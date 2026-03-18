@@ -1,0 +1,21 @@
+[package]
+name = "pensyve-mcp"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "pensyve-mcp"
+path = "src/main.rs"
+
+[dependencies]
+pensyve-core = { path = "../pensyve-core" }
+rmcp = { version = "1.2", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+uuid = { version = "1", features = ["v4"] }
+dirs = "6"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
