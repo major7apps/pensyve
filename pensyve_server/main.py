@@ -1,15 +1,22 @@
 import os
-import pensyve
+
 from fastapi import FastAPI, HTTPException
+
+import pensyve
+
 from .models import (
-    EntityCreate, EntityResponse,
-    EpisodeStartRequest, EpisodeStartResponse,
-    MessageRequest,
-    EpisodeEndRequest, EpisodeEndResponse,
-    RecallRequest, MemoryResponse,
-    RememberRequest,
-    ForgetResponse,
     ConsolidateResponse,
+    EntityCreate,
+    EntityResponse,
+    EpisodeEndRequest,
+    EpisodeEndResponse,
+    EpisodeStartRequest,
+    EpisodeStartResponse,
+    ForgetResponse,
+    MemoryResponse,
+    MessageRequest,
+    RecallRequest,
+    RememberRequest,
 )
 
 app = FastAPI(
@@ -73,7 +80,7 @@ def end_episode(req: EpisodeEndRequest):
 @app.post("/v1/recall", response_model=list[MemoryResponse])
 def recall(req: RecallRequest):
     p = get_pensyve()
-    kwargs = {"limit": req.limit}
+    kwargs: dict[str, object] = {"limit": req.limit}
     if req.entity:
         kwargs["entity"] = p.entity(req.entity)
     if req.types:

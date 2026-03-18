@@ -2,8 +2,10 @@
 End-to-end integration tests for Pensyve Phase 1.
 These verify the full pipeline: ingest → extract → embed → store → recall.
 """
-import pensyve
+
 import tempfile
+
+import pensyve
 
 
 def test_five_line_demo():
