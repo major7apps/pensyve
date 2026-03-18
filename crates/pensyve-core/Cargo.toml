@@ -19,6 +19,7 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 dirs = "6"
+regex = "1"
 
 [dev-dependencies]
 tempfile = "3"
