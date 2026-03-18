@@ -13,3 +13,6 @@ models/
 *.dSYM/
 .fastembed_cache/
 benchmarks/results/*.json
+.cargo/
+node_modules/
+pensyve-ts/dist/

@@ -1,7 +1,0 @@
-# Link against the Homebrew Python 3.14 framework so that `cargo test` works
-# for the pensyve-core cdylib crate without requiring a full maturin build.
-[target.aarch64-apple-darwin]
-rustflags = [
-    "-L/opt/homebrew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14/lib",
-    "-lpython3.14",
-]
