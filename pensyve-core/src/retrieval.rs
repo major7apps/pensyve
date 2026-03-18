@@ -7,6 +7,7 @@ use crate::config::RetrievalConfig;
 use crate::decay;
 use crate::embedding::OnnxEmbedder;
 use crate::graph::MemoryGraph;
+use crate::reranker::Reranker;
 use crate::storage::StorageTrait;
 use crate::types::Memory;
 use crate::vector::VectorIndex;
@@ -23,6 +24,8 @@ pub enum RecallError {
     Storage(#[from] crate::storage::StorageError),
     #[error("Vector error: {0}")]
     Vector(#[from] crate::vector::VectorError),
+    #[error("Reranker error: {0}")]
+    Reranker(#[from] crate::reranker::RerankerError),
 }
 
 // ---------------------------------------------------------------------------
@@ -75,7 +78,13 @@ pub struct RecallEngine<'a> {
     config: &'a RetrievalConfig,
     /// Optional graph for BFS-based graph scoring.
     graph: Option<&'a MemoryGraph>,
+    /// Optional cross-encoder reranker applied after fusion scoring.
+    reranker: Option<&'a Reranker>,
 }
+
+/// Maximum number of candidates to pass into the cross-encoder for reranking.
+/// The cross-encoder is expensive, so we cap the input at this value.
+const RERANK_TOP_N: usize = 20;
 
 impl<'a> RecallEngine<'a> {
     pub fn new(
@@ -90,12 +99,23 @@ impl<'a> RecallEngine<'a> {
             vector_index,
             config,
             graph: None,
+            reranker: None,
         }
     }
 
     /// Attach an optional `MemoryGraph` for graph-based scoring.
     pub fn with_graph(mut self, graph: &'a MemoryGraph) -> Self {
         self.graph = Some(graph);
+        self
+    }
+
+    /// Attach an optional cross-encoder [`Reranker`].
+    ///
+    /// When attached, the top-N candidates (up to `RERANK_TOP_N`) are passed
+    /// through the cross-encoder after fusion scoring and the results are
+    /// reordered by reranker score before the final `limit` is applied.
+    pub fn with_reranker(mut self, reranker: &'a Reranker) -> Self {
+        self.reranker = Some(reranker);
         self
     }
 
@@ -321,6 +341,49 @@ impl<'a> RecallEngine<'a> {
                 .partial_cmp(&a.final_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+
+        // Step 8b: Optional cross-encoder reranking.
+        // We pass up to RERANK_TOP_N candidates through the cross-encoder and
+        // reorder them by reranker score before applying the final limit.
+        if let Some(reranker) = self.reranker {
+            // Take the candidates that will enter the reranker (at most RERANK_TOP_N).
+            let rerank_count = scored.len().min(RERANK_TOP_N);
+            let tail = scored.split_off(rerank_count);
+
+            // Build the text representation for each candidate.
+            let texts: Vec<String> = scored
+                .iter()
+                .map(|c| match &c.memory {
+                    Memory::Episodic(e) => e.content.clone(),
+                    Memory::Semantic(s) => format!("{} {} {}", s.subject, s.predicate, s.object),
+                    Memory::Procedural(p) => {
+                        format!("trigger: {} action: {}", p.trigger, p.action)
+                    }
+                })
+                .collect();
+            let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+
+            // Rerank: returns indices into `text_refs` sorted by score desc.
+            let rerank_results = reranker.rerank(query, &text_refs, rerank_count)?;
+
+            // Reorder `scored` according to reranker ranking.
+            let reranked: Vec<ScoredCandidate> = rerank_results
+                .into_iter()
+                .map(|r| {
+                    let mut cand = scored[r.index].clone();
+                    // Overwrite final_score with the reranker score so downstream
+                    // callers can inspect it.
+                    cand.final_score = r.score;
+                    cand
+                })
+                .collect();
+
+            scored = reranked;
+            // Re-append the tail candidates (below RERANK_TOP_N) which keep
+            // their fusion scores and are already sorted.
+            scored.extend(tail);
+        }
+
         scored.truncate(limit);
 
         // Step 9: Retrieval-induced reinforcement for returned memories.
@@ -558,5 +621,41 @@ mod tests {
             updated_access > initial_access,
             "access_count should increase after retrieval (was {initial_access}, now {updated_access})"
         );
+    }
+
+    #[test]
+    fn test_recall_with_mock_reranker() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteBackend::open(dir.path()).unwrap();
+        let embedder = OnnxEmbedder::new_mock(64);
+        let mut vector_index = VectorIndex::new(64, 16);
+        let config = test_config();
+        let reranker = crate::reranker::Reranker::new_mock();
+
+        let ns = Namespace::new("reranker-ns");
+        storage.save_namespace(&ns).unwrap();
+
+        let mem_a = setup_episodic(&storage, &embedder, &ns, "Rust programming language systems");
+        let mem_b = setup_episodic(&storage, &embedder, &ns, "cooking delicious pasta with garlic");
+        vector_index.add(mem_a.id, &mem_a.embedding).unwrap();
+        vector_index.add(mem_b.id, &mem_b.embedding).unwrap();
+
+        let engine = RecallEngine::new(&storage, &embedder, &vector_index, &config)
+            .with_reranker(&reranker);
+
+        let result = engine
+            .recall("Rust systems programming", ns.id, 5)
+            .unwrap();
+
+        // With the mock reranker the result set is still populated and valid.
+        assert!(!result.memories.is_empty(), "Expected results with reranker attached");
+        // All final_scores are set by the mock reranker and should be in (0, 1].
+        for cand in &result.memories {
+            assert!(
+                cand.final_score > 0.0 && cand.final_score <= 1.0,
+                "Mock reranker score out of range: {}",
+                cand.final_score
+            );
+        }
     }
 }
