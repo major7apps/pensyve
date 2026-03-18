@@ -8,10 +8,8 @@ description = "Universal memory runtime for AI agents"
 
 [lib]
 name = "pensyve_core"
-crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pyo3 = { version = "0.28", features = ["extension-module"] }
 rusqlite = { version = "0.39", features = ["bundled", "vtab"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }

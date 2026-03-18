@@ -1986,7 +1986,6 @@ dependencies = [
  "dirs",
  "fastembed",
  "petgraph",
- "pyo3",
  "regex",
  "rusqlite",
  "serde",
@@ -2010,6 +2009,17 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "pensyve-python"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "pensyve-core",
+ "pyo3",
+ "serde_json",
  "uuid",
 ]
 

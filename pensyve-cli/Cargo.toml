@@ -8,7 +8,7 @@ name = "pensyve"
 path = "src/main.rs"
 
 [dependencies]
-pensyve-core = { path = "../crates/pensyve-core" }
+pensyve-core = { path = "../pensyve-core" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }

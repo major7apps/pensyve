@@ -1,0 +1,16 @@
+[package]
+name = "pensyve-python"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[lib]
+name = "pensyve_python"
+crate-type = ["cdylib"]
+
+[dependencies]
+pensyve-core = { path = "../pensyve-core" }
+pyo3 = { version = "0.28", features = ["extension-module"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+serde_json = "1"

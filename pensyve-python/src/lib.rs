@@ -6,16 +6,30 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use uuid::Uuid;
 
-use crate::config::{PensyveConfig, RetrievalConfig};
-use crate::consolidation::ConsolidationEngine;
-use crate::embedding::OnnxEmbedder;
-use crate::retrieval::RecallEngine;
-use crate::storage::sqlite::SqliteBackend;
-use crate::storage::StorageTrait;
-use crate::types::{
+use pensyve_core::config::{PensyveConfig, RetrievalConfig};
+use pensyve_core::consolidation::ConsolidationEngine;
+use pensyve_core::embedding::OnnxEmbedder;
+use pensyve_core::retrieval::RecallEngine;
+use pensyve_core::storage::sqlite::SqliteBackend;
+use pensyve_core::storage::StorageTrait;
+use pensyve_core::types::{
     self, EntityKind, EpisodicMemory, Namespace, Outcome, SemanticMemory,
 };
-use crate::vector::VectorIndex;
+use pensyve_core::vector::VectorIndex;
+
+// ---------------------------------------------------------------------------
+// Module entry point
+// ---------------------------------------------------------------------------
+
+#[pymodule]
+fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("__version__", "0.1.0")?;
+    m.add_class::<PyPensyve>()?;
+    m.add_class::<PyEntity>()?;
+    m.add_class::<PyEpisode>()?;
+    m.add_class::<PyMemory>()?;
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -82,7 +96,7 @@ struct PensyveInner {
     embedder: Arc<OnnxEmbedder>,
     vector_index: Arc<Mutex<VectorIndex>>,
     retrieval_config: RetrievalConfig,
-    consolidation_config: crate::config::ConsolidationConfig,
+    consolidation_config: pensyve_core::config::ConsolidationConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -602,17 +616,4 @@ impl PyMemory {
             self.score,
         )
     }
-}
-
-// ---------------------------------------------------------------------------
-// Module registration
-// ---------------------------------------------------------------------------
-
-/// Register all Python classes with the module.
-pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PyPensyve>()?;
-    m.add_class::<PyEntity>()?;
-    m.add_class::<PyEpisode>()?;
-    m.add_class::<PyMemory>()?;
-    Ok(())
 }
