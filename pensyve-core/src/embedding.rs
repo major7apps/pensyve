@@ -24,7 +24,7 @@ pub type EmbeddingResult<T> = Result<T, EmbeddingError>;
 
 enum EmbedderInner {
     Mock,
-    Real(Mutex<TextEmbedding>),
+    Real(Box<Mutex<TextEmbedding>>),
 }
 
 // ---------------------------------------------------------------------------
@@ -38,29 +38,27 @@ pub struct OnnxEmbedder {
 
 impl OnnxEmbedder {
     /// Create a real ONNX-backed embedder using fastembed.
-    /// Downloads the model to the HuggingFace cache on first use (~90 MB).
+    /// Downloads the model to the `HuggingFace` cache on first use (~90 MB).
     ///
     /// Supported model names:
-    ///   - "all-MiniLM-L6-v2"  → 384 dimensions
+    ///   - `"all-MiniLM-L6-v2"`  → 384 dimensions
     pub fn new(model_name: &str) -> EmbeddingResult<Self> {
         let (model_enum, dims) = match model_name {
             "all-MiniLM-L6-v2" => (EmbeddingModel::AllMiniLML6V2, 384),
             other => {
                 return Err(EmbeddingError::ModelLoad(format!(
-                    "Unknown model: '{}'. Supported: all-MiniLM-L6-v2",
-                    other
-                )))
+                    "Unknown model: '{other}'. Supported: all-MiniLM-L6-v2"
+                )));
             }
         };
 
-        let model = TextEmbedding::try_new(
-            InitOptions::new(model_enum).with_show_download_progress(true),
-        )
-        .map_err(|e| EmbeddingError::ModelLoad(e.to_string()))?;
+        let model =
+            TextEmbedding::try_new(InitOptions::new(model_enum).with_show_download_progress(true))
+                .map_err(|e| EmbeddingError::ModelLoad(e.to_string()))?;
 
         Ok(Self {
             dimensions: dims,
-            inner: EmbedderInner::Real(Mutex::new(model)),
+            inner: EmbedderInner::Real(Box::new(Mutex::new(model))),
         })
     }
 
@@ -76,8 +74,7 @@ impl OnnxEmbedder {
     /// Legacy constructor kept for backward compatibility. Always returns an error.
     pub fn from_path(model_path: &str, _tokenizer_path: &str) -> EmbeddingResult<Self> {
         Err(EmbeddingError::ModelLoad(format!(
-            "from_path is deprecated; use OnnxEmbedder::new() instead (path: {})",
-            model_path
+            "from_path is deprecated; use OnnxEmbedder::new() instead (path: {model_path})"
         )))
     }
 
@@ -88,7 +85,7 @@ impl OnnxEmbedder {
             EmbedderInner::Real(mutex) => {
                 let mut model = mutex
                     .lock()
-                    .map_err(|e| EmbeddingError::Inference(format!("Mutex poisoned: {}", e)))?;
+                    .map_err(|e| EmbeddingError::Inference(format!("Mutex poisoned: {e}")))?;
                 let embeddings = model
                     .embed(vec![text], None)
                     .map_err(|e| EmbeddingError::Inference(e.to_string()))?;
@@ -103,13 +100,16 @@ impl OnnxEmbedder {
     /// Embed a batch of text strings.
     pub fn embed_batch(&self, texts: &[&str]) -> EmbeddingResult<Vec<Vec<f32>>> {
         match &self.inner {
-            EmbedderInner::Mock => texts.iter().map(|t| Ok(mock_embed(t, self.dimensions))).collect(),
+            EmbedderInner::Mock => texts
+                .iter()
+                .map(|t| Ok(mock_embed(t, self.dimensions)))
+                .collect(),
             EmbedderInner::Real(mutex) => {
                 let mut model = mutex
                     .lock()
-                    .map_err(|e| EmbeddingError::Inference(format!("Mutex poisoned: {}", e)))?;
+                    .map_err(|e| EmbeddingError::Inference(format!("Mutex poisoned: {e}")))?;
                 model
-                    .embed(texts.to_vec(), None)
+                    .embed(texts, None)
                     .map_err(|e| EmbeddingError::Inference(e.to_string()))
             }
         }
@@ -125,6 +125,11 @@ impl OnnxEmbedder {
 // Mock embedding internals
 // ---------------------------------------------------------------------------
 
+/// LCG multiplier (Numerical Recipes / glibc).
+const LCG_A: u64 = 6_364_136_223_846_793_005;
+/// LCG increment (Numerical Recipes / glibc).
+const LCG_C: u64 = 1_442_695_040_888_963_407;
+
 /// Produce a deterministic, normalized embedding for `text` with length `dim`.
 /// Uses a seeded LCG (linear congruential generator) seeded from the text hash.
 fn mock_embed(text: &str, dim: usize) -> Vec<f32> {
@@ -133,14 +138,10 @@ fn mock_embed(text: &str, dim: usize) -> Vec<f32> {
     text.hash(&mut hasher);
     let seed = hasher.finish();
 
-    // Simple LCG parameters (same as Numerical Recipes / glibc).
-    const A: u64 = 6364136223846793005;
-    const C: u64 = 1442695040888963407;
-
     let mut state = seed;
     let mut raw: Vec<f32> = (0..dim)
         .map(|_| {
-            state = state.wrapping_mul(A).wrapping_add(C);
+            state = state.wrapping_mul(LCG_A).wrapping_add(LCG_C);
             // Map upper 32 bits to [-1, 1].
             let bits = (state >> 32) as u32;
             (bits as f32 / u32::MAX as f32) * 2.0 - 1.0
@@ -265,7 +266,10 @@ mod tests {
         let a = embedder.embed("hello world").unwrap();
         let b = embedder.embed("hello world").unwrap();
         let sim = cosine_similarity(&a, &b);
-        assert!((sim - 1.0).abs() < 0.001, "Same text should produce same embedding");
+        assert!(
+            (sim - 1.0).abs() < 0.001,
+            "Same text should produce same embedding"
+        );
     }
 
     #[test]

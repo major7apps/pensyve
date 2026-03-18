@@ -183,10 +183,7 @@ mod tests {
     fn test_search_dimension_mismatch() {
         let index = VectorIndex::new(4, 100);
         let result = index.search(&[1.0, 0.0], 5);
-        assert!(matches!(
-            result,
-            Err(VectorError::DimensionMismatch { .. })
-        ));
+        assert!(matches!(result, Err(VectorError::DimensionMismatch { .. })));
     }
 
     #[test]

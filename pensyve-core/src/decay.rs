@@ -19,15 +19,16 @@ pub fn retrievability(stability: f32, elapsed_days: f32) -> f32 {
 /// Calculate new stability after successful retrieval.
 ///
 /// Uses the FSRS stability increase formula:
-///   new_S = S * (1 + increase_factor * (11 - D) * S^(-0.2) * (e^(0.2 * R) - 1))
+///   `new_S = S * (1 + increase_factor * (11 - D) * S^(-0.2) * (e^(0.2 * R) - 1))`
 ///
 /// `difficulty` is on a 1–10 scale (1 = easy, 10 = hard); default for memories is 5.
 pub fn reinforce(stability: f32, retrievability: f32, difficulty: u8) -> f32 {
     let increase_factor: f32 = 0.5;
-    let d = difficulty.clamp(1, 10) as f32;
+    let d = f32::from(difficulty.clamp(1, 10));
     let r = retrievability.clamp(0.0, 1.0);
     // Low retrievability produces a larger boost (forgotten memories are reinforced more).
-    let increase = increase_factor * (11.0 - d) * stability.powf(-0.2) * (0.2_f32 * (1.0 - r)).exp_m1();
+    let increase =
+        increase_factor * (11.0 - d) * stability.powf(-0.2) * (0.2_f32 * (1.0 - r)).exp_m1();
     stability * (1.0 + increase)
 }
 

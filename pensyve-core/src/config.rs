@@ -85,6 +85,7 @@ impl Default for PensyveConfig {
 // Builder
 // ---------------------------------------------------------------------------
 
+#[must_use]
 pub struct PensyveConfigBuilder {
     config: PensyveConfig,
 }

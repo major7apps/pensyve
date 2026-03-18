@@ -241,8 +241,7 @@ impl ProceduralMemory {
     ) -> Self {
         let (trial_count, success_count) = match &outcome {
             Outcome::Success => (1, 1),
-            Outcome::Failure => (1, 0),
-            Outcome::Partial => (1, 0),
+            Outcome::Failure | Outcome::Partial => (1, 0),
         };
 
         Self {
@@ -372,13 +371,8 @@ mod tests {
     #[test]
     fn test_procedural_memory_creation() {
         let ns_id = Uuid::new_v4();
-        let mem = ProceduralMemory::new(
-            ns_id,
-            "on_error",
-            "retry",
-            Outcome::Success,
-            HashMap::new(),
-        );
+        let mem =
+            ProceduralMemory::new(ns_id, "on_error", "retry", Outcome::Success, HashMap::new());
         assert!((mem.reliability - 0.5).abs() < f32::EPSILON);
         assert_eq!(mem.trial_count, 1);
         assert_eq!(mem.success_count, 1);

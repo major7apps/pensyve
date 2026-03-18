@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::config::ConsolidationConfig;
 use crate::decay;
-use crate::embedding::{cosine_similarity, OnnxEmbedder};
+use crate::embedding::{OnnxEmbedder, cosine_similarity};
 use crate::storage::{StorageError, StorageTrait};
 use crate::types::{EpisodicMemory, Memory, SemanticMemory};
 
@@ -43,6 +43,8 @@ pub struct ConsolidationStats {
 
 pub struct ConsolidationEngine;
 
+const SIMILARITY_THRESHOLD: f32 = 0.8;
+
 impl ConsolidationEngine {
     /// Run all consolidation jobs for a namespace.
     ///
@@ -67,8 +69,8 @@ impl ConsolidationEngine {
     // -----------------------------------------------------------------------
 
     /// Scan episodic memories for repeated facts about the same entity.
-    /// When 2+ episodic memories for the same about_entity have cosine similarity
-    /// > 0.8, promote them to a single SemanticMemory.
+    /// When 2+ episodic memories for the same `about_entity` have cosine similarity
+    /// > 0.8, promote them to a single `SemanticMemory`.
     fn promote_episodic_to_semantic(
         storage: &dyn StorageTrait,
         embedder: &OnnxEmbedder,
@@ -81,14 +83,16 @@ impl ConsolidationEngine {
         let mut episodic_by_entity: HashMap<Uuid, Vec<EpisodicMemory>> = HashMap::new();
         for mem in all_memories {
             if let Memory::Episodic(em) = mem {
-                episodic_by_entity.entry(em.about_entity).or_default().push(em);
+                episodic_by_entity
+                    .entry(em.about_entity)
+                    .or_default()
+                    .push(em);
             }
         }
 
         let mut promoted = 0usize;
-        const SIMILARITY_THRESHOLD: f32 = 0.8;
 
-        for (_entity_id, memories) in &episodic_by_entity {
+        for memories in episodic_by_entity.values() {
             // Skip groups with only one memory — nothing to cluster.
             if memories.len() < 2 {
                 continue;
@@ -147,8 +151,10 @@ impl ConsolidationEngine {
                 let cluster_size = cluster.len();
                 let about_entity = most_recent.about_entity;
                 let confidence = (cluster_size as f32 * 0.3).min(1.0);
-                let source_episodes: Vec<Uuid> =
-                    cluster.iter().map(|&idx| memories[idx].episode_id).collect();
+                let source_episodes: Vec<Uuid> = cluster
+                    .iter()
+                    .map(|&idx| memories[idx].episode_id)
+                    .collect();
 
                 // Create the semantic memory.
                 let mut sem = SemanticMemory::new(
@@ -178,7 +184,7 @@ impl ConsolidationEngine {
 
     /// Apply FSRS decay to all memories in the namespace.
     ///
-    /// Returns (decayed_count, archived_count).
+    /// Returns `(decayed_count, archived_count)`.
     fn decay_pass(
         storage: &dyn StorageTrait,
         config: &ConsolidationConfig,
@@ -202,7 +208,11 @@ impl ConsolidationEngine {
                         // Mark as archived by setting retrievability to near-zero and
                         // generating a summary stub if none exists. We store the updated
                         // stability/retrievability back via update_episodic_access.
-                        storage.update_episodic_access(em.id, em.stability * 0.5, retrievability)?;
+                        storage.update_episodic_access(
+                            em.id,
+                            em.stability * 0.5,
+                            retrievability,
+                        )?;
                         archived += 1;
                     } else {
                         // Just record updated retrievability.
@@ -266,7 +276,7 @@ mod tests {
     use crate::config::{ConsolidationConfig, PensyveConfig};
     use crate::embedding::OnnxEmbedder;
     use crate::storage::sqlite::SqliteBackend;
-    use crate::types::{EpisodicMemory, Episode, Namespace};
+    use crate::types::{Episode, EpisodicMemory, Namespace};
 
     fn make_storage(tmp: &str) -> SqliteBackend {
         SqliteBackend::open(&PathBuf::from(tmp)).expect("open storage")
@@ -372,14 +382,7 @@ mod tests {
             let episode = Episode::new(ns.id, vec![source_id, entity_id]);
             storage.save_episode(&episode).unwrap();
             insert_episodic(
-                &storage,
-                &embedder,
-                &ns,
-                ep_id,
-                source_id,
-                entity_id,
-                content,
-                i as i64,
+                &storage, &embedder, &ns, ep_id, source_id, entity_id, content, i as i64,
             );
         }
 
@@ -443,7 +446,10 @@ mod tests {
 
         // The memory retrievability should have been updated in storage.
         let updated = storage.get_episodic(mem.id).unwrap();
-        assert!(updated.is_some(), "Memory should still exist after decay pass");
+        assert!(
+            updated.is_some(),
+            "Memory should still exist after decay pass"
+        );
     }
 
     #[test]
