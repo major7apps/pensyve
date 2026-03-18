@@ -1,0 +1,13 @@
+target/
+__pycache__/
+*.egg-info/
+dist/
+.env
+*.db
+*.db-journal
+models/
+*.onnx
+.venv/
+*.so
+*.dylib
+*.dSYM/

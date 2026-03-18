@@ -1,0 +1,24 @@
+[package]
+name = "pensyve-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Universal memory runtime for AI agents"
+
+[lib]
+name = "pensyve_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.28", features = ["extension-module"] }
+rusqlite = { version = "0.39", features = ["bundled", "vtab"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+dirs = "6"
+
+[dev-dependencies]
+tempfile = "3"
