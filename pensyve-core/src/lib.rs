@@ -5,6 +5,7 @@ pub mod embedding;
 pub mod extraction;
 pub mod graph;
 pub mod procedural;
+pub mod reranker;
 pub mod retrieval;
 pub mod storage;
 pub mod types;
