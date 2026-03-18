@@ -12,3 +12,4 @@ models/
 *.dylib
 *.dSYM/
 .fastembed_cache/
+benchmarks/results/*.json
