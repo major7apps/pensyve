@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 
+pub mod config;
 pub mod types;
 
 #[pymodule]
