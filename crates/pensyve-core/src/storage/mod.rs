@@ -1,6 +1,6 @@
 use uuid::Uuid;
 
-use crate::types::{Entity, EpisodicMemory, Episode, Memory, Namespace, ProceduralMemory, SemanticMemory};
+use crate::types::{Edge, Entity, EpisodicMemory, Episode, Memory, Namespace, ProceduralMemory, SemanticMemory};
 
 pub mod sqlite;
 
@@ -72,4 +72,11 @@ pub trait StorageTrait: Send + Sync {
 
     // Deletion
     fn delete_memories_by_entity(&self, entity_id: Uuid) -> StorageResult<usize>;
+
+    // Entities (bulk)
+    fn list_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Entity>>;
+
+    // Edges
+    fn save_edge(&self, edge: &Edge) -> StorageResult<()>;
+    fn get_edges_for_entity(&self, entity_id: Uuid) -> StorageResult<Vec<Edge>>;
 }

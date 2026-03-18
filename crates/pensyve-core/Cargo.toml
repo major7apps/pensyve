@@ -21,6 +21,7 @@ thiserror = "2"
 dirs = "6"
 regex = "1"
 fastembed = "5"
+petgraph = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

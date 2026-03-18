@@ -6,6 +6,7 @@ use uuid::Uuid;
 use crate::config::RetrievalConfig;
 use crate::decay;
 use crate::embedding::OnnxEmbedder;
+use crate::graph::MemoryGraph;
 use crate::storage::StorageTrait;
 use crate::types::Memory;
 use crate::vector::VectorIndex;
@@ -72,6 +73,8 @@ pub struct RecallEngine<'a> {
     embedder: &'a OnnxEmbedder,
     vector_index: &'a VectorIndex,
     config: &'a RetrievalConfig,
+    /// Optional graph for BFS-based graph scoring.
+    graph: Option<&'a MemoryGraph>,
 }
 
 impl<'a> RecallEngine<'a> {
@@ -86,16 +89,38 @@ impl<'a> RecallEngine<'a> {
             embedder,
             vector_index,
             config,
+            graph: None,
         }
+    }
+
+    /// Attach an optional `MemoryGraph` for graph-based scoring.
+    pub fn with_graph(mut self, graph: &'a MemoryGraph) -> Self {
+        self.graph = Some(graph);
+        self
     }
 
     /// Run the full recall pipeline for `query` in `namespace_id`, returning
     /// up to `limit` scored candidates sorted by final score descending.
+    ///
+    /// `target_entity` is used for graph traversal: if a graph is attached
+    /// and a target entity is supplied, BFS scores are computed from that
+    /// entity and used to populate `graph_score` on each candidate.
     pub fn recall(
         &self,
         query: &str,
         namespace_id: Uuid,
         limit: usize,
+    ) -> Result<RecallResult, RecallError> {
+        self.recall_with_entity(query, namespace_id, limit, None)
+    }
+
+    /// Like `recall`, but allows specifying a `target_entity` for graph BFS.
+    pub fn recall_with_entity(
+        &self,
+        query: &str,
+        namespace_id: Uuid,
+        limit: usize,
+        target_entity: Option<Uuid>,
     ) -> Result<RecallResult, RecallError> {
         let max_candidates = self.config.max_candidates;
 
@@ -184,6 +209,17 @@ impl<'a> RecallEngine<'a> {
             .max()
             .unwrap_or(0);
 
+        // Step 6b: Build graph score map from BFS if graph + target_entity are available.
+        // graph_map: memory_id → BFS proximity score
+        let graph_map: HashMap<Uuid, f32> = match (self.graph, target_entity) {
+            (Some(g), Some(entity_id)) => {
+                g.traverse(entity_id, 4)
+                    .into_iter()
+                    .collect()
+            }
+            _ => HashMap::new(),
+        };
+
         // Step 7: Score each candidate.
         let now = Utc::now();
         let weights = &self.config.weights;
@@ -232,7 +268,22 @@ impl<'a> RecallEngine<'a> {
                     Memory::Procedural(p) => p.reliability,
                 };
 
-                let graph_score = 0.0f32;
+                // Graph score: BFS proximity from the target entity.
+                // Also check the entity linked to this memory (about_entity /
+                // subject) so memories linked to the target entity score well
+                // even when the memory ID itself isn't in the graph map.
+                let graph_score = {
+                    // Direct hit on memory node in graph.
+                    let direct = *graph_map.get(&id).unwrap_or(&0.0);
+                    // Entity-linked hit: check the owning entity.
+                    let entity_linked = match &memory {
+                        Memory::Episodic(e) => *graph_map.get(&e.about_entity).unwrap_or(&0.0),
+                        Memory::Semantic(s) => *graph_map.get(&s.subject).unwrap_or(&0.0),
+                        Memory::Procedural(_) => 0.0,
+                    };
+                    direct.max(entity_linked)
+                };
+
                 let intent_score = 0.0f32;
                 let type_boost = 1.0f32;
 
@@ -310,8 +361,8 @@ mod tests {
     use crate::types::{EntityKind, Entity, EpisodicMemory, Episode, Namespace};
     use crate::vector::VectorIndex;
 
-    /// Phase 1 default weights: [vector, bm25, graph, intent, recency, access, confidence, type_boost]
-    const TEST_WEIGHTS: [f32; 8] = [0.30, 0.15, 0.0, 0.0, 0.20, 0.10, 0.15, 0.10];
+    /// Default weights: [vector, bm25, graph, intent, recency, access, confidence, type_boost]
+    const TEST_WEIGHTS: [f32; 8] = [0.25, 0.10, 0.15, 0.0, 0.20, 0.10, 0.10, 0.10];
 
     fn test_config() -> RetrievalConfig {
         RetrievalConfig {

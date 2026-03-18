@@ -8,8 +8,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::types::{
-    Entity, EntityKind, EpisodicMemory, Episode, Memory, Namespace, Outcome, ProceduralMemory,
-    SemanticMemory,
+    Edge, Entity, EntityKind, EpisodicMemory, Episode, Memory, Namespace, Outcome,
+    ProceduralMemory, SemanticMemory,
 };
 
 use super::{StorageError, StorageResult, StorageTrait};
@@ -136,6 +136,19 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     content,
     tokenize='porter unicode61'
 );
+
+CREATE TABLE IF NOT EXISTS edges (
+    id          TEXT PRIMARY KEY,
+    source      TEXT NOT NULL,
+    target      TEXT NOT NULL,
+    relation    TEXT NOT NULL,
+    weight      REAL NOT NULL DEFAULT 1.0,
+    valid_at    TEXT NOT NULL,
+    invalid_at  TEXT,
+    metadata    TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);
+CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);
 "#;
 
 // ---------------------------------------------------------------------------
@@ -923,6 +936,112 @@ impl StorageTrait for SqliteBackend {
         }
 
         Ok(total)
+    }
+
+    // -----------------------------------------------------------------------
+    // Entities (bulk)
+    // -----------------------------------------------------------------------
+
+    fn list_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Entity>> {
+        let conn = self.conn.lock().unwrap();
+        let ns_str = namespace_id.to_string();
+        let mut stmt = conn.prepare(
+            "SELECT id, namespace_id, name, kind, metadata, created_at FROM entities WHERE namespace_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![&ns_str], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut entities = Vec::new();
+        for row in rows {
+            let (id_str, ns_id_str, name, kind_str, metadata_str, created_at_str) = row?;
+            let id = Uuid::parse_str(&id_str).unwrap_or_default();
+            let ns_id = Uuid::parse_str(&ns_id_str).unwrap_or_default();
+            let kind = match kind_str.as_str() {
+                "User" => EntityKind::User,
+                "Team" => EntityKind::Team,
+                "Tool" => EntityKind::Tool,
+                _ => EntityKind::Agent,
+            };
+            let metadata: std::collections::HashMap<String, serde_json::Value> =
+                serde_json::from_str(&metadata_str).unwrap_or_default();
+            let created_at = str_to_dt(&created_at_str);
+            entities.push(Entity { id, namespace_id: ns_id, name, kind, metadata, created_at });
+        }
+        Ok(entities)
+    }
+
+    // -----------------------------------------------------------------------
+    // Edges
+    // -----------------------------------------------------------------------
+
+    fn save_edge(&self, edge: &Edge) -> StorageResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let metadata = serde_json::to_string(&edge.metadata)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO edges (id, source, target, relation, weight, valid_at, invalid_at, metadata) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                edge.id.to_string(),
+                edge.source.to_string(),
+                edge.target.to_string(),
+                edge.relation,
+                edge.weight,
+                edge.valid_at.to_rfc3339(),
+                edge.invalid_at.map(|dt| dt.to_rfc3339()),
+                metadata,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn get_edges_for_entity(&self, entity_id: Uuid) -> StorageResult<Vec<Edge>> {
+        let conn = self.conn.lock().unwrap();
+        let id_str = entity_id.to_string();
+        let mut stmt = conn.prepare(
+            "SELECT id, source, target, relation, weight, valid_at, invalid_at, metadata \
+             FROM edges WHERE source = ?1 OR target = ?1",
+        )?;
+        let rows = stmt.query_map(params![&id_str], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, f64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        let mut edges = Vec::new();
+        for row in rows {
+            let (id_str, src_str, tgt_str, relation, weight, valid_at_str, invalid_at_opt, metadata_str) = row?;
+            let id = Uuid::parse_str(&id_str).unwrap_or_default();
+            let source = Uuid::parse_str(&src_str).unwrap_or_default();
+            let target = Uuid::parse_str(&tgt_str).unwrap_or_default();
+            let valid_at = str_to_dt(&valid_at_str);
+            let invalid_at = invalid_at_opt.map(|s| str_to_dt(&s));
+            let metadata: std::collections::HashMap<String, serde_json::Value> =
+                serde_json::from_str(&metadata_str).unwrap_or_default();
+            edges.push(Edge {
+                id,
+                source,
+                target,
+                relation,
+                weight: weight as f32,
+                valid_at,
+                invalid_at,
+                metadata,
+            });
+        }
+        Ok(edges)
     }
 }
 

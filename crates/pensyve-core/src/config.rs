@@ -69,7 +69,7 @@ impl Default for PensyveConfig {
             retrieval: RetrievalConfig {
                 default_limit: 5,
                 max_candidates: 100,
-                weights: [0.30, 0.15, 0.20, 0.10, 0.10, 0.05, 0.05, 0.05],
+                weights: [0.25, 0.10, 0.15, 0.0, 0.20, 0.10, 0.10, 0.10],
             },
             consolidation: ConsolidationConfig {
                 idle_timeout_secs: 30,
