@@ -7,6 +7,7 @@ use pyo3::types::PyDict;
 use uuid::Uuid;
 
 use crate::config::{PensyveConfig, RetrievalConfig};
+use crate::consolidation::ConsolidationEngine;
 use crate::embedding::OnnxEmbedder;
 use crate::retrieval::RecallEngine;
 use crate::storage::sqlite::SqliteBackend;
@@ -81,6 +82,7 @@ struct PensyveInner {
     embedder: Arc<OnnxEmbedder>,
     vector_index: Arc<Mutex<VectorIndex>>,
     retrieval_config: RetrievalConfig,
+    consolidation_config: crate::config::ConsolidationConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +166,7 @@ impl PyPensyve {
                 embedder,
                 vector_index,
                 retrieval_config: config.retrieval,
+                consolidation_config: config.consolidation,
             }),
         })
     }
@@ -332,6 +335,35 @@ impl PyPensyve {
             stability: mem.stability,
             score: 0.0,
         })
+    }
+
+    /// Run the consolidation engine (episodic→semantic promotion + FSRS decay).
+    ///
+    /// Returns a dict with keys: promoted, decayed, archived.
+    ///
+    /// Args:
+    ///     entity: Unused in Phase 2; consolidation runs namespace-wide (default: None).
+    #[pyo3(signature = (entity=None))]
+    fn consolidate<'py>(
+        &self,
+        py: Python<'py>,
+        entity: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let _ = entity; // namespace-wide for now
+        let ns_id = self.inner.namespace.id;
+        let stats = ConsolidationEngine::run(
+            self.inner.storage.as_ref(),
+            self.inner.embedder.as_ref(),
+            &self.inner.consolidation_config,
+            ns_id,
+        )
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Consolidation failed: {e}")))?;
+
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("promoted", stats.promoted)?;
+        dict.set_item("decayed", stats.decayed)?;
+        dict.set_item("archived", stats.archived)?;
+        Ok(dict)
     }
 
     /// Archive or delete all memories about an entity.

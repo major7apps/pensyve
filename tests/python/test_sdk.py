@@ -189,3 +189,44 @@ def test_recall_limit():
             p.remember(entity=user, fact=f"Fact number {i} about alice")
         results = p.recall("fact about alice", limit=3)
         assert len(results) <= 3
+
+
+def test_consolidate_returns_dict():
+    """consolidate() should return a dict with promoted, decayed, archived keys."""
+    with tempfile.TemporaryDirectory() as d:
+        p = pensyve.Pensyve(path=d)
+        result = p.consolidate()
+        assert isinstance(result, dict)
+        assert "promoted" in result
+        assert "decayed" in result
+        assert "archived" in result
+        assert result["promoted"] >= 0
+        assert result["decayed"] >= 0
+        assert result["archived"] >= 0
+
+
+def test_consolidate_promotes_repeated_facts():
+    """Repeated episodic memories about the same entity should be promoted."""
+    with tempfile.TemporaryDirectory() as d:
+        p = pensyve.Pensyve(path=d)
+        agent = p.entity("bot", kind="agent")
+        user = p.entity("carol", kind="user")
+
+        # Record the same message in 3 separate episodes.
+        for _ in range(3):
+            with p.episode(agent, user) as ep:
+                ep.message("user", "I prefer dark mode")
+
+        result = p.consolidate()
+        # The consolidation engine should have promoted at least one semantic memory.
+        assert result["promoted"] >= 1
+
+
+def test_consolidate_no_op_on_empty_namespace():
+    """Consolidation on an empty namespace should return all zeros."""
+    with tempfile.TemporaryDirectory() as d:
+        p = pensyve.Pensyve(path=d, namespace="empty-ns")
+        result = p.consolidate()
+        assert result["promoted"] == 0
+        assert result["decayed"] == 0
+        assert result["archived"] == 0
