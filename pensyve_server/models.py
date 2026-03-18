@@ -1,5 +1,4 @@
-from pydantic import BaseModel, Field
-from typing import Optional
+from pydantic import BaseModel
 
 
 class EntityCreate(BaseModel):
@@ -29,7 +28,7 @@ class MessageRequest(BaseModel):
 
 class EpisodeEndRequest(BaseModel):
     episode_id: str
-    outcome: Optional[str] = None  # "success", "failure", "partial"
+    outcome: str | None = None  # "success", "failure", "partial"
 
 
 class EpisodeEndResponse(BaseModel):
@@ -38,9 +37,9 @@ class EpisodeEndResponse(BaseModel):
 
 class RecallRequest(BaseModel):
     query: str
-    entity: Optional[str] = None
+    entity: str | None = None
     limit: int = 5
-    types: Optional[list[str]] = None
+    types: list[str] | None = None
 
 
 class MemoryResponse(BaseModel):
@@ -49,7 +48,7 @@ class MemoryResponse(BaseModel):
     memory_type: str
     confidence: float
     stability: float
-    score: Optional[float] = None
+    score: float | None = None
 
 
 class RememberRequest(BaseModel):

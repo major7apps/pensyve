@@ -1,9 +1,12 @@
 """Generate synthetic benchmark conversations with planted facts."""
+
 import json
 import random
 
 
-def generate_benchmark(num_conversations=50, facts_per_conversation=3, distractors_per_conversation=5):
+def generate_benchmark(
+    num_conversations=50, facts_per_conversation=3, distractors_per_conversation=5
+):
     """Generate a benchmark dataset.
 
     Each conversation has:
@@ -23,22 +26,38 @@ def generate_benchmark(num_conversations=50, facts_per_conversation=3, distracto
 
     # Fact templates: (fact_template, query_template, expected_keywords)
     fact_templates = [
-        ("I prefer {preference} for my development environment",
-         "What does the user prefer for development?", ["{preference}"]),
-        ("My favorite programming language is {language}",
-         "What programming language does the user prefer?", ["{language}"]),
-        ("I work at {company} as a {role}",
-         "Where does the user work?", ["{company}"]),
-        ("I'm currently working on {project}",
-         "What project is the user working on?", ["{project}"]),
-        ("The best approach for {problem} is {solution}",
-         "How should we handle {problem}?", ["{solution}"]),
-        ("I usually deploy to {platform}",
-         "What platform does the user deploy to?", ["{platform}"]),
-        ("My team uses {tool} for {purpose}",
-         "What tool does the team use for {purpose}?", ["{tool}"]),
-        ("I had issues with {issue} and fixed it by {fix}",
-         "How was {issue} fixed?", ["{fix}"]),
+        (
+            "I prefer {preference} for my development environment",
+            "What does the user prefer for development?",
+            ["{preference}"],
+        ),
+        (
+            "My favorite programming language is {language}",
+            "What programming language does the user prefer?",
+            ["{language}"],
+        ),
+        ("I work at {company} as a {role}", "Where does the user work?", ["{company}"]),
+        (
+            "I'm currently working on {project}",
+            "What project is the user working on?",
+            ["{project}"],
+        ),
+        (
+            "The best approach for {problem} is {solution}",
+            "How should we handle {problem}?",
+            ["{solution}"],
+        ),
+        (
+            "I usually deploy to {platform}",
+            "What platform does the user deploy to?",
+            ["{platform}"],
+        ),
+        (
+            "My team uses {tool} for {purpose}",
+            "What tool does the team use for {purpose}?",
+            ["{tool}"],
+        ),
+        ("I had issues with {issue} and fixed it by {fix}", "How was {issue} fixed?", ["{fix}"]),
     ]
 
     # Values for template variables
@@ -47,13 +66,37 @@ def generate_benchmark(num_conversations=50, facts_per_conversation=3, distracto
     companies = ["Acme Corp", "TechStart", "DataFlow", "CloudNine", "BuildFast"]
     roles = ["senior engineer", "tech lead", "architect", "principal engineer"]
     projects = ["auth service rewrite", "API gateway", "data pipeline", "mobile app", "ML platform"]
-    problems = ["slow queries", "memory leaks", "race conditions", "timeout errors", "auth failures"]
-    solutions = ["adding an index", "connection pooling", "mutex locks", "retry with backoff", "token refresh"]
+    problems = [
+        "slow queries",
+        "memory leaks",
+        "race conditions",
+        "timeout errors",
+        "auth failures",
+    ]
+    solutions = [
+        "adding an index",
+        "connection pooling",
+        "mutex locks",
+        "retry with backoff",
+        "token refresh",
+    ]
     platforms = ["AWS", "GCP", "Vercel", "Fly.io", "Railway"]
     tools = ["Docker", "Kubernetes", "Terraform", "GitHub Actions", "ArgoCD"]
     purposes = ["deployment", "CI/CD", "monitoring", "testing", "infrastructure"]
-    issues = ["database deadlocks", "SSL certificate expiry", "DNS resolution", "container OOM", "API rate limiting"]
-    fixes = ["reordering transactions", "auto-renewal setup", "switching to DoH", "increasing memory limits", "implementing backoff"]
+    issues = [
+        "database deadlocks",
+        "SSL certificate expiry",
+        "DNS resolution",
+        "container OOM",
+        "API rate limiting",
+    ]
+    fixes = [
+        "reordering transactions",
+        "auto-renewal setup",
+        "switching to DoH",
+        "increasing memory limits",
+        "implementing backoff",
+    ]
 
     distractors = [
         "How's the weather today?",
@@ -74,25 +117,39 @@ def generate_benchmark(num_conversations=50, facts_per_conversation=3, distracto
         conv_queries = []
 
         # Select random fact templates and fill them
-        selected = random.sample(range(len(fact_templates)), min(facts_per_conversation, len(fact_templates)))
+        selected = random.sample(
+            range(len(fact_templates)), min(facts_per_conversation, len(fact_templates))
+        )
 
         for template_idx in selected:
             template, query_template, expected_keywords = fact_templates[template_idx]
 
             # Fill template variables
             variables = {}
-            if "{preference}" in template: variables["preference"] = random.choice(preferences)
-            if "{language}" in template: variables["language"] = random.choice(languages)
-            if "{company}" in template: variables["company"] = random.choice(companies)
-            if "{role}" in template: variables["role"] = random.choice(roles)
-            if "{project}" in template: variables["project"] = random.choice(projects)
-            if "{problem}" in template: variables["problem"] = random.choice(problems)
-            if "{solution}" in template: variables["solution"] = random.choice(solutions)
-            if "{platform}" in template: variables["platform"] = random.choice(platforms)
-            if "{tool}" in template: variables["tool"] = random.choice(tools)
-            if "{purpose}" in template: variables["purpose"] = random.choice(purposes)
-            if "{issue}" in template: variables["issue"] = random.choice(issues)
-            if "{fix}" in template: variables["fix"] = random.choice(fixes)
+            if "{preference}" in template:
+                variables["preference"] = random.choice(preferences)
+            if "{language}" in template:
+                variables["language"] = random.choice(languages)
+            if "{company}" in template:
+                variables["company"] = random.choice(companies)
+            if "{role}" in template:
+                variables["role"] = random.choice(roles)
+            if "{project}" in template:
+                variables["project"] = random.choice(projects)
+            if "{problem}" in template:
+                variables["problem"] = random.choice(problems)
+            if "{solution}" in template:
+                variables["solution"] = random.choice(solutions)
+            if "{platform}" in template:
+                variables["platform"] = random.choice(platforms)
+            if "{tool}" in template:
+                variables["tool"] = random.choice(tools)
+            if "{purpose}" in template:
+                variables["purpose"] = random.choice(purposes)
+            if "{issue}" in template:
+                variables["issue"] = random.choice(issues)
+            if "{fix}" in template:
+                variables["fix"] = random.choice(fixes)
 
             fact_text = template.format(**variables)
             query_text = query_template.format(**variables)
@@ -101,22 +158,26 @@ def generate_benchmark(num_conversations=50, facts_per_conversation=3, distracto
             messages.append({"role": "user", "content": fact_text})
             messages.append({"role": "agent", "content": "Got it, I'll remember that."})
             conv_facts.append({"text": fact_text, "keywords": expected})
-            conv_queries.append({
-                "query": query_text,
-                "expected_keywords": expected,
-                "source_conversation": conv_idx,
-            })
+            conv_queries.append(
+                {
+                    "query": query_text,
+                    "expected_keywords": expected,
+                    "source_conversation": conv_idx,
+                }
+            )
 
         # Add distractors interspersed
         for _ in range(distractors_per_conversation):
             pos = random.randint(0, len(messages))
             messages.insert(pos, {"role": "user", "content": random.choice(distractors)})
 
-        benchmark["conversations"].append({
-            "id": conv_idx,
-            "messages": messages,
-            "planted_facts": conv_facts,
-        })
+        benchmark["conversations"].append(
+            {
+                "id": conv_idx,
+                "messages": messages,
+                "planted_facts": conv_facts,
+            }
+        )
         benchmark["queries"].extend(conv_queries)
 
     # Shuffle queries so they're not in conversation order
@@ -130,4 +191,6 @@ if __name__ == "__main__":
     data = generate_benchmark()
     with open("benchmarks/results/synthetic_benchmark.json", "w") as f:
         json.dump(data, f, indent=2)
-    print(f"Generated {len(data['conversations'])} conversations with {len(data['queries'])} queries")
+    print(
+        f"Generated {len(data['conversations'])} conversations with {len(data['queries'])} queries"
+    )

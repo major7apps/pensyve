@@ -1,13 +1,16 @@
 """Run Pensyve benchmarks."""
+
 import argparse
-import sys
 import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from synthetic.generate import generate_benchmark
-from synthetic.evaluate import evaluate
 import json
 import random
+
+from synthetic.evaluate import evaluate
+from synthetic.generate import generate_benchmark
 
 
 def main():
@@ -25,7 +28,9 @@ def main():
         os.makedirs("benchmarks/results", exist_ok=True)
         with open("benchmarks/results/synthetic_benchmark.json", "w") as f:
             json.dump(data, f, indent=2)
-        print(f"Generated {len(data['conversations'])} conversations, {len(data['queries'])} queries")
+        print(
+            f"Generated {len(data['conversations'])} conversations, {len(data['queries'])} queries"
+        )
 
     if args.evaluate or not args.generate:
         report = evaluate("benchmarks/results/synthetic_benchmark.json", verbose=args.verbose)
