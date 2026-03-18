@@ -63,7 +63,7 @@ impl Default for PensyveConfig {
             },
             embedding: EmbeddingConfig {
                 model: "all-MiniLM-L6-v2".to_string(),
-                dimensions: 768,
+                dimensions: 384,
             },
             extraction: ExtractionConfig { default_tier: 1 },
             retrieval: RetrievalConfig {

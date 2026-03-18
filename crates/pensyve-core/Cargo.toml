@@ -20,6 +20,7 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 dirs = "6"
 regex = "1"
+fastembed = "5"
 
 [dev-dependencies]
 tempfile = "3"

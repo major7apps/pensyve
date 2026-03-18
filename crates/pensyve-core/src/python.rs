@@ -134,9 +134,13 @@ impl PyPensyve {
             }
         };
 
-        // Create embedder (mock mode for Phase 1).
-        let dimensions = config.embedding.dimensions;
-        let embedder = Arc::new(OnnxEmbedder::new_mock(dimensions));
+        // Try real ONNX embedder first; fall back to mock if unavailable
+        // (e.g. offline, no disk space, or model not yet downloaded).
+        let dimensions = 384; // all-MiniLM-L6-v2 output size
+        let embedder = Arc::new(
+            OnnxEmbedder::new("all-MiniLM-L6-v2")
+                .unwrap_or_else(|_| OnnxEmbedder::new_mock(dimensions)),
+        );
 
         // Create vector index.
         let vector_index = Arc::new(Mutex::new(VectorIndex::new(dimensions, 1024)));
