@@ -4,6 +4,7 @@ pub mod config;
 pub mod decay;
 pub mod embedding;
 pub mod extraction;
+pub mod procedural;
 pub mod python;
 pub mod retrieval;
 pub mod storage;
