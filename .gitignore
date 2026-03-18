@@ -11,3 +11,4 @@ models/
 *.so
 *.dylib
 *.dSYM/
+.fastembed_cache/

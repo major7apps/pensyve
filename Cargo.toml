@@ -1,3 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/pensyve-core", "crates/pensyve-mcp", "cli"]
+members = [
+    "pensyve-core",
+    "pensyve-python",
+    "pensyve-mcp",
+    "pensyve-cli",
+]
