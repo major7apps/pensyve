@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 pub mod config;
+pub mod decay;
 pub mod embedding;
 pub mod extraction;
 pub mod storage;
