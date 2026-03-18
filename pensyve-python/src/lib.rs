@@ -10,11 +10,9 @@ use pensyve_core::config::{PensyveConfig, RetrievalConfig};
 use pensyve_core::consolidation::ConsolidationEngine;
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::retrieval::RecallEngine;
-use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::storage::StorageTrait;
-use pensyve_core::types::{
-    self, EntityKind, EpisodicMemory, Namespace, Outcome, SemanticMemory,
-};
+use pensyve_core::storage::sqlite::SqliteBackend;
+use pensyve_core::types::{self, EntityKind, EpisodicMemory, Namespace, Outcome, SemanticMemory};
 use pensyve_core::vector::VectorIndex;
 
 // ---------------------------------------------------------------------------
@@ -35,7 +33,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Parse an EntityKind from a Python string.
+/// Parse an `EntityKind` from a Python string.
 fn parse_entity_kind(kind: &str) -> PyResult<EntityKind> {
     match kind.to_lowercase().as_str() {
         "agent" => Ok(EntityKind::Agent),
@@ -43,13 +41,12 @@ fn parse_entity_kind(kind: &str) -> PyResult<EntityKind> {
         "team" => Ok(EntityKind::Team),
         "tool" => Ok(EntityKind::Tool),
         _ => Err(PyRuntimeError::new_err(format!(
-            "Unknown entity kind: '{}'. Expected one of: agent, user, team, tool",
-            kind
+            "Unknown entity kind: '{kind}'. Expected one of: agent, user, team, tool"
         ))),
     }
 }
 
-/// Format an EntityKind as a Python string.
+/// Format an `EntityKind` as a Python string.
 fn entity_kind_str(kind: &EntityKind) -> &'static str {
     match kind {
         EntityKind::Agent => "agent",
@@ -138,9 +135,9 @@ impl PyPensyve {
             Ok(Some(existing)) => existing,
             Ok(None) => {
                 let ns = Namespace::new(&ns_name);
-                storage
-                    .save_namespace(&ns)
-                    .map_err(|e| PyRuntimeError::new_err(format!("Failed to save namespace: {e}")))?;
+                storage.save_namespace(&ns).map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to save namespace: {e}"))
+                })?;
                 ns
             }
             Err(e) => {
@@ -228,6 +225,7 @@ impl PyPensyve {
     /// Args:
     ///     *participants: Entity objects participating in this episode.
     #[pyo3(signature = (*participants))]
+    #[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
     fn episode(&self, participants: Vec<PyRef<'_, PyEntity>>) -> PyResult<PyEpisode> {
         let participant_uuids: Vec<Uuid> = participants.iter().map(|e| e.uuid).collect();
 
@@ -252,6 +250,7 @@ impl PyPensyve {
     ///     limit: Maximum number of results (default: 5).
     ///     types: Optional list of memory type strings to filter by.
     #[pyo3(signature = (query, entity=None, limit=5, types=None))]
+    #[allow(clippy::needless_pass_by_value)]
     fn recall(
         &self,
         query: &str,
@@ -306,6 +305,7 @@ impl PyPensyve {
     ///     fact: The fact to remember (e.g. "Seth prefers Python").
     ///     confidence: Confidence level in [0, 1] (default: 0.8).
     #[pyo3(signature = (entity, fact, confidence=0.8))]
+    #[allow(clippy::needless_pass_by_value)]
     fn remember(
         &self,
         entity: PyRef<'_, PyEntity>,
@@ -371,7 +371,9 @@ impl PyPensyve {
             &self.inner.consolidation_config,
             ns_id,
         )
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Consolidation failed: {e}")))?;
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Consolidation failed: {e}"))
+        })?;
 
         let dict = pyo3::types::PyDict::new(py);
         dict.set_item("promoted", stats.promoted)?;
@@ -384,8 +386,9 @@ impl PyPensyve {
     ///
     /// Args:
     ///     entity: The entity whose memories to forget.
-    ///     hard_delete: If True, permanently delete; otherwise archive (default: False).
+    ///     `hard_delete`: If True, permanently delete; otherwise archive (default: False).
     #[pyo3(signature = (entity, hard_delete=false))]
+    #[allow(clippy::needless_pass_by_value)]
     fn forget<'py>(
         &self,
         py: Python<'py>,
@@ -410,7 +413,9 @@ impl PyPensyve {
 /// Simple heuristic: look for common verb patterns.
 fn parse_fact(fact: &str) -> (String, String) {
     // Try to split on common verb patterns.
-    let verbs = ["prefers", "likes", "uses", "knows", "is", "has", "wants", "needs"];
+    let verbs = [
+        "prefers", "likes", "uses", "knows", "is", "has", "wants", "needs",
+    ];
     for verb in &verbs {
         if let Some(pos) = fact.to_lowercase().find(verb) {
             let before = fact[..pos].trim();
@@ -444,7 +449,10 @@ pub struct PyEntity {
 #[pymethods]
 impl PyEntity {
     fn __repr__(&self) -> String {
-        format!("Entity(name='{}', kind='{}', id='{}')", self.name, self.kind, self.id)
+        format!(
+            "Entity(name='{}', kind='{}', id='{}')",
+            self.name, self.kind, self.id
+        )
     }
 }
 
@@ -493,8 +501,7 @@ impl PyEpisode {
                 Ok(())
             }
             _ => Err(PyRuntimeError::new_err(format!(
-                "Unknown outcome: '{}'. Expected one of: success, failure, partial",
-                result
+                "Unknown outcome: '{result}'. Expected one of: success, failure, partial"
             ))),
         }
     }
@@ -517,7 +524,6 @@ impl PyEpisode {
 
         // Determine the outcome.
         let outcome = match self.outcome.as_deref() {
-            Some("success") => Outcome::Success,
             Some("failure") => Outcome::Failure,
             Some("partial") => Outcome::Partial,
             _ => Outcome::Success, // Default to success if not set.

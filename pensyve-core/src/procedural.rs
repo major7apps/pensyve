@@ -2,10 +2,10 @@ use crate::types::{Outcome, ProceduralMemory};
 
 /// Update procedural memory reliability using beta-binomial posterior.
 ///
-/// The reliability score is the mean of a Beta(alpha, beta) distribution where:
-/// - alpha = success_count + 1 (prior of 1 for uninformative)
-/// - beta = failure_count + 1
-/// - reliability = alpha / (alpha + beta)
+/// The reliability score is the mean of a `Beta(alpha, beta)` distribution where:
+/// - `alpha = success_count + 1` (prior of 1 for uninformative)
+/// - `beta = failure_count + 1`
+/// - `reliability = alpha / (alpha + beta)`
 ///
 /// This naturally handles:
 /// - New procedures start at 0.5 (uninformative prior)
@@ -19,8 +19,8 @@ pub fn update_reliability(
     let new_trial = current_trial_count + 1;
     let new_success = match new_outcome {
         Outcome::Success => current_success_count + 1,
-        Outcome::Failure => current_success_count,
-        Outcome::Partial => current_success_count, // partial = not a clear success
+        // Partial is not a clear success; treat like failure.
+        Outcome::Failure | Outcome::Partial => current_success_count,
     };
 
     // Beta distribution mean: alpha / (alpha + beta)
@@ -36,7 +36,7 @@ pub fn update_reliability(
 /// Check if a procedure should be pruned.
 ///
 /// A procedure is considered unreliable if:
-/// - It has been tried enough times (>= min_trials)
+/// - It has been tried enough times (>= `min_trials`)
 /// - Its reliability is below the threshold
 pub fn should_prune(reliability: f32, trial_count: u32, min_trials: u32, threshold: f32) -> bool {
     trial_count >= min_trials && reliability < threshold
@@ -45,7 +45,7 @@ pub fn should_prune(reliability: f32, trial_count: u32, min_trials: u32, thresho
 /// Find the best procedure for a given trigger among candidates.
 ///
 /// Returns the index of the most reliable procedure that meets the reliability
-/// threshold, or None if all candidates are below the threshold.
+/// threshold, or `None` if all candidates are below the threshold.
 pub fn select_best_procedure(
     procedures: &[ProceduralMemory],
     reliability_threshold: f32,

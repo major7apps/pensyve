@@ -38,7 +38,7 @@ enum RerankerInner {
     /// so no model download is required.
     Mock,
     /// Real fastembed cross-encoder.
-    Real(Mutex<TextRerank>),
+    Real(Box<Mutex<TextRerank>>),
 }
 
 // ---------------------------------------------------------------------------
@@ -60,7 +60,7 @@ impl Reranker {
     ///   - `"BGERerankerBase"` — BAAI/bge-reranker-base (English + Chinese)
     ///   - `"JINARerankerV1TurboEn"` — jinaai/jina-reranker-v1-turbo-en (English)
     ///
-    /// Downloads the model to the HuggingFace cache on first use.
+    /// Downloads the model to the `HuggingFace` cache on first use.
     pub fn new(model_name: &str) -> Result<Self, RerankerError> {
         let model_enum = match model_name {
             "BGERerankerBase" => RerankerModel::BGERerankerBase,
@@ -74,7 +74,7 @@ impl Reranker {
         .map_err(|e| RerankerError::ModelLoad(e.to_string()))?;
 
         Ok(Self {
-            inner: RerankerInner::Real(Mutex::new(text_rerank)),
+            inner: RerankerInner::Real(Box::new(Mutex::new(text_rerank))),
         })
     }
 

@@ -5,7 +5,7 @@ use pensyve_core::{
     config::RetrievalConfig,
     embedding::OnnxEmbedder,
     retrieval::RecallEngine,
-    storage::{sqlite::SqliteBackend, StorageTrait},
+    storage::{StorageTrait, sqlite::SqliteBackend},
     types::{Memory, Namespace},
     vector::VectorIndex,
 };
@@ -81,8 +81,8 @@ fn storage_path(namespace: &str) -> PathBuf {
         .join(namespace)
 }
 
-/// Open (or create) the SqliteBackend for `path`.
-fn open_storage(path: &PathBuf) -> Result<SqliteBackend, Box<dyn std::error::Error>> {
+/// Open (or create) the `SqliteBackend` for `path`.
+fn open_storage(path: &std::path::Path) -> Result<SqliteBackend, Box<dyn std::error::Error>> {
     Ok(SqliteBackend::open(path)?)
 }
 
@@ -100,7 +100,7 @@ fn ensure_namespace(
     Ok(ns)
 }
 
-/// Build a VectorIndex pre-loaded with all embeddings from `namespace_id`.
+/// Build a `VectorIndex` pre-loaded with all embeddings from `namespace_id`.
 fn build_vector_index(
     storage: &SqliteBackend,
     namespace_id: uuid::Uuid,
@@ -147,13 +147,11 @@ fn cmd_recall(
 
     // If an entity filter is provided, look up the entity UUID and filter.
     let entity_id = if let Some(name) = entity_filter {
-        match storage.get_entity_by_name(name, ns.id)? {
-            Some(e) => Some(e.id),
-            None => {
-                eprintln!("Warning: entity '{name}' not found in namespace '{namespace_name}'");
-                None
-            }
+        let entity = storage.get_entity_by_name(name, ns.id)?;
+        if entity.is_none() {
+            eprintln!("Warning: entity '{name}' not found in namespace '{namespace_name}'");
         }
+        entity.map(|e| e.id)
     } else {
         None
     };
@@ -223,9 +221,7 @@ fn cmd_stats(namespace_name: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // Storage size from the SQLite file.
     let db_path = path.join("memories.db");
-    let storage_bytes = std::fs::metadata(&db_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let storage_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
     let stats = serde_json::json!({
         "namespace": namespace_name,
@@ -252,23 +248,20 @@ fn cmd_inspect(
     let storage = open_storage(&path)?;
     let ns = ensure_namespace(&storage, namespace_name)?;
 
-    let entity = match storage.get_entity_by_name(entity_name, ns.id)? {
-        Some(e) => e,
-        None => {
-            let out = serde_json::json!({
-                "entity": entity_name,
-                "namespace": namespace_name,
-                "error": "entity not found",
-                "memories": [],
-            });
-            println!("{}", serde_json::to_string_pretty(&out)?);
-            return Ok(());
-        }
+    let Some(entity) = storage.get_entity_by_name(entity_name, ns.id)? else {
+        let out = serde_json::json!({
+            "entity": entity_name,
+            "namespace": namespace_name,
+            "error": "entity not found",
+            "memories": [],
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
     };
 
-    let want_episodic = type_filter.map_or(true, |t| t.eq_ignore_ascii_case("episodic"));
-    let want_semantic = type_filter.map_or(true, |t| t.eq_ignore_ascii_case("semantic"));
-    let want_procedural = type_filter.map_or(true, |t| t.eq_ignore_ascii_case("procedural"));
+    let want_episodic = type_filter.is_none_or(|t| t.eq_ignore_ascii_case("episodic"));
+    let want_semantic = type_filter.is_none_or(|t| t.eq_ignore_ascii_case("semantic"));
+    let want_procedural = type_filter.is_none_or(|t| t.eq_ignore_ascii_case("procedural"));
 
     let mut memories: Vec<serde_json::Value> = Vec::new();
 
@@ -310,7 +303,7 @@ fn cmd_inspect(
         },
         "namespace": namespace_name,
         "memories": memories,
-        "note": if !want_procedural { "procedural memories are not entity-scoped" } else { "" },
+        "note": if want_procedural { "" } else { "procedural memories are not entity-scoped" },
     });
 
     println!("{}", serde_json::to_string_pretty(&out)?);

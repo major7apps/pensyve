@@ -4,12 +4,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{
-    Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
-};
-use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
+use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
 use rmcp::schemars;
 use rmcp::serde_json;
+use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -20,9 +18,7 @@ use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::retrieval::RecallEngine;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
-use pensyve_core::types::{
-    Entity, EntityKind, Episode, Namespace, Outcome, SemanticMemory,
-};
+use pensyve_core::types::{Entity, EntityKind, Episode, Namespace, Outcome, SemanticMemory};
 use pensyve_core::vector::VectorIndex;
 
 // ---------------------------------------------------------------------------
@@ -72,7 +68,7 @@ struct EpisodeStartParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct EpisodeEndParams {
-    /// The episode ID returned by pensyve_episode_start.
+    /// The episode ID returned by `pensyve_episode_start`.
     episode_id: String,
     /// Outcome of the episode: "success", "failure", or "partial".
     outcome: Option<String>,
@@ -118,10 +114,7 @@ impl PensyveMcpServer {
         name = "pensyve_recall",
         description = "Search memories by semantic similarity and text matching. Returns ranked results from episodic, semantic, and procedural memory."
     )]
-    async fn recall(
-        &self,
-        Parameters(params): Parameters<RecallParams>,
-    ) -> String {
+    async fn recall(&self, Parameters(params): Parameters<RecallParams>) -> String {
         let limit = params.limit.unwrap_or(5) as usize;
         let state = &self.state;
 
@@ -161,21 +154,21 @@ impl PensyveMcpServer {
                         let mut outer = serde_json::to_value(&c.memory).unwrap_or_default();
                         let inner = if let serde_json::Value::Object(ref mut map) = outer {
                             // The variant name key holds the actual object.
-                            map.values_mut().next()
+                            map.values_mut()
+                                .next()
                                 .and_then(|v| if v.is_object() { Some(v.take()) } else { None })
-                                .unwrap_or(serde_json::Value::Object(Default::default()))
+                                .unwrap_or(serde_json::Value::Object(serde_json::Map::default()))
                         } else {
                             outer.clone()
                         };
-                        let result = if let serde_json::Value::Object(mut map) = inner {
+                        if let serde_json::Value::Object(mut map) = inner {
                             map.remove("embedding");
                             map.insert("_type".to_string(), serde_json::json!(type_name));
                             map.insert("_score".to_string(), serde_json::json!(c.final_score));
                             serde_json::Value::Object(map)
                         } else {
                             serde_json::json!({ "_type": type_name, "_score": c.final_score })
-                        };
-                        result
+                        }
                     })
                     .collect();
 
@@ -190,15 +183,15 @@ impl PensyveMcpServer {
         name = "pensyve_remember",
         description = "Store an explicit fact about an entity as a semantic memory. Returns the stored memory object."
     )]
-    async fn remember(
-        &self,
-        Parameters(params): Parameters<RememberParams>,
-    ) -> String {
+    async fn remember(&self, Parameters(params): Parameters<RememberParams>) -> String {
         let state = &self.state;
         let confidence = params.confidence.unwrap_or(1.0) as f32;
 
         // Get or create the entity.
-        let entity = match state.storage.get_entity_by_name(&params.entity, state.namespace.id) {
+        let entity = match state
+            .storage
+            .get_entity_by_name(&params.entity, state.namespace.id)
+        {
             Ok(Some(e)) => e,
             Ok(None) => {
                 let mut e = Entity::new(&params.entity, EntityKind::Agent);
@@ -213,18 +206,16 @@ impl PensyveMcpServer {
 
         // Split fact into predicate + object on first whitespace.
         let (predicate, object) = if let Some(pos) = params.fact.find(' ') {
-            (params.fact[..pos].to_string(), params.fact[pos + 1..].to_string())
+            (
+                params.fact[..pos].to_string(),
+                params.fact[pos + 1..].to_string(),
+            )
         } else {
             ("knows".to_string(), params.fact.clone())
         };
 
-        let mut mem = SemanticMemory::new(
-            state.namespace.id,
-            entity.id,
-            predicate,
-            object,
-            confidence,
-        );
+        let mut mem =
+            SemanticMemory::new(state.namespace.id, entity.id, predicate, object, confidence);
 
         // Generate embedding.
         match state.embedder.embed(&params.fact) {
@@ -255,10 +246,7 @@ impl PensyveMcpServer {
         name = "pensyve_episode_start",
         description = "Begin tracking an interaction episode with named participants. Returns the episode_id needed to close the episode."
     )]
-    async fn episode_start(
-        &self,
-        Parameters(params): Parameters<EpisodeStartParams>,
-    ) -> String {
+    async fn episode_start(&self, Parameters(params): Parameters<EpisodeStartParams>) -> String {
         let state = &self.state;
 
         // Resolve or create participant entities.
@@ -297,15 +285,11 @@ impl PensyveMcpServer {
         name = "pensyve_episode_end",
         description = "Close an episode and extract any memories from it. Returns the count of memories created."
     )]
-    async fn episode_end(
-        &self,
-        Parameters(params): Parameters<EpisodeEndParams>,
-    ) -> String {
+    async fn episode_end(&self, Parameters(params): Parameters<EpisodeEndParams>) -> String {
         let state = &self.state;
 
-        let episode_id = match params.episode_id.parse::<Uuid>() {
-            Ok(id) => id,
-            Err(_) => return format!("Invalid episode_id: '{}'", params.episode_id),
+        let Ok(episode_id) = params.episode_id.parse::<Uuid>() else {
+            return format!("Invalid episode_id: '{}'", params.episode_id);
         };
 
         let outcome = match params.outcome.as_deref() {
@@ -313,10 +297,7 @@ impl PensyveMcpServer {
             Some("failure") => Outcome::Failure,
             Some("partial") => Outcome::Partial,
             Some(other) => {
-                return format!(
-                    "Unknown outcome '{}'; use success, failure, or partial",
-                    other
-                )
+                return format!("Unknown outcome '{other}'; use success, failure, or partial");
             }
         };
 
@@ -342,13 +323,13 @@ impl PensyveMcpServer {
         name = "pensyve_forget",
         description = "Delete all memories associated with an entity. Returns the count of forgotten memories."
     )]
-    async fn forget(
-        &self,
-        Parameters(params): Parameters<ForgetParams>,
-    ) -> String {
+    async fn forget(&self, Parameters(params): Parameters<ForgetParams>) -> String {
         let state = &self.state;
 
-        let entity = match state.storage.get_entity_by_name(&params.entity, state.namespace.id) {
+        let entity = match state
+            .storage
+            .get_entity_by_name(&params.entity, state.namespace.id)
+        {
             Ok(Some(e)) => e,
             Ok(None) => {
                 return serde_json::to_string_pretty(&serde_json::json!({
@@ -379,14 +360,14 @@ impl PensyveMcpServer {
         name = "pensyve_inspect",
         description = "View all memories stored for an entity, optionally filtered by type. Returns an array of memory objects with stats."
     )]
-    async fn inspect(
-        &self,
-        Parameters(params): Parameters<InspectParams>,
-    ) -> String {
+    async fn inspect(&self, Parameters(params): Parameters<InspectParams>) -> String {
         let state = &self.state;
         let limit = params.limit.unwrap_or(20) as usize;
 
-        let entity = match state.storage.get_entity_by_name(&params.entity, state.namespace.id) {
+        let entity = match state
+            .storage
+            .get_entity_by_name(&params.entity, state.namespace.id)
+        {
             Ok(Some(e)) => e,
             Ok(None) => {
                 return serde_json::to_string_pretty(&serde_json::json!({
@@ -485,7 +466,7 @@ fn resolve_namespace() -> String {
     std::env::var("PENSYVE_NAMESPACE").unwrap_or_else(|_| "default".to_string())
 }
 
-async fn load_vector_index(
+fn load_vector_index(
     storage: &SqliteBackend,
     namespace_id: Uuid,
     dimensions: usize,
@@ -505,7 +486,10 @@ async fn load_vector_index(
                     }
                 }
             }
-            eprintln!("Loaded {loaded}/{} memories into vector index", memories.len());
+            eprintln!(
+                "Loaded {loaded}/{} memories into vector index",
+                memories.len()
+            );
         }
         Err(e) => {
             eprintln!("Warning: failed to load memories for vector index: {e}");
@@ -567,7 +551,7 @@ async fn main() -> Result<()> {
     let dimensions = embedder.dimensions();
 
     // Load existing embeddings into the vector index.
-    let vector_index = load_vector_index(&storage, namespace.id, dimensions).await;
+    let vector_index = load_vector_index(&storage, namespace.id, dimensions);
 
     let retrieval_config = RetrievalConfig {
         default_limit: 5,

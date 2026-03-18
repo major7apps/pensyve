@@ -10,17 +10,12 @@ pub struct ExtractedEntity {
     pub end: usize,
 }
 
-static EMAIL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").unwrap()
-});
+static EMAIL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}").unwrap());
 
-static DATE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\d{4}-\d{2}-\d{2}").unwrap()
-});
+static DATE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{4}-\d{2}-\d{2}").unwrap());
 
-static URL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"https?://[^\s<>"]+"#).unwrap()
-});
+static URL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s<>"]+"#).unwrap());
 
 pub fn extract_patterns(text: &str) -> Vec<ExtractedEntity> {
     let mut entities: Vec<ExtractedEntity> = Vec::new();
@@ -125,7 +120,11 @@ mod tests {
     fn test_url_http_and_https() {
         let text = "See http://foo.com and https://bar.org.";
         let result = extract_patterns(text);
-        let urls: Vec<&str> = result.iter().filter(|e| e.kind == "url").map(|e| e.value.as_str()).collect();
+        let urls: Vec<&str> = result
+            .iter()
+            .filter(|e| e.kind == "url")
+            .map(|e| e.value.as_str())
+            .collect();
         assert!(urls.contains(&"http://foo.com"));
         assert!(urls.contains(&"https://bar.org."));
     }
@@ -145,7 +144,10 @@ mod tests {
         let text = "Date: 2024-01-01, email: hello@world.com, url: https://world.com";
         let result = extract_patterns(text);
         for w in result.windows(2) {
-            assert!(w[0].start <= w[1].start, "Results should be sorted by start position");
+            assert!(
+                w[0].start <= w[1].start,
+                "Results should be sorted by start position"
+            );
         }
     }
 
@@ -164,6 +166,9 @@ mod tests {
         let result = extract_patterns(text);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].kind, "url");
-        assert_eq!(result[0].value, "https://api.example.com/v1/search?q=rust&page=1");
+        assert_eq!(
+            result[0].value,
+            "https://api.example.com/v1/search?q=rust&page=1"
+        );
     }
 }

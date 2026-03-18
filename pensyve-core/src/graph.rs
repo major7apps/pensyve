@@ -71,12 +71,12 @@ impl MemoryGraph {
             }
             // Visit all outgoing neighbours.
             for neighbor in self.graph.neighbors(current) {
-                if !visited.contains_key(&neighbor) {
+                if let std::collections::hash_map::Entry::Vacant(e) = visited.entry(neighbor) {
                     let next_depth = depth + 1;
-                    visited.insert(neighbor, next_depth);
+                    e.insert(next_depth);
                     queue.push_back((neighbor, next_depth));
 
-                    let score = 1.0f32 / (1.0 + next_depth as f32);
+                    let score = 1.0_f32 / (1.0 + next_depth as f32);
                     let id = self.graph[neighbor];
                     results.push((id, score));
                 }
@@ -97,9 +97,8 @@ impl MemoryGraph {
         let mut graph = MemoryGraph::new();
 
         // Load all entities in the namespace.
-        let entities = match storage.list_entities_by_namespace(namespace_id) {
-            Ok(e) => e,
-            Err(_) => return graph,
+        let Ok(entities) = storage.list_entities_by_namespace(namespace_id) else {
+            return graph;
         };
 
         for entity in &entities {
@@ -173,7 +172,10 @@ mod tests {
 
         let b_score = results.iter().find(|(id, _)| *id == b).unwrap().1;
         let c_score = results.iter().find(|(id, _)| *id == c).unwrap().1;
-        assert!(b_score > c_score, "b (depth 1) should score higher than c (depth 2)");
+        assert!(
+            b_score > c_score,
+            "b (depth 1) should score higher than c (depth 2)"
+        );
     }
 
     #[test]
@@ -242,7 +244,7 @@ mod tests {
     #[test]
     fn test_graph_build_from_storage() {
         use crate::storage::sqlite::SqliteBackend;
-        use crate::types::{Entity, EntityKind, EpisodicMemory, Episode, Namespace};
+        use crate::types::{Entity, EntityKind, Episode, EpisodicMemory, Namespace};
 
         let dir = tempfile::tempdir().unwrap();
         let storage = SqliteBackend::open(dir.path()).unwrap();
