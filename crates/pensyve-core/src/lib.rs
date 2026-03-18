@@ -4,6 +4,7 @@ pub mod config;
 pub mod embedding;
 pub mod storage;
 pub mod types;
+pub mod vector;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
