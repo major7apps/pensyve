@@ -1,6 +1,6 @@
 # Pensyve Progress Tracker
 
-*Session: March 18, 2026*
+*Last updated: March 18, 2026*
 
 ## Phase 1: Core Engine — COMPLETE
 
@@ -33,6 +33,52 @@
 | 20 | REST API (FastAPI, 8 endpoints) | Done | `6ffc487` | 5 |
 | 21 | Benchmark harness (synthetic, 50 conversations) | Done | `f6d8870` | — |
 
+## Phase 3: Quality & Scale — COMPLETE
+
+| # | Task | Status | Track | Tests Added |
+|---|------|--------|-------|-------------|
+| 22 | REST API bug fixes (UUID episodes, memories_created, consolidate stub) | Done | T1.4 | 2 |
+| 23 | Intent scoring (Question/Action/Recall/General heuristics) | Done | T1.5 | 6 |
+| 24 | LongMemEval_S benchmark infrastructure | Done | T1.1 | 11 |
+| 25 | Weight tuning script (differential evolution) | Done | T1.2 | — |
+| 26 | Tier 2 extraction wired into REST API | Done | T1.3 | 2 |
+| 27 | Postgres storage backend (feature-gated) | Done | T3.1 | — |
+| 28 | REST API hardening (auth, stats, inspect, CORS, pagination) | Done | T3.2 | 15 |
+| 29 | Multimodal ContentType enum | Done | T3.3 | 8 |
+| 30 | Memory mesh RBAC module | Done | T3.4 | 10 |
+| 31 | Observability (metrics, tracing, Prometheus) | Done | T3.5 | 7 |
+
+## Phase 4: Claude Code Plugin — COMPLETE
+
+| # | Task | Status | Track |
+|---|------|--------|-------|
+| 32 | Plugin scaffold + MCP integration | Done | T2.1 |
+| 33 | 6 slash commands (remember, recall, forget, inspect, consolidate, memory-status) | Done | T2.2 |
+| 34 | 4 skills (session-memory, memory-informed-refactor, context-loader, memory-review) | Done | T2.3 |
+| 35 | 2 agents (memory-curator, context-researcher) | Done | T2.4 |
+| 36 | 4 hooks (SessionStart, Stop, PreCompact, UserPromptSubmit) | Done | T2.5 |
+| 37 | Marketplace packaging + README | Done | T2.6 |
+
+## Phase 5: SDK & Ecosystem — COMPLETE
+
+| # | Task | Status | Track | Tests Added |
+|---|------|--------|-------|-------------|
+| 38 | TypeScript SDK completion (bug fix, timeout/retry, PensyveError) | Done | T4.1 | 36 |
+| 39 | Go SDK (HTTP client, context-aware) | Done | T4.2 | 17 |
+| 40 | WASM build (standalone, in-memory) | Done | T4.3 | 5 |
+| 41 | VS Code extension (sidebar, commands, status bar) | Done | T4.4 | — |
+| 42 | Framework integrations (LangChain, CrewAI, OpenClaw, Autogen) | Done | T4.5 | — |
+
+## Phase 6: Infrastructure & Deployment — COMPLETE
+
+| # | Task | Status | Track | Notes |
+|---|------|--------|-------|-------|
+| 43 | Secrets hardening (.gitignore, gitleaks, .env.example) | Done | T5.3 | — |
+| 44 | OpenTofu infrastructure (8 AWS modules) | Done | T5.1 | In pensyve-infra repo |
+| 45 | Website scaffold (Astro + Tailwind) | Done | T5.4 | — |
+| 46 | Dockerfile + CI/CD workflow | Done | T5.2 | — |
+| 47 | Billing module (tier limits, usage tracking) | Done | T5.5 | 18 |
+
 ## Infrastructure & Tooling
 
 | Task | Status | Commit |
@@ -48,25 +94,30 @@
 
 | Ecosystem | Tests | Passing | Ignored |
 |-----------|-------|---------|---------|
-| Rust | 97 | 97 | 6 (need model download) |
-| Python | 46 | 46 | 0 |
-| TypeScript | 2 | 2 | 0 |
-| **Total** | **145** | **145** | **6** |
+| Rust | 127 | 127 | 6 (need model download) |
+| Python | 92 | 92 | 0 |
+| TypeScript | 38 | 38 | 0 |
+| Go | 17 | 17 | 0 |
+| WASM | 5 | 5 | 0 |
+| **Total** | **279** | **279** | **6** |
 
 ## Benchmark Results
 
 | Benchmark | Score | Date | Notes |
 |-----------|-------|------|-------|
 | Synthetic (50 conv, 150 queries) | 28% | 2026-03-18 | Mock embeddings, untuned weights |
-| Synthetic (real ONNX) | TBD | — | Next step |
-| LongMemEval_S | TBD | — | Phase 3 target: 80%+ |
+| LongMemEval_S (builtin, 16 queries) | 87.5% | 2026-03-18 | Real ONNX, intent scoring |
+| LongMemEval_S (full dataset) | TBD | — | Need to download full dataset |
 
-## Phase 3 Next Steps
+## Repository Structure
 
-1. Run benchmark with real ONNX embeddings
-2. Tune fusion weights on LongMemEval_S dev set
-3. Wire Tier 2 extraction into episode processing
-4. Integrate LongMemEval_S dataset
-5. Multimodal memory (images, code)
-6. Memory mesh (namespace RBAC)
-7. Observability (retrieval traces)
+| Repo | Visibility | Purpose |
+|------|-----------|---------|
+| `pensyve` | Public | Core engine, SDKs, plugin, website, CI |
+| `pensyve-infra` | Private | OpenTofu modules, deploy workflows, billing infra |
+
+## Project Stats
+
+- **74 commits** across 47 tasks
+- **11 subprojects**: pensyve-core, pensyve-python, pensyve-mcp, pensyve-cli, pensyve-ts, pensyve-go, pensyve-wasm, pensyve-vscode, pensyve-plugin, website, integrations
+- **279 tests** across 5 languages (Rust, Python, TypeScript, Go, Rust/WASM)
