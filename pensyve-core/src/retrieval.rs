@@ -16,6 +16,135 @@ use crate::vector::VectorIndex;
 type CandidateMaps = (HashMap<Uuid, Memory>, HashMap<Uuid, f32>);
 
 // ---------------------------------------------------------------------------
+// Query Intent
+// ---------------------------------------------------------------------------
+
+/// Classified intent of a user query, used to boost memory types that are
+/// most relevant for the kind of question being asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryIntent {
+    /// The user is asking a factual or informational question.
+    Question,
+    /// The user wants to perform an action or needs procedural guidance.
+    Action,
+    /// The user is trying to remember something specific.
+    Recall,
+    /// General / unclear intent.
+    General,
+}
+
+/// Recall keywords — specific memory-retrieval cues that often co-occur with
+/// question words like "what" or "do", so they are checked first.
+const RECALL_KEYWORDS: &[&str] = &[
+    "remember",
+    "recall",
+    "told me",
+    "said that",
+    "mentioned",
+    "last time",
+    "previously",
+    "earlier",
+    "before",
+    "history",
+    "past ",
+    "talked about",
+    "discussed",
+    "you said",
+    "i said",
+    "we discussed",
+];
+
+/// Action keywords — imperative verbs and procedural cues.
+const ACTION_KEYWORDS: &[&str] = &[
+    "how do i",
+    "how to",
+    "steps to",
+    "run ",
+    "execute",
+    "deploy",
+    "install",
+    "build ",
+    "create ",
+    "fix ",
+    "solve",
+    "implement",
+    "configure",
+    "setup",
+    "set up",
+    "start ",
+    "stop ",
+    "restart",
+    "update ",
+    "upgrade",
+    "debug",
+    "troubleshoot",
+];
+
+/// Question keywords — interrogative patterns.
+const QUESTION_KEYWORDS: &[&str] = &[
+    "what ", "what's", "who ", "who's", "where ", "where's", "when ", "when's", "why ", "which ",
+    "is it", "are there", "does ", "do ", "can ", "could ", "should ", "would ", "will ", "?",
+];
+
+/// Classify the intent of a query using keyword pattern matching.
+///
+/// The classifier checks for keywords in priority order: Recall cues first
+/// (most specific, often co-occur with question words), then Action keywords,
+/// then Question words. If none match, returns `General`.
+pub fn classify_intent(query: &str) -> QueryIntent {
+    let lower = query.to_lowercase();
+
+    for kw in RECALL_KEYWORDS {
+        if lower.contains(kw) {
+            return QueryIntent::Recall;
+        }
+    }
+
+    for kw in ACTION_KEYWORDS {
+        if lower.contains(kw) {
+            return QueryIntent::Action;
+        }
+    }
+
+    for kw in QUESTION_KEYWORDS {
+        if lower.contains(kw) {
+            return QueryIntent::Question;
+        }
+    }
+
+    QueryIntent::General
+}
+
+/// Return an intent-based score for a given memory type.
+///
+/// This biases retrieval toward memory types that best match the query intent.
+/// For example, Action queries strongly favor procedural memories, while
+/// Question queries favor episodic and semantic memories.
+pub fn intent_score_for_type(intent: &QueryIntent, memory_type: &str) -> f32 {
+    match intent {
+        QueryIntent::Question => match memory_type {
+            "episodic" => 0.8,
+            "semantic" => 0.6,
+            "procedural" => 0.2,
+            _ => 0.5,
+        },
+        QueryIntent::Action => match memory_type {
+            "procedural" => 0.9,
+            "semantic" => 0.3,
+            "episodic" => 0.1,
+            _ => 0.5,
+        },
+        QueryIntent::Recall => match memory_type {
+            "semantic" => 0.8,
+            "episodic" => 0.6,
+            "procedural" => 0.3,
+            _ => 0.5,
+        },
+        QueryIntent::General => 0.5,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
 
@@ -160,6 +289,9 @@ impl<'a> RecallEngine<'a> {
         // Step 5: Normalize BM25 scores (positional rank).
         let bm25_map = self.build_bm25_map(query, namespace_id, max_candidates)?;
 
+        // Classify query intent for intent-based scoring.
+        let intent = classify_intent(query);
+
         // Step 6: Scoring signals.
         let max_access = candidates
             .values()
@@ -187,6 +319,7 @@ impl<'a> RecallEngine<'a> {
                     &vector_map,
                     &bm25_map,
                     &graph_map,
+                    &intent,
                     max_access,
                     now,
                     weights,
@@ -291,12 +424,14 @@ impl<'a> RecallEngine<'a> {
 }
 
 /// Score a single candidate using all fusion signals.
+#[allow(clippy::too_many_arguments)]
 fn score_candidate(
     id: Uuid,
     memory: Memory,
     vector_map: &HashMap<Uuid, f32>,
     bm25_map: &HashMap<Uuid, f32>,
     graph_map: &HashMap<Uuid, f32>,
+    intent: &QueryIntent,
     max_access: u32,
     now: chrono::DateTime<Utc>,
     weights: &[f32; 8],
@@ -340,7 +475,12 @@ fn score_candidate(
     };
     let graph_score = direct.max(entity_linked);
 
-    let intent_score = 0.0_f32;
+    let memory_type_str = match &memory {
+        Memory::Episodic(_) => "episodic",
+        Memory::Semantic(_) => "semantic",
+        Memory::Procedural(_) => "procedural",
+    };
+    let intent_score = intent_score_for_type(intent, memory_type_str);
     let type_boost = 1.0_f32;
 
     // weights[0]=vector, [1]=bm25, [2]=graph, [3]=intent,
@@ -417,7 +557,7 @@ mod tests {
     use crate::vector::VectorIndex;
 
     /// Default weights: [vector, bm25, graph, intent, recency, access, confidence, type_boost]
-    const TEST_WEIGHTS: [f32; 8] = [0.25, 0.10, 0.15, 0.0, 0.20, 0.10, 0.10, 0.10];
+    const TEST_WEIGHTS: [f32; 8] = [0.25, 0.10, 0.15, 0.05, 0.20, 0.10, 0.10, 0.05];
 
     fn test_config() -> RetrievalConfig {
         RetrievalConfig {
@@ -620,6 +760,96 @@ mod tests {
         assert!(
             updated_access > initial_access,
             "access_count should increase after retrieval (was {initial_access}, now {updated_access})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Intent classification and scoring tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_intent_question() {
+        assert_eq!(classify_intent("What is Rust?"), QueryIntent::Question);
+        assert_eq!(
+            classify_intent("Who wrote this library?"),
+            QueryIntent::Question
+        );
+        assert_eq!(
+            classify_intent("Where is the config file?"),
+            QueryIntent::Question
+        );
+    }
+
+    #[test]
+    fn test_classify_intent_action() {
+        assert_eq!(
+            classify_intent("How to build the project"),
+            QueryIntent::Action
+        );
+        assert_eq!(
+            classify_intent("Deploy the application to prod"),
+            QueryIntent::Action
+        );
+        assert_eq!(
+            classify_intent("Fix the broken test"),
+            QueryIntent::Action
+        );
+    }
+
+    #[test]
+    fn test_classify_intent_recall() {
+        assert_eq!(
+            classify_intent("Do you remember our talk?"),
+            QueryIntent::Recall
+        );
+        assert_eq!(
+            classify_intent("What did we discuss last time?"),
+            QueryIntent::Recall
+        );
+        assert_eq!(
+            classify_intent("You mentioned something previously"),
+            QueryIntent::Recall
+        );
+    }
+
+    #[test]
+    fn test_classify_intent_general() {
+        assert_eq!(classify_intent("Rust"), QueryIntent::General);
+        assert_eq!(classify_intent("hello world"), QueryIntent::General);
+        assert_eq!(classify_intent("pensyve core"), QueryIntent::General);
+    }
+
+    #[test]
+    fn test_intent_score_question_favors_episodic() {
+        let q_episodic = intent_score_for_type(&QueryIntent::Question, "episodic");
+        let q_semantic = intent_score_for_type(&QueryIntent::Question, "semantic");
+        let q_procedural = intent_score_for_type(&QueryIntent::Question, "procedural");
+        assert!(
+            q_episodic > q_semantic,
+            "Question should favor episodic over semantic"
+        );
+        assert!(
+            q_semantic > q_procedural,
+            "Question should favor semantic over procedural"
+        );
+    }
+
+    #[test]
+    fn test_intent_score_action_favors_procedural() {
+        let a_procedural = intent_score_for_type(&QueryIntent::Action, "procedural");
+        let a_semantic = intent_score_for_type(&QueryIntent::Action, "semantic");
+        let a_episodic = intent_score_for_type(&QueryIntent::Action, "episodic");
+        assert!(
+            a_procedural > a_semantic,
+            "Action should favor procedural over semantic"
+        );
+        assert!(
+            a_semantic > a_episodic,
+            "Action should favor semantic over episodic"
+        );
+        assert!(
+            (a_procedural - 0.9).abs() < f32::EPSILON,
+            "Action+procedural should be 0.9"
         );
     }
 
