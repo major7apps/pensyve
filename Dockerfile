@@ -1,5 +1,5 @@
 # Stage 1: Build Rust binaries
-FROM rust:1.85-bookworm AS rust-builder
+FROM rust:bookworm AS rust-builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY pensyve-core/ pensyve-core/
@@ -9,7 +9,7 @@ COPY pensyve-cli/ pensyve-cli/
 RUN cargo build --release -p pensyve-mcp -p pensyve-cli
 
 # Stage 2: Build Python wheel
-FROM rust:1.85-bookworm AS python-builder
+FROM rust:bookworm AS python-builder
 RUN apt-get update && apt-get install -y python3 python3-pip python3-venv && rm -rf /var/lib/apt/lists/*
 RUN pip3 install --break-system-packages maturin
 WORKDIR /build
