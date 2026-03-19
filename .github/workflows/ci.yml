@@ -24,12 +24,13 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Cargo clippy
         run: cargo clippy --workspace -- -D warnings
+      - uses: astral-sh/setup-uv@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Python lint
         run: |
-          pip install ruff pyright
+          uv pip install --system ruff pyright
           ruff check pensyve_server/ tests/
           ruff check benchmarks/ || true
 
@@ -48,12 +49,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install dependencies
         run: |
-          pip install uv
           uv venv .venv
           . .venv/bin/activate
           uv pip install -e ".[dev]"
