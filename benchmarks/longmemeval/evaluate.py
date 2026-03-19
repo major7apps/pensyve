@@ -10,9 +10,8 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 
-from benchmarks.longmemeval.dataset import MemEvalDataset, MemEvalQuery
-
 import pensyve
+from benchmarks.longmemeval.dataset import MemEvalDataset, MemEvalQuery
 
 
 @dataclass
@@ -77,6 +76,7 @@ def evaluate(
     finally:
         if tmp_dir is not None:
             import shutil
+
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 

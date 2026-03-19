@@ -46,7 +46,9 @@ app.add_middleware(
 
 # Global Pensyve instance
 _pensyve = None
-_episodes: dict[str, dict] = {}  # episode_id -> {"ep": Episode, "message_count": int, "created_at": float}
+_episodes: dict[
+    str, dict
+] = {}  # episode_id -> {"ep": Episode, "message_count": int, "created_at": float}
 _EPISODE_TTL_SECONDS = 1800  # 30 minutes
 
 # Tier 2 extraction (gated by env var)

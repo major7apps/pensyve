@@ -94,7 +94,7 @@ def _rust_prometheus_text() -> str:
         import pensyve._core as core  # type: ignore[import-not-found]
 
         if hasattr(core, "prometheus_metrics"):
-            return core.prometheus_metrics()
+            return core.prometheus_metrics()  # type: ignore[attr-defined]
     except (ImportError, AttributeError):
         pass
     return ""

@@ -21,26 +21,63 @@ use super::{StorageResult, StorageTrait};
 // ---------------------------------------------------------------------------
 
 type EpisodicRow = (
-    Uuid, Uuid, Uuid, Uuid, Uuid, String,
-    Option<String>, Option<String>, Option<String>,
-    DateTime<Utc>, f32, f32, i32, Option<DateTime<Utc>>,
+    Uuid,
+    Uuid,
+    Uuid,
+    Uuid,
+    Uuid,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    DateTime<Utc>,
+    f32,
+    f32,
+    i32,
+    Option<DateTime<Utc>>,
 );
 
 type SemanticRow = (
-    Uuid, Uuid, Uuid, String, String, Option<Uuid>, f32,
-    DateTime<Utc>, Option<DateTime<Utc>>, serde_json::Value,
-    Option<String>, f32, f32,
+    Uuid,
+    Uuid,
+    Uuid,
+    String,
+    String,
+    Option<Uuid>,
+    f32,
+    DateTime<Utc>,
+    Option<DateTime<Utc>>,
+    serde_json::Value,
+    Option<String>,
+    f32,
+    f32,
 );
 
 type ProceduralRow = (
-    Uuid, Uuid, String, String, String, serde_json::Value, f32,
-    i32, i32, serde_json::Value, Option<String>,
-    DateTime<Utc>, Option<DateTime<Utc>>,
+    Uuid,
+    Uuid,
+    String,
+    String,
+    String,
+    serde_json::Value,
+    f32,
+    i32,
+    i32,
+    serde_json::Value,
+    Option<String>,
+    DateTime<Utc>,
+    Option<DateTime<Utc>>,
 );
 
 type EdgeRow = (
-    Uuid, Uuid, Uuid, String, f32,
-    DateTime<Utc>, Option<DateTime<Utc>>, serde_json::Value,
+    Uuid,
+    Uuid,
+    Uuid,
+    String,
+    f32,
+    DateTime<Utc>,
+    Option<DateTime<Utc>>,
+    serde_json::Value,
 );
 
 // ---------------------------------------------------------------------------
@@ -85,7 +122,10 @@ impl PostgresBackend {
 
     fn run_schema(&self) -> StorageResult<()> {
         self.rt.block_on(async {
-            self.pool.execute(raw_sql(SCHEMA)).await.map_err(sqlx_to_io)?;
+            self.pool
+                .execute(raw_sql(SCHEMA))
+                .await
+                .map_err(sqlx_to_io)?;
             Ok(())
         })
     }
@@ -916,9 +956,20 @@ impl StorageTrait for PostgresBackend {
 
 fn row_to_episodic(row: EpisodicRow) -> EpisodicMemory {
     let (
-        id, namespace_id, episode_id, source_entity, about_entity, content,
-        summary, embedding_text, context_intent,
-        timestamp, stability, retrievability, access_count, last_accessed,
+        id,
+        namespace_id,
+        episode_id,
+        source_entity,
+        about_entity,
+        content,
+        summary,
+        embedding_text,
+        context_intent,
+        timestamp,
+        stability,
+        retrievability,
+        access_count,
+        last_accessed,
     ) = row;
     EpisodicMemory {
         id,
@@ -940,9 +991,19 @@ fn row_to_episodic(row: EpisodicRow) -> EpisodicMemory {
 
 fn row_to_semantic(row: SemanticRow) -> SemanticMemory {
     let (
-        id, namespace_id, subject, predicate, object, object_entity, confidence,
-        valid_at, invalid_at, source_episodes_json,
-        embedding_text, stability, retrievability,
+        id,
+        namespace_id,
+        subject,
+        predicate,
+        object,
+        object_entity,
+        confidence,
+        valid_at,
+        invalid_at,
+        source_episodes_json,
+        embedding_text,
+        stability,
+        retrievability,
     ) = row;
     let source_episodes: Vec<Uuid> =
         serde_json::from_value(source_episodes_json).unwrap_or_default();
@@ -965,9 +1026,19 @@ fn row_to_semantic(row: SemanticRow) -> SemanticMemory {
 
 fn row_to_procedural(row: ProceduralRow) -> ProceduralMemory {
     let (
-        id, namespace_id, trigger, action, outcome_str, context_json, reliability,
-        trial_count, success_count, source_episodes_json, embedding_text,
-        created_at, last_used,
+        id,
+        namespace_id,
+        trigger,
+        action,
+        outcome_str,
+        context_json,
+        reliability,
+        trial_count,
+        success_count,
+        source_episodes_json,
+        embedding_text,
+        created_at,
+        last_used,
     ) = row;
     let context: HashMap<String, serde_json::Value> =
         serde_json::from_value(context_json).unwrap_or_default();
