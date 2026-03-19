@@ -30,9 +30,9 @@ jobs:
           python-version: "3.12"
       - name: Python lint
         run: |
-          uv pip install --system ruff pyright
-          ruff check pensyve_server/ tests/
-          ruff check benchmarks/ || true
+          uv sync --extra dev
+          uv run ruff check pensyve_server/ tests/
+          uv run ruff check benchmarks/ || true
 
   test-rust:
     name: Rust Tests
@@ -55,14 +55,10 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: |
-          uv venv .venv
-          . .venv/bin/activate
-          uv pip install -e ".[dev]"
-          maturin develop --manifest-path pensyve-python/Cargo.toml
+          uv sync --extra dev
+          uv run maturin develop --manifest-path pensyve-python/Cargo.toml
       - name: Run tests
-        run: |
-          . .venv/bin/activate
-          pytest tests/python/ -v
+        run: uv run pytest tests/python/ -v
 
   test-typescript:
     name: TypeScript Tests

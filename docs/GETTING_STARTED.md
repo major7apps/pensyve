@@ -12,16 +12,14 @@
 # Clone
 git clone <repo-url> pensyve && cd pensyve
 
-# Set up Python virtualenv with uv
-uv venv .venv
-source .venv/bin/activate
-uv pip install -e ".[dev]"
+# Install Python deps (creates .venv automatically)
+uv sync --extra dev
 
 # Build the Python SDK
-maturin develop --manifest-path pensyve-python/Cargo.toml
+uv run maturin develop --manifest-path pensyve-python/Cargo.toml
 
 # Verify
-python -c "import pensyve; print(pensyve.__version__)"
+uv run python -c "import pensyve; print(pensyve.__version__)"
 # → 0.1.0
 ```
 
