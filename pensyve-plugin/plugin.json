@@ -1,0 +1,33 @@
+{
+  "name": "pensyve",
+  "version": "0.1.0",
+  "description": "Universal memory runtime — cross-session cognitive memory for Claude Code. Remembers decisions, patterns, and context across coding sessions.",
+  "author": "Major7 Apps",
+  "homepage": "https://pensyve.com",
+  "repository": "https://github.com/major7apps/pensyve",
+  "license": "Apache-2.0",
+  "commands": [
+    "commands/remember.md",
+    "commands/recall.md",
+    "commands/forget.md",
+    "commands/inspect.md",
+    "commands/consolidate.md",
+    "commands/memory-status.md"
+  ],
+  "skills": [
+    "skills/session-memory.md",
+    "skills/memory-informed-refactor.md",
+    "skills/context-loader.md",
+    "skills/memory-review.md"
+  ],
+  "agents": [
+    "agents/memory-curator.md",
+    "agents/context-researcher.md"
+  ],
+  "hooks": [
+    "hooks/session-start.md",
+    "hooks/stop.md",
+    "hooks/pre-compact.md",
+    "hooks/user-prompt-submit.md"
+  ]
+}
