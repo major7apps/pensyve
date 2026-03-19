@@ -48,8 +48,9 @@ const SIMILARITY_THRESHOLD: f32 = 0.8;
 impl ConsolidationEngine {
     /// Run all consolidation jobs for a namespace.
     ///
-    /// Job 1: Episodic → Semantic promotion (repeated facts)
+    /// Job 1: Episodic -> Semantic promotion (repeated facts)
     /// Job 3: FSRS decay pass
+    #[tracing::instrument(skip_all, fields(namespace_id = %namespace_id))]
     pub fn run(
         storage: &dyn StorageTrait,
         embedder: &OnnxEmbedder,

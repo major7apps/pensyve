@@ -20,6 +20,14 @@ dirs = "6"
 regex = "1"
 fastembed = "^5.12"
 petgraph = "0.8"
+tracing = "0.1"
+sqlx-core = { version = "0.8.6", features = ["_rt-tokio", "_tls-none", "json", "chrono", "uuid"], optional = true }
+sqlx-postgres = { version = "0.8.6", features = ["json", "chrono", "uuid"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+
+[features]
+default = []
+postgres = ["dep:sqlx-core", "dep:sqlx-postgres", "dep:tokio"]
 
 [dev-dependencies]
 tempfile = "3"
