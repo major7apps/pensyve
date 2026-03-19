@@ -23,7 +23,7 @@ Most AI agents lose all context between sessions. Pensyve gives them durable, in
 
 ### Prerequisites
 
-- Rust 1.85+
+- Rust 1.88+
 - Python 3.10+ with [uv](https://github.com/astral-sh/uv)
 - [Bun](https://bun.sh) (optional, for TypeScript SDK)
 - [Go 1.21+](https://go.dev) (optional, for Go SDK)
