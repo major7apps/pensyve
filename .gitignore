@@ -2,7 +2,8 @@ target/
 __pycache__/
 *.egg-info/
 dist/
-.env
+.env*
+!.env.example
 *.db
 *.db-journal
 models/
@@ -16,3 +17,44 @@ benchmarks/results/*.json
 .cargo/
 node_modules/
 pensyve-ts/dist/
+
+# --- Secrets & credentials ---
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+credentials*
+*_credentials*
+*.keystore
+service-account*.json
+
+# --- Infrastructure state ---
+terraform.tfstate*
+*.tfstate*
+*.tfvars
+*.tfvars.json
+.terraform/
+.terraform.lock.hcl
+*.tfplan
+
+# --- AWS ---
+.aws/
+aws-exports.js
+
+# --- Docker ---
+docker-compose.override.yml
+
+# --- IDE & OS ---
+.idea/
+.vscode/settings.json
+.vscode/launch.json
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Build artifacts ---
+*.whl
+*.tar.gz
