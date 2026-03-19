@@ -1,4 +1,5 @@
 import os
+import uuid
 
 from fastapi import FastAPI, HTTPException
 
@@ -27,7 +28,7 @@ app = FastAPI(
 
 # Global Pensyve instance
 _pensyve = None
-_episodes = {}  # episode_id -> Episode object
+_episodes = {}  # episode_id -> {"ep": Episode, "message_count": int}
 
 
 def get_pensyve():
@@ -52,29 +53,31 @@ def start_episode(req: EpisodeStartRequest):
     entities = [p.entity(name) for name in req.participants]
     ep = p.episode(*entities)
     ep.__enter__()
-    episode_id = str(id(ep))  # use object id as temp key
-    _episodes[episode_id] = ep
+    episode_id = str(uuid.uuid4())
+    _episodes[episode_id] = {"ep": ep, "message_count": 0}
     return EpisodeStartResponse(episode_id=episode_id)
 
 
 @app.post("/v1/episodes/message")
 def add_message(req: MessageRequest):
-    ep = _episodes.get(req.episode_id)
-    if not ep:
+    entry = _episodes.get(req.episode_id)
+    if not entry:
         raise HTTPException(404, f"Episode {req.episode_id} not found")
-    ep.message(req.role, req.content)
+    entry["ep"].message(req.role, req.content)
+    entry["message_count"] += 1
     return {"status": "ok"}
 
 
 @app.post("/v1/episodes/end", response_model=EpisodeEndResponse)
 def end_episode(req: EpisodeEndRequest):
-    ep = _episodes.pop(req.episode_id, None)
-    if not ep:
+    entry = _episodes.pop(req.episode_id, None)
+    if not entry:
         raise HTTPException(404, f"Episode {req.episode_id} not found")
+    ep = entry["ep"]
     if req.outcome:
         ep.outcome(req.outcome)
     ep.__exit__(None, None, None)
-    return EpisodeEndResponse(memories_created=1)  # approximate
+    return EpisodeEndResponse(memories_created=entry["message_count"])
 
 
 @app.post("/v1/recall", response_model=list[MemoryResponse])
