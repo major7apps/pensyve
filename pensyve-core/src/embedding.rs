@@ -79,6 +79,7 @@ impl OnnxEmbedder {
     }
 
     /// Embed a single text string.
+    #[tracing::instrument(skip_all)]
     pub fn embed(&self, text: &str) -> EmbeddingResult<Vec<f32>> {
         match &self.inner {
             EmbedderInner::Mock => Ok(mock_embed(text, self.dimensions)),
