@@ -6,6 +6,11 @@ use crate::types::{
 
 pub mod sqlite;
 
+#[cfg(feature = "postgres")]
+pub mod postgres;
+#[cfg(feature = "postgres")]
+pub use postgres::PostgresBackend;
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------

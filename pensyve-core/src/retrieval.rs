@@ -269,6 +269,7 @@ impl<'a> RecallEngine<'a> {
     }
 
     /// Like `recall`, but allows specifying a `target_entity` for graph BFS.
+    #[tracing::instrument(skip_all, fields(query, namespace_id = %namespace_id, limit))]
     pub fn recall_with_entity(
         &self,
         query: &str,
