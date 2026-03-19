@@ -5,6 +5,7 @@ Tracks API usage per namespace and enforces tier limits.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from enum import Enum
 
@@ -66,30 +67,34 @@ class UsageTracker:
 
     def __init__(self) -> None:
         self._usage: dict[str, UsageRecord] = {}
+        self._lock = threading.Lock()
 
     def record_api_call(self, namespace: str) -> None:
-        self._get_or_create(namespace).api_calls += 1
+        with self._lock:
+            self._get_or_create(namespace).api_calls += 1
 
     def record_recall(self, namespace: str) -> None:
-        record = self._get_or_create(namespace)
-        record.recalls += 1
+        with self._lock:
+            self._get_or_create(namespace).recalls += 1
 
     def record_store(self, namespace: str) -> None:
-        record = self._get_or_create(namespace)
-        record.memories_stored += 1
+        with self._lock:
+            self._get_or_create(namespace).memories_stored += 1
 
     def get_usage(self, namespace: str) -> UsageRecord:
-        return self._get_or_create(namespace)
+        with self._lock:
+            return self._get_or_create(namespace)
 
     def check_limit(self, namespace: str, tier: Tier) -> tuple[bool, str]:
         """Check if usage is within tier limits. Returns (allowed, reason)."""
-        usage = self._get_or_create(namespace)
-        limits = TIER_LIMITS[tier]
-        if usage.recalls >= limits.recalls_per_month:
-            return False, f"Monthly recall limit reached ({limits.recalls_per_month})"
-        if usage.memories_stored >= limits.max_memories:
-            return False, f"Memory limit reached ({limits.max_memories})"
-        return True, "OK"
+        with self._lock:
+            usage = self._get_or_create(namespace)
+            limits = TIER_LIMITS[tier]
+            if usage.recalls >= limits.recalls_per_month:
+                return False, f"Monthly recall limit reached ({limits.recalls_per_month})"
+            if usage.memories_stored >= limits.max_memories:
+                return False, f"Memory limit reached ({limits.max_memories})"
+            return True, "OK"
 
     def _get_or_create(self, namespace: str) -> UsageRecord:
         if namespace not in self._usage:

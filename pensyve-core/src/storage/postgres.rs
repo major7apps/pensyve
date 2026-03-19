@@ -654,11 +654,8 @@ impl StorageTrait for PostgresBackend {
         limit: usize,
     ) -> StorageResult<Vec<Memory>> {
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        // Convert the query to a tsquery-compatible format: join words with &.
-        let tsquery = query_str
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" & ");
+        // Use plainto_tsquery which handles stop words and punctuation gracefully.
+        let tsquery = query_str.to_string();
 
         self.rt.block_on(async {
             let mut memories = Vec::new();
@@ -669,8 +666,8 @@ impl StorageTrait for PostgresBackend {
                           summary, embedding::text, context_intent, timestamp, stability, retrievability,
                           access_count, last_accessed
                    FROM episodic_memories
-                   WHERE namespace_id = $1 AND fts_content @@ to_tsquery('english', $2)
-                   ORDER BY ts_rank(fts_content, to_tsquery('english', $2)) DESC
+                   WHERE namespace_id = $1 AND fts_content @@ plainto_tsquery('english', $2)
+                   ORDER BY ts_rank(fts_content, plainto_tsquery('english', $2)) DESC
                    LIMIT $3",
             )
             .bind(namespace_id)
@@ -689,8 +686,8 @@ impl StorageTrait for PostgresBackend {
                 r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
                           valid_at, invalid_at, source_episodes, embedding::text, stability, retrievability
                    FROM semantic_memories
-                   WHERE namespace_id = $1 AND fts_content @@ to_tsquery('english', $2)
-                   ORDER BY ts_rank(fts_content, to_tsquery('english', $2)) DESC
+                   WHERE namespace_id = $1 AND fts_content @@ plainto_tsquery('english', $2)
+                   ORDER BY ts_rank(fts_content, plainto_tsquery('english', $2)) DESC
                    LIMIT $3",
             )
             .bind(namespace_id)
@@ -709,8 +706,8 @@ impl StorageTrait for PostgresBackend {
                 r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
                           trial_count, success_count, source_episodes, embedding::text, created_at, last_used
                    FROM procedural_memories
-                   WHERE namespace_id = $1 AND fts_content @@ to_tsquery('english', $2)
-                   ORDER BY ts_rank(fts_content, to_tsquery('english', $2)) DESC
+                   WHERE namespace_id = $1 AND fts_content @@ plainto_tsquery('english', $2)
+                   ORDER BY ts_rank(fts_content, plainto_tsquery('english', $2)) DESC
                    LIMIT $3",
             )
             .bind(namespace_id)

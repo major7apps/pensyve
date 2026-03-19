@@ -67,10 +67,26 @@ def evaluate(
     Returns:
         An EvalReport with accuracy, hits, misses, and per-query results.
     """
+    tmp_dir = None
     if storage_path is None:
         tmp_dir = tempfile.mkdtemp(prefix="pensyve_eval_")
         storage_path = tmp_dir
 
+    try:
+        return _run_evaluation(dataset, storage_path, recall_limit, weights)
+    finally:
+        if tmp_dir is not None:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _run_evaluation(
+    dataset: MemEvalDataset,
+    storage_path: str,
+    recall_limit: int,
+    weights: list[float] | None,
+) -> EvalReport:
+    """Inner evaluation logic."""
     p = pensyve.Pensyve(path=storage_path, namespace="longmemeval")
 
     user = p.entity("eval-user", "user")
