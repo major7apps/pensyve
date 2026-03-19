@@ -1,10 +1,13 @@
+import logging
 import os
 import uuid
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
 import pensyve
 
+from .auth import require_api_key
 from .models import (
     ConsolidateResponse,
     EntityCreate,
@@ -14,21 +17,43 @@ from .models import (
     EpisodeStartRequest,
     EpisodeStartResponse,
     ForgetResponse,
+    InspectRequest,
+    InspectResponse,
     MemoryResponse,
     MessageRequest,
     RecallRequest,
+    RecallResponse,
     RememberRequest,
+    StatsResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Pensyve API",
     description="Universal memory runtime for AI agents",
     version="0.1.0",
+    dependencies=[Depends(require_api_key)],
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Global Pensyve instance
 _pensyve = None
 _episodes = {}  # episode_id -> {"ep": Episode, "message_count": int}
+
+# Tier 2 extraction (gated by env var)
+_tier2_enabled = os.environ.get("PENSYVE_TIER2_ENABLED", "false").lower() == "true"
+_extractor = None
+if _tier2_enabled:
+    from pensyve_server.extraction import Tier2Extractor
+
+    _extractor = Tier2Extractor()
 
 
 def get_pensyve():
@@ -38,6 +63,42 @@ def get_pensyve():
         namespace = os.environ.get("PENSYVE_NAMESPACE", "default")
         _pensyve = pensyve.Pensyve(path=path, namespace=namespace)
     return _pensyve
+
+
+def _memory_to_response(m) -> MemoryResponse:
+    return MemoryResponse(
+        id=m.id,
+        content=m.content,
+        memory_type=m.memory_type,
+        confidence=m.confidence,
+        stability=m.stability,
+        score=getattr(m, "score", None),
+    )
+
+
+def _apply_cursor_pagination(
+    memories: list[MemoryResponse], cursor: str | None, limit: int
+) -> tuple[list[MemoryResponse], str | None]:
+    """Apply cursor-based pagination. Cursor is a memory ID; returns items after it."""
+    if cursor:
+        # Find the cursor position and skip past it
+        found = False
+        filtered = []
+        for m in memories:
+            if found:
+                filtered.append(m)
+            elif m.id == cursor:
+                found = True
+        memories = filtered
+
+    # Apply limit + 1 to detect if there are more results
+    if len(memories) > limit:
+        next_cursor = memories[limit - 1].id
+        memories = memories[:limit]
+    else:
+        next_cursor = None
+
+    return memories, next_cursor
 
 
 @app.post("/v1/entities", response_model=EntityResponse)
@@ -80,26 +141,41 @@ def end_episode(req: EpisodeEndRequest):
     return EpisodeEndResponse(memories_created=entry["message_count"])
 
 
-@app.post("/v1/recall", response_model=list[MemoryResponse])
-def recall(req: RecallRequest):
+@app.post("/v1/recall", response_model=RecallResponse)
+def recall(req: RecallRequest, cursor: str | None = None):
     p = get_pensyve()
-    kwargs: dict[str, object] = {"limit": req.limit}
+    # Fetch extra to support pagination
+    fetch_limit = req.limit + 50  # overfetch for cursor slicing
+    kwargs: dict[str, object] = {"limit": fetch_limit}
     if req.entity:
         kwargs["entity"] = p.entity(req.entity)
     if req.types:
         kwargs["types"] = req.types
     results = p.recall(req.query, **kwargs)
-    return [
-        MemoryResponse(
-            id=m.id,
-            content=m.content,
-            memory_type=m.memory_type,
-            confidence=m.confidence,
-            stability=m.stability,
-            score=getattr(m, "score", None),
-        )
-        for m in results
-    ]
+    memories = [_memory_to_response(m) for m in results]
+
+    # Apply cursor-based pagination
+    memories, next_cursor = _apply_cursor_pagination(memories, cursor, req.limit)
+
+    # Tier 2 contradiction detection
+    contradictions: list[dict[str, str]] = []
+    if _tier2_enabled and _extractor and memories:
+        try:
+            existing_facts = [
+                {"subject": "", "predicate": "", "object": m.content}
+                for m in memories
+                if m.memory_type == "semantic"
+            ]
+            if existing_facts:
+                contradictions = _extractor.detect_contradictions(req.query, existing_facts)
+        except Exception:
+            logger.warning("Tier 2 contradiction detection failed", exc_info=True)
+
+    return RecallResponse(
+        memories=memories,
+        contradictions=contradictions,
+        cursor=next_cursor,
+    )
 
 
 @app.post("/v1/remember", response_model=MemoryResponse)
@@ -107,13 +183,18 @@ def remember(req: RememberRequest):
     p = get_pensyve()
     entity = p.entity(req.entity)
     mem = p.remember(entity=entity, fact=req.fact, confidence=req.confidence)
-    return MemoryResponse(
-        id=mem.id,
-        content=mem.content,
-        memory_type=mem.memory_type,
-        confidence=mem.confidence,
-        stability=mem.stability,
-    )
+
+    # Tier 2 fact extraction
+    if _tier2_enabled and _extractor:
+        try:
+            extracted = _extractor.extract_facts(req.fact)
+            for fact in extracted:
+                fact_text = f"{fact.subject} {fact.predicate} {fact.object}"
+                p.remember(entity=entity, fact=fact_text, confidence=fact.confidence)
+        except Exception:
+            logger.warning("Tier 2 fact extraction failed", exc_info=True)
+
+    return _memory_to_response(mem)
 
 
 @app.delete("/v1/entities/{entity_name}", response_model=ForgetResponse)
@@ -132,6 +213,60 @@ def consolidate():
         promoted=result.get("promoted", 0),
         decayed=result.get("decayed", 0),
         archived=result.get("archived", 0),
+    )
+
+
+@app.get("/v1/stats", response_model=StatsResponse)
+def get_stats():
+    p = get_pensyve()
+    namespace = os.environ.get("PENSYVE_NAMESPACE", "default")
+
+    # Count memories by type using recall with broad queries
+    episodic_count = len(p.recall("*", types=["episodic"], limit=1000))
+    semantic_count = len(p.recall("*", types=["semantic"], limit=1000))
+    procedural_count = len(p.recall("*", types=["procedural"], limit=1000))
+
+    # Estimate entity count from unique results
+    all_memories = p.recall("*", limit=1000)
+    entity_ids = set()
+    for m in all_memories:
+        # Memory objects don't expose entity_id directly, so we count unique content subjects
+        entity_ids.add(getattr(m, "entity_id", None))
+    entity_count = len(entity_ids - {None})
+
+    return StatsResponse(
+        namespace=namespace,
+        entities=entity_count,
+        episodic_memories=episodic_count,
+        semantic_memories=semantic_count,
+        procedural_memories=procedural_count,
+    )
+
+
+@app.post("/v1/inspect", response_model=InspectResponse)
+def inspect(req: InspectRequest):
+    p = get_pensyve()
+    entity = p.entity(req.entity)
+
+    # Fetch a large batch and group by type
+    fetch_limit = req.limit + 50
+    results = p.recall("*", entity=entity, limit=fetch_limit)
+    all_memories = [_memory_to_response(m) for m in results]
+
+    # Apply cursor-based pagination on the full set first
+    all_memories, next_cursor = _apply_cursor_pagination(all_memories, req.cursor, req.limit)
+
+    # Group by type
+    episodic = [m for m in all_memories if m.memory_type == "episodic"]
+    semantic = [m for m in all_memories if m.memory_type == "semantic"]
+    procedural = [m for m in all_memories if m.memory_type == "procedural"]
+
+    return InspectResponse(
+        entity=req.entity,
+        episodic=episodic,
+        semantic=semantic,
+        procedural=procedural,
+        cursor=next_cursor,
     )
 
 
