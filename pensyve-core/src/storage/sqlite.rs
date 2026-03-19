@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::types::{
-    Edge, Entity, EntityKind, Episode, EpisodicMemory, Memory, Namespace, Outcome,
+    ContentType, Edge, Entity, EntityKind, Episode, EpisodicMemory, Memory, Namespace, Outcome,
     ProceduralMemory, SemanticMemory,
 };
 
@@ -43,7 +43,53 @@ impl SqliteBackend {
     fn run_schema(&self) -> StorageResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(SCHEMA)?;
+        Self::run_migrations(&conn)?;
         Ok(())
+    }
+
+    /// Run schema migrations that add columns to existing tables.
+    /// Each migration checks whether the column already exists before altering.
+    fn run_migrations(conn: &Connection) -> StorageResult<()> {
+        // Migration: add content_type column to episodic_memories.
+        if !Self::column_exists(conn, "episodic_memories", "content_type")? {
+            conn.execute_batch(
+                "ALTER TABLE episodic_memories ADD COLUMN content_type TEXT NOT NULL DEFAULT 'text';",
+            )?;
+        }
+
+        // Migration: add content_type column to semantic_memories.
+        if !Self::column_exists(conn, "semantic_memories", "content_type")? {
+            conn.execute_batch(
+                "ALTER TABLE semantic_memories ADD COLUMN content_type TEXT NOT NULL DEFAULT 'text';",
+            )?;
+        }
+
+        // Migration: create ACL table for memory mesh RBAC.
+        conn.execute_batch(
+            r"CREATE TABLE IF NOT EXISTS acl (
+                id           TEXT PRIMARY KEY,
+                namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+                entity_id    TEXT NOT NULL REFERENCES entities(id),
+                role         TEXT NOT NULL DEFAULT 'reader',
+                granted_by   TEXT NOT NULL,
+                granted_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(namespace_id, entity_id)
+            );",
+        )?;
+
+        Ok(())
+    }
+
+    /// Check whether a column exists in a table using `PRAGMA table_info`.
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> StorageResult<bool> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for name in rows {
+            if name? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -460,10 +506,10 @@ impl StorageTrait for SqliteBackend {
         let last_accessed = opt_dt_to_str(mem.last_accessed);
         conn.execute(
             r"INSERT OR REPLACE INTO episodic_memories
-               (id, namespace_id, episode_id, source_entity, about_entity, content, summary,
-                embedding, context_intent, timestamp, stability, retrievability,
+               (id, namespace_id, episode_id, source_entity, about_entity, content, content_type,
+                summary, embedding, context_intent, timestamp, stability, retrievability,
                 access_count, last_accessed)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 mem.id.to_string(),
                 mem.namespace_id.to_string(),
@@ -471,6 +517,7 @@ impl StorageTrait for SqliteBackend {
                 mem.source_entity.to_string(),
                 mem.about_entity.to_string(),
                 mem.content,
+                mem.content_type.as_str(),
                 mem.summary,
                 embedding_blob,
                 mem.context_intent,
@@ -501,8 +548,8 @@ impl StorageTrait for SqliteBackend {
         let result = conn
             .query_row(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                          summary, embedding, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed
+                          content_type, summary, embedding, context_intent, timestamp,
+                          stability, retrievability, access_count, last_accessed
                    FROM episodic_memories WHERE id = ?1",
                 params![id.to_string()],
                 row_to_episodic,
@@ -519,8 +566,8 @@ impl StorageTrait for SqliteBackend {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                      summary, embedding, context_intent, timestamp, stability, retrievability,
-                      access_count, last_accessed
+                      content_type, summary, embedding, context_intent, timestamp,
+                      stability, retrievability, access_count, last_accessed
                FROM episodic_memories WHERE about_entity = ?1
                ORDER BY timestamp DESC LIMIT ?2",
         )?;
@@ -578,15 +625,17 @@ impl StorageTrait for SqliteBackend {
 
         conn.execute(
             r"INSERT OR REPLACE INTO semantic_memories
-               (id, namespace_id, subject, predicate, object, object_entity, confidence,
-                valid_at, invalid_at, source_episodes, embedding, stability, retrievability)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+               (id, namespace_id, subject, predicate, object, content_type, object_entity,
+                confidence, valid_at, invalid_at, source_episodes, embedding, stability,
+                retrievability)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 mem.id.to_string(),
                 mem.namespace_id.to_string(),
                 mem.subject.to_string(),
                 mem.predicate,
                 mem.object,
+                mem.content_type.as_str(),
                 object_entity,
                 f64::from(mem.confidence),
                 mem.valid_at.to_rfc3339(),
@@ -617,8 +666,9 @@ impl StorageTrait for SqliteBackend {
         let conn = self.conn.lock().unwrap();
         let result = conn
             .query_row(
-                r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
-                          valid_at, invalid_at, source_episodes, embedding, stability, retrievability
+                r"SELECT id, namespace_id, subject, predicate, object, content_type,
+                          object_entity, confidence, valid_at, invalid_at,
+                          source_episodes, embedding, stability, retrievability
                    FROM semantic_memories WHERE id = ?1",
                 params![id.to_string()],
                 row_to_semantic,
@@ -634,8 +684,9 @@ impl StorageTrait for SqliteBackend {
     ) -> StorageResult<Vec<SemanticMemory>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
-                      valid_at, invalid_at, source_episodes, embedding, stability, retrievability
+            r"SELECT id, namespace_id, subject, predicate, object, content_type,
+                      object_entity, confidence, valid_at, invalid_at,
+                      source_episodes, embedding, stability, retrievability
                FROM semantic_memories WHERE subject = ?1
                ORDER BY valid_at DESC LIMIT ?2",
         )?;
@@ -791,8 +842,8 @@ impl StorageTrait for SqliteBackend {
                     let result = conn
                         .query_row(
                             r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                                      summary, embedding, context_intent, timestamp, stability, retrievability,
-                                      access_count, last_accessed
+                                      content_type, summary, embedding, context_intent, timestamp,
+                                      stability, retrievability, access_count, last_accessed
                                FROM episodic_memories WHERE id = ?1",
                             params![id.to_string()],
                             row_to_episodic,
@@ -805,8 +856,9 @@ impl StorageTrait for SqliteBackend {
                 "semantic" => {
                     let result = conn
                         .query_row(
-                            r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
-                                      valid_at, invalid_at, source_episodes, embedding, stability, retrievability
+                            r"SELECT id, namespace_id, subject, predicate, object, content_type,
+                                      object_entity, confidence, valid_at, invalid_at,
+                                      source_episodes, embedding, stability, retrievability
                                FROM semantic_memories WHERE id = ?1",
                             params![id.to_string()],
                             row_to_semantic,
@@ -849,8 +901,8 @@ impl StorageTrait for SqliteBackend {
         {
             let mut stmt = conn.prepare(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                          summary, embedding, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed
+                          content_type, summary, embedding, context_intent, timestamp,
+                          stability, retrievability, access_count, last_accessed
                    FROM episodic_memories WHERE namespace_id = ?1",
             )?;
             let rows = stmt.query_map(params![&ns_str], row_to_episodic)?;
@@ -862,8 +914,9 @@ impl StorageTrait for SqliteBackend {
         // Semantic
         {
             let mut stmt = conn.prepare(
-                r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
-                          valid_at, invalid_at, source_episodes, embedding, stability, retrievability
+                r"SELECT id, namespace_id, subject, predicate, object, content_type,
+                          object_entity, confidence, valid_at, invalid_at,
+                          source_episodes, embedding, stability, retrievability
                    FROM semantic_memories WHERE namespace_id = ?1",
             )?;
             let rows = stmt.query_map(params![&ns_str], row_to_semantic)?;
@@ -1093,14 +1146,15 @@ fn row_to_episodic(
     let src_str: String = row.get(3)?;
     let about_str: String = row.get(4)?;
     let content: String = row.get(5)?;
-    let summary: Option<String> = row.get(6)?;
-    let embedding_bytes: Option<Vec<u8>> = row.get(7)?;
-    let context_intent: Option<String> = row.get(8)?;
-    let timestamp_str: String = row.get(9)?;
-    let stability: f64 = row.get(10)?;
-    let retrievability: f64 = row.get(11)?;
-    let access_count: u32 = row.get(12)?;
-    let last_accessed_str: Option<String> = row.get(13)?;
+    let content_type_str: String = row.get(6)?;
+    let summary: Option<String> = row.get(7)?;
+    let embedding_bytes: Option<Vec<u8>> = row.get(8)?;
+    let context_intent: Option<String> = row.get(9)?;
+    let timestamp_str: String = row.get(10)?;
+    let stability: f64 = row.get(11)?;
+    let retrievability: f64 = row.get(12)?;
+    let access_count: u32 = row.get(13)?;
+    let last_accessed_str: Option<String> = row.get(14)?;
 
     Ok(Ok(EpisodicMemory {
         id: Uuid::parse_str(&id_str).unwrap_or_default(),
@@ -1109,6 +1163,7 @@ fn row_to_episodic(
         source_entity: Uuid::parse_str(&src_str).unwrap_or_default(),
         about_entity: Uuid::parse_str(&about_str).unwrap_or_default(),
         content,
+        content_type: ContentType::from_str(&content_type_str),
         summary,
         embedding: embedding_bytes
             .as_deref()
@@ -1131,14 +1186,15 @@ fn row_to_semantic(
     let subject_str: String = row.get(2)?;
     let predicate: String = row.get(3)?;
     let object: String = row.get(4)?;
-    let object_entity_str: Option<String> = row.get(5)?;
-    let confidence: f64 = row.get(6)?;
-    let valid_at_str: String = row.get(7)?;
-    let invalid_at_str: Option<String> = row.get(8)?;
-    let source_episodes_str: String = row.get(9)?;
-    let embedding_bytes: Option<Vec<u8>> = row.get(10)?;
-    let stability: f64 = row.get(11)?;
-    let retrievability: f64 = row.get(12)?;
+    let content_type_str: String = row.get(5)?;
+    let object_entity_str: Option<String> = row.get(6)?;
+    let confidence: f64 = row.get(7)?;
+    let valid_at_str: String = row.get(8)?;
+    let invalid_at_str: Option<String> = row.get(9)?;
+    let source_episodes_str: String = row.get(10)?;
+    let embedding_bytes: Option<Vec<u8>> = row.get(11)?;
+    let stability: f64 = row.get(12)?;
+    let retrievability: f64 = row.get(13)?;
 
     Ok(Ok(SemanticMemory {
         id: Uuid::parse_str(&id_str).unwrap_or_default(),
@@ -1146,6 +1202,7 @@ fn row_to_semantic(
         subject: Uuid::parse_str(&subject_str).unwrap_or_default(),
         predicate,
         object,
+        content_type: ContentType::from_str(&content_type_str),
         object_entity: object_entity_str
             .as_deref()
             .and_then(|s| Uuid::parse_str(s).ok()),
@@ -1664,5 +1721,74 @@ mod tests {
         for (a, b) in original.iter().zip(recovered.iter()) {
             assert!((a - b).abs() < f32::EPSILON, "mismatch: {a} vs {b}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Content type tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_episodic_content_type_roundtrip() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+
+        let mut mem = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "fn main() { println!(\"hello\"); }",
+        );
+        mem.content_type = ContentType::Code;
+        db.save_episodic(&mem).unwrap();
+
+        let fetched = db.get_episodic(mem.id).unwrap().unwrap();
+        assert_eq!(fetched.content_type, ContentType::Code);
+    }
+
+    #[test]
+    fn test_semantic_content_type_roundtrip() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+
+        let mut mem = SemanticMemory::new(ns.id, Uuid::new_v4(), "produces", "image output", 0.85);
+        mem.content_type = ContentType::Image;
+        db.save_semantic(&mem).unwrap();
+
+        let fetched = db.get_semantic(mem.id).unwrap().unwrap();
+        assert_eq!(fetched.content_type, ContentType::Image);
+    }
+
+    #[test]
+    fn test_episodic_default_content_type_text() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+
+        let mem = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "plain text memory",
+        );
+        db.save_episodic(&mem).unwrap();
+
+        let fetched = db.get_episodic(mem.id).unwrap().unwrap();
+        assert_eq!(fetched.content_type, ContentType::Text);
+    }
+
+    // -----------------------------------------------------------------------
+    // ACL table creation test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_acl_table_exists() {
+        let (_dir, db) = setup();
+        let conn = db.conn.lock().unwrap();
+        // Verify the ACL table was created by running a simple query.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM acl", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }
