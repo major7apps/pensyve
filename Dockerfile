@@ -16,7 +16,7 @@ ENV UV_LINK_MODE=copy
 WORKDIR /build
 RUN uv venv /opt/venv
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --python /opt/venv/bin/python maturin
+    uv pip install --python /opt/venv/bin/python "maturin[patchelf]"
 COPY Cargo.toml Cargo.lock ./
 COPY pensyve-core/ pensyve-core/
 COPY pensyve-python/ pensyve-python/
