@@ -1,3 +1,4 @@
+import hmac
 import os
 
 from fastapi import HTTPException, Request
@@ -10,6 +11,7 @@ async def require_api_key(request: Request):
     if not PENSYVE_API_KEYS:
         return  # Auth disabled
     key = request.headers.get("X-Pensyve-Key", "")
-    valid_keys = {k.strip() for k in PENSYVE_API_KEYS.split(",") if k.strip()}
-    if key not in valid_keys:
+    valid_keys = [k.strip() for k in PENSYVE_API_KEYS.split(",") if k.strip()]
+    key_bytes = key.encode()
+    if not any(hmac.compare_digest(key_bytes, k.encode()) for k in valid_keys):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")

@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 import uuid
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -45,7 +46,8 @@ app.add_middleware(
 
 # Global Pensyve instance
 _pensyve = None
-_episodes = {}  # episode_id -> {"ep": Episode, "message_count": int}
+_episodes: dict[str, dict] = {}  # episode_id -> {"ep": Episode, "message_count": int, "created_at": float}
+_EPISODE_TTL_SECONDS = 1800  # 30 minutes
 
 # Tier 2 extraction (gated by env var)
 _tier2_enabled = os.environ.get("PENSYVE_TIER2_ENABLED", "false").lower() == "true"
@@ -63,6 +65,19 @@ def get_pensyve():
         namespace = os.environ.get("PENSYVE_NAMESPACE", "default")
         _pensyve = pensyve.Pensyve(path=path, namespace=namespace)
     return _pensyve
+
+
+def _sweep_stale_episodes():
+    """Remove episodes older than TTL to prevent memory leaks."""
+    now = time.time()
+    stale = [eid for eid, e in _episodes.items() if now - e["created_at"] > _EPISODE_TTL_SECONDS]
+    for eid in stale:
+        entry = _episodes.pop(eid, None)
+        if entry:
+            try:
+                entry["ep"].__exit__(None, None, None)
+            except Exception:
+                logger.warning("Failed to close stale episode %s", eid, exc_info=True)
 
 
 def _memory_to_response(m) -> MemoryResponse:
@@ -115,7 +130,9 @@ def start_episode(req: EpisodeStartRequest):
     ep = p.episode(*entities)
     ep.__enter__()
     episode_id = str(uuid.uuid4())
-    _episodes[episode_id] = {"ep": ep, "message_count": 0}
+    _episodes[episode_id] = {"ep": ep, "message_count": 0, "created_at": time.time()}
+    # Sweep stale episodes
+    _sweep_stale_episodes()
     return EpisodeStartResponse(episode_id=episode_id)
 
 
@@ -221,22 +238,15 @@ def get_stats():
     p = get_pensyve()
     namespace = os.environ.get("PENSYVE_NAMESPACE", "default")
 
-    # Count memories by type using recall with broad queries
-    episodic_count = len(p.recall("*", types=["episodic"], limit=1000))
-    semantic_count = len(p.recall("*", types=["semantic"], limit=1000))
-    procedural_count = len(p.recall("*", types=["procedural"], limit=1000))
-
-    # Estimate entity count from unique results
+    # Single broad recall, then group client-side
     all_memories = p.recall("*", limit=1000)
-    entity_ids = set()
-    for m in all_memories:
-        # Memory objects don't expose entity_id directly, so we count unique content subjects
-        entity_ids.add(getattr(m, "entity_id", None))
-    entity_count = len(entity_ids - {None})
+    episodic_count = sum(1 for m in all_memories if m.memory_type == "episodic")
+    semantic_count = sum(1 for m in all_memories if m.memory_type == "semantic")
+    procedural_count = sum(1 for m in all_memories if m.memory_type == "procedural")
 
     return StatsResponse(
         namespace=namespace,
-        entities=entity_count,
+        entities=0,  # Not available via SDK — requires storage-level count query
         episodic_memories=episodic_count,
         semantic_memories=semantic_count,
         procedural_memories=procedural_count,

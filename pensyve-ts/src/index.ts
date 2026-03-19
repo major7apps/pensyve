@@ -253,7 +253,8 @@ export class Pensyve {
       },
       "Recall",
     );
-    return camelCaseKeys(await res.json()) as Memory[];
+    const body = camelCaseKeys(await res.json()) as { memories: Memory[]; cursor?: string };
+    return body.memories ?? (body as unknown as Memory[]);
   }
 
   async remember(options: RememberOptions): Promise<Memory> {
@@ -299,10 +300,7 @@ export class Pensyve {
   async stats(): Promise<Record<string, unknown>> {
     const res = await this.request(
       `${this.baseUrl}/v1/stats`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-      },
+      { method: "GET" },
       "Stats",
     );
     return camelCaseKeys(await res.json()) as Record<string, unknown>;
