@@ -80,6 +80,14 @@ class Pensyve:
         """
         ...
 
+    def consolidate(self) -> dict[str, int]:
+        """Run consolidation (episodic->semantic promotion, FSRS decay, archival).
+
+        Returns:
+            Dict with keys: promoted, decayed, archived (counts).
+        """
+        ...
+
 class Entity:
     """Represents an entity (agent, user, team, or tool)."""
 
