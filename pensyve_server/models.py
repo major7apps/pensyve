@@ -78,3 +78,23 @@ class StatsResponse(BaseModel):
     episodic_memories: int
     semantic_memories: int
     procedural_memories: int
+
+
+class RecallResponse(BaseModel):
+    memories: list[MemoryResponse]
+    contradictions: list[dict[str, str]] = []
+    cursor: str | None = None
+
+
+class InspectRequest(BaseModel):
+    entity: str
+    limit: int = 50
+    cursor: str | None = None
+
+
+class InspectResponse(BaseModel):
+    entity: str
+    episodic: list[MemoryResponse] = []
+    semantic: list[MemoryResponse] = []
+    procedural: list[MemoryResponse] = []
+    cursor: str | None = None
