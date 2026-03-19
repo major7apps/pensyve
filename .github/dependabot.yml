@@ -41,16 +41,6 @@ updates:
       - "dependencies"
       - "vscode"
 
-  # Bun — website (Astro)
-  - package-ecosystem: "bun"
-    directory: "/website"
-    schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-    labels:
-      - "dependencies"
-      - "website"
-
   # Go — Go SDK
   - package-ecosystem: "gomod"
     directory: "/pensyve-go"

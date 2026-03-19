@@ -97,7 +97,6 @@ uv run maturin develop --manifest-path pensyve-python/Cargo.toml
 | `pensyve-vscode/` | TypeScript (VS Code) | VS Code extension with sidebar, commands, status bar |
 | `pensyve-plugin/` | Claude Code plugin | 6 commands, 4 skills, 2 agents, 4 hooks for cross-session memory |
 | `integrations/` | Python | Framework adapters for LangChain, CrewAI, OpenClaw, Autogen |
-| `website/` | Astro + Tailwind | Static site for pensyve.com |
 
 **Dependency flow**: All Rust consumers depend on `pensyve-core`. The Python server depends on the PyO3 module (`pensyve._core`). The TypeScript and Go SDKs talk to the REST API over HTTP. The VS Code extension uses its own HTTP client. The Claude Code plugin wraps the MCP server.
 
