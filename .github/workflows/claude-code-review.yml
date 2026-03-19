@@ -1,0 +1,73 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+jobs:
+  claude-review:
+    if: github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          track_progress: true
+
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            You are reviewing a PR for Pensyve — a universal memory runtime for
+            AI agents. The codebase is Rust core + Python (PyO3/FastAPI) +
+            TypeScript (bun) + Go SDKs. Read CLAUDE.md at the repo root for
+            full architecture and conventions before starting.
+
+            ## Review checklist
+
+            1. **Correctness** — Logic errors, off-by-one, missing error paths,
+               panics/unwraps in Rust that should be Results, unhandled Python
+               exceptions, broken SQL queries.
+
+            2. **Security** — SQL injection (especially in storage/ and
+               pensyve_server/), unsafe deserialization, auth bypass, secrets in
+               code, command injection in CI workflows.
+
+            3. **Cross-language boundaries** — PyO3 bindings must match the Rust
+               API. TypeScript and Go SDKs must stay consistent with the REST
+               API contract. Type stubs in _core.pyi must reflect reality.
+
+            4. **Performance** — Unnecessary allocations in hot paths (retrieval,
+               embedding), N+1 queries, blocking async, missing indices.
+
+            5. **Tests** — New behaviour should have tests. Rust unit tests live
+               next to the code; Python integration tests in tests/python/.
+               Flag missing coverage for non-trivial changes only.
+
+            ## Output rules
+
+            - Use inline comments (mcp__github_inline_comment__create_inline_comment)
+              for specific issues tied to a line of code.
+            - Use `gh pr comment` for a short summary (≤10 lines) at the end.
+            - If no critical issues are found, approve with a one-line summary.
+            - Do NOT comment on formatting, import order, or naming style —
+              linters handle that (clippy, ruff, eslint).
+            - Do NOT suggest documentation or comment additions.
+            - Be concise. One sentence per finding is enough.
+
+          claude_args: |
+            --model claude-opus-4-6
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
