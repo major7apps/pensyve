@@ -16,6 +16,8 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY pensyve-core/ pensyve-core/
 COPY pensyve-python/ pensyve-python/
+COPY pensyve-mcp/ pensyve-mcp/
+COPY pensyve-cli/ pensyve-cli/
 RUN maturin build --release --manifest-path pensyve-python/Cargo.toml -o /wheels
 
 # Stage 3: Runtime
@@ -23,7 +25,8 @@ FROM python:3.12-slim-bookworm
 RUN useradd -m -s /bin/bash pensyve
 WORKDIR /app
 
-# Install Python deps via pyproject.toml
+# Copy server code + pyproject.toml, then install deps
+COPY pensyve_server/ pensyve_server/
 COPY pyproject.toml .
 RUN pip install --no-cache-dir .
 
@@ -34,9 +37,6 @@ RUN pip install --no-cache-dir /tmp/*.whl && rm /tmp/*.whl
 # Copy Rust binaries
 COPY --from=rust-builder /build/target/release/pensyve-mcp /usr/local/bin/
 COPY --from=rust-builder /build/target/release/pensyve-cli /usr/local/bin/
-
-# Copy server code
-COPY pensyve_server/ pensyve_server/
 
 USER pensyve
 EXPOSE 8000
