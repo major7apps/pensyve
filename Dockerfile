@@ -12,14 +12,15 @@ RUN cargo build --release -p pensyve-mcp -p pensyve-cli
 FROM rust:bookworm AS python-builder
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 RUN apt-get update && apt-get install -y python3 python3-venv && rm -rf /var/lib/apt/lists/*
-RUN uv pip install --system maturin
 WORKDIR /build
+# Create a temporary venv for maturin
+RUN uv venv /opt/venv && /opt/venv/bin/pip install maturin
 COPY Cargo.toml Cargo.lock ./
 COPY pensyve-core/ pensyve-core/
 COPY pensyve-python/ pensyve-python/
 COPY pensyve-mcp/ pensyve-mcp/
 COPY pensyve-cli/ pensyve-cli/
-RUN maturin build --release --manifest-path pensyve-python/Cargo.toml -o /wheels
+RUN /opt/venv/bin/maturin build --release --manifest-path pensyve-python/Cargo.toml -o /wheels
 
 # Stage 3: Runtime
 FROM python:3.12-slim-bookworm
@@ -32,9 +33,9 @@ COPY pyproject.toml uv.lock ./
 COPY pensyve_server/ pensyve_server/
 RUN uv sync --frozen --no-dev --no-editable
 
-# Install PyO3 wheel
+# Install PyO3 wheel into the uv-managed venv
 COPY --from=python-builder /wheels/*.whl /tmp/
-RUN uv pip install --system --no-cache /tmp/*.whl && rm /tmp/*.whl
+RUN uv pip install /tmp/*.whl && rm /tmp/*.whl
 
 # Copy Rust binaries
 COPY --from=rust-builder /build/target/release/pensyve-mcp /usr/local/bin/
@@ -46,4 +47,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/health')" || exit 1
 
-CMD ["uvicorn", "pensyve_server.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uv", "run", "uvicorn", "pensyve_server.main:app", "--host", "0.0.0.0", "--port", "8000"]
