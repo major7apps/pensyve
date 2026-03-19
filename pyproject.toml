@@ -2,6 +2,27 @@
 name = "pensyve-workspace"
 version = "0.1.0"
 requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "maturin",
+    "fastembed",
+    "pyright",
+    "ruff",
+    "pytest",
+]
+extraction = [
+    "llama-cpp-python",
+]
+benchmarks = [
+    "scipy",
+    "numpy",
+]
 
 [tool.ruff]
 target-version = "py310"

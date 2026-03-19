@@ -56,8 +56,7 @@ jobs:
           pip install uv
           uv venv .venv
           . .venv/bin/activate
-          uv pip install -r pensyve_server/requirements.txt
-          uv pip install maturin fastembed pytest
+          uv pip install -e ".[dev]"
           maturin develop --manifest-path pensyve-python/Cargo.toml
       - name: Run tests
         run: |

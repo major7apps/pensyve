@@ -15,7 +15,7 @@ git clone <repo-url> pensyve && cd pensyve
 # Set up Python virtualenv with uv
 uv venv .venv
 source .venv/bin/activate
-uv pip install maturin ruff pyright pytest httpx fastapi uvicorn
+uv pip install -e ".[dev]"
 
 # Build the Python SDK
 maturin develop --manifest-path pensyve-python/Cargo.toml

@@ -23,9 +23,9 @@ FROM python:3.12-slim-bookworm
 RUN useradd -m -s /bin/bash pensyve
 WORKDIR /app
 
-# Install Python deps
-COPY pensyve_server/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python deps via pyproject.toml
+COPY pyproject.toml .
+RUN pip install --no-cache-dir .
 
 # Install PyO3 wheel
 COPY --from=python-builder /wheels/*.whl /tmp/
