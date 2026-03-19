@@ -41,8 +41,8 @@ updates:
       - "dependencies"
       - "vscode"
 
-  # npm — website (Astro)
-  - package-ecosystem: "npm"
+  # Bun — website (Astro)
+  - package-ecosystem: "bun"
     directory: "/website"
     schedule:
       interval: "weekly"
