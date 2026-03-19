@@ -1,0 +1,72 @@
+version: 2
+
+updates:
+  # Rust (Cargo) — workspace root
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "rust"
+
+  # Python (pip) — server requirements
+  - package-ecosystem: "pip"
+    directory: "/pensyve_server"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "python"
+
+  # TypeScript (npm/bun) — TS SDK
+  - package-ecosystem: "npm"
+    directory: "/pensyve-ts"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "typescript"
+
+  # TypeScript (npm) — VS Code extension
+  - package-ecosystem: "npm"
+    directory: "/pensyve-vscode"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "vscode"
+
+  # TypeScript (npm) — website
+  - package-ecosystem: "npm"
+    directory: "/website"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "website"
+
+  # Go — Go SDK
+  - package-ecosystem: "gomod"
+    directory: "/pensyve-go"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "go"
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "ci"
