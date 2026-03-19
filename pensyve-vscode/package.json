@@ -1,0 +1,80 @@
+{
+  "name": "pensyve-vscode",
+  "displayName": "Pensyve",
+  "description": "Universal memory runtime for AI agents — recall, remember, and inspect memories from VS Code",
+  "version": "0.1.0",
+  "publisher": "major7apps",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "pensyve.recall",
+        "title": "Pensyve: Recall Memories"
+      },
+      {
+        "command": "pensyve.remember",
+        "title": "Pensyve: Remember Fact"
+      },
+      {
+        "command": "pensyve.stats",
+        "title": "Pensyve: Memory Stats"
+      },
+      {
+        "command": "pensyve.consolidate",
+        "title": "Pensyve: Consolidate Memories"
+      }
+    ],
+    "configuration": {
+      "title": "Pensyve",
+      "properties": {
+        "pensyve.serverUrl": {
+          "type": "string",
+          "default": "http://localhost:8000",
+          "description": "Pensyve REST API server URL"
+        },
+        "pensyve.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for authenticated requests"
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "pensyve",
+          "title": "Pensyve",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "pensyve": [
+        {
+          "type": "webview",
+          "id": "pensyve.sidebar",
+          "name": "Memory Browser"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}
