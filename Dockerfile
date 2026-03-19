@@ -27,10 +27,10 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 RUN useradd -m -s /bin/bash pensyve
 WORKDIR /app
 
-# Copy server code + pyproject.toml, then install deps
+# Install deps via uv sync (reads pyproject.toml + uv.lock)
+COPY pyproject.toml uv.lock ./
 COPY pensyve_server/ pensyve_server/
-COPY pyproject.toml .
-RUN uv pip install --system --no-cache .
+RUN uv sync --frozen --no-dev --no-editable
 
 # Install PyO3 wheel
 COPY --from=python-builder /wheels/*.whl /tmp/

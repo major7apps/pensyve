@@ -33,9 +33,8 @@ Most AI agents lose all context between sessions. Pensyve gives them durable, in
 ```bash
 git clone https://github.com/major7apps/pensyve.git && cd pensyve
 
-# Set up Python environment
-uv venv .venv && source .venv/bin/activate
-uv pip install -e ".[dev]"
+# Set up Python environment and install deps
+uv sync --extra dev
 
 # Build the Python SDK (compiles Rust → native Python module)
 maturin develop --manifest-path pensyve-python/Cargo.toml

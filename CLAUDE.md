@@ -76,10 +76,8 @@ cargo run -p pensyve-mcp
 ### Python environment setup
 
 ```bash
-uv venv .venv
-source .venv/bin/activate
-uv pip install -e ".[dev]"
-maturin develop --manifest-path pensyve-python/Cargo.toml
+uv sync --extra dev
+uv run maturin develop --manifest-path pensyve-python/Cargo.toml
 ```
 
 ## Architecture
