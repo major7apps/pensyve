@@ -78,8 +78,7 @@ cargo run -p pensyve-mcp
 ```bash
 uv venv .venv
 source .venv/bin/activate
-uv pip install -r pensyve_server/requirements.txt
-uv pip install maturin llama-cpp-python fastembed pyright ruff pytest
+uv pip install -e ".[dev]"
 maturin develop --manifest-path pensyve-python/Cargo.toml
 ```
 

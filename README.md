@@ -35,8 +35,7 @@ git clone https://github.com/major7apps/pensyve.git && cd pensyve
 
 # Set up Python environment
 uv venv .venv && source .venv/bin/activate
-uv pip install -r pensyve_server/requirements.txt
-uv pip install maturin fastembed pytest
+uv pip install -e ".[dev]"
 
 # Build the Python SDK (compiles Rust → native Python module)
 maturin develop --manifest-path pensyve-python/Cargo.toml

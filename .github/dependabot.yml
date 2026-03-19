@@ -11,9 +11,9 @@ updates:
       - "dependencies"
       - "rust"
 
-  # Python (pip) — server requirements
-  - package-ecosystem: "pip"
-    directory: "/pensyve_server"
+  # Python (uv) — pyproject.toml at root
+  - package-ecosystem: "uv"
+    directory: "/"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
@@ -21,8 +21,8 @@ updates:
       - "dependencies"
       - "python"
 
-  # TypeScript (npm/bun) — TS SDK
-  - package-ecosystem: "npm"
+  # Bun — TypeScript SDK
+  - package-ecosystem: "bun"
     directory: "/pensyve-ts"
     schedule:
       interval: "weekly"
@@ -31,7 +31,7 @@ updates:
       - "dependencies"
       - "typescript"
 
-  # TypeScript (npm) — VS Code extension
+  # npm — VS Code extension (uses package-lock.json)
   - package-ecosystem: "npm"
     directory: "/pensyve-vscode"
     schedule:
@@ -41,7 +41,7 @@ updates:
       - "dependencies"
       - "vscode"
 
-  # TypeScript (npm) — website
+  # npm — website (Astro)
   - package-ecosystem: "npm"
     directory: "/website"
     schedule:
