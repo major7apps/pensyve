@@ -1,0 +1,51 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --color-bg: #0a0a0f;
+    --color-bg-secondary: #111119;
+    --color-surface: #1a1a24;
+    --color-border: #2a2a3a;
+    --color-text: #e4e4ed;
+    --color-text-secondary: #9494a8;
+    --color-accent: #6366f1;
+    --color-accent-light: #818cf8;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-[var(--color-bg)] text-[var(--color-text)] antialiased;
+    font-feature-settings: "liga" 1, "calt" 1;
+  }
+
+  ::selection {
+    @apply bg-brand-600/40 text-white;
+  }
+}
+
+@layer components {
+  .gradient-text {
+    @apply bg-gradient-to-r from-brand-400 to-brand-200 bg-clip-text text-transparent;
+  }
+
+  .card {
+    @apply rounded-xl border border-[var(--color-border)] bg-[var(--color-surface)] p-6;
+  }
+
+  .btn-primary {
+    @apply inline-flex items-center rounded-lg bg-brand-600 px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-brand-500 focus:outline-none focus:ring-2 focus:ring-brand-500 focus:ring-offset-2 focus:ring-offset-[var(--color-bg)];
+  }
+
+  .btn-secondary {
+    @apply inline-flex items-center rounded-lg border border-[var(--color-border)] bg-transparent px-5 py-2.5 text-sm font-medium text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface)] focus:outline-none focus:ring-2 focus:ring-brand-500 focus:ring-offset-2 focus:ring-offset-[var(--color-bg)];
+  }
+
+  .code-block {
+    @apply rounded-lg border border-[var(--color-border)] bg-[#0d0d14] p-4 font-mono text-sm leading-relaxed;
+  }
+}
