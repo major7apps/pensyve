@@ -221,14 +221,14 @@ results = p.recall(<span class="text-green-400">"programming language"</span>)</
 cargo run -p pensyve-mcp
 
 <span class="text-[var(--color-text-secondary)]"># Add to Claude Desktop config</span>
-{
-  <span class="text-green-400">"mcpServers"</span>: {
-    <span class="text-green-400">"pensyve"</span>: {
+{'{'}
+  <span class="text-green-400">"mcpServers"</span>: {'{'}
+    <span class="text-green-400">"pensyve"</span>: {'{'}
       <span class="text-green-400">"command"</span>: <span class="text-green-400">"pensyve-mcp"</span>,
       <span class="text-green-400">"args"</span>: []
-    }
-  }
-}
+    {'}'}
+  {'}'}
+{'}'}
 
 <span class="text-[var(--color-text-secondary)]"># Tools: recall, remember, episode</span></code></pre>
             </div>
@@ -247,7 +247,7 @@ uvicorn pensyve_server.main:app --reload
 <span class="text-[var(--color-text-secondary)]"># Remember</span>
 curl -X POST http://localhost:8000/v1/remember \
   -H <span class="text-green-400">"Content-Type: application/json"</span> \
-  -d <span class="text-green-400">'{"content": "User likes dark mode"}'</span>
+  -d <span class="text-green-400">'{'{'}"content": "User likes dark mode"{'}'}'</span>
 
 <span class="text-[var(--color-text-secondary)]"># Recall</span>
 curl http://localhost:8000/v1/recall?q=preferences</code></pre>
@@ -261,11 +261,11 @@ curl http://localhost:8000/v1/recall?q=preferences</code></pre>
               TypeScript SDK
             </h3>
             <div class="code-block">
-              <pre><code class="text-[var(--color-text)]"><span class="text-brand-400">import</span> { Pensyve } <span class="text-brand-400">from</span> <span class="text-green-400">"pensyve"</span>;
+              <pre><code class="text-[var(--color-text)]"><span class="text-brand-400">import</span> {'{'} Pensyve {'}'} <span class="text-brand-400">from</span> <span class="text-green-400">"pensyve"</span>;
 
-<span class="text-brand-400">const</span> p = <span class="text-brand-400">new</span> Pensyve({
+<span class="text-brand-400">const</span> p = <span class="text-brand-400">new</span> Pensyve({'{'}
   baseUrl: <span class="text-green-400">"http://localhost:8000"</span>,
-});
+{'}'});
 
 <span class="text-brand-400">await</span> p.remember(<span class="text-green-400">"User prefers TypeScript"</span>);
 
