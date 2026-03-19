@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.85+ (`rustup update`)
+- Rust 1.88+ (`rustup update`)
 - Python 3.10+ with uv (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
 - Bun (for TypeScript SDK, optional) (`curl -fsSL https://bun.sh/install | bash`)
 

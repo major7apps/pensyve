@@ -9,7 +9,7 @@ Universal memory runtime for AI agents. Rust core engine with Python (PyO3), MCP
 ## Build & Dev Commands
 
 ```bash
-# Prerequisites: Rust 1.85+, Python 3.10+, uv (Python), bun (TypeScript), maturin, Go 1.21+
+# Prerequisites: Rust 1.88+, Python 3.10+, uv (Python), bun (TypeScript), maturin, Go 1.21+
 
 # Full build (Rust + PyO3 native module into .venv)
 make build
@@ -149,7 +149,7 @@ Feature-complete plugin for the Claude Code marketplace:
 
 ## Conventions
 
-- **Rust edition 2024**, min MSRV 1.85. Clippy pedantic enabled workspace-wide (see allowed lints in root `Cargo.toml`).
+- **Rust edition 2024**, min MSRV 1.88. Clippy pedantic enabled workspace-wide (see allowed lints in root `Cargo.toml`).
 - **rustfmt**: 100 char line width, 4-space indent.
 - **Python**: ruff with `line-length = 100`, rules E/W/F/I/N/UP/B/SIM/RUF. pyright basic mode (0 errors). Test paths under `tests/python/`.
 - **TypeScript**: bun runtime, eslint with typescript-eslint. See `pensyve-ts/CLAUDE.md` for bun-specific conventions.
