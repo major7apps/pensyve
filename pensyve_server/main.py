@@ -165,12 +165,13 @@ def recall(req: RecallRequest, cursor: str | None = None):
     p = get_pensyve()
     # Fetch extra to support pagination
     fetch_limit = req.limit + 50  # overfetch for cursor slicing
-    kwargs: dict[str, object] = {"limit": fetch_limit}
-    if req.entity:
-        kwargs["entity"] = p.entity(req.entity)
-    if req.types:
-        kwargs["types"] = req.types
-    results = p.recall(req.query, **kwargs)
+    entity = p.entity(req.entity) if req.entity else None
+    results = p.recall(
+        req.query,
+        entity=entity,
+        limit=fetch_limit,
+        types=req.types if req.types else None,
+    )
     memories = [_memory_to_response(m) for m in results]
 
     # Apply cursor-based pagination
