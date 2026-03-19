@@ -82,8 +82,26 @@ const ACTION_KEYWORDS: &[&str] = &[
 
 /// Question keywords — interrogative patterns.
 const QUESTION_KEYWORDS: &[&str] = &[
-    "what ", "what's", "who ", "who's", "where ", "where's", "when ", "when's", "why ", "which ",
-    "is it", "are there", "does ", "do ", "can ", "could ", "should ", "would ", "will ", "?",
+    "what ",
+    "what's",
+    "who ",
+    "who's",
+    "where ",
+    "where's",
+    "when ",
+    "when's",
+    "why ",
+    "which ",
+    "is it",
+    "are there",
+    "does ",
+    "do ",
+    "can ",
+    "could ",
+    "should ",
+    "would ",
+    "will ",
+    "?",
 ];
 
 /// Classify the intent of a query using keyword pattern matching.
@@ -791,10 +809,7 @@ mod tests {
             classify_intent("Deploy the application to prod"),
             QueryIntent::Action
         );
-        assert_eq!(
-            classify_intent("Fix the broken test"),
-            QueryIntent::Action
-        );
+        assert_eq!(classify_intent("Fix the broken test"), QueryIntent::Action);
     }
 
     #[test]

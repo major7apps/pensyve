@@ -35,13 +35,15 @@ impl PensyveMetrics {
     /// Record a completed recall operation with its duration in milliseconds.
     pub fn record_recall(&self, duration_ms: u64) {
         self.recall_count.fetch_add(1, Ordering::Relaxed);
-        self.recall_total_ms.fetch_add(duration_ms, Ordering::Relaxed);
+        self.recall_total_ms
+            .fetch_add(duration_ms, Ordering::Relaxed);
     }
 
     /// Record a completed embedding operation with its duration in milliseconds.
     pub fn record_embed(&self, duration_ms: u64) {
         self.embed_count.fetch_add(1, Ordering::Relaxed);
-        self.embed_total_ms.fetch_add(duration_ms, Ordering::Relaxed);
+        self.embed_total_ms
+            .fetch_add(duration_ms, Ordering::Relaxed);
     }
 
     /// Record a completed store (save) operation.

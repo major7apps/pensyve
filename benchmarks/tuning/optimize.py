@@ -27,11 +27,11 @@ _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-import numpy as np
-from scipy.optimize import differential_evolution
+import numpy as np  # noqa: E402
+from scipy.optimize import differential_evolution  # noqa: E402
 
-from benchmarks.longmemeval.dataset import load_longmemeval_s
-from benchmarks.longmemeval.evaluate import evaluate
+from benchmarks.longmemeval.dataset import load_longmemeval_s  # noqa: E402
+from benchmarks.longmemeval.evaluate import evaluate  # noqa: E402
 
 SIGNAL_NAMES = [
     "vector",
@@ -75,7 +75,7 @@ def objective(raw_weights: np.ndarray) -> float:
     Returns:
         Negative accuracy (since differential_evolution minimizes).
     """
-    global _eval_count, _best_accuracy  # noqa: PLW0603
+    global _eval_count, _best_accuracy
 
     weights = normalize_weights(raw_weights)
     _eval_count += 1
@@ -87,16 +87,13 @@ def objective(raw_weights: np.ndarray) -> float:
         _best_accuracy = report.accuracy
 
     if _verbose and _eval_count % 10 == 0:
-        print(
-            f"  [iter {_eval_count:4d}] accuracy={report.accuracy:.1%} "
-            f"best={_best_accuracy:.1%}"
-        )
+        print(f"  [iter {_eval_count:4d}] accuracy={report.accuracy:.1%} best={_best_accuracy:.1%}")
 
     return -report.accuracy
 
 
 def main() -> int:
-    global _verbose  # noqa: PLW0603
+    global _verbose
 
     parser = argparse.ArgumentParser(
         description="Optimize Pensyve retrieval weights via differential evolution"
@@ -139,7 +136,9 @@ def main() -> int:
     print("\nEvaluating default weights...")
     dataset = load_longmemeval_s()
     baseline = evaluate(dataset, recall_limit=10)
-    print(f"  Baseline accuracy: {baseline.accuracy:.1%} ({baseline.hits}/{baseline.total_queries})")
+    print(
+        f"  Baseline accuracy: {baseline.accuracy:.1%} ({baseline.hits}/{baseline.total_queries})"
+    )
 
     print("\nRunning differential evolution...")
     start = time.perf_counter()
@@ -172,14 +171,14 @@ def main() -> int:
     print(f"  Improvement:        {improvement:+.1%}")
 
     print("\n  Optimized weights:")
-    for name, w in zip(SIGNAL_NAMES, best_weights):
+    for name, w in zip(SIGNAL_NAMES, best_weights, strict=True):
         default_w = DEFAULT_WEIGHTS[SIGNAL_NAMES.index(name)]
         delta = w - default_w
         print(f"    {name:12s}: {w:.4f}  (default: {default_w:.4f}, delta: {delta:+.4f})")
 
     # Output as a Rust array literal for easy copy-paste.
     rust_array = ", ".join(f"{w:.4f}" for w in best_weights)
-    print(f"\n  Rust config literal:")
+    print("\n  Rust config literal:")
     print(f"    weights: [{rust_array}]")
 
     return 0

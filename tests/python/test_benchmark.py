@@ -40,8 +40,7 @@ class TestDataset:
         conv_ids = {c.conversation_id for c in dataset.conversations}
         for query in dataset.queries:
             assert query.conversation_id in conv_ids, (
-                f"Query {query.query_id} references unknown conversation "
-                f"{query.conversation_id}"
+                f"Query {query.query_id} references unknown conversation {query.conversation_id}"
             )
 
     def test_load_from_json_files(self):

@@ -16,8 +16,8 @@ _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from benchmarks.longmemeval.dataset import load_longmemeval_s
-from benchmarks.longmemeval.evaluate import evaluate
+from benchmarks.longmemeval.dataset import load_longmemeval_s  # noqa: E402
+from benchmarks.longmemeval.evaluate import evaluate  # noqa: E402
 
 
 def main() -> int:
@@ -42,10 +42,7 @@ def main() -> int:
 
     print("Loading dataset...")
     dataset = load_longmemeval_s(args.data_dir)
-    print(
-        f"  {dataset.num_conversations} conversations, "
-        f"{dataset.num_queries} queries"
-    )
+    print(f"  {dataset.num_conversations} conversations, {dataset.num_queries} queries")
 
     print("\nRunning evaluation...")
     report = evaluate(dataset, recall_limit=args.limit)
@@ -69,9 +66,7 @@ def main() -> int:
             print(f"  [{status}] {r.query_id}: {r.question}")
             print(f"         Gold: {r.gold_answer}")
             if not r.hit:
-                preview = "; ".join(
-                    t[:60] for t in r.recalled_texts[:3]
-                )
+                preview = "; ".join(t[:60] for t in r.recalled_texts[:3])
                 print(f"         Got:  {preview}")
 
     return 0
