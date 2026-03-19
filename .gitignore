@@ -58,3 +58,4 @@ Thumbs.db
 # --- Build artifacts ---
 *.whl
 *.tar.gz
+.superpowers/
