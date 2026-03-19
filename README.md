@@ -9,12 +9,15 @@ Agents use Pensyve to remember across sessions, learn from outcomes, and share k
 Most AI agents lose all context between sessions. Pensyve gives them durable, intelligent memory:
 
 - **Three memory types** — Episodic (what happened), Semantic (what is known), Procedural (what works)
-- **8-signal fusion retrieval** — Vector similarity, BM25 lexical, graph proximity, recency, access frequency, confidence, type boost, and intent matching
+- **Multimodal content** — Text, code, images, tool outputs, structured data
+- **8-signal fusion retrieval** — Vector similarity, BM25 lexical, graph proximity, intent classification, recency, access frequency, confidence, type boost
 - **Learns from outcomes** — Bayesian tracking on action→outcome procedures automatically surfaces what works
 - **Forgetting curve** — FSRS-based memory decay with retrieval-induced reinforcement (memories you use get stronger)
 - **Consolidation** — Background "dreaming" promotes repeated episodic facts to semantic knowledge
 - **Offline-first** — SQLite storage, ONNX embeddings, optional local LLM extraction. No API keys needed.
+- **Scales to cloud** — Feature-gated Postgres backend with pgvector for managed deployments
 - **Cross-encoder reranking** — BGE reranker on top-k results for precision
+- **Access control** — RBAC memory mesh with owner/writer/reader roles and private/shared/public visibility
 
 ## Quick Start
 
@@ -23,6 +26,7 @@ Most AI agents lose all context between sessions. Pensyve gives them durable, in
 - Rust 1.85+
 - Python 3.10+ with [uv](https://github.com/astral-sh/uv)
 - [Bun](https://bun.sh) (optional, for TypeScript SDK)
+- [Go 1.21+](https://go.dev) (optional, for Go SDK)
 
 ### Install
 
@@ -31,7 +35,8 @@ git clone https://github.com/major7apps/pensyve.git && cd pensyve
 
 # Set up Python environment
 uv venv .venv && source .venv/bin/activate
-uv pip install maturin ruff pyright pytest httpx fastapi uvicorn
+uv pip install -r pensyve_server/requirements.txt
+uv pip install maturin fastembed pytest
 
 # Build the Python SDK (compiles Rust → native Python module)
 maturin develop --manifest-path pensyve-python/Cargo.toml
@@ -86,10 +91,7 @@ p.consolidate()
 Works with Claude Code, Cursor, and any MCP-compatible client.
 
 ```bash
-# Build
 cargo build --release --bin pensyve-mcp
-
-# Add to .mcp.json
 ```
 
 ```json
@@ -103,11 +105,25 @@ cargo build --release --bin pensyve-mcp
 }
 ```
 
-**Tools exposed:** `recall`, `remember`, `start_episode`, `add_message`, `end_episode`, `consolidate`
+**Tools exposed:** `recall`, `remember`, `episode_start`, `episode_end`, `forget`, `inspect`
+
+### Claude Code Plugin
+
+Full cognitive memory layer for Claude Code — install from the marketplace or manually.
+
+```
+pensyve-plugin/
+├── 6 slash commands   /remember, /recall, /forget, /inspect, /consolidate, /memory-status
+├── 4 skills           session-memory, memory-informed-refactor, context-loader, memory-review
+├── 2 agents           memory-curator (background), context-researcher (on-demand)
+└── 4 hooks            SessionStart, Stop, PreCompact, UserPromptSubmit
+```
+
+See [`pensyve-plugin/README.md`](pensyve-plugin/README.md) for details.
 
 ### REST API
 
-FastAPI server for language-agnostic access.
+FastAPI server with authentication, pagination, and metrics.
 
 ```bash
 uvicorn pensyve_server.main:app --port 8000
@@ -125,50 +141,68 @@ curl -X POST http://localhost:8000/v1/recall \
   -d '{"query": "programming language", "entity": "seth"}'
 ```
 
-**Endpoints:** `POST /v1/entities`, `POST /v1/episodes/start`, `POST /v1/episodes/message`, `POST /v1/episodes/end`, `POST /v1/recall`, `POST /v1/remember`, `DELETE /v1/entities/{name}`, `POST /v1/consolidate`, `GET /v1/health`
+**Endpoints:** `POST /v1/entities`, `POST /v1/episodes/{start,message,end}`, `POST /v1/recall`, `POST /v1/remember`, `POST /v1/inspect`, `GET /v1/stats`, `DELETE /v1/entities/{name}`, `POST /v1/consolidate`, `GET /v1/health`, `GET /metrics`
 
 ### TypeScript SDK
 
-HTTP client targeting the REST API.
+HTTP client with timeout, retry, and structured errors.
 
 ```typescript
 import { Pensyve } from "pensyve";
 
-const p = new Pensyve({ baseUrl: "http://localhost:8000" });
+const p = new Pensyve({ baseUrl: "http://localhost:8000", timeoutMs: 10000, retries: 2 });
 await p.remember({ entity: "seth", fact: "Likes TypeScript", confidence: 0.9 });
 const memories = await p.recall("programming", { entity: "seth" });
+```
+
+### Go SDK
+
+Context-aware HTTP client with structured errors.
+
+```go
+import pensyve "github.com/major7apps/pensyve-go"
+
+client := pensyve.NewClient(pensyve.Config{BaseURL: "http://localhost:8000"})
+ctx := context.Background()
+client.Remember(ctx, "seth", "Likes Go", 0.9)
+memories, _ := client.Recall(ctx, "programming", nil)
 ```
 
 ### CLI
 
 ```bash
-cargo build --bin pensyve
+cargo build --bin pensyve-cli
 
 # Recall memories
-./target/debug/pensyve recall "editor preferences" --entity user
+./target/debug/pensyve-cli recall "editor preferences" --entity user
 
 # Show stats
-./target/debug/pensyve stats
+./target/debug/pensyve-cli stats
 
 # Inspect an entity
-./target/debug/pensyve inspect --entity user
+./target/debug/pensyve-cli inspect --entity user
 ```
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                        Consumers                              │
-│  Python SDK    MCP Server    REST API    TypeScript SDK       │
-│  (PyO3)        (stdio)       (FastAPI)   (HTTP)              │
-├──────────────────────────────────────────────────────────────┤
-│                     pensyve-core (Rust)                       │
-│                                                               │
-│  Storage (SQLite+FTS5)  ·  Embeddings (ONNX/fastembed)       │
-│  Vector Index  ·  Graph (petgraph)  ·  Reranker (BGE)        │
-│  FSRS Decay  ·  Bayesian Procedural  ·  Consolidation        │
-│  Tier 1 Extraction (patterns)  ·  Tier 2 Extraction (LLM)   │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                          Consumers                                   │
+│  Python SDK  MCP Server  REST API  TypeScript SDK  Go SDK  CLI      │
+│  (PyO3)      (stdio)     (FastAPI) (HTTP)          (HTTP)  (clap)   │
+├──────────────────────────────────────────────────────────────────────┤
+│                       pensyve-core (Rust)                            │
+│                                                                      │
+│  Storage (SQLite+FTS5 / Postgres+pgvector)  ·  Embeddings (ONNX)    │
+│  Vector Index  ·  Graph (petgraph)  ·  Reranker (BGE)               │
+│  FSRS Decay  ·  Bayesian Procedural  ·  Consolidation               │
+│  Intent Scoring  ·  Extraction (Tier 1 + Tier 2)                    │
+│  Observability (tracing + Prometheus)  ·  RBAC Mesh                 │
+├──────────────────────────────────────────────────────────────────────┤
+│                       Extensions                                     │
+│  Claude Code Plugin  ·  VS Code Extension  ·  WASM Build            │
+│  Framework Integrations (LangChain, CrewAI, OpenClaw, Autogen)      │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Data Model
@@ -179,7 +213,7 @@ Namespace (isolation boundary)
         ├── Episodes (bounded interaction sequences)
         │     └── Messages (role + content)
         └── Memories
-              ├── Episodic  — what happened (timestamped events)
+              ├── Episodic  — what happened (timestamped, multimodal content type)
               ├── Semantic  — what is known (SPO triples with temporal validity)
               └── Procedural — what works (action→outcome with Bayesian reliability)
 ```
@@ -187,32 +221,33 @@ Namespace (isolation boundary)
 ### Retrieval Pipeline
 
 1. **Embed** query via ONNX (all-MiniLM-L6-v2, 384 dims)
-2. **Vector search** — cosine similarity against stored embeddings
-3. **BM25 search** — FTS5 lexical matching
-4. **Graph traversal** — petgraph BFS from query entity
-5. **Fusion scoring** — weighted sum of 8 signals
-6. **Cross-encoder reranking** — BGE reranker on top-20 candidates
-7. **FSRS reinforcement** — retrieved memories get stability boost
-
-### Memory Lifecycle
-
-- **Ingest** — Messages are extracted (Tier 1 patterns, optional Tier 2 LLM), embedded, and stored
-- **Retrieve** — Multi-signal fusion with reranking; accessed memories are reinforced
-- **Consolidate** — Background pass promotes repeated episodic→semantic, decays unaccessed, archives below threshold, updates Bayesian reliability
+2. **Classify intent** — Question/Action/Recall/General (keyword heuristics)
+3. **Vector search** — cosine similarity against stored embeddings
+4. **BM25 search** — FTS5 lexical matching
+5. **Graph traversal** — petgraph BFS from query entity
+6. **Fusion scoring** — weighted sum of 8 signals (vector, BM25, graph, intent, recency, access, confidence, type boost)
+7. **Cross-encoder reranking** — BGE reranker on top-20 candidates
+8. **FSRS reinforcement** — retrieved memories get stability boost
 
 ## Project Structure
 
 ```
 pensyve/
-├── pensyve-core/      Rust engine (rlib) — all core logic
-├── pensyve-python/    Python SDK via PyO3 (cdylib)
-├── pensyve-mcp/       MCP server binary (stdio, rmcp)
-├── pensyve-cli/       CLI binary (clap)
-├── pensyve-ts/        TypeScript SDK (bun)
-├── pensyve_server/    FastAPI REST API + Tier 2 LLM extraction
-├── tests/python/      Python integration tests
-├── benchmarks/        Evaluation harness
-└── docs/              Architecture, roadmap, getting started
+├── pensyve-core/       Rust engine (rlib) — storage, embedding, retrieval, graph, decay, mesh, observability
+├── pensyve-python/     Python SDK via PyO3 (cdylib)
+├── pensyve-mcp/        MCP server binary (stdio, rmcp)
+├── pensyve-cli/        CLI binary (clap)
+├── pensyve-ts/         TypeScript SDK (bun) — timeout, retry, PensyveError
+├── pensyve-go/         Go SDK — context-aware HTTP client
+├── pensyve-wasm/       WASM build — standalone minimal in-memory Pensyve
+├── pensyve-vscode/     VS Code extension — sidebar, commands, status bar
+├── pensyve-plugin/     Claude Code plugin — commands, skills, agents, hooks
+├── pensyve_server/     FastAPI REST API — auth, pagination, metrics, billing, Tier 2 extraction
+├── integrations/       Framework adapters (LangChain, CrewAI, OpenClaw, Autogen)
+├── tests/python/       Python integration tests
+├── benchmarks/         LongMemEval_S evaluation + weight tuning
+├── website/            Astro + Tailwind static site for pensyve.com
+└── docs/               Architecture, roadmap, design specs, implementation plans
 ```
 
 ## Development
@@ -225,6 +260,24 @@ make format     # cargo fmt + ruff format
 make check      # lint + test (CI gate)
 ```
 
+### Additional SDKs
+
+```bash
+cd pensyve-ts && bun test          # TypeScript (38 tests)
+cd pensyve-go && go test ./...     # Go (17 tests)
+cd pensyve-wasm && cargo check     # WASM (standalone)
+```
+
+### Benchmarks
+
+```bash
+# Run LongMemEval_S evaluation (builtin dataset: 87.5% baseline)
+python benchmarks/longmemeval/run.py --verbose
+
+# Run weight optimization
+python benchmarks/tuning/optimize.py --maxiter 50
+```
+
 ## Competitive Landscape
 
 | Feature | Pensyve | Mem0 | Zep | Honcho |
@@ -233,8 +286,17 @@ make check      # lint + test (CI gate)
 | Procedural memory (learns from outcomes) | **Yes** | No | No | No |
 | Multi-signal fusion scoring | **8 signals** | 1 | 3 | 1 |
 | Retrieval-induced reinforcement (FSRS) | **Yes** | No | No | No |
+| Intent-aware retrieval | **Yes** | No | No | No |
+| Multimodal content types | **Yes** | Text only | Text only | Text only |
+| RBAC memory mesh | **Yes** | No | No | No |
 | Cross-platform local LLM extraction | **Yes** | No | Cloud only | Cloud only |
 | MCP server | **Yes** | No | No | Plugin |
+| Claude Code plugin | **Yes** | No | No | No |
+| VS Code extension | **Yes** | No | No | No |
+| Framework integrations | **4** | 2 | 1 | 1 |
+| Postgres backend | **Yes** (feature-gated) | Yes | Yes | Yes |
+| Go SDK | **Yes** | No | No | No |
+| WASM build | **Yes** | No | No | No |
 | Open source engine | Apache 2.0 | Yes | Partial | Yes |
 
 ## License
