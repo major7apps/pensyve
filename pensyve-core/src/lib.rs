@@ -4,6 +4,7 @@ pub mod decay;
 pub mod embedding;
 pub mod extraction;
 pub mod graph;
+pub mod mesh;
 pub mod observability;
 pub mod procedural;
 pub mod reranker;

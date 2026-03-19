@@ -23,6 +23,40 @@ pub enum Outcome {
     Partial,
 }
 
+/// Type of content stored in a memory.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ContentType {
+    #[default]
+    Text,
+    Code,
+    Image,
+    ToolOutput,
+    Structured,
+}
+
+impl ContentType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Code => "code",
+            Self::Image => "image",
+            Self::ToolOutput => "tool_output",
+            Self::Structured => "structured",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "code" => Self::Code,
+            "image" => Self::Image,
+            "tool_output" => Self::ToolOutput,
+            "structured" => Self::Structured,
+            _ => Self::Text,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Namespace
 // ---------------------------------------------------------------------------
@@ -120,6 +154,7 @@ pub struct EpisodicMemory {
     pub source_entity: Uuid,
     pub about_entity: Uuid,
     pub content: String,
+    pub content_type: ContentType,
     pub summary: Option<String>,
     pub embedding: Vec<f32>,
     pub context_intent: Option<String>,
@@ -147,6 +182,7 @@ impl EpisodicMemory {
             source_entity,
             about_entity,
             content: content.into(),
+            content_type: ContentType::Text,
             summary: None,
             embedding: Vec::new(),
             context_intent: None,
@@ -171,6 +207,7 @@ pub struct SemanticMemory {
     pub subject: Uuid,
     pub predicate: String,
     pub object: String,
+    pub content_type: ContentType,
     /// Optional entity UUID when the object is itself a known entity.
     pub object_entity: Option<Uuid>,
     /// Confidence in [0, 1].
@@ -197,6 +234,7 @@ impl SemanticMemory {
             subject,
             predicate: predicate.into(),
             object: object.into(),
+            content_type: ContentType::Text,
             object_entity: None,
             confidence,
             valid_at: Utc::now(),
@@ -386,5 +424,50 @@ mod tests {
         episode.close(Outcome::Success);
         assert!(episode.ended_at.is_some());
         assert!(matches!(episode.outcome, Some(Outcome::Success)));
+    }
+
+    #[test]
+    fn test_content_type_roundtrip() {
+        let variants = [
+            (ContentType::Text, "text"),
+            (ContentType::Code, "code"),
+            (ContentType::Image, "image"),
+            (ContentType::ToolOutput, "tool_output"),
+            (ContentType::Structured, "structured"),
+        ];
+        for (ct, expected_str) in &variants {
+            assert_eq!(ct.as_str(), *expected_str);
+            assert_eq!(ContentType::from_str(expected_str), *ct);
+        }
+    }
+
+    #[test]
+    fn test_content_type_default() {
+        let ct = ContentType::default();
+        assert_eq!(ct, ContentType::Text);
+    }
+
+    #[test]
+    fn test_content_type_unknown_fallback() {
+        assert_eq!(ContentType::from_str("unknown"), ContentType::Text);
+        assert_eq!(ContentType::from_str(""), ContentType::Text);
+    }
+
+    #[test]
+    fn test_episodic_memory_default_content_type() {
+        let ns_id = Uuid::new_v4();
+        let ep_id = Uuid::new_v4();
+        let src = Uuid::new_v4();
+        let about = Uuid::new_v4();
+        let mem = EpisodicMemory::new(ns_id, ep_id, src, about, "test");
+        assert_eq!(mem.content_type, ContentType::Text);
+    }
+
+    #[test]
+    fn test_semantic_memory_default_content_type() {
+        let ns_id = Uuid::new_v4();
+        let subject = Uuid::new_v4();
+        let mem = SemanticMemory::new(ns_id, subject, "knows", "Rust", 0.9);
+        assert_eq!(mem.content_type, ContentType::Text);
     }
 }
