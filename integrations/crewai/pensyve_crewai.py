@@ -9,6 +9,7 @@ Maps CrewAI's memory concepts to Pensyve:
     - Long-term memory  -> Pensyve semantic (persisted facts)
     - Entity memory     -> Pensyve entities (per-agent)
 """
+
 from __future__ import annotations
 
 from typing import Any
