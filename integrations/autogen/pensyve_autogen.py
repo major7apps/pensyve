@@ -7,6 +7,7 @@ Usage:
 Provides multi-agent memory with per-agent entities in a shared namespace,
 enabling both isolated and cross-agent memory sharing.
 """
+
 from __future__ import annotations
 
 from typing import Any

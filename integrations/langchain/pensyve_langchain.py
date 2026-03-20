@@ -5,6 +5,7 @@ Usage:
     memory = PensyveMemory(namespace="my-project")
     # Use as drop-in replacement for ConversationBufferMemory
 """
+
 from __future__ import annotations
 
 from typing import Any

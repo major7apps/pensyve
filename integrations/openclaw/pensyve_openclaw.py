@@ -8,6 +8,7 @@ Usage:
 Provides a plugin-style adapter exposing remember, recall, and forget as
 tool definitions compatible with OpenClaw/OpenHands tool interfaces.
 """
+
 from __future__ import annotations
 
 from typing import Any
