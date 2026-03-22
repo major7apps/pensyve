@@ -22,6 +22,7 @@ from .models import (
     EpisodeStartResponse,
     FeedbackRequest,
     ForgetResponse,
+    GdprErasureResponse,
     InspectRequest,
     InspectResponse,
     MemoryResponse,
@@ -256,6 +257,26 @@ def forget(entity_name: str, hard_delete: bool = False):
     result = p.forget(entity=entity, hard_delete=hard_delete)
     _activity.record("forget", entity_name)
     return ForgetResponse(forgotten_count=result["forgotten_count"])
+
+
+@app.delete(
+    "/v1/gdpr/erase/{entity_name}",
+    response_model=GdprErasureResponse,
+    dependencies=[Depends(require_role("owner"))],
+)
+def gdpr_erase(entity_name: str):
+    """GDPR Article 17: Right to erasure. Cascading delete of all entity data."""
+    p = get_pensyve()
+    entity = p.entity(entity_name)
+    result = p.forget(entity=entity, hard_delete=True)
+    _activity.record("gdpr_erasure", f"entity={entity_name}")
+    return GdprErasureResponse(
+        memories_deleted=result.get("forgotten_count", 0),
+        edges_deleted=0,
+        entities_deleted=1,
+        complete=True,
+        warnings=[],
+    )
 
 
 @app.post(

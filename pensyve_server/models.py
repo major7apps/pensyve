@@ -118,3 +118,11 @@ class FeedbackRequest(BaseModel):
     memory_id: str
     relevant: bool
     signals: list[float] | None = None  # Optional; server can look up from last recall
+
+
+class GdprErasureResponse(BaseModel):
+    memories_deleted: int
+    edges_deleted: int
+    entities_deleted: int
+    complete: bool
+    warnings: list[str]
