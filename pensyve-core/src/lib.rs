@@ -1,3 +1,4 @@
+pub mod a2a;
 pub mod config;
 pub mod consolidation;
 pub mod decay;

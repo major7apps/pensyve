@@ -126,3 +126,17 @@ class GdprErasureResponse(BaseModel):
     entities_deleted: int
     complete: bool
     warnings: list[str]
+
+
+class A2ATaskRequest(BaseModel):
+    task_id: str
+    capability: str
+    input: dict
+    from_agent: str
+
+
+class A2ATaskResponse(BaseModel):
+    task_id: str
+    status: str
+    output: dict
+    error: str | None = None
