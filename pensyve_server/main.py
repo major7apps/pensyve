@@ -12,6 +12,8 @@ from .activity import ActivityTracker
 from .auth import require_api_key
 from .billing import UsageTracker
 from .models import (
+    A2ATaskRequest,
+    A2ATaskResponse,
     ActivityResponse,
     ConsolidateResponse,
     EntityCreate,
@@ -366,6 +368,74 @@ def get_recent_activity(limit: int = 10):
         RecentEventResponse(id=e.id, type=e.event_type, content=e.content, timestamp=e.timestamp)
         for e in events
     ]
+
+
+@app.get("/v1/a2a/agent-card")
+def a2a_agent_card():
+    """Return the A2A agent card describing Pensyve's capabilities."""
+    base_url = os.environ.get("PENSYVE_BASE_URL", "http://localhost:8000")
+    return {
+        "name": "pensyve-memory",
+        "description": "Universal memory runtime for AI agents",
+        "protocol": "a2a/v1",
+        "capabilities": [
+            {"id": "memory.recall", "description": "Query memories by semantic similarity"},
+            {"id": "memory.remember", "description": "Store a new memory"},
+            {"id": "memory.forget", "description": "Delete memories for an entity"},
+        ],
+        "endpoint": base_url,
+        "auth": {"auth_type": "api_key", "header": "X-Pensyve-Key"},
+    }
+
+
+@app.post("/v1/a2a/task", response_model=A2ATaskResponse)
+def a2a_task(req: A2ATaskRequest):
+    """Handle an A2A task request by routing to the appropriate capability."""
+    p = get_pensyve()
+    _activity.record("a2a_task", f"capability={req.capability} from={req.from_agent}")
+
+    try:
+        if req.capability == "memory.recall":
+            query = req.input.get("query", "")
+            limit = req.input.get("limit", 5)
+            entity_name = req.input.get("entity")
+            entity = p.entity(entity_name) if entity_name else None
+            results = p.recall(query, entity=entity, limit=limit)
+            memories = [{"content": m.content, "score": getattr(m, "score", 0)} for m in results]
+            return A2ATaskResponse(
+                task_id=req.task_id, status="completed", output={"memories": memories}
+            )
+
+        elif req.capability == "memory.remember":
+            entity_name = req.input["entity"]
+            fact = req.input["fact"]
+            confidence = req.input.get("confidence", 0.8)
+            entity = p.entity(entity_name)
+            mem = p.remember(entity=entity, fact=fact, confidence=confidence)
+            return A2ATaskResponse(
+                task_id=req.task_id, status="completed", output={"memory_id": mem.id}
+            )
+
+        elif req.capability == "memory.forget":
+            entity_name = req.input["entity"]
+            entity = p.entity(entity_name)
+            result = p.forget(entity=entity)
+            return A2ATaskResponse(
+                task_id=req.task_id,
+                status="completed",
+                output={"forgotten_count": result["forgotten_count"]},
+            )
+
+        else:
+            return A2ATaskResponse(
+                task_id=req.task_id,
+                status="failed",
+                output={},
+                error=f"Unknown capability: {req.capability}",
+            )
+
+    except Exception as e:
+        return A2ATaskResponse(task_id=req.task_id, status="failed", output={}, error=str(e))
 
 
 @app.get("/v1/health")
