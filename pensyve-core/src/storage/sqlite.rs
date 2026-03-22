@@ -183,14 +183,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 );
 
 CREATE TABLE IF NOT EXISTS edges (
-    id          TEXT PRIMARY KEY,
-    source      TEXT NOT NULL,
-    target      TEXT NOT NULL,
-    relation    TEXT NOT NULL,
-    weight      REAL NOT NULL DEFAULT 1.0,
-    valid_at    TEXT NOT NULL,
-    invalid_at  TEXT,
-    metadata    TEXT NOT NULL DEFAULT '{}'
+    id              TEXT PRIMARY KEY,
+    source          TEXT NOT NULL,
+    target          TEXT NOT NULL,
+    relation        TEXT NOT NULL,
+    weight          REAL NOT NULL DEFAULT 1.0,
+    valid_at        TEXT NOT NULL,
+    invalid_at      TEXT,
+    superseded_by   TEXT,
+    metadata        TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);
@@ -1064,8 +1065,8 @@ impl StorageTrait for SqliteBackend {
         let conn = self.conn.lock().unwrap();
         let metadata = serde_json::to_string(&edge.metadata)?;
         conn.execute(
-            "INSERT OR REPLACE INTO edges (id, source, target, relation, weight, valid_at, invalid_at, metadata) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR REPLACE INTO edges (id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 edge.id.to_string(),
                 edge.source.to_string(),
@@ -1074,6 +1075,7 @@ impl StorageTrait for SqliteBackend {
                 edge.weight,
                 edge.valid_at.to_rfc3339(),
                 edge.invalid_at.map(|dt| dt.to_rfc3339()),
+                edge.superseded_by.map(|id| id.to_string()),
                 metadata,
             ],
         )?;
@@ -1084,7 +1086,7 @@ impl StorageTrait for SqliteBackend {
         let conn = self.conn.lock().unwrap();
         let id_str = entity_id.to_string();
         let mut stmt = conn.prepare(
-            "SELECT id, source, target, relation, weight, valid_at, invalid_at, metadata \
+            "SELECT id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata \
              FROM edges WHERE source = ?1 OR target = ?1",
         )?;
         let rows = stmt.query_map(params![&id_str], |row| {
@@ -1096,7 +1098,8 @@ impl StorageTrait for SqliteBackend {
                 row.get::<_, f64>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, Option<String>>(6)?,
-                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
             ))
         })?;
         let mut edges = Vec::new();
@@ -1109,6 +1112,7 @@ impl StorageTrait for SqliteBackend {
                 weight,
                 valid_at_str,
                 invalid_at_opt,
+                superseded_by_opt,
                 metadata_str,
             ) = row?;
             let id = Uuid::parse_str(&id_str).unwrap_or_default();
@@ -1116,6 +1120,7 @@ impl StorageTrait for SqliteBackend {
             let target = Uuid::parse_str(&tgt_str).unwrap_or_default();
             let valid_at = str_to_dt(&valid_at_str);
             let invalid_at = invalid_at_opt.map(|s| str_to_dt(&s));
+            let superseded_by = superseded_by_opt.and_then(|s| Uuid::parse_str(&s).ok());
             let metadata: std::collections::HashMap<String, serde_json::Value> =
                 serde_json::from_str(&metadata_str).unwrap_or_default();
             edges.push(Edge {
@@ -1126,6 +1131,7 @@ impl StorageTrait for SqliteBackend {
                 weight: weight as f32,
                 valid_at,
                 invalid_at,
+                superseded_by,
                 metadata,
             });
         }

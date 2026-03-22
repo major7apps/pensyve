@@ -218,7 +218,7 @@ Namespace (isolation boundary)
 
 ### Retrieval Pipeline
 
-1. **Embed** query via ONNX (all-MiniLM-L6-v2, 384 dims)
+1. **Embed** query via ONNX (Alibaba-NLP/gte-base-en-v1.5, 768 dims)
 2. **Classify intent** — Question/Action/Recall/General (keyword heuristics)
 3. **Vector search** — cosine similarity against stored embeddings
 4. **BM25 search** — FTS5 lexical matching

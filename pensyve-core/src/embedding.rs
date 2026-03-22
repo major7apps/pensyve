@@ -28,6 +28,25 @@ enum EmbedderInner {
 }
 
 // ---------------------------------------------------------------------------
+// Supported models
+// ---------------------------------------------------------------------------
+
+/// Known embedding models and their output dimensionality.
+pub const SUPPORTED_MODELS: &[(&str, usize)] = &[
+    ("Alibaba-NLP/gte-base-en-v1.5", 768),
+    ("all-MiniLM-L6-v2", 384),
+    ("sentence-transformers/all-MiniLM-L6-v2", 384),
+];
+
+/// Returns the embedding dimensions for a known model, or `None`.
+pub fn model_dimensions(model_name: &str) -> Option<usize> {
+    SUPPORTED_MODELS
+        .iter()
+        .find(|(name, _)| *name == model_name)
+        .map(|(_, dims)| *dims)
+}
+
+// ---------------------------------------------------------------------------
 // OnnxEmbedder
 // ---------------------------------------------------------------------------
 
@@ -38,16 +57,23 @@ pub struct OnnxEmbedder {
 
 impl OnnxEmbedder {
     /// Create a real ONNX-backed embedder using fastembed.
-    /// Downloads the model to the `HuggingFace` cache on first use (~90 MB).
+    /// Downloads the model to the HuggingFace cache on first use.
     ///
     /// Supported model names:
-    ///   - `"all-MiniLM-L6-v2"`  → 384 dimensions
+    ///   - `"Alibaba-NLP/gte-base-en-v1.5"` → 768 dimensions (default)
+    ///   - `"all-MiniLM-L6-v2"` → 384 dimensions
+    ///   - `"sentence-transformers/all-MiniLM-L6-v2"` → 384 dimensions
     pub fn new(model_name: &str) -> EmbeddingResult<Self> {
         let (model_enum, dims) = match model_name {
-            "all-MiniLM-L6-v2" => (EmbeddingModel::AllMiniLML6V2, 384),
+            "Alibaba-NLP/gte-base-en-v1.5" => (EmbeddingModel::GTEBaseENV15, 768),
+            "all-MiniLM-L6-v2" | "sentence-transformers/all-MiniLM-L6-v2" => {
+                (EmbeddingModel::AllMiniLML6V2, 384)
+            }
             other => {
+                let supported: Vec<&str> = SUPPORTED_MODELS.iter().map(|(name, _)| *name).collect();
                 return Err(EmbeddingError::ModelLoad(format!(
-                    "Unknown model: '{other}'. Supported: all-MiniLM-L6-v2"
+                    "Unknown model: '{other}'. Supported: {}",
+                    supported.join(", ")
                 )));
             }
         };
@@ -307,5 +333,69 @@ mod tests {
         for emb in &embeddings {
             assert_eq!(emb.len(), 384);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Model registry tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_model_dimensions_known() {
+        assert_eq!(model_dimensions("Alibaba-NLP/gte-base-en-v1.5"), Some(768));
+        assert_eq!(model_dimensions("all-MiniLM-L6-v2"), Some(384));
+        assert_eq!(
+            model_dimensions("sentence-transformers/all-MiniLM-L6-v2"),
+            Some(384)
+        );
+    }
+
+    #[test]
+    fn test_model_dimensions_unknown() {
+        assert_eq!(model_dimensions("nonexistent-model"), None);
+    }
+
+    #[test]
+    fn test_sentence_transformers_alias() {
+        // "sentence-transformers/all-MiniLM-L6-v2" should resolve to the same model.
+        let result = OnnxEmbedder::new("sentence-transformers/all-MiniLM-L6-v2");
+        // This would succeed if the model is downloaded, but we only check it doesn't
+        // return "Unknown model" error.
+        if let Err(e) = &result {
+            assert!(
+                !e.to_string().contains("Unknown model"),
+                "sentence-transformers alias should be recognized"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Real GTE ONNX tests (require model download ~350 MB — run with --ignored)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore] // requires model download (~350 MB)
+    fn test_real_gte_embedding_dimensions() {
+        let embedder = OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5").unwrap();
+        let emb = embedder.embed("hello world").unwrap();
+        assert_eq!(emb.len(), 768);
+    }
+
+    #[test]
+    #[ignore] // requires model download (~350 MB)
+    fn test_real_gte_embedding_similarity() {
+        let embedder = OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5").unwrap();
+        let a = embedder.embed("The cat sat on the mat").unwrap();
+        let b = embedder.embed("A feline rested on the rug").unwrap();
+        let c = embedder.embed("Quantum physics is complex").unwrap();
+
+        let sim_ab = cosine_similarity(&a, &b);
+        let sim_ac = cosine_similarity(&a, &c);
+
+        assert!(
+            sim_ab > sim_ac,
+            "Similar sentences should have higher similarity: sim_ab={:.4}, sim_ac={:.4}",
+            sim_ab,
+            sim_ac
+        );
     }
 }

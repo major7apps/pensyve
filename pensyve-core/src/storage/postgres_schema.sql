@@ -123,14 +123,15 @@ CREATE INDEX IF NOT EXISTS idx_procedural_fts ON procedural_memories USING GIN(f
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS edges (
-    id          UUID PRIMARY KEY,
-    source      UUID NOT NULL,
-    target      UUID NOT NULL,
-    relation    TEXT NOT NULL,
-    weight      REAL NOT NULL DEFAULT 1.0,
-    valid_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    invalid_at  TIMESTAMPTZ,
-    metadata    JSONB NOT NULL DEFAULT '{}'
+    id              UUID PRIMARY KEY,
+    source          UUID NOT NULL,
+    target          UUID NOT NULL,
+    relation        TEXT NOT NULL,
+    weight          REAL NOT NULL DEFAULT 1.0,
+    valid_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    invalid_at      TIMESTAMPTZ,
+    superseded_by   UUID,
+    metadata        JSONB NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);

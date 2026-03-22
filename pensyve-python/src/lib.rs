@@ -147,13 +147,13 @@ impl PyPensyve {
             }
         };
 
-        // Try real ONNX embedder first; fall back to mock if unavailable
-        // (e.g. offline, no disk space, or model not yet downloaded).
-        let dimensions = 384; // all-MiniLM-L6-v2 output size
+        // Try GTE (768d) first, then MiniLM (384d) fallback, then mock.
         let embedder = Arc::new(
-            OnnxEmbedder::new("all-MiniLM-L6-v2")
-                .unwrap_or_else(|_| OnnxEmbedder::new_mock(dimensions)),
+            OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5")
+                .or_else(|_| OnnxEmbedder::new("all-MiniLM-L6-v2"))
+                .unwrap_or_else(|_| OnnxEmbedder::new_mock(768)),
         );
+        let dimensions = embedder.dimensions();
 
         // Create vector index.
         let vector_index = Arc::new(Mutex::new(VectorIndex::new(dimensions, 1024)));

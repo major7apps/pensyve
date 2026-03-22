@@ -77,6 +77,7 @@ type EdgeRow = (
     f32,
     DateTime<Utc>,
     Option<DateTime<Utc>>,
+    Option<Uuid>,
     serde_json::Value,
 );
 
@@ -896,10 +897,10 @@ impl StorageTrait for PostgresBackend {
         let metadata = serde_json::to_value(&edge.metadata)?;
         self.rt.block_on(async {
             query::<Postgres>(
-                r"INSERT INTO edges (id, source, target, relation, weight, valid_at, invalid_at, metadata)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                r"INSERT INTO edges (id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                    ON CONFLICT (id) DO UPDATE SET
-                       relation = $4, weight = $5, invalid_at = $7, metadata = $8",
+                       relation = $4, weight = $5, invalid_at = $7, superseded_by = $8, metadata = $9",
             )
             .bind(edge.id)
             .bind(edge.source)
@@ -908,6 +909,7 @@ impl StorageTrait for PostgresBackend {
             .bind(edge.weight)
             .bind(edge.valid_at)
             .bind(edge.invalid_at)
+            .bind(edge.superseded_by)
             .bind(&metadata)
             .execute(&self.pool)
             .await
@@ -919,7 +921,7 @@ impl StorageTrait for PostgresBackend {
     fn get_edges_for_entity(&self, entity_id: Uuid) -> StorageResult<Vec<Edge>> {
         self.rt.block_on(async {
             let rows: Vec<EdgeRow> = query_as::<Postgres, _>(
-                r"SELECT id, source, target, relation, weight, valid_at, invalid_at, metadata
+                r"SELECT id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata
                    FROM edges WHERE source = $1 OR target = $1",
             )
             .bind(entity_id)
@@ -930,7 +932,7 @@ impl StorageTrait for PostgresBackend {
             Ok(rows
                 .into_iter()
                 .map(
-                    |(id, source, target, relation, weight, valid_at, invalid_at, metadata)| {
+                    |(id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata)| {
                         let metadata: HashMap<String, serde_json::Value> =
                             serde_json::from_value(metadata).unwrap_or_default();
                         Edge {
@@ -941,6 +943,7 @@ impl StorageTrait for PostgresBackend {
                             weight,
                             valid_at,
                             invalid_at,
+                            superseded_by,
                             metadata,
                         }
                     },
