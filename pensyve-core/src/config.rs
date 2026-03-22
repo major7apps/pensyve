@@ -64,8 +64,8 @@ impl Default for PensyveConfig {
                 path: home.to_string_lossy().into_owned(),
             },
             embedding: EmbeddingConfig {
-                model: "all-MiniLM-L6-v2".to_string(),
-                dimensions: 384,
+                model: "Alibaba-NLP/gte-base-en-v1.5".to_string(),
+                dimensions: 768,
             },
             extraction: ExtractionConfig { default_tier: 1 },
             retrieval: RetrievalConfig {

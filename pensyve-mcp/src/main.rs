@@ -534,17 +534,26 @@ async fn main() -> Result<()> {
         Err(e) => return Err(anyhow::anyhow!("Storage error: {e}")),
     };
 
-    // Initialize embedder: try real ONNX model, fall back to mock.
-    let embedder = match OnnxEmbedder::new("all-MiniLM-L6-v2") {
+    // Initialize embedder: try GTE (768d) first, then MiniLM (384d), then mock.
+    let embedder = match OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5") {
         Ok(e) => {
-            eprintln!("Using real ONNX embedder (all-MiniLM-L6-v2, 384 dims)");
+            eprintln!("Using real ONNX embedder (Alibaba-NLP/gte-base-en-v1.5, 768 dims)");
             e
         }
-        Err(err) => {
-            eprintln!(
-                "Warning: ONNX embedder unavailable ({err}), falling back to mock (384 dims)"
-            );
-            OnnxEmbedder::new_mock(384)
+        Err(gte_err) => {
+            eprintln!("GTE model unavailable ({gte_err}), trying all-MiniLM-L6-v2 fallback");
+            match OnnxEmbedder::new("all-MiniLM-L6-v2") {
+                Ok(e) => {
+                    eprintln!("Using fallback ONNX embedder (all-MiniLM-L6-v2, 384 dims)");
+                    e
+                }
+                Err(mini_err) => {
+                    eprintln!(
+                        "Warning: ONNX embedders unavailable ({mini_err}), falling back to mock (768 dims)"
+                    );
+                    OnnxEmbedder::new_mock(768)
+                }
+            }
         }
     };
 

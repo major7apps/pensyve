@@ -313,6 +313,8 @@ pub struct Edge {
     pub weight: f32,
     pub valid_at: DateTime<Utc>,
     pub invalid_at: Option<DateTime<Utc>>,
+    /// ID of the edge that superseded (replaced) this one, if any.
+    pub superseded_by: Option<Uuid>,
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
@@ -326,8 +328,14 @@ impl Edge {
             weight: 1.0,
             valid_at: Utc::now(),
             invalid_at: None,
+            superseded_by: None,
             metadata: HashMap::new(),
         }
+    }
+
+    /// Returns `true` if this edge is temporally valid (not yet invalidated).
+    pub fn is_valid(&self) -> bool {
+        self.invalid_at.is_none()
     }
 }
 

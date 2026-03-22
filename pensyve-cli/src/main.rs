@@ -132,7 +132,7 @@ fn cmd_recall(
     let storage = open_storage(&path)?;
     let ns = ensure_namespace(&storage, namespace_name)?;
 
-    // Phase 1: mock embedder with 768 dimensions (matching default config).
+    // Mock embedder with 768 dimensions (matching default config: Alibaba-NLP/gte-base-en-v1.5).
     let embedder = OnnxEmbedder::new_mock(768);
     let vector_index = build_vector_index(&storage, ns.id, 768)?;
 

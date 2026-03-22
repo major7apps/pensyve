@@ -20,6 +20,7 @@ from .models import (
     EpisodeEndResponse,
     EpisodeStartRequest,
     EpisodeStartResponse,
+    FeedbackRequest,
     ForgetResponse,
     InspectRequest,
     InspectResponse,
@@ -209,6 +210,16 @@ def recall(req: RecallRequest, cursor: str | None = None):
         contradictions=contradictions,
         cursor=next_cursor,
     )
+
+
+@app.post("/v1/feedback")
+def submit_feedback(req: FeedbackRequest):
+    """Record user feedback on a recalled memory to improve retrieval weights."""
+    # For now, log the feedback. Full weight learning requires the Rust WeightLearner
+    # to be exposed via PyO3 (future work).
+    logger.info("Feedback: memory=%s relevant=%s", req.memory_id, req.relevant)
+    _activity.record("feedback", f"memory={req.memory_id} relevant={req.relevant}")
+    return {"status": "recorded"}
 
 
 @app.post(

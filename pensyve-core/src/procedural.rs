@@ -58,6 +58,52 @@ pub fn select_best_procedure(
         .map(|(i, _)| i)
 }
 
+/// Transfer high-reliability procedures from one entity's namespace to another.
+///
+/// Only transfers procedures with reliability above `min_reliability` and
+/// at least `min_trials` observations. Transferred procedures get a
+/// reduced initial reliability (70% of source) to account for context
+/// differences.
+pub fn transfer_procedures(
+    source_procedures: &[ProceduralMemory],
+    existing_procedures: &[ProceduralMemory],
+    min_reliability: f32,
+    min_trials: u32,
+) -> Vec<ProceduralMemory> {
+    let transfer_discount = 0.7;
+    let mut transferred = Vec::new();
+
+    for proc in source_procedures {
+        // Skip low-reliability or low-sample procedures
+        if proc.reliability < min_reliability || proc.trial_count < min_trials {
+            continue;
+        }
+
+        // Skip if target already has a similar procedure (same trigger+action)
+        let already_exists = existing_procedures
+            .iter()
+            .any(|existing| existing.trigger == proc.trigger && existing.action == proc.action);
+        if already_exists {
+            continue;
+        }
+
+        // Create transferred copy with reduced reliability
+        let mut transferred_proc = ProceduralMemory::new(
+            proc.namespace_id,
+            proc.trigger.clone(),
+            proc.action.clone(),
+            proc.outcome.clone(),
+            proc.context.clone(),
+        );
+        transferred_proc.reliability = proc.reliability * transfer_discount;
+        transferred_proc.trial_count = 0; // Reset trials for new context
+        transferred_proc.success_count = 0;
+        transferred.push(transferred_proc);
+    }
+
+    transferred
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -190,5 +236,85 @@ mod tests {
         assert_eq!(successes, 0);
         // Beta(1,2) mean = 1/3 ≈ 0.333
         assert!((rel - 0.333).abs() < 0.01);
+    }
+
+    // -----------------------------------------------------------------------
+    // transfer_procedures tests
+    // -----------------------------------------------------------------------
+
+    fn make_proc(
+        trigger: &str,
+        action: &str,
+        reliability: f32,
+        trial_count: u32,
+    ) -> ProceduralMemory {
+        let mut p = ProceduralMemory::new(
+            Uuid::new_v4(),
+            trigger,
+            action,
+            Outcome::Success,
+            HashMap::new(),
+        );
+        p.reliability = reliability;
+        p.trial_count = trial_count;
+        p.success_count = trial_count; // assume all successes for simplicity
+        p
+    }
+
+    #[test]
+    fn test_transfer_high_reliability_only() {
+        let source = vec![
+            make_proc("on_error", "retry", 0.9, 20),
+            make_proc("on_timeout", "backoff", 0.3, 20),
+        ];
+        let existing: Vec<ProceduralMemory> = vec![];
+
+        let result = transfer_procedures(&source, &existing, 0.7, 5);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].trigger, "on_error");
+    }
+
+    #[test]
+    fn test_transfer_applies_discount() {
+        let source = vec![make_proc("on_error", "retry", 0.9, 20)];
+        let existing: Vec<ProceduralMemory> = vec![];
+
+        let result = transfer_procedures(&source, &existing, 0.5, 5);
+        assert_eq!(result.len(), 1);
+        // 0.9 * 0.7 = 0.63
+        assert!((result[0].reliability - 0.63).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_transfer_skips_duplicates() {
+        let source = vec![make_proc("on_error", "retry", 0.9, 20)];
+        let existing = vec![make_proc("on_error", "retry", 0.5, 5)];
+
+        let result = transfer_procedures(&source, &existing, 0.5, 5);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_transfer_resets_trial_count() {
+        let source = vec![make_proc("on_error", "retry", 0.9, 20)];
+        let existing: Vec<ProceduralMemory> = vec![];
+
+        let result = transfer_procedures(&source, &existing, 0.5, 5);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].trial_count, 0);
+        assert_eq!(result[0].success_count, 0);
+    }
+
+    #[test]
+    fn test_transfer_respects_min_trials() {
+        let source = vec![
+            make_proc("on_error", "retry", 0.9, 3), // only 3 trials, below min
+            make_proc("on_timeout", "backoff", 0.85, 10), // 10 trials, above min
+        ];
+        let existing: Vec<ProceduralMemory> = vec![];
+
+        let result = transfer_procedures(&source, &existing, 0.7, 5);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].trigger, "on_timeout");
     }
 }

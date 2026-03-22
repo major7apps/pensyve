@@ -112,3 +112,9 @@ class RecentEventResponse(BaseModel):
     type: str
     content: str
     timestamp: str
+
+
+class FeedbackRequest(BaseModel):
+    memory_id: str
+    relevant: bool
+    signals: list[float] | None = None  # Optional; server can look up from last recall
