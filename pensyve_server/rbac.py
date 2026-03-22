@@ -5,8 +5,8 @@ behind Writer+ permissions. Read operations require Reader+ (currently
 all authenticated users).
 """
 
-import os
 import logging
+import os
 
 from fastapi import HTTPException, Request
 
@@ -48,7 +48,9 @@ def require_role(required: str):
         if caller_level < required_level:
             logger.warning(
                 "RBAC denied: caller_role=%s required=%s path=%s",
-                caller_role, required, request.url.path,
+                caller_role,
+                required,
+                request.url.path,
             )
             raise HTTPException(
                 status_code=403,
