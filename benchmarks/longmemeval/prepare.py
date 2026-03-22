@@ -82,8 +82,7 @@ def _download_dataset(output_dir: Path) -> Path:
 
     # If neither worked, list available files to help debug.
     print(
-        f"\nError: Could not find {_HF_FILENAME} or {_HF_FILENAME_ALT} "
-        f"in {_HF_REPO_ID}.",
+        f"\nError: Could not find {_HF_FILENAME} or {_HF_FILENAME_ALT} in {_HF_REPO_ID}.",
         file=sys.stderr,
     )
     print("Attempting to list available files...", file=sys.stderr)
@@ -153,10 +152,12 @@ def _convert_dataset(raw_path: Path, output_dir: Path) -> tuple[int, int]:
                 # Clean up messages: remove 'has_answer' field, keep role+content.
                 messages = []
                 for turn in session:
-                    messages.append({
-                        "role": turn["role"],
-                        "content": turn["content"],
-                    })
+                    messages.append(
+                        {
+                            "role": turn["role"],
+                            "content": turn["content"],
+                        }
+                    )
 
                 metadata: dict[str, str] = {}
                 if idx < len(haystack_dates):
@@ -181,14 +182,16 @@ def _convert_dataset(raw_path: Path, output_dir: Path) -> tuple[int, int]:
 
         difficulty = _DIFFICULTY_MAP.get(question_type, "medium")
 
-        queries.append({
-            "query_id": question_id,
-            "question": question,
-            "gold_answer": answer,
-            "conversation_id": primary_conv_id,
-            "difficulty": difficulty,
-            "question_type": question_type,
-        })
+        queries.append(
+            {
+                "query_id": question_id,
+                "question": question,
+                "gold_answer": answer,
+                "conversation_id": primary_conv_id,
+                "difficulty": difficulty,
+                "question_type": question_type,
+            }
+        )
 
     conversations = list(conversations_by_id.values())
 
@@ -283,7 +286,7 @@ def main() -> int:
     print(f"  Output directory: {output_dir}")
     print(f"  Conversations:    {num_convs}")
     print(f"  Queries:          {num_queries}")
-    print(f"\nRun the benchmark with:")
+    print("\nRun the benchmark with:")
     print(f"  python benchmarks/longmemeval/run.py --data-dir {output_dir}")
 
     return 0

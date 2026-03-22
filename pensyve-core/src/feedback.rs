@@ -57,11 +57,10 @@ impl WeightLearner {
     /// increase weights proportional to the signal values. For irrelevant
     /// memories, we decrease weights.
     pub fn update(&mut self, feedback: &RetrievalFeedback) {
-        let direction = if feedback.relevant { 1.0_f32 } else { -1.0_f32 };
+        let direction: f32 = if feedback.relevant { 1.0 } else { -1.0 };
 
-        for i in 0..8 {
-            self.weights[i] += self.learning_rate * direction * feedback.signals[i];
-            self.weights[i] = self.weights[i].max(MIN_WEIGHT);
+        for (w, &signal) in self.weights.iter_mut().zip(&feedback.signals) {
+            *w = (*w + self.learning_rate * direction * signal).max(MIN_WEIGHT);
         }
 
         // Normalize so weights sum to 1.0

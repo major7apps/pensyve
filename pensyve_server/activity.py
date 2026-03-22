@@ -9,6 +9,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import ClassVar
 
 
 @dataclass
@@ -43,6 +44,13 @@ class ActivityTracker:
         with self._lock:
             return list(reversed(self._events[-limit:]))
 
+    # Maps event_type to the corresponding key in the daily summary dict
+    _EVENT_TYPE_TO_KEY: ClassVar[dict[str, str]] = {
+        "recall": "recalls",
+        "remember": "remembers",
+        "forget": "forgets",
+    }
+
     def daily_summary(self, days: int = 30) -> list[dict]:
         """Aggregate events by date for the past N days."""
         with self._lock:
@@ -50,13 +58,10 @@ class ActivityTracker:
                 lambda: {"recalls": 0, "remembers": 0, "forgets": 0}
             )
             for event in self._events:
-                date = event.timestamp[:10]  # "2026-03-22"
-                if event.event_type == "recall":
-                    counts[date]["recalls"] += 1
-                elif event.event_type == "remember":
-                    counts[date]["remembers"] += 1
-                elif event.event_type == "forget":
-                    counts[date]["forgets"] += 1
+                key = self._EVENT_TYPE_TO_KEY.get(event.event_type)
+                if key:
+                    date = event.timestamp[:10]  # "2026-03-22"
+                    counts[date][key] += 1
 
         # Return sorted by date, last N days
         sorted_dates = sorted(counts.keys(), reverse=True)[:days]

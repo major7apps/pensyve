@@ -153,6 +153,11 @@ const VISUAL_KEYWORDS: &[&str] = &[
     "layout",
 ];
 
+/// Returns true if the text contains any of the given keywords.
+fn matches_any(text: &str, keywords: &[&str]) -> bool {
+    keywords.iter().any(|kw| text.contains(kw))
+}
+
 /// Classify the intent of a query using keyword pattern matching.
 ///
 /// The classifier checks for keywords in priority order: Recall cues first
@@ -161,33 +166,18 @@ const VISUAL_KEYWORDS: &[&str] = &[
 pub fn classify_intent(query: &str) -> QueryIntent {
     let lower = query.to_lowercase();
 
-    for kw in RECALL_KEYWORDS {
-        if lower.contains(kw) {
-            return QueryIntent::Recall;
-        }
-    }
+    // Priority order: most specific first.
+    let checks: &[(&[&str], QueryIntent)] = &[
+        (RECALL_KEYWORDS, QueryIntent::Recall),
+        (CODE_KEYWORDS, QueryIntent::Code),
+        (VISUAL_KEYWORDS, QueryIntent::Visual),
+        (ACTION_KEYWORDS, QueryIntent::Action),
+        (QUESTION_KEYWORDS, QueryIntent::Question),
+    ];
 
-    for kw in CODE_KEYWORDS {
-        if lower.contains(kw) {
-            return QueryIntent::Code;
-        }
-    }
-
-    for kw in VISUAL_KEYWORDS {
-        if lower.contains(kw) {
-            return QueryIntent::Visual;
-        }
-    }
-
-    for kw in ACTION_KEYWORDS {
-        if lower.contains(kw) {
-            return QueryIntent::Action;
-        }
-    }
-
-    for kw in QUESTION_KEYWORDS {
-        if lower.contains(kw) {
-            return QueryIntent::Question;
+    for (keywords, intent) in checks {
+        if matches_any(&lower, keywords) {
+            return intent.clone();
         }
     }
 

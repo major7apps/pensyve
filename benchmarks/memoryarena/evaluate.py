@@ -49,7 +49,12 @@ def evaluate(
         for scenario in scenarios:
             category = scenario.category
             if category not in results.by_category:
-                results.by_category[category] = {"correct": 0, "incorrect": 0, "neutral": 0, "total": 0}
+                results.by_category[category] = {
+                    "correct": 0,
+                    "incorrect": 0,
+                    "neutral": 0,
+                    "total": 0,
+                }
 
             # Ingest setup messages
             t0 = time.time()
@@ -79,13 +84,15 @@ def evaluate(
                 results.incorrect += 1
                 results.by_category[category]["incorrect"] += 1
                 status = "INCORRECT"
-                results.failures.append({
-                    "scenario_id": scenario.scenario_id,
-                    "category": category,
-                    "question": scenario.test_query,
-                    "expected": scenario.correct_action,
-                    "got_incorrect": scenario.incorrect_action,
-                })
+                results.failures.append(
+                    {
+                        "scenario_id": scenario.scenario_id,
+                        "category": category,
+                        "question": scenario.test_query,
+                        "expected": scenario.correct_action,
+                        "got_incorrect": scenario.incorrect_action,
+                    }
+                )
             else:
                 results.neutral += 1
                 results.by_category[category]["neutral"] += 1

@@ -43,12 +43,10 @@ async def rate_limit_check(request: Request):
     if _RATE_LIMIT <= 0:
         return  # Disabled
 
-    # Key by API key or client IP
-    key = (
-        request.headers.get("X-Pensyve-Key", "") or request.client.host
-        if request.client
-        else "unknown"
-    )
+    # Key by API key if present, otherwise client IP
+    key = request.headers.get("X-Pensyve-Key", "")
+    if not key:
+        key = request.client.host if request.client else "unknown"
     bucket = _buckets[key]
     if not bucket.consume():
         logger.warning("Rate limit exceeded for key=%s", key[:12])

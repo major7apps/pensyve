@@ -35,9 +35,10 @@ impl MultiModalIndex {
         embedding: &[f32],
         content_type: &str,
     ) -> Result<(), crate::vector::VectorError> {
-        match content_type {
-            "image" | "Image" => self.image.add(id, embedding),
-            "code" | "Code" => self.code.add(id, embedding),
+        let lower = content_type.to_lowercase();
+        match lower.as_str() {
+            "image" => self.image.add(id, embedding),
+            "code" => self.code.add(id, embedding),
             _ => self.text.add(id, embedding),
         }
     }
@@ -51,21 +52,19 @@ impl MultiModalIndex {
         limit: usize,
     ) -> Result<Vec<(Uuid, f32, ModalitySpace)>, crate::vector::VectorError> {
         let mut results = Vec::new();
+        let query_dims = query_embedding.len();
 
-        // Only search spaces whose dimensionality matches the query
-        if query_embedding.len() == self.text.dimensions() {
-            for (id, score) in self.text.search(query_embedding, limit)? {
-                results.push((id, score, ModalitySpace::Text));
-            }
-        }
-        if query_embedding.len() == self.image.dimensions() {
-            for (id, score) in self.image.search(query_embedding, limit)? {
-                results.push((id, score, ModalitySpace::Image));
-            }
-        }
-        if query_embedding.len() == self.code.dimensions() {
-            for (id, score) in self.code.search(query_embedding, limit)? {
-                results.push((id, score, ModalitySpace::Code));
+        let spaces: &[(&VectorIndex, ModalitySpace)] = &[
+            (&self.text, ModalitySpace::Text),
+            (&self.image, ModalitySpace::Image),
+            (&self.code, ModalitySpace::Code),
+        ];
+
+        for (index, space) in spaces {
+            if query_dims == index.dimensions() {
+                for (id, score) in index.search(query_embedding, limit)? {
+                    results.push((id, score, space.clone()));
+                }
             }
         }
 

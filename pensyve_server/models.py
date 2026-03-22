@@ -57,11 +57,6 @@ class RememberRequest(BaseModel):
     confidence: float = 0.8
 
 
-class ForgetRequest(BaseModel):
-    entity: str
-    hard_delete: bool = False
-
-
 class ForgetResponse(BaseModel):
     forgotten_count: int
 

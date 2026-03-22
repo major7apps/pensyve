@@ -72,13 +72,9 @@ impl MemoryGraph {
     /// Invalidate an edge by setting its `invalid_at` timestamp.
     /// Optionally records which edge superseded this one.
     pub fn invalidate_edge(&mut self, from: Uuid, to: Uuid, superseded_by: Option<Uuid>) {
-        let from_idx = match self.node_map.get(&from) {
-            Some(idx) => *idx,
-            None => return,
-        };
-        let to_idx = match self.node_map.get(&to) {
-            Some(idx) => *idx,
-            None => return,
+        let (Some(&from_idx), Some(&to_idx)) = (self.node_map.get(&from), self.node_map.get(&to))
+        else {
+            return;
         };
 
         // Find all petgraph edges from → to and invalidate those that are still valid.
@@ -100,37 +96,30 @@ impl MemoryGraph {
 
     /// Get only temporally valid edges for an entity (where `invalid_at` is `None`).
     pub fn get_valid_edges(&self, entity_id: Uuid) -> Vec<&Edge> {
-        let node_idx = match self.node_map.get(&entity_id) {
-            Some(idx) => *idx,
-            None => return Vec::new(),
+        let Some(&node_idx) = self.node_map.get(&entity_id) else {
+            return Vec::new();
         };
 
-        let mut result = Vec::new();
-        for edge_ref in self.graph.edges(node_idx) {
-            if let Some(meta) = self.edge_meta.get(&edge_ref.id())
-                && meta.invalid_at.is_none()
-            {
-                result.push(meta);
-            }
-        }
-        result
+        self.graph
+            .edges(node_idx)
+            .filter_map(|edge_ref| self.edge_meta.get(&edge_ref.id()))
+            .filter(|meta| meta.invalid_at.is_none())
+            .collect()
     }
 
     /// Get the temporal history of an entity's relationships, including
     /// superseded edges, sorted by `valid_at` ascending.
     pub fn get_edge_history(&self, entity_id: Uuid) -> Vec<&Edge> {
-        let node_idx = match self.node_map.get(&entity_id) {
-            Some(idx) => *idx,
-            None => return Vec::new(),
+        let Some(&node_idx) = self.node_map.get(&entity_id) else {
+            return Vec::new();
         };
 
-        let mut result: Vec<&Edge> = Vec::new();
-        for edge_ref in self.graph.edges(node_idx) {
-            if let Some(meta) = self.edge_meta.get(&edge_ref.id()) {
-                result.push(meta);
-            }
-        }
-        // Sort by valid_at ascending for chronological history.
+        let mut result: Vec<&Edge> = self
+            .graph
+            .edges(node_idx)
+            .filter_map(|edge_ref| self.edge_meta.get(&edge_ref.id()))
+            .collect();
+
         result.sort_by_key(|e| e.valid_at);
         result
     }
@@ -145,9 +134,8 @@ impl MemoryGraph {
     /// number of hops from `start`.  Nodes at depth 1 score 0.5, depth 2
     /// score 0.333, etc.
     pub fn traverse(&self, start: Uuid, max_depth: usize) -> Vec<(Uuid, f32)> {
-        let start_idx = match self.node_map.get(&start) {
-            Some(idx) => *idx,
-            None => return Vec::new(),
+        let Some(&start_idx) = self.node_map.get(&start) else {
+            return Vec::new();
         };
 
         // BFS: (node_index, depth)

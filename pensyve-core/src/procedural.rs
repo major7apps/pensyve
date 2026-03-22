@@ -71,37 +71,29 @@ pub fn transfer_procedures(
     min_trials: u32,
 ) -> Vec<ProceduralMemory> {
     let transfer_discount = 0.7;
-    let mut transferred = Vec::new();
 
-    for proc in source_procedures {
-        // Skip low-reliability or low-sample procedures
-        if proc.reliability < min_reliability || proc.trial_count < min_trials {
-            continue;
-        }
-
-        // Skip if target already has a similar procedure (same trigger+action)
-        let already_exists = existing_procedures
-            .iter()
-            .any(|existing| existing.trigger == proc.trigger && existing.action == proc.action);
-        if already_exists {
-            continue;
-        }
-
-        // Create transferred copy with reduced reliability
-        let mut transferred_proc = ProceduralMemory::new(
-            proc.namespace_id,
-            proc.trigger.clone(),
-            proc.action.clone(),
-            proc.outcome.clone(),
-            proc.context.clone(),
-        );
-        transferred_proc.reliability = proc.reliability * transfer_discount;
-        transferred_proc.trial_count = 0; // Reset trials for new context
-        transferred_proc.success_count = 0;
-        transferred.push(transferred_proc);
-    }
-
-    transferred
+    source_procedures
+        .iter()
+        .filter(|proc| proc.reliability >= min_reliability && proc.trial_count >= min_trials)
+        .filter(|proc| {
+            !existing_procedures
+                .iter()
+                .any(|existing| existing.trigger == proc.trigger && existing.action == proc.action)
+        })
+        .map(|proc| {
+            let mut transferred_proc = ProceduralMemory::new(
+                proc.namespace_id,
+                proc.trigger.clone(),
+                proc.action.clone(),
+                proc.outcome.clone(),
+                proc.context.clone(),
+            );
+            transferred_proc.reliability = proc.reliability * transfer_discount;
+            transferred_proc.trial_count = 0;
+            transferred_proc.success_count = 0;
+            transferred_proc
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
