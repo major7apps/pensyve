@@ -2,6 +2,7 @@ import logging
 import os
 import time
 import uuid
+from collections import Counter
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -75,12 +76,15 @@ _usage_tracker = UsageTracker()
 _activity = ActivityTracker()
 
 
+def _get_namespace() -> str:
+    return os.environ.get("PENSYVE_NAMESPACE", "default")
+
+
 def get_pensyve():
     global _pensyve
     if _pensyve is None:
         path = os.environ.get("PENSYVE_PATH", None)
-        namespace = os.environ.get("PENSYVE_NAMESPACE", "default")
-        _pensyve = pensyve.Pensyve(path=path, namespace=namespace)
+        _pensyve = pensyve.Pensyve(path=path, namespace=_get_namespace())
     return _pensyve
 
 
@@ -185,9 +189,9 @@ def recall(req: RecallRequest, cursor: str | None = None):
         req.query,
         entity=entity,
         limit=fetch_limit,
-        types=req.types if req.types else None,
+        types=req.types or None,
     )
-    _usage_tracker.record_recall(os.environ.get("PENSYVE_NAMESPACE", "default"))
+    _usage_tracker.record_recall(_get_namespace())
     _activity.record("recall", req.query)
     memories = [_memory_to_response(m) for m in results]
 
@@ -243,7 +247,7 @@ def remember(req: RememberRequest):
         except Exception:
             logger.warning("Tier 2 fact extraction failed", exc_info=True)
 
-    _usage_tracker.record_store(os.environ.get("PENSYVE_NAMESPACE", "default"))
+    _usage_tracker.record_store(_get_namespace())
     _activity.record("remember", req.fact[:100])
     return _memory_to_response(mem)
 
@@ -300,20 +304,17 @@ def consolidate():
 @app.get("/v1/stats", response_model=StatsResponse)
 def get_stats():
     p = get_pensyve()
-    namespace = os.environ.get("PENSYVE_NAMESPACE", "default")
 
-    # Single broad recall, then group client-side
+    # Single broad recall, then count by type in one pass
     all_memories = p.recall("*", limit=1000)
-    episodic_count = sum(1 for m in all_memories if m.memory_type == "episodic")
-    semantic_count = sum(1 for m in all_memories if m.memory_type == "semantic")
-    procedural_count = sum(1 for m in all_memories if m.memory_type == "procedural")
+    type_counts = Counter(m.memory_type for m in all_memories)
 
     return StatsResponse(
-        namespace=namespace,
+        namespace=_get_namespace(),
         entities=0,  # Not available via SDK — requires storage-level count query
-        episodic_memories=episodic_count,
-        semantic_memories=semantic_count,
-        procedural_memories=procedural_count,
+        episodic_memories=type_counts.get("episodic", 0),
+        semantic_memories=type_counts.get("semantic", 0),
+        procedural_memories=type_counts.get("procedural", 0),
     )
 
 
@@ -346,7 +347,7 @@ def inspect(req: InspectRequest):
 
 @app.get("/v1/usage")
 def get_usage():
-    namespace = os.environ.get("PENSYVE_NAMESPACE", "default")
+    namespace = _get_namespace()
     usage = _usage_tracker.get_usage(namespace)
     return {
         "namespace": namespace,

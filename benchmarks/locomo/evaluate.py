@@ -73,12 +73,14 @@ def evaluate(
             else:
                 results.misses += 1
                 results.by_category[category]["misses"] += 1
-                results.missed_queries.append({
-                    "query_id": query.query_id,
-                    "question": query.question,
-                    "gold_answer": query.gold_answer,
-                    "category": category,
-                })
+                results.missed_queries.append(
+                    {
+                        "query_id": query.query_id,
+                        "question": query.question,
+                        "gold_answer": query.gold_answer,
+                        "category": category,
+                    }
+                )
 
             if verbose:
                 status = "HIT" if hit else "MISS"

@@ -9,7 +9,7 @@ Tests whether an agent can:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -30,7 +30,10 @@ def load_builtin() -> list[ArenaScenario]:
             scenario_id="ma-1",
             category="preference",
             setup_messages=[
-                {"role": "user", "content": "I always want code examples in Python, never JavaScript"},
+                {
+                    "role": "user",
+                    "content": "I always want code examples in Python, never JavaScript",
+                },
                 {"role": "assistant", "content": "Noted, I'll use Python for all code examples."},
             ],
             test_query="What language should code examples use?",
@@ -56,7 +59,10 @@ def load_builtin() -> list[ArenaScenario]:
                 {"role": "user", "content": "Don't use pip install directly, always use uv"},
                 {"role": "assistant", "content": "I'll use uv for all Python package management."},
                 {"role": "user", "content": "Last time you used pip and it broke the venv"},
-                {"role": "assistant", "content": "Sorry about that, I'll stick to uv going forward."},
+                {
+                    "role": "assistant",
+                    "content": "Sorry about that, I'll stick to uv going forward.",
+                },
             ],
             test_query="How should I install Python packages?",
             correct_action="uv",
@@ -66,7 +72,10 @@ def load_builtin() -> list[ArenaScenario]:
             scenario_id="ma-4",
             category="mistake_avoidance",
             setup_messages=[
-                {"role": "user", "content": "Never use force push to main, it caused an outage last month"},
+                {
+                    "role": "user",
+                    "content": "Never use force push to main, it caused an outage last month",
+                },
                 {"role": "assistant", "content": "Understood, no force pushing to main."},
             ],
             test_query="Can I force push to the main branch?",
@@ -78,7 +87,10 @@ def load_builtin() -> list[ArenaScenario]:
             scenario_id="ma-5",
             category="procedure_selection",
             setup_messages=[
-                {"role": "user", "content": "For database migrations, always use alembic, not raw SQL"},
+                {
+                    "role": "user",
+                    "content": "For database migrations, always use alembic, not raw SQL",
+                },
                 {"role": "assistant", "content": "I'll use alembic for all migration work."},
             ],
             test_query="How should I handle database schema changes?",
@@ -89,7 +101,10 @@ def load_builtin() -> list[ArenaScenario]:
             scenario_id="ma-6",
             category="procedure_selection",
             setup_messages=[
-                {"role": "user", "content": "Deploy to staging first, then prod. Never skip staging."},
+                {
+                    "role": "user",
+                    "content": "Deploy to staging first, then prod. Never skip staging.",
+                },
                 {"role": "assistant", "content": "Understood, staging before production always."},
             ],
             test_query="What's the deployment procedure?",

@@ -46,7 +46,10 @@ def load_builtin() -> tuple[list[LoCoMoConversation], list[LoCoMoQuery]]:
         LoCoMoConversation(
             conversation_id="lc-2",
             messages=[
-                {"role": "user", "content": "Actually I changed my mind, I accepted the offer from Meta instead"},
+                {
+                    "role": "user",
+                    "content": "Actually I changed my mind, I accepted the offer from Meta instead",
+                },
                 {"role": "assistant", "content": "Meta is also a great choice!"},
             ],
             timestamp="2026-01-20",
@@ -54,7 +57,10 @@ def load_builtin() -> tuple[list[LoCoMoConversation], list[LoCoMoQuery]]:
         LoCoMoConversation(
             conversation_id="lc-3",
             messages=[
-                {"role": "user", "content": "I've been learning Rust for 3 months now. Also started Go last week."},
+                {
+                    "role": "user",
+                    "content": "I've been learning Rust for 3 months now. Also started Go last week.",
+                },
                 {"role": "assistant", "content": "Both are great systems languages."},
             ],
             timestamp="2026-02-01",
@@ -62,7 +68,10 @@ def load_builtin() -> tuple[list[LoCoMoConversation], list[LoCoMoQuery]]:
         LoCoMoConversation(
             conversation_id="lc-4",
             messages=[
-                {"role": "user", "content": "My Rust project uses async with Tokio. The Go project is a CLI tool."},
+                {
+                    "role": "user",
+                    "content": "My Rust project uses async with Tokio. The Go project is a CLI tool.",
+                },
                 {"role": "assistant", "content": "Nice combination of async and CLI work."},
             ],
             timestamp="2026-02-15",
@@ -70,7 +79,10 @@ def load_builtin() -> tuple[list[LoCoMoConversation], list[LoCoMoQuery]]:
         LoCoMoConversation(
             conversation_id="lc-5",
             messages=[
-                {"role": "user", "content": "I ran 5 miles on Monday, 3 miles Tuesday, and 7 miles Wednesday"},
+                {
+                    "role": "user",
+                    "content": "I ran 5 miles on Monday, 3 miles Tuesday, and 7 miles Wednesday",
+                },
                 {"role": "assistant", "content": "That's a solid training week so far."},
             ],
             timestamp="2026-03-01",
@@ -79,17 +91,55 @@ def load_builtin() -> tuple[list[LoCoMoConversation], list[LoCoMoQuery]]:
 
     queries = [
         # Temporal
-        LoCoMoQuery("lq-1", "Which company did the user accept a job at first?", "Google", "temporal", ["lc-1", "lc-2"]),
+        LoCoMoQuery(
+            "lq-1",
+            "Which company did the user accept a job at first?",
+            "Google",
+            "temporal",
+            ["lc-1", "lc-2"],
+        ),
         LoCoMoQuery("lq-2", "Did the user learn Rust or Go first?", "Rust", "temporal", ["lc-3"]),
         # Multi-hop
-        LoCoMoQuery("lq-3", "What async runtime does the user use for their Rust project?", "Tokio", "multihop", ["lc-3", "lc-4"]),
-        LoCoMoQuery("lq-4", "What type of project is the user building in Go?", "CLI tool", "multihop", ["lc-3", "lc-4"]),
+        LoCoMoQuery(
+            "lq-3",
+            "What async runtime does the user use for their Rust project?",
+            "Tokio",
+            "multihop",
+            ["lc-3", "lc-4"],
+        ),
+        LoCoMoQuery(
+            "lq-4",
+            "What type of project is the user building in Go?",
+            "CLI tool",
+            "multihop",
+            ["lc-3", "lc-4"],
+        ),
         # Contradictory
-        LoCoMoQuery("lq-5", "Where does the user currently work?", "Meta", "contradictory", ["lc-1", "lc-2"]),
-        LoCoMoQuery("lq-6", "Did the user end up working at Google?", "No", "contradictory", ["lc-1", "lc-2"]),
+        LoCoMoQuery(
+            "lq-5", "Where does the user currently work?", "Meta", "contradictory", ["lc-1", "lc-2"]
+        ),
+        LoCoMoQuery(
+            "lq-6",
+            "Did the user end up working at Google?",
+            "No",
+            "contradictory",
+            ["lc-1", "lc-2"],
+        ),
         # Aggregation
-        LoCoMoQuery("lq-7", "How many total miles did the user run this week?", "15", "aggregation", ["lc-5"]),
-        LoCoMoQuery("lq-8", "How many programming languages is the user learning?", "2", "aggregation", ["lc-3"]),
+        LoCoMoQuery(
+            "lq-7",
+            "How many total miles did the user run this week?",
+            "15",
+            "aggregation",
+            ["lc-5"],
+        ),
+        LoCoMoQuery(
+            "lq-8",
+            "How many programming languages is the user learning?",
+            "2",
+            "aggregation",
+            ["lc-3"],
+        ),
     ]
 
     return conversations, queries

@@ -7,6 +7,7 @@
 use uuid::Uuid;
 
 use crate::storage::{StorageError, StorageTrait};
+use crate::types::Memory;
 
 /// Result of a GDPR erasure operation.
 #[derive(Debug, Clone, Default)]
@@ -112,31 +113,33 @@ pub fn export_entity_data(
     let entity_memories: Vec<String> = all_memories
         .into_iter()
         .filter(|m| match m {
-            crate::types::Memory::Episodic(e) => {
-                e.about_entity == entity_id || e.source_entity == entity_id
-            }
-            crate::types::Memory::Semantic(s) => s.subject == entity_id,
-            crate::types::Memory::Procedural(_) => false,
+            Memory::Episodic(e) => e.about_entity == entity_id || e.source_entity == entity_id,
+            Memory::Semantic(s) => s.subject == entity_id,
+            Memory::Procedural(_) => false,
         })
-        .map(|m| match m {
-            crate::types::Memory::Episodic(e) => {
-                format!(
-                    r#"{{"type":"episodic","id":"{}","content":"{}","timestamp":"{}"}}"#,
-                    e.id, e.content, e.timestamp
-                )
-            }
-            crate::types::Memory::Semantic(s) => {
-                format!(
-                    r#"{{"type":"semantic","id":"{}","subject":"{}","predicate":"{}","object":"{}"}}"#,
-                    s.id, s.subject, s.predicate, s.object
-                )
-            }
-            crate::types::Memory::Procedural(p) => {
-                format!(
-                    r#"{{"type":"procedural","id":"{}","trigger":"{}","action":"{}"}}"#,
-                    p.id, p.trigger, p.action
-                )
-            }
+        .map(|m| {
+            let json = match m {
+                Memory::Episodic(e) => serde_json::json!({
+                    "type": "episodic",
+                    "id": e.id.to_string(),
+                    "content": e.content,
+                    "timestamp": e.timestamp.to_rfc3339(),
+                }),
+                Memory::Semantic(s) => serde_json::json!({
+                    "type": "semantic",
+                    "id": s.id.to_string(),
+                    "subject": s.subject.to_string(),
+                    "predicate": s.predicate,
+                    "object": s.object,
+                }),
+                Memory::Procedural(p) => serde_json::json!({
+                    "type": "procedural",
+                    "id": p.id.to_string(),
+                    "trigger": p.trigger,
+                    "action": p.action,
+                }),
+            };
+            json.to_string()
         })
         .collect();
 
@@ -144,7 +147,7 @@ pub fn export_entity_data(
 
     Ok(ExportResult {
         memories: entity_memories,
-        entities: vec![format!(r#"{{"id":"{}"}}"#, entity_id)],
+        entities: vec![serde_json::json!({"id": entity_id.to_string()}).to_string()],
         total_records: total + 1,
     })
 }

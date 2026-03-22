@@ -39,16 +39,20 @@ def main():
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with open(args.output, "w") as f:
-            json.dump({
-                "accuracy": results.accuracy,
-                "safety_rate": results.safety_rate,
-                "correct": results.correct,
-                "incorrect": results.incorrect,
-                "neutral": results.neutral,
-                "total": results.total,
-                "by_category": results.by_category,
-                "failures": results.failures,
-            }, f, indent=2)
+            json.dump(
+                {
+                    "accuracy": results.accuracy,
+                    "safety_rate": results.safety_rate,
+                    "correct": results.correct,
+                    "incorrect": results.incorrect,
+                    "neutral": results.neutral,
+                    "total": results.total,
+                    "by_category": results.by_category,
+                    "failures": results.failures,
+                },
+                f,
+                indent=2,
+            )
         print(f"\nResults saved to {args.output}")
 
 

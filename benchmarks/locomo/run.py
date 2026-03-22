@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
 
@@ -46,15 +45,19 @@ def main():
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with open(args.output, "w") as f:
-            json.dump({
-                "accuracy": results.accuracy,
-                "hits": results.hits,
-                "total": results.total,
-                "by_category": results.by_category,
-                "ingest_time_ms": results.ingest_time_ms,
-                "query_time_ms": results.query_time_ms,
-                "missed_queries": results.missed_queries,
-            }, f, indent=2)
+            json.dump(
+                {
+                    "accuracy": results.accuracy,
+                    "hits": results.hits,
+                    "total": results.total,
+                    "by_category": results.by_category,
+                    "ingest_time_ms": results.ingest_time_ms,
+                    "query_time_ms": results.query_time_ms,
+                    "missed_queries": results.missed_queries,
+                },
+                f,
+                indent=2,
+            )
         print(f"\nResults saved to {args.output}")
 
 
