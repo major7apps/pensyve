@@ -250,12 +250,37 @@ pensyve/
 
 ## Development
 
+### First-Time Setup
+
+```bash
+# Create venv and install dependencies
+uv venv && source .venv/bin/activate
+uv pip install -e ".[dev]"
+
+# Build the native Python module (required for Python tests)
+maturin develop --manifest-path pensyve-python/Cargo.toml --release
+
+# Verify the module loads
+python -c "import pensyve; print(pensyve.__version__)"
+```
+
+### Build & Test
+
 ```bash
 make build      # Compile Rust + build PyO3 module
 make test       # Run all tests (Rust + Python)
 make lint       # clippy + ruff + pyright
 make format     # cargo fmt + ruff format
 make check      # lint + test (CI gate)
+```
+
+To run test suites individually:
+
+```bash
+cargo test --workspace                # Rust tests
+.venv/bin/python -m pytest tests/     # Python tests (requires maturin develop)
+cd pensyve-ts && bun test             # TypeScript tests
+cd pensyve-go && go test ./...        # Go tests
 ```
 
 ### Additional SDKs
