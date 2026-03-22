@@ -284,11 +284,11 @@ impl PyPensyve {
             .collect();
 
         // Filter by entity if provided.
-        // For Phase 1 we don't have per-entity filtering in the recall engine,
+        // We don't yet have per-entity filtering in the recall engine,
         // so this is a post-filter on the results. The recall engine returns
         // all memories in the namespace.
-        // TODO: Add entity filtering to RecallEngine in Phase 2.
-        let _ = entity; // Entity filtering deferred to Phase 2.
+        // TODO: Add entity filtering to RecallEngine.
+        let _ = entity;
 
         // Filter by memory types if provided.
         if let Some(type_filter) = types {
