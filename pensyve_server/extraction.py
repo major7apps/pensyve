@@ -9,10 +9,50 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# --- Compiled PII detection patterns (module-level for performance) ---
+
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
+_PHONE_RE = re.compile(
+    r"(?<!\d)"                          # not preceded by digit
+    r"(?:\+?1[-.\s]?)?"                 # optional country code
+    r"(?:\(?\d{3}\)?[-.\s]?)"           # area code
+    r"\d{3}[-.\s]?\d{4}"               # subscriber number
+    r"(?!\d)"                           # not followed by digit
+)
+_TOKEN_RE = re.compile(
+    r"(?:sk-[a-zA-Z0-9]{20,})"         # OpenAI-style
+    r"|(?:pk_(?:live|test)_[a-zA-Z0-9]{20,})"  # Stripe public key
+    r"|(?:psy_[a-zA-Z0-9]{10,})"       # Pensyve tokens
+    r"|(?:ghp_[a-zA-Z0-9]{36,})"       # GitHub PAT
+    r"|(?:Bearer\s+[a-zA-Z0-9._\-]{20,})"  # Bearer tokens
+)
+_SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+_CC_RE = re.compile(r"\b(?:\d[ -]?){13,16}\d\b")
+_IP_RE = re.compile(
+    r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}"
+    r"(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b"
+)
+
+
+def sanitize_pii(text: str) -> str:
+    """Detect and redact common PII patterns from text.
+
+    Applied before sending text to the LLM so sensitive data is never
+    memorized or surfaced in recall results.
+    """
+    text = _TOKEN_RE.sub("[TOKEN_REDACTED]", text)
+    text = _SSN_RE.sub("[SSN_REDACTED]", text)
+    text = _CC_RE.sub("[CC_REDACTED]", text)
+    text = _EMAIL_RE.sub("[EMAIL_REDACTED]", text)
+    text = _PHONE_RE.sub("[PHONE_REDACTED]", text)
+    text = _IP_RE.sub("[IP_REDACTED]", text)
+    return text
 
 
 @dataclass
@@ -101,6 +141,8 @@ class Tier2Extractor:
         if not self.is_available:
             return self._mock_extract_facts(text)
 
+        text = sanitize_pii(text)
+
         prompt = f"""Extract factual statements from the following text as JSON.
 Return an array of objects with "subject", "predicate", "object", and "confidence" (0.0-1.0) fields.
 Only extract clearly stated facts, not opinions or questions.
@@ -131,6 +173,11 @@ JSON array:"""
         """
         if not self.is_available:
             return self._mock_extract_causal(messages)
+
+        messages = [
+            {**msg, "content": sanitize_pii(msg.get("content", ""))}
+            for msg in messages
+        ]
 
         conversation = "\n".join(
             f"{msg.get('role', 'user')}: {msg.get('content', '')}" for msg in messages
@@ -173,6 +220,8 @@ JSON array:"""
         if not self.is_available or not existing_facts:
             return []
 
+        new_text = sanitize_pii(new_text)
+
         facts_str = "\n".join(
             f"- {f.get('subject', '')} {f.get('predicate', '')} {f.get('object', '')}"
             for f in existing_facts
@@ -207,6 +256,13 @@ JSON array:"""
         self, text: str, messages: list[dict[str, str]] | None = None
     ) -> ExtractionResult:
         """Run all extraction passes on text and optional conversation messages."""
+        text = sanitize_pii(text)
+        if messages:
+            messages = [
+                {**msg, "content": sanitize_pii(msg.get("content", ""))}
+                for msg in messages
+            ]
+
         result = ExtractionResult()
         result.facts = self.extract_facts(text)
         if messages:

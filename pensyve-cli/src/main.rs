@@ -140,6 +140,7 @@ fn cmd_recall(
         default_limit: limit,
         max_candidates: 100,
         weights: [0.30, 0.15, 0.20, 0.10, 0.10, 0.05, 0.05, 0.05],
+        recall_timeout_secs: 5,
     };
 
     let engine = RecallEngine::new(&storage, &embedder, &vector_index, &config);

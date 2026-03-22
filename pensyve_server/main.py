@@ -9,6 +9,9 @@ from fastapi.middleware.cors import CORSMiddleware
 import pensyve
 
 from .auth import require_api_key
+from .rbac import require_role
+from .rate_limit import rate_limit_check
+from .billing import UsageTracker, Tier
 from .models import (
     ConsolidateResponse,
     EntityCreate,
@@ -34,12 +37,16 @@ app = FastAPI(
     title="Pensyve API",
     description="Universal memory runtime for AI agents",
     version="0.1.0",
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_api_key), Depends(rate_limit_check)],
 )
+
+_allowed_origins = os.environ.get(
+    "PENSYVE_CORS_ORIGINS", "http://localhost:3000"
+).split(",")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -58,6 +65,8 @@ if _tier2_enabled:
     from pensyve_server.extraction import Tier2Extractor
 
     _extractor = Tier2Extractor()
+
+_usage_tracker = UsageTracker()
 
 
 def get_pensyve():
@@ -172,6 +181,7 @@ def recall(req: RecallRequest, cursor: str | None = None):
         limit=fetch_limit,
         types=req.types if req.types else None,
     )
+    _usage_tracker.record_recall(os.environ.get("PENSYVE_NAMESPACE", "default"))
     memories = [_memory_to_response(m) for m in results]
 
     # Apply cursor-based pagination
@@ -198,7 +208,7 @@ def recall(req: RecallRequest, cursor: str | None = None):
     )
 
 
-@app.post("/v1/remember", response_model=MemoryResponse)
+@app.post("/v1/remember", response_model=MemoryResponse, dependencies=[Depends(require_role("writer"))])
 def remember(req: RememberRequest):
     p = get_pensyve()
     entity = p.entity(req.entity)
@@ -214,10 +224,11 @@ def remember(req: RememberRequest):
         except Exception:
             logger.warning("Tier 2 fact extraction failed", exc_info=True)
 
+    _usage_tracker.record_store(os.environ.get("PENSYVE_NAMESPACE", "default"))
     return _memory_to_response(mem)
 
 
-@app.delete("/v1/entities/{entity_name}", response_model=ForgetResponse)
+@app.delete("/v1/entities/{entity_name}", response_model=ForgetResponse, dependencies=[Depends(require_role("writer"))])
 def forget(entity_name: str, hard_delete: bool = False):
     p = get_pensyve()
     entity = p.entity(entity_name)
@@ -225,7 +236,7 @@ def forget(entity_name: str, hard_delete: bool = False):
     return ForgetResponse(forgotten_count=result["forgotten_count"])
 
 
-@app.post("/v1/consolidate", response_model=ConsolidateResponse)
+@app.post("/v1/consolidate", response_model=ConsolidateResponse, dependencies=[Depends(require_role("owner"))])
 def consolidate():
     p = get_pensyve()
     result = p.consolidate()
@@ -281,6 +292,18 @@ def inspect(req: InspectRequest):
         procedural=procedural,
         cursor=next_cursor,
     )
+
+
+@app.get("/v1/usage")
+def get_usage():
+    namespace = os.environ.get("PENSYVE_NAMESPACE", "default")
+    usage = _usage_tracker.get_usage(namespace)
+    return {
+        "namespace": namespace,
+        "api_calls": usage.api_calls,
+        "recalls": usage.recalls,
+        "memories_stored": usage.memories_stored,
+    }
 
 
 @app.get("/v1/health")

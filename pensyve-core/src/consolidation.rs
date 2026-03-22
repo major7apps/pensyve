@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use uuid::Uuid;
@@ -57,9 +58,19 @@ impl ConsolidationEngine {
         config: &ConsolidationConfig,
         namespace_id: Uuid,
     ) -> ConsolidationResult {
+        let start = Instant::now();
+        let max_dur = Duration::from_secs(config.max_duration_secs);
+
         let mut stats = ConsolidationStats::default();
-        stats.promoted += Self::promote_episodic_to_semantic(storage, embedder, namespace_id)?;
-        let (decayed, archived) = Self::decay_pass(storage, config, namespace_id)?;
+        stats.promoted +=
+            Self::promote_episodic_to_semantic(storage, embedder, namespace_id, start, max_dur)?;
+
+        if start.elapsed() > max_dur {
+            return Ok(stats);
+        }
+
+        let (decayed, archived) =
+            Self::decay_pass(storage, config, namespace_id, start, max_dur)?;
         stats.decayed += decayed;
         stats.archived += archived;
         Ok(stats)
@@ -76,6 +87,8 @@ impl ConsolidationEngine {
         storage: &dyn StorageTrait,
         embedder: &OnnxEmbedder,
         namespace_id: Uuid,
+        start: Instant,
+        max_duration: Duration,
     ) -> Result<usize, ConsolidationError> {
         // Fetch all memories for this namespace to identify episodic ones.
         let all_memories = storage.get_all_memories_by_namespace(namespace_id)?;
@@ -94,6 +107,10 @@ impl ConsolidationEngine {
         let mut promoted = 0usize;
 
         for memories in episodic_by_entity.values() {
+            if start.elapsed() > max_duration {
+                break;
+            }
+
             // Skip groups with only one memory — nothing to cluster.
             if memories.len() < 2 {
                 continue;
@@ -190,6 +207,8 @@ impl ConsolidationEngine {
         storage: &dyn StorageTrait,
         config: &ConsolidationConfig,
         namespace_id: Uuid,
+        start: Instant,
+        max_duration: Duration,
     ) -> Result<(usize, usize), ConsolidationError> {
         let all_memories = storage.get_all_memories_by_namespace(namespace_id)?;
         let now = Utc::now();
@@ -199,6 +218,9 @@ impl ConsolidationEngine {
         let mut archived = 0usize;
 
         for mem in all_memories {
+            if start.elapsed() > max_duration {
+                break;
+            }
             match mem {
                 Memory::Episodic(em) => {
                     let reference_time = em.last_accessed.unwrap_or(em.timestamp);

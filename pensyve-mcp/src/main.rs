@@ -557,6 +557,7 @@ async fn main() -> Result<()> {
         default_limit: 5,
         max_candidates: 100,
         weights: [0.30, 0.15, 0.20, 0.10, 0.10, 0.05, 0.05, 0.05],
+        recall_timeout_secs: 5,
     };
 
     let state = Arc::new(PensyveState {
