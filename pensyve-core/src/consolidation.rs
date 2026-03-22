@@ -69,8 +69,7 @@ impl ConsolidationEngine {
             return Ok(stats);
         }
 
-        let (decayed, archived) =
-            Self::decay_pass(storage, config, namespace_id, start, max_dur)?;
+        let (decayed, archived) = Self::decay_pass(storage, config, namespace_id, start, max_dur)?;
         stats.decayed += decayed;
         stats.archived += archived;
         Ok(stats)

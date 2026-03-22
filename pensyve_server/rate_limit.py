@@ -4,9 +4,9 @@ Limits requests per API key (or per IP if auth is disabled).
 Configurable via PENSYVE_RATE_LIMIT (requests/minute, default 600).
 """
 
+import logging
 import os
 import time
-import logging
 from collections import defaultdict
 
 from fastapi import HTTPException, Request
@@ -18,7 +18,7 @@ _WINDOW_SECONDS = 60
 
 
 class _TokenBucket:
-    __slots__ = ("tokens", "last_refill")
+    __slots__ = ("last_refill", "tokens")
 
     def __init__(self) -> None:
         self.tokens = float(_RATE_LIMIT)
@@ -44,7 +44,11 @@ async def rate_limit_check(request: Request):
         return  # Disabled
 
     # Key by API key or client IP
-    key = request.headers.get("X-Pensyve-Key", "") or request.client.host if request.client else "unknown"
+    key = (
+        request.headers.get("X-Pensyve-Key", "") or request.client.host
+        if request.client
+        else "unknown"
+    )
     bucket = _buckets[key]
     if not bucket.consume():
         logger.warning("Rate limit exceeded for key=%s", key[:12])
