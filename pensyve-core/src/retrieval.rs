@@ -227,7 +227,6 @@ pub fn intent_score_for_type(intent: &QueryIntent, memory_type: &str) -> f32 {
         },
         QueryIntent::Visual => match memory_type {
             "episodic" => 0.8,
-            "semantic" => 0.5,
             "procedural" => 0.2,
             _ => 0.5,
         },

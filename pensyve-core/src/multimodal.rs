@@ -14,7 +14,7 @@ pub struct MultiModalIndex {
     pub text: VectorIndex,
     /// Image embeddings (768d for Florence-2).
     pub image: VectorIndex,
-    /// Code embeddings (768d for UniXcoder).
+    /// Code embeddings (768d for `UniXcoder`).
     pub code: VectorIndex,
 }
 

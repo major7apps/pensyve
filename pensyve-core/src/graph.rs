@@ -89,11 +89,11 @@ impl MemoryGraph {
             .collect();
 
         for edge_idx in edge_indices {
-            if let Some(meta) = self.edge_meta.get_mut(&edge_idx) {
-                if meta.invalid_at.is_none() {
-                    meta.invalid_at = Some(Utc::now());
-                    meta.superseded_by = superseded_by;
-                }
+            if let Some(meta) = self.edge_meta.get_mut(&edge_idx)
+                && meta.invalid_at.is_none()
+            {
+                meta.invalid_at = Some(Utc::now());
+                meta.superseded_by = superseded_by;
             }
         }
     }
@@ -107,10 +107,10 @@ impl MemoryGraph {
 
         let mut result = Vec::new();
         for edge_ref in self.graph.edges(node_idx) {
-            if let Some(meta) = self.edge_meta.get(&edge_ref.id()) {
-                if meta.invalid_at.is_none() {
-                    result.push(meta);
-                }
+            if let Some(meta) = self.edge_meta.get(&edge_ref.id())
+                && meta.invalid_at.is_none()
+            {
+                result.push(meta);
             }
         }
         result
@@ -166,10 +166,10 @@ impl MemoryGraph {
             // Visit all outgoing neighbours, skipping temporally invalid edges.
             for edge_ref in self.graph.edges(current) {
                 // Skip edges that have been invalidated (superseded).
-                if let Some(meta) = self.edge_meta.get(&edge_ref.id()) {
-                    if meta.invalid_at.is_some() {
-                        continue;
-                    }
+                if let Some(meta) = self.edge_meta.get(&edge_ref.id())
+                    && meta.invalid_at.is_some()
+                {
+                    continue;
                 }
 
                 let neighbor = edge_ref.target();
