@@ -29,6 +29,10 @@ pub enum QueryIntent {
     Action,
     /// The user is trying to remember something specific.
     Recall,
+    /// The user is asking about code or programming.
+    Code,
+    /// The user is asking about visual/image content.
+    Visual,
     /// General / unclear intent.
     General,
 }
@@ -104,6 +108,51 @@ const QUESTION_KEYWORDS: &[&str] = &[
     "?",
 ];
 
+/// Code keywords — programming and technical cues.
+const CODE_KEYWORDS: &[&str] = &[
+    "code",
+    "function",
+    "class",
+    "import",
+    "def ",
+    "fn ",
+    "struct ",
+    "implement",
+    "syntax",
+    "compile",
+    "runtime",
+    "error in",
+    "stack trace",
+    "exception",
+    "variable",
+    "method",
+    "API",
+    "endpoint",
+    "schema",
+    "migration",
+    "query",
+    "SQL",
+];
+
+/// Visual keywords — image and display cues.
+const VISUAL_KEYWORDS: &[&str] = &[
+    "image",
+    "picture",
+    "photo",
+    "screenshot",
+    "diagram",
+    "chart",
+    "graph",
+    "visual",
+    "looks like",
+    "shown in",
+    "display",
+    "UI",
+    "interface",
+    "design",
+    "layout",
+];
+
 /// Classify the intent of a query using keyword pattern matching.
 ///
 /// The classifier checks for keywords in priority order: Recall cues first
@@ -115,6 +164,18 @@ pub fn classify_intent(query: &str) -> QueryIntent {
     for kw in RECALL_KEYWORDS {
         if lower.contains(kw) {
             return QueryIntent::Recall;
+        }
+    }
+
+    for kw in CODE_KEYWORDS {
+        if lower.contains(kw) {
+            return QueryIntent::Code;
+        }
+    }
+
+    for kw in VISUAL_KEYWORDS {
+        if lower.contains(kw) {
+            return QueryIntent::Visual;
         }
     }
 
@@ -156,6 +217,18 @@ pub fn intent_score_for_type(intent: &QueryIntent, memory_type: &str) -> f32 {
             "semantic" => 0.8,
             "episodic" => 0.6,
             "procedural" => 0.3,
+            _ => 0.5,
+        },
+        QueryIntent::Code => match memory_type {
+            "procedural" => 0.8,
+            "semantic" => 0.6,
+            "episodic" => 0.3,
+            _ => 0.5,
+        },
+        QueryIntent::Visual => match memory_type {
+            "episodic" => 0.8,
+            "semantic" => 0.5,
+            "procedural" => 0.2,
             _ => 0.5,
         },
         QueryIntent::General => 0.5,
@@ -868,6 +941,44 @@ mod tests {
             (a_procedural - 0.9).abs() < f32::EPSILON,
             "Action+procedural should be 0.9"
         );
+    }
+
+    #[test]
+    fn test_classify_intent_code() {
+        assert_eq!(
+            classify_intent("Show me the function definition"),
+            QueryIntent::Code
+        );
+        assert_eq!(
+            classify_intent("What's the API endpoint for users?"),
+            QueryIntent::Code
+        );
+    }
+
+    #[test]
+    fn test_classify_intent_visual() {
+        assert_eq!(
+            classify_intent("What does the image show?"),
+            QueryIntent::Visual
+        );
+        assert_eq!(
+            classify_intent("Describe the screenshot"),
+            QueryIntent::Visual
+        );
+    }
+
+    #[test]
+    fn test_intent_score_code_favors_procedural() {
+        let c_procedural = intent_score_for_type(&QueryIntent::Code, "procedural");
+        let c_semantic = intent_score_for_type(&QueryIntent::Code, "semantic");
+        assert!(c_procedural > c_semantic);
+    }
+
+    #[test]
+    fn test_intent_score_visual_favors_episodic() {
+        let v_episodic = intent_score_for_type(&QueryIntent::Visual, "episodic");
+        let v_semantic = intent_score_for_type(&QueryIntent::Visual, "semantic");
+        assert!(v_episodic > v_semantic);
     }
 
     #[test]

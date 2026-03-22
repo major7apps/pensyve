@@ -99,6 +99,11 @@ impl VectorIndex {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Return the configured embedding dimensionality.
+    pub fn dimensions(&self) -> usize {
+        self.dimensions
+    }
 }
 
 // ---------------------------------------------------------------------------
