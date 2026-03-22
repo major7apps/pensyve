@@ -37,10 +37,10 @@ git clone https://github.com/major7apps/pensyve.git && cd pensyve
 uv sync --extra dev
 
 # Build the Python SDK (compiles Rust → native Python module)
-maturin develop --manifest-path pensyve-python/Cargo.toml
+uv run maturin develop --release -m pensyve-python/Cargo.toml
 
 # Verify
-python -c "import pensyve; print(pensyve.__version__)"
+uv run python -c "import pensyve; print(pensyve.__version__)"
 ```
 
 ### 5-Line Demo
@@ -253,16 +253,19 @@ pensyve/
 ### First-Time Setup
 
 ```bash
-# Create venv and install dependencies
-uv venv && source .venv/bin/activate
-uv pip install -e ".[dev]"
+# Install dependencies (creates .venv automatically)
+uv sync --extra dev
 
-# Build the native Python module (required for Python tests)
-maturin develop --manifest-path pensyve-python/Cargo.toml --release
+# Build the native Python module (required before running any Python code)
+uv run maturin develop --release -m pensyve-python/Cargo.toml
 
 # Verify the module loads
-python -c "import pensyve; print(pensyve.__version__)"
+uv run python -c "import pensyve; print(pensyve.__version__)"
 ```
+
+> **Note:** The `pensyve` Python package is a native Rust extension built with PyO3.
+> You must run `uv run maturin develop` before `pytest` or any Python import of `pensyve`,
+> otherwise you will get `ModuleNotFoundError: No module named 'pensyve'`.
 
 ### Build & Test
 
@@ -277,10 +280,11 @@ make check      # lint + test (CI gate)
 To run test suites individually:
 
 ```bash
-cargo test --workspace                # Rust tests
-.venv/bin/python -m pytest tests/     # Python tests (requires maturin develop)
-cd pensyve-ts && bun test             # TypeScript tests
-cd pensyve-go && go test ./...        # Go tests
+cargo test --workspace                                       # Rust tests
+uv run maturin develop --release -m pensyve-python/Cargo.toml  # Build PyO3 module first
+uv run pytest tests/python/ -v                               # Python tests
+cd pensyve-ts && bun test                                    # TypeScript tests
+cd pensyve-go && go test ./...                               # Go tests
 ```
 
 ### Additional SDKs

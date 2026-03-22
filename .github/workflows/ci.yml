@@ -60,6 +60,20 @@ jobs:
       - name: Run tests
         run: uv run pytest tests/python/ -v
 
+  test-rust-models:
+    name: Rust Tests (with models)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache ONNX models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: onnx-models-${{ runner.os }}-v1
+      - name: Run model-dependent tests
+        run: cargo test --workspace -- --ignored
+
   test-typescript:
     name: TypeScript Tests
     runs-on: ubuntu-latest

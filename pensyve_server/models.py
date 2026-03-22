@@ -98,3 +98,17 @@ class InspectResponse(BaseModel):
     semantic: list[MemoryResponse] = []
     procedural: list[MemoryResponse] = []
     cursor: str | None = None
+
+
+class ActivityResponse(BaseModel):
+    date: str
+    recalls: int
+    remembers: int
+    forgets: int
+
+
+class RecentEventResponse(BaseModel):
+    id: str
+    type: str
+    content: str
+    timestamp: str

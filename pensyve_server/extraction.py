@@ -19,17 +19,17 @@ logger = logging.getLogger(__name__)
 
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
 _PHONE_RE = re.compile(
-    r"(?<!\d)"                          # not preceded by digit
-    r"(?:\+?1[-.\s]?)?"                 # optional country code
-    r"(?:\(?\d{3}\)?[-.\s]?)"           # area code
-    r"\d{3}[-.\s]?\d{4}"               # subscriber number
-    r"(?!\d)"                           # not followed by digit
+    r"(?<!\d)"  # not preceded by digit
+    r"(?:\+?1[-.\s]?)?"  # optional country code
+    r"(?:\(?\d{3}\)?[-.\s]?)"  # area code
+    r"\d{3}[-.\s]?\d{4}"  # subscriber number
+    r"(?!\d)"  # not followed by digit
 )
 _TOKEN_RE = re.compile(
-    r"(?:sk-[a-zA-Z0-9]{20,})"         # OpenAI-style
+    r"(?:sk-[a-zA-Z0-9]{20,})"  # OpenAI-style
     r"|(?:pk_(?:live|test)_[a-zA-Z0-9]{20,})"  # Stripe public key
-    r"|(?:psy_[a-zA-Z0-9]{10,})"       # Pensyve tokens
-    r"|(?:ghp_[a-zA-Z0-9]{36,})"       # GitHub PAT
+    r"|(?:psy_[a-zA-Z0-9]{10,})"  # Pensyve tokens
+    r"|(?:ghp_[a-zA-Z0-9]{36,})"  # GitHub PAT
     r"|(?:Bearer\s+[a-zA-Z0-9._\-]{20,})"  # Bearer tokens
 )
 _SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
@@ -174,10 +174,7 @@ JSON array:"""
         if not self.is_available:
             return self._mock_extract_causal(messages)
 
-        messages = [
-            {**msg, "content": sanitize_pii(msg.get("content", ""))}
-            for msg in messages
-        ]
+        messages = [{**msg, "content": sanitize_pii(msg.get("content", ""))} for msg in messages]
 
         conversation = "\n".join(
             f"{msg.get('role', 'user')}: {msg.get('content', '')}" for msg in messages
@@ -259,8 +256,7 @@ JSON array:"""
         text = sanitize_pii(text)
         if messages:
             messages = [
-                {**msg, "content": sanitize_pii(msg.get("content", ""))}
-                for msg in messages
+                {**msg, "content": sanitize_pii(msg.get("content", ""))} for msg in messages
             ]
 
         result = ExtractionResult()

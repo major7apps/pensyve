@@ -270,9 +270,25 @@ impl PyPensyve {
             .recall(query, self.inner.namespace.id, limit)
             .map_err(|e| PyRuntimeError::new_err(format!("Recall failed: {e}")))?;
 
+        // Post-filter by entity if provided.
+        let entity_id = entity.map(|e| e.uuid);
+
         let mut memories: Vec<PyMemory> = result
             .memories
             .into_iter()
+            .filter(|c| {
+                if let Some(eid) = entity_id {
+                    match &c.memory {
+                        types::Memory::Episodic(m) => {
+                            m.about_entity == eid || m.source_entity == eid
+                        }
+                        types::Memory::Semantic(m) => m.subject == eid,
+                        types::Memory::Procedural(_) => true,
+                    }
+                } else {
+                    true
+                }
+            })
             .map(|c| PyMemory {
                 id: c.memory_id.to_string(),
                 content: memory_content(&c.memory),
@@ -282,13 +298,6 @@ impl PyPensyve {
                 score: c.final_score,
             })
             .collect();
-
-        // Filter by entity if provided.
-        // We don't yet have per-entity filtering in the recall engine,
-        // so this is a post-filter on the results. The recall engine returns
-        // all memories in the namespace.
-        // TODO: Add entity filtering to RecallEngine.
-        let _ = entity;
 
         // Filter by memory types if provided.
         if let Some(type_filter) = types {
