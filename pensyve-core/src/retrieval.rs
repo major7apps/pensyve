@@ -583,6 +583,7 @@ mod tests {
             default_limit: 5,
             max_candidates: 50,
             weights: TEST_WEIGHTS,
+            recall_timeout_secs: 5,
         }
     }
 

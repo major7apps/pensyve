@@ -26,6 +26,7 @@ pub struct RetrievalConfig {
     pub default_limit: usize,
     pub max_candidates: usize,
     pub weights: [f32; 8],
+    pub recall_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +35,7 @@ pub struct ConsolidationConfig {
     pub memory_threshold: usize,
     pub cron_interval_hours: u64,
     pub fsrs_decay_threshold: f32,
+    pub max_duration_secs: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -70,12 +72,14 @@ impl Default for PensyveConfig {
                 default_limit: 5,
                 max_candidates: 100,
                 weights: [0.25, 0.10, 0.15, 0.05, 0.20, 0.10, 0.10, 0.05],
+                recall_timeout_secs: 5,
             },
             consolidation: ConsolidationConfig {
                 idle_timeout_secs: 30,
                 memory_threshold: 100,
                 cron_interval_hours: 6,
                 fsrs_decay_threshold: 0.1,
+                max_duration_secs: 60,
             },
         }
     }
@@ -139,6 +143,11 @@ impl PensyveConfigBuilder {
         self
     }
 
+    pub fn retrieval_timeout_secs(mut self, secs: u64) -> Self {
+        self.config.retrieval.recall_timeout_secs = secs;
+        self
+    }
+
     pub fn consolidation_idle_timeout_secs(mut self, secs: u64) -> Self {
         self.config.consolidation.idle_timeout_secs = secs;
         self
@@ -156,6 +165,11 @@ impl PensyveConfigBuilder {
 
     pub fn consolidation_fsrs_decay_threshold(mut self, threshold: f32) -> Self {
         self.config.consolidation.fsrs_decay_threshold = threshold;
+        self
+    }
+
+    pub fn consolidation_max_duration_secs(mut self, secs: u64) -> Self {
+        self.config.consolidation.max_duration_secs = secs;
         self
     }
 

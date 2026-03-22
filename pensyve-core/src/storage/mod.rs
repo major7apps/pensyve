@@ -25,6 +25,8 @@ pub enum StorageError {
     NotFound(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Storage context: {0}")]
+    Context(String),
 }
 
 pub type StorageResult<T> = Result<T, StorageError>;

@@ -286,7 +286,7 @@ def test_inspect_with_memories(client):
 
 
 def test_cors_headers(client):
-    """CORS preflight should return correct headers."""
+    """CORS preflight should return allowed origin (not wildcard)."""
     r = client.options(
         "/v1/health",
         headers={
@@ -295,14 +295,14 @@ def test_cors_headers(client):
         },
     )
     assert r.status_code == 200
-    assert r.headers.get("access-control-allow-origin") == "*"
+    assert r.headers.get("access-control-allow-origin") == "http://localhost:3000"
 
 
 def test_cors_on_response(client):
-    """Normal responses should include CORS headers."""
+    """Normal responses should include CORS headers for allowed origin."""
     r = client.get("/v1/health", headers={"Origin": "http://localhost:3000"})
     assert r.status_code == 200
-    assert r.headers.get("access-control-allow-origin") == "*"
+    assert r.headers.get("access-control-allow-origin") == "http://localhost:3000"
 
 
 # --- Pagination tests ---
