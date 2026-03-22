@@ -57,7 +57,7 @@ pub struct OnnxEmbedder {
 
 impl OnnxEmbedder {
     /// Create a real ONNX-backed embedder using fastembed.
-    /// Downloads the model to the HuggingFace cache on first use.
+    /// Downloads the model to the `HuggingFace` cache on first use.
     ///
     /// Supported model names:
     ///   - `"Alibaba-NLP/gte-base-en-v1.5"` → 768 dimensions (default)

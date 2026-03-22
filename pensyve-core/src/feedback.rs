@@ -15,7 +15,7 @@ const MIN_WEIGHT: f32 = 0.01;
 /// Feedback signal for a recalled memory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalFeedback {
-    /// The 8 raw signal scores for this candidate (vector, bm25, graph, intent, recency, access, confidence, type_boost).
+    /// The 8 raw signal scores for this candidate: vector, bm25, graph, intent, recency, access, confidence, type-boost.
     pub signals: [f32; 8],
     /// Whether the user found this memory relevant (true) or not (false).
     pub relevant: bool,
