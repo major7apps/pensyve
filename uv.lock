@@ -925,6 +925,7 @@ dependencies = [
 
 [package.optional-dependencies]
 benchmarks = [
+    { name = "huggingface-hub" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -945,6 +946,7 @@ extraction = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "fastembed", marker = "extra == 'dev'" },
+    { name = "huggingface-hub", marker = "extra == 'benchmarks'" },
     { name = "llama-cpp-python", marker = "extra == 'extraction'" },
     { name = "maturin", marker = "extra == 'dev'" },
     { name = "numpy", marker = "extra == 'benchmarks'" },

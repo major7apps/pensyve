@@ -8,9 +8,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import pensyve
 
+from .activity import ActivityTracker
 from .auth import require_api_key
 from .billing import UsageTracker
 from .models import (
+    ActivityResponse,
     ConsolidateResponse,
     EntityCreate,
     EntityResponse,
@@ -25,6 +27,7 @@ from .models import (
     MessageRequest,
     RecallRequest,
     RecallResponse,
+    RecentEventResponse,
     RememberRequest,
     StatsResponse,
 )
@@ -65,6 +68,7 @@ if _tier2_enabled:
     _extractor = Tier2Extractor()
 
 _usage_tracker = UsageTracker()
+_activity = ActivityTracker()
 
 
 def get_pensyve():
@@ -180,6 +184,7 @@ def recall(req: RecallRequest, cursor: str | None = None):
         types=req.types if req.types else None,
     )
     _usage_tracker.record_recall(os.environ.get("PENSYVE_NAMESPACE", "default"))
+    _activity.record("recall", req.query)
     memories = [_memory_to_response(m) for m in results]
 
     # Apply cursor-based pagination
@@ -225,6 +230,7 @@ def remember(req: RememberRequest):
             logger.warning("Tier 2 fact extraction failed", exc_info=True)
 
     _usage_tracker.record_store(os.environ.get("PENSYVE_NAMESPACE", "default"))
+    _activity.record("remember", req.fact[:100])
     return _memory_to_response(mem)
 
 
@@ -237,6 +243,7 @@ def forget(entity_name: str, hard_delete: bool = False):
     p = get_pensyve()
     entity = p.entity(entity_name)
     result = p.forget(entity=entity, hard_delete=hard_delete)
+    _activity.record("forget", entity_name)
     return ForgetResponse(forgotten_count=result["forgotten_count"])
 
 
@@ -248,6 +255,7 @@ def forget(entity_name: str, hard_delete: bool = False):
 def consolidate():
     p = get_pensyve()
     result = p.consolidate()
+    _activity.record("consolidate", f"promoted={result.get('promoted', 0)}")
     return ConsolidateResponse(
         promoted=result.get("promoted", 0),
         decayed=result.get("decayed", 0),
@@ -312,6 +320,20 @@ def get_usage():
         "recalls": usage.recalls,
         "memories_stored": usage.memories_stored,
     }
+
+
+@app.get("/v1/activity", response_model=list[ActivityResponse])
+def get_activity(days: int = 30):
+    return _activity.daily_summary(days)
+
+
+@app.get("/v1/activity/recent", response_model=list[RecentEventResponse])
+def get_recent_activity(limit: int = 10):
+    events = _activity.recent(limit)
+    return [
+        RecentEventResponse(id=e.id, type=e.event_type, content=e.content, timestamp=e.timestamp)
+        for e in events
+    ]
 
 
 @app.get("/v1/health")

@@ -3,23 +3,23 @@
 # Build everything
 build:
 	cargo build
-	.venv/bin/maturin develop --manifest-path pensyve-python/Cargo.toml
+	uv run maturin develop --release -m pensyve-python/Cargo.toml
 
 # Run all tests
 test: build
 	cargo test
-	.venv/bin/pytest tests/python/ -v
+	uv run pytest tests/python/ -v
 
 # Lint
 lint:
 	cargo clippy --workspace -- -D warnings
-	.venv/bin/ruff check .
-	.venv/bin/pyright
+	uv run ruff check .
+	uv run pyright
 
 # Format
 format:
 	cargo fmt --all
-	.venv/bin/ruff format .
+	uv run ruff format .
 
 # Check everything (CI)
 check: lint test
