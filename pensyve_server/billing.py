@@ -110,7 +110,7 @@ class UsageTracker:
             redis_client = await get_redis()
             if redis_client:
                 key = f"usage:{namespace}:{datetime.date.today().strftime('%Y-%m')}"
-                await redis_client.eval(INCR_EXPIRE_LUA, 1, key, 60 * 60 * 24 * 32)
+                await redis_client.eval(INCR_EXPIRE_LUA, 1, key, 60 * 60 * 24 * 32)  # type: ignore[arg-type]
                 return
         except Exception:
             logger.warning("redis_billing_fallback", namespace=namespace)
