@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
+use tracing::info;
 use uuid::Uuid;
 
 use crate::config::RetrievalConfig;
@@ -357,6 +358,7 @@ impl<'a> RecallEngine<'a> {
         limit: usize,
         target_entity: Option<Uuid>,
     ) -> Result<RecallResult, RecallError> {
+        let start = std::time::Instant::now();
         let max_candidates = self.config.max_candidates;
 
         // Steps 1–4: embed, search, merge candidates.
@@ -389,6 +391,7 @@ impl<'a> RecallEngine<'a> {
         };
 
         // Step 7: Score and sort candidates.
+        let candidates_found = candidates.len();
         let now = Utc::now();
         let weights = &self.config.weights;
         let mut scored: Vec<ScoredCandidate> = candidates
@@ -423,6 +426,16 @@ impl<'a> RecallEngine<'a> {
 
         // Step 9: Retrieval-induced reinforcement.
         self.apply_reinforcement(&scored);
+
+        info!(
+            event = "recall_decision",
+            query = %query,
+            intent = ?intent,
+            candidates_found = candidates_found,
+            results_returned = scored.len(),
+            duration_ms = start.elapsed().as_millis() as u64,
+            "recall completed"
+        );
 
         Ok(RecallResult { memories: scored })
     }

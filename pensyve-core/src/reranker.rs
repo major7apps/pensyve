@@ -94,6 +94,7 @@ impl Reranker {
     /// Returns up to `top_k` [`RerankResult`]s sorted by score descending
     /// (most relevant first).  If `top_k` is zero or exceeds `documents.len()`,
     /// all documents are returned.
+    #[tracing::instrument(skip_all)]
     pub fn rerank(
         &self,
         query: &str,
