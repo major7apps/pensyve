@@ -111,6 +111,15 @@ export interface RecallOptions {
   entity?: string;
   limit?: number;
   types?: Array<"episodic" | "semantic" | "procedural">;
+  /** Pagination cursor returned from a previous recall() call. */
+  cursor?: string;
+}
+
+/** Result returned by recall(), including an optional pagination cursor. */
+export interface RecallResult {
+  memories: Memory[];
+  /** Opaque cursor for fetching the next page of results. */
+  cursor?: string;
 }
 
 export interface RememberOptions {
@@ -138,6 +147,36 @@ export interface EpisodeHandle {
   addMessage(role: string, content: string): Promise<void>;
   setOutcome(outcome: "success" | "failure" | "partial"): void;
   end(): Promise<{ memoriesCreated: number }>;
+}
+
+/** Options for inspect(). */
+export interface InspectOptions {
+  /** Filter by memory type. */
+  type?: string;
+  /** Maximum number of results. */
+  limit?: number;
+  /** Pagination cursor. */
+  cursor?: string;
+}
+
+/** Options for activity(). */
+export interface ActivityOptions {
+  /** Number of days of activity to return (default: 7). */
+  days?: number;
+}
+
+/** Options for recentActivity(). */
+export interface RecentActivityOptions {
+  /** Maximum number of recent activity entries (default: 10). */
+  limit?: number;
+}
+
+/** A2A task input. */
+export interface A2ATask {
+  /** The A2A method name. */
+  method: string;
+  /** Arbitrary input payload for the task. */
+  input: Record<string, unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +229,8 @@ export class Pensyve {
   }
 
   /**
-   * Central request method with timeout + retry on 5xx.
+   * Central request method with timeout, retry on 5xx, and exponential
+   * backoff with jitter.
    */
   private async request(
     url: string,
@@ -238,7 +278,8 @@ export class Pensyve {
 
       // Wait before next retry (skip delay after last attempt)
       if (attempt < maxAttempts - 1) {
-        const delay = this.retryBaseDelayMs * Math.pow(2, attempt);
+        const jitter = 0.5 + Math.random() * 0.5;
+        const delay = Math.min(this.retryBaseDelayMs * Math.pow(2, attempt) * jitter, 30000);
         await new Promise((r) => setTimeout(r, delay));
       }
     }
@@ -250,6 +291,14 @@ export class Pensyve {
   // Public API
   // -----------------------------------------------------------------------
 
+  /**
+   * Create or retrieve an entity (user, agent, etc.).
+   *
+   * @param name - The entity name (e.g. a user ID or username).
+   * @param kind - The entity kind, defaults to "user".
+   * @returns The resolved {@link Entity}.
+   * @throws {PensyveError} on API error.
+   */
   async entity(name: string, kind: string = "user"): Promise<Entity> {
     const res = await this.request(
       `${this.baseUrl}/v1/entities`,
@@ -263,7 +312,15 @@ export class Pensyve {
     return camelCaseKeys(await res.json()) as Entity;
   }
 
-  async recall(query: string, options: RecallOptions = {}): Promise<Memory[]> {
+  /**
+   * Recall memories relevant to a query.
+   *
+   * @param query - The natural-language search query.
+   * @param options - Optional filters: entity, limit, types, and cursor for pagination.
+   * @returns A {@link RecallResult} containing matched memories and an optional pagination cursor.
+   * @throws {PensyveError} on API error.
+   */
+  async recall(query: string, options: RecallOptions = {}): Promise<RecallResult> {
     const res = await this.request(
       `${this.baseUrl}/v1/recall`,
       {
@@ -274,14 +331,30 @@ export class Pensyve {
           entity: options.entity,
           limit: options.limit ?? 5,
           types: options.types,
+          cursor: options.cursor,
         }),
       },
       "Recall",
     );
-    const body = camelCaseKeys(await res.json()) as { memories: Memory[]; cursor?: string };
-    return body.memories ?? (body as unknown as Memory[]);
+    const raw = await res.json();
+    const body = camelCaseKeys(raw) as { memories?: Memory[]; cursor?: string };
+    // Handle both {memories: [...]} and bare array responses
+    if (Array.isArray(body)) {
+      return { memories: body as unknown as Memory[] };
+    }
+    return {
+      memories: body.memories ?? [],
+      cursor: body.cursor,
+    };
   }
 
+  /**
+   * Store a new fact in memory.
+   *
+   * @param options - The entity, fact content, and optional confidence score.
+   * @returns The created {@link Memory}.
+   * @throws {PensyveError} on API error.
+   */
   async remember(options: RememberOptions): Promise<Memory> {
     const res = await this.request(
       `${this.baseUrl}/v1/remember`,
@@ -299,6 +372,14 @@ export class Pensyve {
     return camelCaseKeys(await res.json()) as Memory;
   }
 
+  /**
+   * Forget all memories for an entity.
+   *
+   * @param entityName - The entity whose memories should be forgotten.
+   * @param hardDelete - If true, permanently deletes records (default: false).
+   * @returns A {@link ForgetResult} with the count of forgotten memories.
+   * @throws {PensyveError} on API error.
+   */
   async forget(entityName: string, hardDelete: boolean = false): Promise<ForgetResult> {
     const params = new URLSearchParams();
     if (hardDelete) params.set("hard_delete", "true");
@@ -310,6 +391,12 @@ export class Pensyve {
     return camelCaseKeys(await res.json()) as ForgetResult;
   }
 
+  /**
+   * Trigger memory consolidation (promotes, decays, and archives memories).
+   *
+   * @returns A {@link ConsolidateResult} with counts of promoted, decayed, and archived memories.
+   * @throws {PensyveError} on API error.
+   */
   async consolidate(): Promise<ConsolidateResult> {
     const res = await this.request(
       `${this.baseUrl}/v1/consolidate`,
@@ -322,6 +409,12 @@ export class Pensyve {
     return camelCaseKeys(await res.json()) as ConsolidateResult;
   }
 
+  /**
+   * Retrieve memory store statistics.
+   *
+   * @returns A record of statistics with camelCase keys.
+   * @throws {PensyveError} on API error.
+   */
   async stats(): Promise<Record<string, unknown>> {
     const res = await this.request(
       `${this.baseUrl}/v1/stats`,
@@ -331,6 +424,12 @@ export class Pensyve {
     return camelCaseKeys(await res.json()) as Record<string, unknown>;
   }
 
+  /**
+   * Check the health of the Pensyve server.
+   *
+   * @returns A {@link HealthResult} with status and version.
+   * @throws {PensyveError} on API error.
+   */
   async health(): Promise<HealthResult> {
     const res = await this.request(
       `${this.baseUrl}/v1/health`,
@@ -340,6 +439,175 @@ export class Pensyve {
     return camelCaseKeys(await res.json()) as HealthResult;
   }
 
+  /**
+   * Submit relevance feedback for a specific memory.
+   *
+   * @param memoryId - The ID of the memory to provide feedback for.
+   * @param relevant - Whether the memory was relevant.
+   * @param signals - Optional named signal scores (e.g., `{ clicked: 1 }`).
+   * @returns The raw API response as a plain record.
+   * @throws {PensyveError} on API error.
+   */
+  async feedback(
+    memoryId: string,
+    relevant: boolean,
+    signals?: Record<string, number>,
+  ): Promise<Record<string, unknown>> {
+    const res = await this.request(
+      `${this.baseUrl}/v1/feedback`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ memory_id: memoryId, relevant, signals }),
+      },
+      "Feedback",
+    );
+    return camelCaseKeys(await res.json()) as Record<string, unknown>;
+  }
+
+  /**
+   * Inspect stored memories for a given entity.
+   *
+   * @param entity - The entity name to inspect.
+   * @param options - Optional filters: type, limit, and cursor for pagination.
+   * @returns A {@link RecallResult} containing the entity's memories and an optional pagination cursor.
+   * @throws {PensyveError} on API error.
+   */
+  async inspect(entity: string, options: InspectOptions = {}): Promise<RecallResult> {
+    const res = await this.request(
+      `${this.baseUrl}/v1/inspect`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          entity,
+          type: options.type,
+          limit: options.limit,
+          cursor: options.cursor,
+        }),
+      },
+      "Inspect",
+    );
+    const raw = await res.json();
+    const body = camelCaseKeys(raw) as { memories?: Memory[]; cursor?: string };
+    if (Array.isArray(body)) {
+      return { memories: body as unknown as Memory[] };
+    }
+    return {
+      memories: body.memories ?? [],
+      cursor: body.cursor,
+    };
+  }
+
+  /**
+   * Retrieve activity summary for the namespace.
+   *
+   * @param options - Optional number of days to include (default: 7).
+   * @returns A record of activity data with camelCase keys.
+   * @throws {PensyveError} on API error.
+   */
+  async activity(options: ActivityOptions = {}): Promise<Record<string, unknown>> {
+    const params = new URLSearchParams();
+    if (options.days !== undefined) params.set("days", String(options.days));
+    const res = await this.request(
+      `${this.baseUrl}/v1/activity?${params}`,
+      { method: "GET" },
+      "Activity",
+    );
+    return camelCaseKeys(await res.json()) as Record<string, unknown>;
+  }
+
+  /**
+   * Retrieve the most recent activity entries.
+   *
+   * @param options - Optional limit on number of entries (default: 10).
+   * @returns A record of recent activity data with camelCase keys.
+   * @throws {PensyveError} on API error.
+   */
+  async recentActivity(options: RecentActivityOptions = {}): Promise<Record<string, unknown>> {
+    const params = new URLSearchParams();
+    if (options.limit !== undefined) params.set("limit", String(options.limit));
+    const res = await this.request(
+      `${this.baseUrl}/v1/activity/recent?${params}`,
+      { method: "GET" },
+      "Recent activity",
+    );
+    return camelCaseKeys(await res.json()) as Record<string, unknown>;
+  }
+
+  /**
+   * Retrieve usage statistics for the current API key / namespace.
+   *
+   * @returns A record of usage data with camelCase keys.
+   * @throws {PensyveError} on API error.
+   */
+  async usage(): Promise<Record<string, unknown>> {
+    const res = await this.request(
+      `${this.baseUrl}/v1/usage`,
+      { method: "GET" },
+      "Usage",
+    );
+    return camelCaseKeys(await res.json()) as Record<string, unknown>;
+  }
+
+  /**
+   * Erase all data for an entity under GDPR right-to-erasure obligations.
+   *
+   * @param entity - The entity name whose data should be erased.
+   * @returns A record confirming the erasure with camelCase keys.
+   * @throws {PensyveError} on API error.
+   */
+  async gdprErase(entity: string): Promise<Record<string, unknown>> {
+    const res = await this.request(
+      `${this.baseUrl}/v1/gdpr/erase/${encodeURIComponent(entity)}`,
+      { method: "DELETE" },
+      "GDPR erase",
+    );
+    return camelCaseKeys(await res.json()) as Record<string, unknown>;
+  }
+
+  /**
+   * Retrieve the A2A (agent-to-agent) agent card for this Pensyve instance.
+   *
+   * @returns A record describing the agent card with camelCase keys.
+   * @throws {PensyveError} on API error.
+   */
+  async a2aAgentCard(): Promise<Record<string, unknown>> {
+    const res = await this.request(
+      `${this.baseUrl}/v1/a2a/agent-card`,
+      { method: "GET" },
+      "A2A agent card",
+    );
+    return camelCaseKeys(await res.json()) as Record<string, unknown>;
+  }
+
+  /**
+   * Submit an A2A task to the Pensyve agent.
+   *
+   * @param task - The task descriptor containing a method name and input payload.
+   * @returns The task result as a record with camelCase keys.
+   * @throws {PensyveError} on API error.
+   */
+  async a2aTask(task: A2ATask): Promise<Record<string, unknown>> {
+    const res = await this.request(
+      `${this.baseUrl}/v1/a2a/task`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(task),
+      },
+      "A2A task",
+    );
+    return camelCaseKeys(await res.json()) as Record<string, unknown>;
+  }
+
+  /**
+   * Start a new episode for multi-turn conversation memory capture.
+   *
+   * @param participants - List of entity names participating in the episode.
+   * @returns An {@link EpisodeHandle} for adding messages and ending the episode.
+   * @throws {PensyveError} on API error.
+   */
   async startEpisode(participants: string[]): Promise<EpisodeHandle> {
     const res = await this.request(
       `${this.baseUrl}/v1/episodes/start`,
@@ -358,6 +626,13 @@ export class Pensyve {
     let outcome: "success" | "failure" | "partial" | undefined;
 
     return {
+      /**
+       * Append a message to the episode transcript.
+       *
+       * @param role - The speaker role (e.g. "user" or "assistant").
+       * @param content - The message content.
+       * @throws {PensyveError} on API error.
+       */
       async addMessage(role: string, content: string): Promise<void> {
         await client.request(
           `${client.baseUrl}/v1/episodes/message`,
@@ -369,9 +644,20 @@ export class Pensyve {
           "Add message",
         );
       },
+      /**
+       * Set the episode outcome before calling end().
+       *
+       * @param value - The outcome: "success", "failure", or "partial".
+       */
       setOutcome(value: "success" | "failure" | "partial"): void {
         outcome = value;
       },
+      /**
+       * End the episode and distil memories from the transcript.
+       *
+       * @returns An object with the count of memories created.
+       * @throws {PensyveError} on API error.
+       */
       async end(): Promise<{ memoriesCreated: number }> {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const payload: Record<string, any> = { episode_id: episodeId };
