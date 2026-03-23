@@ -77,6 +77,8 @@ export class PensyveError extends Error {
 
 export interface PensyveConfig {
   baseUrl: string;
+  /** API key sent as X-Pensyve-Key header on every request. */
+  apiKey?: string;
   namespace?: string;
   /** Custom fetch implementation (useful for testing). */
   fetch?: typeof globalThis.fetch;
@@ -86,6 +88,8 @@ export interface PensyveConfig {
   retries?: number;
   /** Base delay in ms for exponential backoff (default: 500). */
   retryBaseDelayMs?: number;
+  /** Optional debug callback invoked after each completed request. */
+  onDebug?: (msg: string, meta?: Record<string, unknown>) => void;
 }
 
 export interface Entity {
@@ -142,19 +146,27 @@ export interface EpisodeHandle {
 
 export class Pensyve {
   private baseUrl: string;
+  private apiKey: string;
   private namespace: string;
   private _fetch: typeof globalThis.fetch;
   private timeoutMs: number;
   private retries: number;
   private retryBaseDelayMs: number;
+  private onDebug: ((msg: string, meta?: Record<string, unknown>) => void) | null;
 
   constructor(config: PensyveConfig) {
     this.baseUrl = config.baseUrl.replace(/\/$/, "");
+    this.apiKey = config.apiKey ?? "";
     this.namespace = config.namespace ?? "default";
     this._fetch = config.fetch ?? globalThis.fetch;
     this.timeoutMs = config.timeoutMs ?? 30_000;
     this.retries = config.retries ?? 2;
     this.retryBaseDelayMs = config.retryBaseDelayMs ?? 500;
+    this.onDebug = config.onDebug ?? null;
+
+    if (!config.apiKey && typeof process !== "undefined" && process.env?.NODE_ENV !== "production") {
+      console.warn("Pensyve: no apiKey configured — requests to auth-required servers will fail with 401");
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -185,12 +197,25 @@ export class Pensyve {
     init: RequestInit,
     context: string,
   ): Promise<Response> {
+    // Merge auth header into every request
+    const headers: Record<string, string> = {
+      ...(init.headers as Record<string, string>),
+      ...(this.apiKey ? { "X-Pensyve-Key": this.apiKey } : {}),
+    };
+    const mergedInit: RequestInit = { ...init, headers };
+
     let lastError: unknown;
     const maxAttempts = 1 + this.retries; // first try + retries
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
-        const res = await this.fetchWithTimeout(url, init);
+        const start = Date.now();
+        const res = await this.fetchWithTimeout(url, mergedInit);
+
+        this.onDebug?.(`${mergedInit.method ?? "GET"} ${url} → ${res.status}`, {
+          duration: Date.now() - start,
+          attempt: attempt + 1,
+        });
 
         if (res.ok) {
           return res;

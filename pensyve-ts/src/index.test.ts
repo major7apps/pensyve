@@ -687,6 +687,63 @@ describe("Error propagation", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Authentication & debug
+// ---------------------------------------------------------------------------
+
+describe("Authentication", () => {
+  test("injects X-Pensyve-Key header when apiKey is set", async () => {
+    let capturedHeaders: Record<string, string> = {};
+    const mockFetch = async (url: string | URL | Request, init?: RequestInit) => {
+      const h = new Headers(init?.headers);
+      capturedHeaders = Object.fromEntries(h.entries());
+      return new Response(JSON.stringify({ status: "ok", version: "0.1.0" }));
+    };
+
+    const client = new Pensyve({
+      baseUrl: "http://localhost:8000",
+      apiKey: "test-key-123",
+      fetch: mockFetch as typeof fetch,
+      retries: 0,
+    });
+    await client.health();
+    expect(capturedHeaders["x-pensyve-key"]).toBe("test-key-123");
+  });
+
+  test("does not inject header when apiKey is empty", async () => {
+    let capturedHeaders: Record<string, string> = {};
+    const mockFetch = async (url: string | URL | Request, init?: RequestInit) => {
+      const h = new Headers(init?.headers);
+      capturedHeaders = Object.fromEntries(h.entries());
+      return new Response(JSON.stringify({ status: "ok", version: "0.1.0" }));
+    };
+
+    const client = new Pensyve({
+      baseUrl: "http://localhost:8000",
+      fetch: mockFetch as typeof fetch,
+      retries: 0,
+    });
+    await client.health();
+    expect(capturedHeaders["x-pensyve-key"]).toBeUndefined();
+  });
+
+  test("calls onDebug callback", async () => {
+    const debugLogs: string[] = [];
+    const mockFetch = async () =>
+      new Response(JSON.stringify({ status: "ok", version: "0.1.0" }));
+
+    const client = new Pensyve({
+      baseUrl: "http://localhost:8000",
+      fetch: mockFetch as typeof fetch,
+      retries: 0,
+      onDebug: (msg) => debugLogs.push(msg),
+    });
+    await client.health();
+    expect(debugLogs.length).toBeGreaterThan(0);
+    expect(debugLogs[0]).toContain("200");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Integration-style: full episode lifecycle
 // ---------------------------------------------------------------------------
 
