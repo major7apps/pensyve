@@ -136,3 +136,43 @@ CREATE TABLE IF NOT EXISTS edges (
 
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);
+
+-- ---------------------------------------------------------------------------
+-- Row-Level Security (Postgres only)
+-- Namespace isolation: each connection must set pensyve.namespace_id via
+--   SELECT set_config('pensyve.namespace_id', '<uuid>', true)
+-- before executing queries.  The 'true' flag makes the setting local to
+-- the current transaction.  missing_ok=true in current_setting means a NULL
+-- is returned (no rows visible) when the GUC is not set.
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE entities             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE episodes             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE episodic_memories    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE semantic_memories    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE procedural_memories  ENABLE ROW LEVEL SECURITY;
+
+DO $$ BEGIN
+  CREATE POLICY namespace_isolation_entities ON entities
+    USING (namespace_id::text = current_setting('pensyve.namespace_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+  CREATE POLICY namespace_isolation_episodes ON episodes
+    USING (namespace_id::text = current_setting('pensyve.namespace_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+  CREATE POLICY namespace_isolation_episodic ON episodic_memories
+    USING (namespace_id::text = current_setting('pensyve.namespace_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+  CREATE POLICY namespace_isolation_semantic ON semantic_memories
+    USING (namespace_id::text = current_setting('pensyve.namespace_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+  CREATE POLICY namespace_isolation_procedural ON procedural_memories
+    USING (namespace_id::text = current_setting('pensyve.namespace_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
