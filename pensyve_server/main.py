@@ -14,7 +14,7 @@ from starlette.responses import JSONResponse
 import pensyve
 
 from .activity import ActivityTracker
-from .auth import require_api_key
+from .auth import require_api_key, validate_auth_config
 from .billing import UsageTracker
 from .errors import ErrorResponse, NotFoundError, PensyveError
 from .logging import RequestIdMiddleware, configure_logging
@@ -55,6 +55,7 @@ logger = structlog.get_logger()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    validate_auth_config()
     db_dir = os.path.join(os.path.expanduser("~"), ".pensyve", _get_namespace())
     db_path = os.path.join(db_dir, "memories.db")
     _activity.set_db_path(db_path)
