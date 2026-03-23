@@ -1053,13 +1053,13 @@ requires-dist = [
     { name = "llama-cpp-python", marker = "extra == 'extraction'" },
     { name = "maturin", marker = "extra == 'dev'" },
     { name = "numpy", marker = "extra == 'benchmarks'" },
-    { name = "pydantic", specifier = ">=2.0" },
+    { name = "pydantic", specifier = ">=2.0,<3.0" },
     { name = "pyright", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'dev'" },
-    { name = "redis", extras = ["hiredis"], specifier = ">=5.0" },
+    { name = "redis", extras = ["hiredis"], specifier = ">=5.0,<8.0" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "scipy", marker = "extra == 'benchmarks'" },
-    { name = "structlog", specifier = ">=24.0" },
+    { name = "structlog", specifier = ">=24.0,<26.0" },
     { name = "uvicorn", specifier = ">=0.34" },
 ]
 provides-extras = ["dev", "extraction", "benchmarks"]
