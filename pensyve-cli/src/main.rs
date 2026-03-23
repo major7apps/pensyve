@@ -269,7 +269,7 @@ fn cmd_recall(
             if candidates.is_empty() {
                 println!("No memories found for query '{query}'");
             } else {
-                println!("{:<6} {:<12} {:<8} {}", "rank", "type", "score", "content");
+                println!("{:<6} {:<12} {:<8} content", "rank", "type", "score");
                 println!("{}", "-".repeat(72));
                 for (i, c) in candidates.iter().enumerate() {
                     let kind = match &c.memory {
@@ -347,7 +347,7 @@ fn cmd_stats(
             println!("Storage path:   {}", path.to_string_lossy());
             println!("Storage bytes:  {storage_bytes}");
             println!();
-            println!("{:<14} {}", "type", "count");
+            println!("{:<14} count", "type");
             println!("{}", "-".repeat(22));
             println!("{:<14} {}", "episodic", episodic_count);
             println!("{:<14} {}", "semantic", semantic_count);
@@ -445,7 +445,7 @@ fn cmd_inspect(
             if memories.is_empty() {
                 println!("No memories found.");
             } else {
-                println!("{:<12} {:<38} {}", "type", "id", "summary");
+                println!("{:<12} {:<38} summary", "type", "id");
                 println!("{}", "-".repeat(80));
                 for m in &memories {
                     let kind = m["type"].as_str().unwrap_or("?");
@@ -459,7 +459,7 @@ fn cmd_inspect(
                             m["object"].as_str().unwrap_or("")
                         )
                     };
-                    println!("{:<12} {:<38} {}", kind, id, summary);
+                    println!("{kind:<12} {id:<38} {summary}");
                 }
             }
             if !want_procedural {

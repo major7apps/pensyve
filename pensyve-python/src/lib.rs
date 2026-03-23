@@ -209,6 +209,7 @@ impl PyPensyve {
 
         // Store model info for health endpoint.
         // SAFETY: called once during single-threaded init before server accepts requests.
+        #[allow(unsafe_code)]
         unsafe {
             std::env::set_var("_PENSYVE_EMBEDDING_MODEL", model_name);
             std::env::set_var("_PENSYVE_EMBEDDING_DIMS", dimensions.to_string());
