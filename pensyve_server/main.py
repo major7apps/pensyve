@@ -37,6 +37,7 @@ from .models import (
     RecallResponse,
     RecentEventResponse,
     RememberRequest,
+    RememberResponse,
     StatsResponse,
 )
 from .rate_limit import rate_limit_check
@@ -258,12 +259,14 @@ def submit_feedback(req: FeedbackRequest):
 
 
 @app.post(
-    "/v1/remember", response_model=MemoryResponse, dependencies=[Depends(require_role("writer"))]
+    "/v1/remember", response_model=RememberResponse, dependencies=[Depends(require_role("writer"))]
 )
 def remember(req: RememberRequest):
     p = get_pensyve()
     entity = p.entity(req.entity)
     mem = p.remember(entity=entity, fact=req.fact, confidence=req.confidence)
+
+    extraction_tier = 1
 
     # Tier 2 fact extraction
     if _tier2_enabled and _extractor:
@@ -272,12 +275,22 @@ def remember(req: RememberRequest):
             for fact in extracted:
                 fact_text = f"{fact.subject} {fact.predicate} {fact.object}"
                 p.remember(entity=entity, fact=fact_text, confidence=fact.confidence)
+            extraction_tier = 2
         except Exception:
-            logger.warning("Tier 2 fact extraction failed", exc_info=True)
+            logger.warning("tier2_extraction_failed", exc_info=True)
 
     _usage_tracker.record_store(_get_namespace())
     _activity.record("remember", req.fact[:100])
-    return _memory_to_response(mem)
+    base = _memory_to_response(mem)
+    return RememberResponse(
+        id=base.id,
+        content=base.content,
+        memory_type=base.memory_type,
+        confidence=base.confidence,
+        stability=base.stability,
+        score=base.score,
+        extraction_tier=extraction_tier,
+    )
 
 
 @app.delete(
