@@ -6,14 +6,17 @@ from collections import Counter
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 import pensyve
 
 from .activity import ActivityTracker
 from .auth import require_api_key
 from .billing import UsageTracker
+from .errors import ErrorResponse, NotFoundError, PensyveError
 from .logging import RequestIdMiddleware, configure_logging
 from .metrics import MetricsMiddleware
 from .metrics import router as metrics_router
@@ -83,6 +86,20 @@ app = FastAPI(
     lifespan=lifespan,
     dependencies=[Depends(require_api_key), Depends(rate_limit_check)],
 )
+
+
+@app.exception_handler(PensyveError)
+async def pensyve_error_handler(request: Request, exc: PensyveError) -> JSONResponse:
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=ErrorResponse(
+            error=exc.error_code,
+            message=exc.message,
+            request_id=request_id,
+            detail=exc.detail,
+        ).model_dump(),
+    )
 
 _allowed_origins = os.environ.get("PENSYVE_CORS_ORIGINS", "http://localhost:3000").split(",")
 
@@ -198,7 +215,7 @@ def start_episode(req: EpisodeStartRequest):
 def add_message(req: MessageRequest):
     entry = _episodes.get(req.episode_id)
     if not entry:
-        raise HTTPException(404, f"Episode {req.episode_id} not found")
+        raise NotFoundError(f"Episode {req.episode_id} not found")
     entry["ep"].message(req.role, req.content)
     entry["message_count"] += 1
     return {"status": "ok"}
@@ -208,7 +225,7 @@ def add_message(req: MessageRequest):
 def end_episode(req: EpisodeEndRequest):
     entry = _episodes.pop(req.episode_id, None)
     if not entry:
-        raise HTTPException(404, f"Episode {req.episode_id} not found")
+        raise NotFoundError(f"Episode {req.episode_id} not found")
     ep = entry["ep"]
     if req.outcome:
         ep.outcome(req.outcome)

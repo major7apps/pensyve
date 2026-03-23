@@ -8,7 +8,9 @@ all authenticated users).
 import os
 
 import structlog
-from fastapi import HTTPException, Request
+from starlette.requests import Request
+
+from .errors import PermissionError
 
 logger = structlog.get_logger()
 
@@ -48,9 +50,8 @@ def require_role(required: str):
                 required=required,
                 path=str(request.url.path),
             )
-            raise HTTPException(
-                status_code=403,
-                detail=f"Insufficient permissions: requires {required} role",
+            raise PermissionError(
+                f"Insufficient permissions: requires {required} role",
             )
 
     return _check

@@ -4,8 +4,9 @@ import os
 import time
 
 import structlog
-from fastapi import HTTPException, Request
+from starlette.requests import Request
 
+from .errors import RateLimitError
 from .redis_client import INCR_EXPIRE_LUA, get_redis
 
 logger = structlog.get_logger()
@@ -52,13 +53,9 @@ async def rate_limit_check(request: Request):
             redis_key = f"ratelimit:{key}"
             current = int(await redis_client.eval(INCR_EXPIRE_LUA, 1, redis_key, _WINDOW_SECONDS))  # type: ignore[arg-type]
             if current > _RATE_LIMIT:
-                raise HTTPException(
-                    status_code=429,
-                    detail="Rate limit exceeded. Try again shortly.",
-                    headers={"Retry-After": str(_WINDOW_SECONDS)},
-                )
+                raise RateLimitError("Rate limit exceeded. Try again shortly.")
             return
-    except HTTPException:
+    except RateLimitError:
         raise
     except Exception:
         logger.warning("redis_rate_limit_fallback", key_prefix=key[:12])
@@ -73,8 +70,4 @@ async def rate_limit_check(request: Request):
     bucket = _buckets[key]
     if not bucket.consume():
         logger.warning("rate_limit_exceeded", key_prefix=key[:12])
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded. Try again shortly.",
-            headers={"Retry-After": str(_WINDOW_SECONDS)},
-        )
+        raise RateLimitError("Rate limit exceeded. Try again shortly.")
