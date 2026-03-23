@@ -4,14 +4,14 @@ Limits requests per API key (or per IP if auth is disabled).
 Configurable via PENSYVE_RATE_LIMIT (requests/minute, default 600).
 """
 
-import logging
 import os
 import time
 from collections import defaultdict
 
+import structlog
 from fastapi import HTTPException, Request
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 _RATE_LIMIT = int(os.environ.get("PENSYVE_RATE_LIMIT", "600"))  # per minute
 _WINDOW_SECONDS = 60
@@ -49,7 +49,7 @@ async def rate_limit_check(request: Request):
         key = request.client.host if request.client else "unknown"
     bucket = _buckets[key]
     if not bucket.consume():
-        logger.warning("Rate limit exceeded for key=%s", key[:12])
+        logger.warning("rate_limit_exceeded", key_prefix=key[:12])
         raise HTTPException(
             status_code=429,
             detail="Rate limit exceeded. Try again shortly.",
