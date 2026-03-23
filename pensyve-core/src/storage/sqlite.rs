@@ -20,7 +20,10 @@ use super::{StorageError, StorageResult, StorageTrait};
 /// Acquire the connection lock, converting a `PoisonError` to `StorageError::LockPoisoned`.
 macro_rules! lock_conn {
     ($self:expr) => {
-        $self.conn.lock().map_err(|e| StorageError::LockPoisoned(e.to_string()))?
+        $self
+            .conn
+            .lock()
+            .map_err(|e| StorageError::LockPoisoned(e.to_string()))?
     };
 }
 
