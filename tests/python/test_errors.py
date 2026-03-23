@@ -36,6 +36,7 @@ def auth_client():
         import pensyve_server.main as main_mod
 
         auth_mod.PENSYVE_API_KEYS = "test-key-1"
+        auth_mod.AUTH_MODE = "optional"
         main_mod._pensyve = None
         main_mod._episodes = {}
         main_mod._tier2_enabled = False

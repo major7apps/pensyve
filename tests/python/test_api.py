@@ -39,6 +39,7 @@ def auth_client():
         import pensyve_server.main as main_mod
 
         auth_mod.PENSYVE_API_KEYS = "test-key-1, test-key-2"
+        auth_mod.AUTH_MODE = "optional"
         main_mod._pensyve = None
         main_mod._episodes = {}
         main_mod._tier2_enabled = False
@@ -206,20 +207,20 @@ def test_auth_no_keys_configured(client):
 
 def test_auth_rejects_missing_key(auth_client):
     """When API keys are configured, requests without key should be rejected."""
-    r = auth_client.get("/v1/health")
+    r = auth_client.get("/v1/stats")
     assert r.status_code == 401
     assert "Invalid or missing" in r.json()["message"]
 
 
 def test_auth_rejects_wrong_key(auth_client):
     """When API keys are configured, wrong keys should be rejected."""
-    r = auth_client.get("/v1/health", headers={"X-Pensyve-Key": "wrong-key"})
+    r = auth_client.get("/v1/stats", headers={"X-Pensyve-Key": "wrong-key"})
     assert r.status_code == 401
 
 
 def test_auth_accepts_valid_key(auth_client):
     """When API keys are configured, valid keys should be accepted."""
-    r = auth_client.get("/v1/health", headers={"X-Pensyve-Key": "test-key-1"})
+    r = auth_client.get("/v1/stats", headers={"X-Pensyve-Key": "test-key-1"})
     assert r.status_code == 200
 
     r = auth_client.get("/v1/health", headers={"X-Pensyve-Key": "test-key-2"})
