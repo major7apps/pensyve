@@ -166,13 +166,43 @@ impl PyPensyve {
             }
         };
 
-        // Try GTE (768d) first, then MiniLM (384d) fallback, then mock.
-        let embedder = Arc::new(
-            OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5")
-                .or_else(|_| OnnxEmbedder::new("all-MiniLM-L6-v2"))
-                .unwrap_or_else(|_| OnnxEmbedder::new_mock(768)),
-        );
+        // Try GTE (768d) first, then MiniLM (384d) fallback.
+        let (embedder, model_name) = match OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5") {
+            Ok(e) => {
+                tracing::info!(embedding_model = "gte-base-en-v1.5", dimensions = 768);
+                (Arc::new(e), "gte-base-en-v1.5")
+            }
+            Err(e1) => {
+                tracing::warn!(error = %e1, "Primary embedding model failed, trying fallback");
+                match OnnxEmbedder::new("all-MiniLM-L6-v2") {
+                    Ok(e) => {
+                        tracing::warn!(embedding_model = "all-MiniLM-L6-v2", dimensions = 384, reason = "primary model unavailable");
+                        (Arc::new(e), "all-MiniLM-L6-v2")
+                    }
+                    Err(e2) => {
+                        let allow_mock = std::env::var("PENSYVE_ALLOW_MOCK_EMBEDDER")
+                            .map(|v| v == "true" || v == "1")
+                            .unwrap_or(false);
+                        if allow_mock {
+                            tracing::warn!(embedding_model = "mock", dimensions = 768, reason = "no real models found, using mock — semantic search will not work");
+                            (Arc::new(OnnxEmbedder::new_mock(768)), "mock")
+                        } else {
+                            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                                format!("No embedding models available (tried gte-base-en-v1.5: {e1}, all-MiniLM-L6-v2: {e2}). Set PENSYVE_ALLOW_MOCK_EMBEDDER=true for mock fallback."),
+                            ));
+                        }
+                    }
+                }
+            }
+        };
         let dimensions = embedder.dimensions();
+
+        // Store model info for health endpoint.
+        // SAFETY: called once during single-threaded init before server accepts requests.
+        unsafe {
+            std::env::set_var("_PENSYVE_EMBEDDING_MODEL", model_name);
+            std::env::set_var("_PENSYVE_EMBEDDING_DIMS", dimensions.to_string());
+        }
 
         // Create vector index.
         let vector_index = Arc::new(Mutex::new(VectorIndex::new(dimensions, 1024)));
