@@ -21,18 +21,14 @@ def _get_caller_role(request: Request) -> str:
     """Determine the caller's role from the request context.
 
     In single-tenant mode (no PENSYVE_RBAC_ENABLED), all authenticated
-    callers are treated as owners. In multi-tenant mode, the role would
-    be resolved from the API key -> namespace ACL mapping.
+    callers are treated as owners. In multi-tenant mode, the role is
+    derived from server-side configuration (not client headers).
     """
     if os.environ.get("PENSYVE_RBAC_ENABLED", "false").lower() != "true":
         return "owner"
 
-    # Future: look up role from API key -> namespace ACL table
-    # For now, check X-Pensyve-Role header (set by upstream gateway/proxy)
-    role = request.headers.get("X-Pensyve-Role", "reader").lower()
-    if role not in ROLE_HIERARCHY:
-        role = "reader"
-    return role
+    # Default role for all authenticated callers. Future: derive from API key -> role mapping.
+    return os.environ.get("PENSYVE_DEFAULT_ROLE", "writer")
 
 
 def require_role(required: str):

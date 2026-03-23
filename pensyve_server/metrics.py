@@ -7,6 +7,7 @@ is available, its metrics are merged into the output.
 
 from __future__ import annotations
 
+import re
 import time
 from collections import defaultdict
 from threading import Lock
@@ -25,6 +26,16 @@ if TYPE_CHECKING:
 _lock = Lock()
 _request_counts: dict[str, int] = defaultdict(int)
 _request_durations_ms: dict[str, float] = defaultdict(float)
+
+
+def _normalize_path(path: str) -> str:
+    """Replace path parameters with placeholders to prevent cardinality explosion."""
+    # Replace UUIDs
+    path = re.sub(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', '{id}', path)
+    # Replace entity names in /v1/entities/{name} and /v1/gdpr/erase/{name}
+    path = re.sub(r'/v1/entities/[^/]+', '/v1/entities/{name}', path)
+    path = re.sub(r'/v1/gdpr/erase/[^/]+', '/v1/gdpr/erase/{name}', path)
+    return path
 
 
 def _record_request(path: str, duration_ms: float) -> None:
@@ -46,7 +57,7 @@ class MetricsMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         duration_ms = (time.monotonic() - start) * 1000.0
         # Normalize the path to avoid cardinality explosion from path params.
-        path = request.url.path
+        path = _normalize_path(request.url.path)
         _record_request(path, duration_ms)
         return response
 

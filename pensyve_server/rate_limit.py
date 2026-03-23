@@ -2,7 +2,6 @@
 
 import os
 import time
-from collections import defaultdict
 
 import structlog
 from fastapi import HTTPException, Request
@@ -33,7 +32,8 @@ class _TokenBucket:
         return False
 
 
-_buckets: dict[str, _TokenBucket] = defaultdict(_TokenBucket)
+_MAX_BUCKETS = 10_000
+_buckets: dict[str, _TokenBucket] = {}
 
 
 async def rate_limit_check(request: Request):
@@ -63,8 +63,15 @@ async def rate_limit_check(request: Request):
     except Exception:
         logger.warning("redis_rate_limit_fallback", key_prefix=key[:12])
 
-    # In-memory fallback
-    if not _buckets[key].consume():
+    # In-memory fallback with bounded bucket cache
+    if key not in _buckets:
+        if len(_buckets) >= _MAX_BUCKETS:
+            # Evict oldest entry (first inserted key)
+            oldest = next(iter(_buckets))
+            del _buckets[oldest]
+        _buckets[key] = _TokenBucket()
+    bucket = _buckets[key]
+    if not bucket.consume():
         logger.warning("rate_limit_exceeded", key_prefix=key[:12])
         raise HTTPException(
             status_code=429,
