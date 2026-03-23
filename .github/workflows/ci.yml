@@ -121,7 +121,7 @@ jobs:
   build-and-push:
     name: Build & Push Docker Image
     needs: [lint, test-rust, test-python, test-typescript, test-go, test-wasm]
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && vars.ECR_PUSH_ENABLED == 'true'
     runs-on: ubuntu-latest
     permissions:
       id-token: write

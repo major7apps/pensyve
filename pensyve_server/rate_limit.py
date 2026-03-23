@@ -50,7 +50,7 @@ async def rate_limit_check(request: Request):
         redis_client = await get_redis()
         if redis_client:
             redis_key = f"ratelimit:{key}"
-            current = await redis_client.eval(INCR_EXPIRE_LUA, 1, redis_key, _WINDOW_SECONDS)
+            current = int(await redis_client.eval(INCR_EXPIRE_LUA, 1, redis_key, _WINDOW_SECONDS))  # type: ignore[arg-type]
             if current > _RATE_LIMIT:
                 raise HTTPException(
                     status_code=429,
