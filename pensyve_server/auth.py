@@ -28,7 +28,7 @@ def validate_auth_config() -> None:
         sys.exit(1)
 
 
-async def require_api_key(request: Request):
+async def require_api_key(request: Request) -> None:
     """Dependency that checks X-Pensyve-Key header. Behaviour depends on AUTH_MODE."""
     if request.url.path in AUTH_BYPASS_PATHS:
         return

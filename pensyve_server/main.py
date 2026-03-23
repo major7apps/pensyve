@@ -4,6 +4,7 @@ import time
 import uuid
 from collections import Counter
 from contextlib import asynccontextmanager
+from typing import Any, cast
 
 import structlog
 from fastapi import Depends, FastAPI
@@ -11,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-import pensyve
+import pensyve  # type: ignore[import-untyped]
 
 from .activity import ActivityTracker
 from .auth import require_api_key, validate_auth_config
@@ -54,13 +55,13 @@ logger = structlog.get_logger()
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI):  # type: ignore[misc]
     validate_auth_config()
     db_dir = os.path.join(os.path.expanduser("~"), ".pensyve", _get_namespace())
     db_path = os.path.join(db_dir, "memories.db")
     _activity.set_db_path(db_path)
 
-    async def _flush_loop():
+    async def _flush_loop() -> None:
         while True:
             await asyncio.sleep(30)
             try:
@@ -114,15 +115,15 @@ app.add_middleware(RequestIdMiddleware)
 app.add_middleware(MetricsMiddleware)
 app.include_router(metrics_router)
 
-_pensyve = None
+_pensyve: Any | None = None
 _episodes: dict[
-    str, dict
+    str, dict[str, Any]
 ] = {}  # episode_id -> {"ep": Episode, "message_count": int, "created_at": float}
 _EPISODE_TTL_SECONDS = 1800  # 30 minutes
 
 # Tier 2 extraction (gated by env var)
 _tier2_enabled = os.environ.get("PENSYVE_TIER2_ENABLED", "false").lower() == "true"
-_extractor = None
+_extractor: "Tier2Extractor | None" = None
 if _tier2_enabled:
     from pensyve_server.extraction import Tier2Extractor
 
@@ -136,15 +137,15 @@ def _get_namespace() -> str:
     return os.environ.get("PENSYVE_NAMESPACE", "default")
 
 
-def get_pensyve():
+def get_pensyve() -> Any:
     global _pensyve
     if _pensyve is None:
         path = os.environ.get("PENSYVE_PATH", None)
-        _pensyve = pensyve.Pensyve(path=path, namespace=_get_namespace())
-    return _pensyve
+        _pensyve = cast(Any, pensyve.Pensyve(path=path, namespace=_get_namespace()))  # type: ignore[misc]
+    return cast(Any, _pensyve)
 
 
-def _sweep_stale_episodes():
+def _sweep_stale_episodes() -> None:
     """Remove episodes older than TTL to prevent memory leaks."""
     now = time.time()
     stale = [eid for eid, e in _episodes.items() if now - e["created_at"] > _EPISODE_TTL_SECONDS]
@@ -157,7 +158,7 @@ def _sweep_stale_episodes():
                 logger.warning("Failed to close stale episode %s", eid, exc_info=True)
 
 
-def _memory_to_response(m) -> MemoryResponse:
+def _memory_to_response(m: Any) -> MemoryResponse:
     return MemoryResponse(
         id=m.id,
         content=m.content,
@@ -175,7 +176,7 @@ def _apply_cursor_pagination(
     if cursor:
         # Find the cursor position and skip past it
         found = False
-        filtered = []
+        filtered: list[MemoryResponse] = []
         for m in memories:
             if found:
                 filtered.append(m)
@@ -194,14 +195,14 @@ def _apply_cursor_pagination(
 
 
 @app.post("/v1/entities", response_model=EntityResponse)
-def create_entity(req: EntityCreate):
+def create_entity(req: EntityCreate) -> EntityResponse:
     p = get_pensyve()
     entity = p.entity(req.name, kind=req.kind)
     return EntityResponse(id=entity.id, name=entity.name, kind=entity.kind)
 
 
 @app.post("/v1/episodes/start", response_model=EpisodeStartResponse)
-def start_episode(req: EpisodeStartRequest):
+def start_episode(req: EpisodeStartRequest) -> EpisodeStartResponse:
     p = get_pensyve()
     entities = [p.entity(name) for name in req.participants]
     ep = p.episode(*entities)
@@ -213,7 +214,7 @@ def start_episode(req: EpisodeStartRequest):
 
 
 @app.post("/v1/episodes/message")
-def add_message(req: MessageRequest):
+def add_message(req: MessageRequest) -> dict[str, str]:
     entry = _episodes.get(req.episode_id)
     if not entry:
         raise NotFoundError(f"Episode {req.episode_id} not found")
@@ -223,7 +224,7 @@ def add_message(req: MessageRequest):
 
 
 @app.post("/v1/episodes/end", response_model=EpisodeEndResponse)
-def end_episode(req: EpisodeEndRequest):
+def end_episode(req: EpisodeEndRequest) -> EpisodeEndResponse:
     entry = _episodes.pop(req.episode_id, None)
     if not entry:
         raise NotFoundError(f"Episode {req.episode_id} not found")
@@ -235,7 +236,7 @@ def end_episode(req: EpisodeEndRequest):
 
 
 @app.post("/v1/recall", response_model=RecallResponse)
-def recall(req: RecallRequest, cursor: str | None = None):
+def recall(req: RecallRequest, cursor: str | None = None) -> RecallResponse:
     p = get_pensyve()
     # Fetch extra to support pagination
     fetch_limit = req.limit + 50  # overfetch for cursor slicing
@@ -275,7 +276,7 @@ def recall(req: RecallRequest, cursor: str | None = None):
 
 
 @app.post("/v1/feedback")
-def submit_feedback(req: FeedbackRequest):
+def submit_feedback(req: FeedbackRequest) -> dict[str, str]:
     """Record user feedback on a recalled memory to improve retrieval weights."""
     # For now, log the feedback. Full weight learning requires the Rust WeightLearner
     # to be exposed via PyO3 (future work).
@@ -287,7 +288,7 @@ def submit_feedback(req: FeedbackRequest):
 @app.post(
     "/v1/remember", response_model=RememberResponse, dependencies=[Depends(require_role("writer"))]
 )
-def remember(req: RememberRequest):
+def remember(req: RememberRequest) -> RememberResponse:
     p = get_pensyve()
     entity = p.entity(req.entity)
     mem = p.remember(entity=entity, fact=req.fact, confidence=req.confidence)
@@ -324,7 +325,7 @@ def remember(req: RememberRequest):
     response_model=ForgetResponse,
     dependencies=[Depends(require_role("writer"))],
 )
-def forget(entity_name: str, hard_delete: bool = False):
+def forget(entity_name: str, hard_delete: bool = False) -> ForgetResponse:
     p = get_pensyve()
     entity = p.entity(entity_name)
     result = p.forget(entity=entity, hard_delete=hard_delete)
@@ -337,7 +338,7 @@ def forget(entity_name: str, hard_delete: bool = False):
     response_model=GdprErasureResponse,
     dependencies=[Depends(require_role("owner"))],
 )
-def gdpr_erase(entity_name: str):
+def gdpr_erase(entity_name: str) -> GdprErasureResponse:
     """GDPR Article 17: Right to erasure. Cascading delete of all entity data."""
     p = get_pensyve()
     entity = p.entity(entity_name)
@@ -357,7 +358,7 @@ def gdpr_erase(entity_name: str):
     response_model=ConsolidateResponse,
     dependencies=[Depends(require_role("owner"))],
 )
-def consolidate():
+def consolidate() -> ConsolidateResponse:
     p = get_pensyve()
     result = p.consolidate()
     _activity.record("consolidate", f"promoted={result.get('promoted', 0)}")
@@ -369,7 +370,7 @@ def consolidate():
 
 
 @app.get("/v1/stats", response_model=StatsResponse)
-def get_stats():
+def get_stats() -> StatsResponse:
     p = get_pensyve()
 
     # TODO: Replace with direct storage-level count query when Pensyve.stats()
@@ -388,7 +389,7 @@ def get_stats():
 
 
 @app.post("/v1/inspect", response_model=InspectResponse)
-def inspect(req: InspectRequest):
+def inspect(req: InspectRequest) -> InspectResponse:
     p = get_pensyve()
     entity = p.entity(req.entity)
 
@@ -415,7 +416,7 @@ def inspect(req: InspectRequest):
 
 
 @app.get("/v1/usage")
-def get_usage():
+def get_usage() -> dict[str, Any]:
     namespace = _get_namespace()
     usage = _usage_tracker.get_usage(namespace)
     return {
@@ -427,12 +428,12 @@ def get_usage():
 
 
 @app.get("/v1/activity", response_model=list[ActivityResponse])
-def get_activity(days: int = 30):
+def get_activity(days: int = 30) -> list[dict[str, Any]]:
     return _activity.daily_summary(days)
 
 
 @app.get("/v1/activity/recent", response_model=list[RecentEventResponse])
-def get_recent_activity(limit: int = 10):
+def get_recent_activity(limit: int = 10) -> list[RecentEventResponse]:
     events = _activity.recent(limit)
     return [
         RecentEventResponse(id=e.id, type=e.event_type, content=e.content, timestamp=e.timestamp)
@@ -441,7 +442,7 @@ def get_recent_activity(limit: int = 10):
 
 
 @app.get("/v1/a2a/agent-card")
-def a2a_agent_card():
+def a2a_agent_card() -> dict[str, Any]:
     """Return the A2A agent card describing Pensyve's capabilities."""
     base_url = os.environ.get("PENSYVE_BASE_URL", "http://localhost:8000")
     return {
@@ -461,7 +462,7 @@ def a2a_agent_card():
 @app.post(
     "/v1/a2a/task", response_model=A2ATaskResponse, dependencies=[Depends(require_role("writer"))]
 )
-def a2a_task(req: A2ATaskRequest):
+def a2a_task(req: A2ATaskRequest) -> A2ATaskResponse:
     """Handle an A2A task request by routing to the appropriate capability."""
     p = get_pensyve()
     _activity.record("a2a_task", f"capability={req.capability} from={req.from_agent}")
@@ -511,5 +512,5 @@ def a2a_task(req: A2ATaskRequest):
 
 
 @app.get("/v1/health")
-def health():
+def health() -> dict[str, str]:
     return {"status": "ok", "version": "0.1.0"}

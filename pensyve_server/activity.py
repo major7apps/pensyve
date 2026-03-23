@@ -7,7 +7,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import structlog
 
@@ -61,7 +61,7 @@ class ActivityTracker:
         "forget": "forgets",
     }
 
-    def daily_summary(self, days: int = 30) -> list[dict]:
+    def daily_summary(self, days: int = 30) -> list[dict[str, Any]]:
         """Aggregate events by date for the past N days."""
         with self._lock:
             counts: dict[str, dict[str, int]] = defaultdict(
