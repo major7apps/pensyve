@@ -5,9 +5,9 @@ requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn>=0.34",
-    "pydantic>=2.0",
-    "structlog>=24.0",
-    "redis[hiredis]>=5.0",
+    "pydantic>=2.0,<3.0",
+    "structlog>=24.0,<26.0",
+    "redis[hiredis]>=5.0,<8.0",
 ]
 
 [project.optional-dependencies]
