@@ -1,6 +1,6 @@
 import { describe, expect, test, mock } from "bun:test";
 import { Pensyve, PensyveError } from "./index";
-import type { PensyveConfig } from "./index";
+import type { PensyveConfig, RecallResult } from "./index";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -299,32 +299,78 @@ describe("entity()", () => {
 describe("recall()", () => {
   test("searches and returns memories with camelCase keys", async () => {
     const fetchFn = mock(async () =>
+      jsonResponse({
+        memories: [
+          {
+            id: "m-1",
+            content: "Alice likes cats",
+            memory_type: "semantic",
+            confidence: 0.9,
+            stability: 0.8,
+            score: 0.95,
+          },
+        ],
+      })
+    );
+
+    const client = makeClient(fetchFn);
+    const result: RecallResult = await client.recall("cats");
+
+    expect(result.memories).toHaveLength(1);
+    expect(result.memories[0].memoryType).toBe("semantic");
+    expect(result.memories[0].score).toBe(0.95);
+    expect(result.memories[0].confidence).toBe(0.9);
+    expect(result.cursor).toBeUndefined();
+  });
+
+  test("returns cursor when present", async () => {
+    const fetchFn = mock(async () =>
+      jsonResponse({
+        memories: [
+          {
+            id: "m-2",
+            content: "test",
+            memory_type: "episodic",
+            confidence: 0.7,
+            stability: 0.5,
+          },
+        ],
+        cursor: "page2-token",
+      })
+    );
+
+    const client = makeClient(fetchFn);
+    const result = await client.recall("test");
+
+    expect(result.memories).toHaveLength(1);
+    expect(result.cursor).toBe("page2-token");
+  });
+
+  test("handles bare array response (legacy)", async () => {
+    const fetchFn = mock(async () =>
       jsonResponse([
         {
-          id: "m-1",
-          content: "Alice likes cats",
+          id: "m-3",
+          content: "bare array memory",
           memory_type: "semantic",
-          confidence: 0.9,
-          stability: 0.8,
-          score: 0.95,
+          confidence: 0.8,
+          stability: 0.6,
         },
       ])
     );
 
     const client = makeClient(fetchFn);
-    const memories = await client.recall("cats");
+    const result = await client.recall("legacy");
 
-    expect(memories).toHaveLength(1);
-    expect(memories[0].memoryType).toBe("semantic");
-    expect(memories[0].score).toBe(0.95);
-    expect(memories[0].confidence).toBe(0.9);
+    expect(result.memories).toHaveLength(1);
+    expect(result.cursor).toBeUndefined();
   });
 
   test("sends options in request body", async () => {
     let captured: Record<string, unknown> | null = null;
     const fetchFn = mock(async (_url: string, init?: RequestInit) => {
       captured = JSON.parse(init?.body as string);
-      return jsonResponse([]);
+      return jsonResponse({ memories: [] });
     });
 
     const client = makeClient(fetchFn);
@@ -336,11 +382,24 @@ describe("recall()", () => {
     expect(captured!.types).toEqual(["semantic"]);
   });
 
+  test("sends cursor when provided", async () => {
+    let captured: Record<string, unknown> | null = null;
+    const fetchFn = mock(async (_url: string, init?: RequestInit) => {
+      captured = JSON.parse(init?.body as string);
+      return jsonResponse({ memories: [], cursor: undefined });
+    });
+
+    const client = makeClient(fetchFn);
+    await client.recall("test", { cursor: "next-page-token" });
+
+    expect(captured!.cursor).toBe("next-page-token");
+  });
+
   test("uses default limit of 5", async () => {
     let captured: Record<string, unknown> | null = null;
     const fetchFn = mock(async (_url: string, init?: RequestInit) => {
       captured = JSON.parse(init?.body as string);
-      return jsonResponse([]);
+      return jsonResponse({ memories: [] });
     });
 
     const client = makeClient(fetchFn);
@@ -576,25 +635,27 @@ describe("health()", () => {
 describe("camelCase mapping", () => {
   test("recall maps memory_type to memoryType", async () => {
     const fetchFn = mock(async () =>
-      jsonResponse([
-        {
-          id: "m-1",
-          content: "test",
-          memory_type: "procedural",
-          confidence: 0.7,
-          stability: 0.5,
-        },
-      ])
+      jsonResponse({
+        memories: [
+          {
+            id: "m-1",
+            content: "test",
+            memory_type: "procedural",
+            confidence: 0.7,
+            stability: 0.5,
+          },
+        ],
+      })
     );
 
     const client = makeClient(fetchFn);
-    const memories = await client.recall("test");
+    const result = await client.recall("test");
 
     // Should have camelCase key
-    expect(memories[0].memoryType).toBe("procedural");
+    expect(result.memories[0].memoryType).toBe("procedural");
     // Should NOT have snake_case key
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((memories[0] as any).memory_type).toBeUndefined();
+    expect((result.memories[0] as any).memory_type).toBeUndefined();
   });
 
   test("forget maps forgotten_count to forgottenCount", async () => {
@@ -778,5 +839,245 @@ describe("Full episode lifecycle", () => {
 
     expect(calls).toEqual(["start", "message", "message", "end"]);
     expect(result.memoriesCreated).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// feedback()
+// ---------------------------------------------------------------------------
+
+describe("feedback()", () => {
+  test("sends POST to /v1/feedback with correct body", async () => {
+    let captured: Record<string, unknown> | null = null;
+    let capturedUrl = "";
+    const fetchFn = mock(async (url: string, init?: RequestInit) => {
+      capturedUrl = String(url);
+      captured = JSON.parse(init?.body as string);
+      return jsonResponse({ status: "accepted" });
+    });
+
+    const client = makeClient(fetchFn);
+    await client.feedback("mem-1", true);
+
+    expect(capturedUrl).toContain("/v1/feedback");
+    expect(captured!.memory_id).toBe("mem-1");
+    expect(captured!.relevant).toBe(true);
+  });
+
+  test("includes signals when provided", async () => {
+    let captured: Record<string, unknown> | null = null;
+    const fetchFn = mock(async (_url: string, init?: RequestInit) => {
+      captured = JSON.parse(init?.body as string);
+      return jsonResponse({ status: "accepted" });
+    });
+
+    const client = makeClient(fetchFn);
+    await client.feedback("mem-2", false, { clicked: 0, saved: 1 });
+
+    expect(captured!.signals).toEqual({ clicked: 0, saved: 1 });
+    expect(captured!.relevant).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// inspect()
+// ---------------------------------------------------------------------------
+
+describe("inspect()", () => {
+  test("sends POST to /v1/inspect and returns RecallResult", async () => {
+    let captured: Record<string, unknown> | null = null;
+    let capturedUrl = "";
+    const fetchFn = mock(async (url: string, init?: RequestInit) => {
+      capturedUrl = String(url);
+      captured = JSON.parse(init?.body as string);
+      return jsonResponse({
+        memories: [
+          { id: "m-5", content: "fact", memory_type: "semantic", confidence: 0.9, stability: 1.0 },
+        ],
+        cursor: "inspect-cursor",
+      });
+    });
+
+    const client = makeClient(fetchFn);
+    const result = await client.inspect("alice", { limit: 20 });
+
+    expect(capturedUrl).toContain("/v1/inspect");
+    expect(captured!.entity).toBe("alice");
+    expect(captured!.limit).toBe(20);
+    expect(result.memories).toHaveLength(1);
+    expect(result.memories[0].memoryType).toBe("semantic");
+    expect(result.cursor).toBe("inspect-cursor");
+  });
+
+  test("works with no options", async () => {
+    const fetchFn = mock(async () =>
+      jsonResponse({ memories: [] })
+    );
+    const client = makeClient(fetchFn);
+    const result = await client.inspect("bob");
+    expect(result.memories).toHaveLength(0);
+    expect(result.cursor).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// activity() and recentActivity()
+// ---------------------------------------------------------------------------
+
+describe("activity()", () => {
+  test("sends GET to /v1/activity", async () => {
+    let capturedUrl = "";
+    const fetchFn = mock(async (url: string) => {
+      capturedUrl = String(url);
+      return jsonResponse({ total_events: 42, by_day: {} });
+    });
+
+    const client = makeClient(fetchFn);
+    const result = await client.activity();
+
+    expect(capturedUrl).toContain("/v1/activity");
+    expect(result.totalEvents).toBe(42);
+  });
+
+  test("includes days param when provided", async () => {
+    let capturedUrl = "";
+    const fetchFn = mock(async (url: string) => {
+      capturedUrl = String(url);
+      return jsonResponse({ total_events: 10 });
+    });
+
+    const client = makeClient(fetchFn);
+    await client.activity({ days: 14 });
+
+    expect(capturedUrl).toContain("days=14");
+  });
+});
+
+describe("recentActivity()", () => {
+  test("sends GET to /v1/activity/recent", async () => {
+    let capturedUrl = "";
+    const fetchFn = mock(async (url: string) => {
+      capturedUrl = String(url);
+      return jsonResponse({ events: [] });
+    });
+
+    const client = makeClient(fetchFn);
+    await client.recentActivity();
+
+    expect(capturedUrl).toContain("/v1/activity/recent");
+  });
+
+  test("includes limit param when provided", async () => {
+    let capturedUrl = "";
+    const fetchFn = mock(async (url: string) => {
+      capturedUrl = String(url);
+      return jsonResponse({ events: [] });
+    });
+
+    const client = makeClient(fetchFn);
+    await client.recentActivity({ limit: 5 });
+
+    expect(capturedUrl).toContain("limit=5");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// usage()
+// ---------------------------------------------------------------------------
+
+describe("usage()", () => {
+  test("sends GET to /v1/usage and returns camelCase data", async () => {
+    let capturedUrl = "";
+    const fetchFn = mock(async (url: string) => {
+      capturedUrl = String(url);
+      return jsonResponse({ memories_stored: 100, api_calls_today: 20 });
+    });
+
+    const client = makeClient(fetchFn);
+    const result = await client.usage();
+
+    expect(capturedUrl).toContain("/v1/usage");
+    expect(result.memoriesStored).toBe(100);
+    expect(result.apiCallsToday).toBe(20);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// gdprErase()
+// ---------------------------------------------------------------------------
+
+describe("gdprErase()", () => {
+  test("sends DELETE to /v1/gdpr/erase/{entity}", async () => {
+    let capturedUrl = "";
+    let capturedMethod = "";
+    const fetchFn = mock(async (url: string, init?: RequestInit) => {
+      capturedUrl = String(url);
+      capturedMethod = init?.method ?? "";
+      return jsonResponse({ erased: true });
+    });
+
+    const client = makeClient(fetchFn);
+    const result = await client.gdprErase("alice");
+
+    expect(capturedUrl).toContain("/v1/gdpr/erase/alice");
+    expect(capturedMethod).toBe("DELETE");
+    expect(result.erased).toBe(true);
+  });
+
+  test("URL-encodes entity name", async () => {
+    let capturedUrl = "";
+    const fetchFn = mock(async (url: string) => {
+      capturedUrl = String(url);
+      return jsonResponse({ erased: true });
+    });
+
+    const client = makeClient(fetchFn);
+    await client.gdprErase("alice smith");
+
+    expect(capturedUrl).toContain("alice%20smith");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// a2aAgentCard() and a2aTask()
+// ---------------------------------------------------------------------------
+
+describe("a2aAgentCard()", () => {
+  test("sends GET to /v1/a2a/agent-card", async () => {
+    let capturedUrl = "";
+    let capturedMethod = "";
+    const fetchFn = mock(async (url: string, init?: RequestInit) => {
+      capturedUrl = String(url);
+      capturedMethod = init?.method ?? "";
+      return jsonResponse({ agent_name: "Pensyve", supported_methods: ["recall"] });
+    });
+
+    const client = makeClient(fetchFn);
+    const result = await client.a2aAgentCard();
+
+    expect(capturedUrl).toContain("/v1/a2a/agent-card");
+    expect(capturedMethod).toBe("GET");
+    expect(result.agentName).toBe("Pensyve");
+  });
+});
+
+describe("a2aTask()", () => {
+  test("sends POST to /v1/a2a/task with task body", async () => {
+    let captured: Record<string, unknown> | null = null;
+    let capturedUrl = "";
+    const fetchFn = mock(async (url: string, init?: RequestInit) => {
+      capturedUrl = String(url);
+      captured = JSON.parse(init?.body as string);
+      return jsonResponse({ task_id: "t-123", status: "queued" });
+    });
+
+    const client = makeClient(fetchFn);
+    const result = await client.a2aTask({ method: "recall", input: { query: "cats" } });
+
+    expect(capturedUrl).toContain("/v1/a2a/task");
+    expect(captured!.method).toBe("recall");
+    expect((captured!.input as Record<string, unknown>).query).toBe("cats");
+    expect(result.taskId).toBe("t-123");
+    expect(result.status).toBe("queued");
   });
 });
