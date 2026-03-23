@@ -6,13 +6,19 @@ use pensyve_core::{
     embedding::OnnxEmbedder,
     retrieval::RecallEngine,
     storage::{StorageTrait, sqlite::SqliteBackend},
-    types::{Memory, Namespace},
+    types::{Entity, EntityKind, Memory, Namespace, SemanticMemory},
     vector::VectorIndex,
 };
 
 // ---------------------------------------------------------------------------
 // CLI definition
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, clap::ValueEnum)]
+enum OutputFormat {
+    Json,
+    Text,
+}
 
 #[derive(Parser)]
 #[command(
@@ -23,6 +29,10 @@ use pensyve_core::{
 struct Cli {
     #[command(subcommand)]
     command: Command,
+
+    /// Output format: json (default) or text
+    #[arg(long, default_value = "json", global = true)]
+    format: OutputFormat,
 }
 
 #[derive(Subcommand)]
@@ -66,6 +76,40 @@ enum Command {
         #[arg(long, default_value = "default")]
         namespace: String,
     },
+
+    /// Store a fact about an entity as a semantic memory
+    Remember {
+        /// Entity name the fact is about
+        #[arg(long)]
+        entity: String,
+
+        /// The fact to remember (e.g. "knows Rust")
+        #[arg(long)]
+        fact: String,
+
+        /// Confidence in the fact, 0.0–1.0
+        #[arg(long, default_value_t = 1.0)]
+        confidence: f64,
+
+        /// Namespace to store the fact in
+        #[arg(long, default_value = "default")]
+        namespace: String,
+    },
+
+    /// Remove memories for an entity
+    Forget {
+        /// Entity name whose memories to remove
+        #[arg(long)]
+        entity: String,
+
+        /// Permanently erase all records (GDPR hard delete)
+        #[arg(long, default_value_t = false)]
+        hard: bool,
+
+        /// Namespace to forget memories in
+        #[arg(long, default_value = "default")]
+        namespace: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +144,22 @@ fn ensure_namespace(
     Ok(ns)
 }
 
+/// Ensure an entity exists in storage, creating it if absent. Returns the
+/// Entity record.
+fn ensure_entity(
+    storage: &SqliteBackend,
+    name: &str,
+    namespace_id: uuid::Uuid,
+) -> Result<Entity, Box<dyn std::error::Error>> {
+    if let Some(entity) = storage.get_entity_by_name(name, namespace_id)? {
+        return Ok(entity);
+    }
+    let mut entity = Entity::new(name, EntityKind::Agent);
+    entity.namespace_id = namespace_id;
+    storage.save_entity(&entity)?;
+    Ok(entity)
+}
+
 /// Build a `VectorIndex` pre-loaded with all embeddings from `namespace_id`.
 fn build_vector_index(
     storage: &SqliteBackend,
@@ -127,6 +187,7 @@ fn cmd_recall(
     entity_filter: Option<&str>,
     limit: usize,
     namespace_name: &str,
+    format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = storage_path(namespace_name);
     let storage = open_storage(&path)?;
@@ -157,7 +218,7 @@ fn cmd_recall(
         None
     };
 
-    let memories: Vec<serde_json::Value> = result
+    let candidates: Vec<_> = result
         .memories
         .iter()
         .filter(|c| {
@@ -171,35 +232,77 @@ fn cmd_recall(
                 true
             }
         })
-        .map(|c| {
-            let kind = match &c.memory {
-                Memory::Episodic(_) => "episodic",
-                Memory::Semantic(_) => "semantic",
-                Memory::Procedural(_) => "procedural",
-            };
-            let content = match &c.memory {
-                Memory::Episodic(m) => m.content.clone(),
-                Memory::Semantic(m) => format!("{} {} {}", m.subject, m.predicate, m.object),
-                Memory::Procedural(m) => format!("{} -> {}", m.trigger, m.action),
-            };
-            serde_json::json!({
-                "id": c.memory_id.to_string(),
-                "type": kind,
-                "content": content,
-                "score": c.final_score,
-                "vector_score": c.vector_score,
-                "bm25_score": c.bm25_score,
-                "recency_score": c.recency_score,
-                "confidence_score": c.confidence_score,
-            })
-        })
         .collect();
 
-    println!("{}", serde_json::to_string_pretty(&memories)?);
+    match format {
+        OutputFormat::Json => {
+            let memories: Vec<serde_json::Value> = candidates
+                .iter()
+                .map(|c| {
+                    let kind = match &c.memory {
+                        Memory::Episodic(_) => "episodic",
+                        Memory::Semantic(_) => "semantic",
+                        Memory::Procedural(_) => "procedural",
+                    };
+                    let content = match &c.memory {
+                        Memory::Episodic(m) => m.content.clone(),
+                        Memory::Semantic(m) => {
+                            format!("{} {} {}", m.subject, m.predicate, m.object)
+                        }
+                        Memory::Procedural(m) => format!("{} -> {}", m.trigger, m.action),
+                    };
+                    serde_json::json!({
+                        "id": c.memory_id.to_string(),
+                        "type": kind,
+                        "content": content,
+                        "score": c.final_score,
+                        "vector_score": c.vector_score,
+                        "bm25_score": c.bm25_score,
+                        "recency_score": c.recency_score,
+                        "confidence_score": c.confidence_score,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&memories)?);
+        }
+        OutputFormat::Text => {
+            if candidates.is_empty() {
+                println!("No memories found for query '{query}'");
+            } else {
+                println!("{:<6} {:<12} {:<8} {}", "rank", "type", "score", "content");
+                println!("{}", "-".repeat(72));
+                for (i, c) in candidates.iter().enumerate() {
+                    let kind = match &c.memory {
+                        Memory::Episodic(_) => "episodic",
+                        Memory::Semantic(_) => "semantic",
+                        Memory::Procedural(_) => "procedural",
+                    };
+                    let content = match &c.memory {
+                        Memory::Episodic(m) => m.content.clone(),
+                        Memory::Semantic(m) => {
+                            format!("{} {} {}", m.subject, m.predicate, m.object)
+                        }
+                        Memory::Procedural(m) => format!("{} -> {}", m.trigger, m.action),
+                    };
+                    println!(
+                        "{:<6} {:<12} {:<8.4} {}",
+                        i + 1,
+                        kind,
+                        c.final_score,
+                        content
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
-fn cmd_stats(namespace_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_stats(
+    namespace_name: &str,
+    format: &OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
     let path = storage_path(namespace_name);
     let storage = open_storage(&path)?;
     let ns = ensure_namespace(&storage, namespace_name)?;
@@ -224,19 +327,35 @@ fn cmd_stats(namespace_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let db_path = path.join("memories.db");
     let storage_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
-    let stats = serde_json::json!({
-        "namespace": namespace_name,
-        "storage_path": path.to_string_lossy(),
-        "counts": {
-            "episodic": episodic_count,
-            "semantic": semantic_count,
-            "procedural": procedural_count,
-            "total": total,
-        },
-        "storage_bytes": storage_bytes,
-    });
+    match format {
+        OutputFormat::Json => {
+            let stats = serde_json::json!({
+                "namespace": namespace_name,
+                "storage_path": path.to_string_lossy(),
+                "counts": {
+                    "episodic": episodic_count,
+                    "semantic": semantic_count,
+                    "procedural": procedural_count,
+                    "total": total,
+                },
+                "storage_bytes": storage_bytes,
+            });
+            println!("{}", serde_json::to_string_pretty(&stats)?);
+        }
+        OutputFormat::Text => {
+            println!("Namespace:      {namespace_name}");
+            println!("Storage path:   {}", path.to_string_lossy());
+            println!("Storage bytes:  {storage_bytes}");
+            println!();
+            println!("{:<14} {}", "type", "count");
+            println!("{}", "-".repeat(22));
+            println!("{:<14} {}", "episodic", episodic_count);
+            println!("{:<14} {}", "semantic", semantic_count);
+            println!("{:<14} {}", "procedural", procedural_count);
+            println!("{:<14} {}", "total", total);
+        }
+    }
 
-    println!("{}", serde_json::to_string_pretty(&stats)?);
     Ok(())
 }
 
@@ -244,19 +363,27 @@ fn cmd_inspect(
     entity_name: &str,
     type_filter: Option<&str>,
     namespace_name: &str,
+    format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = storage_path(namespace_name);
     let storage = open_storage(&path)?;
     let ns = ensure_namespace(&storage, namespace_name)?;
 
     let Some(entity) = storage.get_entity_by_name(entity_name, ns.id)? else {
-        let out = serde_json::json!({
-            "entity": entity_name,
-            "namespace": namespace_name,
-            "error": "entity not found",
-            "memories": [],
-        });
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        match format {
+            OutputFormat::Json => {
+                let out = serde_json::json!({
+                    "entity": entity_name,
+                    "namespace": namespace_name,
+                    "error": "entity not found",
+                    "memories": [],
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            }
+            OutputFormat::Text => {
+                println!("Entity '{entity_name}' not found in namespace '{namespace_name}'");
+            }
+        }
         return Ok(());
     };
 
@@ -296,18 +423,157 @@ fn cmd_inspect(
         }
     }
 
-    let out = serde_json::json!({
-        "entity": {
-            "id": entity.id.to_string(),
-            "name": entity.name,
-            "kind": format!("{:?}", entity.kind),
-        },
-        "namespace": namespace_name,
-        "memories": memories,
-        "note": if want_procedural { "" } else { "procedural memories are not entity-scoped" },
-    });
+    match format {
+        OutputFormat::Json => {
+            let out = serde_json::json!({
+                "entity": {
+                    "id": entity.id.to_string(),
+                    "name": entity.name,
+                    "kind": format!("{:?}", entity.kind),
+                },
+                "namespace": namespace_name,
+                "memories": memories,
+                "note": if want_procedural { "" } else { "procedural memories are not entity-scoped" },
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        OutputFormat::Text => {
+            println!("Entity:    {} ({})", entity.name, entity.id);
+            println!("Kind:      {:?}", entity.kind);
+            println!("Namespace: {namespace_name}");
+            println!();
+            if memories.is_empty() {
+                println!("No memories found.");
+            } else {
+                println!("{:<12} {:<38} {}", "type", "id", "summary");
+                println!("{}", "-".repeat(80));
+                for m in &memories {
+                    let kind = m["type"].as_str().unwrap_or("?");
+                    let id = m["id"].as_str().unwrap_or("?");
+                    let summary = if kind == "episodic" {
+                        m["content"].as_str().unwrap_or("").to_string()
+                    } else {
+                        format!(
+                            "{} {}",
+                            m["predicate"].as_str().unwrap_or(""),
+                            m["object"].as_str().unwrap_or("")
+                        )
+                    };
+                    println!("{:<12} {:<38} {}", kind, id, summary);
+                }
+            }
+            if !want_procedural {
+                println!();
+                println!("Note: procedural memories are not entity-scoped");
+            }
+        }
+    }
 
-    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+fn cmd_remember(
+    entity_name: &str,
+    fact: &str,
+    confidence: f64,
+    namespace_name: &str,
+    format: &OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = storage_path(namespace_name);
+    let storage = open_storage(&path)?;
+    let ns = ensure_namespace(&storage, namespace_name)?;
+    let entity = ensure_entity(&storage, entity_name, ns.id)?;
+
+    // Parse "predicate object" from the fact string. Split on the first space;
+    // if there's no space, use "is" as the predicate and the full string as the object.
+    let (predicate, object) = if let Some(idx) = fact.find(' ') {
+        (&fact[..idx], &fact[idx + 1..])
+    } else {
+        ("is", fact)
+    };
+
+    let mut mem = SemanticMemory::new(
+        ns.id,
+        entity.id,
+        predicate,
+        object,
+        confidence as f32,
+    );
+
+    // Embed using the mock embedder (768 dims) so the memory is searchable.
+    let embedder = OnnxEmbedder::new_mock(768);
+    mem.embedding = embedder.embed(fact)?;
+
+    storage.save_semantic(&mem)?;
+
+    match format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "stored",
+                    "entity": entity_name,
+                    "fact": fact,
+                }))?
+            );
+        }
+        OutputFormat::Text => {
+            println!("Stored fact for entity '{entity_name}'");
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_forget(
+    entity_name: &str,
+    hard: bool,
+    namespace_name: &str,
+    format: &OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = storage_path(namespace_name);
+    let storage = open_storage(&path)?;
+    let ns = ensure_namespace(&storage, namespace_name)?;
+
+    let Some(entity) = storage.get_entity_by_name(entity_name, ns.id)? else {
+        match format {
+            OutputFormat::Json => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "not_found",
+                        "entity": entity_name,
+                    }))?
+                );
+            }
+            OutputFormat::Text => {
+                println!("Entity '{entity_name}' not found in namespace '{namespace_name}'");
+            }
+        }
+        return Ok(());
+    };
+
+    if hard {
+        pensyve_core::gdpr::erase_entity(&storage, entity.id)?;
+    } else {
+        storage.delete_memories_by_entity(entity.id)?;
+    }
+
+    match format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "forgotten",
+                    "entity": entity_name,
+                }))?
+            );
+        }
+        OutputFormat::Text => {
+            println!("Forgotten memories for entity '{entity_name}'");
+        }
+    }
+
     Ok(())
 }
 
@@ -324,15 +590,28 @@ fn main() {
             entity,
             limit,
             namespace,
-        } => cmd_recall(query, entity.as_deref(), *limit, namespace),
+        } => cmd_recall(query, entity.as_deref(), *limit, namespace, &cli.format),
 
-        Command::Stats { namespace } => cmd_stats(namespace),
+        Command::Stats { namespace } => cmd_stats(namespace, &cli.format),
 
         Command::Inspect {
             entity,
             r#type,
             namespace,
-        } => cmd_inspect(entity, r#type.as_deref(), namespace),
+        } => cmd_inspect(entity, r#type.as_deref(), namespace, &cli.format),
+
+        Command::Remember {
+            entity,
+            fact,
+            confidence,
+            namespace,
+        } => cmd_remember(entity, fact, *confidence, namespace, &cli.format),
+
+        Command::Forget {
+            entity,
+            hard,
+            namespace,
+        } => cmd_forget(entity, *hard, namespace, &cli.format),
     };
 
     if let Err(e) = result {
