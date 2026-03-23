@@ -32,7 +32,13 @@ jobs:
         run: |
           uv sync --extra dev
           uv run ruff check pensyve_server/ tests/
-          uv run ruff check benchmarks/ || true
+          uv run pyright pensyve_server/
+      - uses: oven-sh/setup-bun@v2
+      - name: TypeScript lint
+        working-directory: pensyve-ts
+        run: |
+          bun install
+          bun run lint
 
   test-rust:
     name: Rust Tests
@@ -42,23 +48,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Run tests
         run: cargo test --workspace
-
-  test-python:
-    name: Python Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: astral-sh/setup-uv@v7
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - name: Install dependencies
-        run: |
-          uv sync --extra dev
-          uv run maturin develop --manifest-path pensyve-python/Cargo.toml
-      - name: Run tests
-        run: uv run pytest tests/python/ -v
 
   test-rust-models:
     name: Rust Tests (with models)
@@ -74,6 +63,22 @@ jobs:
       - name: Run model-dependent tests
         run: cargo test --workspace -- --ignored
 
+  test-python:
+    name: Python Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install and test
+        run: |
+          uv sync --extra dev
+          uv run maturin develop --manifest-path pensyve-python/Cargo.toml
+          uv run pytest tests/python/ -v
+
   test-typescript:
     name: TypeScript Tests
     runs-on: ubuntu-latest
@@ -84,6 +89,54 @@ jobs:
         working-directory: pensyve-ts
         run: |
           bun install
-          bun run lint
           bun run build
           bun test
+
+  test-go:
+    name: Go Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Run tests
+        working-directory: pensyve-go
+        run: go test ./... -v
+
+  test-wasm:
+    name: WASM Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Run tests
+        working-directory: pensyve-wasm
+        run: wasm-pack test --node
+
+  build-and-push:
+    name: Build & Push Docker Image
+    needs: [lint, test-rust, test-python, test-typescript, test-go, test-wasm]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+      - name: Build and push
+        run: |
+          IMAGE=${{ steps.ecr.outputs.registry }}/pensyve:${{ github.sha }}
+          docker build -t $IMAGE -t ${{ steps.ecr.outputs.registry }}/pensyve:latest .
+          docker push $IMAGE
+          docker push ${{ steps.ecr.outputs.registry }}/pensyve:latest
