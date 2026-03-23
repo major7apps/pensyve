@@ -6,7 +6,7 @@ import time
 import structlog
 from fastapi import HTTPException, Request
 
-from .redis_client import get_redis, INCR_EXPIRE_LUA
+from .redis_client import INCR_EXPIRE_LUA, get_redis
 
 logger = structlog.get_logger()
 

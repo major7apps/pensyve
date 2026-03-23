@@ -15,6 +15,8 @@ from .activity import ActivityTracker
 from .auth import require_api_key
 from .billing import UsageTracker
 from .logging import RequestIdMiddleware, configure_logging
+from .metrics import MetricsMiddleware
+from .metrics import router as metrics_router
 from .models import (
     A2ATaskRequest,
     A2ATaskResponse,
@@ -40,7 +42,6 @@ from .models import (
     RememberResponse,
     StatsResponse,
 )
-from .metrics import MetricsMiddleware, router as metrics_router
 from .rate_limit import rate_limit_check
 from .rbac import require_role
 from .redis_client import close_redis
