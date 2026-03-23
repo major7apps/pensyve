@@ -1,3 +1,4 @@
+"""Pensyve REST API server — FastAPI application with memory operations."""
 import asyncio
 import os
 import time
@@ -194,14 +195,32 @@ def _apply_cursor_pagination(
     return memories, next_cursor
 
 
-@app.post("/v1/entities", response_model=EntityResponse)
+@app.post(
+    "/v1/entities",
+    response_model=EntityResponse,
+    summary="Create entity",
+    description="Create or retrieve a named entity (user, agent, team, or tool) in the current namespace.",
+    responses={
+        401: {"description": "Invalid or missing API key", "model": ErrorResponse},
+        429: {"description": "Rate limit exceeded", "model": ErrorResponse},
+    },
+)
 def create_entity(req: EntityCreate) -> EntityResponse:
     p = get_pensyve()
     entity = p.entity(req.name, kind=req.kind)
     return EntityResponse(id=entity.id, name=entity.name, kind=entity.kind)
 
 
-@app.post("/v1/episodes/start", response_model=EpisodeStartResponse)
+@app.post(
+    "/v1/episodes/start",
+    response_model=EpisodeStartResponse,
+    summary="Start episode",
+    description="Begin a new conversational episode among one or more participants.",
+    responses={
+        401: {"description": "Invalid or missing API key", "model": ErrorResponse},
+        429: {"description": "Rate limit exceeded", "model": ErrorResponse},
+    },
+)
 def start_episode(req: EpisodeStartRequest) -> EpisodeStartResponse:
     p = get_pensyve()
     entities = [p.entity(name) for name in req.participants]
@@ -213,7 +232,16 @@ def start_episode(req: EpisodeStartRequest) -> EpisodeStartResponse:
     return EpisodeStartResponse(episode_id=episode_id)
 
 
-@app.post("/v1/episodes/message")
+@app.post(
+    "/v1/episodes/message",
+    summary="Add episode message",
+    description="Append a role-tagged message to an active episode.",
+    responses={
+        401: {"description": "Invalid or missing API key", "model": ErrorResponse},
+        404: {"description": "Episode not found", "model": ErrorResponse},
+        429: {"description": "Rate limit exceeded", "model": ErrorResponse},
+    },
+)
 def add_message(req: MessageRequest) -> dict[str, str]:
     entry = _episodes.get(req.episode_id)
     if not entry:
@@ -223,7 +251,17 @@ def add_message(req: MessageRequest) -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/v1/episodes/end", response_model=EpisodeEndResponse)
+@app.post(
+    "/v1/episodes/end",
+    response_model=EpisodeEndResponse,
+    summary="End episode",
+    description="Close an active episode and persist extracted memories.",
+    responses={
+        401: {"description": "Invalid or missing API key", "model": ErrorResponse},
+        404: {"description": "Episode not found", "model": ErrorResponse},
+        429: {"description": "Rate limit exceeded", "model": ErrorResponse},
+    },
+)
 def end_episode(req: EpisodeEndRequest) -> EpisodeEndResponse:
     entry = _episodes.pop(req.episode_id, None)
     if not entry:
@@ -235,7 +273,16 @@ def end_episode(req: EpisodeEndRequest) -> EpisodeEndResponse:
     return EpisodeEndResponse(memories_created=entry["message_count"])
 
 
-@app.post("/v1/recall", response_model=RecallResponse)
+@app.post(
+    "/v1/recall",
+    response_model=RecallResponse,
+    summary="Search memories",
+    description="Search for relevant memories using multi-signal fusion retrieval.",
+    responses={
+        401: {"description": "Invalid or missing API key", "model": ErrorResponse},
+        429: {"description": "Rate limit exceeded", "model": ErrorResponse},
+    },
+)
 def recall(req: RecallRequest, cursor: str | None = None) -> RecallResponse:
     p = get_pensyve()
     # Fetch extra to support pagination
@@ -275,7 +322,15 @@ def recall(req: RecallRequest, cursor: str | None = None) -> RecallResponse:
     )
 
 
-@app.post("/v1/feedback")
+@app.post(
+    "/v1/feedback",
+    summary="Submit memory feedback",
+    description="Record user feedback on a recalled memory to improve retrieval weights.",
+    responses={
+        401: {"description": "Invalid or missing API key", "model": ErrorResponse},
+        429: {"description": "Rate limit exceeded", "model": ErrorResponse},
+    },
+)
 def submit_feedback(req: FeedbackRequest) -> dict[str, str]:
     """Record user feedback on a recalled memory to improve retrieval weights."""
     # For now, log the feedback. Full weight learning requires the Rust WeightLearner
@@ -286,7 +341,16 @@ def submit_feedback(req: FeedbackRequest) -> dict[str, str]:
 
 
 @app.post(
-    "/v1/remember", response_model=RememberResponse, dependencies=[Depends(require_role("writer"))]
+    "/v1/remember",
+    response_model=RememberResponse,
+    dependencies=[Depends(require_role("writer"))],
+    summary="Store a memory",
+    description="Store a new fact or memory for a named entity.",
+    responses={
+        401: {"description": "Invalid or missing API key", "model": ErrorResponse},
+        403: {"description": "Insufficient role permissions", "model": ErrorResponse},
+        429: {"description": "Rate limit exceeded", "model": ErrorResponse},
+    },
 )
 def remember(req: RememberRequest) -> RememberResponse:
     p = get_pensyve()
@@ -357,6 +421,13 @@ def gdpr_erase(entity_name: str) -> GdprErasureResponse:
     "/v1/consolidate",
     response_model=ConsolidateResponse,
     dependencies=[Depends(require_role("owner"))],
+    summary="Consolidate memories",
+    description="Run memory consolidation: promote high-stability memories, decay stale ones, archive low-confidence entries.",
+    responses={
+        401: {"description": "Invalid or missing API key", "model": ErrorResponse},
+        403: {"description": "Insufficient role permissions", "model": ErrorResponse},
+        429: {"description": "Rate limit exceeded", "model": ErrorResponse},
+    },
 )
 def consolidate() -> ConsolidateResponse:
     p = get_pensyve()
@@ -369,7 +440,16 @@ def consolidate() -> ConsolidateResponse:
     )
 
 
-@app.get("/v1/stats", response_model=StatsResponse)
+@app.get(
+    "/v1/stats",
+    response_model=StatsResponse,
+    summary="Memory statistics",
+    description="Return aggregate memory counts by type for the current namespace.",
+    responses={
+        401: {"description": "Invalid or missing API key", "model": ErrorResponse},
+        429: {"description": "Rate limit exceeded", "model": ErrorResponse},
+    },
+)
 def get_stats() -> StatsResponse:
     p = get_pensyve()
 
@@ -388,7 +468,16 @@ def get_stats() -> StatsResponse:
     )
 
 
-@app.post("/v1/inspect", response_model=InspectResponse)
+@app.post(
+    "/v1/inspect",
+    response_model=InspectResponse,
+    summary="Inspect entity memories",
+    description="Retrieve all memories for a specific entity, grouped by memory type with cursor pagination.",
+    responses={
+        401: {"description": "Invalid or missing API key", "model": ErrorResponse},
+        429: {"description": "Rate limit exceeded", "model": ErrorResponse},
+    },
+)
 def inspect(req: InspectRequest) -> InspectResponse:
     p = get_pensyve()
     entity = p.entity(req.entity)
@@ -427,12 +516,30 @@ def get_usage() -> dict[str, Any]:
     }
 
 
-@app.get("/v1/activity", response_model=list[ActivityResponse])
+@app.get(
+    "/v1/activity",
+    response_model=list[ActivityResponse],
+    summary="Activity summary",
+    description="Return daily recall/remember/forget counts for the past N days.",
+    responses={
+        401: {"description": "Invalid or missing API key", "model": ErrorResponse},
+        429: {"description": "Rate limit exceeded", "model": ErrorResponse},
+    },
+)
 def get_activity(days: int = 30) -> list[dict[str, Any]]:
     return _activity.daily_summary(days)
 
 
-@app.get("/v1/activity/recent", response_model=list[RecentEventResponse])
+@app.get(
+    "/v1/activity/recent",
+    response_model=list[RecentEventResponse],
+    summary="Recent activity events",
+    description="Return the most recent N activity events in reverse-chronological order.",
+    responses={
+        401: {"description": "Invalid or missing API key", "model": ErrorResponse},
+        429: {"description": "Rate limit exceeded", "model": ErrorResponse},
+    },
+)
 def get_recent_activity(limit: int = 10) -> list[RecentEventResponse]:
     events = _activity.recent(limit)
     return [
@@ -511,6 +618,17 @@ def a2a_task(req: A2ATaskRequest) -> A2ATaskResponse:
         return A2ATaskResponse(task_id=req.task_id, status="failed", output={}, error=str(e))
 
 
-@app.get("/v1/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "version": "0.1.0"}
+@app.get(
+    "/v1/health",
+    summary="Health check",
+    description="Returns server status, version, and active embedding model. Does not require authentication.",
+)
+def health() -> dict[str, str | int]:
+    embedding_model = os.environ.get("_PENSYVE_EMBEDDING_MODEL", "unknown")
+    embedding_dims_str = os.environ.get("_PENSYVE_EMBEDDING_DIMS", "0")
+    return {
+        "status": "ok",
+        "version": "0.1.0",
+        "embedding_model": embedding_model,
+        "embedding_dims": int(embedding_dims_str) if embedding_dims_str.isdigit() else 0,
+    }
