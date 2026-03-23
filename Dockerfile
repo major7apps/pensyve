@@ -27,7 +27,13 @@ COPY pensyve-cli/ pensyve-cli/
 ENV PATH="/opt/venv/bin:$PATH"
 RUN maturin build --release --manifest-path pensyve-python/Cargo.toml -o /wheels
 
-# Stage 3: Runtime
+# Stage 3: Download embedding models (must match runtime base for glibc compat)
+FROM python:3.13-slim-trixie AS model-download
+RUN pip install --no-cache-dir fastembed
+RUN python -c "from fastembed import TextEmbedding; TextEmbedding('Alibaba-NLP/gte-base-en-v1.5')"
+RUN python -c "from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')"
+
+# Stage 4: Runtime
 FROM python:3.13-slim-trixie
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
@@ -58,6 +64,10 @@ COPY --from=rust-builder /build/target/release/pensyve /usr/local/bin/pensyve-cl
 
 # Non-root user
 RUN useradd -m -s /bin/bash pensyve
+
+# Copy pre-downloaded embedding models
+COPY --from=model-download --chown=pensyve:pensyve /root/.cache/huggingface /home/pensyve/.cache/huggingface
+
 USER pensyve
 EXPOSE 8000
 
