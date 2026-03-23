@@ -1,7 +1,9 @@
+import asyncio
 import os
 import time
 import uuid
 from collections import Counter
+from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import Depends, FastAPI, HTTPException
@@ -43,10 +45,33 @@ from .rbac import require_role
 configure_logging()
 logger = structlog.get_logger()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db_dir = os.path.join(os.path.expanduser("~"), ".pensyve", _get_namespace())
+    db_path = os.path.join(db_dir, "memories.db")
+    _activity.set_db_path(db_path)
+
+    async def _flush_loop():
+        while True:
+            await asyncio.sleep(30)
+            try:
+                count = await _activity.flush()
+                if count > 0:
+                    logger.info("activity_flush", count=count)
+            except Exception:
+                logger.exception("activity_flush_error")
+
+    task = asyncio.create_task(_flush_loop())
+    yield
+    task.cancel()
+
+
 app = FastAPI(
     title="Pensyve API",
     description="Universal memory runtime for AI agents",
     version="0.1.0",
+    lifespan=lifespan,
     dependencies=[Depends(require_api_key), Depends(rate_limit_check)],
 )
 

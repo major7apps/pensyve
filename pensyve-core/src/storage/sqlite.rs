@@ -195,6 +195,15 @@ CREATE TABLE IF NOT EXISTS edges (
 );
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);
+
+CREATE TABLE IF NOT EXISTS activity_events (
+    id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    namespace_id TEXT NOT NULL DEFAULT 'default',
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_activity_created ON activity_events(created_at);
 ";
 
 // ---------------------------------------------------------------------------
