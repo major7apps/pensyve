@@ -75,14 +75,16 @@ func TestRecallWithOptions(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]Memory{
-			{
-				ID:         "mem-1",
-				Content:    "Rust is a systems language",
-				MemoryType: "semantic",
-				Confidence: 0.9,
-				Stability:  0.8,
-				Score:      0.95,
+		json.NewEncoder(w).Encode(recallResponse{
+			Memories: []Memory{
+				{
+					ID:         "mem-1",
+					Content:    "Rust is a systems language",
+					MemoryType: "semantic",
+					Confidence: 0.9,
+					Stability:  0.8,
+					Score:      0.95,
+				},
 			},
 		})
 	}))
@@ -119,7 +121,7 @@ func TestRecallWithNilOptions(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]Memory{})
+		json.NewEncoder(w).Encode(recallResponse{Memories: []Memory{}})
 	}))
 	defer server.Close()
 
@@ -543,63 +545,74 @@ func TestFeedbackNoSignals(t *testing.T) {
 }
 
 func TestInspect(t *testing.T) {
+	cursor := "next-page-token"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "GET" {
-			t.Errorf("expected GET, got %s", r.Method)
+		if r.Method != "POST" {
+			t.Errorf("expected POST, got %s", r.Method)
 		}
-		if r.URL.Path != "/v1/inspect/alice" {
+		if r.URL.Path != "/v1/inspect" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
-		if r.URL.Query().Get("type") != "semantic" {
-			t.Errorf("unexpected type param: %s", r.URL.Query().Get("type"))
+		var body inspectRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode body: %v", err)
 		}
-		if r.URL.Query().Get("limit") != "5" {
-			t.Errorf("unexpected limit param: %s", r.URL.Query().Get("limit"))
+		if body.Entity != "alice" {
+			t.Errorf("unexpected entity: %s", body.Entity)
+		}
+		if body.Limit != 5 {
+			t.Errorf("unexpected limit: %d", body.Limit)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(InspectResult{
-			Entity:   Entity{ID: "ent-1", Name: "alice", Kind: "user"},
-			Memories: []Memory{{ID: "mem-1", Content: "likes coffee"}},
-			Cursor:   "next-page-token",
+			Entity:   "alice",
+			Semantic: []Memory{{ID: "mem-1", Content: "likes coffee"}},
+			Cursor:   &cursor,
 		})
 	}))
 	defer server.Close()
 
 	client := NewClient(Config{BaseURL: server.URL})
 	result, err := client.Inspect(context.Background(), "alice", &InspectOptions{
-		Type:  "semantic",
 		Limit: 5,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Entity.Name != "alice" {
-		t.Errorf("expected entity alice, got %s", result.Entity.Name)
+	if result.Entity != "alice" {
+		t.Errorf("expected entity alice, got %s", result.Entity)
 	}
-	if len(result.Memories) != 1 {
-		t.Fatalf("expected 1 memory, got %d", len(result.Memories))
+	mems := result.Memories()
+	if len(mems) != 1 {
+		t.Fatalf("expected 1 memory, got %d", len(mems))
 	}
-	if result.Memories[0].Content != "likes coffee" {
-		t.Errorf("unexpected content: %s", result.Memories[0].Content)
+	if mems[0].Content != "likes coffee" {
+		t.Errorf("unexpected content: %s", mems[0].Content)
 	}
-	if result.Cursor != "next-page-token" {
-		t.Errorf("unexpected cursor: %s", result.Cursor)
+	if result.Cursor == nil || *result.Cursor != "next-page-token" {
+		t.Errorf("unexpected cursor: %v", result.Cursor)
 	}
 }
 
 func TestInspectNilOptions(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/inspect/bob" {
+		if r.Method != "POST" {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != "/v1/inspect" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
-		if r.URL.RawQuery != "" {
-			t.Errorf("expected no query params, got: %s", r.URL.RawQuery)
+		var body inspectRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		if body.Entity != "bob" {
+			t.Errorf("unexpected entity: %s", body.Entity)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(InspectResult{
-			Entity:   Entity{ID: "ent-2", Name: "bob", Kind: "user"},
-			Memories: []Memory{},
+			Entity: "bob",
 		})
 	}))
 	defer server.Close()
@@ -609,8 +622,8 @@ func TestInspectNilOptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Entity.Name != "bob" {
-		t.Errorf("expected entity bob, got %s", result.Entity.Name)
+	if result.Entity != "bob" {
+		t.Errorf("expected entity bob, got %s", result.Entity)
 	}
 }
 

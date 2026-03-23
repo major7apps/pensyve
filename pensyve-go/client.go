@@ -231,12 +231,12 @@ func (c *Client) Recall(ctx context.Context, query string, opts *RecallOptions) 
 		}
 	}
 
-	var memories []Memory
-	err := c.do(ctx, "POST", "/v1/recall", req, &memories)
+	var resp recallResponse
+	err := c.do(ctx, "POST", "/v1/recall", req, &resp)
 	if err != nil {
 		return nil, err
 	}
-	return memories, nil
+	return resp.Memories, nil
 }
 
 // Remember stores a fact for the given entity with the specified confidence.
@@ -299,25 +299,18 @@ func (c *Client) Feedback(ctx context.Context, req FeedbackRequest) error {
 // Inspect returns the stored memories for the given entity. opts may be nil
 // to use server defaults.
 func (c *Client) Inspect(ctx context.Context, entity string, opts *InspectOptions) (*InspectResult, error) {
-	path := "/v1/inspect/" + url.PathEscape(entity)
+	req := inspectRequest{Entity: entity}
 	if opts != nil {
-		q := url.Values{}
-		if opts.Type != "" {
-			q.Set("type", opts.Type)
-		}
 		if opts.Limit > 0 {
-			q.Set("limit", fmt.Sprintf("%d", opts.Limit))
+			req.Limit = opts.Limit
 		}
 		if opts.Cursor != "" {
-			q.Set("cursor", opts.Cursor)
-		}
-		if len(q) > 0 {
-			path += "?" + q.Encode()
+			req.Cursor = opts.Cursor
 		}
 	}
 
 	var result InspectResult
-	if err := c.do(ctx, "GET", path, nil, &result); err != nil {
+	if err := c.do(ctx, "POST", "/v1/inspect", req, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
