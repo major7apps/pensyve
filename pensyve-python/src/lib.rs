@@ -451,6 +451,32 @@ impl PyPensyve {
         Ok(dict)
     }
 
+    /// Return aggregate memory counts using direct SQL COUNT queries.
+    ///
+    /// Returns a dict with keys: entities, episodic, semantic, procedural.
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let ns_id = self.inner.namespace.id;
+
+        let (episodic, semantic, procedural) = self
+            .inner
+            .storage
+            .count_memories_by_namespace(ns_id)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to count memories: {e}")))?;
+
+        let entities = self
+            .inner
+            .storage
+            .count_entities_by_namespace(ns_id)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to count entities: {e}")))?;
+
+        let dict = PyDict::new(py);
+        dict.set_item("entities", entities)?;
+        dict.set_item("episodic", episodic)?;
+        dict.set_item("semantic", semantic)?;
+        dict.set_item("procedural", procedural)?;
+        Ok(dict)
+    }
+
     /// Archive or delete all memories about an entity.
     ///
     /// Args:

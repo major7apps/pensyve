@@ -76,4 +76,5 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
 
 # Use venv directly instead of uv run to avoid overhead
 ENV PATH="/app/.venv/bin:$PATH"
+ENV PENSYVE_AUTH_MODE=required
 CMD ["uvicorn", "pensyve_server.main:app", "--host", "0.0.0.0", "--port", "8000"]

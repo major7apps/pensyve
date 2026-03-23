@@ -27,6 +27,8 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("Storage context: {0}")]
     Context(String),
+    #[error("Mutex lock poisoned: {0}")]
+    LockPoisoned(String),
 }
 
 pub type StorageResult<T> = Result<T, StorageError>;
@@ -106,4 +108,14 @@ pub trait StorageTrait: Send + Sync {
     // Edges
     fn save_edge(&self, edge: &Edge) -> StorageResult<()>;
     fn get_edges_for_entity(&self, entity_id: Uuid) -> StorageResult<Vec<Edge>>;
+
+    // Counts (lightweight, no embedding pipeline)
+    /// Count memories by type for a namespace without loading memory content.
+    fn count_memories_by_namespace(
+        &self,
+        namespace_id: Uuid,
+    ) -> StorageResult<(usize, usize, usize)>; // (episodic, semantic, procedural)
+
+    /// Count entities in a namespace.
+    fn count_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize>;
 }

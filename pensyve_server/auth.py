@@ -11,7 +11,7 @@ from .errors import AuthenticationError
 logger = structlog.get_logger()
 
 PENSYVE_API_KEYS = os.environ.get("PENSYVE_API_KEYS", "")
-AUTH_MODE = os.environ.get("PENSYVE_AUTH_MODE", "optional")
+AUTH_MODE = os.environ.get("PENSYVE_AUTH_MODE", "required")
 AUTH_BYPASS_PATHS = {"/v1/health", "/metrics"}
 
 
