@@ -1,14 +1,14 @@
 """Pensyve REST API server — FastAPI application with memory operations."""
 import asyncio
 import os
+import threading
 import time
 import uuid
-from collections import Counter
 from contextlib import asynccontextmanager
 from typing import Any, cast
 
 import structlog
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -120,6 +120,7 @@ _pensyve: Any | None = None
 _episodes: dict[
     str, dict[str, Any]
 ] = {}  # episode_id -> {"ep": Episode, "message_count": int, "created_at": float}
+_episodes_lock = threading.Lock()
 _EPISODE_TTL_SECONDS = 1800  # 30 minutes
 
 # Tier 2 extraction (gated by env var)
@@ -149,14 +150,17 @@ def get_pensyve() -> Any:
 def _sweep_stale_episodes() -> None:
     """Remove episodes older than TTL to prevent memory leaks."""
     now = time.time()
-    stale = [eid for eid, e in _episodes.items() if now - e["created_at"] > _EPISODE_TTL_SECONDS]
-    for eid in stale:
-        entry = _episodes.pop(eid, None)
-        if entry:
-            try:
-                entry["ep"].__exit__(None, None, None)
-            except Exception:
-                logger.warning("Failed to close stale episode %s", eid, exc_info=True)
+    with _episodes_lock:
+        stale_entries = {
+            eid: _episodes.pop(eid)
+            for eid, e in list(_episodes.items())
+            if now - e["created_at"] > _EPISODE_TTL_SECONDS
+        }
+    for eid, entry in stale_entries.items():
+        try:
+            entry["ep"].__exit__(None, None, None)
+        except Exception:
+            logger.warning("Failed to close stale episode %s", eid, exc_info=True)
 
 
 def _memory_to_response(m: Any) -> MemoryResponse:
@@ -187,7 +191,7 @@ def _apply_cursor_pagination(
 
     # Apply limit + 1 to detect if there are more results
     if len(memories) > limit:
-        next_cursor = memories[limit - 1].id
+        next_cursor = memories[limit].id  # first item of next page becomes the cursor
         memories = memories[:limit]
     else:
         next_cursor = None
@@ -227,7 +231,8 @@ def start_episode(req: EpisodeStartRequest) -> EpisodeStartResponse:
     ep = p.episode(*entities)
     ep.__enter__()
     episode_id = str(uuid.uuid4())
-    _episodes[episode_id] = {"ep": ep, "message_count": 0, "created_at": time.time()}
+    with _episodes_lock:
+        _episodes[episode_id] = {"ep": ep, "message_count": 0, "created_at": time.time()}
     _sweep_stale_episodes()
     return EpisodeStartResponse(episode_id=episode_id)
 
@@ -243,11 +248,13 @@ def start_episode(req: EpisodeStartRequest) -> EpisodeStartResponse:
     },
 )
 def add_message(req: MessageRequest) -> dict[str, str]:
-    entry = _episodes.get(req.episode_id)
+    with _episodes_lock:
+        entry = _episodes.get(req.episode_id)
     if not entry:
         raise NotFoundError(f"Episode {req.episode_id} not found")
     entry["ep"].message(req.role, req.content)
-    entry["message_count"] += 1
+    with _episodes_lock:
+        entry["message_count"] += 1
     return {"status": "ok"}
 
 
@@ -263,7 +270,8 @@ def add_message(req: MessageRequest) -> dict[str, str]:
     },
 )
 def end_episode(req: EpisodeEndRequest) -> EpisodeEndResponse:
-    entry = _episodes.pop(req.episode_id, None)
+    with _episodes_lock:
+        entry = _episodes.pop(req.episode_id, None)
     if not entry:
         raise NotFoundError(f"Episode {req.episode_id} not found")
     ep = entry["ep"]
@@ -286,7 +294,7 @@ def end_episode(req: EpisodeEndRequest) -> EpisodeEndResponse:
 def recall(req: RecallRequest, cursor: str | None = None) -> RecallResponse:
     p = get_pensyve()
     # Fetch extra to support pagination
-    fetch_limit = req.limit + 50  # overfetch for cursor slicing
+    fetch_limit = req.limit + 1  # fetch one extra to detect if there are more results
     entity = p.entity(req.entity) if req.entity else None
     results = p.recall(
         req.query,
@@ -452,19 +460,14 @@ def consolidate() -> ConsolidateResponse:
 )
 def get_stats() -> StatsResponse:
     p = get_pensyve()
-
-    # TODO: Replace with direct storage-level count query when Pensyve.stats()
-    # is exposed via PyO3. Current approach runs a full recall pipeline which is
-    # expensive and caps at 10_000 results, so counts may be approximate.
-    all_memories = p.recall("*", limit=10_000)
-    type_counts = Counter(m.memory_type for m in all_memories)
-
+    # Use storage-level count queries — O(1), no embedding pipeline
+    counts = p.stats()
     return StatsResponse(
         namespace=_get_namespace(),
-        entities=0,  # Not available via SDK — requires storage-level count query
-        episodic_memories=type_counts.get("episodic", 0),
-        semantic_memories=type_counts.get("semantic", 0),
-        procedural_memories=type_counts.get("procedural", 0),
+        entities=counts.get("entities", 0),
+        episodic_memories=counts.get("episodic", 0),
+        semantic_memories=counts.get("semantic", 0),
+        procedural_memories=counts.get("procedural", 0),
     )
 
 
@@ -483,7 +486,7 @@ def inspect(req: InspectRequest) -> InspectResponse:
     entity = p.entity(req.entity)
 
     # Fetch a large batch and group by type
-    fetch_limit = req.limit + 50
+    fetch_limit = req.limit + 1
     results = p.recall("*", entity=entity, limit=fetch_limit)
     all_memories = [_memory_to_response(m) for m in results]
 
@@ -526,7 +529,7 @@ def get_usage() -> dict[str, Any]:
         429: {"description": "Rate limit exceeded", "model": ErrorResponse},
     },
 )
-def get_activity(days: int = 30) -> list[dict[str, Any]]:
+def get_activity(days: int = Query(default=30, ge=1, le=365)) -> list[dict[str, Any]]:
     return _activity.daily_summary(days)
 
 
@@ -540,7 +543,7 @@ def get_activity(days: int = 30) -> list[dict[str, Any]]:
         429: {"description": "Rate limit exceeded", "model": ErrorResponse},
     },
 )
-def get_recent_activity(limit: int = 10) -> list[RecentEventResponse]:
+def get_recent_activity(limit: int = Query(default=10, ge=1, le=100)) -> list[RecentEventResponse]:
     events = _activity.recent(limit)
     return [
         RecentEventResponse(id=e.id, type=e.event_type, content=e.content, timestamp=e.timestamp)

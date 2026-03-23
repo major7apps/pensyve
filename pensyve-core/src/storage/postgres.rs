@@ -6,7 +6,7 @@ use sqlx_core::query::query;
 use sqlx_core::query_as::query_as;
 use sqlx_core::raw_sql::raw_sql;
 use sqlx_postgres::{PgPool, PgPoolOptions, Postgres};
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 use uuid::Uuid;
 
 use crate::types::{
@@ -101,16 +101,33 @@ impl PostgresBackend {
     ///
     /// This will create a connection pool and run the schema migration.
     pub fn new(database_url: &str) -> StorageResult<Self> {
+        let pool = match Handle::try_current() {
+            Ok(handle) => {
+                // Already in an async context — block in place to avoid nested runtime panic
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        PgPoolOptions::new()
+                            .max_connections(10)
+                            .connect(database_url)
+                            .await
+                            .map_err(sqlx_to_io)
+                    })
+                })?
+            }
+            Err(_) => {
+                // No async context — create a blocking runtime for pool init
+                let init_rt = Runtime::new().map_err(io_err)?;
+                init_rt.block_on(async {
+                    PgPoolOptions::new()
+                        .max_connections(10)
+                        .connect(database_url)
+                        .await
+                        .map_err(sqlx_to_io)
+                })?
+            }
+        };
+
         let rt = Runtime::new().map_err(io_err)?;
-
-        let pool = rt.block_on(async {
-            PgPoolOptions::new()
-                .max_connections(10)
-                .connect(database_url)
-                .await
-                .map_err(sqlx_to_io)
-        })?;
-
         let backend = Self {
             pool,
             rt,
@@ -1056,6 +1073,61 @@ impl StorageTrait for PostgresBackend {
                     },
                 )
                 .collect())
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Counts
+    // -----------------------------------------------------------------------
+
+    fn count_memories_by_namespace(
+        &self,
+        namespace_id: Uuid,
+    ) -> StorageResult<(usize, usize, usize)> {
+        self.rt.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+
+            let (episodic,): (i64,) = query_as::<Postgres, _>(
+                "SELECT COUNT(*) FROM episodic_memories WHERE namespace_id = $1",
+            )
+            .bind(namespace_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+
+            let (semantic,): (i64,) = query_as::<Postgres, _>(
+                "SELECT COUNT(*) FROM semantic_memories WHERE namespace_id = $1 AND invalid_at IS NULL",
+            )
+            .bind(namespace_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+
+            let (procedural,): (i64,) = query_as::<Postgres, _>(
+                "SELECT COUNT(*) FROM procedural_memories WHERE namespace_id = $1",
+            )
+            .bind(namespace_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+
+            Ok((episodic as usize, semantic as usize, procedural as usize))
+        })
+    }
+
+    fn count_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
+        self.rt.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+
+            let (count,): (i64,) = query_as::<Postgres, _>(
+                "SELECT COUNT(*) FROM entities WHERE namespace_id = $1",
+            )
+            .bind(namespace_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+
+            Ok(count as usize)
         })
     }
 }

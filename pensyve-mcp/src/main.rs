@@ -222,11 +222,11 @@ impl PensyveMcpServer {
             Ok(embedding) => {
                 let mut vector_index = state.vector_index.lock().await;
                 if let Err(err) = vector_index.add(mem.id, &embedding) {
-                    eprintln!("Warning: failed to add to vector index: {err}");
+                    tracing::warn!("Failed to add to vector index: {err}");
                 }
                 mem.embedding = embedding;
             }
-            Err(err) => eprintln!("Warning: embedding failed: {err}"),
+            Err(err) => tracing::warn!("Embedding failed: {err}"),
         }
 
         if let Err(err) = state.storage.save_semantic(&mem) {
@@ -396,7 +396,7 @@ impl PensyveMcpServer {
                         memories.push(val);
                     }
                 }
-                Err(err) => eprintln!("Warning: failed to list episodic memories: {err}"),
+                Err(err) => tracing::warn!("Failed to list episodic memories: {err}"),
             }
         }
 
@@ -413,7 +413,7 @@ impl PensyveMcpServer {
                         memories.push(val);
                     }
                 }
-                Err(err) => eprintln!("Warning: failed to list semantic memories: {err}"),
+                Err(err) => tracing::warn!("Failed to list semantic memories: {err}"),
             }
         }
 
@@ -480,19 +480,19 @@ fn load_vector_index(
                 let embedding = memory.embedding();
                 if !embedding.is_empty() {
                     if let Err(e) = index.add(memory.id(), embedding) {
-                        eprintln!("Warning: skipping memory in index load: {e}");
+                        tracing::warn!("Skipping memory in index load: {e}");
                     } else {
                         loaded += 1;
                     }
                 }
             }
-            eprintln!(
+            tracing::info!(
                 "Loaded {loaded}/{} memories into vector index",
                 memories.len()
             );
         }
         Err(e) => {
-            eprintln!("Warning: failed to load memories for vector index: {e}");
+            tracing::warn!("Failed to load memories for vector index: {e}");
         }
     }
 
@@ -513,9 +513,9 @@ async fn main() -> Result<()> {
     let storage_path = resolve_storage_path();
     let namespace_name = resolve_namespace();
 
-    eprintln!("pensyve-mcp starting up");
-    eprintln!("  storage: {}", storage_path.display());
-    eprintln!("  namespace: {namespace_name}");
+    tracing::info!("pensyve-mcp starting up");
+    tracing::info!("  storage: {}", storage_path.display());
+    tracing::info!("  namespace: {namespace_name}");
 
     // Open SQLite storage.
     let storage = SqliteBackend::open(&storage_path).map_err(|e| {
@@ -528,7 +528,7 @@ async fn main() -> Result<()> {
         Ok(None) => {
             let ns = Namespace::new(&namespace_name);
             storage.save_namespace(&ns)?;
-            eprintln!("Created namespace '{namespace_name}' (id={})", ns.id);
+            tracing::info!("Created namespace '{namespace_name}' (id={})", ns.id);
             ns
         }
         Err(e) => return Err(anyhow::anyhow!("Storage error: {e}")),
@@ -537,19 +537,19 @@ async fn main() -> Result<()> {
     // Initialize embedder: try GTE (768d) first, then MiniLM (384d), then mock.
     let embedder = match OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5") {
         Ok(e) => {
-            eprintln!("Using real ONNX embedder (Alibaba-NLP/gte-base-en-v1.5, 768 dims)");
+            tracing::info!("Using real ONNX embedder (Alibaba-NLP/gte-base-en-v1.5, 768 dims)");
             e
         }
         Err(gte_err) => {
-            eprintln!("GTE model unavailable ({gte_err}), trying all-MiniLM-L6-v2 fallback");
+            tracing::warn!("GTE model unavailable ({gte_err}), trying all-MiniLM-L6-v2 fallback");
             match OnnxEmbedder::new("all-MiniLM-L6-v2") {
                 Ok(e) => {
-                    eprintln!("Using fallback ONNX embedder (all-MiniLM-L6-v2, 384 dims)");
+                    tracing::info!("Using fallback ONNX embedder (all-MiniLM-L6-v2, 384 dims)");
                     e
                 }
                 Err(mini_err) => {
-                    eprintln!(
-                        "Warning: ONNX embedders unavailable ({mini_err}), falling back to mock (768 dims)"
+                    tracing::warn!(
+                        "ONNX embedders unavailable ({mini_err}), falling back to mock (768 dims)"
                     );
                     OnnxEmbedder::new_mock(768)
                 }
@@ -584,7 +584,7 @@ async fn main() -> Result<()> {
         tool_router: PensyveMcpServer::tool_router(),
     };
 
-    eprintln!("pensyve-mcp ready, listening on stdio");
+    tracing::info!("pensyve-mcp ready, listening on stdio");
 
     // Serve over stdio.
     let (stdin, stdout) = rmcp::transport::io::stdio();
@@ -595,6 +595,6 @@ async fn main() -> Result<()> {
 
     service.waiting().await?;
 
-    eprintln!("pensyve-mcp shut down");
+    tracing::info!("pensyve-mcp shut down");
     Ok(())
 }

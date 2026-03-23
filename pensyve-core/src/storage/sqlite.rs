@@ -14,6 +14,17 @@ use crate::types::{
 use super::{StorageError, StorageResult, StorageTrait};
 
 // ---------------------------------------------------------------------------
+// Safe lock acquisition
+// ---------------------------------------------------------------------------
+
+/// Acquire the connection lock, converting a `PoisonError` to `StorageError::LockPoisoned`.
+macro_rules! lock_conn {
+    ($self:expr) => {
+        $self.conn.lock().map_err(|e| StorageError::LockPoisoned(e.to_string()))?
+    };
+}
+
+// ---------------------------------------------------------------------------
 // SqliteBackend
 // ---------------------------------------------------------------------------
 
@@ -41,7 +52,7 @@ impl SqliteBackend {
     }
 
     fn run_schema(&self) -> StorageResult<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         conn.execute_batch(SCHEMA)?;
         Self::run_migrations(&conn)?;
         Ok(())
@@ -300,7 +311,7 @@ impl StorageTrait for SqliteBackend {
     // -----------------------------------------------------------------------
 
     fn save_namespace(&self, ns: &Namespace) -> StorageResult<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let metadata = serde_json::to_string(&ns.metadata)?;
         conn.execute(
             "INSERT OR REPLACE INTO namespaces (id, name, created_at, metadata) VALUES (?1, ?2, ?3, ?4)",
@@ -315,7 +326,7 @@ impl StorageTrait for SqliteBackend {
     }
 
     fn get_namespace(&self, id: Uuid) -> StorageResult<Option<Namespace>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let result = conn
             .query_row(
                 "SELECT id, name, created_at, metadata FROM namespaces WHERE id = ?1",
@@ -349,7 +360,7 @@ impl StorageTrait for SqliteBackend {
     }
 
     fn get_namespace_by_name(&self, name: &str) -> StorageResult<Option<Namespace>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let result = conn
             .query_row(
                 "SELECT id, name, created_at, metadata FROM namespaces WHERE name = ?1",
@@ -387,7 +398,7 @@ impl StorageTrait for SqliteBackend {
     // -----------------------------------------------------------------------
 
     fn save_entity(&self, entity: &Entity) -> StorageResult<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let kind = entity_kind_to_str(&entity.kind);
         let metadata = serde_json::to_string(&entity.metadata)?;
         conn.execute(
@@ -405,7 +416,7 @@ impl StorageTrait for SqliteBackend {
     }
 
     fn get_entity(&self, id: Uuid) -> StorageResult<Option<Entity>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let result = conn
             .query_row(
                 "SELECT id, namespace_id, name, kind, metadata, created_at FROM entities WHERE id = ?1",
@@ -439,7 +450,7 @@ impl StorageTrait for SqliteBackend {
     }
 
     fn get_entity_by_name(&self, name: &str, namespace_id: Uuid) -> StorageResult<Option<Entity>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let result = conn
             .query_row(
                 "SELECT id, namespace_id, name, kind, metadata, created_at FROM entities WHERE name = ?1 AND namespace_id = ?2",
@@ -477,7 +488,7 @@ impl StorageTrait for SqliteBackend {
     // -----------------------------------------------------------------------
 
     fn save_episode(&self, episode: &Episode) -> StorageResult<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let participants = uuids_to_json(&episode.participants);
         let ended_at = opt_dt_to_str(episode.ended_at);
         let outcome = episode.outcome.as_ref().map(outcome_to_str);
@@ -507,7 +518,7 @@ impl StorageTrait for SqliteBackend {
     // -----------------------------------------------------------------------
 
     fn save_episodic(&self, mem: &EpisodicMemory) -> StorageResult<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let embedding_blob = if mem.embedding.is_empty() {
             None
         } else {
@@ -554,7 +565,7 @@ impl StorageTrait for SqliteBackend {
     }
 
     fn get_episodic(&self, id: Uuid) -> StorageResult<Option<EpisodicMemory>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let result = conn
             .query_row(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
@@ -573,7 +584,7 @@ impl StorageTrait for SqliteBackend {
         about_entity: Uuid,
         limit: usize,
     ) -> StorageResult<Vec<EpisodicMemory>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let mut stmt = conn.prepare(
             r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                       content_type, summary, embedding, context_intent, timestamp,
@@ -601,7 +612,7 @@ impl StorageTrait for SqliteBackend {
         stability: f32,
         retrievability: f32,
     ) -> StorageResult<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         conn.execute(
             r"UPDATE episodic_memories
                SET stability = ?1, retrievability = ?2,
@@ -623,7 +634,7 @@ impl StorageTrait for SqliteBackend {
     // -----------------------------------------------------------------------
 
     fn save_semantic(&self, mem: &SemanticMemory) -> StorageResult<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let embedding_blob = if mem.embedding.is_empty() {
             None
         } else {
@@ -673,7 +684,7 @@ impl StorageTrait for SqliteBackend {
     }
 
     fn get_semantic(&self, id: Uuid) -> StorageResult<Option<SemanticMemory>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let result = conn
             .query_row(
                 r"SELECT id, namespace_id, subject, predicate, object, content_type,
@@ -692,7 +703,7 @@ impl StorageTrait for SqliteBackend {
         subject: Uuid,
         limit: usize,
     ) -> StorageResult<Vec<SemanticMemory>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let mut stmt = conn.prepare(
             r"SELECT id, namespace_id, subject, predicate, object, content_type,
                       object_entity, confidence, valid_at, invalid_at,
@@ -715,7 +726,7 @@ impl StorageTrait for SqliteBackend {
     }
 
     fn invalidate_semantic(&self, id: Uuid) -> StorageResult<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         conn.execute(
             "UPDATE semantic_memories SET invalid_at = ?1 WHERE id = ?2",
             params![Utc::now().to_rfc3339(), id.to_string()],
@@ -728,7 +739,7 @@ impl StorageTrait for SqliteBackend {
     // -----------------------------------------------------------------------
 
     fn save_procedural(&self, mem: &ProceduralMemory) -> StorageResult<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let embedding_blob = if mem.embedding.is_empty() {
             None
         } else {
@@ -777,7 +788,7 @@ impl StorageTrait for SqliteBackend {
     }
 
     fn get_procedural(&self, id: Uuid) -> StorageResult<Option<ProceduralMemory>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let result = conn
             .query_row(
                 r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
@@ -797,7 +808,7 @@ impl StorageTrait for SqliteBackend {
         trial_count: u32,
         success_count: u32,
     ) -> StorageResult<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         conn.execute(
             r"UPDATE procedural_memories
                SET reliability = ?1, trial_count = ?2, success_count = ?3,
@@ -824,7 +835,7 @@ impl StorageTrait for SqliteBackend {
         namespace_id: Uuid,
         limit: usize,
     ) -> StorageResult<Vec<Memory>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let mut stmt = conn.prepare(
             r"SELECT memory_id, memory_type FROM memory_fts
                WHERE memory_fts MATCH ?1 AND namespace_id = ?2
@@ -903,7 +914,7 @@ impl StorageTrait for SqliteBackend {
     // -----------------------------------------------------------------------
 
     fn get_all_memories_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Memory>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let ns_str = namespace_id.to_string();
         let mut memories = Vec::new();
 
@@ -956,7 +967,7 @@ impl StorageTrait for SqliteBackend {
     // -----------------------------------------------------------------------
 
     fn delete_memories_by_entity(&self, entity_id: Uuid) -> StorageResult<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let id_str = entity_id.to_string();
         let mut total = 0usize;
 
@@ -1025,7 +1036,7 @@ impl StorageTrait for SqliteBackend {
     // -----------------------------------------------------------------------
 
     fn list_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Entity>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let ns_str = namespace_id.to_string();
         let mut stmt = conn.prepare(
             "SELECT id, namespace_id, name, kind, metadata, created_at FROM entities WHERE namespace_id = ?1",
@@ -1071,7 +1082,7 @@ impl StorageTrait for SqliteBackend {
     // -----------------------------------------------------------------------
 
     fn save_edge(&self, edge: &Edge) -> StorageResult<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let metadata = serde_json::to_string(&edge.metadata)?;
         conn.execute(
             "INSERT OR REPLACE INTO edges (id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata) \
@@ -1092,7 +1103,7 @@ impl StorageTrait for SqliteBackend {
     }
 
     fn get_edges_for_entity(&self, entity_id: Uuid) -> StorageResult<Vec<Edge>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = lock_conn!(self);
         let id_str = entity_id.to_string();
         let mut stmt = conn.prepare(
             "SELECT id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata \
@@ -1145,6 +1156,48 @@ impl StorageTrait for SqliteBackend {
             });
         }
         Ok(edges)
+    }
+
+    // -----------------------------------------------------------------------
+    // Counts
+    // -----------------------------------------------------------------------
+
+    fn count_memories_by_namespace(
+        &self,
+        namespace_id: Uuid,
+    ) -> StorageResult<(usize, usize, usize)> {
+        let conn = lock_conn!(self);
+        let ns = namespace_id.to_string();
+
+        let episodic: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM episodic_memories WHERE namespace_id = ?1",
+            params![ns],
+            |row| row.get(0),
+        )?;
+
+        let semantic: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM semantic_memories WHERE namespace_id = ?1 AND invalid_at IS NULL",
+            params![ns],
+            |row| row.get(0),
+        )?;
+
+        let procedural: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM procedural_memories WHERE namespace_id = ?1",
+            params![ns],
+            |row| row.get(0),
+        )?;
+
+        Ok((episodic as usize, semantic as usize, procedural as usize))
+    }
+
+    fn count_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
+        let conn = lock_conn!(self);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM entities WHERE namespace_id = ?1",
+            params![namespace_id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
     }
 }
 
