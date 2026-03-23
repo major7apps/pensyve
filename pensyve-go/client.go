@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -19,17 +20,34 @@ type Config struct {
 	// APIKey is an optional API key sent via the X-Pensyve-Key header.
 	APIKey string
 	// Timeout is the HTTP client timeout. Defaults to 30 seconds if zero.
+	// Ignored when HTTPClient is provided.
 	Timeout time.Duration
+	// Logger is an optional structured logger. When nil, no logging is emitted.
+	Logger *slog.Logger
+	// HTTPClient is an optional custom HTTP client. When nil, a default client
+	// with the configured Timeout is used.
+	HTTPClient *http.Client
+	// Retry controls exponential-backoff retry behaviour. When nil, no retries
+	// are performed.
+	Retry *RetryConfig
 }
 
 // PensyveError is returned when the API responds with a non-2xx status code.
 type PensyveError struct {
 	Status int
 	Detail string
+	// sentinel is set to one of ErrNotFound, ErrUnauthorized, ErrRateLimited
+	// so that errors.Is works through the chain.
+	sentinel error
 }
 
 func (e *PensyveError) Error() string {
 	return fmt.Sprintf("pensyve: HTTP %d: %s", e.Status, e.Detail)
+}
+
+// Unwrap allows errors.Is to match sentinel errors (ErrNotFound, etc.).
+func (e *PensyveError) Unwrap() error {
+	return e.sentinel
 }
 
 // Client is an HTTP client for the Pensyve memory runtime API.
@@ -37,42 +55,93 @@ type Client struct {
 	baseURL    string
 	apiKey     string
 	httpClient *http.Client
+	logger     *slog.Logger
+	retry      *RetryConfig
 }
 
 // NewClient creates a new Pensyve API client with the given configuration.
 func NewClient(cfg Config) *Client {
-	timeout := cfg.Timeout
-	if timeout == 0 {
-		timeout = 30 * time.Second
+	hc := cfg.HTTPClient
+	if hc == nil {
+		timeout := cfg.Timeout
+		if timeout == 0 {
+			timeout = 30 * time.Second
+		}
+		hc = &http.Client{Timeout: timeout}
 	}
 	return &Client{
-		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
-		apiKey:  cfg.APIKey,
-		httpClient: &http.Client{
-			Timeout: timeout,
-		},
+		baseURL:    strings.TrimRight(cfg.BaseURL, "/"),
+		apiKey:     cfg.APIKey,
+		httpClient: hc,
+		logger:     cfg.Logger,
+		retry:      cfg.Retry,
 	}
 }
 
 // do performs an HTTP request and decodes the JSON response.
 // If body is nil, no request body is sent. If result is nil, the response body
 // is discarded (but status is still checked).
+// When a RetryConfig is set, 5xx responses are retried with exponential backoff.
 func (c *Client) do(ctx context.Context, method, path string, body, result interface{}) error {
-	var reqBody io.Reader
+	var bodyBytes []byte
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
 			return fmt.Errorf("pensyve: marshal request: %w", err)
 		}
-		reqBody = bytes.NewReader(data)
+		bodyBytes = data
 	}
+
+	maxAttempts := 1
+	if c.retry != nil {
+		maxAttempts = 1 + c.retry.MaxRetries
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			delay := c.retry.delay(attempt - 1)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		lastErr = c.doOnce(ctx, method, path, bodyBytes, result, attempt)
+		if lastErr == nil {
+			return nil
+		}
+
+		// Only retry on 5xx errors; 4xx and network errors are not retried.
+		if !IsRetryable(lastErr) {
+			return lastErr
+		}
+
+		// If we have no more attempts left, stop.
+		if attempt == maxAttempts-1 {
+			break
+		}
+	}
+
+	return lastErr
+}
+
+// doOnce executes a single HTTP attempt.
+func (c *Client) doOnce(ctx context.Context, method, path string, bodyBytes []byte, result interface{}, attempt int) error {
+	var reqBody io.Reader
+	if bodyBytes != nil {
+		reqBody = bytes.NewReader(bodyBytes)
+	}
+
+	start := time.Now()
 
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reqBody)
 	if err != nil {
 		return fmt.Errorf("pensyve: create request: %w", err)
 	}
 
-	if body != nil {
+	if bodyBytes != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if c.apiKey != "" {
@@ -90,16 +159,36 @@ func (c *Client) do(ctx context.Context, method, path string, body, result inter
 		return fmt.Errorf("pensyve: read response: %w", err)
 	}
 
+	if c.logger != nil {
+		c.logger.Debug("pensyve request",
+			"method", method,
+			"path", path,
+			"status", resp.StatusCode,
+			"duration", time.Since(start),
+			"attempt", attempt+1,
+		)
+	}
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		detail := string(respBody)
-		// Try to extract a "detail" field from JSON error responses
+		// Try to extract a "detail" field from JSON error responses.
 		var errResp struct {
 			Detail string `json:"detail"`
 		}
 		if json.Unmarshal(respBody, &errResp) == nil && errResp.Detail != "" {
 			detail = errResp.Detail
 		}
-		return &PensyveError{Status: resp.StatusCode, Detail: detail}
+
+		pe := &PensyveError{Status: resp.StatusCode, Detail: detail}
+		switch resp.StatusCode {
+		case 404:
+			pe.sentinel = ErrNotFound
+		case 401:
+			pe.sentinel = ErrUnauthorized
+		case 429:
+			pe.sentinel = ErrRateLimited
+		}
+		return pe
 	}
 
 	if result != nil {
@@ -155,7 +244,7 @@ func (c *Client) Remember(ctx context.Context, entity, fact string, confidence f
 	var memory Memory
 	err := c.do(ctx, "POST", "/v1/remember", rememberRequest{
 		Entity:     entity,
-		Fact:        fact,
+		Fact:       fact,
 		Confidence: confidence,
 	}, &memory)
 	if err != nil {
