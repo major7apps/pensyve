@@ -11,7 +11,11 @@ import threading
 from dataclasses import dataclass
 from enum import Enum
 
+import structlog
+
 from .redis_client import INCR_EXPIRE_LUA, get_redis
+
+logger = structlog.get_logger()
 
 
 class Tier(Enum):
@@ -109,7 +113,7 @@ class UsageTracker:
                 await redis_client.eval(INCR_EXPIRE_LUA, 1, key, 60 * 60 * 24 * 32)
                 return
         except Exception:
-            pass
+            logger.warning("redis_billing_fallback", namespace=namespace)
         self.record_api_call(namespace)
 
     def _get_or_create(self, namespace: str) -> UsageRecord:

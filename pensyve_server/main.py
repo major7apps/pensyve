@@ -64,6 +64,10 @@ async def lifespan(app: FastAPI):
                     logger.info("activity_flush", count=count)
             except Exception:
                 logger.exception("activity_flush_error")
+            try:
+                _sweep_stale_episodes()
+            except Exception:
+                logger.exception("sweep_stale_episodes_error")
 
     task = asyncio.create_task(_flush_loop())
     yield
@@ -349,8 +353,10 @@ def consolidate():
 def get_stats():
     p = get_pensyve()
 
-    # Single broad recall, then count by type in one pass
-    all_memories = p.recall("*", limit=1000)
+    # TODO: Replace with direct storage-level count query when Pensyve.stats()
+    # is exposed via PyO3. Current approach runs a full recall pipeline which is
+    # expensive and caps at 10_000 results, so counts may be approximate.
+    all_memories = p.recall("*", limit=10_000)
     type_counts = Counter(m.memory_type for m in all_memories)
 
     return StatsResponse(
@@ -433,7 +439,9 @@ def a2a_agent_card():
     }
 
 
-@app.post("/v1/a2a/task", response_model=A2ATaskResponse)
+@app.post(
+    "/v1/a2a/task", response_model=A2ATaskResponse, dependencies=[Depends(require_role("writer"))]
+)
 def a2a_task(req: A2ATaskRequest):
     """Handle an A2A task request by routing to the appropriate capability."""
     p = get_pensyve()
