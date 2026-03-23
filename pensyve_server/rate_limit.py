@@ -7,21 +7,12 @@ from collections import defaultdict
 import structlog
 from fastapi import HTTPException, Request
 
-from .redis_client import get_redis
+from .redis_client import get_redis, INCR_EXPIRE_LUA
 
 logger = structlog.get_logger()
 
 _RATE_LIMIT = int(os.environ.get("PENSYVE_RATE_LIMIT", "600"))
 _WINDOW_SECONDS = 60
-
-# Atomic increment + expire via Lua script (avoids INCR/EXPIRE race condition)
-_RATE_LIMIT_LUA = """
-local current = redis.call('INCR', KEYS[1])
-if current == 1 then
-    redis.call('EXPIRE', KEYS[1], ARGV[1])
-end
-return current
-"""
 
 
 class _TokenBucket:
@@ -59,7 +50,7 @@ async def rate_limit_check(request: Request):
         redis_client = await get_redis()
         if redis_client:
             redis_key = f"ratelimit:{key}"
-            current = await redis_client.eval(_RATE_LIMIT_LUA, 1, redis_key, _WINDOW_SECONDS)
+            current = await redis_client.eval(INCR_EXPIRE_LUA, 1, redis_key, _WINDOW_SECONDS)
             if current > _RATE_LIMIT:
                 raise HTTPException(
                     status_code=429,
