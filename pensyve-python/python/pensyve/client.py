@@ -2,16 +2,14 @@
 from __future__ import annotations
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential_jitter, retry_if_exception
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential_jitter
 
 
 def _is_retryable(exc: BaseException) -> bool:
     """Returns True for 5xx and network errors."""
     if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500:
         return True
-    if isinstance(exc, (httpx.ConnectError, httpx.TimeoutException)):
-        return True
-    return False
+    return isinstance(exc, (httpx.ConnectError, httpx.TimeoutException))
 
 
 class PensyveClient:
