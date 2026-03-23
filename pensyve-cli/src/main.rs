@@ -492,13 +492,7 @@ fn cmd_remember(
         ("is", fact)
     };
 
-    let mut mem = SemanticMemory::new(
-        ns.id,
-        entity.id,
-        predicate,
-        object,
-        confidence as f32,
-    );
+    let mut mem = SemanticMemory::new(ns.id, entity.id, predicate, object, confidence as f32);
 
     // Embed using the mock embedder (768 dims) so the memory is searchable.
     let embedder = OnnxEmbedder::new_mock(768);

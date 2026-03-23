@@ -27,9 +27,7 @@ pub struct HistogramBuckets {
 
 impl HistogramBuckets {
     pub fn new(boundaries: &'static [f64]) -> Self {
-        let counts = (0..=boundaries.len())
-            .map(|_| AtomicU64::new(0))
-            .collect();
+        let counts = (0..=boundaries.len()).map(|_| AtomicU64::new(0)).collect();
         Self {
             boundaries,
             counts,

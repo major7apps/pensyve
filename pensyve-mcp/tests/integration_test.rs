@@ -36,9 +36,8 @@ struct TestState {
 impl TestState {
     fn new() -> Self {
         let tmpdir = tempfile::TempDir::new().expect("create temp dir");
-        let storage = Arc::new(
-            SqliteBackend::open(tmpdir.path()).expect("open sqlite in temp dir"),
-        );
+        let storage =
+            Arc::new(SqliteBackend::open(tmpdir.path()).expect("open sqlite in temp dir"));
 
         // Use the mock embedder (no ONNX model needed).
         let embedder = OnnxEmbedder::new_mock(768);

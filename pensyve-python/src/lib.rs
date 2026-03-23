@@ -176,7 +176,11 @@ impl PyPensyve {
                 tracing::warn!(error = %e1, "Primary embedding model failed, trying fallback");
                 match OnnxEmbedder::new("all-MiniLM-L6-v2") {
                     Ok(e) => {
-                        tracing::warn!(embedding_model = "all-MiniLM-L6-v2", dimensions = 384, reason = "primary model unavailable");
+                        tracing::warn!(
+                            embedding_model = "all-MiniLM-L6-v2",
+                            dimensions = 384,
+                            reason = "primary model unavailable"
+                        );
                         (Arc::new(e), "all-MiniLM-L6-v2")
                     }
                     Err(e2) => {
@@ -184,11 +188,17 @@ impl PyPensyve {
                             .map(|v| v == "true" || v == "1")
                             .unwrap_or(false);
                         if allow_mock {
-                            tracing::warn!(embedding_model = "mock", dimensions = 768, reason = "no real models found, using mock — semantic search will not work");
+                            tracing::warn!(
+                                embedding_model = "mock",
+                                dimensions = 768,
+                                reason = "no real models found, using mock — semantic search will not work"
+                            );
                             (Arc::new(OnnxEmbedder::new_mock(768)), "mock")
                         } else {
                             return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                                format!("No embedding models available (tried gte-base-en-v1.5: {e1}, all-MiniLM-L6-v2: {e2}). Set PENSYVE_ALLOW_MOCK_EMBEDDER=true for mock fallback."),
+                                format!(
+                                    "No embedding models available (tried gte-base-en-v1.5: {e1}, all-MiniLM-L6-v2: {e2}). Set PENSYVE_ALLOW_MOCK_EMBEDDER=true for mock fallback."
+                                ),
                             ));
                         }
                     }
