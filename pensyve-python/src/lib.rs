@@ -26,8 +26,8 @@ static TRACING_INIT: Once = Once::new();
 fn init_tracing() {
     TRACING_INIT.call_once(|| {
         use tracing_subscriber::{EnvFilter, fmt};
-        let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("pensyve=info"));
+        let filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pensyve=info"));
         fmt()
             .json()
             .with_env_filter(filter)

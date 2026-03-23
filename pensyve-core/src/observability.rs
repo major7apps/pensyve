@@ -62,7 +62,8 @@ impl PensyveMetrics {
 
     /// Record a Tier 2 extraction fallback to Tier 1.
     pub fn record_extraction_fallback(&self) {
-        self.extraction_fallback_count.fetch_add(1, Ordering::Relaxed);
+        self.extraction_fallback_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record an embedding operation failure.
@@ -130,7 +131,10 @@ impl PensyveMetrics {
             "# HELP pensyve_extraction_fallback_total Total Tier 2 extraction fallbacks to Tier 1."
         );
         let _ = writeln!(buf, "# TYPE pensyve_extraction_fallback_total counter");
-        let _ = writeln!(buf, "pensyve_extraction_fallback_total {extraction_fallback}");
+        let _ = writeln!(
+            buf,
+            "pensyve_extraction_fallback_total {extraction_fallback}"
+        );
 
         let _ = writeln!(
             buf,
