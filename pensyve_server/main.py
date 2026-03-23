@@ -91,7 +91,6 @@ app.add_middleware(RequestIdMiddleware)
 app.add_middleware(MetricsMiddleware)
 app.include_router(metrics_router)
 
-# Global Pensyve instance
 _pensyve = None
 _episodes: dict[
     str, dict
@@ -186,7 +185,6 @@ def start_episode(req: EpisodeStartRequest):
     ep.__enter__()
     episode_id = str(uuid.uuid4())
     _episodes[episode_id] = {"ep": ep, "message_count": 0, "created_at": time.time()}
-    # Sweep stale episodes
     _sweep_stale_episodes()
     return EpisodeStartResponse(episode_id=episode_id)
 

@@ -5,9 +5,13 @@ Tracks API usage per namespace and enforces tier limits.
 
 from __future__ import annotations
 
+import datetime
+import sys
 import threading
 from dataclasses import dataclass
 from enum import Enum
+
+from .redis_client import INCR_EXPIRE_LUA, get_redis
 
 
 class Tier(Enum):
@@ -45,10 +49,10 @@ TIER_LIMITS = {
         storage_bytes=5 * 1024 * 1024 * 1024,
     ),
     Tier.ENTERPRISE: TierLimits(
-        namespaces=999,
-        max_memories=999_999_999,
-        recalls_per_month=999_999_999,
-        storage_bytes=999 * 1024 * 1024 * 1024,
+        namespaces=sys.maxsize,
+        max_memories=sys.maxsize,
+        recalls_per_month=sys.maxsize,
+        storage_bytes=sys.maxsize,
     ),
 }
 
@@ -99,21 +103,10 @@ class UsageTracker:
     async def record_api_call_redis(self, namespace: str) -> None:
         """Increment usage in Redis if available, else in-memory."""
         try:
-            from .redis_client import get_redis
-
             redis_client = await get_redis()
             if redis_client:
-                import datetime
-
                 key = f"usage:{namespace}:{datetime.date.today().strftime('%Y-%m')}"
-                lua = """
-local current = redis.call('INCR', KEYS[1])
-if current == 1 then
-    redis.call('EXPIRE', KEYS[1], ARGV[1])
-end
-return current
-"""
-                await redis_client.eval(lua, 1, key, 60 * 60 * 24 * 32)
+                await redis_client.eval(INCR_EXPIRE_LUA, 1, key, 60 * 60 * 24 * 32)
                 return
         except Exception:
             pass

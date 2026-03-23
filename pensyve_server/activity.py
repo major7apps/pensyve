@@ -108,7 +108,8 @@ class ActivityTracker:
                 conn.close()
         except Exception:
             logger.exception("activity_flush_failed")
-            # Put events back for retry
+            # Put events back for retry, capped to avoid unbounded growth
             with self._lock:
-                self._pending_flush = to_flush + self._pending_flush
+                combined = to_flush + self._pending_flush
+                self._pending_flush = combined[-self._max_events:]
             return 0
