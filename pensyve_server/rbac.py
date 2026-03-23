@@ -8,7 +8,6 @@ all authenticated users).
 import os
 
 import structlog
-
 from fastapi import HTTPException, Request
 
 logger = structlog.get_logger()

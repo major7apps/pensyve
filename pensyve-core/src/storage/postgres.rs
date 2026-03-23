@@ -89,7 +89,7 @@ pub struct PostgresBackend {
     pool: PgPool,
     rt: Runtime,
     /// Optional default namespace for RLS scoping on get-by-id methods
-    /// where the trait signature does not provide a namespace_id.
+    /// where the trait signature does not provide a `namespace_id`.
     default_namespace: Option<Uuid>,
 }
 
@@ -133,7 +133,8 @@ impl PostgresBackend {
     }
 
     /// Set the default namespace used to scope RLS on get-by-id queries
-    /// where the `StorageTrait` signature does not provide a namespace_id.
+    /// where the `StorageTrait` signature does not provide a `namespace_id`.
+    #[must_use]
     pub fn with_default_namespace(mut self, namespace_id: Uuid) -> Self {
         self.default_namespace = Some(namespace_id);
         self
@@ -171,7 +172,7 @@ impl PostgresBackend {
 
     /// Acquire a connection, scoping it to `default_namespace` if one has been
     /// configured.  Used for `StorageTrait` methods whose signatures do not
-    /// include a namespace_id parameter.
+    /// include a `namespace_id` parameter.
     async fn maybe_scoped_conn(
         &self,
     ) -> StorageResult<sqlx_core::pool::PoolConnection<sqlx_postgres::Postgres>> {
@@ -1087,6 +1088,7 @@ fn row_to_episodic(row: EpisodicRow) -> EpisodicMemory {
         source_entity,
         about_entity,
         content,
+        content_type: crate::types::ContentType::Text,
         summary,
         embedding: pgtext_to_embedding(embedding_text.as_deref()),
         context_intent,
@@ -1122,6 +1124,7 @@ fn row_to_semantic(row: SemanticRow) -> SemanticMemory {
         subject,
         predicate,
         object,
+        content_type: crate::types::ContentType::Text,
         object_entity,
         confidence,
         valid_at,

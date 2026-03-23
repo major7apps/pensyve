@@ -73,10 +73,7 @@ _INJECTION_PATTERNS = [
 
 def detect_prompt_injection(text: str) -> bool:
     """Return True if text contains likely prompt injection patterns."""
-    for pattern in _INJECTION_PATTERNS:
-        if pattern.search(text):
-            return True
-    return False
+    return any(pattern.search(text) for pattern in _INJECTION_PATTERNS)
 
 
 @dataclass
