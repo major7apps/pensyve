@@ -52,6 +52,13 @@ type recallRequest struct {
 	Types  []string `json:"types,omitempty"`
 }
 
+// recallResponse is the JSON body returned by POST /v1/recall.
+type recallResponse struct {
+	Memories      []Memory `json:"memories"`
+	Contradictions []Memory `json:"contradictions"`
+	Cursor        *string  `json:"cursor"`
+}
+
 // rememberRequest is the JSON body for POST /v1/remember.
 type rememberRequest struct {
 	Entity     string  `json:"entity"`
@@ -105,23 +112,41 @@ type FeedbackRequest struct {
 
 // InspectOptions configures an inspect query.
 type InspectOptions struct {
-	// Type filters results to a specific memory type.
-	Type string `json:"type,omitempty"`
 	// Limit is the maximum number of results to return.
 	Limit int `json:"limit,omitempty"`
 	// Cursor is an opaque pagination token from a previous response.
 	Cursor string `json:"cursor,omitempty"`
 }
 
-// InspectResult is the response from GET /v1/inspect/{entity}.
+// inspectRequest is the JSON body for POST /v1/inspect.
+type inspectRequest struct {
+	Entity string `json:"entity"`
+	Limit  int    `json:"limit,omitempty"`
+	Cursor string `json:"cursor,omitempty"`
+}
+
+// InspectResult is the response from POST /v1/inspect.
 type InspectResult struct {
-	// Entity is the entity whose memories were inspected.
-	Entity Entity `json:"entity"`
-	// Memories is the list of matching memory records.
-	Memories []Memory `json:"memories"`
+	// Entity is the name of the entity whose memories were inspected.
+	Entity string `json:"entity"`
+	// Episodic is the list of episodic memory records.
+	Episodic []Memory `json:"episodic"`
+	// Semantic is the list of semantic memory records.
+	Semantic []Memory `json:"semantic"`
+	// Procedural is the list of procedural memory records.
+	Procedural []Memory `json:"procedural"`
 	// Cursor is an opaque token for fetching the next page. Empty when there
 	// are no more results.
-	Cursor string `json:"cursor,omitempty"`
+	Cursor *string `json:"cursor,omitempty"`
+}
+
+// Memories returns all memories across all types (episodic + semantic + procedural).
+func (r *InspectResult) Memories() []Memory {
+	result := make([]Memory, 0, len(r.Episodic)+len(r.Semantic)+len(r.Procedural))
+	result = append(result, r.Episodic...)
+	result = append(result, r.Semantic...)
+	result = append(result, r.Procedural...)
+	return result
 }
 
 // ActivityItem represents memory operation counts for a single day.
