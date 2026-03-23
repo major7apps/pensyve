@@ -3,6 +3,76 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
+// Histogram support
+// ---------------------------------------------------------------------------
+
+const DURATION_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+/// A hand-rolled Prometheus-compatible histogram backed by `AtomicU64` counters.
+///
+/// Buckets are cumulative: each bucket counts all observations <= its boundary,
+/// matching the Prometheus histogram specification.
+pub struct HistogramBuckets {
+    /// Upper bounds for each bucket
+    boundaries: &'static [f64],
+    /// Count per bucket (index matches boundaries, last is +Inf)
+    counts: Vec<AtomicU64>,
+    /// Sum of all observed values stored as microseconds for integer precision
+    sum_us: AtomicU64,
+    /// Total observation count
+    total: AtomicU64,
+}
+
+impl HistogramBuckets {
+    pub fn new(boundaries: &'static [f64]) -> Self {
+        let counts = (0..=boundaries.len())
+            .map(|_| AtomicU64::new(0))
+            .collect();
+        Self {
+            boundaries,
+            counts,
+            sum_us: AtomicU64::new(0),
+            total: AtomicU64::new(0),
+        }
+    }
+
+    /// Record an observation in seconds.
+    pub fn observe(&self, value_secs: f64) {
+        self.total.fetch_add(1, Ordering::Relaxed);
+        self.sum_us
+            .fetch_add((value_secs * 1_000_000.0) as u64, Ordering::Relaxed);
+        // Increment all buckets where value <= boundary (cumulative semantics).
+        for (i, &boundary) in self.boundaries.iter().enumerate() {
+            if value_secs <= boundary {
+                self.counts[i].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // Always increment the +Inf bucket.
+        self.counts[self.boundaries.len()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Format as Prometheus histogram exposition text.
+    pub fn prometheus_text(&self, name: &str) -> String {
+        let mut buf = String::new();
+        buf.push_str(&format!("# HELP {name} Duration in seconds\n"));
+        buf.push_str(&format!("# TYPE {name} histogram\n"));
+        for (i, &boundary) in self.boundaries.iter().enumerate() {
+            let count = self.counts[i].load(Ordering::Relaxed);
+            buf.push_str(&format!("{name}_bucket{{le=\"{boundary}\"}} {count}\n"));
+        }
+        let inf_count = self.counts[self.boundaries.len()].load(Ordering::Relaxed);
+        buf.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {inf_count}\n"));
+        let sum = self.sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        buf.push_str(&format!("{name}_sum {sum}\n"));
+        let total = self.total.load(Ordering::Relaxed);
+        buf.push_str(&format!("{name}_count {total}\n"));
+        buf
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PensyveMetrics
 // ---------------------------------------------------------------------------
 
@@ -19,6 +89,11 @@ pub struct PensyveMetrics {
     pub consolidation_count: AtomicU64,
     pub extraction_fallback_count: AtomicU64,
     pub embedding_failure_count: AtomicU64,
+
+    // Histograms
+    pub recall_duration: HistogramBuckets,
+    pub embed_duration: HistogramBuckets,
+    pub store_duration: HistogramBuckets,
 }
 
 impl PensyveMetrics {
@@ -33,6 +108,9 @@ impl PensyveMetrics {
             consolidation_count: AtomicU64::new(0),
             extraction_fallback_count: AtomicU64::new(0),
             embedding_failure_count: AtomicU64::new(0),
+            recall_duration: HistogramBuckets::new(DURATION_BUCKETS),
+            embed_duration: HistogramBuckets::new(DURATION_BUCKETS),
+            store_duration: HistogramBuckets::new(DURATION_BUCKETS),
         }
     }
 
@@ -143,6 +221,23 @@ impl PensyveMetrics {
         let _ = writeln!(buf, "# TYPE pensyve_embedding_failure_total counter");
         let _ = writeln!(buf, "pensyve_embedding_failure_total {embedding_failure}");
 
+        // Histograms
+        buf.push_str(
+            &self
+                .recall_duration
+                .prometheus_text("pensyve_recall_duration_seconds"),
+        );
+        buf.push_str(
+            &self
+                .embed_duration
+                .prometheus_text("pensyve_embed_duration_seconds"),
+        );
+        buf.push_str(
+            &self
+                .store_duration
+                .prometheus_text("pensyve_store_duration_seconds"),
+        );
+
         buf
     }
 }
@@ -225,6 +320,11 @@ mod tests {
         assert!(text.contains("# HELP"));
         assert!(text.contains("# TYPE"));
         assert!(text.contains("counter"));
+        // Verify histograms are included
+        assert!(text.contains("pensyve_recall_duration_seconds_bucket"));
+        assert!(text.contains("pensyve_embed_duration_seconds_bucket"));
+        assert!(text.contains("pensyve_store_duration_seconds_bucket"));
+        assert!(text.contains("histogram"));
     }
 
     #[test]
@@ -248,5 +348,18 @@ mod tests {
         let m2 = metrics();
         // Both should point to the same instance.
         assert!(std::ptr::eq(m1, m2));
+    }
+
+    #[test]
+    fn test_histogram_observe_and_text() {
+        let h = HistogramBuckets::new(DURATION_BUCKETS);
+        h.observe(0.003); // falls in 0.005 bucket
+        h.observe(0.15); // falls in 0.25 bucket
+        h.observe(20.0); // only +Inf
+
+        let text = h.prometheus_text("test_duration_seconds");
+        assert!(text.contains("test_duration_seconds_bucket{le=\"0.005\"} 1"));
+        assert!(text.contains("test_duration_seconds_bucket{le=\"+Inf\"} 3"));
+        assert!(text.contains("test_duration_seconds_count 3"));
     }
 }
