@@ -40,6 +40,7 @@ from .models import (
     RememberResponse,
     StatsResponse,
 )
+from .metrics import MetricsMiddleware, router as metrics_router
 from .rate_limit import rate_limit_check
 from .rbac import require_role
 from .redis_client import close_redis
@@ -87,6 +88,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(RequestIdMiddleware)
+app.add_middleware(MetricsMiddleware)
+app.include_router(metrics_router)
 
 # Global Pensyve instance
 _pensyve = None
