@@ -1,4 +1,6 @@
 """Structured error types for the Pensyve API."""
+from typing import Any
+
 from pydantic import BaseModel
 
 
@@ -8,7 +10,7 @@ class ErrorResponse(BaseModel):
     error: str
     message: str
     request_id: str
-    detail: dict | None = None
+    detail: dict[str, Any] | None = None
 
 
 class PensyveError(Exception):
@@ -17,7 +19,7 @@ class PensyveError(Exception):
     status_code: int = 500
     error_code: str = "internal_error"
 
-    def __init__(self, message: str, detail: dict | None = None):
+    def __init__(self, message: str, detail: dict[str, Any] | None = None):
         self.message = message
         self.detail = detail
         super().__init__(message)

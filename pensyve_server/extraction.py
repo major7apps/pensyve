@@ -13,6 +13,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +101,9 @@ class CausalChain:
 class ExtractionResult:
     """Result of Tier 2 extraction."""
 
-    facts: list[ExtractedFact] = field(default_factory=list)
-    causal_chains: list[CausalChain] = field(default_factory=list)
-    contradictions: list[dict[str, str]] = field(default_factory=list)
+    facts: list[ExtractedFact] = field(default_factory=list[ExtractedFact])
+    causal_chains: list[CausalChain] = field(default_factory=list[CausalChain])
+    contradictions: list[dict[str, str]] = field(default_factory=list[dict[str, str]])
 
 
 class Tier2Extractor:
@@ -125,14 +126,14 @@ class Tier2Extractor:
             n_ctx: Context window size.
             n_gpu_layers: GPU layers (-1 = all available, 0 = CPU only).
         """
-        self._llm: object | None = None
+        self._llm: Any | None = None
         self._model_path = model_path
 
         if model_path is not None:
             model_file = Path(model_path)
             if model_file.exists():
                 try:
-                    from llama_cpp import Llama
+                    from llama_cpp import Llama  # type: ignore[import-untyped]
 
                     self._llm = Llama(
                         model_path=str(model_file),
@@ -178,7 +179,7 @@ Text: {text}
 JSON array:"""
 
         result = self._generate_json(prompt, max_tokens=512)
-        facts = []
+        facts: list[ExtractedFact] = []
         if isinstance(result, list):
             for item in result:
                 if all(k in item for k in ("subject", "predicate", "object")):
@@ -222,7 +223,7 @@ Conversation:
 JSON array:"""
 
         result = self._generate_json(prompt, max_tokens=512)
-        chains = []
+        chains: list[CausalChain] = []
         if isinstance(result, list):
             for item in result:
                 if all(k in item for k in ("trigger", "action", "outcome")):
@@ -302,7 +303,7 @@ JSON array:"""
             result.causal_chains = self.extract_causal_chains(messages)
         return result
 
-    def _generate_json(self, prompt: str, max_tokens: int = 512) -> list | dict | None:  # type: ignore[type-arg]
+    def _generate_json(self, prompt: str, max_tokens: int = 512) -> list[Any] | dict[str, Any] | None:
         """Generate JSON output from LLM with grammar constraints if available."""
         if self._llm is None:
             return None
@@ -310,10 +311,10 @@ JSON array:"""
         try:
             # Try with JSON grammar first
             try:
-                from llama_cpp import LlamaGrammar
+                from llama_cpp import LlamaGrammar  # type: ignore[import-untyped]
 
                 # Simple JSON array grammar
-                grammar = LlamaGrammar.from_string(
+                grammar: Any = LlamaGrammar.from_string(  # type: ignore[misc]
                     r"""
                     root   ::= "[" ws (value ("," ws value)*)? "]" ws
                     value  ::= object
@@ -324,14 +325,14 @@ JSON array:"""
                     ws     ::= [ \t\n]*
                 """
                 )
-                response = self._llm(  # type: ignore[operator]
+                response = self._llm(
                     prompt, max_tokens=max_tokens, grammar=grammar, temperature=0
                 )
             except Exception:
                 # Fall back to no grammar
-                response = self._llm(prompt, max_tokens=max_tokens, temperature=0)  # type: ignore[operator]
+                response = self._llm(prompt, max_tokens=max_tokens, temperature=0)
 
-            text = response["choices"][0]["text"].strip()  # type: ignore[index]
+            text = response["choices"][0]["text"].strip()
             # Try to find JSON in the response
             if text.startswith("["):
                 return json.loads(text)  # type: ignore[no-any-return]
@@ -351,7 +352,7 @@ JSON array:"""
 
     def _mock_extract_facts(self, text: str) -> list[ExtractedFact]:
         """Simple heuristic extraction without LLM."""
-        facts = []
+        facts: list[ExtractedFact] = []
         sentences = text.replace(".", ".\n").split("\n")
         for sentence in sentences:
             sentence = sentence.strip()
@@ -382,7 +383,7 @@ JSON array:"""
 
     def _mock_extract_causal(self, messages: list[dict[str, str]]) -> list[CausalChain]:
         """Simple pattern matching for action-outcome pairs."""
-        chains = []
+        chains: list[CausalChain] = []
         for i, msg in enumerate(messages):
             content = msg.get("content", "").lower()
             # Look for "fixed", "resolved", "solved" as success indicators

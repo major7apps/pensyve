@@ -59,7 +59,7 @@ known-first-party = ["pensyve", "pensyve_server"]
 
 [tool.pyright]
 pythonVersion = "3.10"
-typeCheckingMode = "basic"
+typeCheckingMode = "strict"
 include = [
     "pensyve_server",
     "tests/python",

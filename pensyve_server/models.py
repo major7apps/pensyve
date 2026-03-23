@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -148,12 +150,12 @@ class A2ATaskRequest(BaseModel):
 
     task_id: str
     capability: str
-    input: dict
+    input: dict[str, Any]
     from_agent: str
 
 
 class A2ATaskResponse(BaseModel):
     task_id: str
     status: str
-    output: dict
+    output: dict[str, Any]
     error: str | None = None

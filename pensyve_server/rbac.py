@@ -6,6 +6,8 @@ all authenticated users).
 """
 
 import os
+from collections.abc import Callable, Coroutine
+from typing import Any
 
 import structlog
 from starlette.requests import Request
@@ -32,7 +34,7 @@ def _get_caller_role(request: Request) -> str:
     return os.environ.get("PENSYVE_DEFAULT_ROLE", "writer")
 
 
-def require_role(required: str):
+def require_role(required: str) -> Callable[[Request], Coroutine[Any, Any, None]]:
     """FastAPI dependency that checks the caller has at least `required` role.
 
     Usage:
@@ -40,7 +42,7 @@ def require_role(required: str):
     """
     required_level = ROLE_HIERARCHY.get(required, 1)
 
-    async def _check(request: Request):
+    async def _check(request: Request) -> None:
         caller_role = _get_caller_role(request)
         caller_level = ROLE_HIERARCHY.get(caller_role, 0)
         if caller_level < required_level:

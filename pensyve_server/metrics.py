@@ -11,13 +11,10 @@ import re
 import time
 from collections import defaultdict
 from threading import Lock
-from typing import TYPE_CHECKING
+from collections.abc import Awaitable, Callable
 
 from fastapi import APIRouter, Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
 
 # ---------------------------------------------------------------------------
 # Server-side metrics state
@@ -52,7 +49,7 @@ def _record_request(path: str, duration_ms: float) -> None:
 class MetricsMiddleware(BaseHTTPMiddleware):
     """Starlette middleware that records request count and latency per path."""
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(self, request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
         start = time.monotonic()
         response = await call_next(request)
         duration_ms = (time.monotonic() - start) * 1000.0
