@@ -19,8 +19,27 @@ use pensyve_core::vector::VectorIndex;
 // Module entry point
 // ---------------------------------------------------------------------------
 
+use std::sync::Once;
+
+static TRACING_INIT: Once = Once::new();
+
+fn init_tracing() {
+    TRACING_INIT.call_once(|| {
+        use tracing_subscriber::{EnvFilter, fmt};
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("pensyve=info"));
+        fmt()
+            .json()
+            .with_env_filter(filter)
+            .with_target(true)
+            .with_thread_ids(false)
+            .init();
+    });
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    init_tracing();
     m.add("__version__", "0.1.0")?;
     m.add_class::<PyPensyve>()?;
     m.add_class::<PyEntity>()?;
