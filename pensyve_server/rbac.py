@@ -5,12 +5,13 @@ behind Writer+ permissions. Read operations require Reader+ (currently
 all authenticated users).
 """
 
-import logging
 import os
+
+import structlog
 
 from fastapi import HTTPException, Request
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 # Role hierarchy: Owner > Writer > Reader
 ROLE_HIERARCHY = {"owner": 3, "writer": 2, "reader": 1}
@@ -47,10 +48,10 @@ def require_role(required: str):
         caller_level = ROLE_HIERARCHY.get(caller_role, 0)
         if caller_level < required_level:
             logger.warning(
-                "RBAC denied: caller_role=%s required=%s path=%s",
-                caller_role,
-                required,
-                request.url.path,
+                "rbac_denied",
+                caller_role=caller_role,
+                required=required,
+                path=str(request.url.path),
             )
             raise HTTPException(
                 status_code=403,

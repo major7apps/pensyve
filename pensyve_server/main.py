@@ -1,9 +1,9 @@
-import logging
 import os
 import time
 import uuid
 from collections import Counter
 
+import structlog
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -12,6 +12,7 @@ import pensyve
 from .activity import ActivityTracker
 from .auth import require_api_key
 from .billing import UsageTracker
+from .logging import RequestIdMiddleware, configure_logging
 from .models import (
     A2ATaskRequest,
     A2ATaskResponse,
@@ -39,7 +40,8 @@ from .models import (
 from .rate_limit import rate_limit_check
 from .rbac import require_role
 
-logger = logging.getLogger(__name__)
+configure_logging()
+logger = structlog.get_logger()
 
 app = FastAPI(
     title="Pensyve API",
@@ -56,6 +58,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestIdMiddleware)
 
 # Global Pensyve instance
 _pensyve = None
