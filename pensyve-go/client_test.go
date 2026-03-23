@@ -483,3 +483,351 @@ func TestPensyveErrorString(t *testing.T) {
 		t.Errorf("expected %q, got %q", expected, err.Error())
 	}
 }
+
+func TestFeedback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" || r.URL.Path != "/v1/feedback" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+
+		var req FeedbackRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		if req.MemoryID != "mem-abc" {
+			t.Errorf("unexpected memory_id: %s", req.MemoryID)
+		}
+		if !req.Relevant {
+			t.Errorf("expected relevant=true")
+		}
+		if req.Signals["click"] != 1.0 {
+			t.Errorf("unexpected signals: %v", req.Signals)
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{BaseURL: server.URL})
+	err := client.Feedback(context.Background(), FeedbackRequest{
+		MemoryID: "mem-abc",
+		Relevant: true,
+		Signals:  map[string]float64{"click": 1.0},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFeedbackNoSignals(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req FeedbackRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		if req.Signals != nil {
+			t.Errorf("expected no signals, got %v", req.Signals)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{BaseURL: server.URL})
+	err := client.Feedback(context.Background(), FeedbackRequest{
+		MemoryID: "mem-xyz",
+		Relevant: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInspect(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			t.Errorf("expected GET, got %s", r.Method)
+		}
+		if r.URL.Path != "/v1/inspect/alice" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if r.URL.Query().Get("type") != "semantic" {
+			t.Errorf("unexpected type param: %s", r.URL.Query().Get("type"))
+		}
+		if r.URL.Query().Get("limit") != "5" {
+			t.Errorf("unexpected limit param: %s", r.URL.Query().Get("limit"))
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(InspectResult{
+			Entity:   Entity{ID: "ent-1", Name: "alice", Kind: "user"},
+			Memories: []Memory{{ID: "mem-1", Content: "likes coffee"}},
+			Cursor:   "next-page-token",
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{BaseURL: server.URL})
+	result, err := client.Inspect(context.Background(), "alice", &InspectOptions{
+		Type:  "semantic",
+		Limit: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Entity.Name != "alice" {
+		t.Errorf("expected entity alice, got %s", result.Entity.Name)
+	}
+	if len(result.Memories) != 1 {
+		t.Fatalf("expected 1 memory, got %d", len(result.Memories))
+	}
+	if result.Memories[0].Content != "likes coffee" {
+		t.Errorf("unexpected content: %s", result.Memories[0].Content)
+	}
+	if result.Cursor != "next-page-token" {
+		t.Errorf("unexpected cursor: %s", result.Cursor)
+	}
+}
+
+func TestInspectNilOptions(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/inspect/bob" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if r.URL.RawQuery != "" {
+			t.Errorf("expected no query params, got: %s", r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(InspectResult{
+			Entity:   Entity{ID: "ent-2", Name: "bob", Kind: "user"},
+			Memories: []Memory{},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{BaseURL: server.URL})
+	result, err := client.Inspect(context.Background(), "bob", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Entity.Name != "bob" {
+		t.Errorf("expected entity bob, got %s", result.Entity.Name)
+	}
+}
+
+func TestActivity(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/v1/activity" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if r.URL.Query().Get("days") != "7" {
+			t.Errorf("unexpected days param: %s", r.URL.Query().Get("days"))
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]ActivityItem{
+			{Date: "2026-03-17", Recalls: 10, Remembers: 3, Forgets: 1},
+			{Date: "2026-03-18", Recalls: 8, Remembers: 2, Forgets: 0},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{BaseURL: server.URL})
+	items, err := client.Activity(context.Background(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+	if items[0].Date != "2026-03-17" {
+		t.Errorf("unexpected date: %s", items[0].Date)
+	}
+	if items[0].Recalls != 10 {
+		t.Errorf("unexpected recalls: %d", items[0].Recalls)
+	}
+}
+
+func TestRecentActivity(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/v1/activity/recent" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if r.URL.Query().Get("limit") != "3" {
+			t.Errorf("unexpected limit param: %s", r.URL.Query().Get("limit"))
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]RecentEvent{
+			{
+				Type:      "recall",
+				Entity:    "alice",
+				Content:   "queried for rust memories",
+				Timestamp: "2026-03-23T12:00:00Z",
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{BaseURL: server.URL})
+	events, err := client.RecentActivity(context.Background(), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Type != "recall" {
+		t.Errorf("unexpected event type: %s", events[0].Type)
+	}
+	if events[0].Entity != "alice" {
+		t.Errorf("unexpected entity: %s", events[0].Entity)
+	}
+}
+
+func TestUsage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/v1/usage" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(UsageResult{
+			TotalOps:   1500,
+			MonthlyOps: 200,
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{BaseURL: server.URL})
+	result, err := client.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TotalOps != 1500 {
+		t.Errorf("expected TotalOps 1500, got %d", result.TotalOps)
+	}
+	if result.MonthlyOps != 200 {
+		t.Errorf("expected MonthlyOps 200, got %d", result.MonthlyOps)
+	}
+}
+
+func TestGDPRErase(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "DELETE" {
+			t.Errorf("expected DELETE, got %s", r.Method)
+		}
+		if r.URL.Path != "/v1/gdpr/erase/alice" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{BaseURL: server.URL})
+	err := client.GDPRErase(context.Background(), "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGDPRErasePathEncoding(t *testing.T) {
+	// url.PathEscape encodes slashes; verify that an entity name containing a
+	// slash is correctly percent-encoded so it doesn't collapse path segments.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// r.URL.RawPath holds the original percent-encoded form when it differs
+		// from the decoded r.URL.Path.
+		rawPath := r.URL.RawPath
+		if rawPath == "" {
+			rawPath = r.URL.Path
+		}
+		if rawPath != "/v1/gdpr/erase/alice%2Fbob" {
+			t.Errorf("unexpected raw path: %s", rawPath)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{BaseURL: server.URL})
+	err := client.GDPRErase(context.Background(), "alice/bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestA2AAgentCard(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/v1/a2a" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(A2AAgentCard{
+			Name:        "Pensyve Memory Agent",
+			Description: "Universal memory runtime for AI agents",
+			URL:         "https://api.pensyve.ai",
+			Capabilities: []struct {
+				Name string `json:"name"`
+			}{
+				{Name: "recall"},
+				{Name: "remember"},
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{BaseURL: server.URL})
+	card, err := client.A2AAgentCard(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if card.Name != "Pensyve Memory Agent" {
+		t.Errorf("unexpected name: %s", card.Name)
+	}
+	if len(card.Capabilities) != 2 {
+		t.Fatalf("expected 2 capabilities, got %d", len(card.Capabilities))
+	}
+	if card.Capabilities[0].Name != "recall" {
+		t.Errorf("unexpected capability: %s", card.Capabilities[0].Name)
+	}
+}
+
+func TestA2ATask(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" || r.URL.Path != "/v1/a2a/task" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+
+		var req A2ATaskRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		if req.Method != "recall" {
+			t.Errorf("unexpected method: %s", req.Method)
+		}
+		if req.Input["query"] != "rust" {
+			t.Errorf("unexpected input: %v", req.Input)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(A2ATaskResponse{
+			Status: "success",
+			Output: map[string]interface{}{"count": float64(3)},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(Config{BaseURL: server.URL})
+	resp, err := client.A2ATask(context.Background(), A2ATaskRequest{
+		Method: "recall",
+		Input:  map[string]interface{}{"query": "rust"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Status != "success" {
+		t.Errorf("unexpected status: %s", resp.Status)
+	}
+	if resp.Output["count"] != float64(3) {
+		t.Errorf("unexpected output count: %v", resp.Output["count"])
+	}
+}
