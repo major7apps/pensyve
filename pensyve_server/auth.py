@@ -1,3 +1,4 @@
+"""API key authentication for the Pensyve REST API."""
 import hmac
 import os
 import sys

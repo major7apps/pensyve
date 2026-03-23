@@ -1,9 +1,12 @@
+"""Pydantic request and response models for the Pensyve API."""
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
 class EntityCreate(BaseModel):
+    """Request body for creating or retrieving a named entity."""
+
     model_config = ConfigDict(strict=True, extra="forbid")
 
     name: str = Field(min_length=1, max_length=10000)
@@ -11,22 +14,30 @@ class EntityCreate(BaseModel):
 
 
 class EntityResponse(BaseModel):
+    """Response containing the entity's ID, name, and kind."""
+
     id: str
     name: str
     kind: str
 
 
 class EpisodeStartRequest(BaseModel):
+    """Request body for starting a new conversational episode."""
+
     model_config = ConfigDict(strict=True, extra="forbid")
 
     participants: list[str]  # entity names
 
 
 class EpisodeStartResponse(BaseModel):
+    """Response containing the newly created episode ID."""
+
     episode_id: str
 
 
 class MessageRequest(BaseModel):
+    """Request body for appending a message to an active episode."""
+
     model_config = ConfigDict(strict=True, extra="forbid")
 
     episode_id: str
@@ -35,6 +46,8 @@ class MessageRequest(BaseModel):
 
 
 class EpisodeEndRequest(BaseModel):
+    """Request body for closing an active episode with an optional outcome label."""
+
     model_config = ConfigDict(strict=True, extra="forbid")
 
     episode_id: str
@@ -42,10 +55,14 @@ class EpisodeEndRequest(BaseModel):
 
 
 class EpisodeEndResponse(BaseModel):
+    """Response indicating how many memories were created when the episode closed."""
+
     memories_created: int
 
 
 class RecallRequest(BaseModel):
+    """Request body for searching memories by semantic query."""
+
     model_config = ConfigDict(strict=True, extra="forbid")
 
     query: str = Field(min_length=1, max_length=10000)
@@ -55,6 +72,8 @@ class RecallRequest(BaseModel):
 
 
 class MemoryResponse(BaseModel):
+    """A single memory record returned by recall or inspect."""
+
     id: str
     content: str
     memory_type: str
@@ -64,6 +83,8 @@ class MemoryResponse(BaseModel):
 
 
 class RememberRequest(BaseModel):
+    """Request body for storing a new memory for an entity."""
+
     model_config = ConfigDict(strict=True, extra="forbid")
 
     entity: str
@@ -72,20 +93,28 @@ class RememberRequest(BaseModel):
 
 
 class RememberResponse(MemoryResponse):
+    """Response for a stored memory, including which extraction tier was used."""
+
     extraction_tier: int = 1  # 1=patterns only, 2=local LLM, 3=API LLM
 
 
 class ForgetResponse(BaseModel):
+    """Response indicating how many memories were deleted."""
+
     forgotten_count: int
 
 
 class ConsolidateResponse(BaseModel):
+    """Response with counts of memories promoted, decayed, and archived."""
+
     promoted: int
     decayed: int
     archived: int
 
 
 class StatsResponse(BaseModel):
+    """Aggregate memory counts for a namespace, broken down by memory type."""
+
     namespace: str
     entities: int
     episodic_memories: int
@@ -94,12 +123,16 @@ class StatsResponse(BaseModel):
 
 
 class RecallResponse(BaseModel):
+    """Search results including memories, contradiction warnings, and a pagination cursor."""
+
     memories: list[MemoryResponse]
     contradictions: list[dict[str, str]] = []
     cursor: str | None = None
 
 
 class InspectRequest(BaseModel):
+    """Request body for inspecting all memories belonging to a specific entity."""
+
     model_config = ConfigDict(strict=True, extra="forbid")
 
     entity: str
@@ -108,6 +141,8 @@ class InspectRequest(BaseModel):
 
 
 class InspectResponse(BaseModel):
+    """Entity memories grouped by type with a cursor for pagination."""
+
     entity: str
     episodic: list[MemoryResponse] = []
     semantic: list[MemoryResponse] = []
@@ -116,6 +151,8 @@ class InspectResponse(BaseModel):
 
 
 class ActivityResponse(BaseModel):
+    """Daily activity summary with per-operation counts."""
+
     date: str
     recalls: int
     remembers: int
@@ -123,6 +160,8 @@ class ActivityResponse(BaseModel):
 
 
 class RecentEventResponse(BaseModel):
+    """A single recent activity event with its type, content, and timestamp."""
+
     id: str
     type: str
     content: str
@@ -130,6 +169,8 @@ class RecentEventResponse(BaseModel):
 
 
 class FeedbackRequest(BaseModel):
+    """Request body for submitting relevance feedback on a recalled memory."""
+
     model_config = ConfigDict(strict=True, extra="forbid")
 
     memory_id: str
@@ -138,6 +179,8 @@ class FeedbackRequest(BaseModel):
 
 
 class GdprErasureResponse(BaseModel):
+    """Response confirming completion of a GDPR Article 17 right-to-erasure request."""
+
     memories_deleted: int
     edges_deleted: int
     entities_deleted: int
@@ -146,6 +189,8 @@ class GdprErasureResponse(BaseModel):
 
 
 class A2ATaskRequest(BaseModel):
+    """Request body for dispatching an A2A protocol task to a named capability."""
+
     model_config = ConfigDict(strict=True, extra="forbid")
 
     task_id: str
@@ -155,6 +200,8 @@ class A2ATaskRequest(BaseModel):
 
 
 class A2ATaskResponse(BaseModel):
+    """Response from an A2A task execution, including status and capability output."""
+
     task_id: str
     status: str
     output: dict[str, Any]

@@ -10,8 +10,8 @@ from __future__ import annotations
 import re
 import time
 from collections import defaultdict
-from threading import Lock
 from collections.abc import Awaitable, Callable
+from threading import Lock
 
 from fastapi import APIRouter, Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
