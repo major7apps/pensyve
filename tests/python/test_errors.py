@@ -74,7 +74,8 @@ def test_error_response_has_all_required_fields(client):
 
 def test_auth_error_returns_structured_response(auth_client):
     """Missing API key returns structured 401 with error=unauthorized."""
-    resp = auth_client.get("/v1/health")
+    # Use /v1/stats (not /v1/health — health bypasses auth by design)
+    resp = auth_client.get("/v1/stats")
     assert resp.status_code == 401
     body = resp.json()
     assert body["error"] == "unauthorized"
@@ -84,7 +85,7 @@ def test_auth_error_returns_structured_response(auth_client):
 
 def test_auth_error_no_bare_detail_field(auth_client):
     """Structured 401 should not expose a bare 'detail' field."""
-    resp = auth_client.get("/v1/health")
+    resp = auth_client.get("/v1/stats")
     body = resp.json()
     assert "detail" not in body or body.get("detail") is None
 
