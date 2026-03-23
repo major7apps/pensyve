@@ -57,6 +57,10 @@ class RememberRequest(BaseModel):
     confidence: float = 0.8
 
 
+class RememberResponse(MemoryResponse):
+    extraction_tier: int = 1  # 1=patterns only, 2=local LLM, 3=API LLM
+
+
 class ForgetResponse(BaseModel):
     forgotten_count: int
 
