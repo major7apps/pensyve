@@ -130,6 +130,46 @@ impl PostgresBackend {
             Ok(())
         })
     }
+
+    /// Set the active namespace on a single Postgres connection so that the
+    /// row-level security policies (defined in `postgres_schema.sql`) filter
+    /// rows to that namespace.
+    ///
+    /// **Usage pattern** — acquire a connection from the pool, call this
+    /// helper, then run all queries for the request on the *same* connection:
+    ///
+    /// ```ignore
+    /// let mut conn = backend.pool().acquire().await?;
+    /// backend.set_namespace_config(&mut conn, namespace_id).await?;
+    /// // … subsequent queries on `conn` are namespace-scoped via RLS …
+    /// ```
+    ///
+    /// The `true` flag passed to `set_config` makes the GUC local to the
+    /// current transaction; outside a transaction it persists for the session.
+    ///
+    /// NOTE: The current `StorageTrait` methods execute directly against the
+    /// shared pool (each call may land on a different connection), so the GUC
+    /// is not automatically applied.  Callers that need strict RLS enforcement
+    /// should open an explicit connection, set the namespace config, and issue
+    /// all queries within the same connection/transaction.
+    pub async fn set_namespace_config(
+        &self,
+        conn: &mut sqlx_postgres::PgConnection,
+        namespace_id: uuid::Uuid,
+    ) -> StorageResult<()> {
+        query("SELECT set_config('pensyve.namespace_id', $1, true)")
+            .bind(namespace_id.to_string())
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+        Ok(())
+    }
+
+    /// Expose the underlying pool so callers can acquire explicit connections
+    /// for namespace-scoped RLS sessions (see [`set_namespace_config`]).
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
 }
 
 // ---------------------------------------------------------------------------
