@@ -53,19 +53,20 @@ impl HistogramBuckets {
 
     /// Format as Prometheus histogram exposition text.
     pub fn prometheus_text(&self, name: &str) -> String {
+        use std::fmt::Write;
         let mut buf = String::new();
-        buf.push_str(&format!("# HELP {name} Duration in seconds\n"));
-        buf.push_str(&format!("# TYPE {name} histogram\n"));
+        let _ = writeln!(buf, "# HELP {name} Duration in seconds");
+        let _ = writeln!(buf, "# TYPE {name} histogram");
         for (i, &boundary) in self.boundaries.iter().enumerate() {
             let count = self.counts[i].load(Ordering::Relaxed);
-            buf.push_str(&format!("{name}_bucket{{le=\"{boundary}\"}} {count}\n"));
+            let _ = writeln!(buf, "{name}_bucket{{le=\"{boundary}\"}} {count}");
         }
         let inf_count = self.counts[self.boundaries.len()].load(Ordering::Relaxed);
-        buf.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {inf_count}\n"));
+        let _ = writeln!(buf, "{name}_bucket{{le=\"+Inf\"}} {inf_count}");
         let sum = self.sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0;
-        buf.push_str(&format!("{name}_sum {sum}\n"));
+        let _ = writeln!(buf, "{name}_sum {sum}");
         let total = self.total.load(Ordering::Relaxed);
-        buf.push_str(&format!("{name}_count {total}\n"));
+        let _ = writeln!(buf, "{name}_count {total}");
         buf
     }
 }
