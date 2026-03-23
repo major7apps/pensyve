@@ -1,7 +1,9 @@
 import hmac
 import os
 
-from fastapi import HTTPException, Request
+from starlette.requests import Request
+
+from .errors import AuthenticationError
 
 PENSYVE_API_KEYS = os.environ.get("PENSYVE_API_KEYS", "")
 
@@ -14,4 +16,4 @@ async def require_api_key(request: Request):
     valid_keys = [k.strip() for k in PENSYVE_API_KEYS.split(",") if k.strip()]
     key_bytes = key.encode()
     if not any(hmac.compare_digest(key_bytes, k.encode()) for k in valid_keys):
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        raise AuthenticationError("Invalid or missing API key")

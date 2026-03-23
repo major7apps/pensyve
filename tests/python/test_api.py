@@ -208,7 +208,7 @@ def test_auth_rejects_missing_key(auth_client):
     """When API keys are configured, requests without key should be rejected."""
     r = auth_client.get("/v1/health")
     assert r.status_code == 401
-    assert "Invalid or missing" in r.json()["detail"]
+    assert "Invalid or missing" in r.json()["message"]
 
 
 def test_auth_rejects_wrong_key(auth_client):
