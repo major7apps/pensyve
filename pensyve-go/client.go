@@ -290,6 +290,94 @@ func (c *Client) Health(ctx context.Context) (*HealthResult, error) {
 	return &result, nil
 }
 
+// Feedback submits relevance feedback for a recalled memory. Use this to
+// signal whether a memory retrieved by Recall was actually useful.
+func (c *Client) Feedback(ctx context.Context, req FeedbackRequest) error {
+	return c.do(ctx, "POST", "/v1/feedback", req, nil)
+}
+
+// Inspect returns the stored memories for the given entity. opts may be nil
+// to use server defaults.
+func (c *Client) Inspect(ctx context.Context, entity string, opts *InspectOptions) (*InspectResult, error) {
+	path := "/v1/inspect/" + url.PathEscape(entity)
+	if opts != nil {
+		q := url.Values{}
+		if opts.Type != "" {
+			q.Set("type", opts.Type)
+		}
+		if opts.Limit > 0 {
+			q.Set("limit", fmt.Sprintf("%d", opts.Limit))
+		}
+		if opts.Cursor != "" {
+			q.Set("cursor", opts.Cursor)
+		}
+		if len(q) > 0 {
+			path += "?" + q.Encode()
+		}
+	}
+
+	var result InspectResult
+	if err := c.do(ctx, "GET", path, nil, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// Activity returns per-day memory operation counts for the past N days.
+func (c *Client) Activity(ctx context.Context, days int) ([]ActivityItem, error) {
+	path := fmt.Sprintf("/v1/activity?days=%d", days)
+	var items []ActivityItem
+	if err := c.do(ctx, "GET", path, nil, &items); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+// RecentActivity returns the most recent memory events, up to limit entries.
+func (c *Client) RecentActivity(ctx context.Context, limit int) ([]RecentEvent, error) {
+	path := fmt.Sprintf("/v1/activity/recent?limit=%d", limit)
+	var events []RecentEvent
+	if err := c.do(ctx, "GET", path, nil, &events); err != nil {
+		return nil, err
+	}
+	return events, nil
+}
+
+// Usage returns aggregate operation counts for the authenticated account.
+func (c *Client) Usage(ctx context.Context) (*UsageResult, error) {
+	var result UsageResult
+	if err := c.do(ctx, "GET", "/v1/usage", nil, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GDPRErase permanently deletes all data associated with the given entity to
+// comply with GDPR right-to-erasure requests.
+func (c *Client) GDPRErase(ctx context.Context, entity string) error {
+	path := "/v1/gdpr/erase/" + url.PathEscape(entity)
+	return c.do(ctx, "DELETE", path, nil, nil)
+}
+
+// A2AAgentCard returns the agent capability descriptor for this Pensyve
+// instance, used for agent-to-agent discovery.
+func (c *Client) A2AAgentCard(ctx context.Context) (*A2AAgentCard, error) {
+	var card A2AAgentCard
+	if err := c.do(ctx, "GET", "/v1/a2a", nil, &card); err != nil {
+		return nil, err
+	}
+	return &card, nil
+}
+
+// A2ATask dispatches a task to this agent using the Agent-to-Agent protocol.
+func (c *Client) A2ATask(ctx context.Context, req A2ATaskRequest) (*A2ATaskResponse, error) {
+	var resp A2ATaskResponse
+	if err := c.do(ctx, "POST", "/v1/a2a/task", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // StartEpisode begins a new episode with the given participants and returns
 // an EpisodeHandle for adding messages and ending the episode.
 func (c *Client) StartEpisode(ctx context.Context, participants []string) (*EpisodeHandle, error) {
