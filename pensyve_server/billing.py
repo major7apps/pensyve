@@ -96,6 +96,29 @@ class UsageTracker:
                 return False, f"Memory limit reached ({limits.max_memories})"
             return True, "OK"
 
+    async def record_api_call_redis(self, namespace: str) -> None:
+        """Increment usage in Redis if available, else in-memory."""
+        try:
+            from .redis_client import get_redis
+
+            redis_client = await get_redis()
+            if redis_client:
+                import datetime
+
+                key = f"usage:{namespace}:{datetime.date.today().strftime('%Y-%m')}"
+                lua = """
+local current = redis.call('INCR', KEYS[1])
+if current == 1 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return current
+"""
+                await redis_client.eval(lua, 1, key, 60 * 60 * 24 * 32)
+                return
+        except Exception:
+            pass
+        self.record_api_call(namespace)
+
     def _get_or_create(self, namespace: str) -> UsageRecord:
         if namespace not in self._usage:
             self._usage[namespace] = UsageRecord(namespace=namespace)
