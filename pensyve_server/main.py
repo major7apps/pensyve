@@ -42,6 +42,7 @@ from .models import (
 )
 from .rate_limit import rate_limit_check
 from .rbac import require_role
+from .redis_client import close_redis
 
 configure_logging()
 logger = structlog.get_logger()
@@ -66,6 +67,7 @@ async def lifespan(app: FastAPI):
     task = asyncio.create_task(_flush_loop())
     yield
     task.cancel()
+    await close_redis()
 
 
 app = FastAPI(
