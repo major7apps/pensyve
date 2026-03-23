@@ -17,6 +17,8 @@ pub struct PensyveMetrics {
     pub embed_total_ms: AtomicU64,
     pub store_count: AtomicU64,
     pub consolidation_count: AtomicU64,
+    pub extraction_fallback_count: AtomicU64,
+    pub embedding_failure_count: AtomicU64,
 }
 
 impl PensyveMetrics {
@@ -29,6 +31,8 @@ impl PensyveMetrics {
             embed_total_ms: AtomicU64::new(0),
             store_count: AtomicU64::new(0),
             consolidation_count: AtomicU64::new(0),
+            extraction_fallback_count: AtomicU64::new(0),
+            embedding_failure_count: AtomicU64::new(0),
         }
     }
 
@@ -56,6 +60,16 @@ impl PensyveMetrics {
         self.consolidation_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a Tier 2 extraction fallback to Tier 1.
+    pub fn record_extraction_fallback(&self) {
+        self.extraction_fallback_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an embedding operation failure.
+    pub fn record_embedding_failure(&self) {
+        self.embedding_failure_count.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Export all metrics in Prometheus text exposition format.
     pub fn prometheus_text(&self) -> String {
         let mut buf = String::with_capacity(512);
@@ -66,6 +80,8 @@ impl PensyveMetrics {
         let embed_total_ms = self.embed_total_ms.load(Ordering::Relaxed);
         let store_count = self.store_count.load(Ordering::Relaxed);
         let consolidation_count = self.consolidation_count.load(Ordering::Relaxed);
+        let extraction_fallback = self.extraction_fallback_count.load(Ordering::Relaxed);
+        let embedding_failure = self.embedding_failure_count.load(Ordering::Relaxed);
 
         let _ = writeln!(
             buf,
@@ -108,6 +124,20 @@ impl PensyveMetrics {
         );
         let _ = writeln!(buf, "# TYPE pensyve_consolidation_count counter");
         let _ = writeln!(buf, "pensyve_consolidation_count {consolidation_count}");
+
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_extraction_fallback_total Total Tier 2 extraction fallbacks to Tier 1."
+        );
+        let _ = writeln!(buf, "# TYPE pensyve_extraction_fallback_total counter");
+        let _ = writeln!(buf, "pensyve_extraction_fallback_total {extraction_fallback}");
+
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_embedding_failure_total Total embedding operation failures."
+        );
+        let _ = writeln!(buf, "# TYPE pensyve_embedding_failure_total counter");
+        let _ = writeln!(buf, "pensyve_embedding_failure_total {embedding_failure}");
 
         buf
     }
@@ -174,6 +204,9 @@ mod tests {
         m.record_embed(50);
         m.record_store();
         m.record_consolidation();
+        m.record_extraction_fallback();
+        m.record_extraction_fallback();
+        m.record_embedding_failure();
 
         let text = m.prometheus_text();
         assert!(text.contains("pensyve_recall_count 1"));
@@ -182,10 +215,27 @@ mod tests {
         assert!(text.contains("pensyve_embed_duration_ms_total 50"));
         assert!(text.contains("pensyve_store_count 1"));
         assert!(text.contains("pensyve_consolidation_count 1"));
+        assert!(text.contains("pensyve_extraction_fallback_total 2"));
+        assert!(text.contains("pensyve_embedding_failure_total 1"));
         // Verify Prometheus format markers
         assert!(text.contains("# HELP"));
         assert!(text.contains("# TYPE"));
         assert!(text.contains("counter"));
+    }
+
+    #[test]
+    fn test_record_extraction_fallback() {
+        let m = PensyveMetrics::new();
+        m.record_extraction_fallback();
+        m.record_extraction_fallback();
+        assert_eq!(m.extraction_fallback_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_record_embedding_failure() {
+        let m = PensyveMetrics::new();
+        m.record_embedding_failure();
+        assert_eq!(m.embedding_failure_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
