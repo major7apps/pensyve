@@ -7,6 +7,7 @@ from conversation text.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -53,6 +54,29 @@ def sanitize_pii(text: str) -> str:
     text = _PHONE_RE.sub("[PHONE_REDACTED]", text)
     text = _IP_RE.sub("[IP_REDACTED]", text)
     return text
+
+
+# --- Compiled prompt injection detection patterns (module-level for performance) ---
+
+_INJECTION_PATTERNS = [
+    re.compile(r"ignore\s+(all\s+)?previous", re.IGNORECASE),
+    re.compile(r"disregard\s+(all\s+)?(above|previous)", re.IGNORECASE),
+    re.compile(r"system\s*:", re.IGNORECASE),
+    re.compile(r"<\|im_start\|>", re.IGNORECASE),
+    re.compile(r"\[INST\]", re.IGNORECASE),
+    re.compile(
+        r"(?:^|\n)(?:---+|===+|###)\s*(?:instruction|system|prompt)",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+]
+
+
+def detect_prompt_injection(text: str) -> bool:
+    """Return True if text contains likely prompt injection patterns."""
+    for pattern in _INJECTION_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
 
 
 @dataclass
@@ -141,6 +165,11 @@ class Tier2Extractor:
         if not self.is_available:
             return self._mock_extract_facts(text)
 
+        if detect_prompt_injection(text):
+            content_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
+            logger.warning("prompt_injection_detected content_hash=%s", content_hash)
+            return []
+
         text = sanitize_pii(text)
 
         prompt = f"""Extract factual statements from the following text as JSON.
@@ -173,6 +202,12 @@ JSON array:"""
         """
         if not self.is_available:
             return self._mock_extract_causal(messages)
+
+        combined = "\n".join(msg.get("content", "") for msg in messages)
+        if detect_prompt_injection(combined):
+            content_hash = hashlib.sha256(combined.encode()).hexdigest()[:16]
+            logger.warning("prompt_injection_detected content_hash=%s", content_hash)
+            return []
 
         messages = [{**msg, "content": sanitize_pii(msg.get("content", ""))} for msg in messages]
 
@@ -215,6 +250,11 @@ JSON array:"""
         Returns list of {new_claim, contradicted_fact, explanation}.
         """
         if not self.is_available or not existing_facts:
+            return []
+
+        if detect_prompt_injection(new_text):
+            content_hash = hashlib.sha256(new_text.encode()).hexdigest()[:16]
+            logger.warning("prompt_injection_detected content_hash=%s", content_hash)
             return []
 
         new_text = sanitize_pii(new_text)
