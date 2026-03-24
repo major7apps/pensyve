@@ -1,3 +1,5 @@
+![Pensyve Banner Logo](docs/images/logo.png)
+
 # Pensyve
 
 Universal memory runtime for AI agents. Framework-agnostic, protocol-native, offline-first.
@@ -183,25 +185,7 @@ cargo build --bin pensyve-cli
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                          Consumers                                   │
-│  Python SDK  MCP Server  REST API  TypeScript SDK  Go SDK  CLI      │
-│  (PyO3)      (stdio)     (FastAPI) (HTTP)          (HTTP)  (clap)   │
-├──────────────────────────────────────────────────────────────────────┤
-│                       pensyve-core (Rust)                            │
-│                                                                      │
-│  Storage (SQLite+FTS5 / Postgres+pgvector)  ·  Embeddings (ONNX)    │
-│  Vector Index  ·  Graph (petgraph)  ·  Reranker (BGE)               │
-│  FSRS Decay  ·  Bayesian Procedural  ·  Consolidation               │
-│  Intent Scoring  ·  Extraction (Tier 1 + Tier 2)                    │
-│  Observability (tracing + Prometheus)  ·  RBAC Mesh                 │
-├──────────────────────────────────────────────────────────────────────┤
-│                       Extensions                                     │
-│  Claude Code Plugin  ·  VS Code Extension  ·  WASM Build            │
-│  Framework Integrations (LangChain, CrewAI, OpenClaw, Autogen)      │
-└──────────────────────────────────────────────────────────────────────┘
-```
+![Pensyve Architecture](docs/images/architecture.png)
 
 ### Data Model
 
