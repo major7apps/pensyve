@@ -27,11 +27,13 @@ COPY pensyve-cli/ pensyve-cli/
 ENV PATH="/opt/venv/bin:$PATH"
 RUN maturin build --release --manifest-path pensyve-python/Cargo.toml -o /wheels
 
-# Stage 3: Download embedding models (must match runtime base for glibc compat)
+# Stage 3: Pre-download ONNX embedding models for the Rust fastembed crate.
+# Uses huggingface_hub (same cache format as hf_hub Rust crate) to avoid
+# model downloads on first ECS task start.
 FROM python:3.13-slim-trixie AS model-download
-RUN pip install --no-cache-dir fastembed
-RUN python -c "from fastembed import TextEmbedding; TextEmbedding('Alibaba-NLP/gte-base-en-v1.5')"
-RUN python -c "from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')"
+RUN pip install --no-cache-dir huggingface_hub
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('Alibaba-NLP/gte-base-en-v1.5', cache_dir='/model-cache', allow_patterns=['onnx/*', 'tokenizer*', 'config*', 'special_tokens*'])"
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('Qdrant/all-MiniLM-L6-v2-onnx', cache_dir='/model-cache', allow_patterns=['*.onnx', 'tokenizer*', 'config*', 'special_tokens*'])"
 
 # Stage 4: Runtime
 FROM python:3.13-slim-trixie
@@ -65,10 +67,11 @@ COPY --from=rust-builder /build/target/release/pensyve /usr/local/bin/pensyve-cl
 # Non-root user
 RUN useradd -m -s /bin/bash pensyve
 
-# Copy pre-downloaded embedding models
-COPY --from=model-download --chown=pensyve:pensyve /root/.cache/huggingface /home/pensyve/.cache/huggingface
+# Copy pre-downloaded embedding models (hf_hub cache format)
+COPY --from=model-download --chown=pensyve:pensyve /model-cache /home/pensyve/.cache/fastembed
 
 USER pensyve
+ENV FASTEMBED_CACHE_DIR=/home/pensyve/.cache/fastembed
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
