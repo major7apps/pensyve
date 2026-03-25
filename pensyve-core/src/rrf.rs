@@ -1,0 +1,151 @@
+//! Reciprocal Rank Fusion (RRF) implementation.
+//!
+//! Reference: Cormack, G. V., Clarke, C. L., & Buettcher, S. (2009).
+//! "Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods."
+//! SIGIR 2009.
+//!
+//! Formula: `RRF_score(d) = Σ_r w_r / (k + rank_r(d))`
+//! where rank is 1-indexed and k is a smoothing constant (default 60).
+
+use std::collections::HashMap;
+use uuid::Uuid;
+
+/// Combines multiple ranked lists using Reciprocal Rank Fusion.
+///
+/// # Arguments
+/// * `rankings` — Slice of ranked lists, each containing `(id, original_score)` pairs
+///   sorted by score descending. Original scores are ignored; only rank position matters.
+/// * `weights` — Per-ranking weight applied to the RRF contribution. Must have the same
+///   length as `rankings`. Pass all `1.0` for unweighted fusion.
+/// * `k` — Smoothing constant (Cormack et al. recommend 60). Lower values make rank
+///   differences more pronounced.
+///
+/// # Returns
+/// Vec of `(id, rrf_score)` sorted by `rrf_score` descending.
+pub fn reciprocal_rank_fusion(
+    rankings: &[Vec<(Uuid, f32)>],
+    weights: &[f32],
+    k: u32,
+) -> Vec<(Uuid, f32)> {
+    assert_eq!(
+        rankings.len(),
+        weights.len(),
+        "rankings and weights must have the same length"
+    );
+
+    if rankings.is_empty() {
+        return Vec::new();
+    }
+
+    let k_f = k as f64;
+    let mut scores: HashMap<Uuid, f64> = HashMap::new();
+
+    for (ranking, &weight) in rankings.iter().zip(weights.iter()) {
+        let w = weight as f64;
+        for (rank_0, (id, _original_score)) in ranking.iter().enumerate() {
+            let rank_1 = (rank_0 + 1) as f64; // convert to 1-indexed
+            let contribution = w / (k_f + rank_1);
+            *scores.entry(*id).or_insert(0.0) += contribution;
+        }
+    }
+
+    let mut result: Vec<(Uuid, f32)> = scores
+        .into_iter()
+        .map(|(id, score)| (id, score as f32))
+        .collect();
+
+    // Sort descending by RRF score; break ties by UUID for determinism
+    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then_with(|| a.0.cmp(&b.0)));
+
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(n: u8) -> Uuid {
+        Uuid::from_bytes([n; 16])
+    }
+
+    #[test]
+    fn test_single_ranking() {
+        // One list of 3 items — RRF should preserve the original order.
+        let ranking = vec![(id(1), 0.9_f32), (id(2), 0.5), (id(3), 0.1)];
+        let result = reciprocal_rank_fusion(&[ranking], &[1.0], 60);
+
+        assert_eq!(result.len(), 3);
+        // Rank 1 gets 1/61, rank 2 gets 1/62, rank 3 gets 1/63 → descending order preserved
+        assert_eq!(result[0].0, id(1));
+        assert_eq!(result[1].0, id(2));
+        assert_eq!(result[2].0, id(3));
+    }
+
+    #[test]
+    fn test_consensus_wins() {
+        // id(2) is ranked #2 in both lists.
+        // id(1) is ranked #1 in the first list only (absent from second).
+        // id(2) should beat id(1) due to consensus across lists.
+        let list_a = vec![(id(1), 1.0_f32), (id(2), 0.8), (id(3), 0.5)];
+        let list_b = vec![(id(4), 1.0_f32), (id(2), 0.9), (id(5), 0.3)];
+
+        let result = reciprocal_rank_fusion(&[list_a, list_b], &[1.0, 1.0], 60);
+
+        // id(2): 1/62 + 1/62 ≈ 0.03226
+        // id(1): 1/61 ≈ 0.01639
+        // id(4): 1/61 ≈ 0.01639
+        let pos_id2 = result.iter().position(|(uid, _)| *uid == id(2)).unwrap();
+        let pos_id1 = result.iter().position(|(uid, _)| *uid == id(1)).unwrap();
+        assert!(pos_id2 < pos_id1, "consensus item (id2) should rank above id1");
+    }
+
+    #[test]
+    fn test_weighted_rrf() {
+        // First list has weight=2.0, second has weight=1.0.
+        // id(1) is #1 in list_a (heavy), id(2) is #1 in list_b (light).
+        // id(1) should outscore id(2).
+        let list_a = vec![(id(1), 1.0_f32), (id(3), 0.5)];
+        let list_b = vec![(id(2), 1.0_f32), (id(3), 0.5)];
+
+        let result = reciprocal_rank_fusion(&[list_a, list_b], &[2.0, 1.0], 60);
+
+        // id(1): 2.0/61 ≈ 0.03279
+        // id(2): 1.0/61 ≈ 0.01639
+        // id(3): 2.0/62 + 1.0/62 ≈ 0.04839 — actually wins due to both lists
+        let pos_id1 = result.iter().position(|(uid, _)| *uid == id(1)).unwrap();
+        let pos_id2 = result.iter().position(|(uid, _)| *uid == id(2)).unwrap();
+        assert!(
+            pos_id1 < pos_id2,
+            "weighted list_a's #1 (id1) should beat list_b's #1 (id2)"
+        );
+    }
+
+    #[test]
+    fn test_empty_rankings() {
+        let result = reciprocal_rank_fusion(&[], &[], 60);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_k_parameter_sensitivity() {
+        // With low k, rank differences are more pronounced (wider spread between scores).
+        // With high k, scores are compressed closer together.
+        // Verify by comparing the score spread for the same two items under different k values.
+        let ranking = vec![(id(1), 1.0_f32), (id(2), 0.5)];
+
+        let result_low_k = reciprocal_rank_fusion(&[ranking.clone()], &[1.0], 1);
+        let result_high_k = reciprocal_rank_fusion(&[ranking], &[1.0], 1000);
+
+        let spread_low = result_low_k[0].1 - result_low_k[1].1;
+        let spread_high = result_high_k[0].1 - result_high_k[1].1;
+
+        assert!(
+            spread_low > spread_high,
+            "lower k should produce wider score spread: low_k spread={spread_low}, high_k spread={spread_high}"
+        );
+
+        // Order is preserved regardless of k
+        assert_eq!(result_low_k[0].0, id(1), "id1 should be first under low k");
+        assert_eq!(result_high_k[0].0, id(1), "id1 should be first under high k");
+    }
+}
