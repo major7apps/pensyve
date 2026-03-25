@@ -1,4 +1,5 @@
 """Tests for PensyveClient and AsyncPensyveClient using httpx mock transport."""
+
 from __future__ import annotations
 
 import json
@@ -11,6 +12,7 @@ from pensyve.client import AsyncPensyveClient, PensyveClient
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def make_client(handler) -> PensyveClient:
     """Create a sync client backed by a mock transport."""
@@ -41,6 +43,7 @@ def json_response(data, status_code: int = 200) -> httpx.Response:
 # ---------------------------------------------------------------------------
 # Sync client tests
 # ---------------------------------------------------------------------------
+
 
 class TestPensyveClientRecall:
     def test_recall_returns_memories(self):
@@ -79,15 +82,17 @@ class TestPensyveClientRecall:
 class TestPensyveClientRemember:
     def test_remember_returns_memory(self):
         def handler(request):
-            return json_response({
-                "id": "mem-1",
-                "content": "Prefers dark mode",
-                "memory_type": "semantic",
-                "confidence": 0.8,
-                "stability": 1.0,
-                "score": None,
-                "extraction_tier": 1,
-            })
+            return json_response(
+                {
+                    "id": "mem-1",
+                    "content": "Prefers dark mode",
+                    "memory_type": "semantic",
+                    "confidence": 0.8,
+                    "stability": 1.0,
+                    "score": None,
+                    "extraction_tier": 1,
+                }
+            )
 
         client = make_client(handler)
         result = client.remember("alice", "Prefers dark mode")
@@ -99,10 +104,17 @@ class TestPensyveClientRemember:
 
         def handler(request):
             captured["body"] = json.loads(request.content)
-            return json_response({
-                "id": "x", "content": "fact", "memory_type": "semantic",
-                "confidence": 0.9, "stability": 1.0, "score": None, "extraction_tier": 1,
-            })
+            return json_response(
+                {
+                    "id": "x",
+                    "content": "fact",
+                    "memory_type": "semantic",
+                    "confidence": 0.9,
+                    "stability": 1.0,
+                    "score": None,
+                    "extraction_tier": 1,
+                }
+            )
 
         client = make_client(handler)
         client.remember("bob", "likes Python", confidence=0.9)
@@ -157,13 +169,15 @@ class TestPensyveClientEntity:
 class TestPensyveClientInspect:
     def test_inspect_returns_grouped_memories(self):
         def handler(request):
-            return json_response({
-                "entity": "alice",
-                "episodic": [],
-                "semantic": [],
-                "procedural": [],
-                "cursor": None,
-            })
+            return json_response(
+                {
+                    "entity": "alice",
+                    "episodic": [],
+                    "semantic": [],
+                    "procedural": [],
+                    "cursor": None,
+                }
+            )
 
         client = make_client(handler)
         result = client.inspect("alice")
@@ -175,10 +189,15 @@ class TestPensyveClientInspect:
 
         def handler(request):
             captured["body"] = json.loads(request.content)
-            return json_response({
-                "entity": "alice", "episodic": [], "semantic": [],
-                "procedural": [], "cursor": None,
-            })
+            return json_response(
+                {
+                    "entity": "alice",
+                    "episodic": [],
+                    "semantic": [],
+                    "procedural": [],
+                    "cursor": None,
+                }
+            )
 
         client = make_client(handler)
         client.inspect("alice", cursor="abc123")
@@ -221,13 +240,15 @@ class TestPensyveClientFeedback:
 class TestPensyveClientStats:
     def test_stats_returns_counts(self):
         def handler(request):
-            return json_response({
-                "namespace": "default",
-                "entities": 3,
-                "episodic_memories": 10,
-                "semantic_memories": 5,
-                "procedural_memories": 2,
-            })
+            return json_response(
+                {
+                    "namespace": "default",
+                    "entities": 3,
+                    "episodic_memories": 10,
+                    "semantic_memories": 5,
+                    "procedural_memories": 2,
+                }
+            )
 
         client = make_client(handler)
         result = client.stats()
@@ -238,9 +259,9 @@ class TestPensyveClientStats:
 class TestPensyveClientActivity:
     def test_activity_returns_list(self):
         def handler(request):
-            return json_response([
-                {"date": "2026-03-22", "recalls": 4, "remembers": 2, "forgets": 0}
-            ])
+            return json_response(
+                [{"date": "2026-03-22", "recalls": 4, "remembers": 2, "forgets": 0}]
+            )
 
         client = make_client(handler)
         result = client.activity(days=7)
@@ -249,9 +270,16 @@ class TestPensyveClientActivity:
 
     def test_recent_activity_returns_list(self):
         def handler(request):
-            return json_response([
-                {"id": "evt-1", "type": "recall", "content": "query", "timestamp": "2026-03-22T10:00:00"}
-            ])
+            return json_response(
+                [
+                    {
+                        "id": "evt-1",
+                        "type": "recall",
+                        "content": "query",
+                        "timestamp": "2026-03-22T10:00:00",
+                    }
+                ]
+            )
 
         client = make_client(handler)
         result = client.recent_activity(limit=5)
@@ -262,12 +290,14 @@ class TestPensyveClientActivity:
 class TestPensyveClientUsage:
     def test_usage_returns_counts(self):
         def handler(request):
-            return json_response({
-                "namespace": "default",
-                "api_calls": 100,
-                "recalls": 50,
-                "memories_stored": 30,
-            })
+            return json_response(
+                {
+                    "namespace": "default",
+                    "api_calls": 100,
+                    "recalls": 50,
+                    "memories_stored": 30,
+                }
+            )
 
         client = make_client(handler)
         result = client.usage()
@@ -277,12 +307,14 @@ class TestPensyveClientUsage:
 class TestPensyveClientHealth:
     def test_health_returns_status(self):
         def handler(request):
-            return json_response({
-                "status": "ok",
-                "version": "0.1.0",
-                "embedding_model": "minilm",
-                "embedding_dims": 384,
-            })
+            return json_response(
+                {
+                    "status": "ok",
+                    "version": "0.1.0",
+                    "embedding_model": "minilm",
+                    "embedding_dims": 384,
+                }
+            )
 
         client = make_client(handler)
         result = client.health()
@@ -292,13 +324,15 @@ class TestPensyveClientHealth:
 class TestPensyveClientGdpr:
     def test_gdpr_erase_returns_counts(self):
         def handler(request):
-            return json_response({
-                "memories_deleted": 15,
-                "edges_deleted": 0,
-                "entities_deleted": 1,
-                "complete": True,
-                "warnings": [],
-            })
+            return json_response(
+                {
+                    "memories_deleted": 15,
+                    "edges_deleted": 0,
+                    "entities_deleted": 1,
+                    "complete": True,
+                    "warnings": [],
+                }
+            )
 
         client = make_client(handler)
         result = client.gdpr_erase("alice")
@@ -308,12 +342,14 @@ class TestPensyveClientGdpr:
 
 class TestPensyveClientEpisode:
     def test_episode_lifecycle(self):
-        responses = iter([
-            {"episode_id": "ep-abc"},
-            {"status": "ok"},
-            {"status": "ok"},
-            {"memories_created": 2},
-        ])
+        responses = iter(
+            [
+                {"episode_id": "ep-abc"},
+                {"status": "ok"},
+                {"status": "ok"},
+                {"memories_created": 2},
+            ]
+        )
 
         def handler(request):
             return json_response(next(responses))
@@ -339,8 +375,9 @@ class TestPensyveClientAuth:
 
         def handler(request):
             captured["key"] = request.headers.get("x-pensyve-key")
-            return json_response({"status": "ok", "version": "0.1.0",
-                                  "embedding_model": "m", "embedding_dims": 0})
+            return json_response(
+                {"status": "ok", "version": "0.1.0", "embedding_model": "m", "embedding_dims": 0}
+            )
 
         client = PensyveClient.__new__(PensyveClient)
         client._client = httpx.Client(
@@ -356,8 +393,9 @@ class TestPensyveClientAuth:
 class TestPensyveClientContextManager:
     def test_context_manager(self):
         def handler(request):
-            return json_response({"status": "ok", "version": "0.1.0",
-                                  "embedding_model": "m", "embedding_dims": 0})
+            return json_response(
+                {"status": "ok", "version": "0.1.0", "embedding_model": "m", "embedding_dims": 0}
+            )
 
         with PensyveClient.__new__(PensyveClient) as client:
             client._client = httpx.Client(
@@ -372,6 +410,7 @@ class TestPensyveClientContextManager:
 # ---------------------------------------------------------------------------
 # Async client tests
 # ---------------------------------------------------------------------------
+
 
 class TestAsyncPensyveClientRecall:
     @pytest.mark.asyncio
@@ -400,10 +439,17 @@ class TestAsyncPensyveClientRemember:
     @pytest.mark.asyncio
     async def test_remember_returns_memory(self):
         def handler(request):
-            return json_response({
-                "id": "m1", "content": "fact", "memory_type": "semantic",
-                "confidence": 0.8, "stability": 1.0, "score": None, "extraction_tier": 1,
-            })
+            return json_response(
+                {
+                    "id": "m1",
+                    "content": "fact",
+                    "memory_type": "semantic",
+                    "confidence": 0.8,
+                    "stability": 1.0,
+                    "score": None,
+                    "extraction_tier": 1,
+                }
+            )
 
         client = make_async_client(handler)
         result = await client.remember("alice", "fact")
@@ -436,10 +482,15 @@ class TestAsyncPensyveClientInspect:
     @pytest.mark.asyncio
     async def test_inspect_returns_grouped(self):
         def handler(request):
-            return json_response({
-                "entity": "alice", "episodic": [], "semantic": [],
-                "procedural": [], "cursor": None,
-            })
+            return json_response(
+                {
+                    "entity": "alice",
+                    "episodic": [],
+                    "semantic": [],
+                    "procedural": [],
+                    "cursor": None,
+                }
+            )
 
         client = make_async_client(handler)
         result = await client.inspect("alice")
@@ -472,10 +523,15 @@ class TestAsyncPensyveClientStats:
     @pytest.mark.asyncio
     async def test_stats_returns_data(self):
         def handler(request):
-            return json_response({
-                "namespace": "ns", "entities": 0,
-                "episodic_memories": 1, "semantic_memories": 2, "procedural_memories": 0,
-            })
+            return json_response(
+                {
+                    "namespace": "ns",
+                    "entities": 0,
+                    "episodic_memories": 1,
+                    "semantic_memories": 2,
+                    "procedural_memories": 0,
+                }
+            )
 
         client = make_async_client(handler)
         result = await client.stats()
@@ -486,7 +542,9 @@ class TestAsyncPensyveClientActivity:
     @pytest.mark.asyncio
     async def test_activity_returns_list(self):
         def handler(request):
-            return json_response([{"date": "2026-03-22", "recalls": 1, "remembers": 0, "forgets": 0}])
+            return json_response(
+                [{"date": "2026-03-22", "recalls": 1, "remembers": 0, "forgets": 0}]
+            )
 
         client = make_async_client(handler)
         result = await client.activity(days=14)
@@ -495,9 +553,9 @@ class TestAsyncPensyveClientActivity:
     @pytest.mark.asyncio
     async def test_recent_activity_returns_list(self):
         def handler(request):
-            return json_response([
-                {"id": "e1", "type": "recall", "content": "q", "timestamp": "2026-03-22T00:00:00"}
-            ])
+            return json_response(
+                [{"id": "e1", "type": "recall", "content": "q", "timestamp": "2026-03-22T00:00:00"}]
+            )
 
         client = make_async_client(handler)
         result = await client.recent_activity(limit=3)
@@ -508,9 +566,14 @@ class TestAsyncPensyveClientUsage:
     @pytest.mark.asyncio
     async def test_usage_returns_counts(self):
         def handler(request):
-            return json_response({
-                "namespace": "default", "api_calls": 10, "recalls": 5, "memories_stored": 3,
-            })
+            return json_response(
+                {
+                    "namespace": "default",
+                    "api_calls": 10,
+                    "recalls": 5,
+                    "memories_stored": 3,
+                }
+            )
 
         client = make_async_client(handler)
         result = await client.usage()
@@ -521,8 +584,9 @@ class TestAsyncPensyveClientHealth:
     @pytest.mark.asyncio
     async def test_health_returns_ok(self):
         def handler(request):
-            return json_response({"status": "ok", "version": "0.1.0",
-                                  "embedding_model": "m", "embedding_dims": 384})
+            return json_response(
+                {"status": "ok", "version": "0.1.0", "embedding_model": "m", "embedding_dims": 384}
+            )
 
         client = make_async_client(handler)
         result = await client.health()
@@ -533,10 +597,15 @@ class TestAsyncPensyveClientGdpr:
     @pytest.mark.asyncio
     async def test_gdpr_erase_returns_counts(self):
         def handler(request):
-            return json_response({
-                "memories_deleted": 7, "edges_deleted": 0,
-                "entities_deleted": 1, "complete": True, "warnings": [],
-            })
+            return json_response(
+                {
+                    "memories_deleted": 7,
+                    "edges_deleted": 0,
+                    "entities_deleted": 1,
+                    "complete": True,
+                    "warnings": [],
+                }
+            )
 
         client = make_async_client(handler)
         result = await client.gdpr_erase("alice")
@@ -546,11 +615,13 @@ class TestAsyncPensyveClientGdpr:
 class TestAsyncPensyveClientEpisode:
     @pytest.mark.asyncio
     async def test_episode_lifecycle(self):
-        responses = iter([
-            {"episode_id": "ep-xyz"},
-            {"status": "ok"},
-            {"memories_created": 1},
-        ])
+        responses = iter(
+            [
+                {"episode_id": "ep-xyz"},
+                {"status": "ok"},
+                {"memories_created": 1},
+            ]
+        )
 
         def handler(request):
             return json_response(next(responses))
@@ -570,8 +641,9 @@ class TestAsyncPensyveClientContextManager:
     @pytest.mark.asyncio
     async def test_async_context_manager(self):
         def handler(request):
-            return json_response({"status": "ok", "version": "0.1.0",
-                                  "embedding_model": "m", "embedding_dims": 0})
+            return json_response(
+                {"status": "ok", "version": "0.1.0", "embedding_model": "m", "embedding_dims": 0}
+            )
 
         async with AsyncPensyveClient.__new__(AsyncPensyveClient) as client:
             client._client = httpx.AsyncClient(

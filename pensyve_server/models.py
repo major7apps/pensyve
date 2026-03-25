@@ -1,4 +1,5 @@
 """Pydantic request and response models for the Pensyve API."""
+
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field

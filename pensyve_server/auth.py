@@ -1,4 +1,5 @@
 """API key authentication for the Pensyve REST API."""
+
 import hmac
 import os
 import sys
@@ -18,7 +19,9 @@ AUTH_BYPASS_PATHS = {"/v1/health", "/metrics"}
 def validate_auth_config() -> None:
     """Validate auth configuration at startup. Exits if mode=required and no keys set."""
     if AUTH_MODE == "disabled":
-        logger.warning("auth_disabled", message="Authentication is disabled via PENSYVE_AUTH_MODE=disabled")
+        logger.warning(
+            "auth_disabled", message="Authentication is disabled via PENSYVE_AUTH_MODE=disabled"
+        )
         return
     if AUTH_MODE == "required" and not PENSYVE_API_KEYS.strip():
         print(

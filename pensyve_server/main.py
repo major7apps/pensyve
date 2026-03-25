@@ -1,4 +1,5 @@
 """Pensyve REST API server — FastAPI application with memory operations."""
+
 import asyncio
 import os
 import threading
@@ -103,6 +104,7 @@ async def pensyve_error_handler(request: Request, exc: PensyveError) -> JSONResp
             detail=exc.detail,
         ).model_dump(),
     )
+
 
 _allowed_origins = os.environ.get("PENSYVE_CORS_ORIGINS", "http://localhost:3000").split(",")
 
