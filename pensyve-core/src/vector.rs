@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use uuid::Uuid;
 
 use crate::embedding::cosine_similarity;
@@ -20,20 +22,20 @@ pub enum VectorError {
 // VectorIndex
 // ---------------------------------------------------------------------------
 
-/// Brute-force UUID-keyed vector index backed by a Vec.
+/// Brute-force UUID-keyed vector index backed by a HashMap.
 /// Suitable for Phase 1 where memory counts stay below ~100K entries.
-/// Similarity search is O(n) via cosine similarity.
+/// Similarity search is O(n) via cosine similarity; removal is O(1).
 pub struct VectorIndex {
-    entries: Vec<(Uuid, Vec<f32>)>,
+    entries: HashMap<Uuid, Vec<f32>>,
     dimensions: usize,
 }
 
 impl VectorIndex {
     /// Create a new index with the given embedding dimensionality.
-    /// `capacity` is used as an initial allocation hint.
-    pub fn new(dimensions: usize, capacity: usize) -> Self {
+    /// `_capacity_hint` is accepted for API compatibility but not used internally.
+    pub fn new(dimensions: usize, _capacity_hint: usize) -> Self {
         Self {
-            entries: Vec::with_capacity(capacity),
+            entries: HashMap::new(),
             dimensions,
         }
     }
@@ -47,12 +49,7 @@ impl VectorIndex {
             });
         }
 
-        // Replace if already present.
-        if let Some(entry) = self.entries.iter_mut().find(|(eid, _)| *eid == id) {
-            entry.1 = embedding.to_vec();
-        } else {
-            self.entries.push((id, embedding.to_vec()));
-        }
+        self.entries.insert(id, embedding.to_vec());
 
         Ok(())
     }
@@ -82,8 +79,7 @@ impl VectorIndex {
 
     /// Remove the entry for `id`. Returns `NotFound` if `id` is absent.
     pub fn remove(&mut self, id: Uuid) -> Result<(), VectorError> {
-        if let Some(pos) = self.entries.iter().position(|(eid, _)| *eid == id) {
-            self.entries.swap_remove(pos);
+        if self.entries.remove(&id).is_some() {
             Ok(())
         } else {
             Err(VectorError::NotFound(id))
@@ -200,5 +196,40 @@ mod tests {
         assert!(!index.is_empty());
         index.remove(id).unwrap();
         assert!(index.is_empty());
+    }
+
+    #[test]
+    fn test_hnsw_search_finds_nearest() {
+        let mut index = VectorIndex::new(3, 10);
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let id3 = Uuid::new_v4();
+
+        index.add(id1, &[1.0, 0.0, 0.0]).unwrap(); // closest to query [1,0,0]
+        index.add(id2, &[0.0, 1.0, 0.0]).unwrap(); // orthogonal
+        index.add(id3, &[0.5, 0.5, 0.0]).unwrap(); // second closest
+
+        let results = index.search(&[1.0, 0.0, 0.0], 3).unwrap();
+        assert_eq!(results[0].0, id1);
+        assert_eq!(results[1].0, id3);
+    }
+
+    #[test]
+    fn test_hnsw_remove() {
+        let mut index = VectorIndex::new(3, 10);
+        let id = Uuid::new_v4();
+        index.add(id, &[1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(index.len(), 1);
+        index.remove(id).unwrap();
+        assert_eq!(index.len(), 0);
+    }
+
+    #[test]
+    fn test_hnsw_handles_large_k() {
+        let mut index = VectorIndex::new(3, 10);
+        let id = Uuid::new_v4();
+        index.add(id, &[1.0, 0.0, 0.0]).unwrap();
+        let results = index.search(&[1.0, 0.0, 0.0], 100).unwrap();
+        assert_eq!(results.len(), 1);
     }
 }
