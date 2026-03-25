@@ -91,6 +91,20 @@ impl SqliteBackend {
             );",
         )?;
 
+        // Migration v2: add new columns for cognitive activation model.
+        // Each statement is attempted and duplicate-column errors are silently ignored.
+        for stmt in &[
+            "ALTER TABLE episodic_memories ADD COLUMN salience REAL DEFAULT 0.5",
+            "ALTER TABLE episodic_memories ADD COLUMN storage_strength REAL DEFAULT 0.0",
+            "ALTER TABLE episodic_memories ADD COLUMN event_time REAL",
+            "ALTER TABLE episodic_memories ADD COLUMN superseded_by TEXT",
+            "ALTER TABLE edges ADD COLUMN edge_type TEXT DEFAULT 'ENTITY'",
+            "ALTER TABLE edges ADD COLUMN confidence REAL DEFAULT 1.0",
+            "ALTER TABLE edges ADD COLUMN half_life_days REAL DEFAULT 90.0",
+        ] {
+            let _ = conn.execute(stmt, []);
+        }
+
         Ok(())
     }
 
@@ -104,6 +118,29 @@ impl SqliteBackend {
             }
         }
         Ok(false)
+    }
+
+    /// Record a memory access timestamp for ACT-R activation tracking.
+    pub fn record_access(&self, memory_id: &str, timestamp: f64) -> Result<(), StorageError> {
+        let conn = lock_conn!(self);
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_accesses (memory_id, accessed_at) VALUES (?1, ?2)",
+            rusqlite::params![memory_id, timestamp],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve the most recent access timestamps for a memory, newest first.
+    pub fn get_access_times(&self, memory_id: &str, limit: usize) -> Result<Vec<f64>, StorageError> {
+        let conn = lock_conn!(self);
+        let mut stmt = conn.prepare(
+            "SELECT accessed_at FROM memory_accesses WHERE memory_id = ?1 ORDER BY accessed_at DESC LIMIT ?2"
+        )?;
+        let times: Vec<f64> = stmt
+            .query_map(rusqlite::params![memory_id, limit as i64], |row| row.get(0))?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(times)
     }
 }
 
@@ -218,6 +255,13 @@ CREATE TABLE IF NOT EXISTS activity_events (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 CREATE INDEX IF NOT EXISTS idx_activity_created ON activity_events(created_at);
+
+CREATE TABLE IF NOT EXISTS memory_accesses (
+    memory_id TEXT NOT NULL,
+    accessed_at REAL NOT NULL,
+    PRIMARY KEY (memory_id, accessed_at)
+);
+CREATE INDEX IF NOT EXISTS idx_accesses_memory ON memory_accesses(memory_id);
 ";
 
 // ---------------------------------------------------------------------------
