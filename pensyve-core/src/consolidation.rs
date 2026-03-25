@@ -285,6 +285,88 @@ impl ConsolidationEngine {
 }
 
 // ---------------------------------------------------------------------------
+// Task 15: Conflict Detection
+// ---------------------------------------------------------------------------
+
+/// Detect existing memories superseded by a new memory.
+/// Returns indices where cosine similarity exceeds threshold.
+pub fn detect_superseded(
+    existing: &[(&str, Vec<f32>)],
+    new_embedding: &[f32],
+    threshold: f32,
+) -> Vec<usize> {
+    existing
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, emb))| cosine_similarity(new_embedding, emb) > threshold)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Task 16: Graduated Forgetting
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForgettingAction {
+    Keep,
+    Compress,
+    Archive,
+}
+
+pub fn retention_score(age_days: f32, access_count: u32, salience: f32, is_superseded: bool) -> f32 {
+    let age_factor = (-age_days / 30.0).exp();
+    let access_factor = ((access_count as f32 + 1.0).ln() / 5.0).min(1.0);
+    let superseded_penalty = if is_superseded { -0.3 } else { 0.0 };
+    let raw = 0.3 * age_factor + 0.3 * access_factor + 0.2 * salience + 0.2 + superseded_penalty;
+    raw.clamp(0.0, 1.0)
+}
+
+pub fn forgetting_tier(retention: f32) -> ForgettingAction {
+    if retention >= 0.7 {
+        ForgettingAction::Keep
+    } else if retention >= 0.3 {
+        ForgettingAction::Compress
+    } else {
+        ForgettingAction::Archive
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 20: Temporal Context Vector
+// ---------------------------------------------------------------------------
+
+/// Drifting temporal context vector per session.
+/// c_new = ρ × c_old + (1 - ρ) × embedding
+pub struct TemporalContext {
+    context: Vec<f32>,
+    rho: f32,
+}
+
+impl TemporalContext {
+    pub fn new(dimensions: usize) -> Self {
+        Self { context: vec![0.0; dimensions], rho: 0.85 }
+    }
+
+    pub fn update(&mut self, embedding: &[f32]) {
+        for (c, &e) in self.context.iter_mut().zip(embedding.iter()) {
+            *c = self.rho * *c + (1.0 - self.rho) * e;
+        }
+    }
+
+    pub fn current(&self) -> &[f32] { &self.context }
+}
+
+// ---------------------------------------------------------------------------
+// Task 21: Prioritized Replay
+// ---------------------------------------------------------------------------
+
+pub fn replay_priority(salience: f32, retrievability: f32, is_superseded: bool) -> f32 {
+    if is_superseded { return 0.0; }
+    salience * (1.0 - retrievability)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -513,6 +595,79 @@ mod tests {
             stats.archived
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Task 15: Conflict detection tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_detect_superseded_memory() {
+        let existing = vec![("Alice works at Google", vec![0.9, 0.1, 0.0])];
+        let new_emb = vec![0.88, 0.12, 0.0];
+        let result = detect_superseded(&existing, &new_emb, 0.85);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_no_false_supersession() {
+        let existing = vec![("Bob likes pizza", vec![0.0, 1.0, 0.0])];
+        let new_emb = vec![1.0, 0.0, 0.0];
+        let result = detect_superseded(&existing, &new_emb, 0.85);
+        assert!(result.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 16: Graduated forgetting tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_retention_score_range() {
+        let high = retention_score(1.0, 100, 0.9, false);
+        let low = retention_score(30.0, 1, 0.1, true);
+        assert!(high > 0.7);
+        assert!(low < 0.3);
+    }
+
+    #[test]
+    fn test_forgetting_tiers() {
+        assert_eq!(forgetting_tier(0.8), ForgettingAction::Keep);
+        assert_eq!(forgetting_tier(0.5), ForgettingAction::Compress);
+        assert_eq!(forgetting_tier(0.2), ForgettingAction::Archive);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 20: Temporal context tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_temporal_context_drifts() {
+        let mut ctx = TemporalContext::new(3);
+        ctx.update(&[1.0, 0.0, 0.0]);
+        ctx.update(&[0.0, 1.0, 0.0]);
+        let v = ctx.current();
+        assert!(v[1] > v[0], "More recent input should dominate");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 21: Prioritized replay tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_replay_priority() {
+        let high = replay_priority(0.9, 0.1, false);
+        let low = replay_priority(0.1, 0.9, false);
+        assert!(high > low);
+    }
+
+    #[test]
+    fn test_superseded_gets_zero_priority() {
+        let p = replay_priority(0.9, 0.1, true);
+        assert!(p < 0.01);
+    }
+
+    // -----------------------------------------------------------------------
+    // Existing engine tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_consolidation_result_default() {

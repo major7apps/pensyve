@@ -63,6 +63,18 @@ pub fn update_difficulty(difficulty: u8, success: bool) -> u8 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Task 19: Dual-Strength Model
+// ---------------------------------------------------------------------------
+
+pub fn increment_storage_strength(current: f32) -> f32 {
+    current + (1.0 + current).ln() + 0.1
+}
+
+pub fn should_archive(storage_strength: f32, retrievability: f32) -> bool {
+    storage_strength < 1.0 && retrievability < 0.1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +157,24 @@ mod tests {
     fn test_dynamic_difficulty_on_failure() {
         assert_eq!(update_difficulty(5, false), 7);
         assert_eq!(update_difficulty(9, false), 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 19: Dual-Strength Model tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_storage_strength_increases_monotonically() {
+        let s0 = 0.0_f32;
+        let s1 = increment_storage_strength(s0);
+        let s2 = increment_storage_strength(s1);
+        assert!(s2 > s1);
+        assert!(s1 > s0);
+    }
+
+    #[test]
+    fn test_should_archive_requires_both_low() {
+        assert!(!should_archive(5.0, 0.05)); // high storage, low retrieval → keep
+        assert!(should_archive(0.1, 0.05));  // low both → archive
     }
 }
