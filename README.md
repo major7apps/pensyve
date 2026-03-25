@@ -119,7 +119,7 @@ pensyve-plugin/
 └── 4 hooks            SessionStart, Stop, PreCompact, UserPromptSubmit
 ```
 
-See [`pensyve-plugin/README.md`](pensyve-plugin/README.md) for details.
+See [`integrations/claude-code/README.md`](integrations/claude-code/README.md) for details.
 
 ### REST API
 
@@ -222,10 +222,21 @@ pensyve/
 ├── pensyve-ts/         TypeScript SDK (bun) — timeout, retry, PensyveError
 ├── pensyve-go/         Go SDK — context-aware HTTP client
 ├── pensyve-wasm/       WASM build — standalone minimal in-memory Pensyve
-├── pensyve-vscode/     VS Code extension — sidebar, commands, status bar
-├── pensyve-plugin/     Claude Code plugin — commands, skills, agents, hooks
 ├── pensyve_server/     FastAPI REST API — auth, pagination, metrics, billing, Tier 2 extraction
-├── integrations/       Framework adapters (LangChain Python/TS, CrewAI, OpenClaw plugin, Autogen)
+├── integrations/       All integrations — IDE plugins, framework adapters, code harnesses
+│   ├── claude-code/    Claude Code plugin (commands, skills, agents, hooks)
+│   ├── vscode/         VS Code sidebar extension
+│   ├── openclaw-plugin/ OpenClaw native memory plugin (TypeScript)
+│   ├── opencode-plugin/ OpenCode native memory plugin (TypeScript)
+│   ├── cursor/         Cursor MCP setup guide
+│   ├── cline/          Cline MCP setup guide
+│   ├── windsurf/       Windsurf MCP setup guide
+│   ├── continue/       Continue MCP setup guide
+│   ├── vscode-copilot/ VS Code Copilot Chat MCP setup guide
+│   ├── langchain/      LangChain/LangGraph Python (PensyveStore + legacy PensyveMemory)
+│   ├── langchain-ts/   LangChain.js/LangGraph.js TypeScript (PensyveStore)
+│   ├── crewai/         CrewAI (PensyveStorage + standalone PensyveCrewMemory)
+│   └── autogen/        Microsoft AutoGen multi-agent memory
 ├── tests/python/       Python integration tests
 ├── benchmarks/         LongMemEval_S evaluation + weight tuning
 ├── website/            Astro + Tailwind static site for pensyve.com

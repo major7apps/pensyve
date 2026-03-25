@@ -2,30 +2,20 @@
  * @pensyve/langchain — Pensyve memory store for LangChain.js / LangGraph.js
  *
  * Implements the LangGraph BaseStore interface (put/get/search/delete)
- * backed by Pensyve's REST API with 8-signal fusion retrieval.
+ * backed by Pensyve. Supports both local and cloud backends.
  *
  * Usage:
  *   import { PensyveStore } from "@pensyve/langchain";
- *   const store = new PensyveStore({ baseUrl: "http://localhost:8000" });
- *
- *   // Use with LangGraph
+ *   const store = new PensyveStore(); // auto-detects local vs cloud
  *   const graph = builder.compile({ store });
- *
- *   // Or standalone
- *   await store.put(["user", "prefs"], "lang", { data: "Prefers TypeScript" });
- *   const results = await store.search(["user", "prefs"], { query: "programming" });
  */
 
-export interface PensyveStoreConfig {
-  /** Pensyve API base URL. Default: http://localhost:8000 */
-  baseUrl?: string;
-  /** API key for authenticated deployments. */
-  apiKey?: string;
-  /** Default entity name. Default: "langchain-agent" */
-  entity?: string;
-  /** Pensyve namespace for isolation. Default: "langchain" */
-  namespace?: string;
-}
+import {
+  PensyveClient,
+  resolveConfig,
+  type PensyveConfig,
+  type Memory,
+} from "../../shared/pensyve-client";
 
 export interface StoreItem {
   namespace: string[];
@@ -36,86 +26,53 @@ export interface StoreItem {
   score?: number;
 }
 
-interface Memory {
-  type: string;
-  content: string;
-  confidence: number;
-  score: number;
-}
-
 /**
- * LangGraph BaseStore-compatible memory backend using Pensyve's REST API.
- *
- * Implements put/get/search/delete with the same interface as LangGraph's
- * InMemoryStore and PostgresStore.
+ * LangGraph BaseStore-compatible memory backend.
+ * Supports local Pensyve server and Pensyve Cloud.
  */
 export class PensyveStore {
-  private baseUrl: string;
-  private headers: Record<string, string>;
+  private client: PensyveClient;
   private defaultEntity: string;
 
-  constructor(config: PensyveStoreConfig = {}) {
-    this.baseUrl = (config.baseUrl ?? "http://localhost:8000").replace(
-      /\/$/,
-      ""
-    );
-    this.defaultEntity = config.entity ?? "langchain-agent";
-    this.headers = { "Content-Type": "application/json" };
-    if (config.apiKey) {
-      this.headers["Authorization"] = `Bearer ${config.apiKey}`;
-    }
+  constructor(config: Partial<PensyveConfig> = {}) {
+    const cfg = resolveConfig(config);
+    this.client = new PensyveClient(cfg);
+    this.defaultEntity = cfg.entity;
   }
 
-  /**
-   * Map a LangGraph namespace array to a Pensyve entity name.
-   */
+  /** Whether the store is connected to Pensyve Cloud. */
+  get isCloud(): boolean {
+    return this.client.isCloud;
+  }
+
   private entityForNamespace(namespace: string[]): string {
     return namespace.length > 0 ? namespace.join("_") : this.defaultEntity;
   }
 
-  /**
-   * Store a document.
-   */
   async put(
     namespace: string[],
     key: string,
     value: Record<string, unknown>
   ): Promise<void> {
-    const entity = this.entityForNamespace(namespace);
     const content = (value.data as string) ?? JSON.stringify(value);
-    await fetch(`${this.baseUrl}/v1/remember`, {
-      method: "POST",
-      headers: this.headers,
-      body: JSON.stringify({
-        entity,
-        fact: `[${key}] ${content}`,
-        confidence: 0.85,
-      }),
-    });
+    // Temporarily override entity for this namespace
+    const origEntity = (this.client as any).entity;
+    (this.client as any).entity = this.entityForNamespace(namespace);
+    await this.client.remember(`[${key}] ${content}`, 0.85);
+    (this.client as any).entity = origEntity;
   }
 
-  /**
-   * Retrieve a specific item by namespace and key.
-   */
   async get(namespace: string[], key: string): Promise<StoreItem | null> {
-    const entity = this.entityForNamespace(namespace);
-    const res = await fetch(`${this.baseUrl}/v1/recall`, {
-      method: "POST",
-      headers: this.headers,
-      body: JSON.stringify({ query: `[${key}]`, entity, limit: 1 }),
-    });
-    if (!res.ok) return null;
+    const origEntity = (this.client as any).entity;
+    (this.client as any).entity = this.entityForNamespace(namespace);
+    const results = await this.client.recall(`[${key}]`, 1);
+    (this.client as any).entity = origEntity;
 
-    const data = await res.json();
-    const memories: Memory[] = data.memories ?? data.results ?? [];
-    if (!memories.length) return null;
-
-    const mem = memories[0];
+    if (!results.length) return null;
+    const mem = results[0];
     let content = mem.content;
     const prefix = `[${key}] `;
-    if (content.startsWith(prefix)) {
-      content = content.slice(prefix.length);
-    }
+    if (content.startsWith(prefix)) content = content.slice(prefix.length);
 
     return {
       namespace,
@@ -127,34 +84,17 @@ export class PensyveStore {
     };
   }
 
-  /**
-   * Search for items in a namespace.
-   */
   async search(
     namespace: string[],
-    options: {
-      query?: string;
-      filter?: Record<string, unknown>;
-      limit?: number;
-    } = {}
+    options: { query?: string; filter?: Record<string, unknown>; limit?: number } = {}
   ): Promise<StoreItem[]> {
-    const entity = this.entityForNamespace(namespace);
-    const res = await fetch(`${this.baseUrl}/v1/recall`, {
-      method: "POST",
-      headers: this.headers,
-      body: JSON.stringify({
-        query: options.query ?? "",
-        entity,
-        limit: options.limit ?? 10,
-      }),
-    });
-    if (!res.ok) return [];
+    const origEntity = (this.client as any).entity;
+    (this.client as any).entity = this.entityForNamespace(namespace);
+    const results = await this.client.recall(options.query ?? "", options.limit ?? 10);
+    (this.client as any).entity = origEntity;
 
-    const data = await res.json();
-    const memories: Memory[] = data.memories ?? data.results ?? [];
     const now = Date.now();
-
-    let items: StoreItem[] = memories.map((m) => ({
+    let items: StoreItem[] = results.map((m: Memory) => ({
       namespace,
       key: m.content.slice(0, 32),
       value: { data: m.content },
@@ -169,18 +109,23 @@ export class PensyveStore {
         Object.entries(filter).every(([k, v]) => item.value[k] === v)
       );
     }
-
     return items;
   }
 
-  /**
-   * Delete all memories for a namespace.
-   */
   async delete(namespace: string[], _key: string): Promise<void> {
-    const entity = this.entityForNamespace(namespace);
-    await fetch(`${this.baseUrl}/v1/entities/${entity}`, {
-      method: "DELETE",
-      headers: this.headers,
-    });
+    const origEntity = (this.client as any).entity;
+    (this.client as any).entity = this.entityForNamespace(namespace);
+    await this.client.forget();
+    (this.client as any).entity = origEntity;
+  }
+
+  /** Get connection status and memory counts. */
+  async status() {
+    return this.client.status();
+  }
+
+  /** Get cloud account info (null if local). */
+  async account() {
+    return this.client.account();
   }
 }
