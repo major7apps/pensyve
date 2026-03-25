@@ -5,6 +5,7 @@ members = [
     "pensyve-python",
     "pensyve-mcp",
     "pensyve-cli",
+    "pensyve-benchmarks",
 ]
 
 [workspace.lints.clippy]
