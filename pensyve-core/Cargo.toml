@@ -33,6 +33,11 @@ postgres = ["dep:sqlx-core", "dep:sqlx-postgres", "dep:tokio"]
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "cognitive_engine"
+harness = false
