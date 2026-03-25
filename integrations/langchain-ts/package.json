@@ -1,0 +1,23 @@
+{
+  "name": "@pensyve/langchain",
+  "version": "0.1.0",
+  "description": "Pensyve memory store for LangChain.js / LangGraph.js — BaseStore-compatible with semantic search",
+  "type": "module",
+  "main": "src/index.ts",
+  "license": "Apache-2.0",
+  "keywords": [
+    "langchain",
+    "langgraph",
+    "memory",
+    "pensyve",
+    "ai-agent",
+    "offline-first"
+  ],
+  "peerDependencies": {
+    "@langchain/langgraph": ">=0.2.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.1"
+  }
+}

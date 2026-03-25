@@ -1,6 +1,8 @@
-# Pensyve LangChain Integration
+# Pensyve LangChain / LangGraph Integration (Python)
 
-Drop-in Pensyve memory backend for LangChain and LangGraph agents.
+Pensyve memory backend for LangChain and LangGraph agents. Provides both the modern LangGraph `BaseStore` interface and the legacy `BaseMemory` interface.
+
+> **For TypeScript/JavaScript**, see [`../langchain-ts/`](../langchain-ts/).
 
 ## Installation
 
@@ -8,66 +10,73 @@ Drop-in Pensyve memory backend for LangChain and LangGraph agents.
 pip install pensyve
 ```
 
-Copy `pensyve_langchain.py` into your project, or add this directory to your Python path.
+## Quick Start (LangGraph — Recommended)
 
-## Quick Start
+LangChain deprecated `BaseMemory` in v0.3. The modern approach uses LangGraph's `BaseStore` with `put/get/search/delete`.
+
+```python
+from pensyve_langchain import PensyveStore
+
+store = PensyveStore(namespace="my-agent")
+
+# Store memories
+store.put(("user_123", "prefs"), "language", {"data": "Prefers Python"})
+store.put(("user_123", "prefs"), "style", {"data": "Likes concise answers"})
+
+# Search by semantic similarity
+results = store.search(("user_123", "prefs"), query="programming language")
+for item in results:
+    print(item.value["data"], f"(score: {item.score:.2f})")
+
+# Get by exact key
+item = store.get(("user_123", "prefs"), "language")
+print(item.value)  # {"data": "Prefers Python"}
+```
+
+### Usage with LangGraph
+
+```python
+from pensyve_langchain import PensyveStore
+from langgraph.prebuilt import create_react_agent
+from langchain_openai import ChatOpenAI
+
+store = PensyveStore(namespace="my-agent")
+model = ChatOpenAI()
+agent = create_react_agent(model, tools=[], store=store)
+```
+
+## Legacy Usage (BaseMemory — Deprecated in LangChain v0.3)
 
 ```python
 from pensyve_langchain import PensyveMemory
 
-# Create memory backend (replaces ConversationBufferMemory)
 memory = PensyveMemory(namespace="my-project")
-
-# Save conversation turns
 memory.save_context(
     {"input": "What is Pensyve?"},
     {"output": "Pensyve is a universal memory runtime for AI agents."}
 )
-
-# Load relevant memories for the next turn
-variables = memory.load_memory_variables({"input": "Tell me more about Pensyve"})
+variables = memory.load_memory_variables({"input": "Tell me more"})
 print(variables["history"])
-
-# Store explicit facts
-memory.remember("User prefers concise answers", confidence=0.9)
-
-# End the episode when the conversation is done
-memory.end_episode(outcome="success")
-
-# Run consolidation to promote repeated patterns
-memory.consolidate()
 ```
 
-## Usage with LangChain
+## API Reference
 
-```python
-from langchain.chains import ConversationChain
-from langchain_openai import ChatOpenAI
-from pensyve_langchain import PensyveMemory
-
-llm = ChatOpenAI()
-memory = PensyveMemory(namespace="chat-app")
-
-# PensyveMemory follows the same interface as ConversationBufferMemory
-chain = ConversationChain(llm=llm, memory=memory)
-chain.invoke({"input": "Hello!"})
-```
-
-## API
-
-### `PensyveMemory(namespace, path, entity_name)`
-
-- `namespace` (str): Pensyve namespace for isolation. Default: `"default"`.
-- `path` (str | None): Storage directory. Default: `~/.pensyve/default`.
-- `entity_name` (str): Name for the agent entity. Default: `"langchain-agent"`.
-
-### Methods
+### `PensyveStore` (LangGraph BaseStore pattern)
 
 | Method | Description |
 |--------|-------------|
-| `load_memory_variables(inputs)` | Recall memories relevant to the input query |
-| `save_context(inputs, outputs)` | Save a user/assistant turn to the current episode |
+| `put(namespace, key, value)` | Store a document |
+| `get(namespace, key)` | Retrieve by namespace + key |
+| `search(namespace, query?, filter?, limit?)` | Semantic search within namespace |
+| `delete(namespace, key)` | Delete memories for namespace |
+
+### `PensyveMemory` (Legacy BaseMemory pattern)
+
+| Method | Description |
+|--------|-------------|
+| `load_memory_variables(inputs)` | Recall memories relevant to input |
+| `save_context(inputs, outputs)` | Save a conversation turn |
 | `remember(fact, confidence)` | Store an explicit semantic memory |
-| `end_episode(outcome)` | Close the current episode with an outcome |
-| `clear()` | End the episode and forget entity memories |
+| `end_episode(outcome)` | Close the current episode |
+| `clear()` | End episode and forget memories |
 | `consolidate()` | Run memory decay and promotion |
