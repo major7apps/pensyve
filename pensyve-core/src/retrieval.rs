@@ -4,11 +4,13 @@ use chrono::Utc;
 use tracing::info;
 use uuid::Uuid;
 
+use crate::activation;
 use crate::config::RetrievalConfig;
 use crate::decay;
 use crate::embedding::OnnxEmbedder;
 use crate::graph::MemoryGraph;
 use crate::reranker::Reranker;
+use crate::rrf;
 use crate::storage::StorageTrait;
 use crate::types::Memory;
 use crate::vector::VectorIndex;
@@ -375,7 +377,122 @@ impl<'a> RecallEngine<'a> {
         // Classify query intent for intent-based scoring.
         let intent = classify_intent(query);
 
-        // Step 6: Scoring signals.
+        // Step 6–7: Build 6 independent rankings and merge via RRF.
+        let candidates_found = candidates.len();
+        let now = Utc::now();
+
+        // 1. Vector similarity ranking (already have scores from gather_candidates)
+        let mut ranking_vec: Vec<(Uuid, f32)> = vector_map
+            .iter()
+            .map(|(&id, &score)| (id, score))
+            .collect();
+        ranking_vec.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 2. BM25 ranking (from FTS results — already gathered)
+        let mut ranking_bm25: Vec<(Uuid, f32)> = bm25_map
+            .iter()
+            .map(|(&id, &score)| (id, score))
+            .collect();
+        ranking_bm25.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 3. Activation ranking (ACT-R base-level activation)
+        let mut ranking_activation: Vec<(Uuid, f32)> = candidates
+            .iter()
+            .map(|(&id, mem)| {
+                let b = match mem {
+                    Memory::Episodic(e) => {
+                        // Bootstrap access history from access_count + last_accessed
+                        let count = e.access_count.max(1);
+                        let last = e
+                            .last_accessed
+                            .unwrap_or(e.timestamp)
+                            .timestamp() as f64;
+                        let times: Vec<f64> = (0..count.min(20))
+                            .map(|i| last - (i as f64 * 3600.0))
+                            .collect();
+                        activation::base_level_activation(
+                            &times,
+                            now.timestamp() as f64,
+                            0.5,
+                        )
+                    }
+                    Memory::Semantic(_) => 0.0,
+                    Memory::Procedural(_) => 0.0,
+                };
+                (id, b)
+            })
+            .collect();
+        ranking_activation
+            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 4. Spreading activation / graph ranking
+        let ranking_spread: Vec<(Uuid, f32)> = match (self.graph, target_entity) {
+            (Some(g), Some(entity_id)) => {
+                let intent_str = match &intent {
+                    QueryIntent::Question => "question",
+                    QueryIntent::Action => "action",
+                    QueryIntent::Recall => "recall",
+                    QueryIntent::Code => "code",
+                    QueryIntent::Visual => "visual",
+                    QueryIntent::General => "general",
+                };
+                g.beam_search(
+                    entity_id,
+                    intent_str,
+                    self.config.beam_width,
+                    self.config.max_depth,
+                )
+            }
+            _ => Vec::new(),
+        };
+
+        // 5. Intent-type alignment ranking
+        let mut ranking_intent: Vec<(Uuid, f32)> = candidates
+            .iter()
+            .map(|(&id, mem)| {
+                let score = intent_score_for_type(
+                    &intent,
+                    match mem {
+                        Memory::Episodic(_) => "episodic",
+                        Memory::Semantic(_) => "semantic",
+                        Memory::Procedural(_) => "procedural",
+                    },
+                );
+                (id, score)
+            })
+            .collect();
+        ranking_intent
+            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 6. Confidence/reliability ranking
+        let mut ranking_confidence: Vec<(Uuid, f32)> = candidates
+            .iter()
+            .map(|(&id, mem)| {
+                let conf = match mem {
+                    Memory::Episodic(_) => 1.0,
+                    Memory::Semantic(s) => s.confidence,
+                    Memory::Procedural(p) => p.reliability,
+                };
+                (id, conf)
+            })
+            .collect();
+        ranking_confidence
+            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Merge via RRF
+        let rankings = vec![
+            ranking_vec,
+            ranking_bm25,
+            ranking_activation,
+            ranking_spread,
+            ranking_intent,
+            ranking_confidence,
+        ];
+        let rrf_weights = self.config.rrf_weights.to_vec();
+        let rrf_results =
+            rrf::reciprocal_rank_fusion(&rankings, &rrf_weights, self.config.rrf_k);
+
+        // Pre-compute max_access for access_score normalization.
         let max_access = candidates
             .values()
             .map(|m| match m {
@@ -385,37 +502,68 @@ impl<'a> RecallEngine<'a> {
             .max()
             .unwrap_or(0);
 
-        let graph_map: HashMap<Uuid, f32> = match (self.graph, target_entity) {
-            (Some(g), Some(entity_id)) => g.traverse(entity_id, 4).into_iter().collect(),
-            _ => HashMap::new(),
-        };
+        // Convert to ScoredCandidate, preserving individual signal scores for
+        // downstream consumers (CLI JSON output, reinforcement, etc.).
+        let mut scored: Vec<ScoredCandidate> = rrf_results
+            .iter()
+            .filter_map(|&(id, rrf_score)| {
+                candidates.get(&id).map(|mem| {
+                    let vector_score =
+                        vector_map.get(&id).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                    let bm25_score = bm25_map.get(&id).copied().unwrap_or(0.0);
+                    let recency_score = match mem {
+                        Memory::Episodic(e) => decay::retrievability(
+                            e.stability,
+                            decay::elapsed_days(e.timestamp, now),
+                        ),
+                        Memory::Semantic(s) => decay::retrievability(
+                            s.stability,
+                            decay::elapsed_days(s.valid_at, now),
+                        ),
+                        Memory::Procedural(p) => decay::retrievability(
+                            p.reliability,
+                            decay::elapsed_days(p.created_at, now),
+                        ),
+                    };
+                    let confidence_score = match mem {
+                        Memory::Episodic(_) => 1.0_f32,
+                        Memory::Semantic(s) => s.confidence,
+                        Memory::Procedural(p) => p.reliability,
+                    };
+                    let memory_type_str = match mem {
+                        Memory::Episodic(_) => "episodic",
+                        Memory::Semantic(_) => "semantic",
+                        Memory::Procedural(_) => "procedural",
+                    };
+                    let intent_score = intent_score_for_type(&intent, memory_type_str);
 
-        // Step 7: Score and sort candidates.
-        let candidates_found = candidates.len();
-        let now = Utc::now();
-        let weights = &self.config.weights;
-        let mut scored: Vec<ScoredCandidate> = candidates
-            .into_iter()
-            .map(|(id, memory)| {
-                score_candidate(
-                    id,
-                    memory,
-                    &vector_map,
-                    &bm25_map,
-                    &graph_map,
-                    &intent,
-                    max_access,
-                    now,
-                    weights,
-                )
+                    let access_count = match mem {
+                        Memory::Episodic(e) => e.access_count,
+                        Memory::Semantic(_) | Memory::Procedural(_) => 0,
+                    };
+                    let access_score = if max_access == 0 {
+                        0.0_f32
+                    } else {
+                        ((access_count + 1) as f32).ln()
+                            / ((max_access + 1) as f32).ln()
+                    };
+
+                    ScoredCandidate {
+                        memory_id: id,
+                        memory: mem.clone(),
+                        vector_score,
+                        bm25_score,
+                        graph_score: 0.0, // populated via RRF rank, not direct
+                        intent_score,
+                        recency_score,
+                        access_score,
+                        confidence_score,
+                        type_boost: 1.0,
+                        final_score: rrf_score,
+                    }
+                })
             })
             .collect();
-
-        scored.sort_by(|a, b| {
-            b.final_score
-                .partial_cmp(&a.final_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
 
         // Step 8: Optional cross-encoder reranking.
         if let Some(reranker) = self.reranker {
@@ -517,7 +665,10 @@ impl<'a> RecallEngine<'a> {
     }
 }
 
-/// Score a single candidate using all fusion signals.
+/// Score a single candidate using all fusion signals (legacy linear weighted sum).
+///
+/// Retained for ablation studies comparing linear fusion vs RRF.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn score_candidate(
     id: Uuid,
