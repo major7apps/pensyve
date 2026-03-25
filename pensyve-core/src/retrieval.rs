@@ -659,6 +659,10 @@ mod tests {
             max_candidates: 50,
             weights: TEST_WEIGHTS,
             recall_timeout_secs: 5,
+            rrf_k: 60,
+            rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5],
+            beam_width: 10,
+            max_depth: 4,
         }
     }
 

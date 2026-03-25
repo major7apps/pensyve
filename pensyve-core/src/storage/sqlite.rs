@@ -1247,6 +1247,10 @@ fn row_to_episodic(
         retrievability: retrievability as f32,
         access_count,
         last_accessed: str_to_opt_dt(last_accessed_str.as_deref()),
+        salience: 0.5,
+        storage_strength: 0.0,
+        event_time: None,
+        superseded_by: None,
     }))
 }
 
