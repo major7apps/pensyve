@@ -6,6 +6,7 @@ dist/
 !.env.example
 *.db
 *.db-journal
+*.sqlite
 models/
 *.onnx
 .venv/
