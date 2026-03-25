@@ -14,6 +14,7 @@ pub mod observability;
 pub mod ocr;
 pub mod procedural;
 pub mod reranker;
+pub mod salience;
 pub mod retrieval;
 pub mod storage;
 pub mod sync;
