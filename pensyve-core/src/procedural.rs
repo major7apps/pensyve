@@ -1,3 +1,4 @@
+use crate::embedding::cosine_similarity;
 use crate::types::{Outcome, ProceduralMemory};
 
 /// Update procedural memory reliability using beta-binomial posterior.
@@ -94,6 +95,48 @@ pub fn transfer_procedures(
             transferred_proc
         })
         .collect()
+}
+
+/// Compute reliability weighted by context similarity to each past trial.
+///
+/// Uses a beta-binomial model where each trial's contribution is weighted by
+/// how similar its context embedding is to the current context. More similar
+/// contexts receive higher weight, allowing reliability to vary by context.
+///
+/// - `trials`: each entry is `(success, context_embedding)`
+/// - `current_context`: the context embedding to evaluate reliability in
+/// - `gamma`: sharpness exponent — higher values focus weight on closer contexts
+///
+/// Returns `alpha / (alpha + beta)` where alpha and beta start at 1.0 (prior).
+pub fn context_weighted_reliability(
+    trials: &[(bool, Vec<f32>)],
+    current_context: &[f32],
+    gamma: f32,
+) -> f32 {
+    let mut alpha = 1.0f32;
+    let mut beta = 1.0f32;
+
+    for (success, trial_context) in trials {
+        let weight = cosine_similarity(current_context, trial_context)
+            .max(0.0)
+            .powf(gamma);
+        if *success {
+            alpha += weight;
+        } else {
+            beta += weight;
+        }
+    }
+
+    alpha / (alpha + beta)
+}
+
+/// Compute a transfer discount factor based on namespace similarity.
+///
+/// Similar namespaces get higher transfer credit (up to 0.8), dissimilar
+/// namespaces get a lower baseline discount (0.5). The formula is:
+/// `0.5 + 0.3 * clamp(namespace_similarity, 0.0, 1.0)`
+pub fn adaptive_transfer_discount(namespace_similarity: f32) -> f32 {
+    0.5 + 0.3 * namespace_similarity.clamp(0.0, 1.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -308,5 +351,28 @@ mod tests {
         let result = transfer_procedures(&source, &existing, 0.7, 5);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].trigger, "on_timeout");
+    }
+
+    #[test]
+    fn test_context_weighted_reliability() {
+        let trials = vec![
+            (true, vec![1.0, 0.0, 0.0]),
+            (true, vec![1.0, 0.0, 0.0]),
+            (false, vec![0.0, 1.0, 0.0]),
+        ];
+        let ctx_a = vec![1.0, 0.0, 0.0];
+        let ctx_b = vec![0.0, 1.0, 0.0];
+        let rel_a = context_weighted_reliability(&trials, &ctx_a, 2.0);
+        let rel_b = context_weighted_reliability(&trials, &ctx_b, 2.0);
+        assert!(rel_a > rel_b, "Should be more reliable in context A: {rel_a} vs {rel_b}");
+    }
+
+    #[test]
+    fn test_adaptive_transfer_discount() {
+        let similar = adaptive_transfer_discount(0.9);
+        let different = adaptive_transfer_discount(0.2);
+        assert!(similar > different);
+        assert!(similar <= 0.8);
+        assert!(different >= 0.5);
     }
 }
