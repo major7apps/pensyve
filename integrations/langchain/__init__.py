@@ -1,3 +1,3 @@
-from pensyve_langchain import PensyveMemory
+from .pensyve_langchain import PensyveMemory, PensyveStore
 
-__all__ = ["PensyveMemory"]
+__all__ = ["PensyveMemory", "PensyveStore"]

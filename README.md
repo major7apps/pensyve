@@ -240,7 +240,7 @@ pensyve/
 ├── pensyve-vscode/     VS Code extension — sidebar, commands, status bar
 ├── pensyve-plugin/     Claude Code plugin — commands, skills, agents, hooks
 ├── pensyve_server/     FastAPI REST API — auth, pagination, metrics, billing, Tier 2 extraction
-├── integrations/       Framework adapters (LangChain, CrewAI, Hermes Agent, OpenClaw, Autogen)
+├── integrations/       Framework adapters (LangChain Python/TS, CrewAI, Hermes Agent, OpenClaw plugin, Autogen)
 ├── tests/python/       Python integration tests
 ├── benchmarks/         LongMemEval_S evaluation + weight tuning
 ├── website/            Astro + Tailwind static site for pensyve.com
