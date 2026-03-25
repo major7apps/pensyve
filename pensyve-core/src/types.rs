@@ -316,6 +316,8 @@ pub struct Edge {
     /// ID of the edge that superseded (replaced) this one, if any.
     pub superseded_by: Option<Uuid>,
     pub metadata: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub edge_type: crate::graph::EdgeType,
 }
 
 impl Edge {
@@ -330,6 +332,7 @@ impl Edge {
             invalid_at: None,
             superseded_by: None,
             metadata: HashMap::new(),
+            edge_type: crate::graph::EdgeType::default(),
         }
     }
 

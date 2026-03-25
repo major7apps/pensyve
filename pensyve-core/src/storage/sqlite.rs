@@ -1156,6 +1156,7 @@ impl StorageTrait for SqliteBackend {
                 invalid_at,
                 superseded_by,
                 metadata,
+                edge_type: Default::default(),
             });
         }
         Ok(edges)
