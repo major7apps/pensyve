@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use chrono::Utc;
 use petgraph::graph::{DiGraph, EdgeIndex, NodeIndex};
@@ -7,6 +7,46 @@ use uuid::Uuid;
 
 use crate::storage::StorageTrait;
 use crate::types::Edge;
+
+// ---------------------------------------------------------------------------
+// EdgeType
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EdgeType {
+    Temporal,   // "happened before/after"
+    Causal,     // "caused", "led to", "because"
+    Entity,     // "about", "mentions", "involves"
+    Semantic,   // "similar to", "related to"
+    Supersedes, // "replaces", "updates"
+}
+
+impl Default for EdgeType {
+    fn default() -> Self {
+        Self::Entity
+    }
+}
+
+/// How well an edge type aligns with a query intent category.
+/// Returns [0.3, 0.9] — 0.3 is baseline for non-matching types.
+pub fn edge_type_alignment(edge_type: &EdgeType, intent: &str) -> f32 {
+    match (edge_type, intent) {
+        (EdgeType::Temporal, "recall") => 0.9,
+        (EdgeType::Causal, "action") => 0.9,
+        (EdgeType::Entity, "question") => 0.8,
+        (EdgeType::Entity, "code") => 0.7,
+        (EdgeType::Semantic, "recall") => 0.7,
+        (EdgeType::Semantic, "question") => 0.7,
+        (EdgeType::Causal, "code") => 0.6,
+        _ => 0.3,
+    }
+}
+
+/// Temporal confidence of an edge, decaying exponentially.
+/// confidence(edge, t) = base_confidence × exp(-age_days × ln(2) / half_life)
+pub fn edge_confidence_at(base_confidence: f32, age_days: f32, half_life: f32) -> f32 {
+    base_confidence * (-age_days * 2.0_f32.ln() / half_life).exp()
+}
 
 // ---------------------------------------------------------------------------
 // MemoryGraph
@@ -219,6 +259,128 @@ impl MemoryGraph {
         }
 
         graph
+    }
+
+    /// Beam search over typed edges with intent-aware scoring.
+    ///
+    /// Unlike uniform BFS (traverse()), beam search prioritizes edges
+    /// by type alignment, association strength, and temporal confidence.
+    ///
+    /// intent: one of "question", "action", "recall", "code", "visual", "general"
+    pub fn beam_search(
+        &self,
+        start: Uuid,
+        intent: &str,
+        beam_width: usize,
+        max_depth: usize,
+    ) -> Vec<(Uuid, f32)> {
+        let Some(&start_idx) = self.node_map.get(&start) else {
+            return Vec::new();
+        };
+
+        // (negative score for max-heap via BinaryHeap, node_index)
+        #[derive(PartialEq)]
+        struct Candidate(f32, NodeIndex);
+        impl Eq for Candidate {}
+        impl PartialOrd for Candidate {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Candidate {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.0
+                    .partial_cmp(&other.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }
+        }
+
+        let mut visited = HashSet::new();
+        visited.insert(start_idx);
+
+        // Scores accumulated for each visited node (except start).
+        let mut scores: HashMap<NodeIndex, f32> = HashMap::new();
+
+        // Current beam: nodes to expand at this depth level.
+        let mut beam = vec![(start_idx, 1.0_f32)]; // (node, accumulated_score)
+
+        for _depth in 0..max_depth {
+            let mut heap: BinaryHeap<Candidate> = BinaryHeap::new();
+
+            for &(current, parent_score) in &beam {
+                for edge_ref in self.graph.edges(current) {
+                    let neighbor = edge_ref.target();
+                    if visited.contains(&neighbor) {
+                        continue;
+                    }
+
+                    // Skip invalidated (superseded) edges.
+                    if let Some(meta) = self.edge_meta.get(&edge_ref.id()) {
+                        if meta.invalid_at.is_some() {
+                            continue;
+                        }
+                    }
+
+                    // Compute transition score.
+                    let meta = self.edge_meta.get(&edge_ref.id());
+
+                    let type_alignment = meta
+                        .map(|m| edge_type_alignment(&m.edge_type, intent))
+                        .unwrap_or(0.3);
+
+                    let edge_weight = meta.map(|m| m.weight).unwrap_or(*edge_ref.weight());
+
+                    let temporal_confidence = meta
+                        .map(|m| {
+                            let age_days = (Utc::now() - m.valid_at).num_seconds() as f32
+                                / 86400.0;
+                            let half_life = m
+                                .metadata
+                                .get("half_life")
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(90.0) as f32;
+                            edge_confidence_at(1.0, age_days, half_life)
+                        })
+                        .unwrap_or(1.0);
+
+                    let transition_score = (0.4 * type_alignment
+                        + 0.4 * edge_weight
+                        + 0.2 * temporal_confidence)
+                        .exp();
+
+                    let accumulated = parent_score * transition_score;
+
+                    heap.push(Candidate(accumulated, neighbor));
+                }
+            }
+
+            // Select top beam_width candidates.
+            let mut next_beam = Vec::new();
+            let mut count = 0;
+            while let Some(Candidate(score, node_idx)) = heap.pop() {
+                if count >= beam_width {
+                    break;
+                }
+                if visited.insert(node_idx) {
+                    scores.insert(node_idx, score);
+                    next_beam.push((node_idx, score));
+                    count += 1;
+                }
+            }
+
+            if next_beam.is_empty() {
+                break;
+            }
+            beam = next_beam;
+        }
+
+        // Collect results: all visited nodes except start, sorted by score descending.
+        let mut results: Vec<(Uuid, f32)> = scores
+            .iter()
+            .map(|(&node_idx, &score)| (self.graph[node_idx], score))
+            .collect();
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results
     }
 
     pub fn node_count(&self) -> usize {
@@ -462,6 +624,67 @@ mod tests {
         // The current edge should still be valid.
         let current = history.iter().find(|e| e.target == c).unwrap();
         assert!(current.invalid_at.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Typed edges & beam search tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_edge_type_alignment() {
+        assert!(edge_type_alignment(&EdgeType::Temporal, "recall") > 0.3);
+        assert!(edge_type_alignment(&EdgeType::Causal, "action") > 0.3);
+        assert!(edge_type_alignment(&EdgeType::Entity, "question") > 0.3);
+        assert!((edge_type_alignment(&EdgeType::Temporal, "action") - 0.3).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_edge_confidence_decays() {
+        let fresh = edge_confidence_at(1.0, 0.0, 90.0);
+        let old = edge_confidence_at(1.0, 180.0, 90.0);
+        assert!((fresh - 1.0).abs() < 0.01);
+        assert!((old - 0.25).abs() < 0.1);
+        assert!(fresh > old);
+    }
+
+    #[test]
+    fn test_beam_search_basic() {
+        let mut graph = MemoryGraph::new();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        graph.add_node(a);
+        graph.add_node(b);
+        graph.add_node(c);
+
+        let mut edge_ab = Edge::new(a, b, "caused");
+        edge_ab.edge_type = EdgeType::Causal;
+        edge_ab.weight = 0.8;
+        graph.add_edge_with_meta(edge_ab);
+
+        let mut edge_ac = Edge::new(a, c, "mentioned");
+        edge_ac.edge_type = EdgeType::Entity;
+        edge_ac.weight = 0.5;
+        graph.add_edge_with_meta(edge_ac);
+
+        let results = graph.beam_search(a, "action", 5, 2);
+        assert_eq!(results.len(), 2); // found both b and c
+
+        // Causal edge should score higher for "action" intent
+        let b_score = results
+            .iter()
+            .find(|(id, _)| *id == b)
+            .map(|(_, s)| *s)
+            .unwrap_or(0.0);
+        let c_score = results
+            .iter()
+            .find(|(id, _)| *id == c)
+            .map(|(_, s)| *s)
+            .unwrap_or(0.0);
+        assert!(
+            b_score > c_score,
+            "Causal edge should score higher for action intent: b={b_score} c={c_score}"
+        );
     }
 
     #[test]
