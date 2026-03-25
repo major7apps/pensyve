@@ -17,5 +17,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 rayon = "1.10"
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 
+[[bin]]
+name = "monte_carlo_eval"
+path = "src/bin/monte_carlo_eval.rs"
+
+[[bin]]
+name = "sensitivity_sweep"
+path = "src/bin/sensitivity_sweep.rs"
+
 [lints]
 workspace = true
