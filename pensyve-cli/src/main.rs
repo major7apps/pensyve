@@ -202,6 +202,10 @@ fn cmd_recall(
         max_candidates: 100,
         weights: [0.30, 0.15, 0.20, 0.10, 0.10, 0.05, 0.05, 0.05],
         recall_timeout_secs: 5,
+        rrf_k: 60,
+        rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5],
+        beam_width: 10,
+        max_depth: 4,
     };
 
     let engine = RecallEngine::new(&storage, &embedder, &vector_index, &config);

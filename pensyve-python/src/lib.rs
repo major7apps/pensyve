@@ -102,6 +102,19 @@ fn memory_confidence(mem: &types::Memory) -> f32 {
     }
 }
 
+/// Extract episodic-only fields: (salience, `storage_strength`, `event_time`, `superseded_by`).
+fn episodic_fields(mem: &types::Memory) -> (Option<f32>, Option<f32>, Option<String>, Option<String>) {
+    match mem {
+        types::Memory::Episodic(m) => (
+            Some(m.salience),
+            Some(m.storage_strength),
+            m.event_time.map(|t| t.to_rfc3339()),
+            m.superseded_by.map(|id| id.to_string()),
+        ),
+        _ => (None, None, None, None),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared inner state for Pensyve
 // ---------------------------------------------------------------------------
@@ -349,13 +362,21 @@ impl PyPensyve {
                     true
                 }
             })
-            .map(|c| PyMemory {
-                id: c.memory_id.to_string(),
-                content: memory_content(&c.memory),
-                memory_type: memory_type_str(&c.memory).to_string(),
-                confidence: memory_confidence(&c.memory),
-                stability: c.memory.stability(),
-                score: c.final_score,
+            .map(|c| {
+                let (salience, storage_strength, event_time, superseded_by) =
+                    episodic_fields(&c.memory);
+                PyMemory {
+                    id: c.memory_id.to_string(),
+                    content: memory_content(&c.memory),
+                    memory_type: memory_type_str(&c.memory).to_string(),
+                    confidence: memory_confidence(&c.memory),
+                    stability: c.memory.stability(),
+                    score: c.final_score,
+                    salience,
+                    storage_strength,
+                    event_time,
+                    superseded_by,
+                }
             })
             .collect();
 
@@ -417,6 +438,10 @@ impl PyPensyve {
             confidence: mem.confidence,
             stability: mem.stability,
             score: 0.0,
+            salience: None,
+            storage_strength: None,
+            event_time: None,
+            superseded_by: None,
         })
     }
 
@@ -700,13 +725,25 @@ pub struct PyMemory {
     stability: f32,
     #[pyo3(get)]
     score: f32,
+    /// Salience at encoding time [0, 1]. Only set for episodic memories.
+    #[pyo3(get)]
+    salience: Option<f32>,
+    /// Storage strength — monotonically increases. Only set for episodic memories.
+    #[pyo3(get)]
+    storage_strength: Option<f32>,
+    /// When the described event occurred (ISO 8601). Only set for episodic memories.
+    #[pyo3(get)]
+    event_time: Option<String>,
+    /// ID of the memory that superseded this one, if any. Only set for episodic memories.
+    #[pyo3(get)]
+    superseded_by: Option<String>,
 }
 
 #[pymethods]
 impl PyMemory {
     fn __repr__(&self) -> String {
-        format!(
-            "Memory(type='{}', content='{}', confidence={:.2}, score={:.4})",
+        let mut s = format!(
+            "Memory(type='{}', content='{}', confidence={:.2}, score={:.4}",
             self.memory_type,
             if self.content.len() > 50 {
                 format!("{}...", &self.content[..50])
@@ -715,6 +752,16 @@ impl PyMemory {
             },
             self.confidence,
             self.score,
-        )
+        );
+        if let Some(sal) = self.salience {
+            use std::fmt::Write;
+            let _ = write!(s, ", salience={sal:.2}");
+        }
+        if let Some(ss) = self.storage_strength {
+            use std::fmt::Write;
+            let _ = write!(s, ", storage_strength={ss:.2}");
+        }
+        s.push(')');
+        s
     }
 }
