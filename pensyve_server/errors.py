@@ -1,4 +1,5 @@
 """Structured error types for the Pensyve API."""
+
 from typing import Any
 
 from pydantic import BaseModel

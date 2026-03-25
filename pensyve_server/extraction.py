@@ -303,7 +303,9 @@ JSON array:"""
             result.causal_chains = self.extract_causal_chains(messages)
         return result
 
-    def _generate_json(self, prompt: str, max_tokens: int = 512) -> list[Any] | dict[str, Any] | None:
+    def _generate_json(
+        self, prompt: str, max_tokens: int = 512
+    ) -> list[Any] | dict[str, Any] | None:
         """Generate JSON output from LLM with grammar constraints if available."""
         if self._llm is None:
             return None
@@ -325,9 +327,7 @@ JSON array:"""
                     ws     ::= [ \t\n]*
                 """
                 )
-                response = self._llm(
-                    prompt, max_tokens=max_tokens, grammar=grammar, temperature=0
-                )
+                response = self._llm(prompt, max_tokens=max_tokens, grammar=grammar, temperature=0)
             except Exception:
                 # Fall back to no grammar
                 response = self._llm(prompt, max_tokens=max_tokens, temperature=0)

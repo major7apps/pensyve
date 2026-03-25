@@ -111,5 +111,5 @@ class ActivityTracker:
             # Put events back for retry, capped to avoid unbounded growth
             with self._lock:
                 combined = to_flush + self._pending_flush
-                self._pending_flush = combined[-self._max_events:]
+                self._pending_flush = combined[-self._max_events :]
             return 0

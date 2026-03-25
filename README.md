@@ -121,6 +121,21 @@ pensyve-plugin/
 
 See [`pensyve-plugin/README.md`](pensyve-plugin/README.md) for details.
 
+### Hermes Agent Integration
+
+Native memory backend for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — drop-in replacement for Honcho with zero-latency in-process access.
+
+```python
+from integrations.hermes import PensyveSessionManager
+
+mgr = PensyveSessionManager(namespace="hermes")
+session = mgr.get_or_create("my-session")
+mgr.create_conclusion("my-session", "User prefers Python for data science")
+results = mgr.search_context("my-session", "programming language")
+```
+
+See [`integrations/hermes/README.md`](integrations/hermes/README.md) for setup and configuration.
+
 ### REST API
 
 FastAPI server with authentication, pagination, and metrics.
@@ -225,7 +240,7 @@ pensyve/
 ├── pensyve-vscode/     VS Code extension — sidebar, commands, status bar
 ├── pensyve-plugin/     Claude Code plugin — commands, skills, agents, hooks
 ├── pensyve_server/     FastAPI REST API — auth, pagination, metrics, billing, Tier 2 extraction
-├── integrations/       Framework adapters (LangChain, CrewAI, OpenClaw, Autogen)
+├── integrations/       Framework adapters (LangChain, CrewAI, Hermes Agent, OpenClaw, Autogen)
 ├── tests/python/       Python integration tests
 ├── benchmarks/         LongMemEval_S evaluation + weight tuning
 ├── website/            Astro + Tailwind static site for pensyve.com
@@ -304,7 +319,7 @@ python benchmarks/tuning/optimize.py --maxiter 50
 | MCP server | **Yes** | No | No | Plugin |
 | Claude Code plugin | **Yes** | No | No | No |
 | VS Code extension | **Yes** | No | No | No |
-| Framework integrations | **4** | 2 | 1 | 1 |
+| Framework integrations | **5** | 2 | 1 | 1 |
 | Postgres backend | **Yes** (feature-gated) | Yes | Yes | Yes |
 | Go SDK | **Yes** | No | No | No |
 | WASM build | **Yes** | No | No | No |

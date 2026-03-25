@@ -30,13 +30,16 @@ async def get_redis():
         return None
     if _pool is not None:
         import redis.asyncio as aioredis
+
         return aioredis.Redis(connection_pool=_pool)
     try:
         async with _init_lock:
             if _pool is None:
                 import redis.asyncio as aioredis
+
                 _pool = aioredis.ConnectionPool.from_url(_REDIS_URL, max_connections=10)  # type: ignore[misc]
         import redis.asyncio as aioredis
+
         return aioredis.Redis(connection_pool=_pool)
     except Exception:
         logger.warning("redis_connection_failed")

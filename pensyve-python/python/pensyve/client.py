@@ -1,4 +1,5 @@
 """HTTP client for the Pensyve memory API."""
+
 from __future__ import annotations
 
 import httpx
@@ -83,15 +84,11 @@ class PensyveClient:
         params: dict = {}
         if hard_delete:
             params["hard_delete"] = "true"
-        return self._request(
-            "DELETE", f"/v1/entities/{entity}", params=params
-        ).json()
+        return self._request("DELETE", f"/v1/entities/{entity}", params=params).json()
 
     def entity(self, name: str, *, kind: str = "user") -> dict:
         """Create or get an entity."""
-        return self._request(
-            "POST", "/v1/entities", json={"name": name, "kind": kind}
-        ).json()
+        return self._request("POST", "/v1/entities", json={"name": name, "kind": kind}).json()
 
     def inspect(
         self,
@@ -257,9 +254,7 @@ class AsyncPensyveClient:
         params: dict = {}
         if hard_delete:
             params["hard_delete"] = "true"
-        return (
-            await self._request("DELETE", f"/v1/entities/{entity}", params=params)
-        ).json()
+        return (await self._request("DELETE", f"/v1/entities/{entity}", params=params)).json()
 
     async def entity(self, name: str, *, kind: str = "user") -> dict:
         """Create or get an entity."""
@@ -324,9 +319,7 @@ class AsyncPensyveClient:
     async def start_episode(self, participants: list[str]) -> str:
         """Start a new episode. Returns episode_id."""
         resp = (
-            await self._request(
-                "POST", "/v1/episodes/start", json={"participants": participants}
-            )
+            await self._request("POST", "/v1/episodes/start", json={"participants": participants})
         ).json()
         return resp["episode_id"]
 

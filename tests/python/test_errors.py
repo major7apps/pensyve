@@ -1,4 +1,5 @@
 """Tests for the structured error hierarchy and consistent JSON error responses."""
+
 import os
 import tempfile
 
@@ -53,7 +54,11 @@ def test_episode_not_found_returns_structured_error(client):
     """POST /v1/episodes/message with nonexistent episode_id returns structured 404."""
     resp = client.post(
         "/v1/episodes/message",
-        json={"episode_id": "00000000-0000-0000-0000-000000000000", "role": "user", "content": "hi"},
+        json={
+            "episode_id": "00000000-0000-0000-0000-000000000000",
+            "role": "user",
+            "content": "hi",
+        },
     )
     assert resp.status_code == 404
     body = resp.json()
@@ -96,7 +101,11 @@ def test_request_id_header_echoed_in_error(client):
     custom_id = "my-trace-id-abc123"
     resp = client.post(
         "/v1/episodes/message",
-        json={"episode_id": "00000000-0000-0000-0000-000000000000", "role": "user", "content": "hi"},
+        json={
+            "episode_id": "00000000-0000-0000-0000-000000000000",
+            "role": "user",
+            "content": "hi",
+        },
         headers={"X-Request-ID": custom_id},
     )
     assert resp.status_code == 404
