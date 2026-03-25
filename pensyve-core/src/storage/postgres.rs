@@ -1069,6 +1069,7 @@ impl StorageTrait for PostgresBackend {
                             invalid_at,
                             superseded_by,
                             metadata,
+                            edge_type: Default::default(),
                         }
                     },
                 )
@@ -1168,6 +1169,10 @@ fn row_to_episodic(row: EpisodicRow) -> EpisodicMemory {
         retrievability,
         access_count: u32::try_from(access_count).unwrap_or(0),
         last_accessed,
+        salience: 0.5,
+        storage_strength: 0.0,
+        event_time: None,
+        superseded_by: None,
     }
 }
 
