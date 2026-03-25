@@ -165,7 +165,21 @@ pub struct EpisodicMemory {
     pub retrievability: f32,
     pub access_count: u32,
     pub last_accessed: Option<DateTime<Utc>>,
+    /// Salience at encoding time [0, 1]. Modulates decay rate.
+    #[serde(default = "default_salience")]
+    pub salience: f32,
+    /// Storage strength — monotonically increases, never decays.
+    #[serde(default)]
+    pub storage_strength: f32,
+    /// When the described event occurred (may differ from encoding timestamp).
+    #[serde(default)]
+    pub event_time: Option<DateTime<Utc>>,
+    /// If this memory was superseded by a newer one, its ID.
+    #[serde(default)]
+    pub superseded_by: Option<Uuid>,
 }
+
+fn default_salience() -> f32 { 0.5 }
 
 impl EpisodicMemory {
     pub fn new(
@@ -191,6 +205,10 @@ impl EpisodicMemory {
             retrievability: 1.0,
             access_count: 0,
             last_accessed: None,
+            salience: 0.5,
+            storage_strength: 0.0,
+            event_time: None,
+            superseded_by: None,
         }
     }
 }

@@ -22,12 +22,67 @@ pub struct ExtractionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivationConfig {
+    /// ACT-R decay parameter d. Default 0.5.
+    pub decay_parameter: f32,
+    /// Max access timestamps per memory. Default 100.
+    pub max_access_history: usize,
+    /// Noise scale for stochastic retrieval. 0 = deterministic.
+    pub noise_scale: f32,
+}
+
+impl Default for ActivationConfig {
+    fn default() -> Self {
+        Self {
+            decay_parameter: 0.5,
+            max_access_history: 100,
+            noise_scale: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsrsConfig {
+    /// Salience modulation strength. S_eff = S × (1 + beta × salience).
+    pub salience_beta: f32,
+    /// Difficulty increase on failed recall.
+    pub difficulty_increase_on_forget: u8,
+}
+
+impl Default for FsrsConfig {
+    fn default() -> Self {
+        Self {
+            salience_beta: 0.5,
+            difficulty_increase_on_forget: 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalConfig {
     pub default_limit: usize,
     pub max_candidates: usize,
-    pub weights: [f32; 8],
+    pub weights: [f32; 8],  // KEEP for backward compatibility
     pub recall_timeout_secs: u64,
+    // NEW fields:
+    /// RRF constant k. Default 60.
+    #[serde(default = "default_rrf_k")]
+    pub rrf_k: u32,
+    /// Per-signal RRF weights [vec, bm25, activation, spread, intent, confidence].
+    #[serde(default = "default_rrf_weights")]
+    pub rrf_weights: [f32; 6],
+    /// Beam search width. Default 10.
+    #[serde(default = "default_beam_width")]
+    pub beam_width: usize,
+    /// Max graph traversal depth. Default 4.
+    #[serde(default = "default_max_depth")]
+    pub max_depth: usize,
 }
+
+fn default_rrf_k() -> u32 { 60 }
+fn default_rrf_weights() -> [f32; 6] { [1.0, 0.8, 1.0, 0.8, 0.5, 0.5] }
+fn default_beam_width() -> usize { 10 }
+fn default_max_depth() -> usize { 4 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsolidationConfig {
@@ -49,6 +104,8 @@ pub struct PensyveConfig {
     pub extraction: ExtractionConfig,
     pub retrieval: RetrievalConfig,
     pub consolidation: ConsolidationConfig,
+    pub activation: ActivationConfig,
+    pub fsrs: FsrsConfig,
 }
 
 impl Default for PensyveConfig {
@@ -73,6 +130,10 @@ impl Default for PensyveConfig {
                 max_candidates: 100,
                 weights: [0.25, 0.10, 0.15, 0.05, 0.20, 0.10, 0.10, 0.05],
                 recall_timeout_secs: 5,
+                rrf_k: 60,
+                rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5],
+                beam_width: 10,
+                max_depth: 4,
             },
             consolidation: ConsolidationConfig {
                 idle_timeout_secs: 30,
@@ -81,6 +142,8 @@ impl Default for PensyveConfig {
                 fsrs_decay_threshold: 0.1,
                 max_duration_secs: 60,
             },
+            activation: ActivationConfig::default(),
+            fsrs: FsrsConfig::default(),
         }
     }
 }
