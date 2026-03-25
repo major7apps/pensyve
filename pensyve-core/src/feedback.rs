@@ -1,7 +1,7 @@
 //! Feedback-driven weight learning for retrieval fusion.
 //!
 //! When a user marks a recalled memory as relevant or irrelevant, the feedback
-//! is used to nudge the 8 fusion weights via online gradient descent.
+//! is used to nudge the 6 fusion weights via online gradient descent.
 //! Weights are stored per-namespace so different use cases converge to
 //! different optimal retrieval strategies.
 
@@ -15,8 +15,8 @@ const MIN_WEIGHT: f32 = 0.01;
 /// Feedback signal for a recalled memory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalFeedback {
-    /// The 8 raw signal scores for this candidate: vector, bm25, graph, intent, recency, access, confidence, type-boost.
-    pub signals: [f32; 8],
+    /// The 6 raw signal scores for this candidate: vector, BM25, activation, spread, intent, confidence.
+    pub signals: [f32; 6],
     /// Whether the user found this memory relevant (true) or not (false).
     pub relevant: bool,
 }
@@ -25,7 +25,7 @@ pub struct RetrievalFeedback {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WeightLearner {
     /// Current learned weights.
-    pub weights: [f32; 8],
+    pub weights: [f32; 6],
     /// Learning rate.
     pub learning_rate: f32,
     /// Number of feedback samples received.
@@ -34,8 +34,17 @@ pub struct WeightLearner {
 
 impl Default for WeightLearner {
     fn default() -> Self {
+        // Proportional to [1.0, 0.8, 1.0, 0.8, 0.5, 0.5] (RRF signal weights),
+        // normalized to sum to 1.0 (total = 4.6).
         Self {
-            weights: [0.25, 0.10, 0.15, 0.05, 0.20, 0.10, 0.10, 0.05],
+            weights: [
+                1.0 / 4.6,
+                0.8 / 4.6,
+                1.0 / 4.6,
+                0.8 / 4.6,
+                0.5 / 4.6,
+                0.5 / 4.6,
+            ],
             learning_rate: DEFAULT_LEARNING_RATE,
             sample_count: 0,
         }
@@ -44,7 +53,7 @@ impl Default for WeightLearner {
 
 impl WeightLearner {
     /// Create a learner initialized with specific weights.
-    pub fn with_weights(weights: [f32; 8]) -> Self {
+    pub fn with_weights(weights: [f32; 6]) -> Self {
         Self {
             weights,
             ..Default::default()
@@ -100,7 +109,7 @@ mod tests {
 
         // Feedback: vector score was high (1.0), other scores low
         let feedback = RetrievalFeedback {
-            signals: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            signals: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             relevant: true,
         };
         learner.update(&feedback);
@@ -118,7 +127,7 @@ mod tests {
         let initial_w0 = learner.weights[0];
 
         let feedback = RetrievalFeedback {
-            signals: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            signals: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             relevant: false,
         };
         learner.update(&feedback);
@@ -134,7 +143,7 @@ mod tests {
         let mut learner = WeightLearner::default();
         // Apply many negative feedback samples
         let feedback = RetrievalFeedback {
-            signals: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            signals: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
             relevant: false,
         };
         for _ in 0..1000 {
@@ -149,7 +158,7 @@ mod tests {
     fn test_weights_normalized() {
         let mut learner = WeightLearner::default();
         let feedback = RetrievalFeedback {
-            signals: [0.9, 0.1, 0.5, 0.3, 0.7, 0.2, 0.8, 0.4],
+            signals: [0.9, 0.1, 0.5, 0.3, 0.7, 0.2],
             relevant: true,
         };
         learner.update(&feedback);
@@ -167,7 +176,7 @@ mod tests {
         assert_eq!(learner.sample_count, 0);
 
         let feedback = RetrievalFeedback {
-            signals: [0.5; 8],
+            signals: [0.5; 6],
             relevant: true,
         };
         learner.update(&feedback);
