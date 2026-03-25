@@ -5,8 +5,15 @@
   "type": "module",
   "main": "src/index.ts",
   "license": "Apache-2.0",
-  "keywords": ["opencode", "memory", "pensyve", "ai-agent", "offline-first"],
+  "keywords": [
+    "opencode",
+    "memory",
+    "pensyve",
+    "ai-agent",
+    "offline-first"
+  ],
   "devDependencies": {
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.1"
   }
 }
