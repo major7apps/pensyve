@@ -20,7 +20,7 @@ describe("OpenClaw Pensyve Plugin", () => {
 });
 
 describe("Plugin Registration", () => {
-  it("registers 4 tools and 2 hooks", () => {
+  it("registers 5 tools and 2 hooks", () => {
     const registered: { tools: string[]; hooks: string[]; commands: string[] } = {
       tools: [],
       hooks: [],
@@ -42,6 +42,7 @@ describe("Plugin Registration", () => {
       "memory_store",
       "memory_get",
       "memory_forget",
+      "memory_status",
     ]);
     expect(registered.hooks).toEqual([
       "before_agent_start",
@@ -81,6 +82,6 @@ describe("Plugin Registration", () => {
     };
 
     plugin.register(mockApi);
-    expect(toolCount).toBe(4);
+    expect(toolCount).toBe(5);
   });
 });
