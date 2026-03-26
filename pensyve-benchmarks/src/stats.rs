@@ -3,7 +3,7 @@
 //! Provides bootstrap confidence intervals, effect-size measures, hypothesis
 //! tests, multiple-testing correction, and power analysis.
 
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
