@@ -637,8 +637,8 @@ def health() -> dict[str, str | int]:
         get_pensyve()  # Verify runtime is initialized
         from pensyve._core import embedding_info  # type: ignore[import-untyped]
 
-        info: tuple[str, int] = embedding_info()  # type: ignore[reportUnknownVariableType]
-        model, dims = info[0], info[1]
+        model: str = str(embedding_info()[0])
+        dims: int = int(embedding_info()[1])
         return {
             "status": "ok",
             "version": "0.1.0",
