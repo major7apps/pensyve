@@ -1,5 +1,7 @@
-use rand::prelude::*;
-use rand_distr::Normal;
+use rand::RngExt;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
