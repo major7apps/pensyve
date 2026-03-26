@@ -479,18 +479,28 @@ impl<'a> RecallEngine<'a> {
         ranking_confidence
             .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Merge via RRF
-        let rankings = vec![
-            ranking_vec,
-            ranking_bm25,
-            ranking_activation,
-            ranking_spread,
-            ranking_intent,
-            ranking_confidence,
+        // Merge via RRF — only include rankings with discriminative signal.
+        // A ranking where all scores are identical (e.g., empty graph, no access history)
+        // adds noise and dilutes the strong signals like vector similarity.
+        let all_rankings = vec![
+            (ranking_vec, self.config.rrf_weights[0]),
+            (ranking_bm25, self.config.rrf_weights[1]),
+            (ranking_activation, self.config.rrf_weights[2]),
+            (ranking_spread, self.config.rrf_weights[3]),
+            (ranking_intent, self.config.rrf_weights[4]),
+            (ranking_confidence, self.config.rrf_weights[5]),
         ];
-        let rrf_weights = self.config.rrf_weights.to_vec();
+
+        let (rankings, rrf_weights): (Vec<_>, Vec<_>) = all_rankings
+            .into_iter()
+            .filter(|(ranking, _)| has_discriminative_signal(ranking))
+            .unzip();
+
+        // Use adaptive k based on candidate pool size to preserve rank discrimination
+        // at small corpus sizes (k=60 was designed for web-scale IR).
+        let effective_k = rrf::adaptive_k(candidates.len(), self.config.rrf_k);
         let rrf_results =
-            rrf::reciprocal_rank_fusion(&rankings, &rrf_weights, self.config.rrf_k);
+            rrf::reciprocal_rank_fusion(&rankings, &rrf_weights, effective_k);
 
         // Pre-compute max_access for access_score normalization.
         let max_access = candidates
@@ -670,6 +680,24 @@ impl<'a> RecallEngine<'a> {
 /// Retained for ablation studies comparing linear fusion vs RRF.
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
+/// Check whether a ranking has discriminative signal.
+///
+/// A ranking where all scores are the same (or it's empty) provides no
+/// useful information to RRF — it would just add noise. This commonly
+/// happens when:
+/// - Graph ranking is empty (no entity relationships built yet)
+/// - Activation ranking is flat (all memories have zero access count)
+/// - Confidence ranking is uniform (all memories are episodic with 1.0)
+fn has_discriminative_signal(ranking: &[(Uuid, f32)]) -> bool {
+    if ranking.len() < 2 {
+        return !ranking.is_empty();
+    }
+    let first = ranking[0].1;
+    // If any score differs from the first by more than epsilon, there's signal
+    ranking.iter().any(|(_, score)| (score - first).abs() > 1e-6)
+}
+
+#[allow(dead_code)]
 fn score_candidate(
     id: Uuid,
     memory: Memory,
