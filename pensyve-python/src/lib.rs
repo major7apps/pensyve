@@ -19,9 +19,11 @@ use pensyve_core::vector::VectorIndex;
 // Module entry point
 // ---------------------------------------------------------------------------
 
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
 static TRACING_INIT: Once = Once::new();
+static EMBEDDING_MODEL_NAME: OnceLock<String> = OnceLock::new();
+static EMBEDDING_DIMS: OnceLock<usize> = OnceLock::new();
 
 fn init_tracing() {
     TRACING_INIT.call_once(|| {
@@ -37,6 +39,16 @@ fn init_tracing() {
     });
 }
 
+#[pyfunction]
+fn embedding_info() -> (String, usize) {
+    let model = EMBEDDING_MODEL_NAME
+        .get()
+        .map(|s| s.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    let dims = EMBEDDING_DIMS.get().copied().unwrap_or(0);
+    (model, dims)
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     init_tracing();
@@ -45,6 +57,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEntity>()?;
     m.add_class::<PyEpisode>()?;
     m.add_class::<PyMemory>()?;
+    m.add_function(wrap_pyfunction!(embedding_info, m)?)?;
     Ok(())
 }
 
@@ -222,13 +235,9 @@ impl PyPensyve {
         };
         let dimensions = embedder.dimensions();
 
-        // Store model info for health endpoint.
-        // SAFETY: called once during single-threaded init before server accepts requests.
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var("_PENSYVE_EMBEDDING_MODEL", model_name);
-            std::env::set_var("_PENSYVE_EMBEDDING_DIMS", dimensions.to_string());
-        }
+        // Store model info in thread-safe statics for health endpoint.
+        let _ = EMBEDDING_MODEL_NAME.set(model_name.to_string());
+        let _ = EMBEDDING_DIMS.set(dimensions);
 
         // Create vector index.
         let vector_index = Arc::new(Mutex::new(VectorIndex::new(dimensions, 1024)));
@@ -333,6 +342,8 @@ impl PyPensyve {
         limit: usize,
         types: Option<Vec<String>>,
     ) -> PyResult<Vec<PyMemory>> {
+        // NOTE: Lock held across recall (including embedding). RecallEngine borrows &VectorIndex.
+        // Future: make RecallEngine lock internally per-operation to allow concurrent recalls.
         let vi = self.inner.vector_index.lock().unwrap();
         let engine = RecallEngine::new(
             self.inner.storage.as_ref(),
@@ -651,17 +662,13 @@ impl PyEpisode {
             _ => Outcome::Success, // Default to success if not set.
         };
 
-        // Create the episode in storage.
+        // Create the episode object and close it (but don't save yet).
         let mut episode = types::Episode::new(self.namespace_id, self.participants.clone());
         episode.id = self.episode_id;
         episode.close(outcome);
 
-        self.inner
-            .storage
-            .save_episode(&episode)
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to save episode: {e}")))?;
-
-        // For each message, create an episodic memory.
+        // Embed and save all messages BEFORE saving the episode.
+        // If any message fails, the episode is never persisted — no partial writes.
         let source_entity = self.participants.first().copied().unwrap_or(Uuid::nil());
         let about_entity = self.participants.get(1).copied().unwrap_or(source_entity);
 
@@ -695,6 +702,12 @@ impl PyEpisode {
                 .save_episodic(&mem)
                 .map_err(|e| PyRuntimeError::new_err(format!("Storage error: {e}")))?;
         }
+
+        // All messages succeeded — now save the episode.
+        self.inner
+            .storage
+            .save_episode(&episode)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to save episode: {e}")))?;
 
         // Update the episode in storage (with end time and outcome).
         self.inner

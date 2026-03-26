@@ -507,6 +507,43 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    fn get_episode(&self, id: Uuid) -> StorageResult<Option<Episode>> {
+        self.rt.block_on(async {
+            let mut conn = self.maybe_scoped_conn().await?;
+            let row: Option<(
+                Uuid,
+                Uuid,
+                serde_json::Value,
+                DateTime<Utc>,
+                Option<DateTime<Utc>>,
+                Option<String>,
+                serde_json::Value,
+            )> = query_as::<Postgres, _>(
+                "SELECT id, namespace_id, participants, started_at, ended_at, outcome, metadata FROM episodes WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+
+            Ok(row.map(|(id, namespace_id, participants, started_at, ended_at, outcome, metadata)| {
+                let participants: Vec<Uuid> =
+                    serde_json::from_value(participants).unwrap_or_default();
+                let metadata: HashMap<String, serde_json::Value> =
+                    serde_json::from_value(metadata).unwrap_or_default();
+                Episode {
+                    id,
+                    namespace_id,
+                    participants,
+                    started_at,
+                    ended_at,
+                    outcome: outcome.as_deref().map(str_to_outcome),
+                    metadata,
+                }
+            }))
+        })
+    }
+
     fn update_episode(&self, episode: &Episode) -> StorageResult<()> {
         self.save_episode(episode)
     }

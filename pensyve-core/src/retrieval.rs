@@ -241,6 +241,8 @@ pub enum RecallError {
     Vector(#[from] crate::vector::VectorError),
     #[error("Reranker error: {0}")]
     Reranker(#[from] crate::reranker::RerankerError),
+    #[error("RRF error: {0}")]
+    Rrf(#[from] crate::rrf::RrfError),
 }
 
 // ---------------------------------------------------------------------------
@@ -487,7 +489,7 @@ impl<'a> RecallEngine<'a> {
         // Use adaptive k based on candidate pool size to preserve rank discrimination
         // at small corpus sizes (k=60 was designed for web-scale IR).
         let effective_k = rrf::adaptive_k(candidates.len(), self.config.rrf_k);
-        let rrf_results = rrf::reciprocal_rank_fusion(&rankings, &rrf_weights, effective_k);
+        let rrf_results = rrf::reciprocal_rank_fusion(&rankings, &rrf_weights, effective_k)?;
 
         // Pre-compute max_access for access_score normalization.
         let max_access = candidates

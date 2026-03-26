@@ -10,6 +10,16 @@
 use std::collections::HashMap;
 use uuid::Uuid;
 
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, thiserror::Error)]
+pub enum RrfError {
+    #[error("Config error: {0}")]
+    Config(String),
+}
+
 /// Compute adaptive k based on candidate pool size.
 ///
 /// k=60 is designed for web-scale IR (thousands of candidates).
@@ -40,15 +50,17 @@ pub fn reciprocal_rank_fusion(
     rankings: &[Vec<(Uuid, f32)>],
     weights: &[f32],
     k: u32,
-) -> Vec<(Uuid, f32)> {
-    assert_eq!(
-        rankings.len(),
-        weights.len(),
-        "rankings and weights must have the same length"
-    );
+) -> Result<Vec<(Uuid, f32)>, RrfError> {
+    if rankings.len() != weights.len() {
+        return Err(RrfError::Config(format!(
+            "rankings ({}) and weights ({}) must be same length",
+            rankings.len(),
+            weights.len()
+        )));
+    }
 
     if rankings.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let k_f = f64::from(k);
@@ -69,9 +81,9 @@ pub fn reciprocal_rank_fusion(
         .collect();
 
     // Sort descending by RRF score; break ties by UUID for determinism
-    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then_with(|| a.0.cmp(&b.0)));
+    result.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -86,7 +98,7 @@ mod tests {
     fn test_single_ranking() {
         // One list of 3 items — RRF should preserve the original order.
         let ranking = vec![(id(1), 0.9_f32), (id(2), 0.5), (id(3), 0.1)];
-        let result = reciprocal_rank_fusion(&[ranking], &[1.0], 60);
+        let result = reciprocal_rank_fusion(&[ranking], &[1.0], 60).unwrap();
 
         assert_eq!(result.len(), 3);
         // Rank 1 gets 1/61, rank 2 gets 1/62, rank 3 gets 1/63 → descending order preserved
@@ -103,7 +115,7 @@ mod tests {
         let list_a = vec![(id(1), 1.0_f32), (id(2), 0.8), (id(3), 0.5)];
         let list_b = vec![(id(4), 1.0_f32), (id(2), 0.9), (id(5), 0.3)];
 
-        let result = reciprocal_rank_fusion(&[list_a, list_b], &[1.0, 1.0], 60);
+        let result = reciprocal_rank_fusion(&[list_a, list_b], &[1.0, 1.0], 60).unwrap();
 
         // id(2): 1/62 + 1/62 ≈ 0.03226
         // id(1): 1/61 ≈ 0.01639
@@ -124,7 +136,7 @@ mod tests {
         let list_a = vec![(id(1), 1.0_f32), (id(3), 0.5)];
         let list_b = vec![(id(2), 1.0_f32), (id(3), 0.5)];
 
-        let result = reciprocal_rank_fusion(&[list_a, list_b], &[2.0, 1.0], 60);
+        let result = reciprocal_rank_fusion(&[list_a, list_b], &[2.0, 1.0], 60).unwrap();
 
         // id(1): 2.0/61 ≈ 0.03279
         // id(2): 1.0/61 ≈ 0.01639
@@ -139,8 +151,14 @@ mod tests {
 
     #[test]
     fn test_empty_rankings() {
-        let result = reciprocal_rank_fusion(&[], &[], 60);
+        let result = reciprocal_rank_fusion(&[], &[], 60).unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_mismatched_lengths() {
+        let result = reciprocal_rank_fusion(&[vec![]], &[], 60);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -150,8 +168,8 @@ mod tests {
         // Verify by comparing the score spread for the same two items under different k values.
         let ranking = vec![(id(1), 1.0_f32), (id(2), 0.5)];
 
-        let result_low_k = reciprocal_rank_fusion(&[ranking.clone()], &[1.0], 1);
-        let result_high_k = reciprocal_rank_fusion(&[ranking], &[1.0], 1000);
+        let result_low_k = reciprocal_rank_fusion(&[ranking.clone()], &[1.0], 1).unwrap();
+        let result_high_k = reciprocal_rank_fusion(&[ranking], &[1.0], 1000).unwrap();
 
         let spread_low = result_low_k[0].1 - result_low_k[1].1;
         let spread_high = result_high_k[0].1 - result_high_k[1].1;
@@ -195,7 +213,7 @@ mod tests {
             .map(|i| (Uuid::from_bytes([i as u8; 16]), 1.0 - i as f32 / 50.0))
             .collect();
         let k = adaptive_k(50, 60); // should be 5
-        let result = reciprocal_rank_fusion(&[ranking], &[1.0], k);
+        let result = reciprocal_rank_fusion(&[ranking], &[1.0], k).unwrap();
 
         let top_score = result[0].1;
         let bottom_score = result.last().unwrap().1;

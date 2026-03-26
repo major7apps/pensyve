@@ -50,6 +50,7 @@ pub trait StorageTrait: Send + Sync {
 
     // Episodes
     fn save_episode(&self, episode: &Episode) -> StorageResult<()>;
+    fn get_episode(&self, id: Uuid) -> StorageResult<Option<Episode>>;
     fn update_episode(&self, episode: &Episode) -> StorageResult<()>;
 
     // Episodic Memory

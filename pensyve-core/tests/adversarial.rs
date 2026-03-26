@@ -43,7 +43,7 @@ fn test_activation_future_timestamps() {
 
 #[test]
 fn test_rrf_empty_input() {
-    let result = reciprocal_rank_fusion(&[], &[], 60);
+    let result = reciprocal_rank_fusion(&[], &[], 60).unwrap();
     assert!(result.is_empty());
 }
 
@@ -52,7 +52,7 @@ fn test_rrf_single_item() {
     let id = Uuid::new_v4();
     let rankings = vec![vec![(id, 1.0_f32)]];
     let weights = vec![1.0_f32];
-    let result = reciprocal_rank_fusion(&rankings, &weights, 60);
+    let result = reciprocal_rank_fusion(&rankings, &weights, 60).unwrap();
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].0, id);
 }

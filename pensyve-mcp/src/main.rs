@@ -301,8 +301,11 @@ impl PensyveMcpServer {
             }
         };
 
-        let mut episode = Episode::new(state.namespace.id, vec![]);
-        episode.id = episode_id;
+        let mut episode = match state.storage.get_episode(episode_id) {
+            Ok(Some(ep)) => ep,
+            Ok(None) => return format!("Episode not found: {episode_id}"),
+            Err(e) => return format!("Error loading episode: {e}"),
+        };
         episode.close(outcome);
 
         if let Err(err) = state.storage.update_episode(&episode) {
