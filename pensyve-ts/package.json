@@ -28,7 +28,7 @@
     "eslint": "^10.0.3",
     "jiti": "^2.6.1",
     "typescript": "^6.0.2",
-    "typescript-eslint": "^8.57.1"
+    "typescript-eslint": "^8.57.2"
   },
   "license": "Apache-2.0"
 }
