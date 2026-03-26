@@ -31,13 +31,13 @@ pub struct JudgeConfig {
 }
 
 impl JudgeConfig {
-    /// Claude Sonnet 4.6 via the Anthropic Messages API.
+    /// Claude Sonnet 4.6 via OpenRouter (avoids separate Anthropic API key).
     pub fn claude() -> Self {
         Self {
             name: "claude".to_string(),
-            endpoint: "https://api.anthropic.com/v1/messages".to_string(),
-            model: "claude-sonnet-4-6-20250514".to_string(),
-            api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
+            endpoint: "https://openrouter.ai/api/v1/chat/completions".to_string(),
+            model: "anthropic/claude-sonnet-4.6".to_string(),
+            api_key_env: Some("OPENROUTER_API_KEY".to_string()),
             temperature: 0.0,
             max_tokens: 512,
             extra_body: None,
