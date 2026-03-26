@@ -97,11 +97,12 @@ fn call_judge(
 
     // Merge extra_body fields (e.g., chat_template_kwargs for Qwen).
     if let Some(extra) = &config.extra_body
-        && let (Some(body_obj), Some(extra_obj)) = (body.as_object_mut(), extra.as_object()) {
-            for (k, v) in extra_obj {
-                body_obj.insert(k.clone(), v.clone());
-            }
+        && let (Some(body_obj), Some(extra_obj)) = (body.as_object_mut(), extra.as_object())
+    {
+        for (k, v) in extra_obj {
+            body_obj.insert(k.clone(), v.clone());
         }
+    }
 
     // Resolve API key from environment if configured.
     let mut request = client

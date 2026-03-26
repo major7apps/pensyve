@@ -11,8 +11,8 @@ use crate::types::{
     ProceduralMemory, SemanticMemory,
 };
 
-use crate::graph::EdgeType;
 use super::{StorageError, StorageResult, StorageTrait};
+use crate::graph::EdgeType;
 
 // ---------------------------------------------------------------------------
 // Safe lock acquisition

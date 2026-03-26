@@ -14,8 +14,8 @@ use crate::types::{
     ProceduralMemory, SemanticMemory,
 };
 
-use crate::graph::EdgeType;
 use super::{StorageResult, StorageTrait};
+use crate::graph::EdgeType;
 
 // ---------------------------------------------------------------------------
 // Row type aliases (for complex tuple types used with query_as)

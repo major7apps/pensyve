@@ -158,9 +158,10 @@ pub fn generate_corpus(config: &CorpusConfig, seed: u64) -> SyntheticCorpus {
                     cosine_similarity(&a.embedding, &embedding)
                         .partial_cmp(&cosine_similarity(&b.embedding, &embedding))
                         .unwrap()
-                }) {
-                    gold_memory_ids.push(best.id);
-                }
+                })
+            {
+                gold_memory_ids.push(best.id);
+            }
 
             let difficulty = difficulty_levels[i % difficulty_levels.len()].to_string();
 
