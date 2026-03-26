@@ -43,7 +43,7 @@ fn init_tracing() {
 fn embedding_info() -> (String, usize) {
     let model = EMBEDDING_MODEL_NAME
         .get()
-        .map(|s| s.clone())
+        .cloned()
         .unwrap_or_else(|| "unknown".to_string());
     let dims = EMBEDDING_DIMS.get().copied().unwrap_or(0);
     (model, dims)
