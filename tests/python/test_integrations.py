@@ -153,7 +153,9 @@ class TestPensyveStorage:
     def test_search_score_threshold(self, tmp_storage):
         storage = PensyveStorage(namespace="threshold", path=tmp_storage)
         storage.save("Dogs are great pets")
-        results = storage.search("dogs pets", score_threshold=0.99)
+        # RRF scoring produces values > 1.0 (sum of rank contributions across signals),
+        # so use a threshold well above the possible RRF score range.
+        results = storage.search("dogs pets", score_threshold=100.0)
         assert results == []
 
     def test_search_empty(self, tmp_storage):
