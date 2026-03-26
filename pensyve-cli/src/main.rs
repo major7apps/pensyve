@@ -200,7 +200,9 @@ fn cmd_recall(
         Err(_) => match OnnxEmbedder::new("all-MiniLM-L6-v2") {
             Ok(e) => e,
             Err(_) => {
-                eprintln!("Warning: ONNX embedder unavailable, using mock (semantic search will be degraded)");
+                eprintln!(
+                    "Warning: ONNX embedder unavailable, using mock (semantic search will be degraded)"
+                );
                 OnnxEmbedder::new_mock(768)
             }
         },
@@ -515,7 +517,9 @@ fn cmd_remember(
         Err(_) => match OnnxEmbedder::new("all-MiniLM-L6-v2") {
             Ok(e) => e,
             Err(_) => {
-                eprintln!("Warning: ONNX embedder unavailable, using mock (semantic search will be degraded)");
+                eprintln!(
+                    "Warning: ONNX embedder unavailable, using mock (semantic search will be degraded)"
+                );
                 OnnxEmbedder::new_mock(768)
             }
         },

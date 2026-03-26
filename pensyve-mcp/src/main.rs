@@ -114,10 +114,7 @@ impl PensyveMcpServer {
         name = "pensyve_recall",
         description = "Search memories by semantic similarity and text matching. Returns ranked results from episodic, semantic, and procedural memory."
     )]
-    async fn recall(
-        &self,
-        Parameters(params): Parameters<RecallParams>,
-    ) -> Result<String, String> {
+    async fn recall(&self, Parameters(params): Parameters<RecallParams>) -> Result<String, String> {
         let limit = params.limit.unwrap_or(5) as usize;
         let state = &self.state;
 
@@ -345,10 +342,7 @@ impl PensyveMcpServer {
         name = "pensyve_forget",
         description = "Delete all memories associated with an entity. Returns the count of forgotten memories."
     )]
-    async fn forget(
-        &self,
-        Parameters(params): Parameters<ForgetParams>,
-    ) -> Result<String, String> {
+    async fn forget(&self, Parameters(params): Parameters<ForgetParams>) -> Result<String, String> {
         let state = &self.state;
 
         let entity = match state
@@ -377,7 +371,10 @@ impl PensyveMcpServer {
             let mut vi = state.vector_index.lock().await;
             let dims = vi.dimensions();
             *vi = VectorIndex::new(dims, 1024);
-            if let Ok(memories) = state.storage.get_all_memories_by_namespace(state.namespace.id) {
+            if let Ok(memories) = state
+                .storage
+                .get_all_memories_by_namespace(state.namespace.id)
+            {
                 for mem in &memories {
                     let emb = mem.embedding();
                     if !emb.is_empty() {
