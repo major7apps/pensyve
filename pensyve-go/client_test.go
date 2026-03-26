@@ -35,7 +35,10 @@ func TestEntityCreation(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 	entity, err := client.Entity(context.Background(), "alice", "user")
 	if err != nil {
 		t.Fatal(err)
@@ -90,7 +93,10 @@ func TestRecallWithOptions(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 	memories, err := client.Recall(context.Background(), "rust programming", &RecallOptions{
 		Entity: "alice",
 		Limit:  10,
@@ -125,7 +131,10 @@ func TestRecallWithNilOptions(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 	memories, err := client.Recall(context.Background(), "test", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -160,7 +169,10 @@ func TestRemember(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 	mem, err := client.Remember(context.Background(), "alice", "likes Go", 0.9)
 	if err != nil {
 		t.Fatal(err)
@@ -190,7 +202,10 @@ func TestForget(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 	count, err := client.Forget(context.Background(), "alice", true)
 	if err != nil {
 		t.Fatal(err)
@@ -211,7 +226,10 @@ func TestForgetSoftDelete(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 	count, err := client.Forget(context.Background(), "bob", false)
 	if err != nil {
 		t.Fatal(err)
@@ -277,7 +295,10 @@ func TestEpisodeFlow(t *testing.T) {
 	defer server.Close()
 
 	ctx := context.Background()
-	client := NewClient(Config{BaseURL: server.URL})
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	ep, err := client.StartEpisode(ctx, []string{"alice", "bot"})
 	if err != nil {
@@ -310,8 +331,11 @@ func TestError4xx(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
-	_, err := client.Entity(context.Background(), "nobody", "user")
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Entity(context.Background(), "nobody", "user")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -335,8 +359,11 @@ func TestError5xx(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
-	_, err := client.Health(context.Background())
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Health(context.Background())
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -362,10 +389,13 @@ func TestAPIKeyHeader(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{
+	client, err := NewClient(Config{
 		BaseURL: server.URL,
 		APIKey:  "my-secret-key",
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	result, err := client.Health(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -387,8 +417,11 @@ func TestNoAPIKeyHeaderWhenEmpty(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
-	_, err := client.Health(context.Background())
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Health(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,7 +442,10 @@ func TestConsolidate(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 	result, err := client.Consolidate(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -430,7 +466,10 @@ func TestHealth(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 	result, err := client.Health(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -454,25 +493,34 @@ func TestTrailingSlashStripped(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL + "/"})
-	_, err := client.Health(context.Background())
+	client, err := NewClient(Config{BaseURL: server.URL + "/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Health(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestCustomTimeout(t *testing.T) {
-	client := NewClient(Config{
+	client, err := NewClient(Config{
 		BaseURL: "http://localhost:9999",
 		Timeout: 5 * time.Second,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if client.httpClient.Timeout != 5*time.Second {
 		t.Errorf("expected 5s timeout, got %v", client.httpClient.Timeout)
 	}
 }
 
 func TestDefaultTimeout(t *testing.T) {
-	client := NewClient(Config{BaseURL: "http://localhost:9999"})
+	client, err := NewClient(Config{BaseURL: "http://localhost:9999"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if client.httpClient.Timeout != 30*time.Second {
 		t.Errorf("expected 30s default timeout, got %v", client.httpClient.Timeout)
 	}
@@ -510,8 +558,11 @@ func TestFeedback(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
-	err := client.Feedback(context.Background(), FeedbackRequest{
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.Feedback(context.Background(), FeedbackRequest{
 		MemoryID: "mem-abc",
 		Relevant: true,
 		Signals:  map[string]float64{"click": 1.0},
@@ -534,8 +585,11 @@ func TestFeedbackNoSignals(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
-	err := client.Feedback(context.Background(), FeedbackRequest{
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.Feedback(context.Background(), FeedbackRequest{
 		MemoryID: "mem-xyz",
 		Relevant: false,
 	})
@@ -573,7 +627,10 @@ func TestInspect(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 	result, err := client.Inspect(context.Background(), "alice", &InspectOptions{
 		Limit: 5,
 	})
@@ -617,7 +674,10 @@ func TestInspectNilOptions(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 	result, err := client.Inspect(context.Background(), "bob", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -644,7 +704,10 @@ func TestActivity(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 	items, err := client.Activity(context.Background(), 7)
 	if err != nil {
 		t.Fatal(err)
@@ -681,7 +744,10 @@ func TestRecentActivity(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 	events, err := client.RecentActivity(context.Background(), 3)
 	if err != nil {
 		t.Fatal(err)
@@ -711,7 +777,10 @@ func TestUsage(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 	result, err := client.Usage(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -736,8 +805,11 @@ func TestGDPRErase(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
-	err := client.GDPRErase(context.Background(), "alice")
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.GDPRErase(context.Background(), "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -760,8 +832,11 @@ func TestGDPRErasePathEncoding(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
-	err := client.GDPRErase(context.Background(), "alice/bob")
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.GDPRErase(context.Background(), "alice/bob")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -788,7 +863,10 @@ func TestA2AAgentCard(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 	card, err := client.A2AAgentCard(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -829,7 +907,10 @@ func TestA2ATask(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
 	resp, err := client.A2ATask(context.Background(), A2ATaskRequest{
 		Method: "recall",
 		Input:  map[string]interface{}{"query": "rust"},

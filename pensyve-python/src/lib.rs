@@ -342,6 +342,10 @@ impl PyPensyve {
         limit: usize,
         types: Option<Vec<String>>,
     ) -> PyResult<Vec<PyMemory>> {
+        if query.is_empty() {
+            return Err(PyRuntimeError::new_err("query must not be empty"));
+        }
+
         // NOTE: Lock held across recall (including embedding). RecallEngine borrows &VectorIndex.
         // Future: make RecallEngine lock internally per-operation to allow concurrent recalls.
         let vi = self.inner.vector_index.lock().unwrap();
@@ -415,6 +419,15 @@ impl PyPensyve {
         fact: &str,
         confidence: f32,
     ) -> PyResult<PyMemory> {
+        if fact.is_empty() {
+            return Err(PyRuntimeError::new_err("fact must not be empty"));
+        }
+        if !(0.0..=1.0).contains(&confidence) {
+            return Err(PyRuntimeError::new_err(
+                "confidence must be between 0.0 and 1.0",
+            ));
+        }
+
         let ns_id = self.inner.namespace.id;
 
         // Parse the fact into predicate + object.
@@ -520,7 +533,7 @@ impl PyPensyve {
     /// Args:
     ///     entity: The entity whose memories to forget.
     ///     `hard_delete`: If True, permanently delete; otherwise archive (default: False).
-    #[pyo3(signature = (entity, hard_delete=false))]
+    #[pyo3(signature = (entity, hard_delete=true))]
     #[allow(clippy::needless_pass_by_value)]
     fn forget<'py>(
         &self,
@@ -528,7 +541,12 @@ impl PyPensyve {
         entity: PyRef<'_, PyEntity>,
         hard_delete: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let _ = hard_delete; // Phase 1: always hard delete via storage.
+        // Phase 1: soft delete not yet implemented. Warn if explicitly requested.
+        if !hard_delete {
+            return Err(PyRuntimeError::new_err(
+                "soft delete not yet supported; use hard_delete=True or omit the parameter",
+            ));
+        }
 
         let count = self
             .inner

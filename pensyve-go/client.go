@@ -60,7 +60,10 @@ type Client struct {
 }
 
 // NewClient creates a new Pensyve API client with the given configuration.
-func NewClient(cfg Config) *Client {
+func NewClient(cfg Config) (*Client, error) {
+	if cfg.BaseURL == "" {
+		return nil, fmt.Errorf("BaseURL is required")
+	}
 	hc := cfg.HTTPClient
 	if hc == nil {
 		timeout := cfg.Timeout
@@ -75,7 +78,7 @@ func NewClient(cfg Config) *Client {
 		httpClient: hc,
 		logger:     cfg.Logger,
 		retry:      cfg.Retry,
-	}
+	}, nil
 }
 
 // do performs an HTTP request and decodes the JSON response.
@@ -113,7 +116,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, result inter
 			return nil
 		}
 
-		// Only retry on 5xx errors; 4xx and network errors are not retried.
+		// Only retry on retryable errors (5xx and network errors); 4xx errors are not retried.
 		if !IsRetryable(lastErr) {
 			return lastErr
 		}
@@ -202,6 +205,12 @@ func (c *Client) doOnce(ctx context.Context, method, path string, bodyBytes []by
 
 // Entity creates or retrieves an entity with the given name and kind.
 func (c *Client) Entity(ctx context.Context, name, kind string) (*Entity, error) {
+	if name == "" {
+		return nil, fmt.Errorf("name must not be empty")
+	}
+	if kind == "" {
+		return nil, fmt.Errorf("kind must not be empty")
+	}
 	var entity Entity
 	err := c.do(ctx, "POST", "/v1/entities", entityCreateRequest{
 		Name: name,
@@ -215,6 +224,9 @@ func (c *Client) Entity(ctx context.Context, name, kind string) (*Entity, error)
 
 // Recall searches for memories matching the given query.
 func (c *Client) Recall(ctx context.Context, query string, opts *RecallOptions) ([]Memory, error) {
+	if query == "" {
+		return nil, fmt.Errorf("query must not be empty")
+	}
 	req := recallRequest{
 		Query: query,
 		Limit: 5,
@@ -241,6 +253,15 @@ func (c *Client) Recall(ctx context.Context, query string, opts *RecallOptions) 
 
 // Remember stores a fact for the given entity with the specified confidence.
 func (c *Client) Remember(ctx context.Context, entity, fact string, confidence float64) (*Memory, error) {
+	if entity == "" {
+		return nil, fmt.Errorf("entity must not be empty")
+	}
+	if fact == "" {
+		return nil, fmt.Errorf("fact must not be empty")
+	}
+	if confidence < 0 || confidence > 1 {
+		return nil, fmt.Errorf("confidence must be between 0.0 and 1.0, got %f", confidence)
+	}
 	var memory Memory
 	err := c.do(ctx, "POST", "/v1/remember", rememberRequest{
 		Entity:     entity,
@@ -257,6 +278,9 @@ func (c *Client) Remember(ctx context.Context, entity, fact string, confidence f
 // are permanently deleted; otherwise they are soft-deleted. Returns the number
 // of memories forgotten.
 func (c *Client) Forget(ctx context.Context, entityName string, hardDelete bool) (int, error) {
+	if entityName == "" {
+		return 0, fmt.Errorf("entity must not be empty")
+	}
 	path := "/v1/entities/" + url.PathEscape(entityName)
 	if hardDelete {
 		path += "?hard_delete=true"

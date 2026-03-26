@@ -63,8 +63,11 @@ func TestErrorsIsWrapping(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
-	_, err := client.Entity(context.Background(), "ghost", "user")
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Entity(context.Background(), "ghost", "user")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -93,8 +96,11 @@ func TestError401Sentinel(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
-	_, err := client.Health(context.Background())
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Health(context.Background())
 	if !IsUnauthorized(err) {
 		t.Errorf("expected IsUnauthorized true, got false (err: %v)", err)
 	}
@@ -106,8 +112,11 @@ func TestError429Sentinel(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{BaseURL: server.URL})
-	_, err := client.Health(context.Background())
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Health(context.Background())
 	if !IsRateLimited(err) {
 		t.Errorf("expected IsRateLimited true, got false (err: %v)", err)
 	}
@@ -135,7 +144,7 @@ func TestRetryOnServerError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{
+	client, err := NewClient(Config{
 		BaseURL: server.URL,
 		Retry: &RetryConfig{
 			MaxRetries:     3,
@@ -144,6 +153,9 @@ func TestRetryOnServerError(t *testing.T) {
 			JitterFraction: 0,
 		},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	result, err := client.Health(context.Background())
 	if err != nil {
@@ -166,7 +178,7 @@ func TestNoRetryOn4xx(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{
+	client, err := NewClient(Config{
 		BaseURL: server.URL,
 		Retry: &RetryConfig{
 			MaxRetries:     3,
@@ -175,8 +187,11 @@ func TestNoRetryOn4xx(t *testing.T) {
 			JitterFraction: 0,
 		},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	_, err := client.Health(context.Background())
+	_, err = client.Health(context.Background())
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -194,7 +209,7 @@ func TestRetryExhausted(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(Config{
+	client, err := NewClient(Config{
 		BaseURL: server.URL,
 		Retry: &RetryConfig{
 			MaxRetries:     2,
@@ -203,8 +218,11 @@ func TestRetryExhausted(t *testing.T) {
 			JitterFraction: 0,
 		},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	_, err := client.Health(context.Background())
+	_, err = client.Health(context.Background())
 	if err == nil {
 		t.Fatal("expected error after exhausted retries")
 	}
@@ -226,8 +244,11 @@ func TestNoRetryWhenRetryConfigNil(t *testing.T) {
 	defer server.Close()
 
 	// No Retry config — default nil means no retries.
-	client := NewClient(Config{BaseURL: server.URL})
-	_, err := client.Health(context.Background())
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Health(context.Background())
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -300,12 +321,15 @@ func TestSlogLogging(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	client := NewClient(Config{
+	client, err := NewClient(Config{
 		BaseURL: server.URL,
 		Logger:  logger,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	_, err := client.Health(context.Background())
+	_, err = client.Health(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,8 +353,11 @@ func TestNoLoggingWhenLoggerNil(t *testing.T) {
 	defer server.Close()
 
 	// nil logger must not panic
-	client := NewClient(Config{BaseURL: server.URL})
-	_, err := client.Health(context.Background())
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Health(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,16 +371,19 @@ func TestCustomHTTPClient(t *testing.T) {
 	defer server.Close()
 
 	custom := &http.Client{Timeout: 7 * time.Second}
-	client := NewClient(Config{
+	client, err := NewClient(Config{
 		BaseURL:    server.URL,
 		HTTPClient: custom,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if client.httpClient != custom {
 		t.Error("expected custom HTTP client to be used")
 	}
 
-	_, err := client.Health(context.Background())
+	_, err = client.Health(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

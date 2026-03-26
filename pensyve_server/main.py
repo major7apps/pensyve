@@ -403,7 +403,7 @@ def remember(req: RememberRequest) -> RememberResponse:
     response_model=ForgetResponse,
     dependencies=[Depends(require_role("writer"))],
 )
-def forget(entity_name: str, hard_delete: bool = False) -> ForgetResponse:
+def forget(entity_name: str, hard_delete: bool = True) -> ForgetResponse:
     p = get_pensyve()
     entity = p.entity(entity_name)
     result = p.forget(entity=entity, hard_delete=hard_delete)
@@ -632,16 +632,20 @@ def a2a_task(req: A2ATaskRequest) -> A2ATaskResponse:
     summary="Health check",
     description="Returns server status, version, and active embedding model. Does not require authentication.",
 )
-def health() -> dict[str, str | int]:
+def health():
     try:
+        p = get_pensyve()
         from pensyve._core import embedding_info  # type: ignore[import-untyped]
 
-        embedding_model, embedding_dims = embedding_info()
-    except Exception:
-        embedding_model, embedding_dims = "unknown", 0
-    return {
-        "status": "ok",
-        "version": "0.1.0",
-        "embedding_model": embedding_model,
-        "embedding_dims": embedding_dims,
-    }
+        model, dims = embedding_info()
+        return {
+            "status": "ok",
+            "version": "0.1.0",
+            "embedding_model": model,
+            "embedding_dims": dims,
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "error": str(e)},
+        )

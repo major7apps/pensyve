@@ -1,6 +1,9 @@
 package pensyve
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 // EpisodeHandle represents an active episode that can receive messages
 // and be ended to produce memories.
@@ -8,10 +11,14 @@ type EpisodeHandle struct {
 	client    *Client
 	episodeID string
 	outcome   string
+	closed    bool
 }
 
 // AddMessage sends a message to the active episode.
 func (e *EpisodeHandle) AddMessage(ctx context.Context, role, content string) error {
+	if e.closed {
+		return fmt.Errorf("episode already ended")
+	}
 	var result map[string]interface{}
 	return e.client.do(ctx, "POST", "/v1/episodes/message", episodeMessageRequest{
 		EpisodeID: e.episodeID,
@@ -27,6 +34,7 @@ func (e *EpisodeHandle) SetOutcome(outcome string) {
 
 // End closes the episode and returns the number of memories created.
 func (e *EpisodeHandle) End(ctx context.Context) (int, error) {
+	e.closed = true
 	var resp episodeEndResponse
 	err := e.client.do(ctx, "POST", "/v1/episodes/end", episodeEndRequest{
 		EpisodeID: e.episodeID,

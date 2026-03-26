@@ -1,6 +1,7 @@
 """Rate limiter with Redis backend (managed) or in-memory fallback (local)."""
 
 import os
+import threading
 import time
 
 import structlog
@@ -35,9 +36,10 @@ class _TokenBucket:
 
 _MAX_BUCKETS = 10_000
 _buckets: dict[str, _TokenBucket] = {}
+_buckets_lock = threading.Lock()
 
 
-async def rate_limit_check(request: Request):
+async def rate_limit_check(request: Request):  # noqa: eval is Redis EVAL, not Python eval
     """FastAPI dependency: Redis-backed rate limiting with in-memory fallback."""
     if _RATE_LIMIT <= 0:
         return
@@ -51,6 +53,7 @@ async def rate_limit_check(request: Request):
         redis_client = await get_redis()
         if redis_client:
             redis_key = f"ratelimit:{key}"
+            # Redis EVAL command (server-side Lua) — not Python eval()
             current = int(await redis_client.eval(INCR_EXPIRE_LUA, 1, redis_key, _WINDOW_SECONDS))  # type: ignore[arg-type]
             if current > _RATE_LIMIT:
                 raise RateLimitError("Rate limit exceeded. Try again shortly.")
@@ -61,13 +64,14 @@ async def rate_limit_check(request: Request):
         logger.warning("redis_rate_limit_fallback", key_prefix=key[:12])
 
     # In-memory fallback with bounded bucket cache
-    if key not in _buckets:
-        if len(_buckets) >= _MAX_BUCKETS:
-            # Evict oldest entry (first inserted key)
-            oldest = next(iter(_buckets))
-            del _buckets[oldest]
-        _buckets[key] = _TokenBucket()
-    bucket = _buckets[key]
-    if not bucket.consume():
-        logger.warning("rate_limit_exceeded", key_prefix=key[:12])
-        raise RateLimitError("Rate limit exceeded. Try again shortly.")
+    with _buckets_lock:
+        if key not in _buckets:
+            if len(_buckets) >= _MAX_BUCKETS:
+                # Evict oldest entry (first inserted key)
+                oldest = next(iter(_buckets))
+                del _buckets[oldest]
+            _buckets[key] = _TokenBucket()
+        bucket = _buckets[key]
+        if not bucket.consume():
+            logger.warning("rate_limit_exceeded", key_prefix=key[:12])
+            raise RateLimitError("Rate limit exceeded. Try again shortly.")
