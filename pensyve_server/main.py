@@ -119,6 +119,7 @@ app.add_middleware(MetricsMiddleware)
 app.include_router(metrics_router)
 
 _pensyve: Any | None = None
+_pensyve_lock = threading.Lock()
 _episodes: dict[
     str, dict[str, Any]
 ] = {}  # episode_id -> {"ep": Episode, "message_count": int, "created_at": float}
@@ -143,10 +144,13 @@ def _get_namespace() -> str:
 
 def get_pensyve() -> Any:
     global _pensyve
-    if _pensyve is None:
-        path = os.environ.get("PENSYVE_PATH", None)
-        _pensyve = cast(Any, pensyve.Pensyve(path=path, namespace=_get_namespace()))  # type: ignore[misc]
-    return cast(Any, _pensyve)
+    if _pensyve is not None:
+        return cast(Any, _pensyve)
+    with _pensyve_lock:
+        if _pensyve is None:
+            path = os.environ.get("PENSYVE_PATH", None)
+            _pensyve = cast(Any, pensyve.Pensyve(path=path, namespace=_get_namespace()))  # type: ignore[misc]
+        return cast(Any, _pensyve)
 
 
 def _sweep_stale_episodes() -> None:
@@ -629,11 +633,15 @@ def a2a_task(req: A2ATaskRequest) -> A2ATaskResponse:
     description="Returns server status, version, and active embedding model. Does not require authentication.",
 )
 def health() -> dict[str, str | int]:
-    embedding_model = os.environ.get("_PENSYVE_EMBEDDING_MODEL", "unknown")
-    embedding_dims_str = os.environ.get("_PENSYVE_EMBEDDING_DIMS", "0")
+    try:
+        from pensyve._core import embedding_info  # type: ignore[import-untyped]
+
+        embedding_model, embedding_dims = embedding_info()
+    except Exception:
+        embedding_model, embedding_dims = "unknown", 0
     return {
         "status": "ok",
         "version": "0.1.0",
         "embedding_model": embedding_model,
-        "embedding_dims": int(embedding_dims_str) if embedding_dims_str.isdigit() else 0,
+        "embedding_dims": embedding_dims,
     }

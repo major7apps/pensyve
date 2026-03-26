@@ -47,6 +47,7 @@ impl SqliteBackend {
         // Enable WAL mode for concurrent reads.
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch("PRAGMA busy_timeout=5000;")?;
 
         let backend = Self {
             conn: Mutex::new(conn),
@@ -144,8 +145,7 @@ impl SqliteBackend {
         )?;
         let times: Vec<f64> = stmt
             .query_map(rusqlite::params![memory_id, limit as i64], |row| row.get(0))?
-            .filter_map(Result::ok)
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(times)
     }
 }
@@ -398,7 +398,8 @@ impl StorageTrait for SqliteBackend {
         match result {
             None => Ok(None),
             Some((id_str, name, created_at_str, metadata_str)) => {
-                let id = Uuid::parse_str(&id_str).unwrap_or_default();
+                let id = Uuid::parse_str(&id_str)
+                    .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?;
                 let created_at = str_to_dt(&created_at_str);
                 let metadata: HashMap<String, serde_json::Value> =
                     serde_json::from_str(&metadata_str)?;
@@ -432,7 +433,8 @@ impl StorageTrait for SqliteBackend {
         match result {
             None => Ok(None),
             Some((id_str, name, created_at_str, metadata_str)) => {
-                let id = Uuid::parse_str(&id_str).unwrap_or_default();
+                let id = Uuid::parse_str(&id_str)
+                    .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?;
                 let created_at = str_to_dt(&created_at_str);
                 let metadata: HashMap<String, serde_json::Value> =
                     serde_json::from_str(&metadata_str)?;
@@ -491,8 +493,10 @@ impl StorageTrait for SqliteBackend {
             None => Ok(None),
             Some((id_str, ns_str, name, kind_str, metadata_str, created_at_str)) => {
                 Ok(Some(Entity {
-                    id: Uuid::parse_str(&id_str).unwrap_or_default(),
-                    namespace_id: Uuid::parse_str(&ns_str).unwrap_or_default(),
+                    id: Uuid::parse_str(&id_str)
+                        .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?,
+                    namespace_id: Uuid::parse_str(&ns_str)
+                        .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?,
                     name,
                     kind: str_to_entity_kind(&kind_str),
                     metadata: serde_json::from_str(&metadata_str)?,
@@ -525,8 +529,10 @@ impl StorageTrait for SqliteBackend {
             None => Ok(None),
             Some((id_str, ns_str, name, kind_str, metadata_str, created_at_str)) => {
                 Ok(Some(Entity {
-                    id: Uuid::parse_str(&id_str).unwrap_or_default(),
-                    namespace_id: Uuid::parse_str(&ns_str).unwrap_or_default(),
+                    id: Uuid::parse_str(&id_str)
+                        .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?,
+                    namespace_id: Uuid::parse_str(&ns_str)
+                        .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?,
                     name,
                     kind: str_to_entity_kind(&kind_str),
                     metadata: serde_json::from_str(&metadata_str)?,
@@ -559,6 +565,44 @@ impl StorageTrait for SqliteBackend {
             ],
         )?;
         Ok(())
+    }
+
+    fn get_episode(&self, id: Uuid) -> StorageResult<Option<Episode>> {
+        let conn = lock_conn!(self);
+        let result = conn
+            .query_row(
+                "SELECT id, namespace_id, participants, started_at, ended_at, outcome, metadata FROM episodes WHERE id = ?1",
+                params![id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        match result {
+            None => Ok(None),
+            Some((id_str, ns_str, participants_str, started_at_str, ended_at_str, outcome_str, metadata_str)) => {
+                Ok(Some(Episode {
+                    id: Uuid::parse_str(&id_str)
+                        .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?,
+                    namespace_id: Uuid::parse_str(&ns_str)
+                        .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?,
+                    participants: json_to_uuids(&participants_str),
+                    started_at: str_to_dt(&started_at_str),
+                    ended_at: str_to_opt_dt(ended_at_str.as_deref()),
+                    outcome: outcome_str.as_deref().map(str_to_outcome),
+                    metadata: serde_json::from_str(&metadata_str)?,
+                }))
+            }
+        }
     }
 
     fn update_episode(&self, episode: &Episode) -> StorageResult<()> {
@@ -888,6 +932,18 @@ impl StorageTrait for SqliteBackend {
         namespace_id: Uuid,
         limit: usize,
     ) -> StorageResult<Vec<Memory>> {
+        // Escape the query for FTS5: wrap each token in double quotes to prevent
+        // special characters (?, [, ], *, etc.) from being interpreted as operators.
+        let escaped_query: String = query
+            .split_whitespace()
+            .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if escaped_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let conn = lock_conn!(self);
         let mut stmt = conn.prepare(
             r"SELECT memory_id, memory_type FROM memory_fts
@@ -897,14 +953,13 @@ impl StorageTrait for SqliteBackend {
         let rows: Vec<(String, String)> = stmt
             .query_map(
                 params![
-                    query,
+                    escaped_query,
                     namespace_id.to_string(),
                     i64::try_from(limit).unwrap_or(i64::MAX)
                 ],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?
-            .filter_map(Result::ok)
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut memories = Vec::new();
         for (id_str, mem_type) in rows {
@@ -1030,15 +1085,13 @@ impl StorageTrait for SqliteBackend {
                 "SELECT id FROM episodic_memories WHERE about_entity = ?1 OR source_entity = ?1",
             )?;
             stmt.query_map(params![&id_str], |row| row.get(0))?
-                .filter_map(Result::ok)
-                .collect()
+                .collect::<Result<Vec<_>, _>>()?
         };
 
         let semantic_ids: Vec<String> = {
             let mut stmt = conn.prepare("SELECT id FROM semantic_memories WHERE subject = ?1")?;
             stmt.query_map(params![&id_str], |row| row.get(0))?
-                .filter_map(Result::ok)
-                .collect()
+                .collect::<Result<Vec<_>, _>>()?
         };
 
         let procedural_ids: Vec<String> = {
@@ -1050,8 +1103,7 @@ impl StorageTrait for SqliteBackend {
             // that match our criteria. For now: no direct entity link, so skip.
             let _: Vec<String> = stmt
                 .query_map(params![&id_str], |row| row.get(0))?
-                .filter_map(Result::ok)
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
             Vec::new()
         };
 
@@ -1107,8 +1159,10 @@ impl StorageTrait for SqliteBackend {
         let mut entities = Vec::new();
         for row in rows {
             let (id_str, ns_id_str, name, kind_str, metadata_str, created_at_str) = row?;
-            let id = Uuid::parse_str(&id_str).unwrap_or_default();
-            let ns_id = Uuid::parse_str(&ns_id_str).unwrap_or_default();
+            let id = Uuid::parse_str(&id_str)
+                .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?;
+            let ns_id = Uuid::parse_str(&ns_id_str)
+                .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?;
             let kind = match kind_str.as_str() {
                 "User" => EntityKind::User,
                 "Team" => EntityKind::Team,
@@ -1116,7 +1170,7 @@ impl StorageTrait for SqliteBackend {
                 _ => EntityKind::Agent,
             };
             let metadata: std::collections::HashMap<String, serde_json::Value> =
-                serde_json::from_str(&metadata_str).unwrap_or_default();
+                serde_json::from_str(&metadata_str)?;
             let created_at = str_to_dt(&created_at_str);
             entities.push(Entity {
                 id,
@@ -1188,14 +1242,20 @@ impl StorageTrait for SqliteBackend {
                 superseded_by_opt,
                 metadata_str,
             ) = row?;
-            let id = Uuid::parse_str(&id_str).unwrap_or_default();
-            let source = Uuid::parse_str(&src_str).unwrap_or_default();
-            let target = Uuid::parse_str(&tgt_str).unwrap_or_default();
+            let id = Uuid::parse_str(&id_str)
+                .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?;
+            let source = Uuid::parse_str(&src_str)
+                .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?;
+            let target = Uuid::parse_str(&tgt_str)
+                .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?;
             let valid_at = str_to_dt(&valid_at_str);
             let invalid_at = invalid_at_opt.map(|s| str_to_dt(&s));
-            let superseded_by = superseded_by_opt.and_then(|s| Uuid::parse_str(&s).ok());
+            let superseded_by = superseded_by_opt
+                .map(|s| Uuid::parse_str(&s)
+                    .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}"))))
+                .transpose()?;
             let metadata: std::collections::HashMap<String, serde_json::Value> =
-                serde_json::from_str(&metadata_str).unwrap_or_default();
+                serde_json::from_str(&metadata_str)?;
             edges.push(Edge {
                 id,
                 source,
@@ -1259,6 +1319,11 @@ impl StorageTrait for SqliteBackend {
 // Row mapping helpers (free functions to avoid borrowing issues)
 // ---------------------------------------------------------------------------
 
+/// Parse a UUID string, returning `StorageError::Context` on failure.
+fn parse_uuid(s: &str) -> Result<Uuid, StorageError> {
+    Uuid::parse_str(s).map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))
+}
+
 fn row_to_episodic(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<Result<EpisodicMemory, StorageError>> {
@@ -1278,12 +1343,33 @@ fn row_to_episodic(
     let access_count: u32 = row.get(13)?;
     let last_accessed_str: Option<String> = row.get(14)?;
 
+    let id = match parse_uuid(&id_str) {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(e)),
+    };
+    let namespace_id = match parse_uuid(&ns_str) {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(e)),
+    };
+    let episode_id = match parse_uuid(&ep_str) {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(e)),
+    };
+    let source_entity = match parse_uuid(&src_str) {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(e)),
+    };
+    let about_entity = match parse_uuid(&about_str) {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(e)),
+    };
+
     Ok(Ok(EpisodicMemory {
-        id: Uuid::parse_str(&id_str).unwrap_or_default(),
-        namespace_id: Uuid::parse_str(&ns_str).unwrap_or_default(),
-        episode_id: Uuid::parse_str(&ep_str).unwrap_or_default(),
-        source_entity: Uuid::parse_str(&src_str).unwrap_or_default(),
-        about_entity: Uuid::parse_str(&about_str).unwrap_or_default(),
+        id,
+        namespace_id,
+        episode_id,
+        source_entity,
+        about_entity,
         content,
         content_type: ContentType::from_str(&content_type_str),
         summary,
@@ -1322,16 +1408,31 @@ fn row_to_semantic(
     let stability: f64 = row.get(12)?;
     let retrievability: f64 = row.get(13)?;
 
+    let id = match parse_uuid(&id_str) {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(e)),
+    };
+    let namespace_id = match parse_uuid(&ns_str) {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(e)),
+    };
+    let subject = match parse_uuid(&subject_str) {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(e)),
+    };
+
     Ok(Ok(SemanticMemory {
-        id: Uuid::parse_str(&id_str).unwrap_or_default(),
-        namespace_id: Uuid::parse_str(&ns_str).unwrap_or_default(),
-        subject: Uuid::parse_str(&subject_str).unwrap_or_default(),
+        id,
+        namespace_id,
+        subject,
         predicate,
         object,
         content_type: ContentType::from_str(&content_type_str),
-        object_entity: object_entity_str
-            .as_deref()
-            .and_then(|s| Uuid::parse_str(s).ok()),
+        object_entity: match object_entity_str.as_deref().map(parse_uuid) {
+            Some(Ok(v)) => Some(v),
+            Some(Err(e)) => return Ok(Err(e)),
+            None => None,
+        },
         confidence: confidence as f32,
         valid_at: str_to_dt(&valid_at_str),
         invalid_at: str_to_opt_dt(invalid_at_str.as_deref()),
@@ -1362,12 +1463,23 @@ fn row_to_procedural(
     let created_at_str: String = row.get(11)?;
     let last_used_str: Option<String> = row.get(12)?;
 
-    let context: HashMap<String, serde_json::Value> =
-        serde_json::from_str(&context_str).unwrap_or_default();
+    let context: HashMap<String, serde_json::Value> = match serde_json::from_str(&context_str) {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(StorageError::Serde(e))),
+    };
+
+    let id = match parse_uuid(&id_str) {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(e)),
+    };
+    let namespace_id = match parse_uuid(&ns_str) {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(e)),
+    };
 
     Ok(Ok(ProceduralMemory {
-        id: Uuid::parse_str(&id_str).unwrap_or_default(),
-        namespace_id: Uuid::parse_str(&ns_str).unwrap_or_default(),
+        id,
+        namespace_id,
         trigger,
         action,
         outcome: str_to_outcome(&outcome_str),
