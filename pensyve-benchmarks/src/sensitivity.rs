@@ -23,9 +23,16 @@ pub struct SweepResult {
 /// Sensitivity coefficient via central finite differences at the default value.
 pub fn sensitivity_coefficient(param_values: &[f64], metric_values: &[f64], default: f64) -> f64 {
     assert_eq!(param_values.len(), metric_values.len());
-    let default_idx = param_values.iter().enumerate()
-        .min_by(|(_, a), (_, b)| ((**a) - default).abs().partial_cmp(&((**b) - default).abs()).unwrap())
-        .map(|(i, _)| i).unwrap_or(0);
+    let default_idx = param_values
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            ((**a) - default)
+                .abs()
+                .partial_cmp(&((**b) - default).abs())
+                .unwrap()
+        })
+        .map_or(0, |(i, _)| i);
 
     if default_idx > 0 && default_idx < param_values.len() - 1 {
         let dp = param_values[default_idx + 1] - param_values[default_idx - 1];
@@ -35,13 +42,20 @@ pub fn sensitivity_coefficient(param_values: &[f64], metric_values: &[f64], defa
         let dp = param_values[1] - param_values[0];
         let dm = metric_values[1] - metric_values[0];
         if dp.abs() > 1e-10 { dm / dp } else { 0.0 }
-    } else { 0.0 }
+    } else {
+        0.0
+    }
 }
 
 /// Fraction of sweep range where metric is within `tolerance` of the maximum.
 pub fn robustness_ratio(metric_values: &[f64], tolerance: f64) -> f64 {
-    if metric_values.is_empty() { return 0.0; }
-    let max_val = metric_values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if metric_values.is_empty() {
+        return 0.0;
+    }
+    let max_val = metric_values
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
     let threshold = max_val * (1.0 - tolerance);
     let within = metric_values.iter().filter(|&&m| m >= threshold).count();
     within as f64 / metric_values.len() as f64

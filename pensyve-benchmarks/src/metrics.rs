@@ -1,6 +1,6 @@
 /// Normalized Discounted Cumulative Gain at k.
 ///
-/// DCG = Σ_{i=0}^{k-1} (2^rel_i - 1) / log₂(i + 2)
+/// DCG = Σ_{i=0}^{k-1} (`2^rel_i` - 1) / log₂(i + 2)
 /// NDCG = DCG / IDCG, where IDCG sorts relevances descending.
 /// Returns 0.0 if IDCG is zero.
 pub fn ndcg_at_k(relevances: &[f64], k: usize) -> f64 {
@@ -23,11 +23,7 @@ pub fn ndcg_at_k(relevances: &[f64], k: usize) -> f64 {
         .map(|(i, &rel)| (2f64.powf(rel) - 1.0) / (i as f64 + 2.0).log2())
         .sum();
 
-    if idcg == 0.0 {
-        0.0
-    } else {
-        dcg / idcg
-    }
+    if idcg == 0.0 { 0.0 } else { dcg / idcg }
 }
 
 /// Mean Reciprocal Rank.
@@ -39,8 +35,7 @@ pub fn mrr(relevant_at: &[bool]) -> f64 {
         .iter()
         .enumerate()
         .find(|&(_, &r)| r)
-        .map(|(i, _)| 1.0 / (i as f64 + 1.0))
-        .unwrap_or(0.0)
+        .map_or(0.0, |(i, _)| 1.0 / (i as f64 + 1.0))
 }
 
 /// Accuracy at 1: is the first position relevant?
@@ -69,7 +64,7 @@ pub fn recall_at_k(relevant_at: &[bool], k: usize, total_relevant: usize) -> f64
 
 /// Brier Score: mean squared error between predicted probabilities and binary actuals.
 ///
-/// score = mean((predicted_i - actual_i)²), where actual_i ∈ {0.0, 1.0}.
+/// score = `mean((predicted_i - actual_i)²)`, where `actual_i` ∈ {0.0, 1.0}.
 /// 0.0 = perfect, 1.0 = worst.
 /// Returns 0.0 on an empty slice.
 pub fn brier_score(predicted: &[f64], actual: &[bool]) -> f64 {
@@ -97,10 +92,7 @@ mod tests {
         // Best possible order — NDCG should be exactly 1.0.
         let relevances = [3.0, 2.0, 1.0, 0.0, 0.0];
         let score = ndcg_at_k(&relevances, 5);
-        assert!(
-            (score - 1.0).abs() < 1e-10,
-            "expected ≈1.0, got {score}"
-        );
+        assert!((score - 1.0).abs() < 1e-10, "expected ≈1.0, got {score}");
     }
 
     #[test]
@@ -108,10 +100,7 @@ mod tests {
         // Worst order for the same relevances — NDCG should be well below 1.0.
         let relevances = [0.0, 0.0, 0.0, 2.0, 3.0];
         let score = ndcg_at_k(&relevances, 5);
-        assert!(
-            score < 0.7,
-            "expected < 0.7 for worst ranking, got {score}"
-        );
+        assert!(score < 0.7, "expected < 0.7 for worst ranking, got {score}");
     }
 
     #[test]
@@ -157,9 +146,6 @@ mod tests {
         let predicted = [0.0, 1.0, 0.0, 1.0];
         let actual = [true, false, true, false];
         let score = brier_score(&predicted, &actual);
-        assert!(
-            (score - 1.0).abs() < 1e-10,
-            "expected ≈1.0, got {score}"
-        );
+        assert!((score - 1.0).abs() < 1e-10, "expected ≈1.0, got {score}");
     }
 }

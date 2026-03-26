@@ -3,11 +3,11 @@
 //! Sweeps key parameters one-at-a-time and reports sensitivity coefficients
 //! and robustness ratios.
 //!
-//! Usage: cargo run -p pensyve-benchmarks --bin sensitivity_sweep
+//! Usage: cargo run -p pensyve-benchmarks --bin `sensitivity_sweep`
 
 use pensyve_benchmarks::{corpus, metrics, sensitivity};
-use pensyve_core::embedding::cosine_similarity;
 use pensyve_core::activation::base_level_activation;
+use pensyve_core::embedding::cosine_similarity;
 
 fn main() {
     println!("=== Pensyve Hyperparameter Sensitivity Sweep ===\n");
@@ -27,15 +27,18 @@ fn main() {
     for &d in &decay_values {
         let mut ndcg_scores = Vec::new();
         for query in &corpus.queries {
-            let mut scored: Vec<(usize, f32)> = corpus.memories.iter()
+            let mut scored: Vec<(usize, f32)> = corpus
+                .memories
+                .iter()
                 .enumerate()
                 .map(|(i, mem)| {
                     let cosine = cosine_similarity(&query.embedding, &mem.embedding);
                     // Add activation component
                     let times: Vec<f64> = (0..mem.access_count.max(1))
-                        .map(|j| mem.timestamp_secs - (j as f64 * 3600.0))
+                        .map(|j| mem.timestamp_secs - (f64::from(j) * 3600.0))
                         .collect();
-                    let activation = base_level_activation(&times, mem.timestamp_secs + 86400.0, d as f32);
+                    let activation =
+                        base_level_activation(&times, mem.timestamp_secs + 86400.0, d as f32);
                     let score = 0.7 * cosine + 0.3 * (activation / 10.0).clamp(-1.0, 1.0);
                     (i, score)
                 })
@@ -43,8 +46,16 @@ fn main() {
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
             let top_k = 5;
-            let relevances: Vec<f64> = scored.iter().take(top_k)
-                .map(|(i, _)| if query.gold_memory_ids.contains(&corpus.memories[*i].id) { 1.0 } else { 0.0 })
+            let relevances: Vec<f64> = scored
+                .iter()
+                .take(top_k)
+                .map(|(i, _)| {
+                    if query.gold_memory_ids.contains(&corpus.memories[*i].id) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                })
                 .collect();
             ndcg_scores.push(metrics::ndcg_at_k(&relevances, top_k));
         }
@@ -57,18 +68,20 @@ fn main() {
 
     println!("ACT-R decay parameter sweep:");
     for (v, m) in decay_values.iter().zip(decay_metrics.iter()) {
-        println!("  d={:.1}: NDCG@5 = {:.4}", v, m);
+        println!("  d={v:.1}: NDCG@5 = {m:.4}");
     }
-    println!("  Sensitivity coefficient: {:.4}", coeff);
-    println!("  Robustness ratio (1%): {:.2}", robust);
+    println!("  Sensitivity coefficient: {coeff:.4}");
+    println!("  Robustness ratio (1%): {robust:.2}");
 
     // Write results
     let result = sensitivity::SweepResult {
         parameter: "actr_decay".into(),
         default_value: 0.5,
-        optimal_value: decay_values[decay_metrics.iter().enumerate()
+        optimal_value: decay_values[decay_metrics
+            .iter()
+            .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .map(|(i, _)| i).unwrap_or(0)],
+            .map_or(0, |(i, _)| i)],
         sensitivity_coefficient: coeff,
         robustness_ratio: robust,
         values: decay_values,

@@ -12,38 +12,30 @@ use crate::types::Edge;
 // EdgeType
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EdgeType {
     Temporal,   // "happened before/after"
     Causal,     // "caused", "led to", "because"
+    #[default]
     Entity,     // "about", "mentions", "involves"
     Semantic,   // "similar to", "related to"
     Supersedes, // "replaces", "updates"
-}
-
-impl Default for EdgeType {
-    fn default() -> Self {
-        Self::Entity
-    }
 }
 
 /// How well an edge type aligns with a query intent category.
 /// Returns [0.3, 0.9] — 0.3 is baseline for non-matching types.
 pub fn edge_type_alignment(edge_type: &EdgeType, intent: &str) -> f32 {
     match (edge_type, intent) {
-        (EdgeType::Temporal, "recall") => 0.9,
-        (EdgeType::Causal, "action") => 0.9,
+        (EdgeType::Temporal, "recall") | (EdgeType::Causal, "action") => 0.9,
         (EdgeType::Entity, "question") => 0.8,
-        (EdgeType::Entity, "code") => 0.7,
-        (EdgeType::Semantic, "recall") => 0.7,
-        (EdgeType::Semantic, "question") => 0.7,
+        (EdgeType::Entity, "code") | (EdgeType::Semantic, "recall" | "question") => 0.7,
         (EdgeType::Causal, "code") => 0.6,
         _ => 0.3,
     }
 }
 
 /// Temporal confidence of an edge, decaying exponentially.
-/// confidence(edge, t) = base_confidence × exp(-age_days × ln(2) / half_life)
+/// confidence(edge, t) = `base_confidence` × exp(-age_days × ln(2) / `half_life`)
 pub fn edge_confidence_at(base_confidence: f32, age_days: f32, half_life: f32) -> f32 {
     base_confidence * (-age_days * 2.0_f32.ln() / half_life).exp()
 }
@@ -263,7 +255,7 @@ impl MemoryGraph {
 
     /// Beam search over typed edges with intent-aware scoring.
     ///
-    /// Unlike uniform BFS (traverse()), beam search prioritizes edges
+    /// Unlike uniform BFS (`traverse()`), beam search prioritizes edges
     /// by type alignment, association strength, and temporal confidence.
     ///
     /// intent: one of "question", "action", "recall", "code", "visual", "general"
@@ -274,11 +266,7 @@ impl MemoryGraph {
         beam_width: usize,
         max_depth: usize,
     ) -> Vec<(Uuid, f32)> {
-        let Some(&start_idx) = self.node_map.get(&start) else {
-            return Vec::new();
-        };
-
-        // (negative score for max-heap via BinaryHeap, node_index)
+        // (score for max-heap via BinaryHeap, node_index)
         #[derive(PartialEq)]
         struct Candidate(f32, NodeIndex);
         impl Eq for Candidate {}
@@ -294,6 +282,10 @@ impl MemoryGraph {
                     .unwrap_or(std::cmp::Ordering::Equal)
             }
         }
+
+        let Some(&start_idx) = self.node_map.get(&start) else {
+            return Vec::new();
+        };
 
         let mut visited = HashSet::new();
         visited.insert(start_idx);
@@ -315,38 +307,33 @@ impl MemoryGraph {
                     }
 
                     // Skip invalidated (superseded) edges.
-                    if let Some(meta) = self.edge_meta.get(&edge_ref.id()) {
-                        if meta.invalid_at.is_some() {
+                    if let Some(meta) = self.edge_meta.get(&edge_ref.id())
+                        && meta.invalid_at.is_some() {
                             continue;
                         }
-                    }
 
                     // Compute transition score.
                     let meta = self.edge_meta.get(&edge_ref.id());
 
                     let type_alignment = meta
-                        .map(|m| edge_type_alignment(&m.edge_type, intent))
-                        .unwrap_or(0.3);
+                        .map_or(0.3, |m| edge_type_alignment(&m.edge_type, intent));
 
-                    let edge_weight = meta.map(|m| m.weight).unwrap_or(*edge_ref.weight());
+                    let edge_weight = meta.map_or(*edge_ref.weight(), |m| m.weight);
 
                     let temporal_confidence = meta
-                        .map(|m| {
-                            let age_days = (Utc::now() - m.valid_at).num_seconds() as f32
-                                / 86400.0;
+                        .map_or(1.0, |m| {
+                            let age_days = (Utc::now() - m.valid_at).num_seconds() as f32 / 86400.0;
                             let half_life = m
                                 .metadata
                                 .get("half_life")
-                                .and_then(|v| v.as_f64())
+                                .and_then(serde_json::Value::as_f64)
                                 .unwrap_or(90.0) as f32;
                             edge_confidence_at(1.0, age_days, half_life)
-                        })
-                        .unwrap_or(1.0);
+                        });
 
-                    let transition_score = (0.4 * type_alignment
-                        + 0.4 * edge_weight
-                        + 0.2 * temporal_confidence)
-                        .exp();
+                    let transition_score =
+                        (0.4 * type_alignment + 0.4 * edge_weight + 0.2 * temporal_confidence)
+                            .exp();
 
                     let accumulated = parent_score * transition_score;
 

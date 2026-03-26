@@ -3,11 +3,11 @@
 //! Generates a synthetic corpus, runs recall queries, computes IR metrics
 //! with bootstrap confidence intervals, and outputs JSON results.
 //!
-//! Usage: cargo run -p pensyve-benchmarks --bin monte_carlo_eval
+//! Usage: cargo run -p pensyve-benchmarks --bin `monte_carlo_eval`
 
-use pensyve_benchmarks::{corpus, metrics, stats, BenchmarkConfig, EvalResult};
-use pensyve_core::embedding::cosine_similarity;
 use chrono::Utc;
+use pensyve_benchmarks::{BenchmarkConfig, EvalResult, corpus, metrics, stats};
+use pensyve_core::embedding::cosine_similarity;
 
 fn main() {
     let config = BenchmarkConfig::default();
@@ -26,8 +26,12 @@ fn main() {
         supersession_rate: 0.05,
     };
     let corpus = corpus::generate_corpus(&corpus_config, config.random_seed);
-    println!("Generated {} memories, {} entities, {} queries",
-        corpus.memories.len(), corpus.entities.len(), corpus.queries.len());
+    println!(
+        "Generated {} memories, {} entities, {} queries",
+        corpus.memories.len(),
+        corpus.entities.len(),
+        corpus.queries.len()
+    );
 
     // Run retrieval simulation
     let mut accuracy_scores = Vec::new();
@@ -36,7 +40,9 @@ fn main() {
 
     for query in &corpus.queries {
         // Simulate retrieval: rank all memories by cosine similarity to query
-        let mut scored: Vec<(usize, f32)> = corpus.memories.iter()
+        let mut scored: Vec<(usize, f32)> = corpus
+            .memories
+            .iter()
             .enumerate()
             .map(|(i, mem)| {
                 let sim = cosine_similarity(&query.embedding, &mem.embedding);
@@ -47,17 +53,20 @@ fn main() {
 
         // Take top-5
         let top_k = 5;
-        let top_ids: Vec<uuid::Uuid> = scored.iter()
+        let top_ids: Vec<uuid::Uuid> = scored
+            .iter()
             .take(top_k)
             .map(|(i, _)| corpus.memories[*i].id)
             .collect();
 
         // Compute relevance at each position
-        let relevant_at: Vec<bool> = top_ids.iter()
+        let relevant_at: Vec<bool> = top_ids
+            .iter()
             .map(|id| query.gold_memory_ids.contains(id))
             .collect();
 
-        let relevances: Vec<f64> = relevant_at.iter()
+        let relevances: Vec<f64> = relevant_at
+            .iter()
             .map(|&r| if r { 1.0 } else { 0.0 })
             .collect();
 
@@ -68,16 +77,36 @@ fn main() {
 
     // Compute statistics
     let results = vec![
-        compute_result("monte_carlo", "cosine_baseline", "accuracy_at_1", &accuracy_scores, &config),
-        compute_result("monte_carlo", "cosine_baseline", "mrr", &mrr_scores, &config),
-        compute_result("monte_carlo", "cosine_baseline", "ndcg_at_5", &ndcg_scores, &config),
+        compute_result(
+            "monte_carlo",
+            "cosine_baseline",
+            "accuracy_at_1",
+            &accuracy_scores,
+            &config,
+        ),
+        compute_result(
+            "monte_carlo",
+            "cosine_baseline",
+            "mrr",
+            &mrr_scores,
+            &config,
+        ),
+        compute_result(
+            "monte_carlo",
+            "cosine_baseline",
+            "ndcg_at_5",
+            &ndcg_scores,
+            &config,
+        ),
     ];
 
     // Print results
     println!("\n=== Results ===");
     for r in &results {
-        println!("{}: {:.3} [{:.3}, {:.3}] (95% CI, n={})",
-            r.metric, r.value, r.ci_lower, r.ci_upper, r.n);
+        println!(
+            "{}: {:.3} [{:.3}, {:.3}] (95% CI, n={})",
+            r.metric, r.value, r.ci_lower, r.ci_upper, r.n
+        );
     }
 
     // Write JSON
@@ -96,7 +125,8 @@ fn compute_result(
     config: &BenchmarkConfig,
 ) -> EvalResult {
     let mean = scores.iter().sum::<f64>() / scores.len() as f64;
-    let (ci_lower, ci_upper) = stats::bootstrap_ci(scores, config.bootstrap_resamples, 0.05, config.random_seed);
+    let (ci_lower, ci_upper) =
+        stats::bootstrap_ci(scores, config.bootstrap_resamples, 0.05, config.random_seed);
     EvalResult {
         benchmark: benchmark.to_string(),
         variant: variant.to_string(),

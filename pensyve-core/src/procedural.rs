@@ -364,7 +364,10 @@ mod tests {
         let ctx_b = vec![0.0, 1.0, 0.0];
         let rel_a = context_weighted_reliability(&trials, &ctx_a, 2.0);
         let rel_b = context_weighted_reliability(&trials, &ctx_b, 2.0);
-        assert!(rel_a > rel_b, "Should be more reliable in context A: {rel_a} vs {rel_b}");
+        assert!(
+            rel_a > rel_b,
+            "Should be more reliable in context A: {rel_a} vs {rel_b}"
+        );
     }
 
     #[test]

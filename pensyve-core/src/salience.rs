@@ -39,7 +39,10 @@ mod tests {
     fn test_high_novelty_increases_salience() {
         let high = compute_salience(0.9, 0.5, 0.5, 0.5);
         let low = compute_salience(0.1, 0.5, 0.5, 0.5);
-        assert!(high > low, "high novelty ({high}) should exceed low novelty ({low})");
+        assert!(
+            high > low,
+            "high novelty ({high}) should exceed low novelty ({low})"
+        );
     }
 
     #[test]
@@ -50,7 +53,10 @@ mod tests {
         let high = effective_stability(base, 1.0, beta);
         let low = effective_stability(base, 0.1, beta);
 
-        assert!(high > low, "high salience stability ({high}) should exceed low ({low})");
+        assert!(
+            high > low,
+            "high salience stability ({high}) should exceed low ({low})"
+        );
 
         // Maximum is base * (1 + beta) when salience == 1.0
         let expected_max = base * (1.0 + beta);

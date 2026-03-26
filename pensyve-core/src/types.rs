@@ -179,7 +179,9 @@ pub struct EpisodicMemory {
     pub superseded_by: Option<Uuid>,
 }
 
-fn default_salience() -> f32 { 0.5 }
+fn default_salience() -> f32 {
+    0.5
+}
 
 impl EpisodicMemory {
     pub fn new(

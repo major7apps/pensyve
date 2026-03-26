@@ -3,9 +3,9 @@
 //! Provides bootstrap confidence intervals, effect-size measures, hypothesis
 //! tests, multiple-testing correction, and power analysis.
 
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::Rng;
 
 // ---------------------------------------------------------------------------
 // 1. Bootstrap percentile confidence interval
@@ -63,10 +63,17 @@ pub fn cohens_d_paired(before: &[f64], after: &[f64]) -> f64 {
         after.len(),
         "cohens_d_paired: slices must have equal length"
     );
-    assert!(!before.is_empty(), "cohens_d_paired: slices must not be empty");
+    assert!(
+        !before.is_empty(),
+        "cohens_d_paired: slices must not be empty"
+    );
 
     let n = before.len() as f64;
-    let diffs: Vec<f64> = before.iter().zip(after.iter()).map(|(b, a)| a - b).collect();
+    let diffs: Vec<f64> = before
+        .iter()
+        .zip(after.iter())
+        .map(|(b, a)| a - b)
+        .collect();
 
     let mean_diff = diffs.iter().sum::<f64>() / n;
     let variance = diffs.iter().map(|d| (d - mean_diff).powi(2)).sum::<f64>() / (n - 1.0);
@@ -95,10 +102,11 @@ pub fn cohens_d_paired(before: &[f64], after: &[f64]) -> f64 {
 fn standard_normal_cdf(z: f64) -> f64 {
     // Handle both tails symmetrically.
     let x = z.abs();
-    let t = 1.0 / (1.0 + 0.2316419 * x);
-    let poly = t * (0.319_381_530
-        + t * (-0.356_563_782
-            + t * (1.781_477_937 + t * (-1.821_255_978 + t * 1.330_274_429))));
+    let t = 1.0 / (1.0 + 0.231_641_9 * x);
+    let poly = t
+        * (0.319_381_530
+            + t * (-0.356_563_782
+                + t * (1.781_477_937 + t * (-1.821_255_978 + t * 1.330_274_429))));
     let pdf = (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt();
     let p = 1.0 - pdf * poly;
     if z >= 0.0 { p } else { 1.0 - p }
@@ -110,6 +118,7 @@ fn standard_normal_cdf(z: f64) -> f64 {
 /// tie-breaking. The test statistic is `W+` (sum of positive ranks).
 ///
 /// Returns `(W_plus, p_value)` (two-sided).
+#[allow(clippy::many_single_char_names)]
 pub fn wilcoxon_signed_rank(x: &[f64], y: &[f64]) -> (f64, f64) {
     assert_eq!(
         x.len(),
@@ -144,8 +153,8 @@ pub fn wilcoxon_signed_rank(x: &[f64], y: &[f64]) -> (f64, f64) {
         }
         // Midrank for the tie group [i, j).
         let midrank = (i + j + 1) as f64 / 2.0; // average of 1-based ranks i+1 .. j
-        for k in i..j {
-            ranks[k] = midrank;
+        for rank in ranks.iter_mut().take(j).skip(i) {
+            *rank = midrank;
         }
         i = j;
     }
@@ -201,7 +210,7 @@ pub fn benjamini_hochberg(p_values: &[f64], alpha: f64) -> Vec<bool> {
     let mut result = vec![false; k];
     if let Some(t) = threshold_rank {
         for (rank_minus_one, (orig_idx, _)) in indexed.iter().enumerate() {
-            if rank_minus_one + 1 <= t {
+            if rank_minus_one < t {
                 result[*orig_idx] = true;
             }
         }
@@ -216,14 +225,14 @@ pub fn benjamini_hochberg(p_values: &[f64], alpha: f64) -> Vec<bool> {
 /// Standard normal quantile (inverse CDF) via Beasley–Springer–Moro rational
 /// approximation.
 fn standard_normal_quantile(p: f64) -> f64 {
+    // Coefficients for the rational approximation.
+    const A: [f64; 4] = [2.515_517, 0.802_853, 0.010_328, 0.0];
+    const B: [f64; 4] = [1.0, 1.432_788, 0.189_269, 0.001_308];
+
     assert!(
         p > 0.0 && p < 1.0,
         "standard_normal_quantile: p must be in (0, 1)"
     );
-
-    // Coefficients for the rational approximation.
-    const A: [f64; 4] = [2.515_517, 0.802_853, 0.010_328, 0.0];
-    const B: [f64; 4] = [1.0, 1.432_788, 0.189_269, 0.001_308];
 
     let pp = if p <= 0.5 { p } else { 1.0 - p };
     let t = (-2.0 * pp.ln()).sqrt();
@@ -293,7 +302,10 @@ mod tests {
     fn test_cohens_d_zero_for_identical() {
         let data: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let d = cohens_d_paired(&data, &data);
-        assert!(d.abs() < 1e-6, "Cohen's d for identical data should be ~0, got {d}");
+        assert!(
+            d.abs() < 1e-6,
+            "Cohen's d for identical data should be ~0, got {d}"
+        );
     }
 
     #[test]
@@ -301,7 +313,10 @@ mod tests {
         let before: Vec<f64> = (1..=20).map(|x| x as f64).collect();
         let after: Vec<f64> = before.iter().map(|x| x + 5.0).collect();
         let d = cohens_d_paired(&before, &after);
-        assert!(d > 1.0, "Cohen's d for 5-unit shift should be > 1.0, got {d}");
+        assert!(
+            d > 1.0,
+            "Cohen's d for 5-unit shift should be > 1.0, got {d}"
+        );
     }
 
     // ---- wilcoxon_signed_rank ----
@@ -321,7 +336,10 @@ mod tests {
         let before: Vec<f64> = (1..=20).map(|x| x as f64).collect();
         let after: Vec<f64> = before.iter().map(|x| x + 5.0).collect();
         let (_stat, p) = wilcoxon_signed_rank(&before, &after);
-        assert!(p < 0.05, "5-unit shift on 20 samples should be significant (p={p})");
+        assert!(
+            p < 0.05,
+            "5-unit shift on 20 samples should be significant (p={p})"
+        );
     }
 
     // ---- benjamini_hochberg ----
@@ -342,7 +360,10 @@ mod tests {
     fn test_benjamini_hochberg_all_significant() {
         let p_values = vec![0.001, 0.002, 0.003];
         let rejected = benjamini_hochberg(&p_values, 0.05);
-        assert!(rejected.iter().all(|&r| r), "all should be rejected: {rejected:?}");
+        assert!(
+            rejected.iter().all(|&r| r),
+            "all should be rejected: {rejected:?}"
+        );
     }
 
     #[test]

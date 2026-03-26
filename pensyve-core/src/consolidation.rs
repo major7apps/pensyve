@@ -314,7 +314,12 @@ pub enum ForgettingAction {
     Archive,
 }
 
-pub fn retention_score(age_days: f32, access_count: u32, salience: f32, is_superseded: bool) -> f32 {
+pub fn retention_score(
+    age_days: f32,
+    access_count: u32,
+    salience: f32,
+    is_superseded: bool,
+) -> f32 {
     let age_factor = (-age_days / 30.0).exp();
     let access_factor = ((access_count as f32 + 1.0).ln() / 5.0).min(1.0);
     let superseded_penalty = if is_superseded { -0.3 } else { 0.0 };
@@ -337,7 +342,7 @@ pub fn forgetting_tier(retention: f32) -> ForgettingAction {
 // ---------------------------------------------------------------------------
 
 /// Drifting temporal context vector per session.
-/// c_new = ρ × c_old + (1 - ρ) × embedding
+/// `c_new` = ρ × `c_old` + (1 - ρ) × embedding
 pub struct TemporalContext {
     context: Vec<f32>,
     rho: f32,
@@ -345,7 +350,10 @@ pub struct TemporalContext {
 
 impl TemporalContext {
     pub fn new(dimensions: usize) -> Self {
-        Self { context: vec![0.0; dimensions], rho: 0.85 }
+        Self {
+            context: vec![0.0; dimensions],
+            rho: 0.85,
+        }
     }
 
     pub fn update(&mut self, embedding: &[f32]) {
@@ -354,7 +362,9 @@ impl TemporalContext {
         }
     }
 
-    pub fn current(&self) -> &[f32] { &self.context }
+    pub fn current(&self) -> &[f32] {
+        &self.context
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -362,7 +372,9 @@ impl TemporalContext {
 // ---------------------------------------------------------------------------
 
 pub fn replay_priority(salience: f32, retrievability: f32, is_superseded: bool) -> f32 {
-    if is_superseded { return 0.0; }
+    if is_superseded {
+        return 0.0;
+    }
     salience * (1.0 - retrievability)
 }
 

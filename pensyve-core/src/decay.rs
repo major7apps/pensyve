@@ -175,6 +175,6 @@ mod tests {
     #[test]
     fn test_should_archive_requires_both_low() {
         assert!(!should_archive(5.0, 0.05)); // high storage, low retrieval → keep
-        assert!(should_archive(0.1, 0.05));  // low both → archive
+        assert!(should_archive(0.1, 0.05)); // low both → archive
     }
 }
