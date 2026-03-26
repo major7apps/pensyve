@@ -637,8 +637,7 @@ def health() -> dict[str, str | int]:
         get_pensyve()  # Verify runtime is initialized
         import pensyve._core as _core  # type: ignore[import-untyped]
 
-        _fn: Any = getattr(_core, "embedding_info")
-        info = cast(tuple[str, int], _fn())
+        info = cast(tuple[str, int], _core.embedding_info())  # pyright: ignore[reportUnknownMemberType]
         model, dims = info[0], info[1]
         return {
             "status": "ok",
