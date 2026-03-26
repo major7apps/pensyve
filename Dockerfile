@@ -8,6 +8,7 @@ COPY pensyve-core/ pensyve-core/
 COPY pensyve-python/ pensyve-python/
 COPY pensyve-mcp/ pensyve-mcp/
 COPY pensyve-cli/ pensyve-cli/
+COPY pensyve-benchmarks/ pensyve-benchmarks/
 RUN cargo build --release -p pensyve-mcp -p pensyve-cli
 
 # Stage 2: Build Python wheel via maturin
@@ -24,6 +25,7 @@ COPY pensyve-core/ pensyve-core/
 COPY pensyve-python/ pensyve-python/
 COPY pensyve-mcp/ pensyve-mcp/
 COPY pensyve-cli/ pensyve-cli/
+COPY pensyve-benchmarks/ pensyve-benchmarks/
 ENV PATH="/opt/venv/bin:$PATH"
 RUN maturin build --release --manifest-path pensyve-python/Cargo.toml -o /wheels
 
