@@ -39,7 +39,7 @@ _buckets: dict[str, _TokenBucket] = {}
 _buckets_lock = threading.Lock()
 
 
-async def rate_limit_check(request: Request):  # noqa: eval is Redis EVAL, not Python eval
+async def rate_limit_check(request: Request):
     """FastAPI dependency: Redis-backed rate limiting with in-memory fallback."""
     if _RATE_LIMIT <= 0:
         return
