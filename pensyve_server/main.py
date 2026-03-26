@@ -145,7 +145,7 @@ def _get_namespace() -> str:
 def get_pensyve() -> Any:
     global _pensyve
     if _pensyve is not None:
-        return cast(Any, _pensyve)
+        return _pensyve
     with _pensyve_lock:
         if _pensyve is None:
             path = os.environ.get("PENSYVE_PATH", None)
@@ -632,11 +632,13 @@ def a2a_task(req: A2ATaskRequest) -> A2ATaskResponse:
     summary="Health check",
     description="Returns server status, version, and active embedding model. Does not require authentication.",
 )
-def health():
+def health() -> dict[str, str | int]:
     try:
         get_pensyve()  # Verify runtime is initialized
         from pensyve._core import embedding_info  # type: ignore[import-untyped]
 
+        model: str
+        dims: int
         model, dims = embedding_info()
         return {
             "status": "ok",
@@ -645,7 +647,4 @@ def health():
             "embedding_dims": dims,
         }
     except Exception as e:
-        return JSONResponse(
-            status_code=503,
-            content={"status": "unhealthy", "error": str(e)},
-        )
+        return {"status": "unhealthy", "error": str(e)}
