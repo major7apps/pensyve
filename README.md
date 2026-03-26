@@ -2,6 +2,11 @@
 
 # Pensyve
 
+[![CI](https://github.com/major7apps/pensyve/actions/workflows/ci.yml/badge.svg)](https://github.com/major7apps/pensyve/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88+-orange.svg)](https://www.rust-lang.org/)
+
 Universal memory runtime for AI agents. Framework-agnostic, protocol-native, offline-first.
 
 Agents use Pensyve to remember across sessions, learn from outcomes, and share knowledge — all backed by a Rust core engine with zero cloud dependencies required.

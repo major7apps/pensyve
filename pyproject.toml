@@ -1,7 +1,27 @@
 [project]
-name = "pensyve-workspace"
+name = "pensyve"
 version = "0.1.0"
+description = "Universal memory runtime for AI agents — framework-agnostic, protocol-native, offline-first"
+readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.10"
+authors = [
+    { name = "Major7 Apps" },
+]
+keywords = ["ai", "agents", "memory", "llm", "mcp", "retrieval", "embeddings"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries",
+]
 dependencies = [
     "fastapi>=0.115",
     "uvicorn>=0.34",
@@ -9,6 +29,13 @@ dependencies = [
     "structlog>=24.0,<26.0",
     "redis[hiredis]>=5.0,<8.0",
 ]
+
+[project.urls]
+Homepage = "https://pensyve.com"
+Repository = "https://github.com/major7apps/pensyve"
+Documentation = "https://pensyve.com/docs"
+Changelog = "https://github.com/major7apps/pensyve/blob/main/CHANGELOG.md"
+Issues = "https://github.com/major7apps/pensyve/issues"
 
 [project.optional-dependencies]
 dev = [
