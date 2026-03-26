@@ -352,6 +352,7 @@ impl<'a> RecallEngine<'a> {
     }
 
     /// Like `recall`, but allows specifying a `target_entity` for graph BFS.
+    #[allow(clippy::too_many_lines)]
     #[tracing::instrument(skip_all, fields(query, namespace_id = %namespace_id, limit))]
     pub fn recall_with_entity(
         &self,
@@ -382,17 +383,13 @@ impl<'a> RecallEngine<'a> {
         let now = Utc::now();
 
         // 1. Vector similarity ranking (already have scores from gather_candidates)
-        let mut ranking_vec: Vec<(Uuid, f32)> = vector_map
-            .iter()
-            .map(|(&id, &score)| (id, score))
-            .collect();
+        let mut ranking_vec: Vec<(Uuid, f32)> =
+            vector_map.iter().map(|(&id, &score)| (id, score)).collect();
         ranking_vec.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // 2. BM25 ranking (from FTS results — already gathered)
-        let mut ranking_bm25: Vec<(Uuid, f32)> = bm25_map
-            .iter()
-            .map(|(&id, &score)| (id, score))
-            .collect();
+        let mut ranking_bm25: Vec<(Uuid, f32)> =
+            bm25_map.iter().map(|(&id, &score)| (id, score)).collect();
         ranking_bm25.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // 3. Activation ranking (ACT-R base-level activation)
@@ -403,21 +400,13 @@ impl<'a> RecallEngine<'a> {
                     Memory::Episodic(e) => {
                         // Bootstrap access history from access_count + last_accessed
                         let count = e.access_count.max(1);
-                        let last = e
-                            .last_accessed
-                            .unwrap_or(e.timestamp)
-                            .timestamp() as f64;
+                        let last = e.last_accessed.unwrap_or(e.timestamp).timestamp() as f64;
                         let times: Vec<f64> = (0..count.min(20))
-                            .map(|i| last - (i as f64 * 3600.0))
+                            .map(|i| last - (f64::from(i) * 3600.0))
                             .collect();
-                        activation::base_level_activation(
-                            &times,
-                            now.timestamp() as f64,
-                            0.5,
-                        )
+                        activation::base_level_activation(&times, now.timestamp() as f64, 0.5)
                     }
-                    Memory::Semantic(_) => 0.0,
-                    Memory::Procedural(_) => 0.0,
+                    Memory::Semantic(_) | Memory::Procedural(_) => 0.0,
                 };
                 (id, b)
             })
@@ -461,8 +450,7 @@ impl<'a> RecallEngine<'a> {
                 (id, score)
             })
             .collect();
-        ranking_intent
-            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranking_intent.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // 6. Confidence/reliability ranking
         let mut ranking_confidence: Vec<(Uuid, f32)> = candidates
@@ -499,8 +487,7 @@ impl<'a> RecallEngine<'a> {
         // Use adaptive k based on candidate pool size to preserve rank discrimination
         // at small corpus sizes (k=60 was designed for web-scale IR).
         let effective_k = rrf::adaptive_k(candidates.len(), self.config.rrf_k);
-        let rrf_results =
-            rrf::reciprocal_rank_fusion(&rankings, &rrf_weights, effective_k);
+        let rrf_results = rrf::reciprocal_rank_fusion(&rankings, &rrf_weights, effective_k);
 
         // Pre-compute max_access for access_score normalization.
         let max_access = candidates
@@ -518,18 +505,16 @@ impl<'a> RecallEngine<'a> {
             .iter()
             .filter_map(|&(id, rrf_score)| {
                 candidates.get(&id).map(|mem| {
-                    let vector_score =
-                        vector_map.get(&id).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                    let vector_score = vector_map.get(&id).copied().unwrap_or(0.0).clamp(0.0, 1.0);
                     let bm25_score = bm25_map.get(&id).copied().unwrap_or(0.0);
                     let recency_score = match mem {
                         Memory::Episodic(e) => decay::retrievability(
                             e.stability,
                             decay::elapsed_days(e.timestamp, now),
                         ),
-                        Memory::Semantic(s) => decay::retrievability(
-                            s.stability,
-                            decay::elapsed_days(s.valid_at, now),
-                        ),
+                        Memory::Semantic(s) => {
+                            decay::retrievability(s.stability, decay::elapsed_days(s.valid_at, now))
+                        }
                         Memory::Procedural(p) => decay::retrievability(
                             p.reliability,
                             decay::elapsed_days(p.created_at, now),
@@ -554,8 +539,7 @@ impl<'a> RecallEngine<'a> {
                     let access_score = if max_access == 0 {
                         0.0_f32
                     } else {
-                        ((access_count + 1) as f32).ln()
-                            / ((max_access + 1) as f32).ln()
+                        ((access_count + 1) as f32).ln() / ((max_access + 1) as f32).ln()
                     };
 
                     ScoredCandidate {
@@ -694,10 +678,12 @@ fn has_discriminative_signal(ranking: &[(Uuid, f32)]) -> bool {
     }
     let first = ranking[0].1;
     // If any score differs from the first by more than epsilon, there's signal
-    ranking.iter().any(|(_, score)| (score - first).abs() > 1e-6)
+    ranking
+        .iter()
+        .any(|(_, score)| (score - first).abs() > 1e-6)
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 fn score_candidate(
     id: Uuid,
     memory: Memory,

@@ -6,17 +6,17 @@
 //! prints JSON results.
 //!
 //! Usage:
-//!   cargo build -p pensyve-benchmarks --bin judge_eval
-//!   OPENROUTER_API_KEY=$OPENROUTER_API_KEY cargo run -p pensyve-benchmarks --bin judge_eval
+//!   cargo build -p pensyve-benchmarks --bin `judge_eval`
+//!   `OPENROUTER_API_KEY=$OPENROUTER_API_KEY` cargo run -p pensyve-benchmarks --bin `judge_eval`
 
 use pensyve_benchmarks::{
-    corpus::{generate_corpus, CorpusConfig},
-    judge::{bradley_terry, build_judge_prompt, parse_judge_response, JudgeConfig},
+    corpus::{CorpusConfig, generate_corpus},
+    judge::{JudgeConfig, bradley_terry, build_judge_prompt, parse_judge_response},
 };
 use pensyve_core::embedding::cosine_similarity;
-use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use serde::Serialize;
 use serde_json::json;
 
@@ -96,13 +96,12 @@ fn call_judge(
     });
 
     // Merge extra_body fields (e.g., chat_template_kwargs for Qwen).
-    if let Some(extra) = &config.extra_body {
-        if let (Some(body_obj), Some(extra_obj)) = (body.as_object_mut(), extra.as_object()) {
+    if let Some(extra) = &config.extra_body
+        && let (Some(body_obj), Some(extra_obj)) = (body.as_object_mut(), extra.as_object()) {
             for (k, v) in extra_obj {
                 body_obj.insert(k.clone(), v.clone());
             }
         }
-    }
 
     // Resolve API key from environment if configured.
     let mut request = client
@@ -113,7 +112,7 @@ fn call_judge(
     if let Some(env_var) = &config.api_key_env {
         match std::env::var(env_var) {
             Ok(key) if !key.is_empty() => {
-                request = request.header("Authorization", format!("Bearer {}", key));
+                request = request.header("Authorization", format!("Bearer {key}"));
             }
             Ok(_) => {
                 eprintln!(
@@ -172,22 +171,21 @@ fn call_judge(
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str());
 
-    match content {
-        Some(text) => match parse_judge_response(text) {
+    if let Some(text) = content {
+        match parse_judge_response(text) {
             Ok(rating) => Some(rating),
             Err(e) => {
                 eprintln!("[{}] Failed to parse judge response: {e}", config.name);
                 None
             }
-        },
-        None => {
-            eprintln!(
-                "[{}] No content in response: {}",
-                config.name,
-                &body_text[..body_text.len().min(300)]
-            );
-            None
         }
+    } else {
+        eprintln!(
+            "[{}] No content in response: {}",
+            config.name,
+            &body_text[..body_text.len().min(300)]
+        );
+        None
     }
 }
 
@@ -195,6 +193,7 @@ fn call_judge(
 // Main
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines, clippy::similar_names)]
 fn main() {
     println!("=== Pensyve LLM Judge Evaluation ===");
 
@@ -229,11 +228,10 @@ fn main() {
         .expect("Failed to build HTTP client");
 
     // --- Per-judge win counters: (wins_a, wins_b, ties) ---
-    let mut judge_wins: std::collections::HashMap<String, (usize, usize, usize)> =
-        judges
-            .iter()
-            .map(|j| (j.name.clone(), (0usize, 0usize, 0usize)))
-            .collect();
+    let mut judge_wins: std::collections::HashMap<String, (usize, usize, usize)> = judges
+        .iter()
+        .map(|j| (j.name.clone(), (0usize, 0usize, 0usize)))
+        .collect();
 
     // For Bradley-Terry: (winner_idx, loser_idx, count)
     // strategy_a = index 0, strategy_b = index 1
@@ -242,7 +240,12 @@ fn main() {
     let mut per_query_results: Vec<QueryResult> = Vec::new();
 
     let total_calls = corpus.queries.len() * judges.len();
-    println!("Running {} queries × {} judges = {} API calls\n", corpus.queries.len(), judges.len(), total_calls);
+    println!(
+        "Running {} queries × {} judges = {} API calls\n",
+        corpus.queries.len(),
+        judges.len(),
+        total_calls
+    );
 
     for (q_idx, query) in corpus.queries.iter().enumerate() {
         // --- Strategy A: top-5 by cosine similarity ---
@@ -271,7 +274,12 @@ fn main() {
         let results_a_refs: Vec<&str> = results_a.iter().map(String::as_str).collect();
         let results_b_refs: Vec<&str> = results_b.iter().map(String::as_str).collect();
 
-        print!("Query {}/{}: \"{}\" ", q_idx + 1, corpus.queries.len(), query.text);
+        print!(
+            "Query {}/{}: \"{}\" ",
+            q_idx + 1,
+            corpus.queries.len(),
+            query.text
+        );
 
         for judge_config in &judges {
             print!("[{}] ", judge_config.name);
@@ -322,7 +330,10 @@ fn main() {
                     });
                 }
                 None => {
-                    eprintln!("\n[{}] Skipping query {q_idx} due to error", judge_config.name);
+                    eprintln!(
+                        "\n[{}] Skipping query {q_idx} due to error",
+                        judge_config.name
+                    );
                 }
             }
         }
@@ -374,8 +385,8 @@ fn main() {
     }
 
     println!("\n=== Bradley-Terry Strengths ===");
-    println!("Strategy A (cosine top-5): {:.4}", strength_a);
-    println!("Strategy B (shuffled baseline): {:.4}", strength_b);
+    println!("Strategy A (cosine top-5): {strength_a:.4}");
+    println!("Strategy B (shuffled baseline): {strength_b:.4}");
 
     // --- Emit JSON output ---
     let output = FinalOutput {

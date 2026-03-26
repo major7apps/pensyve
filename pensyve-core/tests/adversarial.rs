@@ -1,5 +1,5 @@
-use pensyve_core::embedding::cosine_similarity;
 use pensyve_core::activation::base_level_activation;
+use pensyve_core::embedding::cosine_similarity;
 use pensyve_core::rrf::reciprocal_rank_fusion;
 use pensyve_core::vector::VectorIndex;
 use uuid::Uuid;

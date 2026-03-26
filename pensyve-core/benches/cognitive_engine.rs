@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use uuid::Uuid;
 
 fn bench_cosine_768(c: &mut Criterion) {
@@ -20,7 +20,11 @@ fn bench_base_level_activation(c: &mut Criterion) {
 
 fn bench_rrf_fusion(c: &mut Criterion) {
     let rankings: Vec<Vec<(Uuid, f32)>> = (0..6)
-        .map(|_| (0..100).map(|i| (Uuid::new_v4(), 1.0 - i as f32 / 100.0)).collect())
+        .map(|_| {
+            (0..100)
+                .map(|i| (Uuid::new_v4(), 1.0 - i as f32 / 100.0))
+                .collect()
+        })
         .collect();
     let weights = vec![1.0_f32, 0.8, 1.0, 0.8, 0.5, 0.5];
     c.bench_function("rrf_6x100", |bencher| {
@@ -42,5 +46,11 @@ fn bench_ring_buffer(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_cosine_768, bench_base_level_activation, bench_rrf_fusion, bench_ring_buffer);
+criterion_group!(
+    benches,
+    bench_cosine_768,
+    bench_base_level_activation,
+    bench_rrf_fusion,
+    bench_ring_buffer
+);
 criterion_main!(benches);

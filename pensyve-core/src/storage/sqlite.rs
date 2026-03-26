@@ -11,6 +11,7 @@ use crate::types::{
     ProceduralMemory, SemanticMemory,
 };
 
+use crate::graph::EdgeType;
 use super::{StorageError, StorageResult, StorageTrait};
 
 // ---------------------------------------------------------------------------
@@ -131,7 +132,12 @@ impl SqliteBackend {
     }
 
     /// Retrieve the most recent access timestamps for a memory, newest first.
-    pub fn get_access_times(&self, memory_id: &str, limit: usize) -> Result<Vec<f64>, StorageError> {
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn get_access_times(
+        &self,
+        memory_id: &str,
+        limit: usize,
+    ) -> Result<Vec<f64>, StorageError> {
         let conn = lock_conn!(self);
         let mut stmt = conn.prepare(
             "SELECT accessed_at FROM memory_accesses WHERE memory_id = ?1 ORDER BY accessed_at DESC LIMIT ?2"
@@ -1200,7 +1206,7 @@ impl StorageTrait for SqliteBackend {
                 invalid_at,
                 superseded_by,
                 metadata,
-                edge_type: Default::default(),
+                edge_type: EdgeType::default(),
             });
         }
         Ok(edges)

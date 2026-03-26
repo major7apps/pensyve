@@ -1,6 +1,6 @@
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::Rng;
 use rand_distr::Normal;
 use uuid::Uuid;
 
@@ -153,19 +153,14 @@ pub fn generate_corpus(config: &CorpusConfig, seed: u64) -> SyntheticCorpus {
 
             // Guarantee at least one gold memory: pick the closest non-superseded memory
             // in this cluster if the list is still empty.
-            if gold_memory_ids.is_empty() {
-                if let Some(best) = memories
-                    .iter()
-                    .filter(|m| !m.superseded)
-                    .max_by(|a, b| {
-                        cosine_similarity(&a.embedding, &embedding)
-                            .partial_cmp(&cosine_similarity(&b.embedding, &embedding))
-                            .unwrap()
-                    })
-                {
+            if gold_memory_ids.is_empty()
+                && let Some(best) = memories.iter().filter(|m| !m.superseded).max_by(|a, b| {
+                    cosine_similarity(&a.embedding, &embedding)
+                        .partial_cmp(&cosine_similarity(&b.embedding, &embedding))
+                        .unwrap()
+                }) {
                     gold_memory_ids.push(best.id);
                 }
-            }
 
             let difficulty = difficulty_levels[i % difficulty_levels.len()].to_string();
 

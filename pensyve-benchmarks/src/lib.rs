@@ -1,9 +1,9 @@
-pub mod stats;
-pub mod metrics;
 pub mod corpus;
 pub mod judge;
-pub mod sensitivity;
+pub mod metrics;
 pub mod resilience;
+pub mod sensitivity;
+pub mod stats;
 
 use serde::{Deserialize, Serialize};
 

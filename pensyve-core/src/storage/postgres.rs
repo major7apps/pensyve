@@ -14,6 +14,7 @@ use crate::types::{
     ProceduralMemory, SemanticMemory,
 };
 
+use crate::graph::EdgeType;
 use super::{StorageResult, StorageTrait};
 
 // ---------------------------------------------------------------------------
@@ -101,30 +102,27 @@ impl PostgresBackend {
     ///
     /// This will create a connection pool and run the schema migration.
     pub fn new(database_url: &str) -> StorageResult<Self> {
-        let pool = match Handle::try_current() {
-            Ok(handle) => {
-                // Already in an async context — block in place to avoid nested runtime panic
-                tokio::task::block_in_place(|| {
-                    handle.block_on(async {
-                        PgPoolOptions::new()
-                            .max_connections(10)
-                            .connect(database_url)
-                            .await
-                            .map_err(sqlx_to_io)
-                    })
-                })?
-            }
-            Err(_) => {
-                // No async context — create a blocking runtime for pool init
-                let init_rt = Runtime::new().map_err(io_err)?;
-                init_rt.block_on(async {
+        let pool = if let Ok(handle) = Handle::try_current() {
+            // Already in an async context — block in place to avoid nested runtime panic
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
                     PgPoolOptions::new()
                         .max_connections(10)
                         .connect(database_url)
                         .await
                         .map_err(sqlx_to_io)
-                })?
-            }
+                })
+            })?
+        } else {
+            // No async context — create a blocking runtime for pool init
+            let init_rt = Runtime::new().map_err(io_err)?;
+            init_rt.block_on(async {
+                PgPoolOptions::new()
+                    .max_connections(10)
+                    .connect(database_url)
+                    .await
+                    .map_err(sqlx_to_io)
+            })?
         };
 
         let rt = Runtime::new().map_err(io_err)?;
@@ -1069,7 +1067,7 @@ impl StorageTrait for PostgresBackend {
                             invalid_at,
                             superseded_by,
                             metadata,
-                            edge_type: Default::default(),
+                            edge_type: EdgeType::default(),
                         }
                     },
                 )

@@ -19,7 +19,7 @@ pub fn base_level_activation(access_times: &[f64], now: f64, decay: f32) -> f32 
         return -20.0;
     }
 
-    let d = decay as f64;
+    let d = f64::from(decay);
     let sum: f64 = access_times
         .iter()
         .filter_map(|&t_k| {
@@ -133,9 +133,9 @@ impl AccessRingBuffer {
         // Generate `access_count` synthetic timestamps spaced 1 second apart,
         // ending at `last_accessed`.  We only keep the most recent `capacity`
         // of them (the ring buffer evicts the rest automatically).
-        let count = access_count as f64;
+        let count = f64::from(access_count);
         for i in 0..access_count {
-            let t = last_accessed - (count - 1.0 - i as f64);
+            let t = last_accessed - (count - 1.0 - f64::from(i));
             buf.push(t);
         }
 
@@ -153,10 +153,7 @@ mod tests {
         let now = 1000.0_f64;
         let access_times = [now - 1.0];
         let result = base_level_activation(&access_times, now, 0.5);
-        assert!(
-            (result - 0.0).abs() < 1e-5,
-            "expected ≈0.0, got {result}"
-        );
+        assert!((result - 0.0).abs() < 1e-5, "expected ≈0.0, got {result}");
     }
 
     #[test]
@@ -230,7 +227,10 @@ mod tests {
         // Oldest retained item is the 4th pushed (40.0 → wait, items 4..=8 kept)
         // Items pushed: 10, 20, 30, 40, 50, 60, 70, 80.
         // After 8 pushes with cap=5, retained are: 40, 50, 60, 70, 80.
-        assert_eq!(ts, vec![40.0, 50.0, 60.0, 70.0, 80.0],
-            "timestamps() should return oldest-first: {ts:?}");
+        assert_eq!(
+            ts,
+            vec![40.0, 50.0, 60.0, 70.0, 80.0],
+            "timestamps() should return oldest-first: {ts:?}"
+        );
     }
 }

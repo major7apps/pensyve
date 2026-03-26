@@ -182,6 +182,7 @@ fn build_vector_index(
 // Subcommand handlers
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 fn cmd_recall(
     query: &str,
     entity_filter: Option<&str>,

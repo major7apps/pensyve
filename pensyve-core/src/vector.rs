@@ -22,7 +22,7 @@ pub enum VectorError {
 // VectorIndex
 // ---------------------------------------------------------------------------
 
-/// Brute-force UUID-keyed vector index backed by a HashMap.
+/// Brute-force UUID-keyed vector index backed by a `HashMap`.
 /// Suitable for Phase 1 where memory counts stay below ~100K entries.
 /// Similarity search is O(n) via cosine similarity; removal is O(1).
 pub struct VectorIndex {

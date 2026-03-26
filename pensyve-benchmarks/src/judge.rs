@@ -1,7 +1,7 @@
 //! LLM-as-judge evaluation framework.
 //!
 //! Supports pairwise comparison of retrieval results using multiple LLM judges
-//! (Claude, Qwen local, Gemini via OpenRouter). Aggregates win rates into
+//! (Claude, Qwen local, Gemini via `OpenRouter`). Aggregates win rates into
 //! strength parameters via the Bradley-Terry MM algorithm.
 
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Configuration for an LLM judge endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JudgeConfig {
-    /// Human-readable name for this judge (e.g. "claude", "qwen_local").
+    /// Human-readable name for this judge (e.g. "claude", "`qwen_local`").
     pub name: String,
     /// Full URL of the completions/messages endpoint.
     pub endpoint: String,
@@ -31,7 +31,7 @@ pub struct JudgeConfig {
 }
 
 impl JudgeConfig {
-    /// Claude Sonnet 4.6 via OpenRouter (avoids separate Anthropic API key).
+    /// Claude Sonnet 4.6 via `OpenRouter` (avoids separate Anthropic API key).
     pub fn claude() -> Self {
         Self {
             name: "claude".to_string(),
@@ -64,7 +64,7 @@ impl JudgeConfig {
         }
     }
 
-    /// Google Gemini 2.5 Flash Lite via the OpenRouter gateway.
+    /// Google Gemini 2.5 Flash Lite via the `OpenRouter` gateway.
     pub fn gemini_flash_openrouter() -> Self {
         Self {
             name: "gemini_flash_openrouter".to_string(),
@@ -297,8 +297,14 @@ mod tests {
     #[test]
     fn test_judge_prompt_generation() {
         let query = "What is the capital of France?";
-        let results_a = &["Paris is the capital of France.", "France is in Western Europe."];
-        let results_b = &["Lyon is the second-largest city.", "Marseille is a port city."];
+        let results_a = &[
+            "Paris is the capital of France.",
+            "France is in Western Europe.",
+        ];
+        let results_b = &[
+            "Lyon is the second-largest city.",
+            "Marseille is a port city.",
+        ];
 
         let prompt = build_judge_prompt(query, results_a, results_b);
 
@@ -354,7 +360,10 @@ mod tests {
     fn test_parse_judge_response_valid_with_markdown_fence() {
         let raw = "```json\n{\"relevance\": 5, \"completeness\": 5, \"ranking_quality\": 4, \"noise\": 3, \"overall\": \"Both\"}\n```";
         let result = parse_judge_response(raw);
-        assert!(result.is_ok(), "expected Ok for markdown-wrapped JSON, got {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected Ok for markdown-wrapped JSON, got {result:?}"
+        );
         let rating = result.unwrap();
         assert_eq!(rating.overall, "Both");
     }
@@ -365,10 +374,7 @@ mod tests {
     fn test_parse_judge_response_invalid() {
         let raw = "not json";
         let result = parse_judge_response(raw);
-        assert!(
-            result.is_err(),
-            "expected Err for non-JSON input, got Ok"
-        );
+        assert!(result.is_err(), "expected Err for non-JSON input, got Ok");
     }
 
     // ---- test_bradley_terry_equal ----

@@ -43,7 +43,7 @@ impl Default for ActivationConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FsrsConfig {
-    /// Salience modulation strength. S_eff = S × (1 + beta × salience).
+    /// Salience modulation strength. `S_eff` = S × (1 + beta × salience).
     pub salience_beta: f32,
     /// Difficulty increase on failed recall.
     pub difficulty_increase_on_forget: u8,
@@ -62,7 +62,7 @@ impl Default for FsrsConfig {
 pub struct RetrievalConfig {
     pub default_limit: usize,
     pub max_candidates: usize,
-    pub weights: [f32; 8],  // KEEP for backward compatibility
+    pub weights: [f32; 8], // KEEP for backward compatibility
     pub recall_timeout_secs: u64,
     // NEW fields:
     /// RRF constant k. Default 60.
@@ -79,10 +79,18 @@ pub struct RetrievalConfig {
     pub max_depth: usize,
 }
 
-fn default_rrf_k() -> u32 { 60 }
-fn default_rrf_weights() -> [f32; 6] { [1.0, 0.8, 1.0, 0.8, 0.5, 0.5] }
-fn default_beam_width() -> usize { 10 }
-fn default_max_depth() -> usize { 4 }
+fn default_rrf_k() -> u32 {
+    60
+}
+fn default_rrf_weights() -> [f32; 6] {
+    [1.0, 0.8, 1.0, 0.8, 0.5, 0.5]
+}
+fn default_beam_width() -> usize {
+    10
+}
+fn default_max_depth() -> usize {
+    4
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsolidationConfig {

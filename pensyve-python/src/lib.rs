@@ -103,7 +103,9 @@ fn memory_confidence(mem: &types::Memory) -> f32 {
 }
 
 /// Extract episodic-only fields: (salience, `storage_strength`, `event_time`, `superseded_by`).
-fn episodic_fields(mem: &types::Memory) -> (Option<f32>, Option<f32>, Option<String>, Option<String>) {
+fn episodic_fields(
+    mem: &types::Memory,
+) -> (Option<f32>, Option<f32>, Option<String>, Option<String>) {
     match mem {
         types::Memory::Episodic(m) => (
             Some(m.salience),

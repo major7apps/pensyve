@@ -1,25 +1,21 @@
-/// PMI Surprise Signal
-///
-/// Computes pointwise mutual information between a query and a memory item.
-/// Memories that are unexpectedly relevant (high cosine similarity but low base rate)
-/// receive a higher surprise score, boosting their rank in the RRF pipeline.
-///
-/// Based on the MIS framework (arXiv:2508.17403).
+//! PMI Surprise Signal
+//!
+//! Computes pointwise mutual information between a query and a memory item.
+//! Memories that are unexpectedly relevant (high cosine similarity but low base rate)
+//! receive a higher surprise score, boosting their rank in the RRF pipeline.
+//!
+//! Based on the MIS framework (arXiv:2508.17403).
 
 /// Computes PMI(m; q) ≈ ln(P(m,q) / (P(m) × P(q)))
 ///
 /// # Arguments
 /// - `cosine_sim`: cosine similarity between query and memory embeddings [0.0, 1.0]
-/// - `base_rate`: access_count / total_accesses — how often this memory is accessed
+/// - `base_rate`: `access_count` / `total_accesses` — how often this memory is accessed
 /// - `namespace_size`: total number of memories in the namespace (for uniform query prior)
 ///
 /// # Returns
 /// PMI score clamped to [-2.0, 5.0]
-pub fn pointwise_mutual_information(
-    cosine_sim: f32,
-    base_rate: f32,
-    namespace_size: usize,
-) -> f32 {
+pub fn pointwise_mutual_information(cosine_sim: f32, base_rate: f32, namespace_size: usize) -> f32 {
     let p_m = base_rate.max(1e-6_f32);
     // p_q = uniform prior over memories: 1 / namespace_size
     // Used for future calibration; factored out of the ratio below.

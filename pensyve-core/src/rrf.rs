@@ -15,7 +15,7 @@ use uuid::Uuid;
 /// k=60 is designed for web-scale IR (thousands of candidates).
 /// For small corpora, k must be much smaller to preserve rank discrimination.
 ///
-/// Formula: k = max(1, candidate_count / 10)
+/// Formula: k = max(1, `candidate_count` / 10)
 /// - 50 candidates → k=5 (ratio between rank 1 and 50 = 11:1)
 /// - 100 candidates → k=10
 /// - 1000 candidates → k=60 (capped at original Cormack recommendation)
@@ -51,11 +51,11 @@ pub fn reciprocal_rank_fusion(
         return Vec::new();
     }
 
-    let k_f = k as f64;
+    let k_f = f64::from(k);
     let mut scores: HashMap<Uuid, f64> = HashMap::new();
 
     for (ranking, &weight) in rankings.iter().zip(weights.iter()) {
-        let w = weight as f64;
+        let w = f64::from(weight);
         for (rank_0, (id, _original_score)) in ranking.iter().enumerate() {
             let rank_1 = (rank_0 + 1) as f64; // convert to 1-indexed
             let contribution = w / (k_f + rank_1);
@@ -110,7 +110,10 @@ mod tests {
         // id(4): 1/61 ≈ 0.01639
         let pos_id2 = result.iter().position(|(uid, _)| *uid == id(2)).unwrap();
         let pos_id1 = result.iter().position(|(uid, _)| *uid == id(1)).unwrap();
-        assert!(pos_id2 < pos_id1, "consensus item (id2) should rank above id1");
+        assert!(
+            pos_id2 < pos_id1,
+            "consensus item (id2) should rank above id1"
+        );
     }
 
     #[test]
@@ -160,7 +163,11 @@ mod tests {
 
         // Order is preserved regardless of k
         assert_eq!(result_low_k[0].0, id(1), "id1 should be first under low k");
-        assert_eq!(result_high_k[0].0, id(1), "id1 should be first under high k");
+        assert_eq!(
+            result_high_k[0].0,
+            id(1),
+            "id1 should be first under high k"
+        );
     }
 
     #[test]
@@ -196,6 +203,9 @@ mod tests {
 
         // With k=5: ratio = (1/(5+1)) / (1/(5+50)) ≈ 9.2
         // With k=60: ratio = (1/(60+1)) / (1/(60+50)) ≈ 1.8
-        assert!(ratio > 5.0, "Adaptive k should give strong discrimination, ratio={ratio}");
+        assert!(
+            ratio > 5.0,
+            "Adaptive k should give strong discrimination, ratio={ratio}"
+        );
     }
 }
