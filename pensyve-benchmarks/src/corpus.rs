@@ -1,7 +1,7 @@
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand_distr::Normal;
+use rand_distr::{Distribution, Normal};
 use uuid::Uuid;
 
 /// Configuration for synthetic corpus generation.
@@ -92,7 +92,7 @@ pub fn generate_corpus(config: &CorpusConfig, seed: u64) -> SyntheticCorpus {
     let centroids: Vec<Vec<f32>> = (0..config.n_clusters)
         .map(|_| {
             let raw: Vec<f32> = (0..config.dimensions)
-                .map(|_| rng.sample(noise_centroid))
+                .map(|_| noise_centroid.sample(&mut rng))
                 .collect();
             normalize(&raw)
         })
@@ -109,7 +109,7 @@ pub fn generate_corpus(config: &CorpusConfig, seed: u64) -> SyntheticCorpus {
 
             let raw: Vec<f32> = centroids[cluster_idx]
                 .iter()
-                .map(|&c| c + rng.sample(noise_memory))
+                .map(|&c| c + noise_memory.sample(&mut rng))
                 .collect();
             let embedding = normalize(&raw);
 
@@ -135,7 +135,7 @@ pub fn generate_corpus(config: &CorpusConfig, seed: u64) -> SyntheticCorpus {
 
             let raw: Vec<f32> = centroids[cluster_idx]
                 .iter()
-                .map(|&c| c + rng.sample(noise_query))
+                .map(|&c| c + noise_query.sample(&mut rng))
                 .collect();
             let embedding = normalize(&raw);
 
