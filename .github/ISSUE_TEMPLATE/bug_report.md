@@ -1,23 +1,15 @@
 ---
 name: Bug Report
-about: Report a bug in Pensyve
+about: Something isn't working
+title: ""
 labels: bug
 ---
 
-**Describe the bug**
-A clear description of what the bug is.
+**What happened?**
 
-**To Reproduce**
-Steps or code to reproduce:
-```rust
-// your code here
-```
-
-**Expected behavior**
-What you expected to happen.
+**Steps to reproduce**
 
 **Environment**
-- Rust version:
-- OS:
 - Pensyve version:
-- Storage backend: SQLite / Postgres
+- Interface (Python SDK / REST API / MCP / TS / Go / CLI):
+- OS:
