@@ -25,7 +25,7 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/bun": "^1.3.11",
-    "eslint": "^10.0.3",
+    "eslint": "^10.1.0",
     "jiti": "^2.6.1",
     "typescript": "^6.0.2",
     "typescript-eslint": "^8.57.2"
