@@ -194,9 +194,19 @@ fn cmd_recall(
     let storage = open_storage(&path)?;
     let ns = ensure_namespace(&storage, namespace_name)?;
 
-    // Mock embedder with 768 dimensions (matching default config: Alibaba-NLP/gte-base-en-v1.5).
-    let embedder = OnnxEmbedder::new_mock(768);
-    let vector_index = build_vector_index(&storage, ns.id, 768)?;
+    // Try real ONNX embedder with fallback to mock.
+    let embedder = match OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5") {
+        Ok(e) => e,
+        Err(_) => match OnnxEmbedder::new("all-MiniLM-L6-v2") {
+            Ok(e) => e,
+            Err(_) => {
+                eprintln!("Warning: ONNX embedder unavailable, using mock (semantic search will be degraded)");
+                OnnxEmbedder::new_mock(768)
+            }
+        },
+    };
+    let dimensions = embedder.dimensions();
+    let vector_index = build_vector_index(&storage, ns.id, dimensions)?;
 
     let config = RetrievalConfig {
         default_limit: limit,
@@ -499,8 +509,17 @@ fn cmd_remember(
 
     let mut mem = SemanticMemory::new(ns.id, entity.id, predicate, object, confidence as f32);
 
-    // Embed using the mock embedder (768 dims) so the memory is searchable.
-    let embedder = OnnxEmbedder::new_mock(768);
+    // Embed using real ONNX embedder with fallback to mock.
+    let embedder = match OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5") {
+        Ok(e) => e,
+        Err(_) => match OnnxEmbedder::new("all-MiniLM-L6-v2") {
+            Ok(e) => e,
+            Err(_) => {
+                eprintln!("Warning: ONNX embedder unavailable, using mock (semantic search will be degraded)");
+                OnnxEmbedder::new_mock(768)
+            }
+        },
+    };
     mem.embedding = embedder.embed(fact)?;
 
     storage.save_semantic(&mem)?;

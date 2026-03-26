@@ -114,7 +114,10 @@ impl PensyveMcpServer {
         name = "pensyve_recall",
         description = "Search memories by semantic similarity and text matching. Returns ranked results from episodic, semantic, and procedural memory."
     )]
-    async fn recall(&self, Parameters(params): Parameters<RecallParams>) -> String {
+    async fn recall(
+        &self,
+        Parameters(params): Parameters<RecallParams>,
+    ) -> Result<String, String> {
         let limit = params.limit.unwrap_or(5) as usize;
         let state = &self.state;
 
@@ -127,55 +130,54 @@ impl PensyveMcpServer {
             &state.retrieval_config,
         );
 
-        match engine.recall(&params.query, state.namespace.id, limit) {
-            Ok(result) => {
-                let memories: Vec<serde_json::Value> = result
-                    .memories
-                    .iter()
-                    .filter(|c| {
-                        if let Some(types) = &params.types {
-                            let type_name = match &c.memory {
-                                pensyve_core::types::Memory::Episodic(_) => "episodic",
-                                pensyve_core::types::Memory::Semantic(_) => "semantic",
-                                pensyve_core::types::Memory::Procedural(_) => "procedural",
-                            };
-                            types.iter().any(|t| t == type_name)
-                        } else {
-                            true
-                        }
-                    })
-                    .map(|c| {
-                        let type_name = match &c.memory {
-                            pensyve_core::types::Memory::Episodic(_) => "episodic",
-                            pensyve_core::types::Memory::Semantic(_) => "semantic",
-                            pensyve_core::types::Memory::Procedural(_) => "procedural",
-                        };
-                        // Memory serializes as {"Episodic": {...}} — unwrap the inner map.
-                        let mut outer = serde_json::to_value(&c.memory).unwrap_or_default();
-                        let inner = if let serde_json::Value::Object(ref mut map) = outer {
-                            // The variant name key holds the actual object.
-                            map.values_mut()
-                                .next()
-                                .and_then(|v| if v.is_object() { Some(v.take()) } else { None })
-                                .unwrap_or(serde_json::Value::Object(serde_json::Map::default()))
-                        } else {
-                            outer.clone()
-                        };
-                        if let serde_json::Value::Object(mut map) = inner {
-                            map.remove("embedding");
-                            map.insert("_type".to_string(), serde_json::json!(type_name));
-                            map.insert("_score".to_string(), serde_json::json!(c.final_score));
-                            serde_json::Value::Object(map)
-                        } else {
-                            serde_json::json!({ "_type": type_name, "_score": c.final_score })
-                        }
-                    })
-                    .collect();
+        let result = engine
+            .recall(&params.query, state.namespace.id, limit)
+            .map_err(|e| format!("Error recalling memories: {e}"))?;
 
-                serde_json::to_string_pretty(&memories).unwrap_or_else(|e| format!("Error: {e}"))
-            }
-            Err(e) => format!("Error recalling memories: {e}"),
-        }
+        let memories: Vec<serde_json::Value> = result
+            .memories
+            .iter()
+            .filter(|c| {
+                if let Some(types) = &params.types {
+                    let type_name = match &c.memory {
+                        pensyve_core::types::Memory::Episodic(_) => "episodic",
+                        pensyve_core::types::Memory::Semantic(_) => "semantic",
+                        pensyve_core::types::Memory::Procedural(_) => "procedural",
+                    };
+                    types.iter().any(|t| t == type_name)
+                } else {
+                    true
+                }
+            })
+            .map(|c| {
+                let type_name = match &c.memory {
+                    pensyve_core::types::Memory::Episodic(_) => "episodic",
+                    pensyve_core::types::Memory::Semantic(_) => "semantic",
+                    pensyve_core::types::Memory::Procedural(_) => "procedural",
+                };
+                // Memory serializes as {"Episodic": {...}} — unwrap the inner map.
+                let mut outer = serde_json::to_value(&c.memory).unwrap_or_default();
+                let inner = if let serde_json::Value::Object(ref mut map) = outer {
+                    // The variant name key holds the actual object.
+                    map.values_mut()
+                        .next()
+                        .and_then(|v| if v.is_object() { Some(v.take()) } else { None })
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::default()))
+                } else {
+                    outer.clone()
+                };
+                if let serde_json::Value::Object(mut map) = inner {
+                    map.remove("embedding");
+                    map.insert("_type".to_string(), serde_json::json!(type_name));
+                    map.insert("_score".to_string(), serde_json::json!(c.final_score));
+                    serde_json::Value::Object(map)
+                } else {
+                    serde_json::json!({ "_type": type_name, "_score": c.final_score })
+                }
+            })
+            .collect();
+
+        serde_json::to_string_pretty(&memories).map_err(|e| format!("Serialization error: {e}"))
     }
 
     /// Store an explicit semantic fact about an entity.
@@ -183,7 +185,10 @@ impl PensyveMcpServer {
         name = "pensyve_remember",
         description = "Store an explicit fact about an entity as a semantic memory. Returns the stored memory object."
     )]
-    async fn remember(&self, Parameters(params): Parameters<RememberParams>) -> String {
+    async fn remember(
+        &self,
+        Parameters(params): Parameters<RememberParams>,
+    ) -> Result<String, String> {
         let state = &self.state;
         let confidence = params.confidence.unwrap_or(1.0) as f32;
 
@@ -196,12 +201,13 @@ impl PensyveMcpServer {
             Ok(None) => {
                 let mut e = Entity::new(&params.entity, EntityKind::Agent);
                 e.namespace_id = state.namespace.id;
-                if let Err(err) = state.storage.save_entity(&e) {
-                    return format!("Error creating entity: {err}");
-                }
+                state
+                    .storage
+                    .save_entity(&e)
+                    .map_err(|err| format!("Error creating entity: {err}"))?;
                 e
             }
-            Err(err) => return format!("Error looking up entity: {err}"),
+            Err(err) => return Err(format!("Error looking up entity: {err}")),
         };
 
         // Split fact into predicate + object on first whitespace.
@@ -229,16 +235,17 @@ impl PensyveMcpServer {
             Err(err) => tracing::warn!("Embedding failed: {err}"),
         }
 
-        if let Err(err) = state.storage.save_semantic(&mem) {
-            return format!("Error saving semantic memory: {err}");
-        }
+        state
+            .storage
+            .save_semantic(&mem)
+            .map_err(|err| format!("Error saving semantic memory: {err}"))?;
 
         // Strip embedding from response.
         let mut val = serde_json::to_value(&mem).unwrap_or_default();
         if let serde_json::Value::Object(ref mut map) = val {
             map.remove("embedding");
         }
-        serde_json::to_string_pretty(&val).unwrap_or_else(|e| format!("Error: {e}"))
+        serde_json::to_string_pretty(&val).map_err(|e| format!("Serialization error: {e}"))
     }
 
     /// Begin tracking an interaction episode.
@@ -246,7 +253,10 @@ impl PensyveMcpServer {
         name = "pensyve_episode_start",
         description = "Begin tracking an interaction episode with named participants. Returns the episode_id needed to close the episode."
     )]
-    async fn episode_start(&self, Parameters(params): Parameters<EpisodeStartParams>) -> String {
+    async fn episode_start(
+        &self,
+        Parameters(params): Parameters<EpisodeStartParams>,
+    ) -> Result<String, String> {
         let state = &self.state;
 
         // Resolve or create participant entities.
@@ -257,27 +267,29 @@ impl PensyveMcpServer {
                 Ok(None) => {
                     let mut e = Entity::new(name, EntityKind::Agent);
                     e.namespace_id = state.namespace.id;
-                    if let Err(err) = state.storage.save_entity(&e) {
-                        return format!("Error creating entity '{name}': {err}");
-                    }
+                    state
+                        .storage
+                        .save_entity(&e)
+                        .map_err(|err| format!("Error creating entity '{name}': {err}"))?;
                     e
                 }
-                Err(err) => return format!("Error looking up entity '{name}': {err}"),
+                Err(err) => return Err(format!("Error looking up entity '{name}': {err}")),
             };
             participant_ids.push(entity.id);
         }
 
         let episode = Episode::new(state.namespace.id, participant_ids);
-        if let Err(err) = state.storage.save_episode(&episode) {
-            return format!("Error saving episode: {err}");
-        }
+        state
+            .storage
+            .save_episode(&episode)
+            .map_err(|err| format!("Error saving episode: {err}"))?;
 
         serde_json::to_string_pretty(&serde_json::json!({
             "episode_id": episode.id.to_string(),
             "participants": params.participants,
             "started_at": episode.started_at.to_rfc3339(),
         }))
-        .unwrap_or_else(|e| format!("Error: {e}"))
+        .map_err(|e| format!("Serialization error: {e}"))
     }
 
     /// Close an episode and extract memories.
@@ -285,32 +297,39 @@ impl PensyveMcpServer {
         name = "pensyve_episode_end",
         description = "Close an episode and extract any memories from it. Returns the count of memories created."
     )]
-    async fn episode_end(&self, Parameters(params): Parameters<EpisodeEndParams>) -> String {
+    async fn episode_end(
+        &self,
+        Parameters(params): Parameters<EpisodeEndParams>,
+    ) -> Result<String, String> {
         let state = &self.state;
 
-        let Ok(episode_id) = params.episode_id.parse::<Uuid>() else {
-            return format!("Invalid episode_id: '{}'", params.episode_id);
-        };
+        let episode_id = params
+            .episode_id
+            .parse::<Uuid>()
+            .map_err(|_| format!("Invalid episode_id: '{}'", params.episode_id))?;
 
         let outcome = match params.outcome.as_deref() {
             Some("success") | None => Outcome::Success,
             Some("failure") => Outcome::Failure,
             Some("partial") => Outcome::Partial,
             Some(other) => {
-                return format!("Unknown outcome '{other}'; use success, failure, or partial");
+                return Err(format!(
+                    "Unknown outcome '{other}'; use success, failure, or partial"
+                ));
             }
         };
 
         let mut episode = match state.storage.get_episode(episode_id) {
             Ok(Some(ep)) => ep,
-            Ok(None) => return format!("Episode not found: {episode_id}"),
-            Err(e) => return format!("Error loading episode: {e}"),
+            Ok(None) => return Err(format!("Episode not found: {episode_id}")),
+            Err(e) => return Err(format!("Error loading episode: {e}")),
         };
         episode.close(outcome);
 
-        if let Err(err) = state.storage.update_episode(&episode) {
-            return format!("Error updating episode: {err}");
-        }
+        state
+            .storage
+            .update_episode(&episode)
+            .map_err(|err| format!("Error updating episode: {err}"))?;
 
         serde_json::to_string_pretty(&serde_json::json!({
             "episode_id": episode_id.to_string(),
@@ -318,7 +337,7 @@ impl PensyveMcpServer {
             "outcome": params.outcome.as_deref().unwrap_or("success"),
             "ended_at": episode.ended_at.map(|t| t.to_rfc3339()),
         }))
-        .unwrap_or_else(|e| format!("Error: {e}"))
+        .map_err(|e| format!("Serialization error: {e}"))
     }
 
     /// Delete memories for an entity.
@@ -326,7 +345,10 @@ impl PensyveMcpServer {
         name = "pensyve_forget",
         description = "Delete all memories associated with an entity. Returns the count of forgotten memories."
     )]
-    async fn forget(&self, Parameters(params): Parameters<ForgetParams>) -> String {
+    async fn forget(
+        &self,
+        Parameters(params): Parameters<ForgetParams>,
+    ) -> Result<String, String> {
         let state = &self.state;
 
         let entity = match state
@@ -340,22 +362,37 @@ impl PensyveMcpServer {
                     "forgotten_count": 0u32,
                     "message": "Entity not found",
                 }))
-                .unwrap_or_default();
+                .map_err(|e| format!("Serialization error: {e}"));
             }
-            Err(err) => return format!("Error looking up entity: {err}"),
+            Err(err) => return Err(format!("Error looking up entity: {err}")),
         };
 
-        let forgotten_count = match state.storage.delete_memories_by_entity(entity.id) {
-            Ok(count) => count,
-            Err(err) => return format!("Error deleting memories: {err}"),
-        };
+        let forgotten_count = state
+            .storage
+            .delete_memories_by_entity(entity.id)
+            .map_err(|err| format!("Error deleting memories: {err}"))?;
+
+        // Rebuild the in-memory vector index to remove stale entries.
+        if forgotten_count > 0 {
+            let mut vi = state.vector_index.lock().await;
+            let dims = vi.dimensions();
+            *vi = VectorIndex::new(dims, 1024);
+            if let Ok(memories) = state.storage.get_all_memories_by_namespace(state.namespace.id) {
+                for mem in &memories {
+                    let emb = mem.embedding();
+                    if !emb.is_empty() {
+                        let _ = vi.add(mem.id(), emb);
+                    }
+                }
+            }
+        }
 
         serde_json::to_string_pretty(&serde_json::json!({
             "entity": params.entity,
             "entity_id": entity.id.to_string(),
             "forgotten_count": forgotten_count,
         }))
-        .unwrap_or_else(|e| format!("Error: {e}"))
+        .map_err(|e| format!("Serialization error: {e}"))
     }
 
     /// View all memories for an entity.
@@ -363,7 +400,10 @@ impl PensyveMcpServer {
         name = "pensyve_inspect",
         description = "View all memories stored for an entity, optionally filtered by type. Returns an array of memory objects with stats."
     )]
-    async fn inspect(&self, Parameters(params): Parameters<InspectParams>) -> String {
+    async fn inspect(
+        &self,
+        Parameters(params): Parameters<InspectParams>,
+    ) -> Result<String, String> {
         let state = &self.state;
         let limit = params.limit.unwrap_or(20) as usize;
 
@@ -378,9 +418,9 @@ impl PensyveMcpServer {
                     "message": "Entity not found",
                     "memories": [],
                 }))
-                .unwrap_or_default();
+                .map_err(|e| format!("Serialization error: {e}"));
             }
-            Err(err) => return format!("Error looking up entity: {err}"),
+            Err(err) => return Err(format!("Error looking up entity: {err}")),
         };
 
         let type_filter = params.memory_type.as_deref();
@@ -428,7 +468,7 @@ impl PensyveMcpServer {
             "memory_count": memories.len(),
             "memories": memories,
         }))
-        .unwrap_or_else(|e| format!("Error: {e}"))
+        .map_err(|e| format!("Serialization error: {e}"))
     }
 }
 

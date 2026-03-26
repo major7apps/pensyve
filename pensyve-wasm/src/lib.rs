@@ -1,3 +1,16 @@
+//! # Pensyve WASM Build
+//!
+//! Minimal in-memory subset of the Pensyve engine for browser/Node.js environments.
+//!
+//! **Limitations vs native SDK:**
+//! - In-memory only (no SQLite persistence)
+//! - Substring matching (no ONNX embeddings or vector search)
+//! - No BM25, graph traversal, RRF fusion, FSRS decay, or consolidation
+//! - No cross-encoder reranking
+//!
+//! Use for lightweight client-side caching. For full capabilities, use the
+//! Python SDK, REST API, or MCP server.
+
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
