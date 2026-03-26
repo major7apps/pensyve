@@ -14,11 +14,11 @@ use crate::types::Edge;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EdgeType {
-    Temporal,   // "happened before/after"
-    Causal,     // "caused", "led to", "because"
+    Temporal, // "happened before/after"
+    Causal,   // "caused", "led to", "because"
     #[default]
-    Entity,     // "about", "mentions", "involves"
-    Semantic,   // "similar to", "related to"
+    Entity, // "about", "mentions", "involves"
+    Semantic, // "similar to", "related to"
     Supersedes, // "replaces", "updates"
 }
 
@@ -308,28 +308,28 @@ impl MemoryGraph {
 
                     // Skip invalidated (superseded) edges.
                     if let Some(meta) = self.edge_meta.get(&edge_ref.id())
-                        && meta.invalid_at.is_some() {
-                            continue;
-                        }
+                        && meta.invalid_at.is_some()
+                    {
+                        continue;
+                    }
 
                     // Compute transition score.
                     let meta = self.edge_meta.get(&edge_ref.id());
 
-                    let type_alignment = meta
-                        .map_or(0.3, |m| edge_type_alignment(&m.edge_type, intent));
+                    let type_alignment =
+                        meta.map_or(0.3, |m| edge_type_alignment(&m.edge_type, intent));
 
                     let edge_weight = meta.map_or(*edge_ref.weight(), |m| m.weight);
 
-                    let temporal_confidence = meta
-                        .map_or(1.0, |m| {
-                            let age_days = (Utc::now() - m.valid_at).num_seconds() as f32 / 86400.0;
-                            let half_life = m
-                                .metadata
-                                .get("half_life")
-                                .and_then(serde_json::Value::as_f64)
-                                .unwrap_or(90.0) as f32;
-                            edge_confidence_at(1.0, age_days, half_life)
-                        });
+                    let temporal_confidence = meta.map_or(1.0, |m| {
+                        let age_days = (Utc::now() - m.valid_at).num_seconds() as f32 / 86400.0;
+                        let half_life = m
+                            .metadata
+                            .get("half_life")
+                            .and_then(serde_json::Value::as_f64)
+                            .unwrap_or(90.0) as f32;
+                        edge_confidence_at(1.0, age_days, half_life)
+                    });
 
                     let transition_score =
                         (0.4 * type_alignment + 0.4 * edge_weight + 0.2 * temporal_confidence)
