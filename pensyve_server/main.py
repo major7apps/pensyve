@@ -634,7 +634,7 @@ def a2a_task(req: A2ATaskRequest) -> A2ATaskResponse:
 )
 def health():
     try:
-        p = get_pensyve()
+        get_pensyve()  # Verify runtime is initialized
         from pensyve._core import embedding_info  # type: ignore[import-untyped]
 
         model, dims = embedding_info()
