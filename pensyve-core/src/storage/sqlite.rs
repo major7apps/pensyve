@@ -589,19 +589,25 @@ impl StorageTrait for SqliteBackend {
 
         match result {
             None => Ok(None),
-            Some((id_str, ns_str, participants_str, started_at_str, ended_at_str, outcome_str, metadata_str)) => {
-                Ok(Some(Episode {
-                    id: Uuid::parse_str(&id_str)
-                        .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?,
-                    namespace_id: Uuid::parse_str(&ns_str)
-                        .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?,
-                    participants: json_to_uuids(&participants_str),
-                    started_at: str_to_dt(&started_at_str),
-                    ended_at: str_to_opt_dt(ended_at_str.as_deref()),
-                    outcome: outcome_str.as_deref().map(str_to_outcome),
-                    metadata: serde_json::from_str(&metadata_str)?,
-                }))
-            }
+            Some((
+                id_str,
+                ns_str,
+                participants_str,
+                started_at_str,
+                ended_at_str,
+                outcome_str,
+                metadata_str,
+            )) => Ok(Some(Episode {
+                id: Uuid::parse_str(&id_str)
+                    .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?,
+                namespace_id: Uuid::parse_str(&ns_str)
+                    .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?,
+                participants: json_to_uuids(&participants_str),
+                started_at: str_to_dt(&started_at_str),
+                ended_at: str_to_opt_dt(ended_at_str.as_deref()),
+                outcome: outcome_str.as_deref().map(str_to_outcome),
+                metadata: serde_json::from_str(&metadata_str)?,
+            })),
         }
     }
 
@@ -1251,8 +1257,10 @@ impl StorageTrait for SqliteBackend {
             let valid_at = str_to_dt(&valid_at_str);
             let invalid_at = invalid_at_opt.map(|s| str_to_dt(&s));
             let superseded_by = superseded_by_opt
-                .map(|s| Uuid::parse_str(&s)
-                    .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}"))))
+                .map(|s| {
+                    Uuid::parse_str(&s)
+                        .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))
+                })
                 .transpose()?;
             let metadata: std::collections::HashMap<String, serde_json::Value> =
                 serde_json::from_str(&metadata_str)?;
