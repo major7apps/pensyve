@@ -10,6 +10,20 @@
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// Compute adaptive k based on candidate pool size.
+///
+/// k=60 is designed for web-scale IR (thousands of candidates).
+/// For small corpora, k must be much smaller to preserve rank discrimination.
+///
+/// Formula: k = max(1, candidate_count / 10)
+/// - 50 candidates → k=5 (ratio between rank 1 and 50 = 11:1)
+/// - 100 candidates → k=10
+/// - 1000 candidates → k=60 (capped at original Cormack recommendation)
+pub fn adaptive_k(candidate_count: usize, configured_k: u32) -> u32 {
+    let auto_k = (candidate_count / 10).max(1) as u32;
+    auto_k.min(configured_k) // never exceed configured maximum
+}
+
 /// Combines multiple ranked lists using Reciprocal Rank Fusion.
 ///
 /// # Arguments
@@ -18,7 +32,7 @@ use uuid::Uuid;
 /// * `weights` — Per-ranking weight applied to the RRF contribution. Must have the same
 ///   length as `rankings`. Pass all `1.0` for unweighted fusion.
 /// * `k` — Smoothing constant (Cormack et al. recommend 60). Lower values make rank
-///   differences more pronounced.
+///   differences more pronounced. Consider using `adaptive_k()` to auto-tune.
 ///
 /// # Returns
 /// Vec of `(id, rrf_score)` sorted by `rrf_score` descending.
@@ -147,5 +161,41 @@ mod tests {
         // Order is preserved regardless of k
         assert_eq!(result_low_k[0].0, id(1), "id1 should be first under low k");
         assert_eq!(result_high_k[0].0, id(1), "id1 should be first under high k");
+    }
+
+    #[test]
+    fn test_adaptive_k_small_corpus() {
+        // 50 candidates → k=5 (50/10), capped by configured max
+        assert_eq!(adaptive_k(50, 60), 5);
+    }
+
+    #[test]
+    fn test_adaptive_k_large_corpus() {
+        // 1000 candidates → k=60 (capped at configured max of 60)
+        assert_eq!(adaptive_k(1000, 60), 60);
+    }
+
+    #[test]
+    fn test_adaptive_k_tiny_corpus() {
+        // 5 candidates → k=1 (minimum)
+        assert_eq!(adaptive_k(5, 60), 1);
+    }
+
+    #[test]
+    fn test_adaptive_k_preserves_discrimination() {
+        // With adaptive k on a small corpus, rank 1 should significantly outscore rank 50
+        let ranking: Vec<(Uuid, f32)> = (0..50)
+            .map(|i| (Uuid::from_bytes([i as u8; 16]), 1.0 - i as f32 / 50.0))
+            .collect();
+        let k = adaptive_k(50, 60); // should be 5
+        let result = reciprocal_rank_fusion(&[ranking], &[1.0], k);
+
+        let top_score = result[0].1;
+        let bottom_score = result.last().unwrap().1;
+        let ratio = top_score / bottom_score;
+
+        // With k=5: ratio = (1/(5+1)) / (1/(5+50)) ≈ 9.2
+        // With k=60: ratio = (1/(60+1)) / (1/(60+50)) ≈ 1.8
+        assert!(ratio > 5.0, "Adaptive k should give strong discrimination, ratio={ratio}");
     }
 }
