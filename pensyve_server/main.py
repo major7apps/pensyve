@@ -635,10 +635,10 @@ def a2a_task(req: A2ATaskRequest) -> A2ATaskResponse:
 def health() -> dict[str, str | int]:
     try:
         get_pensyve()  # Verify runtime is initialized
-        from pensyve._core import embedding_info  # type: ignore[import-untyped]
+        import pensyve._core as _core  # type: ignore[import-untyped]
 
-        model: str = str(embedding_info()[0])
-        dims: int = int(embedding_info()[1])
+        info = cast(tuple[str, int], _core.embedding_info())
+        model, dims = info[0], info[1]
         return {
             "status": "ok",
             "version": "0.1.0",
