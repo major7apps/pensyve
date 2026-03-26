@@ -29,5 +29,9 @@ path = "src/bin/sensitivity_sweep.rs"
 name = "judge_eval"
 path = "src/bin/judge_eval.rs"
 
+[[bin]]
+name = "real_content_eval"
+path = "src/bin/real_content_eval.rs"
+
 [lints]
 workspace = true
