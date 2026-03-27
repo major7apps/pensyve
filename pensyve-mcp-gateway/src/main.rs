@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod rate_limit;
+mod tenant;
 mod usage;
 
 use std::sync::Arc;
@@ -11,7 +12,6 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService,
     session::local::LocalSessionManager,
 };
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -22,11 +22,12 @@ use pensyve_core::storage::StorageTrait;
 use pensyve_core::types::Namespace;
 use pensyve_core::vector::VectorIndex;
 
-use pensyve_mcp_tools::{PensyveMcpServer, PensyveState};
+use pensyve_mcp_tools::PensyveMcpServer;
 
-use crate::auth::AuthLayer;
+use crate::auth::{AuthContext, AuthLayer};
 use crate::config::GatewayConfig;
 use crate::rate_limit::RateLimitLayer;
+use crate::tenant::TenantStateManager;
 use crate::usage::UsageReporter;
 
 /// Application state shared across all requests.
@@ -34,16 +35,18 @@ pub struct AppState {
     pub auth: auth::AuthValidator,
     pub rate_limiter: rate_limit::RateLimiter,
     pub usage_reporter: UsageReporter,
-    /// Whether API key auth is required (derived from config at startup).
+    pub tenant_mgr: TenantStateManager,
     pub auth_required: bool,
+    pub ct: CancellationToken,
 }
 
-fn create_pensyve_state(config: &GatewayConfig) -> Result<Arc<PensyveState>> {
+fn init_resources(config: &GatewayConfig) -> Result<(Arc<dyn StorageTrait>, Arc<OnnxEmbedder>, Namespace, VectorIndex, RetrievalConfig)> {
     let storage_path = &config.storage_path;
     std::fs::create_dir_all(storage_path)?;
 
     let storage = SqliteBackend::open(storage_path)
         .map_err(|e| anyhow::anyhow!("Failed to open storage at {}: {e}", storage_path.display()))?;
+    let storage: Arc<dyn StorageTrait> = Arc::new(storage);
 
     let namespace_name = &config.namespace;
     let namespace = match storage.get_namespace_by_name(namespace_name) {
@@ -83,6 +86,7 @@ fn create_pensyve_state(config: &GatewayConfig) -> Result<Arc<PensyveState>> {
         }
     };
 
+    let embedder = Arc::new(embedder);
     let dimensions = embedder.dimensions();
 
     let mut index = VectorIndex::new(dimensions, 1024);
@@ -90,10 +94,9 @@ fn create_pensyve_state(config: &GatewayConfig) -> Result<Arc<PensyveState>> {
         let mut loaded = 0usize;
         for memory in &memories {
             let embedding = memory.embedding();
-            if !embedding.is_empty()
-                && index.add(memory.id(), embedding).is_ok() {
-                    loaded += 1;
-                }
+            if !embedding.is_empty() && index.add(memory.id(), embedding).is_ok() {
+                loaded += 1;
+            }
         }
         tracing::info!("Loaded {loaded}/{} memories into vector index", memories.len());
     }
@@ -109,13 +112,7 @@ fn create_pensyve_state(config: &GatewayConfig) -> Result<Arc<PensyveState>> {
         max_depth: 4,
     };
 
-    Ok(Arc::new(PensyveState {
-        storage: Box::new(storage) as Box<dyn StorageTrait>,
-        embedder,
-        vector_index: Mutex::new(index),
-        namespace,
-        retrieval_config,
-    }))
+    Ok((storage, embedder, namespace, index, retrieval_config))
 }
 
 #[tokio::main]
@@ -136,16 +133,43 @@ async fn main() -> Result<()> {
         "pensyve-mcp-gateway starting"
     );
 
-    let pensyve_state = create_pensyve_state(&config)?;
+    let (storage, embedder, namespace, index, retrieval_config) = init_resources(&config)?;
+
+    let tenant_mgr = TenantStateManager::new(
+        storage,
+        embedder,
+        retrieval_config,
+        namespace,
+        index,
+    );
 
     let ct = CancellationToken::new();
 
-    // Create the MCP Streamable HTTP service.
-    // The service_factory creates a fresh PensyveMcpServer for each session.
-    let state_clone = pensyve_state.clone();
+    let auth_required = !config.api_keys.is_empty();
+    let app_state = Arc::new(AppState {
+        auth: auth::AuthValidator::new(&config),
+        rate_limiter: rate_limit::RateLimiter::new(config.rate_limit_per_minute),
+        usage_reporter: UsageReporter::new(config.stripe_api_key.clone()),
+        tenant_mgr,
+        auth_required,
+        ct: ct.clone(),
+    });
+
+    // Create per-tenant MCP service factory. In stateless mode, a new service
+    // is created per request, so we resolve the tenant from a thread-local
+    // set by the axum middleware.
+    let state_for_factory = app_state.clone();
     let mcp_service: StreamableHttpService<PensyveMcpServer, LocalSessionManager> =
         StreamableHttpService::new(
-            move || Ok(PensyveMcpServer::new(state_clone.clone())),
+            move || {
+                // Read the tenant key_id from the thread-local set by our middleware.
+                let tenant_id = CURRENT_TENANT.with(|t| t.borrow().clone());
+                let pensyve_state = match tenant_id {
+                    Some(id) => state_for_factory.tenant_mgr.get_tenant_state(&id),
+                    None => state_for_factory.tenant_mgr.default_state(),
+                };
+                Ok(PensyveMcpServer::new(pensyve_state))
+            },
             Arc::default(),
             StreamableHttpServerConfig {
                 stateful_mode: false,
@@ -156,23 +180,15 @@ async fn main() -> Result<()> {
             },
         );
 
-    // Build axum router.
-    let auth_required = !config.api_keys.is_empty();
-    let app_state = Arc::new(AppState {
-        auth: auth::AuthValidator::new(&config),
-        rate_limiter: rate_limit::RateLimiter::new(config.rate_limit_per_minute),
-        usage_reporter: UsageReporter::new(config.stripe_api_key.clone()),
-        auth_required,
-    });
-
     let app = Router::new()
         .nest_service("/mcp", mcp_service)
         .route("/health", axum::routing::get(health_handler))
+        .layer(axum::middleware::from_fn_with_state(app_state.clone(), tenant_and_usage_middleware))
         .layer(RateLimitLayer::new(app_state.clone()))
         .layer(AuthLayer::new(app_state.clone()))
         .with_state(app_state.clone());
 
-    // Periodic eviction of stale rate-limit entries to bound memory.
+    // Periodic eviction of stale rate-limit entries.
     tokio::spawn({
         let state = app_state;
         async move {
@@ -201,4 +217,40 @@ async fn main() -> Result<()> {
 
 async fn health_handler() -> &'static str {
     "ok"
+}
+
+// Thread-local to pass tenant ID from axum middleware to the rmcp service factory.
+// This is safe because tokio tasks are pinned to threads within a single request.
+std::thread_local! {
+    static CURRENT_TENANT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Axum middleware that:
+/// 1. Sets the tenant ID thread-local from the auth context (for rmcp service factory)
+/// 2. Reports usage to Stripe after the request completes
+async fn tenant_and_usage_middleware(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let auth_ctx = req.extensions().get::<AuthContext>().cloned();
+    let tenant_id = auth_ctx.as_ref().map(|ctx| ctx.key_id.clone());
+    let is_mcp = req.uri().path().starts_with("/mcp");
+
+    CURRENT_TENANT.with(|t| t.borrow_mut().clone_from(&tenant_id));
+    let response = next.run(req).await;
+    CURRENT_TENANT.with(|t| *t.borrow_mut() = None);
+
+    // Report usage for successful MCP requests.
+    if is_mcp && response.status().is_success()
+        && let Some(ctx) = auth_ctx {
+            state.usage_reporter.report(usage::UsageEvent {
+                key_id: ctx.key_id,
+                stripe_customer_id: ctx.user_id,
+                tier: usage::OperationTier::Standard,
+                count: 1,
+            });
+        }
+
+    response
 }

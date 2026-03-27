@@ -134,8 +134,8 @@ async fn main() -> Result<()> {
     };
 
     let state = Arc::new(PensyveState {
-        storage: Box::new(storage) as Box<dyn StorageTrait>,
-        embedder,
+        storage: Arc::new(storage) as Arc<dyn StorageTrait>,
+        embedder: Arc::new(embedder),
         vector_index: Mutex::new(vector_index),
         namespace,
         retrieval_config,

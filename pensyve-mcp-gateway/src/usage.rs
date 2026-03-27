@@ -122,27 +122,44 @@ impl UsageReporter {
         );
 
         for ((customer_id, tier), count) in &aggregated {
-            let result = client
-                .post("https://api.stripe.com/v1/billing/meter_events")
-                .bearer_auth(api_key)
-                .form(&[
-                    ("event_name", tier.event_name()),
-                    ("payload[stripe_customer_id]", customer_id),
-                    ("payload[value]", &count.to_string()),
-                ])
-                .send()
-                .await;
+            let mut success = false;
+            for attempt in 0..3 {
+                if attempt > 0 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500 * 2u64.pow(attempt))).await;
+                }
+                let result = client
+                    .post("https://api.stripe.com/v1/billing/meter_events")
+                    .bearer_auth(api_key)
+                    .form(&[
+                        ("event_name", tier.event_name()),
+                        ("payload[stripe_customer_id]", customer_id),
+                        ("payload[value]", &count.to_string()),
+                    ])
+                    .send()
+                    .await;
 
-            match result {
-                Ok(resp) if resp.status().is_success() => {
-                    tracing::debug!(customer = customer_id, tier = tier.event_name(), "Usage reported");
+                match result {
+                    Ok(resp) if resp.status().is_success() => {
+                        tracing::debug!(customer = customer_id, tier = tier.event_name(), "Usage reported");
+                        success = true;
+                        break;
+                    }
+                    Ok(resp) if resp.status().is_server_error() => {
+                        tracing::warn!(status = %resp.status(), attempt, customer = customer_id, "Stripe meter event failed, retrying");
+                    }
+                    Ok(resp) => {
+                        // Client error (4xx) — don't retry.
+                        tracing::warn!(status = %resp.status(), customer = customer_id, "Stripe meter event rejected");
+                        success = true; // Don't retry client errors.
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, attempt, "Stripe API call failed, retrying");
+                    }
                 }
-                Ok(resp) => {
-                    tracing::warn!(status = %resp.status(), customer = customer_id, "Stripe meter event failed");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Stripe API call failed");
-                }
+            }
+            if !success {
+                tracing::error!(customer = customer_id, count, "Stripe meter event dropped after 3 retries");
             }
         }
     }

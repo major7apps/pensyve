@@ -108,7 +108,9 @@ where
 
     fn call(&mut self, mut req: Request<Body>) -> Self::Future {
         let state = self.state.clone();
-        let mut inner = self.inner.clone();
+        // Clone first, then swap so the poll_ready'd instance handles the request.
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
             let path = req.uri().path();

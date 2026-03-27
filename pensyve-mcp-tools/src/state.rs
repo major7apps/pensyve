@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use tokio::sync::Mutex;
 
 use pensyve_core::config::RetrievalConfig;
@@ -8,11 +10,11 @@ use pensyve_core::vector::VectorIndex;
 
 /// Shared state for the Pensyve MCP server.
 ///
-/// Uses `Box<dyn StorageTrait>` to support both `SQLite` (local) and `PostgreSQL`
-/// (cloud gateway) backends without generics.
+/// Uses `Arc<dyn StorageTrait>` so the storage backend can be shared across
+/// multiple tenant-scoped instances (cloud gateway) or used standalone (local).
 pub struct PensyveState {
-    pub storage: Box<dyn StorageTrait>,
-    pub embedder: OnnxEmbedder,
+    pub storage: Arc<dyn StorageTrait>,
+    pub embedder: Arc<OnnxEmbedder>,
     pub vector_index: Mutex<VectorIndex>,
     pub namespace: Namespace,
     pub retrieval_config: RetrievalConfig,

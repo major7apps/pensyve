@@ -25,8 +25,8 @@ fn create_test_state(dir: &tempfile::TempDir) -> Arc<PensyveState> {
     let index = VectorIndex::new(dimensions, 1024);
 
     Arc::new(PensyveState {
-        storage: Box::new(storage) as Box<dyn StorageTrait>,
-        embedder,
+        storage: Arc::new(storage) as Arc<dyn StorageTrait>,
+        embedder: Arc::new(embedder),
         vector_index: Mutex::new(index),
         namespace,
         retrieval_config: RetrievalConfig {

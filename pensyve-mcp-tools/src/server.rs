@@ -284,10 +284,14 @@ impl PensyveMcpServer {
             .delete_memories_by_entity(entity.id)
             .map_err(|err| format!("Error deleting memories: {err}"))?;
 
+        // Rebuild vector index outside the hot path: load memories first,
+        // then swap the index under the lock to minimize mutex hold time.
         if forgotten_count > 0 {
-            let mut vi = state.vector_index.lock().await;
-            let dims = vi.dimensions();
-            *vi = VectorIndex::new(dims, 1024);
+            let dims = {
+                let vi = state.vector_index.lock().await;
+                vi.dimensions()
+            };
+            let mut new_index = VectorIndex::new(dims, 1024);
             if let Ok(memories) = state
                 .storage
                 .get_all_memories_by_namespace(state.namespace.id)
@@ -295,10 +299,13 @@ impl PensyveMcpServer {
                 for mem in &memories {
                     let emb = mem.embedding();
                     if !emb.is_empty() {
-                        let _ = vi.add(mem.id(), emb);
+                        let _ = new_index.add(mem.id(), emb);
                     }
                 }
             }
+            // Brief lock just to swap.
+            let mut vi = state.vector_index.lock().await;
+            *vi = new_index;
         }
 
         serde_json::to_string_pretty(&serde_json::json!({
