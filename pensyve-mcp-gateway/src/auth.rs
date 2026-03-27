@@ -177,7 +177,6 @@ mod tests {
             api_keys,
             rate_limit_per_minute: 60,
             stripe_api_key: None,
-            cors_origins: vec![],
         }
     }
 

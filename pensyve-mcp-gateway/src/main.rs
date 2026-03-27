@@ -164,16 +164,15 @@ async fn main() -> Result<()> {
     });
 
     // Create per-tenant MCP service factory. In stateless mode, a new service
-    // is created per request, so we resolve the tenant from a thread-local
-    // set by the axum middleware.
+    // is created per request. The tenant ID is passed via tokio::task_local
+    // (safe across .await thread migrations, unlike std::thread_local).
     let state_for_factory = app_state.clone();
     let mcp_service: StreamableHttpService<PensyveMcpServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || {
-                // Read the tenant key_id from the thread-local set by our middleware.
-                let tenant_id = CURRENT_TENANT.with(|t| t.borrow().clone());
+                let tenant_id = CURRENT_TENANT.try_with(Clone::clone).ok().flatten();
                 let pensyve_state = match tenant_id {
-                    Some(id) => state_for_factory.tenant_mgr.get_tenant_state(&id),
+                    Some(id) => state_for_factory.tenant_mgr.get_tenant_state(&id)?,
                     None => state_for_factory.tenant_mgr.default_state(),
                 };
                 Ok(PensyveMcpServer::new(pensyve_state))
@@ -227,14 +226,15 @@ async fn health_handler() -> &'static str {
     "ok"
 }
 
-// Thread-local to pass tenant ID from axum middleware to the rmcp service factory.
-// This is safe because tokio tasks are pinned to threads within a single request.
-std::thread_local! {
-    static CURRENT_TENANT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+// Task-local to pass tenant ID from axum middleware to the rmcp service factory.
+// Uses tokio::task_local (not std::thread_local) so the value follows the task
+// across .await thread migrations in tokio's multi-threaded runtime.
+tokio::task_local! {
+    static CURRENT_TENANT: Option<String>;
 }
 
 /// Axum middleware that:
-/// 1. Sets the tenant ID thread-local from the auth context (for rmcp service factory)
+/// 1. Sets the tenant ID task-local from the auth context (for rmcp service factory)
 /// 2. Reports usage to Stripe after the request completes
 async fn tenant_and_usage_middleware(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
@@ -245,9 +245,7 @@ async fn tenant_and_usage_middleware(
     let tenant_id = auth_ctx.as_ref().map(|ctx| ctx.key_id.clone());
     let is_mcp = req.uri().path().starts_with("/mcp");
 
-    CURRENT_TENANT.with(|t| t.borrow_mut().clone_from(&tenant_id));
-    let response = next.run(req).await;
-    CURRENT_TENANT.with(|t| *t.borrow_mut() = None);
+    let response = CURRENT_TENANT.scope(tenant_id, next.run(req)).await;
 
     // Report usage for successful MCP requests.
     if is_mcp && response.status().is_success()

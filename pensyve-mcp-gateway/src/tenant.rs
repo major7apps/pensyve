@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use tokio::sync::Mutex;
 
 use pensyve_core::config::RetrievalConfig;
@@ -61,32 +62,44 @@ impl TenantStateManager {
 
     /// Get or create an isolated `PensyveState` for a tenant.
     /// Each tenant gets their own namespace so data is fully isolated.
-    pub fn get_tenant_state(&self, tenant_id: &str) -> Arc<PensyveState> {
-        // Fast path: already cached.
-        if let Some(state) = self.tenants.get(tenant_id) {
-            return state.clone();
+    /// Returns an error (rather than silently falling back) if namespace
+    /// creation fails — falling back to the default namespace would break
+    /// tenant isolation.
+    pub fn get_tenant_state(&self, tenant_id: &str) -> Result<Arc<PensyveState>, std::io::Error> {
+        // Use DashMap::entry to atomically check-and-insert, avoiding the
+        // race where two concurrent requests for the same new tenant both
+        // create a namespace and one silently overwrites the other.
+        match self.tenants.entry(tenant_id.to_string()) {
+            Entry::Occupied(e) => Ok(e.get().clone()),
+            Entry::Vacant(e) => {
+                let state = self.create_tenant_state(tenant_id)?;
+                e.insert(state.clone());
+                Ok(state)
+            }
         }
+    }
 
-        // Slow path: create namespace and state.
+    fn create_tenant_state(&self, tenant_id: &str) -> Result<Arc<PensyveState>, std::io::Error> {
         let ns_name = format!("tenant:{tenant_id}");
         let namespace = match self.storage.get_namespace_by_name(&ns_name) {
             Ok(Some(ns)) => ns,
             Ok(None) => {
                 let ns = Namespace::new(&ns_name);
-                if let Err(e) = self.storage.save_namespace(&ns) {
-                    tracing::warn!("Failed to create tenant namespace '{ns_name}': {e}");
-                    return self.default_state.clone();
-                }
+                self.storage.save_namespace(&ns).map_err(|e| {
+                    std::io::Error::other(
+                        format!("Failed to create tenant namespace '{ns_name}': {e}"),
+                    )
+                })?;
                 tracing::info!("Created tenant namespace '{ns_name}' (id={})", ns.id);
                 ns
             }
             Err(e) => {
-                tracing::warn!("Failed to look up tenant namespace '{ns_name}': {e}");
-                return self.default_state.clone();
+                return Err(std::io::Error::other(
+                    format!("Failed to look up tenant namespace '{ns_name}': {e}"),
+                ));
             }
         };
 
-        // Load existing memories into a fresh vector index for this tenant.
         let mut index = VectorIndex::new(self.dimensions, 1024);
         if let Ok(memories) = self.storage.get_all_memories_by_namespace(namespace.id) {
             for mem in &memories {
@@ -97,16 +110,13 @@ impl TenantStateManager {
             }
         }
 
-        let state = Arc::new(PensyveState {
+        Ok(Arc::new(PensyveState {
             storage: self.storage.clone(),
             embedder: self.embedder.clone(),
             vector_index: Mutex::new(index),
             namespace,
             retrieval_config: self.retrieval_config.clone(),
-        });
-
-        self.tenants.insert(tenant_id.to_string(), state.clone());
-        state
+        }))
     }
 }
 
@@ -115,9 +125,7 @@ mod tests {
     use super::*;
     use pensyve_core::storage::sqlite::SqliteBackend;
 
-    #[test]
-    fn test_different_tenants_get_different_namespaces() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_manager(dir: &tempfile::TempDir) -> TenantStateManager {
         let storage = Arc::new(SqliteBackend::open(dir.path()).unwrap()) as Arc<dyn StorageTrait>;
         let ns = Namespace::new("default");
         storage.save_namespace(&ns).unwrap();
@@ -133,18 +141,31 @@ mod tests {
             beam_width: 10,
             max_depth: 4,
         };
+        TenantStateManager::new(storage, embedder, config, ns, index)
+    }
 
-        let mgr = TenantStateManager::new(storage, embedder, config, ns, index);
+    #[test]
+    fn test_different_tenants_get_different_namespaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(&dir);
 
-        let t1 = mgr.get_tenant_state("key_alice");
-        let t2 = mgr.get_tenant_state("key_bob");
-        let t1_again = mgr.get_tenant_state("key_alice");
+        let t1 = mgr.get_tenant_state("key_alice").unwrap();
+        let t2 = mgr.get_tenant_state("key_bob").unwrap();
+        let t1_again = mgr.get_tenant_state("key_alice").unwrap();
 
-        // Different tenants have different namespaces.
         assert_ne!(t1.namespace.id, t2.namespace.id);
-        // Same tenant returns cached state.
         assert_eq!(t1.namespace.id, t1_again.namespace.id);
-        // Neither is the default namespace.
         assert_ne!(t1.namespace.id, mgr.default_state().namespace.id);
+    }
+
+    #[test]
+    fn test_concurrent_same_tenant_returns_same_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(&dir);
+
+        // Simulate concurrent access — both should get the same namespace.
+        let s1 = mgr.get_tenant_state("key_carol").unwrap();
+        let s2 = mgr.get_tenant_state("key_carol").unwrap();
+        assert_eq!(s1.namespace.id, s2.namespace.id);
     }
 }

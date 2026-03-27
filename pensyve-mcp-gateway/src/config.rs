@@ -13,8 +13,6 @@ pub struct GatewayConfig {
     pub rate_limit_per_minute: u32,
     /// Stripe API key for usage reporting (optional).
     pub stripe_api_key: Option<String>,
-    /// CORS allowed origins.
-    pub cors_origins: Vec<String>,
 }
 
 impl GatewayConfig {
@@ -36,13 +34,6 @@ impl GatewayConfig {
             .filter(|s| !s.is_empty())
             .collect();
 
-        let cors_origins: Vec<String> = std::env::var("PENSYVE_CORS_ORIGINS")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-
         Self {
             host: std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
             port: std::env::var("PORT")
@@ -58,7 +49,6 @@ impl GatewayConfig {
                 .and_then(|r| r.parse().ok())
                 .unwrap_or(300),
             stripe_api_key: std::env::var("STRIPE_API_KEY").ok(),
-            cors_origins,
         }
     }
 }
@@ -77,7 +67,6 @@ mod tests {
             api_keys,
             rate_limit_per_minute: 300,
             stripe_api_key: None,
-            cors_origins: vec![],
         }
     }
 
@@ -90,7 +79,6 @@ mod tests {
         assert_eq!(config.rate_limit_per_minute, 300);
         assert!(config.api_keys.is_empty());
         assert!(config.stripe_api_key.is_none());
-        assert!(config.cors_origins.is_empty());
     }
 
     #[test]
