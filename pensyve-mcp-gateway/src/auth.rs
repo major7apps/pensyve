@@ -3,7 +3,8 @@ use std::task::{Context, Poll};
 
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
-use dashmap::DashMap;
+use std::collections::HashMap;
+
 use sha2::{Digest, Sha256};
 use tower::{Layer, Service};
 
@@ -19,16 +20,17 @@ pub struct AuthContext {
 
 /// Validates `psy_` API keys via SHA-256 hash lookup.
 ///
-/// In standalone mode, keys are checked against `PENSYVE_API_KEYS` env var.
-/// In production, this will be extended to query `PostgreSQL` with Redis cache.
+/// Keys are hashed at startup and stored as a read-only map. In production,
+/// this will be extended to query `PostgreSQL` with Redis cache.
 pub struct AuthValidator {
-    /// Pre-hashed keys from config, mapped hash -> key prefix (for identification).
-    valid_key_hashes: DashMap<String, String>,
+    /// Pre-hashed keys, mapped hash -> key prefix (for identification).
+    /// Read-only after construction — no concurrent-write overhead needed.
+    valid_key_hashes: HashMap<String, String>,
 }
 
 impl AuthValidator {
     pub fn new(config: &GatewayConfig) -> Self {
-        let valid_key_hashes = DashMap::new();
+        let mut valid_key_hashes = HashMap::with_capacity(config.api_keys.len());
         for key in &config.api_keys {
             let hash = hash_key(key);
             let prefix = if key.len() >= 12 {
@@ -43,14 +45,13 @@ impl AuthValidator {
 
     /// Validate an API key. Returns `Some(AuthContext)` if valid, `None` otherwise.
     pub fn validate(&self, key: &str) -> Option<AuthContext> {
-        // Check for psy_ prefix.
         if !key.starts_with("psy_") {
             return None;
         }
 
         let hash = hash_key(key);
         self.valid_key_hashes.get(&hash).map(|prefix| AuthContext {
-            key_id: prefix.to_string(),
+            key_id: prefix.clone(),
             user_id: None,
         })
     }
@@ -122,7 +123,7 @@ where
             }
 
             // No API keys configured = open access (dev mode).
-            if state.config.api_keys.is_empty() {
+            if !state.auth_required {
                 req.extensions_mut().insert(AuthContext {
                     key_id: "dev".to_string(),
                     user_id: None,

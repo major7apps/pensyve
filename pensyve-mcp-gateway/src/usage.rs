@@ -1,11 +1,23 @@
+use std::collections::HashMap;
+
 use tokio::sync::mpsc;
 
 /// Operation tier for billing purposes.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OperationTier {
     Standard,
     Multimodal,
     Extraction,
+}
+
+impl OperationTier {
+    fn event_name(self) -> &'static str {
+        match self {
+            Self::Standard => "pensyve_operation",
+            Self::Multimodal => "pensyve_multimodal_operation",
+            Self::Extraction => "pensyve_extraction_operation",
+        }
+    }
 }
 
 /// Usage event sent to the background reporter.
@@ -19,9 +31,9 @@ pub struct UsageEvent {
 
 /// Asynchronous Stripe usage reporter.
 ///
-/// Tool calls send events through an mpsc channel. A background task batches
-/// and submits them to Stripe's billing meter API. This ensures tool call
-/// responses are never blocked by billing.
+/// Tool calls send events through an mpsc channel. A background task
+/// aggregates by (customer, tier) and batches submissions to Stripe.
+/// Tool call responses are never blocked by billing.
 pub struct UsageReporter {
     tx: mpsc::Sender<UsageEvent>,
 }
@@ -30,7 +42,6 @@ impl UsageReporter {
     pub fn new(stripe_api_key: Option<String>) -> Self {
         let (tx, rx) = mpsc::channel(1024);
 
-        // Spawn the background reporting task.
         tokio::spawn(Self::report_loop(rx, stripe_api_key));
 
         Self { tx }
@@ -44,88 +55,98 @@ impl UsageReporter {
     }
 
     async fn report_loop(mut rx: mpsc::Receiver<UsageEvent>, stripe_api_key: Option<String>) {
+        // Reuse the HTTP client across all flushes for connection pooling.
+        let client = reqwest::Client::new();
         let mut batch: Vec<UsageEvent> = Vec::new();
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
 
         loop {
             tokio::select! {
-                Some(event) = rx.recv() => {
-                    batch.push(event);
-                    // Flush immediately if batch is large.
-                    if batch.len() >= 100 {
-                        Self::flush_batch(&mut batch, stripe_api_key.as_ref()).await;
+                event = rx.recv() => {
+                    #[allow(clippy::single_match_else)]
+                    match event {
+                        Some(e) => {
+                            batch.push(e);
+                            if batch.len() >= 100 {
+                                Self::flush_batch(&mut batch, stripe_api_key.as_deref(), &client).await;
+                            }
+                        }
+                        // Channel closed — flush remaining and exit.
+                        None => {
+                            if !batch.is_empty() {
+                                Self::flush_batch(&mut batch, stripe_api_key.as_deref(), &client).await;
+                            }
+                            tracing::info!("Usage reporter shutting down");
+                            return;
+                        }
                     }
                 }
                 _ = interval.tick() => {
                     if !batch.is_empty() {
-                        Self::flush_batch(&mut batch, stripe_api_key.as_ref()).await;
+                        Self::flush_batch(&mut batch, stripe_api_key.as_deref(), &client).await;
                     }
                 }
             }
         }
     }
 
-    async fn flush_batch(batch: &mut Vec<UsageEvent>, stripe_api_key: Option<&String>) {
+    async fn flush_batch(
+        batch: &mut Vec<UsageEvent>,
+        stripe_api_key: Option<&str>,
+        client: &reqwest::Client,
+    ) {
         let Some(api_key) = stripe_api_key else {
-            tracing::debug!(
-                count = batch.len(),
-                "Stripe not configured — discarding usage events"
-            );
+            tracing::debug!(count = batch.len(), "Stripe not configured — discarding usage events");
             batch.clear();
             return;
         };
 
-        let total: u32 = batch.iter().map(|e| e.count).sum();
-        tracing::info!(events = batch.len(), total_ops = total, "Flushing usage to Stripe");
+        // Aggregate by (customer_id, tier) to minimize HTTP calls.
+        let mut aggregated: HashMap<(String, OperationTier), u32> = HashMap::new();
+        for event in batch.drain(..) {
+            if let Some(customer_id) = event.stripe_customer_id {
+                *aggregated
+                    .entry((customer_id, event.tier))
+                    .or_default() += event.count;
+            }
+        }
 
-        // Group by stripe_customer_id + tier for efficient reporting.
-        let client = reqwest::Client::new();
-        for event in batch.iter() {
-            let Some(customer_id) = &event.stripe_customer_id else {
-                continue;
-            };
+        if aggregated.is_empty() {
+            return;
+        }
 
-            let event_name = match event.tier {
-                OperationTier::Standard => "pensyve_operation",
-                OperationTier::Multimodal => "pensyve_multimodal_operation",
-                OperationTier::Extraction => "pensyve_extraction_operation",
-            };
+        tracing::info!(
+            groups = aggregated.len(),
+            total_ops = aggregated.values().sum::<u32>(),
+            "Flushing usage to Stripe"
+        );
 
+        for ((customer_id, tier), count) in &aggregated {
             let result = client
                 .post("https://api.stripe.com/v1/billing/meter_events")
                 .bearer_auth(api_key)
                 .form(&[
-                    ("event_name", event_name),
+                    ("event_name", tier.event_name()),
                     ("payload[stripe_customer_id]", customer_id),
-                    ("payload[value]", &event.count.to_string()),
+                    ("payload[value]", &count.to_string()),
                 ])
                 .send()
                 .await;
 
             match result {
                 Ok(resp) if resp.status().is_success() => {
-                    tracing::debug!(customer = customer_id, tier = event_name, "Usage reported");
+                    tracing::debug!(customer = customer_id, tier = tier.event_name(), "Usage reported");
                 }
                 Ok(resp) => {
-                    tracing::warn!(
-                        status = %resp.status(),
-                        customer = customer_id,
-                        "Stripe meter event failed"
-                    );
+                    tracing::warn!(status = %resp.status(), customer = customer_id, "Stripe meter event failed");
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Stripe API call failed");
                 }
             }
         }
-
-        batch.clear();
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -135,7 +156,6 @@ mod tests {
     async fn test_usage_reporter_does_not_block() {
         let reporter = UsageReporter::new(None);
 
-        // Should not block even without Stripe configured.
         reporter.report(UsageEvent {
             key_id: "test".to_string(),
             stripe_customer_id: None,
@@ -143,7 +163,6 @@ mod tests {
             count: 1,
         });
 
-        // Allow background task to process.
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
 
@@ -161,5 +180,34 @@ mod tests {
         }
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
+    #[test]
+    fn test_operation_tier_event_names() {
+        assert_eq!(OperationTier::Standard.event_name(), "pensyve_operation");
+        assert_eq!(OperationTier::Multimodal.event_name(), "pensyve_multimodal_operation");
+        assert_eq!(OperationTier::Extraction.event_name(), "pensyve_extraction_operation");
+    }
+
+    #[tokio::test]
+    async fn test_flush_batch_aggregates_same_customer_tier() {
+        let client = reqwest::Client::new();
+        let mut batch = vec![
+            UsageEvent {
+                key_id: "k1".into(),
+                stripe_customer_id: Some("cus_1".into()),
+                tier: OperationTier::Standard,
+                count: 3,
+            },
+            UsageEvent {
+                key_id: "k1".into(),
+                stripe_customer_id: Some("cus_1".into()),
+                tier: OperationTier::Standard,
+                count: 7,
+            },
+        ];
+        // Without a real Stripe key, this just discards.
+        UsageReporter::flush_batch(&mut batch, None, &client).await;
+        assert!(batch.is_empty());
     }
 }

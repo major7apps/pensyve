@@ -8,15 +8,46 @@ use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use uuid::Uuid;
 
 use pensyve_core::retrieval::RecallEngine;
-use pensyve_core::types::{Entity, EntityKind, Episode, Outcome, SemanticMemory};
+use pensyve_core::storage::StorageTrait;
+use pensyve_core::types::{Entity, EntityKind, Episode, Memory, Outcome, SemanticMemory};
 use pensyve_core::vector::VectorIndex;
 
 use crate::params::{RecallParams, RememberParams, EpisodeStartParams, EpisodeEndParams, ForgetParams, InspectParams};
 use crate::state::PensyveState;
 
-// ---------------------------------------------------------------------------
-// MCP Server struct
-// ---------------------------------------------------------------------------
+fn memory_type_name(memory: &Memory) -> &'static str {
+    match memory {
+        Memory::Episodic(_) => "episodic",
+        Memory::Semantic(_) => "semantic",
+        Memory::Procedural(_) => "procedural",
+    }
+}
+
+fn strip_embedding(val: &mut serde_json::Value) {
+    if let serde_json::Value::Object(map) = val {
+        map.remove("embedding");
+    }
+}
+
+/// Look up an entity by name, creating it if it doesn't exist.
+fn get_or_create_entity(
+    storage: &dyn StorageTrait,
+    name: &str,
+    namespace_id: Uuid,
+) -> Result<Entity, String> {
+    match storage.get_entity_by_name(name, namespace_id) {
+        Ok(Some(e)) => Ok(e),
+        Ok(None) => {
+            let mut e = Entity::new(name, EntityKind::Agent);
+            e.namespace_id = namespace_id;
+            storage
+                .save_entity(&e)
+                .map_err(|err| format!("Error creating entity '{name}': {err}"))?;
+            Ok(e)
+        }
+        Err(err) => Err(format!("Error looking up entity '{name}': {err}")),
+    }
+}
 
 pub struct PensyveMcpServer {
     pub state: Arc<PensyveState>,
@@ -48,39 +79,29 @@ impl PensyveMcpServer {
         let limit = params.limit.unwrap_or(5) as usize;
         let state = &self.state;
 
-        let vector_index = state.vector_index.lock().await;
-        let engine = RecallEngine::new(
-            state.storage.as_ref(),
-            &state.embedder,
-            &vector_index,
-            &state.retrieval_config,
-        );
-
-        let result = engine
-            .recall(&params.query, state.namespace.id, limit)
-            .map_err(|e| format!("Error recalling memories: {e}"))?;
+        // Hold the mutex only for the retrieval phase, not JSON serialization.
+        let result = {
+            let vector_index = state.vector_index.lock().await;
+            let engine = RecallEngine::new(
+                state.storage.as_ref(),
+                &state.embedder,
+                &vector_index,
+                &state.retrieval_config,
+            );
+            engine
+                .recall(&params.query, state.namespace.id, limit)
+                .map_err(|e| format!("Error recalling memories: {e}"))?
+        };
 
         let memories: Vec<serde_json::Value> = result
             .memories
             .iter()
-            .filter(|c| {
-                if let Some(types) = &params.types {
-                    let type_name = match &c.memory {
-                        pensyve_core::types::Memory::Episodic(_) => "episodic",
-                        pensyve_core::types::Memory::Semantic(_) => "semantic",
-                        pensyve_core::types::Memory::Procedural(_) => "procedural",
-                    };
-                    types.iter().any(|t| t == type_name)
-                } else {
-                    true
-                }
-            })
-            .map(|c| {
-                let type_name = match &c.memory {
-                    pensyve_core::types::Memory::Episodic(_) => "episodic",
-                    pensyve_core::types::Memory::Semantic(_) => "semantic",
-                    pensyve_core::types::Memory::Procedural(_) => "procedural",
-                };
+            .filter_map(|c| {
+                let type_name = memory_type_name(&c.memory);
+                if let Some(types) = &params.types
+                    && !types.iter().any(|t| t == type_name) {
+                        return None;
+                    }
                 let mut outer = serde_json::to_value(&c.memory).unwrap_or_default();
                 let inner = if let serde_json::Value::Object(ref mut map) = outer {
                     map.values_mut()
@@ -90,14 +111,14 @@ impl PensyveMcpServer {
                 } else {
                     outer.clone()
                 };
-                if let serde_json::Value::Object(mut map) = inner {
+                Some(if let serde_json::Value::Object(mut map) = inner {
                     map.remove("embedding");
                     map.insert("_type".to_string(), serde_json::json!(type_name));
                     map.insert("_score".to_string(), serde_json::json!(c.final_score));
                     serde_json::Value::Object(map)
                 } else {
                     serde_json::json!({ "_type": type_name, "_score": c.final_score })
-                }
+                })
             })
             .collect();
 
@@ -116,22 +137,11 @@ impl PensyveMcpServer {
         let state = &self.state;
         let confidence = params.confidence.unwrap_or(1.0) as f32;
 
-        let entity = match state
-            .storage
-            .get_entity_by_name(&params.entity, state.namespace.id)
-        {
-            Ok(Some(e)) => e,
-            Ok(None) => {
-                let mut e = Entity::new(&params.entity, EntityKind::Agent);
-                e.namespace_id = state.namespace.id;
-                state
-                    .storage
-                    .save_entity(&e)
-                    .map_err(|err| format!("Error creating entity: {err}"))?;
-                e
-            }
-            Err(err) => return Err(format!("Error looking up entity: {err}")),
-        };
+        let entity = get_or_create_entity(
+            state.storage.as_ref(),
+            &params.entity,
+            state.namespace.id,
+        )?;
 
         let (predicate, object) = if let Some(pos) = params.fact.find(' ') {
             (
@@ -162,9 +172,7 @@ impl PensyveMcpServer {
             .map_err(|err| format!("Error saving semantic memory: {err}"))?;
 
         let mut val = serde_json::to_value(&mem).unwrap_or_default();
-        if let serde_json::Value::Object(ref mut map) = val {
-            map.remove("embedding");
-        }
+        strip_embedding(&mut val);
         serde_json::to_string_pretty(&val).map_err(|e| format!("Serialization error: {e}"))
     }
 
@@ -181,19 +189,11 @@ impl PensyveMcpServer {
 
         let mut participant_ids: Vec<Uuid> = Vec::new();
         for name in &params.participants {
-            let entity = match state.storage.get_entity_by_name(name, state.namespace.id) {
-                Ok(Some(e)) => e,
-                Ok(None) => {
-                    let mut e = Entity::new(name, EntityKind::Agent);
-                    e.namespace_id = state.namespace.id;
-                    state
-                        .storage
-                        .save_entity(&e)
-                        .map_err(|err| format!("Error creating entity '{name}': {err}"))?;
-                    e
-                }
-                Err(err) => return Err(format!("Error looking up entity '{name}': {err}")),
-            };
+            let entity = get_or_create_entity(
+                state.storage.as_ref(),
+                name,
+                state.namespace.id,
+            )?;
             participant_ids.push(entity.id);
         }
 
@@ -343,30 +343,32 @@ impl PensyveMcpServer {
 
         let type_filter = params.memory_type.as_deref();
         let mut memories: Vec<serde_json::Value> = Vec::new();
+        let mut remaining = limit;
 
-        if type_filter.is_none() || type_filter == Some("episodic") {
-            match state.storage.list_episodic_by_entity(entity.id, limit) {
+        if remaining > 0 && (type_filter.is_none() || type_filter == Some("episodic")) {
+            match state.storage.list_episodic_by_entity(entity.id, remaining) {
                 Ok(episodics) => {
                     for mem in episodics {
                         let mut val = serde_json::to_value(&mem).unwrap_or_default();
+                        strip_embedding(&mut val);
                         if let serde_json::Value::Object(ref mut map) = val {
-                            map.remove("embedding");
                             map.insert("_type".to_string(), serde_json::json!("episodic"));
                         }
                         memories.push(val);
                     }
+                    remaining = limit.saturating_sub(memories.len());
                 }
                 Err(err) => tracing::warn!("Failed to list episodic memories: {err}"),
             }
         }
 
-        if type_filter.is_none() || type_filter == Some("semantic") {
-            match state.storage.list_semantic_by_entity(entity.id, limit) {
+        if remaining > 0 && (type_filter.is_none() || type_filter == Some("semantic")) {
+            match state.storage.list_semantic_by_entity(entity.id, remaining) {
                 Ok(semantics) => {
                     for mem in semantics {
                         let mut val = serde_json::to_value(&mem).unwrap_or_default();
+                        strip_embedding(&mut val);
                         if let serde_json::Value::Object(ref mut map) = val {
-                            map.remove("embedding");
                             map.insert("_type".to_string(), serde_json::json!("semantic"));
                         }
                         memories.push(val);
@@ -375,8 +377,6 @@ impl PensyveMcpServer {
                 Err(err) => tracing::warn!("Failed to list semantic memories: {err}"),
             }
         }
-
-        memories.truncate(limit);
 
         serde_json::to_string_pretty(&serde_json::json!({
             "entity": params.entity,

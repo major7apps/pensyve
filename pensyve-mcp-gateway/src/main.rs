@@ -34,7 +34,8 @@ pub struct AppState {
     pub auth: auth::AuthValidator,
     pub rate_limiter: rate_limit::RateLimiter,
     pub usage_reporter: UsageReporter,
-    pub config: GatewayConfig,
+    /// Whether API key auth is required (derived from config at startup).
+    pub auth_required: bool,
 }
 
 fn create_pensyve_state(config: &GatewayConfig) -> Result<Arc<PensyveState>> {
@@ -156,19 +157,32 @@ async fn main() -> Result<()> {
         );
 
     // Build axum router.
+    let auth_required = !config.api_keys.is_empty();
     let app_state = Arc::new(AppState {
         auth: auth::AuthValidator::new(&config),
         rate_limiter: rate_limit::RateLimiter::new(config.rate_limit_per_minute),
         usage_reporter: UsageReporter::new(config.stripe_api_key.clone()),
-        config: config.clone(),
+        auth_required,
     });
 
     let app = Router::new()
         .nest_service("/mcp", mcp_service)
         .route("/health", axum::routing::get(health_handler))
-        .layer(AuthLayer::new(app_state.clone()))
         .layer(RateLimitLayer::new(app_state.clone()))
-        .with_state(app_state);
+        .layer(AuthLayer::new(app_state.clone()))
+        .with_state(app_state.clone());
+
+    // Periodic eviction of stale rate-limit entries to bound memory.
+    tokio::spawn({
+        let state = app_state;
+        async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                state.rate_limiter.evict_stale();
+            }
+        }
+    });
 
     let bind = format!("{}:{}", config.host, config.port);
     let listener = tokio::net::TcpListener::bind(&bind).await?;

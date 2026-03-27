@@ -31,12 +31,12 @@ impl RateLimiter {
     /// Check if a request is allowed. Returns `true` if under the limit.
     pub fn check(&self, key_id: &str) -> bool {
         let now = now_ms();
-        let window_start = now.saturating_sub(60_000); // 1 minute window
+        let window_start = now.saturating_sub(60_000);
 
         let mut entry = self.windows.entry(key_id.to_string()).or_default();
         let timestamps = entry.value_mut();
 
-        // Remove timestamps outside the window.
+        // Prune expired timestamps.
         timestamps.retain(|&ts| ts > window_start);
 
         if timestamps.len() >= self.max_rpm as usize {
@@ -52,13 +52,24 @@ impl RateLimiter {
         let now = now_ms();
         let window_start = now.saturating_sub(60_000);
 
-        match self.windows.get(key_id) {
-            Some(entry) => {
-                let count = entry.value().iter().filter(|&&ts| ts > window_start).count();
-                self.max_rpm.saturating_sub(count as u32)
+        match self.windows.get_mut(key_id) {
+            Some(mut entry) => {
+                let timestamps = entry.value_mut();
+                // Prune on read too, so counts are accurate and memory is reclaimed.
+                timestamps.retain(|&ts| ts > window_start);
+                self.max_rpm.saturating_sub(timestamps.len() as u32)
             }
             None => self.max_rpm,
         }
+    }
+
+    /// Remove entries with no recent activity. Call periodically to bound memory.
+    pub fn evict_stale(&self) {
+        let window_start = now_ms().saturating_sub(60_000);
+        self.windows.retain(|_, timestamps| {
+            timestamps.retain(|&ts| ts > window_start);
+            !timestamps.is_empty()
+        });
     }
 }
 
