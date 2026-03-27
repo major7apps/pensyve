@@ -40,7 +40,15 @@ pub struct AppState {
     pub ct: CancellationToken,
 }
 
-fn init_resources(config: &GatewayConfig) -> Result<(Arc<dyn StorageTrait>, Arc<OnnxEmbedder>, Namespace, VectorIndex, RetrievalConfig)> {
+struct InitResources {
+    storage: Arc<dyn StorageTrait>,
+    embedder: Arc<OnnxEmbedder>,
+    namespace: Namespace,
+    vector_index: VectorIndex,
+    retrieval_config: RetrievalConfig,
+}
+
+fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
     let storage_path = &config.storage_path;
     std::fs::create_dir_all(storage_path)?;
 
@@ -112,7 +120,7 @@ fn init_resources(config: &GatewayConfig) -> Result<(Arc<dyn StorageTrait>, Arc<
         max_depth: 4,
     };
 
-    Ok((storage, embedder, namespace, index, retrieval_config))
+    Ok(InitResources { storage, embedder, namespace, vector_index: index, retrieval_config })
 }
 
 #[tokio::main]
@@ -133,14 +141,14 @@ async fn main() -> Result<()> {
         "pensyve-mcp-gateway starting"
     );
 
-    let (storage, embedder, namespace, index, retrieval_config) = init_resources(&config)?;
+    let res = init_resources(&config)?;
 
     let tenant_mgr = TenantStateManager::new(
-        storage,
-        embedder,
-        retrieval_config,
-        namespace,
-        index,
+        res.storage,
+        res.embedder,
+        res.retrieval_config,
+        res.namespace,
+        res.vector_index,
     );
 
     let ct = CancellationToken::new();
