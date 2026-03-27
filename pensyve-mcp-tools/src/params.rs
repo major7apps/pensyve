@@ -2,7 +2,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Fields are read via Deserialize, not direct access
 pub struct RecallParams {
     /// The search query text.
     pub query: String,
@@ -39,7 +39,7 @@ pub struct EpisodeEndParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Fields are read via Deserialize, not direct access
 pub struct ForgetParams {
     /// The entity whose memories to remove.
     pub entity: String,

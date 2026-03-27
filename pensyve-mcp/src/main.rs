@@ -15,10 +15,6 @@ use pensyve_core::vector::VectorIndex;
 
 use pensyve_mcp_tools::{PensyveMcpServer, PensyveState};
 
-// ---------------------------------------------------------------------------
-// Startup helpers
-// ---------------------------------------------------------------------------
-
 fn resolve_storage_path() -> PathBuf {
     if let Ok(path) = std::env::var("PENSYVE_PATH") {
         PathBuf::from(path)
@@ -66,10 +62,6 @@ fn load_vector_index(
 
     index
 }
-
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<()> {

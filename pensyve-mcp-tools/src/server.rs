@@ -64,10 +64,6 @@ impl PensyveMcpServer {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tool implementations
-// ---------------------------------------------------------------------------
-
 #[tool_router]
 impl PensyveMcpServer {
     /// Search memories using semantic + BM25 fusion.
@@ -387,10 +383,6 @@ impl PensyveMcpServer {
         .map_err(|e| format!("Serialization error: {e}"))
     }
 }
-
-// ---------------------------------------------------------------------------
-// ServerHandler impl
-// ---------------------------------------------------------------------------
 
 #[tool_handler]
 impl ServerHandler for PensyveMcpServer {
