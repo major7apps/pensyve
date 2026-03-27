@@ -4,6 +4,8 @@ members = [
     "pensyve-core",
     "pensyve-python",
     "pensyve-mcp",
+    "pensyve-mcp-tools",
+    "pensyve-mcp-gateway",
     "pensyve-cli",
     "pensyve-benchmarks",
 ]
