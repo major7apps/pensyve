@@ -399,3 +399,206 @@ async fn test_mcp_invalid_method_returns_error() {
 
     ct.cancel();
 }
+
+#[tokio::test]
+async fn test_mcp_forget_and_inspect() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = create_test_state(&dir);
+    let (url, ct) = start_test_server(state).await;
+
+    let client = reqwest::Client::new();
+
+    // Initialize.
+    client
+        .post(format!("{url}/mcp"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(json_rpc(
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "0.1.0" }
+            }),
+            1,
+        ))
+        .send()
+        .await
+        .expect("init");
+
+    // Remember two facts.
+    for (i, fact) in ["likes Rust", "works at Acme"].iter().enumerate() {
+        client
+            .post(format!("{url}/mcp"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(json_rpc(
+                "tools/call",
+                serde_json::json!({
+                    "name": "pensyve_remember",
+                    "arguments": { "entity": "bob", "fact": fact }
+                }),
+                (i + 2) as u32,
+            ))
+            .send()
+            .await
+            .expect("remember");
+    }
+
+    // Inspect bob — should have 2 memories.
+    let resp = client
+        .post(format!("{url}/mcp"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(json_rpc(
+            "tools/call",
+            serde_json::json!({
+                "name": "pensyve_inspect",
+                "arguments": { "entity": "bob" }
+            }),
+            10,
+        ))
+        .send()
+        .await
+        .expect("inspect");
+
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).expect("parse");
+    let content_text = json["result"]["content"][0]["text"].as_str().unwrap();
+    let inspect_data: serde_json::Value = serde_json::from_str(content_text).unwrap();
+    assert_eq!(inspect_data["memory_count"], 2);
+
+    // Forget bob.
+    let resp = client
+        .post(format!("{url}/mcp"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(json_rpc(
+            "tools/call",
+            serde_json::json!({
+                "name": "pensyve_forget",
+                "arguments": { "entity": "bob" }
+            }),
+            11,
+        ))
+        .send()
+        .await
+        .expect("forget");
+
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).expect("parse");
+    let content_text = json["result"]["content"][0]["text"].as_str().unwrap();
+    let forget_data: serde_json::Value = serde_json::from_str(content_text).unwrap();
+    assert_eq!(forget_data["forgotten_count"], 2);
+
+    // Inspect again — should have 0 memories.
+    let resp = client
+        .post(format!("{url}/mcp"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(json_rpc(
+            "tools/call",
+            serde_json::json!({
+                "name": "pensyve_inspect",
+                "arguments": { "entity": "bob" }
+            }),
+            12,
+        ))
+        .send()
+        .await
+        .expect("inspect after forget");
+
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).expect("parse");
+    let content_text = json["result"]["content"][0]["text"].as_str().unwrap();
+    let inspect_data: serde_json::Value = serde_json::from_str(content_text).unwrap();
+    assert_eq!(inspect_data["memory_count"], 0);
+
+    ct.cancel();
+}
+
+#[tokio::test]
+async fn test_mcp_concurrent_tool_calls() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = create_test_state(&dir);
+    let (url, ct) = start_test_server(state).await;
+
+    let client = reqwest::Client::new();
+
+    // Initialize.
+    client
+        .post(format!("{url}/mcp"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(json_rpc(
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "0.1.0" }
+            }),
+            1,
+        ))
+        .send()
+        .await
+        .expect("init");
+
+    // Fire 10 concurrent remember calls.
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        let client = client.clone();
+        let url = url.clone();
+        handles.push(tokio::spawn(async move {
+            let resp = client
+                .post(format!("{url}/mcp"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(json_rpc(
+                    "tools/call",
+                    serde_json::json!({
+                        "name": "pensyve_remember",
+                        "arguments": {
+                            "entity": format!("entity_{i}"),
+                            "fact": format!("fact number {i}")
+                        }
+                    }),
+                    (i + 10) as u32,
+                ))
+                .send()
+                .await
+                .expect("concurrent remember");
+            resp.status()
+        }));
+    }
+
+    for handle in handles {
+        let status = handle.await.expect("task join");
+        assert_eq!(status, 200);
+    }
+
+    ct.cancel();
+}
+
+#[tokio::test]
+async fn test_mcp_get_method_not_allowed_in_stateless() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = create_test_state(&dir);
+    let (url, ct) = start_test_server(state).await;
+
+    let client = reqwest::Client::new();
+
+    // GET on /mcp should return 405 in stateless mode.
+    let resp = client
+        .get(format!("{url}/mcp"))
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .expect("get request");
+
+    assert_eq!(resp.status(), 405);
+
+    ct.cancel();
+}
