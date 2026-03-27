@@ -86,17 +86,17 @@ impl TenantStateManager {
             Ok(None) => {
                 let ns = Namespace::new(&ns_name);
                 self.storage.save_namespace(&ns).map_err(|e| {
-                    std::io::Error::other(
-                        format!("Failed to create tenant namespace '{ns_name}': {e}"),
-                    )
+                    std::io::Error::other(format!(
+                        "Failed to create tenant namespace '{ns_name}': {e}"
+                    ))
                 })?;
                 tracing::info!("Created tenant namespace '{ns_name}' (id={})", ns.id);
                 ns
             }
             Err(e) => {
-                return Err(std::io::Error::other(
-                    format!("Failed to look up tenant namespace '{ns_name}': {e}"),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "Failed to look up tenant namespace '{ns_name}': {e}"
+                )));
             }
         };
 

@@ -9,16 +9,15 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::Router;
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService,
-    session::local::LocalSessionManager,
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
-use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::storage::StorageTrait;
+use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::Namespace;
 use pensyve_core::vector::VectorIndex;
 
@@ -52,8 +51,9 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
     let storage_path = &config.storage_path;
     std::fs::create_dir_all(storage_path)?;
 
-    let storage = SqliteBackend::open(storage_path)
-        .map_err(|e| anyhow::anyhow!("Failed to open storage at {}: {e}", storage_path.display()))?;
+    let storage = SqliteBackend::open(storage_path).map_err(|e| {
+        anyhow::anyhow!("Failed to open storage at {}: {e}", storage_path.display())
+    })?;
     let storage: Arc<dyn StorageTrait> = Arc::new(storage);
 
     let namespace_name = &config.namespace;
@@ -106,7 +106,10 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
                 loaded += 1;
             }
         }
-        tracing::info!("Loaded {loaded}/{} memories into vector index", memories.len());
+        tracing::info!(
+            "Loaded {loaded}/{} memories into vector index",
+            memories.len()
+        );
     }
 
     let retrieval_config = RetrievalConfig {
@@ -120,7 +123,13 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
         max_depth: 4,
     };
 
-    Ok(InitResources { storage, embedder, namespace, vector_index: index, retrieval_config })
+    Ok(InitResources {
+        storage,
+        embedder,
+        namespace,
+        vector_index: index,
+        retrieval_config,
+    })
 }
 
 #[tokio::main]
@@ -190,7 +199,10 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .nest_service("/mcp", mcp_service)
         .route("/health", axum::routing::get(health_handler))
-        .layer(axum::middleware::from_fn_with_state(app_state.clone(), tenant_and_usage_middleware))
+        .layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            tenant_and_usage_middleware,
+        ))
         .layer(RateLimitLayer::new(app_state.clone()))
         .layer(AuthLayer::new(app_state.clone()))
         .with_state(app_state.clone());
@@ -248,15 +260,17 @@ async fn tenant_and_usage_middleware(
     let response = CURRENT_TENANT.scope(tenant_id, next.run(req)).await;
 
     // Report usage for successful MCP requests.
-    if is_mcp && response.status().is_success()
-        && let Some(ctx) = auth_ctx {
-            state.usage_reporter.report(usage::UsageEvent {
-                key_id: ctx.key_id,
-                stripe_customer_id: ctx.user_id,
-                tier: usage::OperationTier::Standard,
-                count: 1,
-            });
-        }
+    if is_mcp
+        && response.status().is_success()
+        && let Some(ctx) = auth_ctx
+    {
+        state.usage_reporter.report(usage::UsageEvent {
+            key_id: ctx.key_id,
+            stripe_customer_id: ctx.user_id,
+            tier: usage::OperationTier::Standard,
+            count: 1,
+        });
+    }
 
     response
 }

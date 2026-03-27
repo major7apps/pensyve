@@ -137,7 +137,8 @@ where
             // Get the authenticated key_id from request extensions.
             let key_id = req
                 .extensions()
-                .get::<AuthContext>().map_or_else(|| "anonymous".to_string(), |ctx| ctx.key_id.clone());
+                .get::<AuthContext>()
+                .map_or_else(|| "anonymous".to_string(), |ctx| ctx.key_id.clone());
 
             if !state.rate_limiter.check(&key_id) {
                 let body = Body::from(

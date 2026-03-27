@@ -41,8 +41,7 @@ impl GatewayConfig {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(3000),
             storage_path,
-            namespace: std::env::var("PENSYVE_NAMESPACE")
-                .unwrap_or_else(|_| "default".to_string()),
+            namespace: std::env::var("PENSYVE_NAMESPACE").unwrap_or_else(|_| "default".to_string()),
             api_keys,
             rate_limit_per_minute: std::env::var("PENSYVE_RATE_LIMIT")
                 .ok()
@@ -83,10 +82,7 @@ mod tests {
 
     #[test]
     fn test_config_with_api_keys() {
-        let config = make_config(
-            vec!["psy_key1".to_string(), "psy_key2".to_string()],
-            8080,
-        );
+        let config = make_config(vec!["psy_key1".to_string(), "psy_key2".to_string()], 8080);
         assert_eq!(config.api_keys.len(), 2);
         assert_eq!(config.port, 8080);
     }

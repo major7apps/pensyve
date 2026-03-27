@@ -12,7 +12,9 @@ use pensyve_core::storage::StorageTrait;
 use pensyve_core::types::{Entity, EntityKind, Episode, Memory, Outcome, SemanticMemory};
 use pensyve_core::vector::VectorIndex;
 
-use crate::params::{RecallParams, RememberParams, EpisodeStartParams, EpisodeEndParams, ForgetParams, InspectParams};
+use crate::params::{
+    EpisodeEndParams, EpisodeStartParams, ForgetParams, InspectParams, RecallParams, RememberParams,
+};
 use crate::state::PensyveState;
 
 fn memory_type_name(memory: &Memory) -> &'static str {
@@ -95,9 +97,10 @@ impl PensyveMcpServer {
             .filter_map(|c| {
                 let type_name = memory_type_name(&c.memory);
                 if let Some(types) = &params.types
-                    && !types.iter().any(|t| t == type_name) {
-                        return None;
-                    }
+                    && !types.iter().any(|t| t == type_name)
+                {
+                    return None;
+                }
                 let mut outer = serde_json::to_value(&c.memory).unwrap_or_default();
                 let inner = if let serde_json::Value::Object(ref mut map) = outer {
                     map.values_mut()
@@ -133,11 +136,8 @@ impl PensyveMcpServer {
         let state = &self.state;
         let confidence = params.confidence.unwrap_or(1.0) as f32;
 
-        let entity = get_or_create_entity(
-            state.storage.as_ref(),
-            &params.entity,
-            state.namespace.id,
-        )?;
+        let entity =
+            get_or_create_entity(state.storage.as_ref(), &params.entity, state.namespace.id)?;
 
         let (predicate, object) = if let Some(pos) = params.fact.find(' ') {
             (
@@ -185,11 +185,7 @@ impl PensyveMcpServer {
 
         let mut participant_ids: Vec<Uuid> = Vec::new();
         for name in &params.participants {
-            let entity = get_or_create_entity(
-                state.storage.as_ref(),
-                name,
-                state.namespace.id,
-            )?;
+            let entity = get_or_create_entity(state.storage.as_ref(), name, state.namespace.id)?;
             participant_ids.push(entity.id);
         }
 

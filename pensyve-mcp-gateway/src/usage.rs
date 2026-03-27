@@ -96,7 +96,10 @@ impl UsageReporter {
         client: &reqwest::Client,
     ) {
         let Some(api_key) = stripe_api_key else {
-            tracing::debug!(count = batch.len(), "Stripe not configured — discarding usage events");
+            tracing::debug!(
+                count = batch.len(),
+                "Stripe not configured — discarding usage events"
+            );
             batch.clear();
             return;
         };
@@ -105,9 +108,7 @@ impl UsageReporter {
         let mut aggregated: HashMap<(String, OperationTier), u32> = HashMap::new();
         for event in batch.drain(..) {
             if let Some(customer_id) = event.stripe_customer_id {
-                *aggregated
-                    .entry((customer_id, event.tier))
-                    .or_default() += event.count;
+                *aggregated.entry((customer_id, event.tier)).or_default() += event.count;
             }
         }
 
@@ -125,7 +126,8 @@ impl UsageReporter {
             let mut success = false;
             for attempt in 0..3 {
                 if attempt > 0 {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500 * 2u64.pow(attempt))).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500 * 2u64.pow(attempt)))
+                        .await;
                 }
                 let result = client
                     .post("https://api.stripe.com/v1/billing/meter_events")
@@ -140,7 +142,11 @@ impl UsageReporter {
 
                 match result {
                     Ok(resp) if resp.status().is_success() => {
-                        tracing::debug!(customer = customer_id, tier = tier.event_name(), "Usage reported");
+                        tracing::debug!(
+                            customer = customer_id,
+                            tier = tier.event_name(),
+                            "Usage reported"
+                        );
                         success = true;
                         break;
                     }
@@ -159,7 +165,11 @@ impl UsageReporter {
                 }
             }
             if !success {
-                tracing::error!(customer = customer_id, count, "Stripe meter event dropped after 3 retries");
+                tracing::error!(
+                    customer = customer_id,
+                    count,
+                    "Stripe meter event dropped after 3 retries"
+                );
             }
         }
     }
@@ -202,8 +212,14 @@ mod tests {
     #[test]
     fn test_operation_tier_event_names() {
         assert_eq!(OperationTier::Standard.event_name(), "pensyve_operation");
-        assert_eq!(OperationTier::Multimodal.event_name(), "pensyve_multimodal_operation");
-        assert_eq!(OperationTier::Extraction.event_name(), "pensyve_extraction_operation");
+        assert_eq!(
+            OperationTier::Multimodal.event_name(),
+            "pensyve_multimodal_operation"
+        );
+        assert_eq!(
+            OperationTier::Extraction.event_name(),
+            "pensyve_extraction_operation"
+        );
     }
 
     #[tokio::test]

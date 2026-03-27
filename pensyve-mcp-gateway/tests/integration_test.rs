@@ -9,8 +9,7 @@ use pensyve_core::types::Namespace;
 use pensyve_core::vector::VectorIndex;
 use pensyve_mcp_tools::{PensyveMcpServer, PensyveState};
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService,
-    session::local::LocalSessionManager,
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;

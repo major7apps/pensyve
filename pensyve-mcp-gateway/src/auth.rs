@@ -139,7 +139,9 @@ where
             let token = if let Some(token) = auth_header.strip_prefix("Bearer ") {
                 token.trim()
             } else {
-                let body = Body::from(r#"{"error":"unauthorized","message":"Missing or invalid Authorization header. Use: Bearer psy_your_key"}"#);
+                let body = Body::from(
+                    r#"{"error":"unauthorized","message":"Missing or invalid Authorization header. Use: Bearer psy_your_key"}"#,
+                );
                 return Ok(Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
                     .header("content-type", "application/json")
@@ -151,9 +153,8 @@ where
                 req.extensions_mut().insert(ctx);
                 inner.call(req).await
             } else {
-                let body = Body::from(
-                    r#"{"error":"forbidden","message":"Invalid or revoked API key"}"#,
-                );
+                let body =
+                    Body::from(r#"{"error":"forbidden","message":"Invalid or revoked API key"}"#);
                 Ok(Response::builder()
                     .status(StatusCode::FORBIDDEN)
                     .header("content-type", "application/json")
