@@ -37,6 +37,7 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist --manifest-path pensyve-python/Cargo.toml
           manylinux: auto
+          before-script-linux: yum install -y openssl-devel perl-IPC-Cmd || apt-get update && apt-get install -y libssl-dev
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -129,14 +130,14 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p staging
-          cp target/release/pensyve-cli staging/pensyve
+          cp target/release/pensyve staging/pensyve
           cd staging && tar czf ../${{ matrix.artifact }}.tar.gz pensyve
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           mkdir staging
-          cp target/release/pensyve-cli.exe staging/pensyve.exe
+          cp target/release/pensyve.exe staging/pensyve.exe
           Compress-Archive -Path staging/pensyve.exe -DestinationPath ${{ matrix.artifact }}.zip
       - name: Upload artifact
         uses: actions/upload-artifact@v4
