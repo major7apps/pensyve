@@ -1,252 +1,325 @@
 """Pensyve memory backend for CrewAI.
 
-Modern usage (ExternalMemory with StorageBackend — recommended):
-    from pensyve_crewai import PensyveStorage
-    from crewai import Crew
-    from crewai.memory.external.external_memory import ExternalMemory
+Usage:
+    from pensyve_crewai import PensyveMemory
 
+    memory = PensyveMemory(namespace="my-crew")
+    memory.remember("The API uses Bearer token auth")
+    matches = memory.recall("authentication method", limit=5)
+
+    # With a Crew (pass as external memory config)
+    from crewai import Crew
     crew = Crew(
         agents=[...],
         tasks=[...],
         memory=True,
-        memory_config={
-            "provider": "external",
-            "config": {"instance": ExternalMemory(storage=PensyveStorage())},
-        },
+        memory_config={"provider": "custom", "config": {"instance": memory}},
     )
-
-Standalone usage (without CrewAI imports):
-    from pensyve_crewai import PensyveCrewMemory
-    memory = PensyveCrewMemory(namespace="my-crew")
-    memory.save_long_term("agent-1", "User prefers dark mode")
-    results = memory.search("color preferences")
-
-Maps CrewAI's memory concepts to Pensyve:
-    - Short-term memory -> Pensyve episodic (episodes per task)
-    - Long-term memory  -> Pensyve semantic (persisted facts)
-    - Entity memory     -> Pensyve entities (per-agent/per-user)
 """
 
 from __future__ import annotations
 
+import importlib
+import os
+import re
+from dataclasses import dataclass, field
 from typing import Any
 
-import pensyve
+# Lazy-loaded at first use by _get_pensyve_module(). Stored as a module-level
+# attribute so tests can patch ``pensyve_crewai._pensyve_mod``.
+_pensyve_mod: Any = None
+
+
+def _get_pensyve_module() -> Any:
+    """Lazy-import the pensyve SDK. Returns the cached module."""
+    global _pensyve_mod  # noqa: PLW0603
+    if _pensyve_mod is None:
+        _pensyve_mod = importlib.import_module("pensyve")
+    return _pensyve_mod
+
 
 # ---------------------------------------------------------------------------
-# CrewAI StorageBackend-compatible interface (modern, recommended)
+# Result types — defined locally so CrewAI is not a required import
 # ---------------------------------------------------------------------------
 
 
-class PensyveStorage:
-    """CrewAI StorageBackend protocol implementation using Pensyve.
+@dataclass
+class MemoryRecord:
+    """A single stored memory record."""
 
-    Implements the ``save``, ``search``, and ``reset`` methods expected by
-    CrewAI's ``Memory(storage=...)`` and ``ExternalMemory`` classes.
+    content: str
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    Usage with CrewAI ExternalMemory::
 
-        from pensyve_crewai import PensyveStorage
-        from crewai import Crew
-        from crewai.memory.external.external_memory import ExternalMemory
+@dataclass
+class MemoryMatch:
+    """A search result with relevance score, compatible with CrewAI's API.
 
-        storage = PensyveStorage(namespace="my-crew")
-        crew = Crew(
-            agents=[...],
-            tasks=[...],
-            memory=True,
-            memory_config={
-                "provider": "external",
-                "config": {"instance": ExternalMemory(storage=storage)},
-            },
-        )
+    Usage::
+
+        matches = memory.recall("auth method")
+        for m in matches:
+            print(f"[{m.score:.2f}] {m.record.content}")
+    """
+
+    score: float
+    record: MemoryRecord
+
+
+# ---------------------------------------------------------------------------
+# Sentence splitter for extract_memories (no LLM required)
+# ---------------------------------------------------------------------------
+
+# Matches sentence-ending punctuation followed by whitespace or end-of-string.
+# Handles abbreviations like "Dr.", "U.S.", "e.g." by requiring the next char
+# to be uppercase or end-of-string.
+_SENTENCE_RE = re.compile(
+    r"(?<=[.!?])"  # lookbehind: sentence-ending punctuation
+    r"(?:\s+)"     # required whitespace between sentences
+    r"(?=[A-Z\"])" # lookahead: next sentence starts with uppercase or quote
+)
+
+# Common abbreviations that should NOT be treated as sentence boundaries.
+_ABBREVIATIONS = frozenset({
+    "dr.", "mr.", "mrs.", "ms.", "prof.", "sr.", "jr.",
+    "inc.", "ltd.", "corp.", "co.",
+    "vs.", "etc.", "approx.", "dept.", "est.",
+    "e.g.", "i.e.", "no.", "vol.", "rev.",
+    "u.s.", "u.k.", "u.n.",
+    "jan.", "feb.", "mar.", "apr.", "jun.", "jul.", "aug.",
+    "sep.", "oct.", "nov.", "dec.",
+})
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split text into sentences using regex heuristics.
+
+    Returns non-empty, stripped sentences. Joins back fragments that were
+    split on abbreviations.
+    """
+    raw = _SENTENCE_RE.split(text)
+    sentences: list[str] = []
+    for fragment in raw:
+        stripped = fragment.strip()
+        if not stripped:
+            continue
+        # If the previous sentence ends with a known abbreviation, merge.
+        if sentences:
+            prev_lower = sentences[-1].lower()
+            if any(prev_lower.endswith(abbr) for abbr in _ABBREVIATIONS):
+                sentences[-1] = f"{sentences[-1]} {stripped}"
+                continue
+        sentences.append(stripped)
+    return sentences
+
+
+# ---------------------------------------------------------------------------
+# Backend protocol — local SDK vs. cloud REST API
+# ---------------------------------------------------------------------------
+
+
+class _LocalBackend:
+    """Backend using the local Pensyve Python SDK (PyO3 bindings)."""
+
+    def __init__(self, namespace: str, path: str | None, entity_name: str) -> None:
+        mod = _get_pensyve_module()
+        self._pensyve = mod.Pensyve(path=path, namespace=namespace)
+        self._entity = self._pensyve.entity(entity_name, kind="agent")
+
+    def remember(self, text: str, metadata: dict[str, Any] | None) -> None:
+        confidence = 0.85
+        if metadata:
+            confidence = metadata.get("confidence", confidence)
+        self._pensyve.remember(entity=self._entity, fact=text, confidence=confidence)
+
+    def recall(self, query: str, limit: int) -> list[MemoryMatch]:
+        memories = self._pensyve.recall(query, entity=self._entity, limit=limit)
+        results: list[MemoryMatch] = []
+        for mem in memories:
+            content = getattr(mem, "content", str(mem))
+            score = getattr(mem, "score", 0.0)
+            meta: dict[str, Any] = {
+                "type": getattr(mem, "type", "semantic"),
+                "confidence": getattr(mem, "confidence", 0.0),
+            }
+            results.append(
+                MemoryMatch(
+                    score=score,
+                    record=MemoryRecord(content=content, metadata=meta),
+                )
+            )
+        return results
+
+    def reset(self) -> None:
+        self._pensyve.forget(entity=self._entity)
+
+
+def _make_cloud_client(api_key: str, base_url: str) -> Any:
+    """Lazy import and construct a PensyveClient. Isolated for testability."""
+    from pensyve.client import PensyveClient
+
+    return PensyveClient(base_url=base_url, api_key=api_key)
+
+
+class _CloudBackend:
+    """Backend using the Pensyve REST API (pensyve.client.PensyveClient)."""
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        entity_name: str,
+        *,
+        _client: Any | None = None,
+    ) -> None:
+        self._client = _client or _make_cloud_client(api_key, base_url)
+        self._entity_name = entity_name
+        # Ensure the entity exists on the server.
+        self._client.entity(entity_name, kind="agent")
+
+    def remember(self, text: str, metadata: dict[str, Any] | None) -> None:
+        confidence = 0.85
+        if metadata:
+            confidence = metadata.get("confidence", confidence)
+        self._client.remember(self._entity_name, text, confidence=confidence)
+
+    def recall(self, query: str, limit: int) -> list[MemoryMatch]:
+        resp = self._client.recall(query, entity=self._entity_name, limit=limit)
+        # The REST API returns {"memories": [{"content": ..., "score": ..., ...}]}
+        raw_memories = resp.get("memories", [])
+        results: list[MemoryMatch] = []
+        for mem in raw_memories:
+            content = mem.get("content", "")
+            score = mem.get("score", 0.0)
+            meta: dict[str, Any] = {
+                "type": mem.get("type", "semantic"),
+                "confidence": mem.get("confidence", 0.0),
+            }
+            results.append(
+                MemoryMatch(
+                    score=score,
+                    record=MemoryRecord(content=content, metadata=meta),
+                )
+            )
+        return results
+
+    def reset(self) -> None:
+        self._client.forget(self._entity_name)
+
+
+# ---------------------------------------------------------------------------
+# PensyveMemory — the main public class
+# ---------------------------------------------------------------------------
+
+
+class PensyveMemory:
+    """Pensyve memory backend for CrewAI.
+
+    Provides ``remember``, ``recall``, and ``extract_memories`` methods that
+    mirror CrewAI's unified ``Memory`` API, backed by Pensyve's 8-signal
+    fusion retrieval engine.
+
+    Mode detection:
+        - If ``PENSYVE_API_KEY`` is set (or ``api_key`` is passed), uses the
+          Pensyve cloud REST API.
+        - Otherwise, uses the local Pensyve SDK (PyO3 bindings + SQLite).
+
+    Args:
+        namespace: Pensyve namespace for memory isolation.
+        entity_name: Entity name to scope memories to.
+        path: Local storage path (local mode only). Default: ``~/.pensyve/default``.
+        api_key: Pensyve cloud API key. Overrides ``PENSYVE_API_KEY`` env var.
+        base_url: Pensyve cloud API base URL. Default: ``https://api.pensyve.com``.
+
+    Usage::
+
+        memory = PensyveMemory(namespace="my-crew")
+        memory.remember("The API rate limit is 1000 req/min")
+        matches = memory.recall("rate limits", limit=5)
+        for m in matches:
+            print(f"[{m.score:.2f}] {m.record.content}")
+
+        # Extract facts from unstructured text
+        facts = memory.extract_memories("Meeting notes: We decided to migrate to Postgres.")
+        for fact in facts:
+            memory.remember(fact)
     """
 
     def __init__(
         self,
         namespace: str = "default",
-        path: str | None = None,
         entity_name: str = "crew-agent",
-        user_id: str | None = None,
+        *,
+        path: str | None = None,
+        api_key: str | None = None,
+        base_url: str = "https://api.pensyve.com",
     ) -> None:
-        """Initialize the CrewAI storage backend.
+        resolved_key = api_key or os.environ.get("PENSYVE_API_KEY")
+        if resolved_key:
+            self._backend: _LocalBackend | _CloudBackend = _CloudBackend(
+                api_key=resolved_key,
+                base_url=base_url,
+                entity_name=entity_name,
+            )
+            self._mode = "cloud"
+        else:
+            self._backend = _LocalBackend(
+                namespace=namespace,
+                path=path,
+                entity_name=entity_name,
+            )
+            self._mode = "local"
 
-        Args:
-            namespace: Pensyve namespace for isolation.
-            path: Storage directory. Default: ~/.pensyve/default.
-            entity_name: Default agent entity name.
-            user_id: Optional user ID for multi-user scoping. When set,
-                memories are stored under a user-specific entity.
-        """
-        self._pensyve = pensyve.Pensyve(path=path, namespace=namespace)
-        self._entity_name = entity_name
-        self._user_id = user_id
-        self._entities: dict[str, Any] = {}
+    @property
+    def mode(self) -> str:
+        """Return the active backend mode: ``'local'`` or ``'cloud'``."""
+        return self._mode
 
-    def _resolve_entity(self, name: str | None = None) -> Any:
-        """Get or create a cached entity."""
-        key = name or self._user_id or self._entity_name
-        if key not in self._entities:
-            kind = "user" if name == self._user_id else "agent"
-            self._entities[key] = self._pensyve.entity(key, kind=kind)
-        return self._entities[key]
-
-    def save(
+    def remember(
         self,
-        value: str,
+        text: str,
         metadata: dict[str, Any] | None = None,
-        agent: str | None = None,
     ) -> None:
         """Store a memory.
 
-        Implements the CrewAI StorageBackend.save protocol.
-
         Args:
-            value: The content to store.
-            metadata: Optional metadata (currently stored as part of the fact).
-            agent: Optional agent name to scope the memory to.
+            text: The content to remember.
+            metadata: Optional metadata dict. Supports ``confidence`` (float).
         """
-        entity = self._resolve_entity(agent)
-        confidence = 0.85
-        if metadata:
-            confidence = metadata.get("confidence", confidence)
-        self._pensyve.remember(entity=entity, fact=value, confidence=confidence)
+        self._backend.remember(text, metadata)
 
-    def search(
+    def recall(
         self,
         query: str,
         limit: int = 5,
-        score_threshold: float = 0.0,
-    ) -> list[dict[str, Any]]:
-        """Search memories.
-
-        Implements the CrewAI StorageBackend.search protocol.
+    ) -> list[MemoryMatch]:
+        """Search for relevant memories.
 
         Args:
-            query: Search query string.
-            limit: Maximum results to return.
-            score_threshold: Minimum score for results.
+            query: Natural-language search query.
+            limit: Maximum number of results to return.
 
         Returns:
-            List of dicts with 'context', 'score', and 'metadata' keys,
-            matching CrewAI's expected format.
+            List of :class:`MemoryMatch` objects, each with ``.score`` and
+            ``.record.content`` attributes, ordered by relevance.
         """
-        entity = self._resolve_entity()
-        memories = self._pensyve.recall(query, entity=entity, limit=limit)
+        return self._backend.recall(query, limit)
 
-        results = []
-        for mem in memories:
-            score = getattr(mem, "score", 0.0)
-            if score < score_threshold:
-                continue
-            results.append(
-                {
-                    "context": getattr(mem, "content", str(mem)),
-                    "score": score,
-                    "metadata": {
-                        "type": getattr(mem, "type", "semantic"),
-                        "confidence": getattr(mem, "confidence", 0.0),
-                    },
-                }
-            )
-        return results
+    def extract_memories(self, text: str) -> list[str]:
+        """Extract individual facts from unstructured text.
+
+        Uses a lightweight sentence splitter (no LLM required). Each
+        returned string is a standalone fact suitable for passing to
+        :meth:`remember`.
+
+        Args:
+            text: Unstructured text (meeting notes, documentation, etc.).
+
+        Returns:
+            List of extracted fact strings.
+        """
+        return _split_sentences(text)
 
     def reset(self) -> None:
-        """Clear all memories for the default entity."""
-        entity = self._resolve_entity()
-        self._pensyve.forget(entity=entity)
-
-
-# ---------------------------------------------------------------------------
-# Standalone interface (works without CrewAI imports)
-# ---------------------------------------------------------------------------
-
-
-class PensyveCrewMemory:
-    """Standalone CrewAI-compatible memory backend using Pensyve.
-
-    Provides short-term (episodic), long-term (semantic), and entity memory
-    through a unified interface. Does not require CrewAI to be installed.
-    """
-
-    def __init__(self, namespace: str = "default", path: str | None = None):
-        self._pensyve = pensyve.Pensyve(path=path, namespace=namespace)
-        self._entities: dict[str, Any] = {}
-        self._episodes: dict[str, Any] = {}
-
-    def _get_entity(self, name: str, kind: str = "agent") -> Any:
-        """Get or create a cached entity."""
-        key = f"{name}:{kind}"
-        if key not in self._entities:
-            self._entities[key] = self._pensyve.entity(name, kind=kind)
-        return self._entities[key]
-
-    def save_short_term(
-        self,
-        task_id: str,
-        content: str,
-        agent_name: str = "crew-agent",
-        role: str = "assistant",
-    ) -> None:
-        """Save a short-term (episodic) memory for a task."""
-        if task_id not in self._episodes:
-            agent = self._get_entity(agent_name, kind="agent")
-            episode = self._pensyve.episode(agent)
-            episode.__enter__()
-            self._episodes[task_id] = episode
-
-        self._episodes[task_id].message(role, content)
-
-    def end_task(self, task_id: str, outcome: str = "success") -> None:
-        """End the episode for a task."""
-        if task_id in self._episodes:
-            episode = self._episodes.pop(task_id)
-            episode.outcome(outcome)
-            episode.__exit__(None, None, None)
-
-    def save_long_term(
-        self,
-        entity_name: str,
-        fact: str,
-        confidence: float = 0.8,
-        kind: str = "agent",
-    ) -> None:
-        """Save a long-term (semantic) memory."""
-        entity = self._get_entity(entity_name, kind=kind)
-        self._pensyve.remember(entity=entity, fact=fact, confidence=confidence)
-
-    def search(
-        self,
-        query: str,
-        entity_name: str | None = None,
-        types: list[str] | None = None,
-        limit: int = 5,
-    ) -> list[dict[str, Any]]:
-        """Search memories with optional entity and type filters."""
-        entity = self._get_entity(entity_name) if entity_name else None
-        memories = self._pensyve.recall(query, entity=entity, limit=limit, types=types)
-        return [
-            {
-                "content": getattr(m, "content", str(m)),
-                "type": getattr(m, "type", "semantic"),
-                "confidence": getattr(m, "confidence", 0.0),
-                "score": getattr(m, "score", 0.0),
-            }
-            for m in memories
-        ]
-
-    def reset(self, entity_name: str | None = None) -> None:
-        """Clear memories, optionally scoped to an entity."""
-        for task_id in list(self._episodes.keys()):
-            self.end_task(task_id, outcome="partial")
-
-        if entity_name:
-            entity = self._get_entity(entity_name)
-            self._pensyve.forget(entity=entity)
-        else:
-            for entity in self._entities.values():
-                self._pensyve.forget(entity=entity)
-
-    def consolidate(self) -> dict[str, int]:
-        """Run memory consolidation."""
-        return self._pensyve.consolidate()
+        """Clear all memories for this instance's entity."""
+        self._backend.reset()

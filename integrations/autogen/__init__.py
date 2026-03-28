@@ -1,3 +1,3 @@
-from pensyve_autogen import PensyveAgentMemory
+from pensyve_autogen import PensyveMemory
 
-__all__ = ["PensyveAgentMemory"]
+__all__ = ["PensyveMemory"]

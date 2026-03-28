@@ -1,66 +1,97 @@
 # Pensyve AutoGen Integration
 
-Multi-agent memory store for Microsoft AutoGen, providing per-agent entities in a shared Pensyve namespace.
+Async memory backend for Microsoft AutoGen, implementing the `Memory` ABC so it can be passed directly to `AssistantAgent(memory=[...])`.
 
 ## Installation
 
 ```bash
-pip install pensyve
+pip install pensyve-autogen
+
+# With AutoGen (recommended):
+pip install pensyve-autogen[autogen]
 ```
 
-Copy `pensyve_autogen.py` into your project, or add this directory to your Python path.
+Or copy `pensyve_autogen.py` into your project (works standalone without autogen-core installed).
 
 ## Quick Start
 
 ```python
-from pensyve_autogen import PensyveAgentMemory
+from pensyve_autogen import PensyveMemory, MemoryContent, MemoryMimeType
 
-memory = PensyveAgentMemory(namespace="my-team")
+memory = PensyveMemory(namespace="my-team", entity="assistant")
 
-# Record messages per agent
-memory.add_message("researcher", "assistant", "Found 3 relevant papers on RAG")
-memory.add_message("writer", "assistant", "Drafted the introduction section")
+# Store a memory
+await memory.add(MemoryContent(
+    content="User prefers TypeScript",
+    mime_type=MemoryMimeType.TEXT,
+    metadata={"category": "preferences"},
+))
 
-# Store persistent facts per agent
-memory.remember("researcher", "RAG improves factual accuracy by 40%")
-memory.remember("writer", "User prefers academic tone")
+# Query memories
+result = await memory.query("language preferences")
+for entry in result.results:
+    print(f"{entry.content} (score: {entry.score:.2f})")
 
-# Search scoped to a specific agent
-results = memory.search("researcher", "RAG accuracy")
-for r in results:
-    print(f"{r['content']} (score: {r['score']:.2f})")
+# Use with AutoGen agent
+from autogen_ext.models.openai import OpenAIChatCompletionClient
+from autogen_agentchat.agents import AssistantAgent
 
-# Search across all agents
-all_results = memory.search_all("accuracy")
+agent = AssistantAgent(
+    name="assistant",
+    model_client=OpenAIChatCompletionClient(model="gpt-4o"),
+    memory=[memory],
+)
+```
 
-# Share knowledge between agents
-memory.share_memory("researcher", "writer", "RAG improves factual accuracy by 40%")
+## Dual-Mode: Local and Cloud
 
-# End episodes when done
-memory.end_episode("researcher", outcome="success")
-memory.end_episode("writer", outcome="success")
+```python
+# Local mode (default) — PyO3 engine, zero latency
+memory = PensyveMemory(namespace="my-app")
 
-# Consolidation
-stats = memory.consolidate()
+# Cloud mode — auto-detected from API key
+memory = PensyveMemory(
+    namespace="my-app",
+    api_key="pk_live_...",
+)
+
+# Or via environment variable
+# export PENSYVE_API_KEY=pk_live_...
+memory = PensyveMemory(namespace="my-app")
+
+# Explicit mode override
+memory = PensyveMemory(namespace="my-app", mode="cloud", base_url="https://api.pensyve.com")
 ```
 
 ## API
 
-### `PensyveAgentMemory(namespace, path)`
+### `PensyveMemory(namespace, entity, **kwargs)`
 
-- `namespace` (str): Shared Pensyve namespace. Default: `"default"`.
-- `path` (str | None): Storage directory. Default: `~/.pensyve/default`.
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `namespace` | `str` | `"default"` | Pensyve namespace for isolation |
+| `entity` | `str` | `"autogen-agent"` | Entity name for this agent's memories |
+| `path` | `str \| None` | `None` | Storage directory (local mode) |
+| `mode` | `str` | `"auto"` | `"auto"`, `"local"`, or `"cloud"` |
+| `api_key` | `str \| None` | `None` | API key for cloud mode |
+| `base_url` | `str \| None` | `None` | Cloud server URL |
+| `recall_limit` | `int` | `5` | Default number of memories to retrieve |
+| `confidence` | `float` | `0.85` | Default confidence for stored memories |
 
-### Methods
+### Async Methods (AutoGen Memory ABC)
 
 | Method | Description |
 |--------|-------------|
-| `add_message(agent_name, role, content)` | Record a message in an agent's episode |
-| `end_episode(agent_name, outcome)` | Close an agent's current episode |
-| `search(agent_name, query, limit, types)` | Search memories scoped to one agent |
-| `search_all(query, limit, types)` | Search memories across all agents |
-| `remember(agent_name, fact, confidence)` | Store a semantic memory for an agent |
-| `share_memory(from_agent, to_agent, fact)` | Copy a fact to another agent's memory |
-| `forget(agent_name, hard_delete)` | Clear all memories for an agent |
-| `reset()` | Clear all agent memories and episodes |
-| `consolidate()` | Run memory decay and promotion |
+| `await add(content)` | Store a `MemoryContent` as a Pensyve fact |
+| `await query(query, **kwargs)` | Search memories, returns `MemoryQueryResult` |
+| `await update_context(model_context)` | Inject relevant memories as a system message |
+| `await clear()` | Delete all memories for the entity |
+| `await close()` | Clean up resources (no-op for local mode) |
+
+## Running Tests
+
+```bash
+cd integrations/autogen
+pip install -e ".[dev]"
+pytest tests/ -v
+```

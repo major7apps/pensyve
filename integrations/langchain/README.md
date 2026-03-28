@@ -1,73 +1,139 @@
-# Pensyve LangChain Integration
+# Pensyve LangChain / LangGraph Integration
 
-Drop-in Pensyve memory backend for LangChain and LangGraph agents.
+Drop-in Pensyve memory backend for LangGraph agents. Implements the same
+`put` / `get` / `search` / `delete` interface as LangGraph's `InMemoryStore`,
+backed by Pensyve's 8-signal fusion retrieval engine.
 
 ## Installation
 
 ```bash
-pip install pensyve
+pip install pensyve-langchain
 ```
 
-Copy `pensyve_langchain.py` into your project, or add this directory to your Python path.
+Or copy the `pensyve_langchain.py` file into your project.
 
 ## Quick Start
 
 ```python
-from pensyve_langchain import PensyveMemory
+from pensyve_langchain import PensyveStore
 
-# Create memory backend (replaces ConversationBufferMemory)
-memory = PensyveMemory(namespace="my-project")
+store = PensyveStore()
 
-# Save conversation turns
-memory.save_context(
-    {"input": "What is Pensyve?"},
-    {"output": "Pensyve is a universal memory runtime for AI agents."}
-)
+# Store memories
+store.put(("user_123", "memories"), "pref-1", {"text": "likes dark mode"})
+store.put(("user_123", "memories"), "pref-2", {"text": "prefers Python"})
 
-# Load relevant memories for the next turn
-variables = memory.load_memory_variables({"input": "Tell me more about Pensyve"})
-print(variables["history"])
+# Search by semantic query
+items = store.search(("user_123", "memories"), query="color preferences")
+for item in items:
+    print(f"{item.key}: {item.value}")
 
-# Store explicit facts
-memory.remember("User prefers concise answers", confidence=0.9)
+# Get by exact key
+item = store.get(("user_123", "memories"), "pref-1")
+print(item.value)  # {"text": "likes dark mode"}
 
-# End the episode when the conversation is done
-memory.end_episode(outcome="success")
-
-# Run consolidation to promote repeated patterns
-memory.consolidate()
+# Delete
+store.delete(("user_123", "memories"), "pref-1")
 ```
 
-## Usage with LangChain
+## Usage with LangGraph
 
 ```python
-from langchain.chains import ConversationChain
-from langchain_openai import ChatOpenAI
-from pensyve_langchain import PensyveMemory
+from langgraph.graph import StateGraph, START, END
+from pensyve_langchain import PensyveStore
 
-llm = ChatOpenAI()
-memory = PensyveMemory(namespace="chat-app")
+store = PensyveStore()
 
-# PensyveMemory follows the same interface as ConversationBufferMemory
-chain = ConversationChain(llm=llm, memory=memory)
-chain.invoke({"input": "Hello!"})
+# Pre-populate some user preferences
+store.put(("preferences",), "user-42", {"theme": "dark", "lang": "en"})
+
+def my_node(state, *, store):
+    # Read from the store
+    prefs = store.get(("preferences",), "user-42")
+    theme = prefs.value["theme"] if prefs else "light"
+
+    # Write to the store
+    store.put(("user-42", "memories"), "last-query", {"q": state["query"]})
+
+    return {"response": f"Using {theme} theme"}
+
+builder = StateGraph(...)
+builder.add_node("node", my_node)
+# ...
+graph = builder.compile(store=store)
 ```
 
-## API
+## Local vs Cloud Mode
 
-### `PensyveMemory(namespace, path, entity_name)`
+The store auto-detects which mode to use:
 
-- `namespace` (str): Pensyve namespace for isolation. Default: `"default"`.
-- `path` (str | None): Storage directory. Default: `~/.pensyve/default`.
-- `entity_name` (str): Name for the agent entity. Default: `"langchain-agent"`.
+| Condition | Mode | Backend |
+|-----------|------|---------|
+| No API key set | **Local** | Pensyve PyO3 engine (zero latency) |
+| `PENSYVE_API_KEY` env var set | **Cloud** | Pensyve REST API |
+| `api_key=` argument passed | **Cloud** | Pensyve REST API |
+
+```python
+# Local mode (default)
+store = PensyveStore()
+
+# Cloud mode via argument
+store = PensyveStore(api_key="psy_your_key_here")
+
+# Cloud mode via environment variable
+# export PENSYVE_API_KEY=psy_your_key_here
+store = PensyveStore()
+```
+
+## API Reference
+
+### `PensyveStore(namespace, path, api_key, base_url)`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `namespace` | `str` | `"default"` | Pensyve namespace for isolation |
+| `path` | `str \| None` | `None` | Local storage directory (local mode) |
+| `api_key` | `str \| None` | `None` | Cloud API key (falls back to `PENSYVE_API_KEY`) |
+| `base_url` | `str \| None` | `None` | Override cloud API URL |
 
 ### Methods
 
 | Method | Description |
 |--------|-------------|
-| `load_memory_variables(inputs)` | Recall memories relevant to the input query |
-| `save_context(inputs, outputs)` | Save a user/assistant turn to the current episode |
-| `remember(fact, confidence)` | Store an explicit semantic memory |
-| `end_episode(outcome)` | Close the current episode with an outcome |
-| `clear()` | End the episode and forget entity memories |
-| `consolidate()` | Run memory decay and promotion |
+| `put(namespace, key, value)` | Store a dict under namespace/key |
+| `get(namespace, key)` | Get a single item by key, or `None` |
+| `search(namespace, *, query, filter, limit)` | Semantic search within a namespace |
+| `delete(namespace, key)` | Delete memories for a namespace entity |
+| `list_namespaces(*, prefix, limit, offset)` | List known namespaces |
+
+All methods have async variants prefixed with `a` (e.g. `aput`, `aget`).
+
+### `Item`
+
+Returned by `get()` and `search()`. Matches `langgraph.store.base.Item`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `namespace` | `tuple[str, ...]` | The namespace tuple |
+| `key` | `str` | The item key |
+| `value` | `dict[str, Any]` | The stored value dict |
+| `created_at` | `float` | Unix timestamp |
+| `updated_at` | `float` | Unix timestamp |
+| `score` | `float \| None` | Retrieval relevance score |
+
+## Running Tests
+
+```bash
+cd integrations/langchain
+pytest tests/ -v
+```
+
+## Namespace Mapping
+
+LangGraph namespace tuples are joined with `/` to form Pensyve entity names:
+
+| LangGraph namespace | Pensyve entity |
+|---------------------|----------------|
+| `("user_123", "memories")` | `user_123/memories` |
+| `("global",)` | `global` |
+| `()` | `default` |
