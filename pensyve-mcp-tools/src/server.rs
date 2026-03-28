@@ -454,7 +454,10 @@ impl PensyveMcpServer {
         name = "pensyve_account",
         description = "Get account information including plan, usage, and quota. Returns local mode info when not connected to a remote server."
     )]
-    async fn account(&self, Parameters(_params): Parameters<AccountParams>) -> Result<String, String> {
+    async fn account(
+        &self,
+        Parameters(_params): Parameters<AccountParams>,
+    ) -> Result<String, String> {
         let state = &self.state;
 
         if !state.is_remote {
