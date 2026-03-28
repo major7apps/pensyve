@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod rate_limit;
+mod rest;
 mod tenant;
 mod usage;
 
@@ -198,6 +199,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .nest_service("/mcp", mcp_service)
+        .merge(rest::router())
         .route("/health", axum::routing::get(health_handler))
         .layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
