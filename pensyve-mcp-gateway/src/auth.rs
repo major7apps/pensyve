@@ -209,7 +209,7 @@ where
             let path = req.uri().path();
 
             // Skip auth for health checks.
-            if path == "/health" {
+            if path == "/health" || path == "/v1/health" {
                 return inner.call(req).await;
             }
 
