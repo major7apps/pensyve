@@ -18,14 +18,22 @@ pub struct AuthContext {
     pub user_id: Option<String>,
 }
 
-/// Validates `psy_` API keys via SHA-256 hash lookup.
+/// Validates `psy_` API keys via local hash lookup or remote validation endpoint.
 ///
-/// Keys are hashed at startup and stored as a read-only map. In production,
-/// this will be extended to query `PostgreSQL` with Redis cache.
+/// Supports two modes:
+/// - **Local**: keys from `PENSYVE_API_KEYS` env var, hashed at startup (fast, static)
+/// - **Remote**: calls the `/api/auth/validate-key` endpoint (dynamic, DB-backed)
+///
+/// Remote validation results are cached in-memory via `DashMap` with a 5-minute TTL.
 pub struct AuthValidator {
-    /// Pre-hashed keys, mapped hash -> key prefix (for identification).
-    /// Read-only after construction — no concurrent-write overhead needed.
+    /// Pre-hashed local keys, mapped hash -> key prefix.
     valid_key_hashes: HashMap<String, String>,
+    /// Remote validation endpoint URL (set via `PENSYVE_VALIDATION_URL`).
+    validation_url: Option<String>,
+    /// Shared secret for gateway-to-cloud auth.
+    gateway_secret: Option<String>,
+    /// Cache of remote validation results (`key_hash` to context + expiry).
+    remote_cache: dashmap::DashMap<String, (AuthContext, std::time::Instant)>,
 }
 
 impl AuthValidator {
@@ -40,20 +48,105 @@ impl AuthValidator {
             };
             valid_key_hashes.insert(hash, prefix);
         }
-        Self { valid_key_hashes }
+
+        let validation_url = std::env::var("PENSYVE_VALIDATION_URL").ok();
+        let gateway_secret = std::env::var("GATEWAY_VALIDATION_SECRET").ok();
+
+        if validation_url.is_some() {
+            tracing::info!("Remote key validation enabled");
+        }
+
+        Self {
+            valid_key_hashes,
+            validation_url,
+            gateway_secret,
+            remote_cache: dashmap::DashMap::new(),
+        }
     }
 
-    /// Validate an API key. Returns `Some(AuthContext)` if valid, `None` otherwise.
+    /// Validate an API key. Checks local keys first, then remote endpoint.
     pub fn validate(&self, key: &str) -> Option<AuthContext> {
         if !key.starts_with("psy_") {
             return None;
         }
 
+        // 1. Check local key list (from PENSYVE_API_KEYS env var)
         let hash = hash_key(key);
-        self.valid_key_hashes.get(&hash).map(|prefix| AuthContext {
-            key_id: prefix.clone(),
-            user_id: None,
-        })
+        if let Some(prefix) = self.valid_key_hashes.get(&hash) {
+            return Some(AuthContext {
+                key_id: prefix.clone(),
+                user_id: None,
+            });
+        }
+
+        // 2. Check remote validation cache
+        if let Some(entry) = self.remote_cache.get(&hash) {
+            let (ctx, expires) = entry.value();
+            if std::time::Instant::now() < *expires {
+                return Some(ctx.clone());
+            }
+            drop(entry);
+            self.remote_cache.remove(&hash);
+        }
+
+        // 3. Call remote validation endpoint (blocking — runs in tokio context)
+        if let Some(url) = &self.validation_url {
+            match self.validate_remote(url, key, &hash) {
+                Some(ctx) => return Some(ctx),
+                None => return None,
+            }
+        }
+
+        None
+    }
+
+    fn validate_remote(&self, url: &str, key: &str, hash: &str) -> Option<AuthContext> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .ok()?;
+
+        let mut req = client
+            .post(url)
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json");
+
+        if let Some(secret) = &self.gateway_secret {
+            req = req.header("x-gateway-secret", secret);
+        }
+
+        let resp = req.send().ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+
+        let body: serde_json::Value = resp.json().ok()?;
+        if body.get("valid")?.as_bool()? {
+            let ctx = AuthContext {
+                key_id: body
+                    .get("keyId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("remote")
+                    .to_string(),
+                user_id: body
+                    .get("userId")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+            };
+
+            // Cache for 5 minutes
+            self.remote_cache.insert(
+                hash.to_string(),
+                (
+                    ctx.clone(),
+                    std::time::Instant::now() + std::time::Duration::from_secs(300),
+                ),
+            );
+
+            return Some(ctx);
+        }
+
+        None
     }
 }
 
