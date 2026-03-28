@@ -5,6 +5,11 @@
   "type": "module",
   "main": "src/index.ts",
   "license": "Apache-2.0",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
   "keywords": [
     "opencode",
     "memory",
@@ -15,5 +20,8 @@
   "devDependencies": {
     "typescript": "^5.7.0",
     "vitest": "^4.1.1"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.3.3"
   }
 }

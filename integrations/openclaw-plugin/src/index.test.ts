@@ -45,7 +45,7 @@ describe("Plugin Registration", () => {
       "memory_status",
     ]);
     expect(registered.hooks).toEqual([
-      "before_agent_start",
+      "before_prompt_build",
       "after_agent_response",
     ]);
     expect(registered.commands).toEqual(["pensyve"]);

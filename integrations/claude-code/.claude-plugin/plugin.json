@@ -15,10 +15,10 @@
     "commands/memory-status.md"
   ],
   "skills": [
-    "skills/session-memory.md",
-    "skills/memory-informed-refactor.md",
-    "skills/context-loader.md",
-    "skills/memory-review.md"
+    "skills/session-memory/SKILL.md",
+    "skills/memory-informed-refactor/SKILL.md",
+    "skills/context-loader/SKILL.md",
+    "skills/memory-review/SKILL.md"
   ],
   "agents": [
     "agents/memory-curator.md",

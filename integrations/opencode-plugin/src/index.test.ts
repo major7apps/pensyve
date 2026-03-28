@@ -1,64 +1,95 @@
 import { describe, it, expect } from "vitest";
 import { PensyvePlugin } from "./index";
 
+// Minimal ctx matching PluginInput shape
+const makeCtx = (overrides: Record<string, any> = {}) =>
+  ({
+    directory: "/tmp/test",
+    worktree: "/tmp/test",
+    project: {},
+    client: {},
+    serverUrl: new URL("http://localhost:3000"),
+    $: {} as any,
+    config: {},
+    ...overrides,
+  }) as any;
+
 describe("OpenCode Pensyve Plugin", () => {
   it("exports PensyvePlugin function", () => {
     expect(typeof PensyvePlugin).toBe("function");
   });
 
-  it("returns event hooks and tools", async () => {
-    const ctx = { directory: "/tmp/test", config: {} };
-    const result = await PensyvePlugin(ctx);
+  it("returns hooks and tools in correct structure", async () => {
+    const result = await PensyvePlugin(makeCtx());
 
+    // Top-level hook keys
     expect(result.event).toBeDefined();
-    expect(result.tools).toBeDefined();
+    expect(typeof result.event).toBe("function");
+    expect(result["experimental.chat.system.transform"]).toBeDefined();
+    expect(typeof result["experimental.chat.system.transform"]).toBe("function");
+    expect(result["chat.message"]).toBeDefined();
+    expect(typeof result["chat.message"]).toBe("function");
+
+    // Tools under `tool` key
+    expect(result.tool).toBeDefined();
+    expect(result.tool!.pensyve_recall).toBeDefined();
+    expect(result.tool!.pensyve_remember).toBeDefined();
+    expect(result.tool!.pensyve_status).toBeDefined();
   });
 
-  it("registers session.created hook", async () => {
-    const ctx = { directory: "/tmp/test", config: {} };
-    const result = await PensyvePlugin(ctx);
-    expect(typeof result.event["session.created"]).toBe("function");
+  it("registers event handler as a function", async () => {
+    const result = await PensyvePlugin(makeCtx());
+    expect(typeof result.event).toBe("function");
+  });
+
+  it("registers chat.message hook for auto-capture", async () => {
+    const result = await PensyvePlugin(makeCtx());
+    expect(typeof result["chat.message"]).toBe("function");
   });
 
   it("registers system transform hook", async () => {
-    const ctx = { directory: "/tmp/test", config: {} };
-    const result = await PensyvePlugin(ctx);
-    expect(typeof result.event["experimental.chat.system.transform"]).toBe("function");
+    const result = await PensyvePlugin(makeCtx());
+    expect(typeof result["experimental.chat.system.transform"]).toBe("function");
   });
 
-  it("registers message.created hook", async () => {
-    const ctx = { directory: "/tmp/test", config: {} };
-    const result = await PensyvePlugin(ctx);
-    expect(typeof result.event["message.created"]).toBe("function");
+  it("registers pensyve_remember tool with tool() shape", async () => {
+    const result = await PensyvePlugin(makeCtx());
+    const remember = result.tool!.pensyve_remember;
+    expect(remember.description).toContain("Store");
+    expect(remember.args).toBeDefined();
+    expect(typeof remember.execute).toBe("function");
   });
 
-  it("registers pensyve_remember tool", async () => {
-    const ctx = { directory: "/tmp/test", config: {} };
-    const result = await PensyvePlugin(ctx);
-    expect(result.tools.pensyve_remember).toBeDefined();
-    expect(result.tools.pensyve_remember.description).toContain("Store");
-    expect(typeof result.tools.pensyve_remember.execute).toBe("function");
+  it("registers pensyve_recall tool with tool() shape", async () => {
+    const result = await PensyvePlugin(makeCtx());
+    const recall = result.tool!.pensyve_recall;
+    expect(recall.description).toContain("Search");
+    expect(recall.args).toBeDefined();
+    expect(typeof recall.execute).toBe("function");
   });
 
-  it("registers pensyve_recall tool", async () => {
-    const ctx = { directory: "/tmp/test", config: {} };
-    const result = await PensyvePlugin(ctx);
-    expect(result.tools.pensyve_recall).toBeDefined();
-    expect(typeof result.tools.pensyve_recall.execute).toBe("function");
+  it("registers pensyve_status tool with tool() shape", async () => {
+    const result = await PensyvePlugin(makeCtx());
+    const status = result.tool!.pensyve_status;
+    expect(status.description).toContain("status");
+    expect(typeof status.execute).toBe("function");
   });
 
-  it("registers pensyve_status tool", async () => {
-    const ctx = { directory: "/tmp/test", config: {} };
+  it("system transform does not modify output when no memories", async () => {
+    const ctx = makeCtx({ config: { autoRecall: false } });
     const result = await PensyvePlugin(ctx);
-    expect(result.tools.pensyve_status).toBeDefined();
-    expect(typeof result.tools.pensyve_status.execute).toBe("function");
+    const output = { system: ["You are a helpful assistant."] };
+    await result["experimental.chat.system.transform"]!(
+      { model: {} as any },
+      output,
+    );
+    // No memories loaded, so system array should be unchanged
+    expect(output.system).toEqual(["You are a helpful assistant."]);
   });
 
-  it("system transform returns unchanged prompt when no memories", async () => {
-    const ctx = { directory: "/tmp/test", config: { autoRecall: false } };
-    const result = await PensyvePlugin(ctx);
-    const prompt = "You are a helpful assistant.";
-    const transformed = await result.event["experimental.chat.system.transform"](prompt);
-    expect(transformed).toBe(prompt);
+  it("does not have old event/tools keys", async () => {
+    const result = await PensyvePlugin(makeCtx()) as any;
+    // Old structure used result.tools (plural) — new structure uses result.tool (singular)
+    expect(result.tools).toBeUndefined();
   });
 });
