@@ -18,4 +18,6 @@ pub struct PensyveState {
     pub vector_index: Mutex<VectorIndex>,
     pub namespace: Namespace,
     pub retrieval_config: RetrievalConfig,
+    /// True when running as a remote gateway (Streamable HTTP), false for local (stdio).
+    pub is_remote: bool,
 }

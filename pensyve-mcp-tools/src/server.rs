@@ -13,7 +13,8 @@ use pensyve_core::types::{Entity, EntityKind, Episode, Memory, Outcome, Semantic
 use pensyve_core::vector::VectorIndex;
 
 use crate::params::{
-    EpisodeEndParams, EpisodeStartParams, ForgetParams, InspectParams, RecallParams, RememberParams,
+    AccountParams, EpisodeEndParams, EpisodeStartParams, ForgetParams, InspectParams, RecallParams,
+    RememberParams, StatusParams,
 };
 use crate::state::PensyveState;
 
@@ -382,6 +383,95 @@ impl PensyveMcpServer {
             "entity_id": entity.id.to_string(),
             "memory_count": memories.len(),
             "memories": memories,
+        }))
+        .map_err(|e| format!("Serialization error: {e}"))
+    }
+
+    /// Connection status and memory statistics.
+    #[tool(
+        name = "pensyve_status",
+        description = "Get connection status, namespace info, and memory statistics. Free — not metered."
+    )]
+    async fn status(&self, Parameters(params): Parameters<StatusParams>) -> Result<String, String> {
+        let state = &self.state;
+        let ns = &state.namespace;
+
+        // Count memories by type
+        let mut semantic_count = 0usize;
+        let mut episodic_count = 0usize;
+        let mut entity_count = 0usize;
+
+        if let Some(entity_name) = &params.entity {
+            // Stats for a specific entity
+            if let Ok(Some(entity)) = state.storage.get_entity_by_name(entity_name, ns.id) {
+                entity_count = 1;
+                if let Ok(mems) = state.storage.list_semantic_by_entity(entity.id, usize::MAX) {
+                    semantic_count = mems.len();
+                }
+                if let Ok(mems) = state.storage.list_episodic_by_entity(entity.id, usize::MAX) {
+                    episodic_count = mems.len();
+                }
+            }
+        } else {
+            // Global stats for the namespace
+            if let Ok(memories) = state.storage.get_all_memories_by_namespace(ns.id) {
+                for mem in &memories {
+                    match mem {
+                        Memory::Semantic(_) => semantic_count += 1,
+                        Memory::Episodic(_) => episodic_count += 1,
+                        Memory::Procedural(_) => {}
+                    }
+                }
+            }
+            if let Ok(entities) = state.storage.list_entities_by_namespace(ns.id) {
+                entity_count = entities.len();
+            }
+        }
+
+        let vector_count = {
+            let vi = state.vector_index.lock().await;
+            vi.len()
+        };
+
+        serde_json::to_string_pretty(&serde_json::json!({
+            "mode": if state.is_remote { "remote" } else { "local" },
+            "namespace": ns.name,
+            "namespace_id": ns.id.to_string(),
+            "stats": {
+                "total_memories": semantic_count + episodic_count,
+                "semantic": semantic_count,
+                "episodic": episodic_count,
+                "entities": entity_count,
+                "vector_index_size": vector_count,
+            },
+            "health": "ok",
+        }))
+        .map_err(|e| format!("Serialization error: {e}"))
+    }
+
+    /// Cloud account info (plan, usage, quota).
+    #[tool(
+        name = "pensyve_account",
+        description = "Get account information including plan, usage, and quota. Returns local mode info when not connected to a remote server."
+    )]
+    async fn account(&self, Parameters(_params): Parameters<AccountParams>) -> Result<String, String> {
+        let state = &self.state;
+
+        if !state.is_remote {
+            return serde_json::to_string_pretty(&serde_json::json!({
+                "mode": "local",
+                "message": "Local mode — no account or billing. Self-hosted with no usage limits.",
+            }))
+            .map_err(|e| format!("Serialization error: {e}"));
+        }
+
+        // In remote/gateway mode, account info is injected by the gateway's
+        // usage middleware. For now, return a placeholder indicating the tool
+        // is available but details come from the gateway layer.
+        serde_json::to_string_pretty(&serde_json::json!({
+            "mode": "remote",
+            "message": "Account information available via the Pensyve Cloud dashboard.",
+            "dashboard_url": "https://pensyve.com/settings/billing",
         }))
         .map_err(|e| format!("Serialization error: {e}"))
     }

@@ -139,6 +139,7 @@ async fn main() -> Result<()> {
         vector_index: Mutex::new(vector_index),
         namespace,
         retrieval_config,
+        is_remote: false,
     });
 
     let server = PensyveMcpServer::new(state);

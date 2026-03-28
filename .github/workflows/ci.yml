@@ -118,3 +118,14 @@ jobs:
         working-directory: pensyve-wasm
         run: wasm-pack test --node
 
+  test-gateway:
+    name: Gateway Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build gateway
+        run: cargo build -p pensyve-mcp-gateway
+      - name: Run gateway tests
+        run: cargo test -p pensyve-mcp-gateway -p pensyve-mcp-tools
+

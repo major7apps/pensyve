@@ -43,6 +43,7 @@ impl TenantStateManager {
             vector_index: Mutex::new(default_vector_index),
             namespace: default_namespace,
             retrieval_config: retrieval_config.clone(),
+            is_remote: true,
         });
 
         Self {
@@ -116,6 +117,7 @@ impl TenantStateManager {
             vector_index: Mutex::new(index),
             namespace,
             retrieval_config: self.retrieval_config.clone(),
+            is_remote: true,
         }))
     }
 }

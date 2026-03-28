@@ -56,3 +56,12 @@ pub struct InspectParams {
     /// Maximum number of memories to return.
     pub limit: Option<u32>,
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StatusParams {
+    /// Optional entity name to get stats for a specific entity.
+    pub entity: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AccountParams {}
