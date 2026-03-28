@@ -77,7 +77,7 @@ export class PensyveError extends Error {
 
 export interface PensyveConfig {
   baseUrl: string;
-  /** API key sent as X-Pensyve-Key header on every request. */
+  /** API key sent as Authorization: Bearer header on every request. */
   apiKey?: string;
   namespace?: string;
   /** Custom fetch implementation (useful for testing). */
@@ -240,7 +240,7 @@ export class Pensyve {
     // Merge auth header into every request
     const headers: Record<string, string> = {
       ...(init.headers as Record<string, string>),
-      ...(this.apiKey ? { "X-Pensyve-Key": this.apiKey } : {}),
+      ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}),
     };
     const mergedInit: RequestInit = { ...init, headers };
 

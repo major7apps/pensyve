@@ -752,7 +752,7 @@ describe("Error propagation", () => {
 // ---------------------------------------------------------------------------
 
 describe("Authentication", () => {
-  test("injects X-Pensyve-Key header when apiKey is set", async () => {
+  test("injects Authorization Bearer header when apiKey is set", async () => {
     let capturedHeaders: Record<string, string> = {};
     const mockFetch = async (url: string | URL | Request, init?: RequestInit) => {
       const h = new Headers(init?.headers);
@@ -767,7 +767,7 @@ describe("Authentication", () => {
       retries: 0,
     });
     await client.health();
-    expect(capturedHeaders["x-pensyve-key"]).toBe("test-key-123");
+    expect(capturedHeaders["authorization"]).toBe("Bearer test-key-123");
   });
 
   test("does not inject header when apiKey is empty", async () => {
