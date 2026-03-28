@@ -1,0 +1,20 @@
+{
+  "hooks": [
+    {
+      "event": "SessionStart",
+      "command": "session-start"
+    },
+    {
+      "event": "Stop",
+      "command": "stop"
+    },
+    {
+      "event": "PreCompact",
+      "command": "pre-compact"
+    },
+    {
+      "event": "UserPromptSubmit",
+      "command": "user-prompt-submit"
+    }
+  ]
+}

@@ -1,13 +1,10 @@
 {
   "mcpServers": {
     "pensyve": {
-      "command": "pensyve-mcp",
-      "args": [],
-      "env": {
-        "PENSYVE_NAMESPACE": "${PENSYVE_NAMESPACE:-default}",
-        "PENSYVE_PATH": "${PENSYVE_PATH:-~/.pensyve/default}"
-      },
-      "description": "Pensyve memory runtime — 6 tools for cross-session cognitive memory"
+      "url": "https://mcp.pensyve.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${PENSYVE_API_KEY}"
+      }
     }
   }
 }

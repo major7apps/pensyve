@@ -15,7 +15,16 @@ import {
   type Memory,
 } from "../../shared/pensyve-client";
 
-export default {
+// Note: definePluginEntry provides type safety and schema validation.
+// If openclaw/plugin-sdk/core is not available, fall back to plain export.
+let definePluginEntry: (def: any) => any;
+try {
+  ({ definePluginEntry } = require("openclaw/plugin-sdk/core"));
+} catch {
+  definePluginEntry = (def: any) => def;
+}
+
+export default definePluginEntry({
   id: "pensyve",
   name: "Pensyve Memory",
   description:
@@ -108,10 +117,10 @@ export default {
       },
     });
 
-    // ── Auto-Recall (before_agent_start) ────────────────────────────
+    // ── Auto-Recall (before_prompt_build) ─────────────────────────
 
     if (cfg.autoRecall) {
-      api.registerHook("before_agent_start", async (ctx: any) => {
+      api.registerHook("before_prompt_build", async (ctx: any) => {
         try {
           const messages = ctx.messages || [];
           const lastUser = [...messages]
@@ -177,4 +186,4 @@ export default {
       },
     });
   },
-};
+});

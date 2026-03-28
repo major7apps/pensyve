@@ -3,9 +3,13 @@
   "version": "0.1.0",
   "description": "Pensyve memory plugin for OpenClaw — offline-first, 8-signal fusion retrieval",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "dist/index.js",
   "openclaw": {
-    "extensions": ["./src/index.ts"]
+    "extensions": ["./dist/index.js"]
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
   },
   "dependencies": {},
   "devDependencies": {
