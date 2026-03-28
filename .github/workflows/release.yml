@@ -36,7 +36,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --manifest-path pensyve-python/Cargo.toml --features vendored-openssl
+          args: --release --out dist --manifest-path pensyve-python/Cargo.toml
           manylinux: auto
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -124,6 +124,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-${{ matrix.target }}
       - name: Build CLI
         run: cargo build --release -p pensyve-cli
       - name: Package (unix)
@@ -161,6 +164,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mcp-${{ matrix.target }}
       - name: Build MCP server
         run: cargo build --release -p pensyve-mcp
       - name: Package
