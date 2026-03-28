@@ -26,9 +26,19 @@ Most AI agents lose all context between sessions. Pensyve gives them durable, in
 - **Cross-encoder reranking** — BGE reranker on top-k results for precision
 - **Access control** — RBAC memory mesh with owner/writer/reader roles and private/shared/public visibility
 
+## Install
+
+```bash
+pip install pensyve          # Python (PyPI)
+npm install pensyve          # TypeScript (npm)
+go get github.com/major7apps/pensyve-go@v1.0.0  # Go
+```
+
+Or use the MCP server directly with Claude Code, Cursor, or any MCP client — see [MCP Setup](https://pensyve.com/docs/getting-started/mcp-setup).
+
 ## Quick Start
 
-### Prerequisites
+### Prerequisites (building from source)
 
 - Rust 1.88+
 - Python 3.10+ with [uv](https://github.com/astral-sh/uv)
