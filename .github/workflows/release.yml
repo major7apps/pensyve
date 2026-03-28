@@ -184,7 +184,7 @@ jobs:
   # ── GitHub Release ─────────────────────────────────────────────────────────
   github-release:
     name: Create GitHub Release
-    needs: [build-cli, build-mcp]
+    needs: [build-cli, build-mcp, build-python, build-python-sdist]
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
