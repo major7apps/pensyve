@@ -38,6 +38,7 @@ fn create_test_state(dir: &tempfile::TempDir) -> Arc<PensyveState> {
             beam_width: 10,
             max_depth: 4,
         },
+        is_remote: false,
     })
 }
 
@@ -192,7 +193,7 @@ async fn test_mcp_tools_list() {
     let text = resp.text().await.unwrap();
     let json: serde_json::Value = serde_json::from_str(&text).expect("parse json");
     let tools = json["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 6, "Expected 6 tools");
+    assert_eq!(tools.len(), 8, "Expected 8 tools");
 
     // Verify all tool names.
     let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -202,6 +203,8 @@ async fn test_mcp_tools_list() {
     assert!(tool_names.contains(&"pensyve_episode_end"));
     assert!(tool_names.contains(&"pensyve_forget"));
     assert!(tool_names.contains(&"pensyve_inspect"));
+    assert!(tool_names.contains(&"pensyve_status"));
+    assert!(tool_names.contains(&"pensyve_account"));
 
     ct.cancel();
 }
