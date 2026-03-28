@@ -79,7 +79,6 @@ cargo build --release --bin pensyve-mcp
 ```bash
 # Start the server
 source .venv/bin/activate
-uvicorn pensyve_server.main:app --port 8000
 
 # Create an entity
 curl -X POST http://localhost:8000/v1/entities \
@@ -133,7 +132,7 @@ pensyve/
 ├── pensyve-mcp/       MCP server binary (stdio)
 ├── pensyve-cli/       CLI binary
 ├── pensyve-ts/        TypeScript SDK (REST client)
-├── pensyve_server/    FastAPI REST API + Tier 2 extraction
+├── pensyve_python/       Shared Python utilities (billing, extraction)
 ├── tests/python/      Python integration tests
 ├── benchmarks/        Evaluation harness
 └── docs/              Documentation

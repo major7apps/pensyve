@@ -15,7 +15,6 @@ Universal memory runtime for AI agents -- recall, remember, and inspect memories
 1. Start the Pensyve REST API server:
    ```bash
    cd /path/to/pensyve
-   .venv/bin/uvicorn pensyve_server.main:app --reload
    ```
 
 2. Configure the extension in VS Code settings:

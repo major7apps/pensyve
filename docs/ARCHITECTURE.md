@@ -5,13 +5,13 @@
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Consumers                                │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐          │
-│  │ Python   │ │ MCP      │ │ REST     │ │ TypeScript│          │
-│  │ SDK      │ │ Server   │ │ API      │ │ SDK      │          │
-│  │(PyO3)    │ │(stdio)   │ │(FastAPI) │ │(HTTP)    │          │
-│  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘          │
-│       │             │            │             │                │
-│  pensyve-python  pensyve-mcp  pensyve_server  pensyve-ts      │
+│  ┌──────────┐ ┌──────────┐ ┌──────────────┐ ┌──────────┐      │
+│  │ Python   │ │ MCP      │ │ Cloud Gateway│ │ TypeScript│      │
+│  │ SDK      │ │ Server   │ │ REST + MCP   │ │ SDK      │      │
+│  │(PyO3)    │ │(stdio)   │ │(Rust/Axum)   │ │(HTTP)    │      │
+│  └────┬─────┘ └────┬─────┘ └──────┬───────┘ └────┬─────┘      │
+│       │             │              │               │            │
+│  pensyve-python  pensyve-mcp  pensyve-mcp-gateway  pensyve-ts │
 ├───────┼─────────────┼────────────┼─────────────┼────────────────┤
 │       └─────────────┴──────┬─────┘             │                │
 │                            │                   │                │
@@ -50,8 +50,8 @@
 | `pensyve-python` | Rust + Python | PyO3 cdylib | pensyve-core |
 | `pensyve-mcp` | Rust | Binary | pensyve-core |
 | `pensyve-cli` | Rust | Binary | pensyve-core |
-| `pensyve-ts` | TypeScript | npm package | pensyve_server (REST) |
-| `pensyve_server` | Python | FastAPI app | pensyve (Python SDK) |
+| `pensyve-ts` | TypeScript | npm package | pensyve_python (REST) |
+| `pensyve_python` | Python | Shared Python utilities | pensyve (Python SDK) |
 
 ## Data Model
 
