@@ -1,0 +1,281 @@
+{
+  "benchmark": "real_content",
+  "timestamp": "2026-03-26T01:33:40.620489042+00:00",
+  "using_real_embeddings": true,
+  "n_memories": 50,
+  "n_queries": 20,
+  "results": [
+    {
+      "benchmark": "real_content",
+      "variant": "v2_rrf",
+      "metric": "accuracy_at_1",
+      "value": 0.45,
+      "ci_lower": 0.25,
+      "ci_upper": 0.65,
+      "n": 20,
+      "timestamp": "2026-03-26T01:33:40.620489042Z"
+    },
+    {
+      "benchmark": "real_content",
+      "variant": "v2_rrf",
+      "metric": "mrr",
+      "value": 0.61,
+      "ci_lower": 0.4391666666666666,
+      "ci_upper": 0.7708333333333334,
+      "n": 20,
+      "timestamp": "2026-03-26T01:33:40.620489042Z"
+    },
+    {
+      "benchmark": "real_content",
+      "variant": "v2_rrf",
+      "metric": "ndcg_at_5",
+      "value": 0.682049759204785,
+      "ci_lower": 0.5272815276068121,
+      "ci_upper": 0.8192536065216309,
+      "n": 20,
+      "timestamp": "2026-03-26T01:33:40.620489042Z"
+    },
+    {
+      "benchmark": "real_content",
+      "variant": "v2_rrf",
+      "metric": "recall_at_5",
+      "value": 0.6958333333333333,
+      "ci_lower": 0.5291666666666667,
+      "ci_upper": 0.8416666666666668,
+      "n": 20,
+      "timestamp": "2026-03-26T01:33:40.620489042Z"
+    },
+    {
+      "benchmark": "real_content",
+      "variant": "v1_linear",
+      "metric": "accuracy_at_1",
+      "value": 0.75,
+      "ci_lower": 0.55,
+      "ci_upper": 0.9,
+      "n": 20,
+      "timestamp": "2026-03-26T01:33:40.620489042Z"
+    },
+    {
+      "benchmark": "real_content",
+      "variant": "v1_linear",
+      "metric": "mrr",
+      "value": 0.8458333333333334,
+      "ci_lower": 0.7166666666666667,
+      "ci_upper": 0.95,
+      "n": 20,
+      "timestamp": "2026-03-26T01:33:40.620489042Z"
+    },
+    {
+      "benchmark": "real_content",
+      "variant": "v1_linear",
+      "metric": "ndcg_at_5",
+      "value": 0.8902231659537276,
+      "ci_lower": 0.79759778472724,
+      "ci_upper": 0.9669720789148186,
+      "n": 20,
+      "timestamp": "2026-03-26T01:33:40.620489042Z"
+    },
+    {
+      "benchmark": "real_content",
+      "variant": "v1_linear",
+      "metric": "recall_at_5",
+      "value": 0.8291666666666668,
+      "ci_lower": 0.7041666666666667,
+      "ci_upper": 0.9416666666666667,
+      "n": 20,
+      "timestamp": "2026-03-26T01:33:40.620489042Z"
+    }
+  ],
+  "ablation": [
+    {
+      "metric": "accuracy_at_1",
+      "v1_mean": 0.75,
+      "v2_mean": 0.45,
+      "cohens_d": -0.5251727826276826,
+      "wilcoxon_p": 0.05870727614197491
+    },
+    {
+      "metric": "mrr",
+      "v1_mean": 0.8458333333333334,
+      "v2_mean": 0.61,
+      "cohens_d": -0.7143688753347381,
+      "wilcoxon_p": 0.010787498143210783
+    },
+    {
+      "metric": "ndcg_at_5",
+      "v1_mean": 0.8902231659537276,
+      "v2_mean": 0.682049759204785,
+      "cohens_d": -0.8427492005389694,
+      "wilcoxon_p": 0.003701883300407216
+    },
+    {
+      "metric": "recall_at_5",
+      "v1_mean": 0.8291666666666668,
+      "v2_mean": 0.6958333333333333,
+      "cohens_d": -0.5919732060296822,
+      "wilcoxon_p": 0.027707752614604564
+    }
+  ],
+  "per_query": [
+    {
+      "query": "What did Alice say about the borrow checker?",
+      "difficulty": "easy",
+      "v1_accuracy_at_1": 1.0,
+      "v1_mrr": 1.0,
+      "v2_accuracy_at_1": 1.0,
+      "v2_mrr": 1.0
+    },
+    {
+      "query": "What temperature is best for proofing bread?",
+      "difficulty": "easy",
+      "v1_accuracy_at_1": 1.0,
+      "v1_mrr": 1.0,
+      "v2_accuracy_at_1": 1.0,
+      "v2_mrr": 1.0
+    },
+    {
+      "query": "When should you visit Kyoto?",
+      "difficulty": "easy",
+      "v1_accuracy_at_1": 1.0,
+      "v1_mrr": 1.0,
+      "v2_accuracy_at_1": 0.0,
+      "v2_mrr": 0.3333333333333333
+    },
+    {
+      "query": "What is the ii-V-I progression?",
+      "difficulty": "easy",
+      "v1_accuracy_at_1": 1.0,
+      "v1_mrr": 1.0,
+      "v2_accuracy_at_1": 0.0,
+      "v2_mrr": 0.3333333333333333
+    },
+    {
+      "query": "What did Bob recommend for async programming?",
+      "difficulty": "medium",
+      "v1_accuracy_at_1": 1.0,
+      "v1_mrr": 1.0,
+      "v2_accuracy_at_1": 1.0,
+      "v2_mrr": 1.0
+    },
+    {
+      "query": "How does Maria make her bread crusty?",
+      "difficulty": "medium",
+      "v1_accuracy_at_1": 0.0,
+      "v1_mrr": 0.25,
+      "v2_accuracy_at_1": 0.0,
+      "v2_mrr": 0.2
+    },
+    {
+      "query": "What are James's tips for Japan?",
+      "difficulty": "medium",
+      "v1_accuracy_at_1": 1.0,
+      "v1_mrr": 1.0,
+      "v2_accuracy_at_1": 0.0,
+      "v2_mrr": 0.25
+    },
+    {
+      "query": "What scales should a beginner learn?",
+      "difficulty": "medium",
+      "v1_accuracy_at_1": 0.0,
+      "v1_mrr": 0.5,
+      "v2_accuracy_at_1": 0.0,
+      "v2_mrr": 0.25
+    },
+    {
+      "query": "What advice involves the number 60?",
+      "difficulty": "hard",
+      "v1_accuracy_at_1": 1.0,
+      "v1_mrr": 1.0,
+      "v2_accuracy_at_1": 1.0,
+      "v2_mrr": 1.0
+    },
+    {
+      "query": "What has scientific evidence behind it?",
+      "difficulty": "hard",
+      "v1_accuracy_at_1": 1.0,
+      "v1_mrr": 1.0,
+      "v2_accuracy_at_1": 1.0,
+      "v2_mrr": 1.0
+    },
+    {
+      "query": "What should I do before cooking something?",
+      "difficulty": "hard",
+      "v1_accuracy_at_1": 0.0,
+      "v1_mrr": 0.3333333333333333,
+      "v2_accuracy_at_1": 0.0,
+      "v2_mrr": 0.0
+    },
+    {
+      "query": "Who gave advice about performance optimization?",
+      "difficulty": "hard",
+      "v1_accuracy_at_1": 0.0,
+      "v1_mrr": 0.3333333333333333,
+      "v2_accuracy_at_1": 0.0,
+      "v2_mrr": 0.0
+    },
+    {
+      "query": "What involves temperature?",
+      "difficulty": "hard",
+      "v1_accuracy_at_1": 1.0,
+      "v1_mrr": 1.0,
+      "v2_accuracy_at_1": 0.0,
+      "v2_mrr": 0.3333333333333333
+    },
+    {
+      "query": "What did women specifically recommend?",
+      "difficulty": "hard",
+      "v1_accuracy_at_1": 0.0,
+      "v1_mrr": 0.5,
+      "v2_accuracy_at_1": 1.0,
+      "v2_mrr": 1.0
+    },
+    {
+      "query": "What did the team decide about storage?",
+      "difficulty": "medium",
+      "v1_accuracy_at_1": 1.0,
+      "v1_mrr": 1.0,
+      "v2_accuracy_at_1": 1.0,
+      "v2_mrr": 1.0
+    },
+    {
+      "query": "What did Dr. Chen say about sleep?",
+      "difficulty": "easy",
+      "v1_accuracy_at_1": 1.0,
+      "v1_mrr": 1.0,
+      "v2_accuracy_at_1": 0.0,
+      "v2_mrr": 0.5
+    },
+    {
+      "query": "What recipe did Maria share?",
+      "difficulty": "easy",
+      "v1_accuracy_at_1": 1.0,
+      "v1_mrr": 1.0,
+      "v2_accuracy_at_1": 1.0,
+      "v2_mrr": 1.0
+    },
+    {
+      "query": "What did Sarah say about ear training?",
+      "difficulty": "easy",
+      "v1_accuracy_at_1": 1.0,
+      "v1_mrr": 1.0,
+      "v2_accuracy_at_1": 0.0,
+      "v2_mrr": 0.5
+    },
+    {
+      "query": "How do I make crispy roasted vegetables?",
+      "difficulty": "medium",
+      "v1_accuracy_at_1": 1.0,
+      "v1_mrr": 1.0,
+      "v2_accuracy_at_1": 1.0,
+      "v2_mrr": 1.0
+    },
+    {
+      "query": "How should I prepare for hiking in Patagonia?",
+      "difficulty": "medium",
+      "v1_accuracy_at_1": 1.0,
+      "v1_mrr": 1.0,
+      "v2_accuracy_at_1": 0.0,
+      "v2_mrr": 0.5
+    }
+  ]
+}

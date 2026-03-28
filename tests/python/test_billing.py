@@ -1,37 +1,9 @@
-"""Tests for the billing and usage metering module."""
+"""Tests for the usage metering and limit enforcement module."""
 
-from pensyve_server.billing import TIER_LIMITS, Tier, TierLimits, UsageTracker
+from pensyve_server.billing import TierLimits, UsageTracker
 
 
 class TestTierLimits:
-    def test_all_tiers_defined(self):
-        for tier in Tier:
-            assert tier in TIER_LIMITS
-
-    def test_free_tier_limits(self):
-        limits = TIER_LIMITS[Tier.FREE]
-        assert limits.namespaces == 1
-        assert limits.max_memories == 10_000
-        assert limits.recalls_per_month == 1_000
-        assert limits.storage_bytes == 100 * 1024 * 1024
-
-    def test_pro_tier_higher_than_free(self):
-        free = TIER_LIMITS[Tier.FREE]
-        pro = TIER_LIMITS[Tier.PRO]
-        assert pro.namespaces > free.namespaces
-        assert pro.max_memories > free.max_memories
-        assert pro.recalls_per_month > free.recalls_per_month
-        assert pro.storage_bytes > free.storage_bytes
-
-    def test_tier_limits_ascending(self):
-        """Each tier should have higher limits than the previous one."""
-        order = [Tier.FREE, Tier.PRO, Tier.TEAM, Tier.ENTERPRISE]
-        for i in range(len(order) - 1):
-            lower = TIER_LIMITS[order[i]]
-            higher = TIER_LIMITS[order[i + 1]]
-            assert higher.max_memories > lower.max_memories
-            assert higher.recalls_per_month > lower.recalls_per_month
-
     def test_tier_limits_dataclass(self):
         limits = TierLimits(namespaces=2, max_memories=50, recalls_per_month=10, storage_bytes=1024)
         assert limits.namespaces == 2
@@ -91,61 +63,76 @@ class TestUsageTracker:
 
 
 class TestLimitEnforcement:
+    def _make_limits(self, *, max_memories: int = 10_000, recalls: int = 1_000) -> TierLimits:
+        return TierLimits(
+            namespaces=1,
+            max_memories=max_memories,
+            recalls_per_month=recalls,
+            storage_bytes=100 * 1024 * 1024,
+        )
+
     def test_within_limits(self):
-        tracker = UsageTracker()
+        tracker = UsageTracker(limits=self._make_limits())
         tracker.record_recall("ns1")
-        allowed, reason = tracker.check_limit("ns1", Tier.FREE)
+        allowed, reason = tracker.check_limit("ns1")
         assert allowed is True
         assert reason == "OK"
 
     def test_recall_limit_reached(self):
-        tracker = UsageTracker()
+        tracker = UsageTracker(limits=self._make_limits(recalls=1_000))
         for _ in range(1_000):
             tracker.record_recall("ns1")
-        allowed, reason = tracker.check_limit("ns1", Tier.FREE)
+        allowed, reason = tracker.check_limit("ns1")
         assert allowed is False
         assert "recall limit" in reason.lower()
 
     def test_memory_limit_reached(self):
-        tracker = UsageTracker()
+        tracker = UsageTracker(limits=self._make_limits(max_memories=10_000))
         for _ in range(10_000):
             tracker.record_store("ns1")
-        allowed, reason = tracker.check_limit("ns1", Tier.FREE)
+        allowed, reason = tracker.check_limit("ns1")
         assert allowed is False
         assert "memory limit" in reason.lower()
 
-    def test_pro_tier_allows_more(self):
+    def test_higher_limits_allow_more(self):
+        low = self._make_limits(recalls=1_000)
+        high = self._make_limits(recalls=10_000)
         tracker = UsageTracker()
-        # Exceed free tier recall limit but stay within pro
         for _ in range(1_500):
             tracker.record_recall("ns1")
-        free_allowed, _ = tracker.check_limit("ns1", Tier.FREE)
-        pro_allowed, _ = tracker.check_limit("ns1", Tier.PRO)
-        assert free_allowed is False
-        assert pro_allowed is True
+        low_allowed, _ = tracker.check_limit("ns1", limits=low)
+        high_allowed, _ = tracker.check_limit("ns1", limits=high)
+        assert low_allowed is False
+        assert high_allowed is True
 
     def test_fresh_namespace_always_allowed(self):
-        tracker = UsageTracker()
-        for tier in Tier:
-            allowed, reason = tracker.check_limit(f"fresh-{tier.value}", tier)
-            assert allowed is True
-            assert reason == "OK"
+        tracker = UsageTracker(limits=self._make_limits())
+        allowed, reason = tracker.check_limit("fresh-ns")
+        assert allowed is True
+        assert reason == "OK"
 
     def test_recall_limit_one_below(self):
-        """One below the limit should still be allowed."""
-        tracker = UsageTracker()
+        tracker = UsageTracker(limits=self._make_limits(recalls=1_000))
         for _ in range(999):
             tracker.record_recall("ns1")
-        allowed, _ = tracker.check_limit("ns1", Tier.FREE)
+        allowed, _ = tracker.check_limit("ns1")
         assert allowed is True
 
     def test_recall_limit_checked_before_memory_limit(self):
-        """When both limits are exceeded, recall limit message appears."""
-        tracker = UsageTracker()
+        tracker = UsageTracker(limits=self._make_limits(recalls=1_000, max_memories=10_000))
         for _ in range(1_000):
             tracker.record_recall("ns1")
         for _ in range(10_000):
             tracker.record_store("ns1")
-        allowed, reason = tracker.check_limit("ns1", Tier.FREE)
+        allowed, reason = tracker.check_limit("ns1")
         assert allowed is False
         assert "recall limit" in reason.lower()
+
+    def test_unlimited_by_default(self):
+        """With no limits configured, everything is allowed."""
+        tracker = UsageTracker()
+        for _ in range(100_000):
+            tracker.record_recall("ns1")
+        allowed, reason = tracker.check_limit("ns1")
+        assert allowed is True
+        assert reason == "OK"

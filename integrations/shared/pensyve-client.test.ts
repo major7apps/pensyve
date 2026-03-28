@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { resolveConfig, PensyveClient, formatMemories, formatStatus, formatAccount, truncate } from "./pensyve-client";
+import { resolveConfig, PensyveClient, formatMemories, formatStatus, truncate } from "./pensyve-client";
 
 describe("resolveConfig", () => {
   it("defaults to local mode without API key", () => {
@@ -14,7 +14,7 @@ describe("resolveConfig", () => {
   it("switches to cloud mode with API key", () => {
     const cfg = resolveConfig({ apiKey: "pk-test-123" });
     expect(cfg.mode).toBe("cloud");
-    expect(cfg.cloud.apiKey).toBe("pk-test-123");
+    expect(cfg.cloud?.apiKey).toBe("pk-test-123");
   });
 
   it("respects explicit mode override", () => {
@@ -43,17 +43,17 @@ describe("resolveConfig", () => {
 });
 
 describe("PensyveClient", () => {
-  it("creates local client without auth header", () => {
+  it("creates local client", () => {
     const cfg = resolveConfig({});
     const client = new PensyveClient(cfg);
-    expect(client.isCloud).toBe(false);
+    expect(client.isRemote).toBe(false);
     expect(client.entity).toBe("pensyve-agent");
   });
 
-  it("creates cloud client with auth header", () => {
+  it("creates remote client with API key", () => {
     const cfg = resolveConfig({ apiKey: "pk-test" });
     const client = new PensyveClient(cfg);
-    expect(client.isCloud).toBe(true);
+    expect(client.isRemote).toBe(true);
   });
 
   it("has recall method", () => {
@@ -69,17 +69,6 @@ describe("PensyveClient", () => {
   it("has status method", () => {
     const client = new PensyveClient(resolveConfig({}));
     expect(typeof client.status).toBe("function");
-  });
-
-  it("has account method", () => {
-    const client = new PensyveClient(resolveConfig({}));
-    expect(typeof client.account).toBe("function");
-  });
-
-  it("account returns null for local mode", async () => {
-    const client = new PensyveClient(resolveConfig({}));
-    const result = await client.account();
-    expect(result).toBeNull();
   });
 });
 
@@ -113,21 +102,5 @@ describe("helpers", () => {
     });
     expect(result).toContain("local");
     expect(result).toContain("100");
-  });
-
-  it("formatAccount handles null", () => {
-    expect(formatAccount(null)).toContain("Local mode");
-  });
-
-  it("formatAccount shows plan info", () => {
-    const result = formatAccount({
-      plan: "Pro",
-      usage: 500,
-      quota: 10000,
-      periodEnd: "2026-04-01",
-    });
-    expect(result).toContain("Pro");
-    expect(result).toContain("500");
-    expect(result).toContain("10000");
   });
 });

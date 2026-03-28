@@ -1,7 +1,7 @@
 """Shared Pensyve client for Python integrations.
 
-Supports both local (localhost) and cloud (api.pensyve.com) backends
-with auto-detection, API key resolution, and graceful degradation.
+Supports both local (localhost) and remote server backends with
+auto-detection, API key resolution, and graceful degradation.
 
 Usage:
     from shared.pensyve_client import PensyveClient, resolve_config
@@ -18,7 +18,7 @@ from typing import Any
 import pensyve
 
 LOCAL_DEFAULT = "http://localhost:8000"
-CLOUD_DEFAULT = "https://api.pensyve.com"
+REMOTE_DEFAULT = os.environ.get("PENSYVE_REMOTE_URL", "http://localhost:8000")
 
 
 @dataclass
@@ -27,7 +27,7 @@ class PensyveConfig:
 
     mode: str = "auto"
     local_base_url: str = LOCAL_DEFAULT
-    cloud_base_url: str = CLOUD_DEFAULT
+    remote_base_url: str = REMOTE_DEFAULT
     api_key: str = ""
     entity: str = "pensyve-agent"
     namespace: str = "default"
@@ -59,7 +59,7 @@ def resolve_config(raw: dict[str, Any] | None = None) -> PensyveConfig:
     return PensyveConfig(
         mode=mode,
         local_base_url=(raw.get("local") or {}).get("baseUrl", LOCAL_DEFAULT),
-        cloud_base_url=(raw.get("cloud") or {}).get("baseUrl", CLOUD_DEFAULT),
+        remote_base_url=(raw.get("cloud") or {}).get("baseUrl", REMOTE_DEFAULT),
         api_key=api_key,
         entity=raw.get("entity", "pensyve-agent"),
         namespace=raw.get("namespace", "default"),
@@ -79,12 +79,12 @@ class PensyveClient:
 
     def __init__(self, config: PensyveConfig | None = None) -> None:
         self._config = config or PensyveConfig()
-        self.is_cloud = self._config.mode == "cloud"
+        self.is_remote = self._config.mode == "cloud"
 
-        if self.is_cloud:
+        if self.is_remote:
             self._pensyve = None
             self._entity = None
-            self._base_url = self._config.cloud_base_url.rstrip("/")
+            self._base_url = self._config.remote_base_url.rstrip("/")
             self._headers: dict[str, str] = {"Content-Type": "application/json"}
             if self._config.api_key:
                 self._headers["Authorization"] = f"Bearer {self._config.api_key}"
@@ -103,28 +103,28 @@ class PensyveClient:
 
     def recall(self, query: str, limit: int = 5) -> list[Any]:
         """Search memories."""
-        if self.is_cloud:
-            return self._cloud_recall(query, limit)
+        if self.is_remote:
+            return self._remote_recall(query, limit)
         return self._pensyve.recall(query, entity=self._entity, limit=limit)  # type: ignore[union-attr]
 
     def remember(self, fact: str, confidence: float = 0.85) -> None:
         """Store a memory."""
-        if self.is_cloud:
-            self._cloud_remember(fact, confidence)
+        if self.is_remote:
+            self._remote_remember(fact, confidence)
         else:
             self._pensyve.remember(entity=self._entity, fact=fact, confidence=confidence)  # type: ignore[union-attr]
 
     def forget(self) -> None:
         """Delete all memories for the entity."""
-        if self.is_cloud:
-            self._cloud_forget()
+        if self.is_remote:
+            self._remote_forget()
         else:
             self._pensyve.forget(entity=self._entity)  # type: ignore[union-attr]
 
     def stats(self) -> dict[str, int]:
         """Get memory statistics."""
-        if self.is_cloud:
-            return self._cloud_stats()
+        if self.is_remote:
+            return self._remote_stats()
         return self._pensyve.stats()  # type: ignore[union-attr]
 
     def status(self) -> dict[str, Any]:
@@ -132,9 +132,9 @@ class PensyveClient:
         try:
             s = self.stats()
             return {
-                "mode": "cloud" if self.is_cloud else "local",
+                "mode": "cloud" if self.is_remote else "local",
                 "connected": True,
-                "endpoint": self._base_url if self.is_cloud else "local (PyO3)",
+                "endpoint": self._base_url if self.is_remote else "local (PyO3)",
                 **s,
             }
         except Exception:
@@ -144,26 +144,9 @@ class PensyveClient:
                 "endpoint": self._base_url or "local",
             }
 
-    def account(self) -> dict[str, Any] | None:
-        """Get cloud account info (None if local)."""
-        if not self.is_cloud:
-            return None
-        try:
-            import json
-            import urllib.request
+    # -- Remote REST helpers --------------------------------------------------
 
-            req = urllib.request.Request(
-                f"{self._base_url}/v1/account",
-                headers=self._headers,
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                return json.loads(resp.read())
-        except Exception:
-            return None
-
-    # -- Cloud REST helpers --------------------------------------------------
-
-    def _cloud_recall(self, query: str, limit: int) -> list[Any]:
+    def _remote_recall(self, query: str, limit: int) -> list[Any]:
         try:
             import json
             import urllib.request
@@ -183,7 +166,7 @@ class PensyveClient:
         except Exception:
             return []
 
-    def _cloud_remember(self, fact: str, confidence: float) -> None:
+    def _remote_remember(self, fact: str, confidence: float) -> None:
         try:
             import json
             import urllib.request
@@ -205,7 +188,7 @@ class PensyveClient:
         except Exception:
             pass
 
-    def _cloud_forget(self) -> None:
+    def _remote_forget(self) -> None:
         try:
             import urllib.request
 
@@ -218,7 +201,7 @@ class PensyveClient:
         except Exception:
             pass
 
-    def _cloud_stats(self) -> dict[str, int]:
+    def _remote_stats(self) -> dict[str, int]:
         try:
             import json
             import urllib.request

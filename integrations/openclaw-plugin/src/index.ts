@@ -1,7 +1,7 @@
 /**
  * @pensyve/openclaw-pensyve — Offline-first memory plugin for OpenClaw
  *
- * Supports both local Pensyve server and Pensyve Cloud (api.pensyve.com).
+ * Supports both local and remote Pensyve server backends.
  * Uses shared PensyveClient for dual-mode operation.
  */
 
@@ -10,7 +10,6 @@ import {
   resolveConfig,
   formatMemories,
   formatStatus,
-  formatAccount,
   truncate,
   type PensyveConfig,
   type Memory,
@@ -28,7 +27,7 @@ export default {
     const log = api.logger ?? console;
 
     log.info(
-      `pensyve: loaded (${cfg.mode} → ${client.isCloud ? cfg.cloud.baseUrl : cfg.local.baseUrl}, entity=${cfg.entity})`
+      `pensyve: loaded (${cfg.mode} → ${client.isRemote ? cfg.cloud?.baseUrl : cfg.local?.baseUrl}, entity=${cfg.entity})`
     );
 
     // ── Agent Tools ─────────────────────────────────────────────────
@@ -105,8 +104,7 @@ export default {
       parameters: { type: "object", properties: {} },
       async execute() {
         const s = await client.status();
-        const a = await client.account();
-        return `Pensyve Status\n${"─".repeat(40)}\n${formatStatus(s)}\n\n${formatAccount(a)}`;
+        return `Pensyve Status\n${"─".repeat(40)}\n${formatStatus(s)}`;
       },
     });
 
@@ -170,12 +168,10 @@ export default {
           },
         },
         stats: {
-          description: "Show memory statistics and account info",
+          description: "Show memory statistics",
           async execute() {
             const s = await client.status();
-            const a = await client.account();
             console.log(formatStatus(s));
-            if (a) console.log("\n" + formatAccount(a));
           },
         },
       },

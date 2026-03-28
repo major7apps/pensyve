@@ -1,7 +1,7 @@
 /**
  * opencode-pensyve — Native OpenCode plugin for persistent cross-session memory
  *
- * Supports both local Pensyve server and Pensyve Cloud (api.pensyve.com).
+ * Supports both local and remote Pensyve server backends.
  * Uses shared PensyveClient for dual-mode operation.
  *
  * Hooks:
@@ -20,7 +20,6 @@ import {
   resolveConfig,
   formatMemories,
   formatStatus,
-  formatAccount,
   type PensyveConfig,
 } from "../../shared/pensyve-client";
 
@@ -124,8 +123,7 @@ export const PensyvePlugin = async (ctx: any) => {
         },
         async execute() {
           const s = await client.status();
-          const a = await client.account();
-          return `Pensyve Status\n${"─".repeat(40)}\n${formatStatus(s)}\n\n${formatAccount(a)}`;
+          return `Pensyve Status\n${"─".repeat(40)}\n${formatStatus(s)}`;
         },
       },
     },

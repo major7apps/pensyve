@@ -1,28 +1,23 @@
-"""Billing and usage metering for Pensyve managed service.
+"""Usage metering and limit enforcement for the Pensyve API server.
 
-Tracks API usage per namespace and enforces tier limits.
+Tracks API usage per namespace and enforces configurable limits.
+Tier definitions are loaded from environment or passed at init time —
+self-hosted deployments can set their own limits or disable enforcement.
 """
 
 from __future__ import annotations
 
 import datetime
+import os
 import sys
 import threading
 from dataclasses import dataclass
-from enum import Enum
 
 import structlog
 
 from .redis_client import INCR_EXPIRE_LUA, get_redis
 
 logger = structlog.get_logger()
-
-
-class Tier(Enum):
-    FREE = "free"
-    PRO = "pro"
-    TEAM = "team"
-    ENTERPRISE = "enterprise"
 
 
 @dataclass
@@ -33,32 +28,14 @@ class TierLimits:
     storage_bytes: int
 
 
-TIER_LIMITS = {
-    Tier.FREE: TierLimits(
-        namespaces=1,
-        max_memories=10_000,
-        recalls_per_month=1_000,
-        storage_bytes=100 * 1024 * 1024,
-    ),
-    Tier.PRO: TierLimits(
-        namespaces=5,
-        max_memories=100_000,
-        recalls_per_month=10_000,
-        storage_bytes=1024 * 1024 * 1024,
-    ),
-    Tier.TEAM: TierLimits(
-        namespaces=20,
-        max_memories=500_000,
-        recalls_per_month=50_000,
-        storage_bytes=5 * 1024 * 1024 * 1024,
-    ),
-    Tier.ENTERPRISE: TierLimits(
-        namespaces=sys.maxsize,
-        max_memories=sys.maxsize,
-        recalls_per_month=sys.maxsize,
-        storage_bytes=sys.maxsize,
-    ),
-}
+def _default_limits() -> TierLimits:
+    """Return limits from environment, or sensible self-hosted defaults."""
+    return TierLimits(
+        namespaces=int(os.environ.get("PENSYVE_MAX_NAMESPACES", "0")) or sys.maxsize,
+        max_memories=int(os.environ.get("PENSYVE_MAX_MEMORIES", "0")) or sys.maxsize,
+        recalls_per_month=int(os.environ.get("PENSYVE_MAX_RECALLS_PER_MONTH", "0")) or sys.maxsize,
+        storage_bytes=int(os.environ.get("PENSYVE_MAX_STORAGE_BYTES", "0")) or sys.maxsize,
+    )
 
 
 @dataclass
@@ -71,11 +48,16 @@ class UsageRecord:
 
 
 class UsageTracker:
-    """In-memory usage tracker. Production would use DynamoDB or similar."""
+    """In-memory usage tracker with configurable limits.
 
-    def __init__(self) -> None:
+    Limits can be passed at init time or loaded from environment variables.
+    Set limits to 0 (or leave env vars unset) to disable enforcement.
+    """
+
+    def __init__(self, limits: TierLimits | None = None) -> None:
         self._usage: dict[str, UsageRecord] = {}
         self._lock = threading.Lock()
+        self._limits = limits or _default_limits()
 
     def record_api_call(self, namespace: str) -> None:
         with self._lock:
@@ -93,15 +75,18 @@ class UsageTracker:
         with self._lock:
             return self._get_or_create(namespace)
 
-    def check_limit(self, namespace: str, tier: Tier) -> tuple[bool, str]:
-        """Check if usage is within tier limits. Returns (allowed, reason)."""
+    def check_limit(self, namespace: str, limits: TierLimits | None = None) -> tuple[bool, str]:
+        """Check if usage is within limits. Returns (allowed, reason).
+
+        Uses the provided limits, or falls back to the instance defaults.
+        """
         with self._lock:
             usage = self._get_or_create(namespace)
-            limits = TIER_LIMITS[tier]
-            if usage.recalls >= limits.recalls_per_month:
-                return False, f"Monthly recall limit reached ({limits.recalls_per_month})"
-            if usage.memories_stored >= limits.max_memories:
-                return False, f"Memory limit reached ({limits.max_memories})"
+            effective = limits or self._limits
+            if usage.recalls >= effective.recalls_per_month:
+                return False, f"Monthly recall limit reached ({effective.recalls_per_month})"
+            if usage.memories_stored >= effective.max_memories:
+                return False, f"Memory limit reached ({effective.max_memories})"
             return True, "OK"
 
     async def record_api_call_redis(self, namespace: str) -> None:
