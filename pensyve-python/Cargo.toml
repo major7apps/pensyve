@@ -17,8 +17,10 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
-# Vendor OpenSSL for manylinux wheel builds (no system libssl needed)
-openssl = { version = "0.10", features = ["vendored"] }
+# Vendor OpenSSL for manylinux wheel builds (no system libssl needed).
+# Must target openssl-sys directly to ensure feature unification with
+# the transitive openssl-sys pulled through pensyve-core's dep tree.
+openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [lints]
 workspace = true

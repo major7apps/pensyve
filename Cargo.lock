@@ -2631,7 +2631,7 @@ name = "pensyve-python"
 version = "1.0.0"
 dependencies = [
  "chrono",
- "openssl",
+ "openssl-sys",
  "pensyve-core",
  "pyo3",
  "serde_json",
