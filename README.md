@@ -22,7 +22,7 @@ Most AI agents lose all context between sessions. Pensyve gives them durable, in
 - **Forgetting curve** — FSRS-based memory decay with retrieval-induced reinforcement (memories you use get stronger)
 - **Consolidation** — Background "dreaming" promotes repeated episodic facts to semantic knowledge
 - **Offline-first** — SQLite storage, ONNX embeddings, optional local LLM extraction. No API keys needed.
-- **Scales to cloud** — Feature-gated Postgres backend with pgvector for managed deployments
+- **Scales to Postgres** — Feature-gated Postgres backend with pgvector for multi-node deployments
 - **Cross-encoder reranking** — BGE reranker on top-k results for precision
 - **Access control** — RBAC memory mesh with owner/writer/reader roles and private/shared/public visibility
 

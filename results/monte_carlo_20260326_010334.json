@@ -1,0 +1,32 @@
+[
+  {
+    "benchmark": "monte_carlo",
+    "variant": "cosine_baseline",
+    "metric": "accuracy_at_1",
+    "value": 0.97,
+    "ci_lower": 0.945,
+    "ci_upper": 0.99,
+    "n": 200,
+    "timestamp": "2026-03-26T01:03:34.858779897Z"
+  },
+  {
+    "benchmark": "monte_carlo",
+    "variant": "cosine_baseline",
+    "metric": "mrr",
+    "value": 0.985,
+    "ci_lower": 0.9725,
+    "ci_upper": 0.995,
+    "n": 200,
+    "timestamp": "2026-03-26T01:03:34.868095779Z"
+  },
+  {
+    "benchmark": "monte_carlo",
+    "variant": "cosine_baseline",
+    "metric": "ndcg_at_5",
+    "value": 0.9887011230552374,
+    "ci_lower": 0.9816149794318804,
+    "ci_upper": 0.9946158688487725,
+    "n": 200,
+    "timestamp": "2026-03-26T01:03:34.877511422Z"
+  }
+]

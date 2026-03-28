@@ -1,8 +1,8 @@
 /**
  * Shared Pensyve client for all TypeScript integrations.
  *
- * Supports both local (localhost) and cloud (api.pensyve.com) backends
- * with auto-detection, API key resolution, and graceful degradation.
+ * Supports both local (localhost) and remote server backends with
+ * auto-detection, API key resolution, and graceful degradation.
  *
  * Usage:
  *   import { PensyveClient, resolveConfig } from "../shared/pensyve-client";
@@ -47,12 +47,6 @@ export interface StatusInfo {
   procedural: number;
 }
 
-export interface AccountInfo {
-  plan: string;
-  usage: number;
-  quota: number;
-  periodEnd: string;
-}
 
 // -- Errors -----------------------------------------------------------------
 
@@ -66,7 +60,9 @@ export class PensyveError extends Error {
 // -- Config resolution ------------------------------------------------------
 
 const LOCAL_DEFAULT = "http://localhost:8000";
-const CLOUD_DEFAULT = "https://api.pensyve.com";
+const REMOTE_DEFAULT = typeof globalThis.process !== "undefined"
+  ? (globalThis.process as any).env?.PENSYVE_REMOTE_URL ?? LOCAL_DEFAULT
+  : LOCAL_DEFAULT;
 
 /**
  * Resolve a plugin config into a fully-qualified PensyveConfig.
@@ -89,7 +85,7 @@ export function resolveConfig(raw: Partial<PensyveConfig> = {}): Required<Pensyv
   return {
     mode,
     local: { baseUrl: raw.local?.baseUrl ?? LOCAL_DEFAULT },
-    cloud: { baseUrl: raw.cloud?.baseUrl ?? CLOUD_DEFAULT, apiKey },
+    cloud: { baseUrl: raw.cloud?.baseUrl ?? REMOTE_DEFAULT, apiKey },
     apiKey: apiKey ?? "",
     entity: raw.entity ?? "pensyve-agent",
     namespace: raw.namespace ?? "default",
@@ -105,14 +101,14 @@ export class PensyveClient {
   private baseUrl: string;
   private headers: Record<string, string>;
   readonly entity: string;
-  readonly isCloud: boolean;
+  readonly isRemote: boolean;
 
   constructor(cfg: Required<PensyveConfig>) {
-    this.isCloud = cfg.mode === "cloud";
-    this.baseUrl = (this.isCloud ? cfg.cloud.baseUrl : cfg.local.baseUrl)!.replace(/\/$/, "");
+    this.isRemote = cfg.mode === "cloud";
+    this.baseUrl = (this.isRemote ? cfg.cloud.baseUrl : cfg.local.baseUrl)!.replace(/\/$/, "");
     this.entity = cfg.entity;
     this.headers = { "Content-Type": "application/json" };
-    if (this.isCloud && cfg.cloud.apiKey) {
+    if (this.isRemote && cfg.cloud.apiKey) {
       this.headers["X-Pensyve-Key"] = cfg.cloud.apiKey;
     }
   }
@@ -180,7 +176,7 @@ export class PensyveClient {
       if (!health.ok) throw new Error("Health check failed");
       const s = stats.ok ? await stats.json() : {};
       return {
-        mode: this.isCloud ? "cloud" : "local",
+        mode: this.isRemote ? "cloud" : "local",
         connected: true,
         baseUrl: this.baseUrl,
         entities: s.entities ?? 0,
@@ -201,33 +197,6 @@ export class PensyveClient {
     }
   }
 
-  // -- Cloud-only: account & billing ----------------------------------------
-
-  async account(): Promise<AccountInfo | null> {
-    if (!this.isCloud) return null;
-    try {
-      const res = await this.fetchWithTimeout(`${this.baseUrl}/v1/account`, {
-        headers: this.headers,
-      });
-      if (!res.ok) return null;
-      return await res.json();
-    } catch {
-      return null;
-    }
-  }
-
-  async usage(): Promise<{ memories: number; recalls: number; period: string } | null> {
-    if (!this.isCloud) return null;
-    try {
-      const res = await this.fetchWithTimeout(`${this.baseUrl}/v1/usage`, {
-        headers: this.headers,
-      });
-      if (!res.ok) return null;
-      return await res.json();
-    } catch {
-      return null;
-    }
-  }
 }
 
 // -- Helpers ----------------------------------------------------------------
@@ -256,11 +225,3 @@ export function formatStatus(s: StatusInfo): string {
   return lines.join("\n");
 }
 
-export function formatAccount(a: AccountInfo | null): string {
-  if (!a) return "Local mode — no cloud account.";
-  return [
-    `Plan:       ${a.plan}`,
-    `Usage:      ${a.usage} / ${a.quota} this period`,
-    `Period ends: ${a.periodEnd}`,
-  ].join("\n");
-}

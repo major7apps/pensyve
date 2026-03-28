@@ -96,7 +96,7 @@ class RememberRequest(BaseModel):
 class RememberResponse(MemoryResponse):
     """Response for a stored memory, including which extraction tier was used."""
 
-    extraction_tier: int = 1  # 1=patterns only, 2=local LLM, 3=API LLM
+    extraction_tier: int = 1  # 1=patterns, 2=LLM-enhanced
 
 
 class ForgetResponse(BaseModel):

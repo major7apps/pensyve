@@ -118,25 +118,3 @@ jobs:
         working-directory: pensyve-wasm
         run: wasm-pack test --node
 
-  build-and-push:
-    name: Build & Push Docker Image
-    needs: [lint, test-rust, test-python, test-typescript, test-go, test-wasm]
-    if: github.ref == 'refs/heads/main' && vars.ECR_PUSH_ENABLED == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: us-east-1
-      - uses: aws-actions/amazon-ecr-login@v2
-        id: ecr
-      - name: Build and push
-        run: |
-          IMAGE=${{ steps.ecr.outputs.registry }}/pensyve:${{ github.sha }}
-          docker build -t $IMAGE -t ${{ steps.ecr.outputs.registry }}/pensyve:latest .
-          docker push $IMAGE
-          docker push ${{ steps.ecr.outputs.registry }}/pensyve:latest
