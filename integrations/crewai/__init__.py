@@ -1,3 +1,3 @@
-from .pensyve_crewai import PensyveCrewMemory, PensyveStorage
+from .pensyve_crewai import MemoryMatch, MemoryRecord, PensyveMemory
 
-__all__ = ["PensyveCrewMemory", "PensyveStorage"]
+__all__ = ["MemoryMatch", "MemoryRecord", "PensyveMemory"]

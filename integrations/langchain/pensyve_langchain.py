@@ -1,32 +1,47 @@
 """Pensyve memory backend for LangChain / LangGraph.
 
-Modern usage (LangGraph BaseStore pattern — recommended):
-    from pensyve_langchain import PensyveStore
-    store = PensyveStore(namespace="my-project")
-    # Use as a LangGraph-compatible store with put/get/search/delete
+Drop-in replacement for LangGraph's InMemoryStore or any BaseStore-compatible
+backend.  Uses the Pensyve Python SDK (PyO3) for local mode and the Pensyve
+REST API for cloud mode.
 
-Legacy usage (LangChain BaseMemory pattern — deprecated in LangChain v0.3):
-    from pensyve_langchain import PensyveMemory
-    memory = PensyveMemory(namespace="my-project")
-    # Use as drop-in replacement for ConversationBufferMemory
+Usage::
+
+    from pensyve_langchain import PensyveStore
+
+    store = PensyveStore()                       # local (default)
+    store = PensyveStore(api_key="psy_...")       # cloud
+
+    # Use with LangGraph
+    graph = builder.compile(store=store)
+
+    # Standalone
+    store.put(("user", "memories"), "key1", {"text": "likes dark mode"})
+    items = store.search(("user", "memories"), query="preferences")
 """
 
 from __future__ import annotations
 
+import json
+import os
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
-import pensyve
-
 # ---------------------------------------------------------------------------
-# LangGraph BaseStore-compatible interface (modern, recommended)
+# Item — mirrors langgraph.store.base.Item so users get the same shape
+# without requiring langgraph as a dependency.
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class StoreItem:
-    """A single item returned by PensyveStore.get() or .search()."""
+class Item:
+    """A single item returned by PensyveStore.get() or .search().
+
+    Matches the interface of ``langgraph.store.base.Item`` so that code
+    written against InMemoryStore works unchanged with PensyveStore.
+    """
 
     namespace: tuple[str, ...]
     key: str
@@ -36,42 +51,174 @@ class StoreItem:
     score: float | None = None
 
 
+# ---------------------------------------------------------------------------
+# Namespace helpers
+# ---------------------------------------------------------------------------
+
+_NAMESPACE_SEP = "/"
+
+
+def _ns_to_entity(ns: tuple[str, ...]) -> str:
+    """Convert a LangGraph namespace tuple to a Pensyve entity name.
+
+    ("user_123", "memories") -> "user_123/memories"
+    """
+    return _NAMESPACE_SEP.join(ns) if ns else "default"
+
+
+def _make_fact(key: str, value: dict[str, Any]) -> str:
+    """Encode a key + value dict into a Pensyve fact string.
+
+    The key is stored as a bracketed prefix so we can recover it on recall.
+    The full value dict is JSON-serialised after the prefix.
+    """
+    return f"[{key}] {json.dumps(value, separators=(',', ':'))}"
+
+
+def _parse_fact(raw: str) -> tuple[str, dict[str, Any]]:
+    """Parse a fact string back into (key, value_dict).
+
+    Returns (key, value) if the fact matches the ``[key] {json}`` format,
+    otherwise returns (first-32-chars, {"data": raw}).
+    """
+    if raw.startswith("["):
+        bracket_end = raw.find("] ", 1)
+        if bracket_end != -1:
+            key = raw[1:bracket_end]
+            payload = raw[bracket_end + 2 :]
+            try:
+                value = json.loads(payload)
+                if isinstance(value, dict):
+                    return key, value
+            except (json.JSONDecodeError, ValueError):
+                pass
+    # Fallback for memories not written through PensyveStore
+    return raw[:32], {"data": raw}
+
+
+# ---------------------------------------------------------------------------
+# Cloud HTTP helpers (stdlib only — no httpx required)
+# ---------------------------------------------------------------------------
+
+_CLOUD_BASE_URL = "https://api.pensyve.com"
+_CLOUD_TIMEOUT = 15
+
+
+def _cloud_request(
+    method: str,
+    url: str,
+    *,
+    api_key: str,
+    body: dict[str, Any] | None = None,
+    timeout: float = _CLOUD_TIMEOUT,
+) -> Any:
+    """Make an HTTP request to the Pensyve cloud API using stdlib."""
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    data = json.dumps(body).encode() if body else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+# ---------------------------------------------------------------------------
+# PensyveStore — LangGraph BaseStore-compatible
+# ---------------------------------------------------------------------------
+
+
 class PensyveStore:
     """LangGraph BaseStore-compatible memory backend using Pensyve.
 
-    Implements the same put/get/search/delete interface as LangGraph's
-    InMemoryStore and PostgresStore, backed by Pensyve's local engine
-    with 8-signal fusion retrieval.
+    Implements the same ``put`` / ``get`` / ``search`` / ``delete`` /
+    ``list_namespaces`` interface as LangGraph's ``InMemoryStore``,
+    backed by Pensyve's local engine or cloud API.
+
+    Mode detection:
+        - If *api_key* is passed or ``PENSYVE_API_KEY`` is set -> **cloud**
+        - Otherwise -> **local** (requires the ``pensyve`` PyO3 package)
 
     Usage with LangGraph::
 
         from pensyve_langchain import PensyveStore
-        from langgraph.prebuilt import create_react_agent
-
-        store = PensyveStore(namespace="my-agent")
-        agent = create_react_agent(model, tools, store=store)
+        store = PensyveStore()
+        graph = builder.compile(store=store)
 
     Usage standalone::
 
         store = PensyveStore()
         store.put(("user", "prefs"), "lang", {"data": "Prefers Python"})
-        results = store.search(("user", "prefs"), query="programming")
+        items = store.search(("user", "prefs"), query="programming")
     """
 
     def __init__(
         self,
+        *,
         namespace: str = "default",
         path: str | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
     ) -> None:
-        self._pensyve = pensyve.Pensyve(path=path, namespace=namespace)
+        """Initialise the store.
+
+        Args:
+            namespace: Pensyve namespace for storage isolation.
+            path: Local storage directory (local mode only).
+            api_key: Pensyve cloud API key.  If ``None``, falls back to the
+                ``PENSYVE_API_KEY`` environment variable.
+            base_url: Override the cloud API base URL.
+        """
+        self._api_key = api_key or os.environ.get("PENSYVE_API_KEY") or ""
+        self._is_cloud = bool(self._api_key)
+        self._base_url = (base_url or _CLOUD_BASE_URL).rstrip("/")
+        self._namespace = namespace
+
+        # Local-mode state
+        self._pensyve: Any = None
         self._entities: dict[str, Any] = {}
 
-    def _resolve_entity(self, ns: tuple[str, ...]) -> Any:
-        """Map a LangGraph namespace tuple to a Pensyve entity."""
-        name = "_".join(ns) if ns else "default"
+        if not self._is_cloud:
+            import pensyve  # noqa: F811 — lazy import keeps cloud-only light
+
+            self._pensyve = pensyve.Pensyve(path=path, namespace=namespace)
+
+        # Track known namespaces for list_namespaces()
+        self._known_namespaces: set[tuple[str, ...]] = set()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def is_cloud(self) -> bool:
+        """True when the store is using the Pensyve cloud API."""
+        return self._is_cloud
+
+    def _get_entity(self, ns: tuple[str, ...]) -> Any:
+        """Resolve a namespace tuple to a local Pensyve Entity."""
+        name = _ns_to_entity(ns)
         if name not in self._entities:
             self._entities[name] = self._pensyve.entity(name, kind="user")
         return self._entities[name]
+
+    def _cloud(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+    ) -> Any:
+        """Convenience wrapper around ``_cloud_request``."""
+        return _cloud_request(
+            method,
+            f"{self._base_url}{path}",
+            api_key=self._api_key,
+            body=body,
+        )
+
+    # ------------------------------------------------------------------
+    # BaseStore interface
+    # ------------------------------------------------------------------
 
     def put(
         self,
@@ -79,54 +226,78 @@ class PensyveStore:
         key: str,
         value: dict[str, Any],
     ) -> None:
-        """Store a document.
+        """Store a value under *namespace* / *key*.
 
         Args:
-            namespace: Hierarchical namespace (e.g., ("user_123", "memories")).
-            key: Unique key for this item within the namespace.
-            value: Dictionary of data to store.
+            namespace: Hierarchical namespace tuple, e.g. ``("user_123", "memories")``.
+            key: Unique key within the namespace.
+            value: Arbitrary JSON-serialisable dict to store.
         """
-        entity = self._resolve_entity(namespace)
-        content = value.get("data", str(value))
-        self._pensyve.remember(
-            entity=entity,
-            fact=f"[{key}] {content}",
-            confidence=0.85,
-        )
+        self._known_namespaces.add(namespace)
+        fact = _make_fact(key, value)
+        entity_name = _ns_to_entity(namespace)
+
+        if self._is_cloud:
+            self._cloud("POST", "/v1/remember", {
+                "entity": entity_name,
+                "fact": fact,
+                "confidence": 0.85,
+            })
+        else:
+            entity = self._get_entity(namespace)
+            self._pensyve.remember(entity=entity, fact=fact, confidence=0.85)
 
     def get(
         self,
         namespace: tuple[str, ...],
         key: str,
-    ) -> StoreItem | None:
-        """Retrieve a specific item by namespace and key.
+    ) -> Item | None:
+        """Retrieve a single item by *namespace* and *key*.
 
         Args:
-            namespace: Hierarchical namespace.
+            namespace: Hierarchical namespace tuple.
             key: Item key.
 
         Returns:
-            StoreItem if found, None otherwise.
+            An :class:`Item` if found, ``None`` otherwise.
         """
-        entity = self._resolve_entity(namespace)
-        results = self._pensyve.recall(
-            f"[{key}]",
-            entity=entity,
-            limit=1,
-        )
-        if not results:
+        entity_name = _ns_to_entity(namespace)
+
+        if self._is_cloud:
+            resp = self._cloud("POST", "/v1/inspect", {
+                "entity": entity_name,
+                "limit": 50,
+            })
+            # Flatten all memory types returned by inspect
+            memories: list[dict[str, Any]] = []
+            for mem_type in ("episodic", "semantic", "procedural"):
+                memories.extend(resp.get(mem_type, []))
+            for mem in memories:
+                content = mem.get("content", "")
+                parsed_key, parsed_value = _parse_fact(content)
+                if parsed_key == key:
+                    return Item(
+                        namespace=namespace,
+                        key=key,
+                        value=parsed_value,
+                        score=mem.get("score"),
+                    )
             return None
-        mem = results[0]
-        content = getattr(mem, "content", str(mem))
-        # Strip the key prefix if present
-        if content.startswith(f"[{key}] "):
-            content = content[len(f"[{key}] ") :]
-        return StoreItem(
-            namespace=namespace,
-            key=key,
-            value={"data": content},
-            score=getattr(mem, "score", None),
-        )
+
+        # Local mode: use recall with the key as the query
+        entity = self._get_entity(namespace)
+        results = self._pensyve.recall(f"[{key}]", entity=entity, limit=20)
+        for mem in results:
+            content = getattr(mem, "content", str(mem))
+            parsed_key, parsed_value = _parse_fact(content)
+            if parsed_key == key:
+                return Item(
+                    namespace=namespace,
+                    key=key,
+                    value=parsed_value,
+                    score=getattr(mem, "score", None),
+                )
+        return None
 
     def search(
         self,
@@ -135,136 +306,195 @@ class PensyveStore:
         query: str | None = None,
         filter: dict[str, Any] | None = None,
         limit: int = 10,
-    ) -> list[StoreItem]:
+    ) -> list[Item]:
         """Search for items in a namespace.
 
         Args:
-            namespace: Hierarchical namespace.
-            query: Optional semantic search query.
-            filter: Optional key-value filters (checked against value dict).
-            limit: Max results.
+            namespace: Hierarchical namespace tuple.
+            query: Semantic search query.  Pass ``None`` or ``""`` to list all.
+            filter: Key-value filters applied against each item's ``value`` dict.
+            limit: Maximum number of results.
 
         Returns:
-            List of matching StoreItems, ordered by relevance.
+            List of matching :class:`Item` objects, ordered by relevance.
         """
-        entity = self._resolve_entity(namespace)
-        results = self._pensyve.recall(
-            query or "",
-            entity=entity,
-            limit=limit,
-        )
-        items = []
-        for mem in results:
-            content = getattr(mem, "content", str(mem))
-            item = StoreItem(
-                namespace=namespace,
-                key=content[:32],
-                value={"data": content},
-                score=getattr(mem, "score", None),
-            )
-            items.append(item)
+        entity_name = _ns_to_entity(namespace)
+        search_query = query or "*"
 
-        # Apply filter if provided
+        if self._is_cloud:
+            resp = self._cloud("POST", "/v1/recall", {
+                "query": search_query,
+                "entity": entity_name,
+                "limit": limit,
+            })
+            raw_memories = resp.get("memories", [])
+        else:
+            entity = self._get_entity(namespace)
+            raw_memories = self._pensyve.recall(
+                search_query, entity=entity, limit=limit,
+            )
+
+        items: list[Item] = []
+        for mem in raw_memories:
+            if self._is_cloud:
+                content = mem.get("content", "")
+                score = mem.get("score")
+            else:
+                content = getattr(mem, "content", str(mem))
+                score = getattr(mem, "score", None)
+
+            parsed_key, parsed_value = _parse_fact(content)
+            items.append(Item(
+                namespace=namespace,
+                key=parsed_key,
+                value=parsed_value,
+                score=score,
+            ))
+
+        # Apply value-level filters
         if filter:
             items = [
-                item for item in items if all(item.value.get(k) == v for k, v in filter.items())
+                item
+                for item in items
+                if all(item.value.get(k) == v for k, v in filter.items())
             ]
-        return items
+
+        return items[:limit]
 
     def delete(
         self,
         namespace: tuple[str, ...],
         key: str,
     ) -> None:
-        """Delete all memories for a namespace.
+        """Delete memories for a namespace entity.
 
-        Note: Pensyve's forget() operates at the entity level. Individual
-        key deletion is not yet supported — this clears all memories for
-        the namespace entity.
+        .. note::
+
+            Pensyve's ``forget()`` operates at the entity level.  Individual
+            key-level deletion is not yet supported by the engine -- this call
+            archives **all** memories for the namespace entity.
 
         Args:
-            namespace: Hierarchical namespace.
-            key: Item key (currently unused — all entity memories are cleared).
+            namespace: Hierarchical namespace tuple.
+            key: Item key (currently unused -- all entity memories are cleared).
         """
-        entity = self._resolve_entity(namespace)
-        self._pensyve.forget(entity=entity)
+        entity_name = _ns_to_entity(namespace)
 
+        if self._is_cloud:
+            try:
+                _cloud_request(
+                    "DELETE",
+                    f"{self._base_url}/v1/entities/{entity_name}",
+                    api_key=self._api_key,
+                )
+            except urllib.error.HTTPError:
+                pass  # Entity may not exist
+        else:
+            entity = self._get_entity(namespace)
+            self._pensyve.forget(entity=entity)
 
-# ---------------------------------------------------------------------------
-# Legacy LangChain BaseMemory-compatible interface (deprecated in v0.3)
-# ---------------------------------------------------------------------------
+        self._known_namespaces.discard(namespace)
 
-
-class PensyveMemory:
-    """LangChain BaseMemory-compatible backend using Pensyve.
-
-    .. deprecated::
-        LangChain deprecated BaseMemory in v0.3. Use :class:`PensyveStore`
-        with LangGraph instead.
-
-    Maps conversation turns to episodes, explicit facts to semantic memories.
-    """
-
-    memory_key: str = "history"
-
-    def __init__(
+    def list_namespaces(
         self,
-        namespace: str = "default",
-        path: str | None = None,
-        entity_name: str = "langchain-agent",
-    ):
-        self._pensyve = pensyve.Pensyve(path=path, namespace=namespace)
-        self._agent = self._pensyve.entity(entity_name, kind="agent")
-        self._user = self._pensyve.entity("user", kind="user")
-        self._episode: Any | None = None
+        *,
+        prefix: tuple[str, ...] | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[tuple[str, ...]]:
+        """List known namespaces.
 
-    @property
-    def memory_variables(self) -> list[str]:
-        """Return the list of memory variables this memory backend provides."""
-        return [self.memory_key]
+        .. note::
 
-    def load_memory_variables(self, inputs: dict[str, Any] | None = None) -> dict[str, str]:
-        """Load relevant memories based on the latest input."""
-        query = ""
-        if inputs:
-            query = str(next(iter(inputs.values()), ""))
-        if not query:
-            return {self.memory_key: ""}
-        memories = self._pensyve.recall(query, entity=self._user, limit=5)
-        history = "\n".join(f"- {m.content}" for m in memories)
-        return {self.memory_key: history}
+            This returns namespaces that have been written to through this
+            store instance.  Pensyve does not yet expose a server-side
+            namespace listing endpoint.
 
-    def save_context(self, inputs: dict[str, Any], outputs: dict[str, str]) -> None:
-        """Save a conversation turn as an episode message."""
-        if self._episode is None:
-            self._episode = self._pensyve.episode(self._agent, self._user)
-            self._episode.__enter__()
+        Args:
+            prefix: Only return namespaces starting with this prefix.
+            limit: Maximum number of results.
+            offset: Number of results to skip.
 
-        input_text = str(next(iter(inputs.values()), ""))
-        output_text = str(next(iter(outputs.values()), ""))
-        if input_text:
-            self._episode.message("user", input_text)
-        if output_text:
-            self._episode.message("assistant", output_text)
+        Returns:
+            Sorted list of namespace tuples.
+        """
+        namespaces = sorted(self._known_namespaces)
+        if prefix:
+            namespaces = [
+                ns for ns in namespaces if ns[: len(prefix)] == prefix
+            ]
+        return namespaces[offset : offset + limit]
 
-    def clear(self) -> None:
-        """End the current episode and forget entity memories."""
-        if self._episode is not None:
-            self._episode.__exit__(None, None, None)
-            self._episode = None
-        self._pensyve.forget(entity=self._user)
+    # ------------------------------------------------------------------
+    # Async variants (thin wrappers -- Pensyve local is sync-only today)
+    # ------------------------------------------------------------------
 
-    def end_episode(self, outcome: str = "success") -> None:
-        """Explicitly end the current episode with an outcome."""
-        if self._episode is not None:
-            self._episode.outcome(outcome)
-            self._episode.__exit__(None, None, None)
-            self._episode = None
+    async def aput(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+        value: dict[str, Any],
+    ) -> None:
+        """Async version of :meth:`put`."""
+        self.put(namespace, key, value)
 
-    def remember(self, fact: str, confidence: float = 0.8) -> None:
-        """Store an explicit semantic memory."""
-        self._pensyve.remember(entity=self._user, fact=fact, confidence=confidence)
+    async def aget(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+    ) -> Item | None:
+        """Async version of :meth:`get`."""
+        return self.get(namespace, key)
 
-    def consolidate(self) -> dict[str, int]:
-        """Run memory consolidation."""
-        return self._pensyve.consolidate()
+    async def asearch(
+        self,
+        namespace: tuple[str, ...],
+        *,
+        query: str | None = None,
+        filter: dict[str, Any] | None = None,
+        limit: int = 10,
+    ) -> list[Item]:
+        """Async version of :meth:`search`."""
+        return self.search(namespace, query=query, filter=filter, limit=limit)
+
+    async def adelete(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+    ) -> None:
+        """Async version of :meth:`delete`."""
+        self.delete(namespace, key)
+
+    async def alist_namespaces(
+        self,
+        *,
+        prefix: tuple[str, ...] | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[tuple[str, ...]]:
+        """Async version of :meth:`list_namespaces`."""
+        return self.list_namespaces(prefix=prefix, limit=limit, offset=offset)
+
+    # ------------------------------------------------------------------
+    # Batch operations
+    # ------------------------------------------------------------------
+
+    def batch(self, ops: list[tuple[str, tuple[Any, ...]]]) -> list[Any]:
+        """Execute a batch of operations.
+
+        Each element is a ``(method_name, args_tuple)`` pair.  Results are
+        returned in the same order.
+        """
+        results: list[Any] = []
+        for method_name, args in ops:
+            fn = getattr(self, method_name)
+            results.append(fn(*args))
+        return results
+
+    # ------------------------------------------------------------------
+    # Dunder helpers
+    # ------------------------------------------------------------------
+
+    def __repr__(self) -> str:
+        mode = "cloud" if self._is_cloud else "local"
+        return f"PensyveStore(mode={mode!r}, namespace={self._namespace!r})"

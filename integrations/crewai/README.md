@@ -1,14 +1,6 @@
 # Pensyve CrewAI Integration
 
-Pensyve memory backend for CrewAI, mapping CrewAI's memory concepts to Pensyve's engine.
-
-## Concept Mapping
-
-| CrewAI Concept | Pensyve Mapping |
-|---|---|
-| Short-term memory | Episodic memory (episodes per task) |
-| Long-term memory | Semantic memory (persisted facts) |
-| Entity memory | Pensyve entities (per-agent) |
+Pensyve memory backend for CrewAI, providing persistent memory with 8-signal fusion retrieval.
 
 ## Installation
 
@@ -16,51 +8,108 @@ Pensyve memory backend for CrewAI, mapping CrewAI's memory concepts to Pensyve's
 pip install pensyve
 ```
 
-Copy `pensyve_crewai.py` into your project, or add this directory to your Python path.
+Copy this directory into your project, or add it to your Python path.
 
 ## Quick Start
 
 ```python
-from pensyve_crewai import PensyveCrewMemory
+from pensyve_crewai import PensyveMemory
 
-memory = PensyveCrewMemory(namespace="my-crew")
+memory = PensyveMemory(namespace="my-crew")
 
-# Short-term memory: record task progress
-memory.save_short_term("task-123", "Researched competitor pricing", agent_name="researcher")
-memory.save_short_term("task-123", "Found 3 key differentiators", agent_name="researcher")
-memory.end_task("task-123", outcome="success")
+# Store memories
+memory.remember("The API rate limit is 1000 requests per minute.")
+memory.remember("Authentication uses Bearer tokens.", metadata={"confidence": 0.95})
 
-# Long-term memory: store persistent facts
-memory.save_long_term("researcher", "Competitor X charges $99/month")
-memory.save_long_term("researcher", "Market size is $2B annually", confidence=0.7)
+# Search memories
+matches = memory.recall("What are our API limits?", limit=5)
+for m in matches:
+    print(f"[{m.score:.2f}] {m.record.content}")
 
-# Search across all memory types
-results = memory.search("competitor pricing")
-for r in results:
-    print(f"[{r['memory_type']}] {r['content']} (score: {r['score']:.2f})")
+# Extract facts from unstructured text
+facts = memory.extract_memories("Meeting notes: We decided to migrate to Postgres. Deadline is Friday.")
+for fact in facts:
+    memory.remember(fact)
+```
 
-# Search with filters
-semantic_only = memory.search("pricing", types=["semantic"])
-agent_scoped = memory.search("pricing", entity_name="researcher")
+## Usage with CrewAI
 
-# Consolidation
-stats = memory.consolidate()
+```python
+from pensyve_crewai import PensyveMemory
+from crewai import Crew
+
+memory = PensyveMemory(namespace="my-crew")
+crew = Crew(
+    agents=[...],
+    tasks=[...],
+    memory=True,
+    memory_config={"provider": "custom", "config": {"instance": memory}},
+)
+```
+
+## Local vs. Cloud Mode
+
+The integration auto-detects which backend to use:
+
+| Mode | Trigger | Backend |
+|------|---------|---------|
+| Local | No API key set | Pensyve SDK (PyO3 + SQLite) |
+| Cloud | `PENSYVE_API_KEY` env var or `api_key=` param | Pensyve REST API |
+
+```python
+# Local mode (default)
+memory = PensyveMemory(namespace="my-crew")
+
+# Cloud mode (explicit key)
+memory = PensyveMemory(namespace="my-crew", api_key="pk_live_...")
+
+# Cloud mode (env var)
+# export PENSYVE_API_KEY=pk_live_...
+memory = PensyveMemory(namespace="my-crew")
+
+# Check active mode
+print(memory.mode)  # "local" or "cloud"
 ```
 
 ## API
 
-### `PensyveCrewMemory(namespace, path)`
+### `PensyveMemory(namespace, entity_name, *, path, api_key, base_url)`
 
-- `namespace` (str): Pensyve namespace for isolation. Default: `"default"`.
-- `path` (str | None): Storage directory. Default: `~/.pensyve/default`.
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `namespace` | `str` | `"default"` | Pensyve namespace for isolation |
+| `entity_name` | `str` | `"crew-agent"` | Entity name to scope memories to |
+| `path` | `str \| None` | `None` | Local storage path (local mode only) |
+| `api_key` | `str \| None` | `None` | Cloud API key (overrides env var) |
+| `base_url` | `str` | `"https://api.pensyve.com"` | Cloud API URL |
 
 ### Methods
 
 | Method | Description |
 |--------|-------------|
-| `save_short_term(task_id, content, agent_name, role)` | Record episodic memory for a task |
-| `end_task(task_id, outcome)` | Close the episode for a task |
-| `save_long_term(entity_name, fact, confidence, kind)` | Store a semantic memory |
-| `search(query, entity_name, types, limit)` | Search memories with optional filters |
-| `reset(entity_name)` | Clear memories (all or per-entity) |
-| `consolidate()` | Run memory decay and promotion |
+| `remember(text, metadata=None)` | Store a memory with optional metadata |
+| `recall(query, limit=5)` | Search memories, returns `list[MemoryMatch]` |
+| `extract_memories(text)` | Split text into individual facts (no LLM) |
+| `reset()` | Clear all memories for this entity |
+
+### Result Types
+
+```python
+@dataclass
+class MemoryMatch:
+    score: float          # Relevance score (0.0 - 1.0)
+    record: MemoryRecord  # The stored memory
+
+@dataclass
+class MemoryRecord:
+    content: str                    # Memory text
+    metadata: dict[str, Any] = {}   # Additional metadata
+```
+
+## Running Tests
+
+```bash
+cd integrations/crewai
+pip install pytest
+pytest tests/ -v
+```
