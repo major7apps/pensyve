@@ -37,7 +37,8 @@ jobs:
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --manifest-path pensyve-python/Cargo.toml
-          manylinux: auto
+          manylinux: "2_28"
+          before-script-linux: dnf install -y openssl-devel perl-IPC-Cmd
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
