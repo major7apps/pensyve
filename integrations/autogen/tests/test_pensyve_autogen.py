@@ -5,7 +5,7 @@ All tests mock the pensyve SDK so they run without a real Pensyve engine.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -19,7 +19,6 @@ from pensyve_autogen import (
     PensyveMemory,
     UpdateContextResult,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -353,7 +352,6 @@ async def test_cloud_add(mock_pensyve):
 async def test_cloud_query(mock_pensyve):
     """query() in cloud mode should call the REST API."""
     import json
-    from io import BytesIO
 
     mem = PensyveMemory(
         namespace="test",

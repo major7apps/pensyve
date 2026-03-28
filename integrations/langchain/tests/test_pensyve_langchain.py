@@ -6,9 +6,7 @@ All tests mock the pensyve SDK so they run without a native binary.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
-from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
