@@ -31,8 +31,8 @@ jobs:
       - name: Python lint
         run: |
           uv sync --extra dev
-          uv run ruff check pensyve_server/ integrations/ tests/
-          uv run pyright pensyve_server/
+          uv run ruff check pensyve_python/ integrations/ tests/
+          uv run pyright pensyve_python/
       - uses: oven-sh/setup-bun@v2
       - name: TypeScript lint
         working-directory: pensyve-ts

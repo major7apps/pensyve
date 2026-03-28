@@ -131,7 +131,6 @@ See [`integrations/claude-code/README.md`](integrations/claude-code/README.md) f
 FastAPI server with authentication, pagination, and metrics.
 
 ```bash
-uvicorn pensyve_server.main:app --port 8000
 ```
 
 ```bash
@@ -227,7 +226,7 @@ pensyve/
 ├── pensyve-ts/         TypeScript SDK (bun) — timeout, retry, PensyveError
 ├── pensyve-go/         Go SDK — context-aware HTTP client
 ├── pensyve-wasm/       WASM build — standalone minimal in-memory Pensyve
-├── pensyve_server/     FastAPI REST API — auth, pagination, metrics, billing, Tier 2 extraction
+├── pensyve_python/       Shared Python utilities — billing, extraction
 ├── integrations/       All integrations — IDE plugins, framework adapters, code harnesses
 │   ├── claude-code/    Claude Code plugin (commands, skills, agents, hooks)
 │   ├── vscode/         VS Code sidebar extension
