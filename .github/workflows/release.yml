@@ -67,7 +67,7 @@ jobs:
   publish-pypi:
     name: Publish to PyPI
     needs: [build-python, build-python-sdist]
-    if: secrets.PYPI_TOKEN != ''
+    if: ${{ secrets.PYPI_TOKEN != '' }}
     runs-on: ubuntu-latest
     environment: release
     steps:
@@ -84,7 +84,7 @@ jobs:
   # ── Publish to npm (skipped if NPM_TOKEN not configured) ───────────────────
   publish-npm:
     name: Publish to npm
-    if: secrets.NPM_TOKEN != ''
+    if: ${{ secrets.NPM_TOKEN != '' }}
     runs-on: ubuntu-latest
     environment: release
     steps:
