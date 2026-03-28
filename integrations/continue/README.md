@@ -1,46 +1,65 @@
 # Pensyve for Continue
 
-Persistent AI memory for [Continue](https://continue.dev) (open-source AI code assistant for VS Code and JetBrains) via MCP.
+Persistent AI memory for [Continue](https://continue.dev) via MCP.
 
-## Prerequisites
+## Cloud (Recommended)
 
-Build the MCP server from the repo root:
+Add to your Continue config (`~/.continue/config.json`):
 
-```bash
-cargo build --release -p pensyve-mcp
+```json
+{
+  "experimental": {
+    "modelContextProtocolServers": [
+      {
+        "name": "pensyve",
+        "transport": {
+          "type": "streamable-http",
+          "url": "https://mcp.pensyve.com/mcp",
+          "headers": {
+            "Authorization": "Bearer YOUR_API_KEY"
+          }
+        }
+      }
+    ]
+  }
+}
 ```
 
-The binary will be at `target/release/pensyve-mcp`.
+Get your API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
 
-## Setup
+## Local (Offline)
 
-Add to `~/.continue/config.yaml` (global) or `.continue/config.yaml` (per-project):
-
-```yaml
-mcpServers:
-  - name: pensyve
-    command: /path/to/pensyve-mcp
-    env:
-      PENSYVE_PATH: ~/.pensyve/continue
-      PENSYVE_NAMESPACE: continue
+```json
+{
+  "experimental": {
+    "modelContextProtocolServers": [
+      {
+        "name": "pensyve",
+        "transport": {
+          "type": "stdio",
+          "command": "pensyve-mcp",
+          "env": {
+            "PENSYVE_PATH": "~/.pensyve/",
+            "PENSYVE_NAMESPACE": "default"
+          }
+        }
+      }
+    ]
+  }
+}
 ```
 
-Replace `/path/to/pensyve-mcp` with the absolute path to your built binary.
+Requires: `cargo install --path pensyve-mcp` from the repo root.
 
 ## Available Tools
 
 | Tool | Description |
 |------|-------------|
-| `pensyve_recall` | Retrieve relevant memories for a query |
-| `pensyve_remember` | Store a new memory |
-| `pensyve_episode_start` | Begin a conversation episode |
-| `pensyve_episode_end` | End the current episode |
-| `pensyve_forget` | Remove a specific memory |
-| `pensyve_inspect` | View stored memories and metadata |
-
-## Tips
-
-- Use `pensyve_recall` at the start of sessions to load prior context.
-- Use `pensyve_remember` to store important decisions, preferences, and project state.
-- Use `pensyve_episode_start` / `pensyve_episode_end` to bracket conversations.
-- Memories persist across sessions in local SQLite -- no cloud needed.
+| `pensyve_recall` | Search memories by semantic similarity |
+| `pensyve_remember` | Store a fact as semantic memory |
+| `pensyve_episode_start` | Begin tracking an interaction |
+| `pensyve_episode_end` | Close an episode |
+| `pensyve_forget` | Delete an entity's memories |
+| `pensyve_inspect` | List memories for an entity |
+| `pensyve_status` | Connection and memory stats |
+| `pensyve_account` | Plan and usage info |
