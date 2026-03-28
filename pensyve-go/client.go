@@ -17,7 +17,7 @@ import (
 type Config struct {
 	// BaseURL is the base URL of the Pensyve REST API (e.g., "http://localhost:8000").
 	BaseURL string
-	// APIKey is an optional API key sent via the X-Pensyve-Key header.
+	// APIKey is an optional API key sent via the Authorization: Bearer header.
 	APIKey string
 	// Timeout is the HTTP client timeout. Defaults to 30 seconds if zero.
 	// Ignored when HTTPClient is provided.
@@ -148,7 +148,7 @@ func (c *Client) doOnce(ctx context.Context, method, path string, bodyBytes []by
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if c.apiKey != "" {
-		req.Header.Set("X-Pensyve-Key", c.apiKey)
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
 
 	resp, err := c.httpClient.Do(req)

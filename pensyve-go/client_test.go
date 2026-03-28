@@ -379,8 +379,8 @@ func TestError5xx(t *testing.T) {
 
 func TestAPIKeyHeader(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := r.Header.Get("X-Pensyve-Key")
-		if key != "my-secret-key" {
+		key := r.Header.Get("Authorization")
+		if key != "Bearer my-secret-key" {
 			t.Errorf("expected API key 'my-secret-key', got '%s'", key)
 		}
 
@@ -407,7 +407,7 @@ func TestAPIKeyHeader(t *testing.T) {
 
 func TestNoAPIKeyHeaderWhenEmpty(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := r.Header.Get("X-Pensyve-Key")
+		key := r.Header.Get("Authorization")
 		if key != "" {
 			t.Errorf("expected no API key header, got '%s'", key)
 		}

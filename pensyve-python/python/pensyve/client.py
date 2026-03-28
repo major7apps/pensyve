@@ -1,9 +1,14 @@
-"""HTTP client for the Pensyve memory API."""
+"""HTTP client for the Pensyve memory API.
+
+Works with both the local server and the Pensyve Cloud gateway at
+``https://mcp.pensyve.com`` (or ``https://api.pensyve.com``).
+"""
 
 from __future__ import annotations
 
+import time
+
 import httpx
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential_jitter
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -16,8 +21,9 @@ def _is_retryable(exc: BaseException) -> bool:
 class PensyveClient:
     """Synchronous HTTP client for the Pensyve memory API.
 
-    Usage:
-        client = PensyveClient(base_url="http://localhost:8000", api_key="my-key")
+    Usage::
+
+        client = PensyveClient(base_url="https://mcp.pensyve.com", api_key="psy_...")
         result = client.recall("What does the user prefer?")
         client.remember("user", "Prefers dark mode")
     """
@@ -31,7 +37,7 @@ class PensyveClient:
     ):
         headers = {"Content-Type": "application/json"}
         if api_key:
-            headers["X-Pensyve-Key"] = api_key
+            headers["Authorization"] = f"Bearer {api_key}"
         self._client = httpx.Client(
             base_url=base_url,
             headers=headers,
@@ -40,20 +46,21 @@ class PensyveClient:
         self._max_retries = max_retries
 
     def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        """Make an HTTP request with retry logic."""
-
-        @retry(
-            stop=stop_after_attempt(self._max_retries),
-            wait=wait_exponential_jitter(initial=0.5, max=30, jitter=2),
-            retry=retry_if_exception(_is_retryable),
-            reraise=True,
-        )
-        def _do():
-            resp = self._client.request(method, path, **kwargs)
-            resp.raise_for_status()
-            return resp
-
-        return _do()
+        """Make an HTTP request with exponential backoff retry."""
+        last_exc: BaseException | None = None
+        for attempt in range(self._max_retries):
+            try:
+                resp = self._client.request(method, path, **kwargs)
+                resp.raise_for_status()
+                return resp
+            except BaseException as exc:
+                last_exc = exc
+                if not _is_retryable(exc):
+                    raise
+                if attempt + 1 >= self._max_retries:
+                    raise
+                time.sleep(min(0.5 * (2**attempt), 30))
+        raise last_exc  # type: ignore[misc]
 
     def recall(
         self,
@@ -194,7 +201,7 @@ class AsyncPensyveClient:
     ):
         headers = {"Content-Type": "application/json"}
         if api_key:
-            headers["X-Pensyve-Key"] = api_key
+            headers["Authorization"] = f"Bearer {api_key}"
         self._client = httpx.AsyncClient(
             base_url=base_url,
             headers=headers,
