@@ -18,6 +18,7 @@ jobs:
     name: Build Python (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -35,9 +36,8 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --manifest-path pensyve-python/Cargo.toml
+          args: --release --out dist --manifest-path pensyve-python/Cargo.toml --features vendored-openssl
           manylinux: auto
-          before-script-linux: yum install -y openssl-devel perl-IPC-Cmd || apt-get update && apt-get install -y libssl-dev
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -177,7 +177,8 @@ jobs:
   # ── GitHub Release ─────────────────────────────────────────────────────────
   github-release:
     name: Create GitHub Release
-    needs: [build-cli, build-mcp, build-python, build-python-sdist]
+    needs: [build-cli, build-mcp]
+    if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
