@@ -1,0 +1,216 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write  # PyPI trusted publishing
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Build Python wheels (maturin + PyO3) ───────────────────────────────────
+  build-python:
+    name: Build Python (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --manifest-path pensyve-python/Cargo.toml
+          manylinux: auto
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+
+  build-python-sdist:
+    name: Build Python sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist --manifest-path pensyve-python/Cargo.toml
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist/*.tar.gz
+
+  # ── Publish to PyPI ────────────────────────────────────────────────────────
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [build-python, build-python-sdist]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write  # trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  # ── Publish to npm ─────────────────────────────────────────────────────────
+  publish-npm:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Build TypeScript SDK
+        working-directory: pensyve-ts
+        run: |
+          bun install
+          bun run build
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Publish to npm
+        working-directory: pensyve-ts
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ── Build CLI binaries ─────────────────────────────────────────────────────
+  build-cli:
+    name: Build CLI (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: pensyve-cli-linux-amd64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: pensyve-cli-linux-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: pensyve-cli-macos-amd64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: pensyve-cli-macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: pensyve-cli-windows-amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+      - name: Build CLI
+        run: cargo build --release --target ${{ matrix.target }} -p pensyve-cli
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/pensyve-cli staging/pensyve
+          cd staging && tar czf ../${{ matrix.artifact }}.tar.gz pensyve
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          mkdir staging
+          cp target/${{ matrix.target }}/release/pensyve-cli.exe staging/pensyve.exe
+          Compress-Archive -Path staging/pensyve.exe -DestinationPath ${{ matrix.artifact }}.zip
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.*
+
+  # ── Build MCP server binary ────────────────────────────────────────────────
+  build-mcp:
+    name: Build MCP (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: pensyve-mcp-linux-amd64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: pensyve-mcp-macos-amd64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: pensyve-mcp-macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build MCP server
+        run: cargo build --release --target ${{ matrix.target }} -p pensyve-mcp
+      - name: Package
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/pensyve-mcp staging/pensyve-mcp
+          cd staging && tar czf ../${{ matrix.artifact }}.tar.gz pensyve-mcp
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.*
+
+  # ── GitHub Release ─────────────────────────────────────────────────────────
+  github-release:
+    name: Create GitHub Release
+    needs: [build-cli, build-mcp, publish-pypi, publish-npm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts/ -name "*.tar.gz" -o -name "*.zip" | while read f; do
+            cp "$f" release-assets/
+          done
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*
+          draft: false
+          prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') || contains(github.ref, '-rc') }}

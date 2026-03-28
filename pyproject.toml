@@ -52,11 +52,14 @@ benchmarks = [
 ]
 
 [build-system]
-requires = ["setuptools>=68.0"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.12,<2.0"]
+build-backend = "maturin"
 
-[tool.setuptools.packages.find]
-include = ["pensyve_python*"]
+[tool.maturin]
+manifest-path = "pensyve-python/Cargo.toml"
+python-source = "pensyve-python/python"
+module-name = "pensyve._core"
+features = ["pyo3/extension-module"]
 
 [tool.ruff]
 target-version = "py310"
