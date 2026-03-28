@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is Pensyve
 
-Universal memory runtime for AI agents. Rust core engine with Python (PyO3), MCP (stdio), REST (FastAPI), TypeScript (HTTP), and Go (HTTP) consumer interfaces. SQLite-backed (Postgres optional) with ONNX embeddings, vector + BM25 + graph retrieval, FSRS memory decay, Bayesian procedural reliability, multimodal content types, and RBAC memory mesh.
+Universal memory runtime for AI agents. Rust core engine with Python (PyO3), MCP (stdio), REST (Axum), TypeScript (HTTP), and Go (HTTP) consumer interfaces. SQLite-backed (Postgres optional) with ONNX embeddings, vector + BM25 + graph retrieval, FSRS memory decay, Bayesian procedural reliability, multimodal content types, and RBAC memory mesh.
 
 ## Build & Dev Commands
 
@@ -57,8 +57,8 @@ cd pensyve-go && go vet ./...
 # WASM (standalone crate, not in workspace)
 cd pensyve-wasm && cargo check
 
-# Run the REST API server
-.venv/bin/uvicorn pensyve_python.main:app --reload
+# Run the cloud gateway (REST + MCP on port 3000)
+cargo run -p pensyve-mcp-gateway
 
 # Build and run the CLI
 cargo run -p pensyve-cli -- recall "query text"
@@ -122,12 +122,17 @@ Namespace → Entity (agent|user|team|tool) → Episodes (bounded interaction se
 
 ### Python utilities (`pensyve_python/`)
 
-- `main.py` — FastAPI REST API with auth, pagination, CORS, episode TTL sweep, Tier 2 extraction integration
-- `auth.py` — API key authentication via `X-Pensyve-Key` header (timing-safe with `hmac.compare_digest`)
-- `models.py` — Pydantic request/response models including RecallResponse, InspectResponse, StatsResponse
 - `extraction.py` — Tier 2 LLM-based extraction via `llama-cpp-python` (gated by `PENSYVE_TIER2_ENABLED`)
-- `metrics.py` — FastAPI middleware for request metrics + Prometheus `/metrics` endpoint
-- `billing.py` — Usage metering with tier limits (Free/Pro/Team/Enterprise), thread-safe tracker
+- `billing.py` — Usage metering with configurable limits, thread-safe tracker
+
+### Cloud gateway (`pensyve-mcp-gateway/`)
+
+Single Rust/Axum binary serving REST (`/v1/*`) and MCP (`/mcp`) on port 3000:
+- `rest.rs` — REST API route handlers (recall, remember, entities, stats, inspect)
+- `auth.rs` — API key validation (local list + remote endpoint with caching)
+- `rate_limit.rs` — Per-key rate limiting
+- `usage.rs` — Stripe usage event reporting
+- `tenant.rs` — Multi-tenant state management
 
 ### Benchmarks (`benchmarks/`)
 

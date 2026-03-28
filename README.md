@@ -128,7 +128,7 @@ See [`integrations/claude-code/README.md`](integrations/claude-code/README.md) f
 
 ### REST API
 
-FastAPI server with authentication, pagination, and metrics.
+Rust/Axum gateway serving REST + MCP with auth, rate limiting, and usage metering.
 
 ```bash
 ```
