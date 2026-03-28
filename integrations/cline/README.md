@@ -1,63 +1,59 @@
 # Pensyve for Cline
 
-Persistent AI memory for [Cline](https://github.com/cline/cline) (VS Code AI coding extension) via MCP.
+Persistent AI memory for [Cline](https://github.com/cline/cline) via MCP.
 
-## Prerequisites
+## Cloud (Recommended)
 
-Build the MCP server from the repo root:
+1. Open Cline settings → MCP Servers
+2. Add a new server with:
+   - **Name**: pensyve
+   - **URL**: `https://mcp.pensyve.com/mcp`
+   - **Headers**: `Authorization: Bearer YOUR_API_KEY`
 
-```bash
-cargo build --release -p pensyve-mcp
-```
-
-The binary will be at `target/release/pensyve-mcp`.
-
-## Setup
-
-### Option A: Cline Settings UI
-
-Open Cline settings > MCP Servers > Add server:
-
-- **Name:** pensyve
-- **Command:** /path/to/pensyve-mcp
-- **Environment variables:**
-  - `PENSYVE_PATH` = `~/.pensyve/cline`
-  - `PENSYVE_NAMESPACE` = `cline`
-
-### Option B: Config File
-
-Add to `.vscode/mcp.json` in your workspace:
+Or add to your Cline MCP config file:
 
 ```json
 {
-  "servers": {
+  "mcpServers": {
     "pensyve": {
-      "command": "/path/to/pensyve-mcp",
-      "env": {
-        "PENSYVE_PATH": "~/.pensyve/cline",
-        "PENSYVE_NAMESPACE": "cline"
+      "url": "https://mcp.pensyve.com/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_API_KEY"
       }
     }
   }
 }
 ```
 
-Replace `/path/to/pensyve-mcp` with the absolute path to your built binary.
+Get your API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
+
+## Local (Offline)
+
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "command": "pensyve-mcp",
+      "env": {
+        "PENSYVE_PATH": "~/.pensyve/",
+        "PENSYVE_NAMESPACE": "default"
+      }
+    }
+  }
+}
+```
+
+Requires: `cargo install --path pensyve-mcp` from the repo root.
 
 ## Available Tools
 
 | Tool | Description |
 |------|-------------|
-| `pensyve_recall` | Retrieve relevant memories for a query |
-| `pensyve_remember` | Store a new memory |
-| `pensyve_episode_start` | Begin a conversation episode |
-| `pensyve_episode_end` | End the current episode |
-| `pensyve_forget` | Remove a specific memory |
-| `pensyve_inspect` | View stored memories and metadata |
-
-## Tips
-
-- Use `pensyve_recall` at the start of sessions to load prior context.
-- Use `pensyve_remember` to store important decisions, preferences, and project state.
-- Use `pensyve_episode_start` / `pensyve_episode_end` to bracket conversations.
-- Memories persist across sessions in local SQLite -- no cloud needed.
+| `pensyve_recall` | Search memories by semantic similarity |
+| `pensyve_remember` | Store a fact as semantic memory |
+| `pensyve_episode_start` | Begin tracking an interaction |
+| `pensyve_episode_end` | Close an episode |
+| `pensyve_forget` | Delete an entity's memories |
+| `pensyve_inspect` | List memories for an entity |
+| `pensyve_status` | Connection and memory stats |
+| `pensyve_account` | Plan and usage info |
