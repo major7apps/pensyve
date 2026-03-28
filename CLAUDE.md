@@ -58,7 +58,7 @@ cd pensyve-go && go vet ./...
 cd pensyve-wasm && cargo check
 
 # Run the REST API server
-.venv/bin/uvicorn pensyve_server.main:app --reload
+.venv/bin/uvicorn pensyve_python.main:app --reload
 
 # Build and run the CLI
 cargo run -p pensyve-cli -- recall "query text"
@@ -90,7 +90,7 @@ uv run maturin develop --manifest-path pensyve-python/Cargo.toml
 | `pensyve-python` | Rust cdylib (PyO3) | Python SDK via `import pensyve` — wraps core into `Pensyve`, `Entity`, `Episode`, `Memory` classes |
 | `pensyve-mcp` | Rust binary | MCP server (stdio transport via `rmcp`) exposing recall/remember/episode tools |
 | `pensyve-cli` | Rust binary | CLI (`pensyve recall`, `pensyve stats`) via `clap` |
-| `pensyve_server/` | Python (FastAPI) | REST API with auth, pagination, metrics, Tier 2 extraction, billing |
+| `pensyve_python/       Shared Python utilities — billing, Tier 2 extraction
 | `pensyve-ts/` | TypeScript (bun) | HTTP client SDK with timeout, retry, PensyveError |
 | `pensyve-go/` | Go | HTTP client SDK with context.Context, structured errors |
 | `pensyve-wasm/` | Rust cdylib (wasm-bindgen) | Standalone minimal in-memory Pensyve for browser/edge (not in workspace) |
@@ -120,7 +120,7 @@ uv run maturin develop --manifest-path pensyve-python/Cargo.toml
 
 Namespace → Entity (agent|user|team|tool) → Episodes (bounded interaction sequences with messages) → Memories (episodic, semantic, procedural). Semantic memories are SPO triples with temporal validity (`valid_at`/`invalid_at`). Memories support multimodal content types.
 
-### Python server (`pensyve_server/`)
+### Python utilities (`pensyve_python/`)
 
 - `main.py` — FastAPI REST API with auth, pagination, CORS, episode TTL sweep, Tier 2 extraction integration
 - `auth.py` — API key authentication via `X-Pensyve-Key` header (timing-safe with `hmac.compare_digest`)

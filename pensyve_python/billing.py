@@ -7,17 +7,10 @@ self-hosted deployments can set their own limits or disable enforcement.
 
 from __future__ import annotations
 
-import datetime
 import os
 import sys
 import threading
 from dataclasses import dataclass
-
-import structlog
-
-from .redis_client import INCR_EXPIRE_LUA, get_redis
-
-logger = structlog.get_logger()
 
 
 @dataclass
@@ -88,18 +81,6 @@ class UsageTracker:
             if usage.memories_stored >= effective.max_memories:
                 return False, f"Memory limit reached ({effective.max_memories})"
             return True, "OK"
-
-    async def record_api_call_redis(self, namespace: str) -> None:
-        """Increment usage in Redis if available, else in-memory."""
-        try:
-            redis_client = await get_redis()
-            if redis_client:
-                key = f"usage:{namespace}:{datetime.date.today().strftime('%Y-%m')}"
-                await redis_client.eval(INCR_EXPIRE_LUA, 1, key, 60 * 60 * 24 * 32)  # type: ignore[arg-type]
-                return
-        except Exception:
-            logger.warning("redis_billing_fallback", namespace=namespace)
-        self.record_api_call(namespace)
 
     def _get_or_create(self, namespace: str) -> UsageRecord:
         if namespace not in self._usage:

@@ -1,6 +1,6 @@
 """Tests for Tier 2 extraction module."""
 
-from pensyve_server.extraction import (
+from pensyve_python.extraction import (
     CausalChain,
     ExtractedFact,
     ExtractionResult,

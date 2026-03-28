@@ -30,7 +30,6 @@ Pensyve API server must be running. Start it locally:
 cd /path/to/pensyve
 uv sync --extra dev
 uv run maturin develop --release -m pensyve-python/Cargo.toml
-uvicorn pensyve_server.main:app --port 8000
 ```
 
 ## Configuration

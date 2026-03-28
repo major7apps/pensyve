@@ -1,6 +1,6 @@
 """Tests for the usage metering and limit enforcement module."""
 
-from pensyve_server.billing import TierLimits, UsageTracker
+from pensyve_python.billing import TierLimits, UsageTracker
 
 
 class TestTierLimits:
