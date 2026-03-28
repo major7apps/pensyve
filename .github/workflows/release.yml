@@ -67,7 +67,6 @@ jobs:
   publish-pypi:
     name: Publish to PyPI
     needs: [build-python, build-python-sdist]
-    if: ${{ secrets.PYPI_TOKEN != '' }}
     runs-on: ubuntu-latest
     environment: release
     steps:
@@ -77,14 +76,16 @@ jobs:
           merge-multiple: true
           path: dist/
       - name: Publish to PyPI
+        if: env.PYPI_TOKEN != ''
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_TOKEN }}
+        env:
+          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
 
   # ── Publish to npm (skipped if NPM_TOKEN not configured) ───────────────────
   publish-npm:
     name: Publish to npm
-    if: ${{ secrets.NPM_TOKEN != '' }}
     runs-on: ubuntu-latest
     environment: release
     steps:
@@ -100,10 +101,12 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
       - name: Publish to npm
+        if: env.HAS_NPM_TOKEN != ''
         working-directory: pensyve-ts
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # ── Build CLI binaries ─────────────────────────────────────────────────────
   build-cli:
