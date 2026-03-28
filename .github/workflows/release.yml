@@ -63,14 +63,13 @@ jobs:
           name: wheels-sdist
           path: dist/*.tar.gz
 
-  # ── Publish to PyPI ────────────────────────────────────────────────────────
+  # ── Publish to PyPI (skipped if PYPI_TOKEN not configured) ──────────────────
   publish-pypi:
     name: Publish to PyPI
     needs: [build-python, build-python-sdist]
+    if: secrets.PYPI_TOKEN != ''
     runs-on: ubuntu-latest
     environment: release
-    permissions:
-      id-token: write  # trusted publishing
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -79,10 +78,13 @@ jobs:
           path: dist/
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}
 
-  # ── Publish to npm ─────────────────────────────────────────────────────────
+  # ── Publish to npm (skipped if NPM_TOKEN not configured) ───────────────────
   publish-npm:
     name: Publish to npm
+    if: secrets.NPM_TOKEN != ''
     runs-on: ubuntu-latest
     environment: release
     steps:
@@ -194,7 +196,7 @@ jobs:
   # ── GitHub Release ─────────────────────────────────────────────────────────
   github-release:
     name: Create GitHub Release
-    needs: [build-cli, build-mcp, publish-pypi, publish-npm]
+    needs: [build-cli, build-mcp, build-python, build-python-sdist]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
