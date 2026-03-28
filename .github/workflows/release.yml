@@ -7,13 +7,13 @@ on:
 
 permissions:
   contents: write
-  id-token: write  # PyPI trusted publishing
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   # ── Build Python wheels (maturin + PyO3) ───────────────────────────────────
+  # Only native builds — ONNX Runtime lacks prebuilt binaries for cross-compile
   build-python:
     name: Build Python (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -22,10 +22,6 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-          - os: macos-latest
-            target: x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: windows-latest
@@ -108,7 +104,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-  # ── Build CLI binaries ─────────────────────────────────────────────────────
+  # ── Build CLI binaries (native targets only) ───────────────────────────────
   build-cli:
     name: Build CLI (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -118,12 +114,6 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: pensyve-cli-linux-amd64
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            artifact: pensyve-cli-linux-arm64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact: pensyve-cli-macos-amd64
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: pensyve-cli-macos-arm64
@@ -133,28 +123,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
       - name: Build CLI
-        run: cargo build --release --target ${{ matrix.target }} -p pensyve-cli
+        run: cargo build --release -p pensyve-cli
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
           mkdir -p staging
-          cp target/${{ matrix.target }}/release/pensyve-cli staging/pensyve
+          cp target/release/pensyve-cli staging/pensyve
           cd staging && tar czf ../${{ matrix.artifact }}.tar.gz pensyve
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           mkdir staging
-          cp target/${{ matrix.target }}/release/pensyve-cli.exe staging/pensyve.exe
+          cp target/release/pensyve-cli.exe staging/pensyve.exe
           Compress-Archive -Path staging/pensyve.exe -DestinationPath ${{ matrix.artifact }}.zip
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -162,7 +144,7 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.*
 
-  # ── Build MCP server binary ────────────────────────────────────────────────
+  # ── Build MCP server binary (native targets only) ──────────────────────────
   build-mcp:
     name: Build MCP (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -173,22 +155,17 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact: pensyve-mcp-linux-amd64
           - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact: pensyve-mcp-macos-amd64
-          - os: macos-latest
             target: aarch64-apple-darwin
             artifact: pensyve-mcp-macos-arm64
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
       - name: Build MCP server
-        run: cargo build --release --target ${{ matrix.target }} -p pensyve-mcp
+        run: cargo build --release -p pensyve-mcp
       - name: Package
         run: |
           mkdir -p staging
-          cp target/${{ matrix.target }}/release/pensyve-mcp staging/pensyve-mcp
+          cp target/release/pensyve-mcp staging/pensyve-mcp
           cd staging && tar czf ../${{ matrix.artifact }}.tar.gz pensyve-mcp
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -209,7 +186,7 @@ jobs:
       - name: Collect release assets
         run: |
           mkdir -p release-assets
-          find artifacts/ -name "*.tar.gz" -o -name "*.zip" | while read f; do
+          find artifacts/ -name "*.tar.gz" -o -name "*.zip" -o -name "*.whl" | while read f; do
             cp "$f" release-assets/
           done
       - name: Create release
