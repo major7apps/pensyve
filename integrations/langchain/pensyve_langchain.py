@@ -21,6 +21,7 @@ Usage::
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
@@ -179,7 +180,7 @@ class PensyveStore:
         self._entities: dict[str, Any] = {}
 
         if not self._is_cloud:
-            import pensyve  # noqa: F811 — lazy import keeps cloud-only light
+            import pensyve
 
             self._pensyve = pensyve.Pensyve(path=path, namespace=namespace)
 
@@ -381,14 +382,12 @@ class PensyveStore:
         entity_name = _ns_to_entity(namespace)
 
         if self._is_cloud:
-            try:
+            with contextlib.suppress(urllib.error.HTTPError):
                 _cloud_request(
                     "DELETE",
                     f"{self._base_url}/v1/entities/{entity_name}",
                     api_key=self._api_key,
                 )
-            except urllib.error.HTTPError:
-                pass  # Entity may not exist
         else:
             entity = self._get_entity(namespace)
             self._pensyve.forget(entity=entity)

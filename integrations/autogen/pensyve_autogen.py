@@ -24,10 +24,11 @@ to ``AssistantAgent(memory=[...])`` or used standalone.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Protocol, Sequence, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import pensyve
 
@@ -38,6 +39,8 @@ import pensyve
 try:
     from autogen_core.memory import (
         Memory as _AutoGenMemory,
+    )
+    from autogen_core.memory import (
         MemoryContent,
         MemoryMimeType,
         MemoryQueryResult,
@@ -495,7 +498,5 @@ class PensyveMemory:
             method="DELETE",
         )
 
-        try:
+        with contextlib.suppress(Exception):
             await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
-        except Exception:
-            pass

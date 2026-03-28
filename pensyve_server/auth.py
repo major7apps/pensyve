@@ -80,8 +80,8 @@ def _validate_remote(key: str) -> bool:
         return cached[0]
 
     try:
-        import urllib.request
         import json
+        import urllib.request
 
         headers = {
             "Authorization": f"Bearer {key}",
