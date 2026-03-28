@@ -16,11 +16,9 @@ chrono = "0.4"
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-openssl = { version = "0.10", features = ["vendored"], optional = true }
 
-[features]
-default = []
-vendored-openssl = ["openssl"]
+# Vendor OpenSSL for manylinux wheel builds (no system libssl needed)
+openssl = { version = "0.10", features = ["vendored"] }
 
 [lints]
 workspace = true
