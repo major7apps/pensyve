@@ -1,6 +1,6 @@
 {
   "name": "pensyve",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Pensyve TypeScript SDK — universal memory runtime for AI agents",
   "type": "module",
   "main": "dist/index.js",
