@@ -1011,6 +1011,73 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    fn delete_memory_by_id(&self, id: Uuid) -> StorageResult<bool> {
+        self.rt.block_on(async {
+            let mut conn = self.maybe_scoped_conn().await?;
+            let mut deleted = false;
+
+            let result = query::<Postgres>("DELETE FROM episodic_memories WHERE id = $1")
+                .bind(id)
+                .execute(&mut *conn)
+                .await
+                .map_err(sqlx_to_io)?;
+            if result.rows_affected() > 0 { deleted = true; }
+
+            let result = query::<Postgres>("DELETE FROM semantic_memories WHERE id = $1")
+                .bind(id)
+                .execute(&mut *conn)
+                .await
+                .map_err(sqlx_to_io)?;
+            if result.rows_affected() > 0 { deleted = true; }
+
+            let result = query::<Postgres>("DELETE FROM procedural_memories WHERE id = $1")
+                .bind(id)
+                .execute(&mut *conn)
+                .await
+                .map_err(sqlx_to_io)?;
+            if result.rows_affected() > 0 { deleted = true; }
+
+            Ok(deleted)
+        })
+    }
+
+    fn update_semantic_content(
+        &self,
+        id: Uuid,
+        predicate: &str,
+        object: &str,
+        confidence: Option<f32>,
+    ) -> StorageResult<()> {
+        self.rt.block_on(async {
+            let mut conn = self.maybe_scoped_conn().await?;
+
+            if let Some(conf) = confidence {
+                query::<Postgres>(
+                    "UPDATE semantic_memories SET predicate = $1, object = $2, confidence = $3 WHERE id = $4",
+                )
+                .bind(predicate)
+                .bind(object)
+                .bind(conf)
+                .bind(id)
+                .execute(&mut *conn)
+                .await
+                .map_err(sqlx_to_io)?;
+            } else {
+                query::<Postgres>(
+                    "UPDATE semantic_memories SET predicate = $1, object = $2 WHERE id = $3",
+                )
+                .bind(predicate)
+                .bind(object)
+                .bind(id)
+                .execute(&mut *conn)
+                .await
+                .map_err(sqlx_to_io)?;
+            }
+
+            Ok(())
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Entities (bulk)
     // -----------------------------------------------------------------------

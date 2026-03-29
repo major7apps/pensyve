@@ -107,6 +107,25 @@ pub struct InspectResponse {
     pub procedural: Vec<serde_json::Value>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UpdateMemoryRequest {
+    pub content: Option<String>,
+    pub confidence: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeleteMemoryResponse {
+    pub deleted: bool,
+    pub id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateMemoryResponse {
+    pub id: String,
+    pub content: String,
+    pub confidence: f32,
+}
+
 // ---------------------------------------------------------------------------
 // Error helper
 // ---------------------------------------------------------------------------
@@ -220,6 +239,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/v1/remember", routing::post(remember))
         .route("/v1/entities", routing::post(create_entity))
         .route("/v1/entities/{entity_name}", routing::delete(forget_entity))
+        .route("/v1/memories/{id}", routing::delete(delete_memory).patch(update_memory))
         .route("/v1/stats", routing::get(stats))
         .route("/v1/inspect", routing::post(inspect))
 }
@@ -431,6 +451,110 @@ async fn forget_entity(
     }
 
     Ok(Json(ForgetResponse { forgotten_count }))
+}
+
+async fn delete_memory(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, RestError> {
+    let ps = get_pensyve_state(&state);
+
+    let memory_id = Uuid::parse_str(&id).map_err(|_| {
+        RestError(StatusCode::BAD_REQUEST, "Invalid memory ID".to_string())
+    })?;
+
+    let deleted = ps.storage.delete_memory_by_id(memory_id).map_err(|err| {
+        RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Error deleting memory: {err}"),
+        )
+    })?;
+
+    if !deleted {
+        return Err(RestError(
+            StatusCode::NOT_FOUND,
+            format!("Memory {id} not found"),
+        ));
+    }
+
+    // Rebuild vector index.
+    let dims = {
+        let vi = ps.vector_index.lock().await;
+        vi.dimensions()
+    };
+    let mut new_index = VectorIndex::new(dims, 1024);
+    if let Ok(memories) = ps.storage.get_all_memories_by_namespace(ps.namespace.id) {
+        for mem in &memories {
+            let emb = mem.embedding();
+            if !emb.is_empty() {
+                let _ = new_index.add(mem.id(), emb);
+            }
+        }
+    }
+    let mut vi = ps.vector_index.lock().await;
+    *vi = new_index;
+
+    Ok(Json(DeleteMemoryResponse {
+        deleted: true,
+        id,
+    }))
+}
+
+async fn update_memory(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateMemoryRequest>,
+) -> Result<impl IntoResponse, RestError> {
+    let ps = get_pensyve_state(&state);
+
+    let memory_id = Uuid::parse_str(&id).map_err(|_| {
+        RestError(StatusCode::BAD_REQUEST, "Invalid memory ID".to_string())
+    })?;
+
+    // Only semantic memories support content updates for now.
+    let mem = ps.storage.get_semantic(memory_id).map_err(|err| {
+        RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Error fetching memory: {err}"),
+        )
+    })?;
+
+    let mem = mem.ok_or_else(|| {
+        RestError(StatusCode::NOT_FOUND, format!("Semantic memory {id} not found"))
+    })?;
+
+    let content_changed = body.content.is_some();
+    let content = body.content.unwrap_or_else(|| format!("{} {}", mem.predicate, mem.object));
+    let confidence = body.confidence.map(|c| c as f32).unwrap_or(mem.confidence);
+
+    let (predicate, object) = if let Some(pos) = content.find(' ') {
+        (content[..pos].to_string(), content[pos + 1..].to_string())
+    } else {
+        ("knows".to_string(), content.clone())
+    };
+
+    ps.storage
+        .update_semantic_content(memory_id, &predicate, &object, Some(confidence))
+        .map_err(|err| {
+            RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Error updating memory: {err}"),
+            )
+        })?;
+
+    // Re-embed if content changed.
+    if content_changed {
+        if let Ok(embedding) = ps.embedder.embed(&content) {
+            let mut vector_index = ps.vector_index.lock().await;
+            let _ = vector_index.add(memory_id, &embedding);
+        }
+    }
+
+    Ok(Json(UpdateMemoryResponse {
+        id,
+        content: format!("{} {}", predicate, object),
+        confidence,
+    }))
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, RestError> {

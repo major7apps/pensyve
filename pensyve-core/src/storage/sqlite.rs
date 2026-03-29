@@ -1142,6 +1142,62 @@ impl StorageTrait for SqliteBackend {
         Ok(total)
     }
 
+    fn delete_memory_by_id(&self, id: Uuid) -> StorageResult<bool> {
+        let conn = lock_conn!(self);
+        let id_str = id.to_string();
+
+        // Try deleting from each table in order.
+        let mut deleted = false;
+
+        let n = conn.execute("DELETE FROM episodic_memories WHERE id = ?1", params![&id_str])?;
+        if n > 0 { deleted = true; }
+
+        let n = conn.execute("DELETE FROM semantic_memories WHERE id = ?1", params![&id_str])?;
+        if n > 0 { deleted = true; }
+
+        let n = conn.execute("DELETE FROM procedural_memories WHERE id = ?1", params![&id_str])?;
+        if n > 0 { deleted = true; }
+
+        // Remove from FTS index.
+        if deleted {
+            conn.execute("DELETE FROM memory_fts WHERE memory_id = ?1", params![&id_str])?;
+        }
+
+        Ok(deleted)
+    }
+
+    fn update_semantic_content(
+        &self,
+        id: Uuid,
+        predicate: &str,
+        object: &str,
+        confidence: Option<f32>,
+    ) -> StorageResult<()> {
+        let conn = lock_conn!(self);
+        let id_str = id.to_string();
+
+        if let Some(conf) = confidence {
+            conn.execute(
+                "UPDATE semantic_memories SET predicate = ?1, object = ?2, confidence = ?3 WHERE id = ?4",
+                params![predicate, object, conf, &id_str],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE semantic_memories SET predicate = ?1, object = ?2 WHERE id = ?3",
+                params![predicate, object, &id_str],
+            )?;
+        }
+
+        // Update FTS index content.
+        let content = format!("{} {}", predicate, object);
+        conn.execute(
+            "UPDATE memory_fts SET content = ?1 WHERE memory_id = ?2",
+            params![&content, &id_str],
+        )?;
+
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Entities (bulk)
     // -----------------------------------------------------------------------

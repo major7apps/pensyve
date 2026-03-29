@@ -103,6 +103,18 @@ pub trait StorageTrait: Send + Sync {
     // Deletion
     fn delete_memories_by_entity(&self, entity_id: Uuid) -> StorageResult<usize>;
 
+    /// Delete a single memory by its UUID (episodic, semantic, or procedural).
+    fn delete_memory_by_id(&self, id: Uuid) -> StorageResult<bool>;
+
+    /// Update a semantic memory's content and/or confidence.
+    fn update_semantic_content(
+        &self,
+        id: Uuid,
+        predicate: &str,
+        object: &str,
+        confidence: Option<f32>,
+    ) -> StorageResult<()>;
+
     // Entities (bulk)
     fn list_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Entity>>;
 
