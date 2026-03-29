@@ -1,4 +1,4 @@
-![Pensyve Banner Logo](docs/images/logo.png)
+![Pensyve Banner Logo](https://raw.githubusercontent.com/major7apps/pensyve/main/docs/images/logo.png)
 
 # Pensyve
 
@@ -199,7 +199,7 @@ cargo build --bin pensyve-cli
 
 ## Architecture
 
-![Pensyve Architecture](docs/images/architecture.png)
+![Pensyve Architecture](https://raw.githubusercontent.com/major7apps/pensyve/main/docs/images/architecture.png)
 
 ### Data Model
 
