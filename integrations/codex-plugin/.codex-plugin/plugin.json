@@ -1,0 +1,30 @@
+{
+  "name": "pensyve",
+  "version": "1.0.2",
+  "description": "Persistent memory for Codex — your agent remembers decisions, patterns, and context across sessions",
+  "author": {
+    "name": "Major7 Apps",
+    "url": "https://pensyve.com"
+  },
+  "homepage": "https://pensyve.com/docs",
+  "repository": "https://github.com/major7apps/pensyve",
+  "license": "Apache-2.0",
+  "keywords": ["memory", "agents", "mcp", "retrieval", "ai"],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Pensyve Memory",
+    "shortDescription": "Cross-session memory runtime for AI agents",
+    "longDescription": "Give your Codex agent persistent memory that survives across sessions. Pensyve stores decisions, patterns, preferences, and outcomes — and retrieves the right context at the right time with 8-signal fusion ranking.",
+    "developerName": "Major7 Apps",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "websiteURL": "https://pensyve.com",
+    "defaultPrompt": [
+      "What do you remember about this project?",
+      "Remember that we decided to use Postgres for production.",
+      "Review my memory health and suggest cleanup."
+    ]
+  }
+}
