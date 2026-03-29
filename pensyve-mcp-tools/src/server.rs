@@ -110,10 +110,10 @@ impl PensyveMcpServer {
                 {
                     return None;
                 }
-                if let Some(min_conf) = params.min_confidence {
-                    if (memory_confidence(&c.memory) as f64) < min_conf {
-                        return None;
-                    }
+                if let Some(min_conf) = params.min_confidence
+                    && f64::from(memory_confidence(&c.memory)) < min_conf
+                {
+                    return None;
                 }
                 let mut outer = serde_json::to_value(&c.memory).unwrap_or_default();
                 let inner = if let serde_json::Value::Object(ref mut map) = outer {

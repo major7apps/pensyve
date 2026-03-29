@@ -311,10 +311,10 @@ async fn recall(
                     return false;
                 }
             }
-            if let Some(min_conf) = body.min_confidence {
-                if (memory_confidence(&c.memory) as f64) < min_conf {
-                    return false;
-                }
+            if let Some(min_conf) = body.min_confidence
+                && f64::from(memory_confidence(&c.memory)) < min_conf
+            {
+                return false;
             }
             true
         })
