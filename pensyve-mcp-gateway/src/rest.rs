@@ -555,7 +555,7 @@ async fn update_memory(
 
     Ok(Json(UpdateMemoryResponse {
         id,
-        content: format!("{} {}", predicate, object),
+        content: format!("{predicate} {object}"),
         confidence,
     }))
 }
