@@ -239,7 +239,7 @@ fn cmd_recall(
     entity_filter: Option<&str>,
     limit: usize,
     namespace_name: &str,
-    format: &OutputFormat,
+    format: OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = storage_path(namespace_name);
     let storage = open_storage(&path)?;
@@ -363,10 +363,7 @@ fn cmd_recall(
     Ok(())
 }
 
-fn cmd_stats(
-    namespace_name: &str,
-    format: &OutputFormat,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_stats(namespace_name: &str, format: OutputFormat) -> Result<(), Box<dyn std::error::Error>> {
     let path = storage_path(namespace_name);
     let storage = open_storage(&path)?;
     let ns = ensure_namespace(&storage, namespace_name)?;
@@ -407,7 +404,7 @@ fn cmd_stats(
 
 fn cmd_status(
     namespace_name: &str,
-    format: &OutputFormat,
+    format: OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = storage_path(namespace_name);
     let storage = open_storage(&path)?;
@@ -461,7 +458,7 @@ fn cmd_inspect(
     entity_name: &str,
     type_filter: Option<&str>,
     namespace_name: &str,
-    format: &OutputFormat,
+    format: OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = storage_path(namespace_name);
     let storage = open_storage(&path)?;
@@ -575,7 +572,7 @@ fn cmd_remember(
     fact: &str,
     confidence: f64,
     namespace_name: &str,
-    format: &OutputFormat,
+    format: OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = storage_path(namespace_name);
     let storage = open_storage(&path)?;
@@ -628,7 +625,7 @@ fn cmd_forget(
     entity_name: &str,
     hard: bool,
     namespace_name: &str,
-    format: &OutputFormat,
+    format: OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = storage_path(namespace_name);
     let storage = open_storage(&path)?;
@@ -695,30 +692,30 @@ fn main() {
             entity,
             limit,
             namespace,
-        } => cmd_recall(query, entity.as_deref(), *limit, namespace, &format),
+        } => cmd_recall(query, entity.as_deref(), *limit, namespace, format),
 
-        Command::Stats { namespace } => cmd_stats(namespace, &format),
+        Command::Stats { namespace } => cmd_stats(namespace, format),
 
-        Command::Status { namespace } => cmd_status(namespace, &format),
+        Command::Status { namespace } => cmd_status(namespace, format),
 
         Command::Inspect {
             entity,
             r#type,
             namespace,
-        } => cmd_inspect(entity, r#type.as_deref(), namespace, &format),
+        } => cmd_inspect(entity, r#type.as_deref(), namespace, format),
 
         Command::Remember {
             entity,
             fact,
             confidence,
             namespace,
-        } => cmd_remember(entity, fact, *confidence, namespace, &format),
+        } => cmd_remember(entity, fact, *confidence, namespace, format),
 
         Command::Forget {
             entity,
             hard,
             namespace,
-        } => cmd_forget(entity, *hard, namespace, &format),
+        } => cmd_forget(entity, *hard, namespace, format),
     };
 
     if let Err(e) = result {
