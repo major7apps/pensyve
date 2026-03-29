@@ -1021,21 +1021,27 @@ impl StorageTrait for PostgresBackend {
                 .execute(&mut *conn)
                 .await
                 .map_err(sqlx_to_io)?;
-            if result.rows_affected() > 0 { deleted = true; }
+            if result.rows_affected() > 0 {
+                deleted = true;
+            }
 
             let result = query::<Postgres>("DELETE FROM semantic_memories WHERE id = $1")
                 .bind(id)
                 .execute(&mut *conn)
                 .await
                 .map_err(sqlx_to_io)?;
-            if result.rows_affected() > 0 { deleted = true; }
+            if result.rows_affected() > 0 {
+                deleted = true;
+            }
 
             let result = query::<Postgres>("DELETE FROM procedural_memories WHERE id = $1")
                 .bind(id)
                 .execute(&mut *conn)
                 .await
                 .map_err(sqlx_to_io)?;
-            if result.rows_affected() > 0 { deleted = true; }
+            if result.rows_affected() > 0 {
+                deleted = true;
+            }
 
             Ok(deleted)
         })

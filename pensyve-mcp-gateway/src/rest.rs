@@ -239,7 +239,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/v1/remember", routing::post(remember))
         .route("/v1/entities", routing::post(create_entity))
         .route("/v1/entities/{entity_name}", routing::delete(forget_entity))
-        .route("/v1/memories/{id}", routing::delete(delete_memory).patch(update_memory))
+        .route(
+            "/v1/memories/{id}",
+            routing::delete(delete_memory).patch(update_memory),
+        )
         .route("/v1/stats", routing::get(stats))
         .route("/v1/inspect", routing::post(inspect))
 }
@@ -459,9 +462,8 @@ async fn delete_memory(
 ) -> Result<impl IntoResponse, RestError> {
     let ps = get_pensyve_state(&state);
 
-    let memory_id = Uuid::parse_str(&id).map_err(|_| {
-        RestError(StatusCode::BAD_REQUEST, "Invalid memory ID".to_string())
-    })?;
+    let memory_id = Uuid::parse_str(&id)
+        .map_err(|_| RestError(StatusCode::BAD_REQUEST, "Invalid memory ID".to_string()))?;
 
     let deleted = ps.storage.delete_memory_by_id(memory_id).map_err(|err| {
         RestError(
@@ -494,10 +496,7 @@ async fn delete_memory(
     let mut vi = ps.vector_index.lock().await;
     *vi = new_index;
 
-    Ok(Json(DeleteMemoryResponse {
-        deleted: true,
-        id,
-    }))
+    Ok(Json(DeleteMemoryResponse { deleted: true, id }))
 }
 
 async fn update_memory(
@@ -507,9 +506,8 @@ async fn update_memory(
 ) -> Result<impl IntoResponse, RestError> {
     let ps = get_pensyve_state(&state);
 
-    let memory_id = Uuid::parse_str(&id).map_err(|_| {
-        RestError(StatusCode::BAD_REQUEST, "Invalid memory ID".to_string())
-    })?;
+    let memory_id = Uuid::parse_str(&id)
+        .map_err(|_| RestError(StatusCode::BAD_REQUEST, "Invalid memory ID".to_string()))?;
 
     // Only semantic memories support content updates for now.
     let mem = ps.storage.get_semantic(memory_id).map_err(|err| {
@@ -520,11 +518,16 @@ async fn update_memory(
     })?;
 
     let mem = mem.ok_or_else(|| {
-        RestError(StatusCode::NOT_FOUND, format!("Semantic memory {id} not found"))
+        RestError(
+            StatusCode::NOT_FOUND,
+            format!("Semantic memory {id} not found"),
+        )
     })?;
 
     let content_changed = body.content.is_some();
-    let content = body.content.unwrap_or_else(|| format!("{} {}", mem.predicate, mem.object));
+    let content = body
+        .content
+        .unwrap_or_else(|| format!("{} {}", mem.predicate, mem.object));
     let confidence = body.confidence.map(|c| c as f32).unwrap_or(mem.confidence);
 
     let (predicate, object) = if let Some(pos) = content.find(' ') {
