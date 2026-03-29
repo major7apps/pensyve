@@ -1,6 +1,6 @@
 # pensyve-go
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/major7apps/pensyve-go.svg)](https://pkg.go.dev/github.com/major7apps/pensyve-go)
+[![Go Reference](https://pkg.go.dev/badge/github.com/major7apps/pensyve/pensyve-go.svg)](https://pkg.go.dev/github.com/major7apps/pensyve/pensyve-go)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/major7apps/pensyve/blob/main/LICENSE)
 
 Go SDK for **[Pensyve](https://pensyve.com)** — the universal memory runtime for AI agents.
@@ -10,7 +10,7 @@ Give your agents durable memory that persists across sessions, learns from outco
 ## Install
 
 ```bash
-go get github.com/major7apps/pensyve-go@v1.0.0
+go get github.com/major7apps/pensyve/pensyve-go@v1.0.0
 ```
 
 ## Quick Start
@@ -23,7 +23,7 @@ import (
     "fmt"
     "log"
 
-    pensyve "github.com/major7apps/pensyve-go"
+    pensyve "github.com/major7apps/pensyve/pensyve-go"
 )
 
 func main() {
