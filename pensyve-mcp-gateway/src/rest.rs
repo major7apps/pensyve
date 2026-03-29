@@ -266,6 +266,15 @@ async fn recall(
     let ps = get_pensyve_state(&state);
     let limit = body.limit.unwrap_or(5);
 
+    if let Some(mc) = body.min_confidence
+        && !(0.0..=1.0).contains(&mc)
+    {
+        return Err(RestError(
+            StatusCode::BAD_REQUEST,
+            "min_confidence must be between 0.0 and 1.0".to_string(),
+        ));
+    }
+
     // Resolve optional entity filter to UUID.
     let entity_id = if let Some(ref name) = body.entity {
         match ps.storage.get_entity_by_name(name, ps.namespace.id) {

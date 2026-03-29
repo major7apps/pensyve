@@ -207,7 +207,7 @@ Pensyve uses the following environment variables across its components:
 |----------|---------|-------------|
 | `PENSYVE_PATH` | `~/.pensyve/<namespace>` | SQLite database directory |
 | `PENSYVE_NAMESPACE` | `default` | Memory namespace name |
-| `PENSYVE_LOG_LEVEL` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
+| `RUST_LOG` | `pensyve=info` | Tracing filter (e.g. `debug`, `pensyve=debug,hyper=warn`) |
 | `PENSYVE_ALLOW_MOCK_EMBEDDER` | `false` | Fall back to mock embedder if real models unavailable |
 
 ### Gateway / REST API
@@ -217,7 +217,6 @@ Pensyve uses the following environment variables across its components:
 | `PENSYVE_API_KEYS` | *(empty)* | Comma-separated valid API keys (standalone mode) |
 | `PENSYVE_VALIDATION_URL` | *(none)* | Remote endpoint for API key validation |
 | `PENSYVE_RATE_LIMIT` | `300` | Max requests per minute per API key |
-| `PENSYVE_AUTH_ENABLED` | `false` | Enable authentication |
 | `HOST` | `0.0.0.0` | Server bind address |
 | `PORT` | `3000` | Server bind port |
 

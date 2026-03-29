@@ -83,6 +83,12 @@ impl PensyveMcpServer {
         description = "Search memories by semantic similarity and text matching. Returns ranked results from episodic, semantic, and procedural memory."
     )]
     async fn recall(&self, Parameters(params): Parameters<RecallParams>) -> Result<String, String> {
+        if let Some(mc) = params.min_confidence
+            && !(0.0..=1.0).contains(&mc)
+        {
+            return Err("min_confidence must be between 0.0 and 1.0".to_string());
+        }
+
         let limit = params.limit.unwrap_or(5) as usize;
         let state = &self.state;
 
