@@ -200,7 +200,10 @@ struct MemoryCounts {
     total: usize,
 }
 
-fn count_memories(storage: &SqliteBackend, namespace_id: uuid::Uuid) -> Result<MemoryCounts, Box<dyn std::error::Error>> {
+fn count_memories(
+    storage: &SqliteBackend,
+    namespace_id: uuid::Uuid,
+) -> Result<MemoryCounts, Box<dyn std::error::Error>> {
     let all_memories = storage.get_all_memories_by_namespace(namespace_id)?;
     let mut episodic = 0usize;
     let mut semantic = 0usize;
@@ -212,11 +215,18 @@ fn count_memories(storage: &SqliteBackend, namespace_id: uuid::Uuid) -> Result<M
             Memory::Procedural(_) => procedural += 1,
         }
     }
-    Ok(MemoryCounts { episodic, semantic, procedural, total: episodic + semantic + procedural })
+    Ok(MemoryCounts {
+        episodic,
+        semantic,
+        procedural,
+        total: episodic + semantic + procedural,
+    })
 }
 
 fn db_size(path: &std::path::Path) -> u64 {
-    std::fs::metadata(path.join("memories.db")).map(|m| m.len()).unwrap_or(0)
+    std::fs::metadata(path.join("memories.db"))
+        .map(|m| m.len())
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
