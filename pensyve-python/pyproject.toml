@@ -5,9 +5,24 @@ build-backend = "maturin"
 [project]
 name = "pensyve"
 version = "1.0.0"
-description = "Universal memory runtime for AI agents"
+description = "Universal memory runtime for AI agents — framework-agnostic, protocol-native, offline-first"
+readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
+authors = [{ name = "Major7 Apps" }]
+keywords = ["ai", "agents", "memory", "llm", "mcp", "retrieval", "embeddings"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://pensyve.com"
+Repository = "https://github.com/major7apps/pensyve"
+Documentation = "https://pensyve.com/docs"
 
 [project.optional-dependencies]
 http = ["httpx>=0.27", "tenacity>=8.0"]

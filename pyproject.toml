@@ -60,6 +60,12 @@ manifest-path = "pensyve-python/Cargo.toml"
 python-source = "pensyve-python/python"
 module-name = "pensyve._core"
 features = ["pyo3/extension-module"]
+include = [
+    { path = "README.md", format = "sdist" },
+    { path = "README.md", format = "wheel" },
+    { path = "LICENSE", format = "sdist" },
+    { path = "LICENSE", format = "wheel" },
+]
 
 [tool.ruff]
 target-version = "py310"
