@@ -120,7 +120,7 @@ cargo build --release --bin pensyve-mcp
 }
 ```
 
-**Tools exposed:** `recall`, `remember`, `episode_start`, `episode_end`, `forget`, `inspect`
+**Tools exposed:** `recall`, `remember`, `episode_start`, `episode_end`, `forget`, `inspect`, `status`, `account`
 
 ### Claude Code Plugin
 
@@ -141,21 +141,23 @@ See [`integrations/claude-code/README.md`](integrations/claude-code/README.md) f
 Rust/Axum gateway serving REST + MCP with auth, rate limiting, and usage metering.
 
 ```bash
+cargo build --release --bin pensyve-mcp-gateway
+./target/release/pensyve-mcp-gateway  # listens on 0.0.0.0:3000
 ```
 
 ```bash
 # Remember
-curl -X POST http://localhost:8000/v1/remember \
+curl -X POST http://localhost:3000/v1/remember \
   -H "Content-Type: application/json" \
   -d '{"entity": "seth", "fact": "Seth prefers Python", "confidence": 0.95}'
 
 # Recall
-curl -X POST http://localhost:8000/v1/recall \
+curl -X POST http://localhost:3000/v1/recall \
   -H "Content-Type: application/json" \
   -d '{"query": "programming language", "entity": "seth"}'
 ```
 
-**Endpoints:** `POST /v1/entities`, `POST /v1/episodes/{start,message,end}`, `POST /v1/recall`, `POST /v1/remember`, `POST /v1/inspect`, `GET /v1/stats`, `DELETE /v1/entities/{name}`, `POST /v1/consolidate`, `GET /v1/health`, `GET /metrics`
+**Endpoints:** `GET /v1/health`, `POST /v1/recall`, `POST /v1/remember`, `POST /v1/entities`, `DELETE /v1/entities/{name}`, `POST /v1/inspect`, `GET /v1/stats`, `PATCH /v1/memories/{id}`, `DELETE /v1/memories/{id}`
 
 ### TypeScript SDK
 
@@ -164,7 +166,7 @@ HTTP client with timeout, retry, and structured errors.
 ```typescript
 import { Pensyve } from "pensyve";
 
-const p = new Pensyve({ baseUrl: "http://localhost:8000", timeoutMs: 10000, retries: 2 });
+const p = new Pensyve({ baseUrl: "http://localhost:3000", timeoutMs: 10000, retries: 2 });
 await p.remember({ entity: "seth", fact: "Likes TypeScript", confidence: 0.9 });
 const memories = await p.recall("programming", { entity: "seth" });
 ```
@@ -174,9 +176,9 @@ const memories = await p.recall("programming", { entity: "seth" });
 Context-aware HTTP client with structured errors.
 
 ```go
-import pensyve "github.com/major7apps/pensyve-go"
+import pensyve "github.com/major7apps/pensyve/pensyve-go"
 
-client := pensyve.NewClient(pensyve.Config{BaseURL: "http://localhost:8000"})
+client := pensyve.NewClient(pensyve.Config{BaseURL: "http://localhost:3000"})
 ctx := context.Background()
 client.Remember(ctx, "seth", "Likes Go", 0.9)
 memories, _ := client.Recall(ctx, "programming", nil)
@@ -187,8 +189,11 @@ memories, _ := client.Recall(ctx, "programming", nil)
 ```bash
 cargo build --bin pensyve-cli
 
-# Recall memories
+# Recall memories (default output is JSON; use --format text for human-readable)
 ./target/debug/pensyve-cli recall "editor preferences" --entity user
+
+# Show namespace status with memory counts
+./target/debug/pensyve-cli status
 
 # Show stats
 ./target/debug/pensyve-cli stats
