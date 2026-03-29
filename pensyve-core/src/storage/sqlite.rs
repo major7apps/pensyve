@@ -1149,18 +1149,36 @@ impl StorageTrait for SqliteBackend {
         // Try deleting from each table in order.
         let mut deleted = false;
 
-        let n = conn.execute("DELETE FROM episodic_memories WHERE id = ?1", params![&id_str])?;
-        if n > 0 { deleted = true; }
+        let n = conn.execute(
+            "DELETE FROM episodic_memories WHERE id = ?1",
+            params![&id_str],
+        )?;
+        if n > 0 {
+            deleted = true;
+        }
 
-        let n = conn.execute("DELETE FROM semantic_memories WHERE id = ?1", params![&id_str])?;
-        if n > 0 { deleted = true; }
+        let n = conn.execute(
+            "DELETE FROM semantic_memories WHERE id = ?1",
+            params![&id_str],
+        )?;
+        if n > 0 {
+            deleted = true;
+        }
 
-        let n = conn.execute("DELETE FROM procedural_memories WHERE id = ?1", params![&id_str])?;
-        if n > 0 { deleted = true; }
+        let n = conn.execute(
+            "DELETE FROM procedural_memories WHERE id = ?1",
+            params![&id_str],
+        )?;
+        if n > 0 {
+            deleted = true;
+        }
 
         // Remove from FTS index.
         if deleted {
-            conn.execute("DELETE FROM memory_fts WHERE memory_id = ?1", params![&id_str])?;
+            conn.execute(
+                "DELETE FROM memory_fts WHERE memory_id = ?1",
+                params![&id_str],
+            )?;
         }
 
         Ok(deleted)
