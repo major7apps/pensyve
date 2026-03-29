@@ -26,6 +26,14 @@ fn memory_type_name(memory: &Memory) -> &'static str {
     }
 }
 
+fn memory_confidence(memory: &Memory) -> f32 {
+    match memory {
+        Memory::Episodic(_) => 1.0,
+        Memory::Semantic(m) => m.confidence,
+        Memory::Procedural(m) => m.reliability,
+    }
+}
+
 fn strip_embedding(val: &mut serde_json::Value) {
     if let serde_json::Value::Object(map) = val {
         map.remove("embedding");
@@ -101,6 +109,11 @@ impl PensyveMcpServer {
                     && !types.iter().any(|t| t == type_name)
                 {
                     return None;
+                }
+                if let Some(min_conf) = params.min_confidence {
+                    if (memory_confidence(&c.memory) as f64) < min_conf {
+                        return None;
+                    }
                 }
                 let mut outer = serde_json::to_value(&c.memory).unwrap_or_default();
                 let inner = if let serde_json::Value::Object(ref mut map) = outer {
