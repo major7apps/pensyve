@@ -546,9 +546,7 @@ async fn update_memory(
         })?;
 
     // Re-embed if content changed.
-    if content_changed
-        && let Ok(embedding) = ps.embedder.embed(&content)
-    {
+    if content_changed && let Ok(embedding) = ps.embedder.embed(&content) {
         let mut vector_index = ps.vector_index.lock().await;
         let _ = vector_index.add(memory_id, &embedding);
     }
