@@ -528,7 +528,7 @@ async fn update_memory(
     let content = body
         .content
         .unwrap_or_else(|| format!("{} {}", mem.predicate, mem.object));
-    let confidence = body.confidence.map(|c| c as f32).unwrap_or(mem.confidence);
+    let confidence = body.confidence.map_or(mem.confidence, |c| c as f32);
 
     let (predicate, object) = if let Some(pos) = content.find(' ') {
         (content[..pos].to_string(), content[pos + 1..].to_string())
@@ -546,11 +546,11 @@ async fn update_memory(
         })?;
 
     // Re-embed if content changed.
-    if content_changed {
-        if let Ok(embedding) = ps.embedder.embed(&content) {
-            let mut vector_index = ps.vector_index.lock().await;
-            let _ = vector_index.add(memory_id, &embedding);
-        }
+    if content_changed
+        && let Ok(embedding) = ps.embedder.embed(&content)
+    {
+        let mut vector_index = ps.vector_index.lock().await;
+        let _ = vector_index.add(memory_id, &embedding);
     }
 
     Ok(Json(UpdateMemoryResponse {
