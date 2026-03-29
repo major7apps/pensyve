@@ -14,7 +14,7 @@ use pensyve_core::{
 // CLI definition
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, clap::ValueEnum)]
+#[derive(Clone, Copy, clap::ValueEnum)]
 enum OutputFormat {
     Json,
     Text,
@@ -33,6 +33,10 @@ struct Cli {
     /// Output format: json (default) or text
     #[arg(long, default_value = "json", global = true)]
     format: OutputFormat,
+
+    /// Shorthand for --format json (useful for piping to jq)
+    #[arg(long, global = true)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -92,6 +96,13 @@ enum Command {
         confidence: f64,
 
         /// Namespace to store the fact in
+        #[arg(long, default_value = "default")]
+        namespace: String,
+    },
+
+    /// Show namespace info and memory counts
+    Status {
+        /// Namespace to show status for
         #[arg(long, default_value = "default")]
         namespace: String,
     },
@@ -176,6 +187,36 @@ fn build_vector_index(
         }
     }
     Ok(index)
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers for stats / status
+// ---------------------------------------------------------------------------
+
+struct MemoryCounts {
+    episodic: usize,
+    semantic: usize,
+    procedural: usize,
+    total: usize,
+}
+
+fn count_memories(storage: &SqliteBackend, namespace_id: uuid::Uuid) -> Result<MemoryCounts, Box<dyn std::error::Error>> {
+    let all_memories = storage.get_all_memories_by_namespace(namespace_id)?;
+    let mut episodic = 0usize;
+    let mut semantic = 0usize;
+    let mut procedural = 0usize;
+    for mem in &all_memories {
+        match mem {
+            Memory::Episodic(_) => episodic += 1,
+            Memory::Semantic(_) => semantic += 1,
+            Memory::Procedural(_) => procedural += 1,
+        }
+    }
+    Ok(MemoryCounts { episodic, semantic, procedural, total: episodic + semantic + procedural })
+}
+
+fn db_size(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path.join("memories.db")).map(|m| m.len()).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -319,26 +360,8 @@ fn cmd_stats(
     let path = storage_path(namespace_name);
     let storage = open_storage(&path)?;
     let ns = ensure_namespace(&storage, namespace_name)?;
-
-    let all_memories = storage.get_all_memories_by_namespace(ns.id)?;
-
-    let mut episodic_count = 0usize;
-    let mut semantic_count = 0usize;
-    let mut procedural_count = 0usize;
-
-    for mem in &all_memories {
-        match mem {
-            Memory::Episodic(_) => episodic_count += 1,
-            Memory::Semantic(_) => semantic_count += 1,
-            Memory::Procedural(_) => procedural_count += 1,
-        }
-    }
-
-    let total = episodic_count + semantic_count + procedural_count;
-
-    // Storage size from the SQLite file.
-    let db_path = path.join("memories.db");
-    let storage_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let counts = count_memories(&storage, ns.id)?;
+    let storage_bytes = db_size(&path);
 
     match format {
         OutputFormat::Json => {
@@ -346,10 +369,10 @@ fn cmd_stats(
                 "namespace": namespace_name,
                 "storage_path": path.to_string_lossy(),
                 "counts": {
-                    "episodic": episodic_count,
-                    "semantic": semantic_count,
-                    "procedural": procedural_count,
-                    "total": total,
+                    "episodic": counts.episodic,
+                    "semantic": counts.semantic,
+                    "procedural": counts.procedural,
+                    "total": counts.total,
                 },
                 "storage_bytes": storage_bytes,
             });
@@ -362,10 +385,62 @@ fn cmd_stats(
             println!();
             println!("{:<14} count", "type");
             println!("{}", "-".repeat(22));
-            println!("{:<14} {}", "episodic", episodic_count);
-            println!("{:<14} {}", "semantic", semantic_count);
-            println!("{:<14} {}", "procedural", procedural_count);
-            println!("{:<14} {}", "total", total);
+            println!("{:<14} {}", "episodic", counts.episodic);
+            println!("{:<14} {}", "semantic", counts.semantic);
+            println!("{:<14} {}", "procedural", counts.procedural);
+            println!("{:<14} {}", "total", counts.total);
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_status(
+    namespace_name: &str,
+    format: &OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = storage_path(namespace_name);
+    let storage = open_storage(&path)?;
+    let ns = ensure_namespace(&storage, namespace_name)?;
+    let counts = count_memories(&storage, ns.id)?;
+
+    let entities = storage
+        .list_entities_by_namespace(ns.id)
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    let storage_bytes = db_size(&path);
+
+    match format {
+        OutputFormat::Json => {
+            let status = serde_json::json!({
+                "namespace": namespace_name,
+                "namespace_id": ns.id.to_string(),
+                "storage_path": path.to_string_lossy(),
+                "entities": entities,
+                "memories": {
+                    "episodic": counts.episodic,
+                    "semantic": counts.semantic,
+                    "procedural": counts.procedural,
+                    "total": counts.total,
+                },
+                "storage_bytes": storage_bytes,
+            });
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        OutputFormat::Text => {
+            println!("Namespace:   {namespace_name}");
+            println!("Namespace ID: {}", ns.id);
+            println!("Storage:     {}", path.to_string_lossy());
+            println!("Size:        {storage_bytes} bytes");
+            println!("Entities:    {entities}");
+            println!();
+            println!("{:<14} count", "memory type");
+            println!("{}", "-".repeat(22));
+            println!("{:<14} {}", "episodic", counts.episodic);
+            println!("{:<14} {}", "semantic", counts.semantic);
+            println!("{:<14} {}", "procedural", counts.procedural);
+            println!("{:<14} {}", "total", counts.total);
         }
     }
 
@@ -598,34 +673,42 @@ fn cmd_forget(
 fn main() {
     let cli = Cli::parse();
 
+    let format = if cli.json {
+        OutputFormat::Json
+    } else {
+        cli.format
+    };
+
     let result = match &cli.command {
         Command::Recall {
             query,
             entity,
             limit,
             namespace,
-        } => cmd_recall(query, entity.as_deref(), *limit, namespace, &cli.format),
+        } => cmd_recall(query, entity.as_deref(), *limit, namespace, &format),
 
-        Command::Stats { namespace } => cmd_stats(namespace, &cli.format),
+        Command::Stats { namespace } => cmd_stats(namespace, &format),
+
+        Command::Status { namespace } => cmd_status(namespace, &format),
 
         Command::Inspect {
             entity,
             r#type,
             namespace,
-        } => cmd_inspect(entity, r#type.as_deref(), namespace, &cli.format),
+        } => cmd_inspect(entity, r#type.as_deref(), namespace, &format),
 
         Command::Remember {
             entity,
             fact,
             confidence,
             namespace,
-        } => cmd_remember(entity, fact, *confidence, namespace, &cli.format),
+        } => cmd_remember(entity, fact, *confidence, namespace, &format),
 
         Command::Forget {
             entity,
             hard,
             namespace,
-        } => cmd_forget(entity, *hard, namespace, &cli.format),
+        } => cmd_forget(entity, *hard, namespace, &format),
     };
 
     if let Err(e) = result {

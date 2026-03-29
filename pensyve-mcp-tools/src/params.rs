@@ -12,6 +12,8 @@ pub struct RecallParams {
     pub types: Option<Vec<String>>,
     /// Maximum number of results to return.
     pub limit: Option<u32>,
+    /// Minimum confidence threshold (0.0–1.0). Memories below this are excluded.
+    pub min_confidence: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
