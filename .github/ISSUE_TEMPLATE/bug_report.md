@@ -1,15 +1,30 @@
 ---
 name: Bug Report
-about: Something isn't working
-title: ""
+about: Report a bug in Pensyve
+title: '[Bug] '
 labels: bug
+assignees: ''
 ---
 
-**What happened?**
+**Describe the bug**
+A clear description of what's wrong.
 
-**Steps to reproduce**
+**To reproduce**
+Steps to reproduce:
+1. 
+2. 
+3. 
+
+**Expected behavior**
+What should happen.
 
 **Environment**
-- Pensyve version:
-- Interface (Python SDK / REST API / MCP / TS / Go / CLI):
-- OS:
+- OS: 
+- Pensyve version: 
+- Interface: [Python SDK / TypeScript SDK / MCP / REST API / CLI]
+- Storage: [SQLite / Postgres / Cloud]
+
+**Logs**
+```
+Paste relevant logs here
+```
