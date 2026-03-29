@@ -1,6 +1,6 @@
 [project]
 name = "pensyve"
-version = "1.0.0"
+version = "1.0.1"
 description = "Universal memory runtime for AI agents — framework-agnostic, protocol-native, offline-first"
 readme = "README.md"
 license = "Apache-2.0"
