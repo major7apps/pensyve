@@ -197,6 +197,55 @@ cargo build --bin pensyve-cli
 ./target/debug/pensyve-cli inspect --entity user
 ```
 
+## Environment Variables
+
+Pensyve uses the following environment variables across its components:
+
+### Core
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PENSYVE_PATH` | `~/.pensyve/<namespace>` | SQLite database directory |
+| `PENSYVE_NAMESPACE` | `default` | Memory namespace name |
+| `RUST_LOG` | `pensyve=info` | Tracing filter (e.g. `debug`, `pensyve=debug,hyper=warn`) |
+| `PENSYVE_ALLOW_MOCK_EMBEDDER` | `false` | Fall back to mock embedder if real models unavailable |
+
+### Gateway / REST API
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PENSYVE_API_KEYS` | *(empty)* | Comma-separated valid API keys (standalone mode) |
+| `PENSYVE_VALIDATION_URL` | *(none)* | Remote endpoint for API key validation |
+| `PENSYVE_RATE_LIMIT` | `300` | Max requests per minute per API key |
+| `HOST` | `0.0.0.0` | Server bind address |
+| `PORT` | `3000` | Server bind port |
+
+### Cloud / Managed Service
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PENSYVE_API_KEY` | *(none)* | Cloud API key for remote mode |
+| `PENSYVE_REMOTE_URL` | `http://localhost:8000` | Remote server URL |
+| `PENSYVE_DATABASE_URL` | *(none)* | Postgres connection string |
+| `PENSYVE_REDIS_URL` | *(none)* | Redis URL for episode state |
+
+### Quotas (managed service)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PENSYVE_MAX_NAMESPACES` | unlimited | Max namespaces per account |
+| `PENSYVE_MAX_MEMORIES` | unlimited | Max total memories per account |
+| `PENSYVE_MAX_RECALLS_PER_MONTH` | unlimited | Max recall operations per month |
+| `PENSYVE_MAX_STORAGE_BYTES` | unlimited | Max storage bytes per account |
+
+### Optional Features
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PENSYVE_TIER2_ENABLED` | `false` | Enable Tier 2 LLM extraction |
+| `PENSYVE_TIER2_MODEL_PATH` | *(none)* | Path to GGUF model file |
+| `PENSYVE_OTEL_ENDPOINT` | *(none)* | OpenTelemetry collector URL |
+
 ## Architecture
 
 ![Pensyve Architecture](https://raw.githubusercontent.com/major7apps/pensyve/main/docs/images/architecture.png)

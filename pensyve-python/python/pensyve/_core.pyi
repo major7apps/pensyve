@@ -2,6 +2,10 @@
 
 __version__: str
 
+def embedding_info() -> tuple[str, int]:
+    """Return (model_name, dimensions) for the active embedding model."""
+    ...
+
 class Pensyve:
     """Main entry point for the Pensyve memory runtime."""
 
@@ -77,6 +81,14 @@ class Pensyve:
         Args:
             entity: The entity whose memories to forget.
             hard_delete: If True, permanently delete (default: False).
+        """
+        ...
+
+    def stats(self) -> dict[str, int]:
+        """Return aggregate memory counts.
+
+        Returns:
+            Dict with keys: entities, episodic, semantic, procedural.
         """
         ...
 
@@ -165,4 +177,24 @@ class Memory:
     @property
     def score(self) -> float:
         """Retrieval score from the recall engine."""
+        ...
+
+    @property
+    def salience(self) -> float | None:
+        """Salience at encoding time [0, 1]. Only set for episodic memories."""
+        ...
+
+    @property
+    def storage_strength(self) -> float | None:
+        """Storage strength (monotonically increases). Only set for episodic memories."""
+        ...
+
+    @property
+    def event_time(self) -> str | None:
+        """When the described event occurred (ISO 8601). Only set for episodic memories."""
+        ...
+
+    @property
+    def superseded_by(self) -> str | None:
+        """ID of the memory that superseded this one, if any. Only set for episodic memories."""
         ...

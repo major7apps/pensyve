@@ -26,6 +26,14 @@ fn memory_type_name(memory: &Memory) -> &'static str {
     }
 }
 
+fn memory_confidence(memory: &Memory) -> f32 {
+    match memory {
+        Memory::Episodic(_) => 1.0,
+        Memory::Semantic(m) => m.confidence,
+        Memory::Procedural(m) => m.reliability,
+    }
+}
+
 fn strip_embedding(val: &mut serde_json::Value) {
     if let serde_json::Value::Object(map) = val {
         map.remove("embedding");
@@ -75,6 +83,12 @@ impl PensyveMcpServer {
         description = "Search memories by semantic similarity and text matching. Returns ranked results from episodic, semantic, and procedural memory."
     )]
     async fn recall(&self, Parameters(params): Parameters<RecallParams>) -> Result<String, String> {
+        if let Some(mc) = params.min_confidence
+            && !(0.0..=1.0).contains(&mc)
+        {
+            return Err("min_confidence must be between 0.0 and 1.0".to_string());
+        }
+
         let limit = params.limit.unwrap_or(5) as usize;
         let state = &self.state;
 
@@ -99,6 +113,11 @@ impl PensyveMcpServer {
                 let type_name = memory_type_name(&c.memory);
                 if let Some(types) = &params.types
                     && !types.iter().any(|t| t == type_name)
+                {
+                    return None;
+                }
+                if let Some(min_conf) = params.min_confidence
+                    && f64::from(memory_confidence(&c.memory)) < min_conf
                 {
                     return None;
                 }

@@ -31,6 +31,7 @@ pub struct RecallRequest {
     pub entity: Option<String>,
     pub limit: Option<usize>,
     pub types: Option<Vec<String>>,
+    pub min_confidence: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -265,6 +266,15 @@ async fn recall(
     let ps = get_pensyve_state(&state);
     let limit = body.limit.unwrap_or(5);
 
+    if let Some(mc) = body.min_confidence
+        && !(0.0..=1.0).contains(&mc)
+    {
+        return Err(RestError(
+            StatusCode::BAD_REQUEST,
+            "min_confidence must be between 0.0 and 1.0".to_string(),
+        ));
+    }
+
     // Resolve optional entity filter to UUID.
     let entity_id = if let Some(ref name) = body.entity {
         match ps.storage.get_entity_by_name(name, ps.namespace.id) {
@@ -306,10 +316,16 @@ async fn recall(
         .filter(|c| {
             if let Some(ref types) = body.types {
                 let tn = memory_type_name(&c.memory);
-                types.iter().any(|t| t == tn)
-            } else {
-                true
+                if !types.iter().any(|t| t == tn) {
+                    return false;
+                }
             }
+            if let Some(min_conf) = body.min_confidence
+                && f64::from(memory_confidence(&c.memory)) < min_conf
+            {
+                return false;
+            }
+            true
         })
         .map(|c| RecallMemory {
             id: c.memory_id.to_string(),
