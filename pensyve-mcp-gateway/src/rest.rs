@@ -31,6 +31,7 @@ pub struct RecallRequest {
     pub entity: Option<String>,
     pub limit: Option<usize>,
     pub types: Option<Vec<String>>,
+    pub min_confidence: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -306,10 +307,16 @@ async fn recall(
         .filter(|c| {
             if let Some(ref types) = body.types {
                 let tn = memory_type_name(&c.memory);
-                types.iter().any(|t| t == tn)
-            } else {
-                true
+                if !types.iter().any(|t| t == tn) {
+                    return false;
+                }
             }
+            if let Some(min_conf) = body.min_confidence {
+                if (memory_confidence(&c.memory) as f64) < min_conf {
+                    return false;
+                }
+            }
+            true
         })
         .map(|c| RecallMemory {
             id: c.memory_id.to_string(),
