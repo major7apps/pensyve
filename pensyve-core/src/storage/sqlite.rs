@@ -1207,7 +1207,7 @@ impl StorageTrait for SqliteBackend {
         }
 
         // Update FTS index content.
-        let content = format!("{} {}", predicate, object);
+        let content = format!("{predicate} {object}");
         conn.execute(
             "UPDATE memory_fts SET content = ?1 WHERE memory_id = ?2",
             params![&content, &id_str],
