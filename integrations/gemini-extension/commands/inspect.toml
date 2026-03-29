@@ -1,0 +1,52 @@
+[command]
+name = "inspect"
+description = "View all memories stored for an entity"
+
+[[command.args]]
+name = "entity"
+description = "The entity to inspect"
+required = true
+
+[[command.args]]
+name = "type"
+description = "Filter by memory type: episodic, semantic, or procedural"
+required = false
+
+[[command.args]]
+name = "limit"
+description = "Maximum number of memories to show (default: 20)"
+required = false
+
+[command.prompt]
+text = """
+View all memories for an entity in Pensyve, organized by memory type.
+
+1. Call `pensyve_inspect` with:
+   - `entity`: "{{entity}}"
+   - `memory_type`: "{{type}}" (if provided)
+   - `limit`: {{limit}} (if provided, otherwise 20)
+
+2. Display results in tables grouped by type:
+
+   **Entity: `{{entity}}`**
+   Total memories: N
+
+   **Semantic Memories** (N):
+   | ID | Subject | Predicate | Object | Confidence | Created |
+   |----|---------|-----------|--------|------------|---------|
+
+   **Episodic Memories** (N):
+   | ID | Summary | Episode | Created |
+   |----|---------|---------|---------|
+
+   **Procedural Memories** (N):
+   | ID | Action | Outcome | Reliability |
+   |----|--------|---------|-------------|
+
+3. Show memory IDs truncated to first 8 characters.
+4. Omit sections with no results.
+5. If the entity has no memories, say so clearly.
+
+Do not fabricate memories -- only display what the MCP tool returns.
+Never show raw embedding vectors.
+"""

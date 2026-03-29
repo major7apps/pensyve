@@ -1,0 +1,47 @@
+[command]
+name = "recall"
+description = "Search persistent memory by semantic similarity"
+
+[[command.args]]
+name = "query"
+description = "The search query to find relevant memories"
+required = true
+
+[[command.args]]
+name = "entity"
+description = "Optional entity name to filter results"
+required = false
+
+[[command.args]]
+name = "limit"
+description = "Maximum number of results (default: 10)"
+required = false
+
+[command.prompt]
+text = """
+Search Pensyve memory for relevant memories.
+
+1. Call `pensyve_recall` with:
+   - `query`: "{{query}}"
+   - `entity`: "{{entity}}" (if provided)
+   - `limit`: {{limit}} (if provided, otherwise 10)
+
+2. Display results grouped by memory type:
+
+   **Semantic Memories** (facts and knowledge):
+   | Score | Entity | Fact | Confidence |
+   |-------|--------|------|------------|
+
+   **Episodic Memories** (interaction records):
+   | Score | Summary | Created |
+   |-------|---------|---------|
+
+   **Procedural Memories** (action-outcome patterns):
+   | Score | Action | Outcome | Reliability |
+   |-------|--------|---------|-------------|
+
+3. Provide a brief natural-language summary of the most relevant findings.
+
+If no results are found, say so clearly and suggest a broader query.
+Do not fabricate memories -- only report what the MCP tool returns.
+"""

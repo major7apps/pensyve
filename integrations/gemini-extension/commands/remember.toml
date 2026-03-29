@@ -1,0 +1,28 @@
+[command]
+name = "remember"
+description = "Store a fact in persistent memory"
+
+[[command.args]]
+name = "fact"
+description = "The fact to remember, optionally prefixed with 'entity: fact' to specify the entity"
+required = true
+
+[command.prompt]
+text = """
+Store the following fact in Pensyve memory.
+
+1. Parse the input for an entity prefix in the format `entity: fact` or `entity - fact`. If no prefix is found, infer the most appropriate entity name from the content. Use lowercase, hyphenated entity names (e.g., `auth-service`, `project-config`).
+
+2. Before storing, run `pensyve_recall` with a query matching the fact to check for duplicates. If a highly similar memory already exists (score > 0.85), inform the user and skip storage.
+
+3. Call `pensyve_remember` with:
+   - `entity`: The parsed or inferred entity name
+   - `fact`: The fact text
+   - `confidence`: 1.0 unless the user indicates uncertainty ("I think", "maybe" = 0.7)
+
+4. Confirm what was stored: entity name, fact text, and memory ID.
+
+Do not store secrets, API keys, passwords, or credentials. Warn the user if the input appears sensitive.
+
+Fact: {{fact}}
+"""

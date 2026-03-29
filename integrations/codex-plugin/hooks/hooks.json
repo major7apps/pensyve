@@ -1,0 +1,12 @@
+{
+  "hooks": [
+    {
+      "event": "SessionStart",
+      "command": "context-loader"
+    },
+    {
+      "event": "Stop",
+      "command": "session-memory"
+    }
+  ]
+}
