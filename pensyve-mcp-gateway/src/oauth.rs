@@ -176,4 +176,68 @@ mod tests {
             "*"
         );
     }
+
+    #[tokio::test]
+    async fn test_oauth_metadata_has_correct_endpoints() {
+        let resp = oauth_metadata().await.into_response();
+        let body = to_bytes(resp.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            json["authorization_endpoint"],
+            "https://pensyve.com/oauth/authorize"
+        );
+        assert_eq!(
+            json["token_endpoint"],
+            "https://mcp.pensyve.com/oauth/token"
+        );
+        assert_eq!(
+            json["revocation_endpoint"],
+            "https://mcp.pensyve.com/oauth/revoke"
+        );
+        assert_eq!(
+            json["registration_endpoint"],
+            "https://mcp.pensyve.com/oauth/register"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oauth_metadata_supports_s256_only() {
+        let resp = oauth_metadata().await.into_response();
+        let body = to_bytes(resp.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let methods = json["code_challenge_methods_supported"]
+            .as_array()
+            .expect("code_challenge_methods_supported should be an array");
+        assert_eq!(methods.len(), 1, "should only support S256");
+        assert_eq!(methods[0], "S256");
+    }
+
+    #[tokio::test]
+    async fn test_oauth_metadata_has_cache_headers() {
+        let resp = oauth_metadata().await.into_response();
+        let cache_control = resp
+            .headers()
+            .get("cache-control")
+            .expect("should have cache-control header")
+            .to_str()
+            .unwrap();
+        assert_eq!(cache_control, "public, max-age=3600");
+    }
+
+    #[tokio::test]
+    async fn test_cors_preflight_allows_post() {
+        let resp = oauth_cors_preflight().await.into_response();
+        let allow_methods = resp
+            .headers()
+            .get("access-control-allow-methods")
+            .expect("should have access-control-allow-methods header")
+            .to_str()
+            .unwrap();
+        assert!(
+            allow_methods.contains("POST"),
+            "access-control-allow-methods should include POST, got: {allow_methods}"
+        );
+    }
 }
