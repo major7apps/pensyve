@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libstdc++6 \
     curl \
+    postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user
@@ -28,4 +29,6 @@ EXPOSE 3000
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:${PORT}/health || exit 1
 
-ENTRYPOINT ["pensyve-mcp-gateway"]
+COPY pensyve-mcp-gateway/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+ENTRYPOINT ["entrypoint.sh"]

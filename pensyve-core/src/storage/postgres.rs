@@ -102,30 +102,35 @@ impl PostgresBackend {
     ///
     /// This will create a connection pool and run the schema migration.
     pub fn new(database_url: &str) -> StorageResult<Self> {
+        // Create the backend's runtime FIRST — all pool operations (including
+        // TLS handshakes) run on this runtime. Using a separate init runtime
+        // causes the pool's spawned tasks to die when the init runtime drops.
+        let rt = Runtime::new().map_err(io_err)?;
+
         let pool = if let Ok(handle) = Handle::try_current() {
             // Already in an async context — block in place to avoid nested runtime panic
             tokio::task::block_in_place(|| {
                 handle.block_on(async {
                     PgPoolOptions::new()
                         .max_connections(10)
+                        .acquire_timeout(std::time::Duration::from_secs(30))
                         .connect(database_url)
                         .await
                         .map_err(sqlx_to_io)
                 })
             })?
         } else {
-            // No async context — create a blocking runtime for pool init
-            let init_rt = Runtime::new().map_err(io_err)?;
-            init_rt.block_on(async {
+            // No async context — use the backend's own runtime for pool init
+            rt.block_on(async {
                 PgPoolOptions::new()
                     .max_connections(10)
+                    .acquire_timeout(std::time::Duration::from_secs(30))
                     .connect(database_url)
                     .await
                     .map_err(sqlx_to_io)
             })?
         };
 
-        let rt = Runtime::new().map_err(io_err)?;
         let backend = Self {
             pool,
             rt,
