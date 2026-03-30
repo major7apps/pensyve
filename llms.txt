@@ -1,0 +1,145 @@
+# Pensyve
+
+> Universal memory runtime for AI agents. Framework-agnostic, protocol-native, offline-first.
+
+Pensyve gives AI agents persistent, cognitive memory that spans across sessions. It remembers decisions, learned patterns, debugging outcomes, and project context — so agents never repeat the same investigation twice.
+
+## Core Concepts
+
+- **Three memory types**: Episodic (what happened), Semantic (what is known), Procedural (what works)
+- **8-signal fusion retrieval**: Vector similarity, BM25, graph proximity, intent classification, recency, access frequency, confidence, type boost
+- **FSRS forgetting curve**: Memories you use get stronger, unused ones fade naturally
+- **Consolidation**: Background "dreaming" promotes repeated episodic facts to semantic knowledge
+- **Offline-first**: SQLite + ONNX embeddings. No API keys needed for local use
+- **Scales to cloud**: Postgres backend, managed service at pensyve.com
+
+## Integration Options
+
+### MCP Server (Claude Code, Cursor, Cline, Windsurf, Continue, VS Code Copilot)
+
+The MCP server exposes 6 tools: `pensyve_recall`, `pensyve_remember`, `pensyve_episode_start`, `pensyve_episode_end`, `pensyve_forget`, `pensyve_inspect`.
+
+**Cloud** (no build required):
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "url": "https://mcp.pensyve.com/mcp",
+      "env": { "PENSYVE_API_KEY": "${PENSYVE_API_KEY}" }
+    }
+  }
+}
+```
+
+**Local** (self-hosted):
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "command": "pensyve-mcp",
+      "args": ["--stdio"]
+    }
+  }
+}
+```
+
+Build: `cargo build --release -p pensyve-mcp`
+
+### Claude Code Plugin
+
+```
+/plugin marketplace add major7apps/pensyve/integrations/claude-code
+/plugin install pensyve@pensyve
+```
+
+Provides 6 slash commands (`/remember`, `/recall`, `/forget`, `/inspect`, `/consolidate`, `/memory-status`), 4 skills, 2 agents, and 4 lifecycle hooks.
+
+### Python SDK (PyO3, zero-overhead)
+
+```bash
+pip install pensyve
+```
+
+```python
+import pensyve
+
+p = pensyve.Pensyve(namespace="my-agent")
+entity = p.entity("user", kind="user")
+p.remember(entity=entity, fact="User prefers Python", confidence=0.95)
+results = p.recall("programming language", entity=entity)
+
+with p.episode(entity) as ep:
+    ep.message("user", "Can you fix the login bug?")
+    ep.message("agent", "Fixed — session token was expiring early")
+    ep.outcome("success")
+```
+
+### TypeScript SDK (HTTP client)
+
+```bash
+npm install pensyve
+```
+
+```typescript
+import { Pensyve } from "pensyve";
+
+const p = new Pensyve({ baseUrl: "http://localhost:3000", apiKey: "psy_..." });
+await p.remember({ entity: "user", fact: "Prefers TypeScript", confidence: 0.9 });
+const memories = await p.recall("preferences", { entity: "user" });
+```
+
+### Go SDK
+
+```bash
+go get github.com/major7apps/pensyve/pensyve-go@latest
+```
+
+```go
+import pensyve "github.com/major7apps/pensyve/pensyve-go"
+
+client := pensyve.NewClient(pensyve.Config{BaseURL: "http://localhost:3000", APIKey: "psy_..."})
+client.Remember(ctx, "user", "Prefers Go", 0.9)
+memories, _ := client.Recall(ctx, "preferences", nil)
+```
+
+### REST API
+
+```bash
+cargo build --release --bin pensyve-mcp-gateway
+./target/release/pensyve-mcp-gateway  # listens on 0.0.0.0:3000
+```
+
+Endpoints: `POST /v1/recall`, `POST /v1/remember`, `POST /v1/inspect`, `POST /v1/consolidate`, `POST /v1/entities`, `DELETE /v1/entities/{name}`, `GET /v1/stats`, `GET /v1/health`
+
+### Framework Integrations
+
+- **LangChain/LangGraph** (Python): `PensyveStore` — drop-in BaseStore replacement. `pip install pensyve-langchain`
+- **LangChain.js/LangGraph.js** (TypeScript): `@pensyve/langchain`
+- **CrewAI**: `PensyveMemory` — drop-in memory backend
+- **AutoGen**: `PensyveMemory` — implements AutoGen Memory ABC
+- **OpenClaw**: Native plugin with auto-recall and auto-capture hooks
+- **OpenCode**: Native plugin with system prompt injection
+
+All framework integrations auto-detect local vs cloud mode based on `PENSYVE_API_KEY`.
+
+## Authentication
+
+Set `PENSYVE_API_KEY` environment variable for cloud access. API keys use the `psy_` prefix. Not needed for local mode.
+
+## Key URLs
+
+- Website: https://pensyve.com
+- GitHub: https://github.com/major7apps/pensyve
+- MCP endpoint: https://mcp.pensyve.com/mcp
+- REST API: https://api.pensyve.com
+- API keys: https://pensyve.com/settings/api-keys
+
+## Documentation
+
+- [README](https://github.com/major7apps/pensyve/blob/main/README.md) — Overview, install, quickstart for all SDKs
+- [Architecture](https://github.com/major7apps/pensyve/blob/main/docs/ARCHITECTURE.md) — System design, data model, retrieval pipeline
+- [Getting Started](https://github.com/major7apps/pensyve/blob/main/docs/GETTING_STARTED.md) — Per-language setup guides
+- [Claude Code Plugin](https://github.com/major7apps/pensyve/blob/main/integrations/claude-code/README.md)
+- [Codex Plugin](https://github.com/major7apps/pensyve/blob/main/integrations/codex-plugin/README.md)
+- [Gemini Extension](https://github.com/major7apps/pensyve/blob/main/integrations/gemini-extension/README.md)
+- [CHANGELOG](https://github.com/major7apps/pensyve/blob/main/CHANGELOG.md)
