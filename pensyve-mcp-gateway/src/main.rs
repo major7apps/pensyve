@@ -19,6 +19,7 @@ use tracing_subscriber::EnvFilter;
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::storage::StorageTrait;
+use pensyve_core::storage::postgres::PostgresBackend;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::Namespace;
 use pensyve_core::vector::VectorIndex;
@@ -50,13 +51,21 @@ struct InitResources {
 }
 
 fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
-    let storage_path = &config.storage_path;
-    std::fs::create_dir_all(storage_path)?;
-
-    let storage = SqliteBackend::open(storage_path).map_err(|e| {
-        anyhow::anyhow!("Failed to open storage at {}: {e}", storage_path.display())
-    })?;
-    let storage: Arc<dyn StorageTrait> = Arc::new(storage);
+    let storage: Arc<dyn StorageTrait> = if let Ok(database_url) = std::env::var("DATABASE_URL") {
+        tracing::info!("Using Postgres backend");
+        let pg = PostgresBackend::new(&database_url).map_err(|e| {
+            anyhow::anyhow!("Failed to connect to Postgres: {e}")
+        })?;
+        Arc::new(pg)
+    } else {
+        let storage_path = &config.storage_path;
+        std::fs::create_dir_all(storage_path)?;
+        tracing::info!("Using SQLite backend at {}", storage_path.display());
+        let sqlite = SqliteBackend::open(storage_path).map_err(|e| {
+            anyhow::anyhow!("Failed to open storage at {}: {e}", storage_path.display())
+        })?;
+        Arc::new(sqlite)
+    };
 
     let namespace_name = &config.namespace;
     let namespace = match storage.get_namespace_by_name(namespace_name) {
@@ -134,9 +143,7 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
     })
 }
 
-#[tokio::main]
-#[allow(clippy::too_many_lines)]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -153,8 +160,18 @@ async fn main() -> Result<()> {
         "pensyve-mcp-gateway starting"
     );
 
+    // Init resources BEFORE tokio runtime to avoid nested runtime panic
+    // when PostgresBackend creates its own internal runtime.
     let res = init_resources(&config)?;
 
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main(config, res))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
     let tenant_mgr = TenantStateManager::new(
         res.storage,
         res.embedder,

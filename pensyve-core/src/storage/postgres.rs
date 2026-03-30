@@ -510,6 +510,7 @@ impl StorageTrait for PostgresBackend {
     fn get_episode(&self, id: Uuid) -> StorageResult<Option<Episode>> {
         self.rt.block_on(async {
             let mut conn = self.maybe_scoped_conn().await?;
+            #[allow(clippy::type_complexity)]
             let row: Option<(
                 Uuid,
                 Uuid,
