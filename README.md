@@ -31,7 +31,7 @@ Most AI agents lose all context between sessions. Pensyve gives them durable, in
 ```bash
 pip install pensyve          # Python (PyPI)
 npm install pensyve          # TypeScript (npm)
-go get github.com/major7apps/pensyve/pensyve-go@pensyve-go/v1.0.0  # Go
+go get github.com/major7apps/pensyve/pensyve-go@latest  # Go
 ```
 
 Or use the MCP server directly with Claude Code, Cursor, or any MCP client — see [MCP Setup](https://pensyve.com/docs/getting-started/mcp-setup).
