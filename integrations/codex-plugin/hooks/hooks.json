@@ -1,12 +1,24 @@
 {
-  "hooks": [
-    {
-      "event": "SessionStart",
-      "command": "context-loader"
-    },
-    {
-      "event": "Stop",
-      "command": "session-memory"
-    }
-  ]
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "context-loader"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "session-memory"
+          }
+        ]
+      }
+    ]
+  }
 }

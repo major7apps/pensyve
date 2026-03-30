@@ -13,20 +13,22 @@ gemini extensions install github:major7apps/pensyve --path integrations/gemini-e
 ### Manual MCP setup
 
 ```bash
-gemini mcp add --transport http pensyve https://api.pensyve.com/mcp \
-  --header "Authorization: Bearer psy_your_key"
+gemini mcp add --transport http pensyve https://mcp.pensyve.com/mcp
 ```
 
-### Configure your API key
+### Connect to Pensyve
 
-```bash
-gemini extensions configure pensyve
-```
+The extension needs a Pensyve API key. Choose one method:
 
-Or set the environment variable directly:
-
+**Option A** — environment variable (recommended):
 ```bash
 export PENSYVE_API_KEY="psy_your_key"
+```
+Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
+
+**Option B** — via Gemini CLI:
+```bash
+gemini extensions configure pensyve
 ```
 
 Get an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).

@@ -17,26 +17,52 @@ git clone https://github.com/major7apps/pensyve
 cp -r pensyve/integrations/codex-plugin ~/.codex/plugins/pensyve
 ```
 
-## Configuration
+## Connect to Pensyve
 
-### API Key
+The plugin needs a running Pensyve MCP server. Choose one:
 
-Sign up at [pensyve.com](https://pensyve.com) and grab an API key from Settings. Add it to your environment:
+**Pensyve Cloud** (managed service — no setup required):
 
-```bash
-export PENSYVE_API_KEY="psy_..."
-```
+1. Sign up at [pensyve.com](https://pensyve.com) and grab your API key
+2. Supply your API key:
 
-Or add it to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.).
+   **Option A** — environment variable (recommended):
+   ```bash
+   export PENSYVE_API_KEY="psy_..."
+   ```
+   Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
 
-### Codex config
+   **Option B** — in your Codex config (`~/.codex/config.toml`):
+   ```toml
+   [plugins.pensyve]
+   enabled = true
 
-Add Pensyve to your `~/.codex/config.toml`:
+   [plugins.pensyve.env]
+   PENSYVE_API_KEY = "psy_..."
+   ```
+
+The plugin ships pre-configured for Pensyve Cloud — once your API key is set, you're ready to go.
+
+**Pensyve Local** (self-hosted — runs entirely on your machine):
+
+1. Build the MCP binary:
+   ```bash
+   git clone https://github.com/major7apps/pensyve
+   cd pensyve
+   cargo build --release -p pensyve-mcp
+   ```
+2. Override the MCP server in your `~/.codex/config.toml`:
+   ```toml
+   [plugins.pensyve.mcpServers.pensyve]
+   command = "pensyve-mcp"
+   args = ["--stdio"]
+   ```
+
+No API key needed — all data stays on your machine in SQLite.
+
+### Optional config
 
 ```toml
-[plugins.pensyve]
-enabled = true
-
 [plugins.pensyve.settings]
 namespace = "my-project"        # Scope memories to this project
 context_loading = "summary"     # "off", "summary", or "full"
