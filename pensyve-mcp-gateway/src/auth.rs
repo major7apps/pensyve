@@ -136,12 +136,10 @@ impl AuthValidator {
             self.remote_cache.remove(&hash);
         }
 
-        // 3. Call remote validation endpoint (blocking — runs in tokio context)
-        if let Some(url) = &self.validation_url {
-            match self.validate_remote(url, key, &hash) {
-                Some(ctx) => return Some(ctx),
-                None => return None,
-            }
+        // 3. Remote validation disabled — reqwest::blocking deadlocks inside tokio.
+        // All keys must be in the PENSYVE_API_KEYS env var or use OAuth JWT.
+        if self.validation_url.is_some() {
+            tracing::debug!("Key not in local list, remote validation skipped (blocking client incompatible with async runtime)");
         }
 
         None
