@@ -61,4 +61,4 @@ User: `/recall database schema changes --limit 5`
 
 - If `pensyve_recall` returns an error, display the error message and suggest checking that the Pensyve MCP server is running.
 - If the result set is empty, inform the user that no memories matched and suggest alternative queries.
-- If the MCP server is not connected, instruct the user to verify their `.mcp.json` configuration.
+- If the MCP server is not connected, instruct the user to verify their MCP server configuration.

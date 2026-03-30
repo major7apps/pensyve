@@ -119,4 +119,4 @@ Confidence assessment criteria:
 - If some `pensyve_recall` queries fail, proceed with results from successful queries and note the failures.
 - If `pensyve_inspect` fails for an entity, skip that entity's inspection and note it in the briefing.
 - If all queries fail, report the error and suggest checking the MCP server connection.
-- If the MCP server is not connected, inform the user: "Pensyve MCP server is not connected. Cannot perform memory research. Verify your `.mcp.json` configuration."
+- If the MCP server is not connected, inform the user: "Pensyve MCP server is not connected. Cannot perform memory research. Verify your MCP server configuration."

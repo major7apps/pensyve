@@ -52,4 +52,4 @@ User: `/consolidate`
 
 - If the MCP consolidation tool is not available, guide the user to the CLI or REST API alternatives.
 - If consolidation fails, display the error and suggest checking the Pensyve server logs.
-- If the MCP server is not connected, instruct the user to verify their `.mcp.json` configuration.
+- If the MCP server is not connected, instruct the user to verify their MCP server configuration.

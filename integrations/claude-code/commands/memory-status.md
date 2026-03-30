@@ -62,5 +62,5 @@ User: `/memory-status`
 ## Error Handling
 
 - If the MCP server is not connected, report it clearly:
-  > Pensyve MCP server is not connected. Verify your `.mcp.json` configuration and ensure `pensyve-mcp` is installed and accessible on your PATH.
+  > Pensyve MCP server is not connected. Verify your MCP server configuration and ensure `pensyve-mcp` is installed and accessible on your PATH.
 - If `pensyve_recall` returns an error, the server may be running but the database may be empty or misconfigured. Report the error and suggest checking the storage path.

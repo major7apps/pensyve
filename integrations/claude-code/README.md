@@ -187,7 +187,7 @@ The plugin wraps 6 MCP tools exposed by the `pensyve-mcp` binary:
 | `pensyve_forget` | `entity`, `hard_delete?` | `forgotten_count` |
 | `pensyve_inspect` | `entity`, `memory_type?`, `limit?` | Array of memories with stats |
 
-All tools communicate over stdio using the MCP protocol. The plugin never bypasses MCP to access storage directly.
+All tools communicate over MCP. The Cloud server is at `https://mcp.pensyve.com/mcp`. The plugin never bypasses MCP to access storage directly.
 
 ## Design Philosophy
 

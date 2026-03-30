@@ -135,4 +135,4 @@ Report results after each action.
 - If `pensyve_inspect` fails for an entity, skip it and note the failure in the report.
 - If `pensyve_recall` returns errors, report partial results and note which queries failed.
 - If `pensyve_forget` fails during cleanup, report the error and continue with remaining actions.
-- If the MCP server is not connected, inform the user and suggest checking their `.mcp.json` configuration.
+- If the MCP server is not connected, inform the user and suggest checking their MCP server configuration.

@@ -51,4 +51,4 @@ User: `/forget old-project`
 
 - If `pensyve_forget` returns an error, display the error message and suggest checking that the Pensyve MCP server is running.
 - If the entity is not found, report it clearly -- this is not an error, just an empty result.
-- If the MCP server is not connected, instruct the user to verify their `.mcp.json` configuration.
+- If the MCP server is not connected, instruct the user to verify their MCP server configuration.

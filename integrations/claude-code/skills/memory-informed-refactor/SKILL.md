@@ -88,5 +88,5 @@ If the user accepts, call `pensyve_episode_start`. Remind the user to close the 
 
 - If `pensyve_recall` returns errors on some queries, present results from the successful queries and note the failures.
 - If `pensyve_inspect` fails, skip the entity inspection and rely on recall results.
-- If the MCP server is not connected, inform the user and suggest checking their `.mcp.json` configuration.
+- If the MCP server is not connected, inform the user and suggest checking their MCP server configuration.
 - If `pensyve_episode_start` fails when the user accepts tracking, report the error but do not block the refactor.

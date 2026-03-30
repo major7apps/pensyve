@@ -92,4 +92,4 @@ After storing, summarize what was saved:
 
 - If `pensyve_remember` fails, display the error and continue with remaining items.
 - If `pensyve_recall` (duplicate check) fails, proceed with storage but note that duplicate checking was skipped.
-- If the MCP server is not connected, inform the user and suggest checking their `.mcp.json` configuration.
+- If the MCP server is not connected, inform the user and suggest checking their MCP server configuration.
