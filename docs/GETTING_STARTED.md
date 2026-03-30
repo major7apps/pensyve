@@ -24,7 +24,7 @@ The fastest way to get persistent memory in Claude Code.
 ### Cloud (no build required)
 
 ```
-/plugin marketplace add major7apps/pensyve/integrations/claude-code
+/plugin marketplace add /path/to/pensyve/integrations/claude-code
 /plugin install pensyve@pensyve
 ```
 
