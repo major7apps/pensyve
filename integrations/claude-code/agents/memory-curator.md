@@ -1,7 +1,8 @@
 ---
 name: memory-curator
-description: "Background monitoring agent that identifies memorable events during a session and suggests storing them with user confirmation"
-model_preference: fast
+description: "Background monitoring agent that identifies memorable events during a session and suggests storing them with user confirmation. Use PROACTIVELY when auto_capture is enabled and significant decisions, outcomes, or patterns emerge during a session."
+model: sonnet
+color: green
 ---
 
 # Memory Curator Agent

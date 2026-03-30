@@ -1,10 +1,6 @@
 ---
-name: forget
 description: "Delete all memories for an entity from Pensyve"
-arguments:
-  - name: entity
-    description: "The entity whose memories should be deleted"
-    required: true
+argument-hint: "<entity>"
 ---
 
 # /forget

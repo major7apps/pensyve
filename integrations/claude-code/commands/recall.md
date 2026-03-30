@@ -1,16 +1,6 @@
 ---
-name: recall
 description: "Search Pensyve memory by semantic similarity and text matching"
-arguments:
-  - name: query
-    description: "The search query to find relevant memories"
-    required: true
-  - name: entity
-    description: "Optional entity name to filter results"
-    required: false
-  - name: limit
-    description: "Maximum number of results (default: 10)"
-    required: false
+argument-hint: "<query> [entity: <name>] [--limit N]"
 ---
 
 # /recall

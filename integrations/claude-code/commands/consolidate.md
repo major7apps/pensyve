@@ -1,7 +1,5 @@
 ---
-name: consolidate
 description: "Run memory consolidation to promote, decay, and archive memories"
-arguments: []
 ---
 
 # /consolidate
