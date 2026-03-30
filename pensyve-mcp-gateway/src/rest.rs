@@ -98,13 +98,13 @@ pub struct StatsResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct InspectRequest {
-    pub entity: String,
+    pub entity: Option<String>,
     pub limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct InspectResponse {
-    pub entity: String,
+    pub entity: Option<String>,
     pub episodic: Vec<serde_json::Value>,
     pub semantic: Vec<serde_json::Value>,
     pub procedural: Vec<serde_json::Value>,
@@ -634,11 +634,43 @@ async fn inspect(
     let ps = get_pensyve_state(&state, &auth_ctx)?;
     let limit = body.limit.unwrap_or(50);
 
-    let entity = match ps.storage.get_entity_by_name(&body.entity, ps.namespace.id) {
+    // No entity specified → return all memories in the namespace.
+    if body.entity.is_none() {
+        let mut episodic = Vec::new();
+        let mut semantic = Vec::new();
+        let mut procedural = Vec::new();
+
+        if let Ok(memories) = ps.storage.get_all_memories_by_namespace(ps.namespace.id) {
+            let mut count = 0usize;
+            for mem in memories {
+                if count >= limit {
+                    break;
+                }
+                let mut val = serde_json::to_value(&mem).unwrap_or_default();
+                strip_embedding(&mut val);
+                match mem {
+                    Memory::Episodic(_) => episodic.push(val),
+                    Memory::Semantic(_) => semantic.push(val),
+                    Memory::Procedural(_) => procedural.push(val),
+                }
+                count += 1;
+            }
+        }
+
+        return Ok(Json(InspectResponse {
+            entity: None,
+            episodic,
+            semantic,
+            procedural,
+        }));
+    }
+
+    let entity_name = body.entity.as_deref().unwrap();
+    let entity = match ps.storage.get_entity_by_name(entity_name, ps.namespace.id) {
         Ok(Some(e)) => e,
         Ok(None) => {
             return Ok(Json(InspectResponse {
-                entity: body.entity,
+                entity: Some(entity_name.to_string()),
                 episodic: vec![],
                 semantic: vec![],
                 procedural: vec![],
@@ -674,7 +706,7 @@ async fn inspect(
     }
 
     Ok(Json(InspectResponse {
-        entity: body.entity,
+        entity: Some(entity_name.to_string()),
         episodic,
         semantic,
         procedural: vec![],
