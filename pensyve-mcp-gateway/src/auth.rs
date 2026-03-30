@@ -222,27 +222,34 @@ where
                 return inner.call(req).await;
             }
 
-            // Extract Bearer token.
+            // Extract API key: Bearer header first, then PENSYVE_API_KEY env var.
             let auth_header = req
                 .headers()
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
 
-            let token = if let Some(token) = auth_header.strip_prefix("Bearer ") {
-                token.trim()
-            } else {
-                let body = Body::from(
-                    r#"{"error":"unauthorized","message":"Missing or invalid Authorization header. Use: Bearer psy_your_key"}"#,
-                );
-                return Ok(Response::builder()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .header("content-type", "application/json")
-                    .body(body)
-                    .expect("valid response"));
+            let header_token = auth_header.strip_prefix("Bearer ").map(|t| t.trim());
+            let env_token = std::env::var("PENSYVE_API_KEY").ok();
+
+            let token = match header_token {
+                Some(t) if !t.is_empty() => t.to_string(),
+                _ => match env_token {
+                    Some(ref t) if !t.is_empty() => t.clone(),
+                    _ => {
+                        let body = Body::from(
+                            r#"{"error":"unauthorized","message":"Missing API key. Set PENSYVE_API_KEY or use Authorization: Bearer psy_your_key"}"#,
+                        );
+                        return Ok(Response::builder()
+                            .status(StatusCode::UNAUTHORIZED)
+                            .header("content-type", "application/json")
+                            .body(body)
+                            .expect("valid response"));
+                    }
+                },
             };
 
-            if let Some(ctx) = state.auth.validate(token) {
+            if let Some(ctx) = state.auth.validate(&token) {
                 req.extensions_mut().insert(ctx);
                 inner.call(req).await
             } else {
