@@ -58,8 +58,8 @@ The plugin needs a running Pensyve MCP server. Choose one:
      "mcpServers": {
        "pensyve": {
          "url": "https://mcp.pensyve.com/mcp",
-         "headers": {
-           "Authorization": "Bearer your-api-key-here"
+         "env": {
+           "PENSYVE_API_KEY": "your-api-key-here"
          }
        }
      }
