@@ -4,10 +4,7 @@
   "description": "Persistent memory for Gemini CLI — your agent remembers decisions, patterns, and context across sessions",
   "mcpServers": {
     "pensyve": {
-      "httpUrl": "https://api.pensyve.com/mcp",
-      "headers": {
-        "Authorization": "Bearer ${PENSYVE_API_KEY}"
-      },
+      "httpUrl": "https://mcp.pensyve.com/mcp",
       "timeout": 30000
     }
   },

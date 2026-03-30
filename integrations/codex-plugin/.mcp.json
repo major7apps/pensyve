@@ -1,9 +1,0 @@
-{
-  "pensyve": {
-    "url": "https://api.pensyve.com/mcp",
-    "bearer_token_env_var": "PENSYVE_API_KEY",
-    "startup_timeout_sec": 10,
-    "tool_timeout_sec": 30,
-    "enabled": true
-  }
-}
