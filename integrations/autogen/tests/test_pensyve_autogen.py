@@ -293,7 +293,7 @@ def test_cloud_mode_with_api_key(mock_pensyve):
     """With an API key, auto mode should resolve to cloud."""
     mem = PensyveMemory(
         namespace="test",
-        api_key="pk_test_123",
+        api_key="psy_test_123",
     )
     assert mem.is_cloud
     assert mem._mode == "cloud"
@@ -301,7 +301,7 @@ def test_cloud_mode_with_api_key(mock_pensyve):
 
 def test_cloud_mode_from_env(mock_pensyve, monkeypatch):
     """PENSYVE_API_KEY env var should trigger cloud mode."""
-    monkeypatch.setenv("PENSYVE_API_KEY", "pk_env_456")
+    monkeypatch.setenv("PENSYVE_API_KEY", "psy_env_456")
 
     mem = PensyveMemory(namespace="test")
 
@@ -313,7 +313,7 @@ def test_explicit_local_mode(mock_pensyve):
     mem = PensyveMemory(
         namespace="test",
         mode="local",
-        api_key="pk_ignored",
+        api_key="psy_ignored",
     )
     assert not mem.is_cloud
 

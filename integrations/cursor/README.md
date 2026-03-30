@@ -2,6 +2,16 @@
 
 Persistent AI memory for [Cursor](https://cursor.sh) via MCP.
 
+## Setup
+
+Set your API key (get one at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys)):
+
+```bash
+export PENSYVE_API_KEY="psy_your_key"
+```
+
+Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
+
 ## Cloud (Recommended)
 
 Add to `.cursor/mcp.json` in your project root:
@@ -11,25 +21,24 @@ Add to `.cursor/mcp.json` in your project root:
   "mcpServers": {
     "pensyve": {
       "url": "https://mcp.pensyve.com/mcp",
-      "headers": {
-        "Authorization": "Bearer YOUR_API_KEY"
+      "env": {
+        "PENSYVE_API_KEY": "${PENSYVE_API_KEY}"
       }
     }
   }
 }
 ```
 
-Get your API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
-
 ## Local (Offline)
 
-For offline use with local storage:
+No API key needed — all data stays on your machine.
 
 ```json
 {
   "mcpServers": {
     "pensyve": {
       "command": "pensyve-mcp",
+      "args": ["--stdio"],
       "env": {
         "PENSYVE_PATH": "~/.pensyve/",
         "PENSYVE_NAMESPACE": "default"
@@ -39,7 +48,7 @@ For offline use with local storage:
 }
 ```
 
-Requires: `cargo install --path pensyve-mcp` from the repo root.
+Build from source: `cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
 
 ## Available Tools
 

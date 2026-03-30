@@ -61,10 +61,10 @@ The integration auto-detects which backend to use:
 memory = PensyveMemory(namespace="my-crew")
 
 # Cloud mode (explicit key)
-memory = PensyveMemory(namespace="my-crew", api_key="pk_live_...")
+memory = PensyveMemory(namespace="my-crew", api_key="psy_...")
 
 # Cloud mode (env var)
-# export PENSYVE_API_KEY=pk_live_...
+# export PENSYVE_API_KEY=psy_...
 memory = PensyveMemory(namespace="my-crew")
 
 # Check active mode
