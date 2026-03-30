@@ -70,14 +70,12 @@ impl AuthValidator {
         }
 
         // Load OAuth public key for JWT validation (Ed25519 PEM).
-        let jwt_decoding_key = std::env::var("OAUTH_PUBLIC_KEY")
-            .ok()
-            .and_then(|pem| {
-                DecodingKey::from_ed_pem(pem.as_bytes())
-                    .inspect(|_| tracing::info!("OAuth JWT validation enabled"))
-                    .inspect_err(|e| tracing::warn!("Failed to load OAUTH_PUBLIC_KEY: {e}"))
-                    .ok()
-            });
+        let jwt_decoding_key = std::env::var("OAUTH_PUBLIC_KEY").ok().and_then(|pem| {
+            DecodingKey::from_ed_pem(pem.as_bytes())
+                .inspect(|_| tracing::info!("OAuth JWT validation enabled"))
+                .inspect_err(|e| tracing::warn!("Failed to load OAUTH_PUBLIC_KEY: {e}"))
+                .ok()
+        });
 
         Self {
             valid_key_hashes,
@@ -408,8 +406,9 @@ mod tests {
 
     /// Helper: create a signed JWT with the given claims.
     fn sign_jwt(claims: &TestClaims) -> String {
-        let encoding_key = jsonwebtoken::EncodingKey::from_ed_pem(TEST_ED25519_PRIVATE_PEM.as_bytes())
-            .expect("test private key should parse");
+        let encoding_key =
+            jsonwebtoken::EncodingKey::from_ed_pem(TEST_ED25519_PRIVATE_PEM.as_bytes())
+                .expect("test private key should parse");
         let header = jsonwebtoken::Header::new(Algorithm::EdDSA);
         jsonwebtoken::encode(&header, claims, &encoding_key).expect("JWT signing should succeed")
     }
@@ -485,7 +484,10 @@ mod tests {
     fn test_auth_validator_jwt_returns_none_without_public_key() {
         // AuthValidator created from config has no jwt_decoding_key (no env var set).
         let validator = AuthValidator::new(&test_config(vec![]));
-        assert!(validator.jwt_decoding_key.is_none(), "precondition: no JWT key configured");
+        assert!(
+            validator.jwt_decoding_key.is_none(),
+            "precondition: no JWT key configured"
+        );
 
         let token = sign_jwt(&valid_claims());
         assert!(
@@ -507,7 +509,10 @@ mod tests {
             ctx.user_id.is_none(),
             "API key auth should have no user_id (only JWT provides user_id)"
         );
-        assert_eq!(ctx.key_id, "psy_testkey1", "key_id should be the 12-char prefix");
+        assert_eq!(
+            ctx.key_id, "psy_testkey1",
+            "key_id should be the 12-char prefix"
+        );
 
         // And a psy_ token that is NOT in the valid list should be rejected via
         // the API key path, never falling through to JWT validation.

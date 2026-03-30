@@ -209,18 +209,15 @@ async fn main() -> Result<()> {
         )
         .route(
             "/oauth/token",
-            axum::routing::post(oauth::oauth_token)
-                .options(oauth::oauth_cors_preflight),
+            axum::routing::post(oauth::oauth_token).options(oauth::oauth_cors_preflight),
         )
         .route(
             "/oauth/revoke",
-            axum::routing::post(oauth::oauth_revoke)
-                .options(oauth::oauth_cors_preflight),
+            axum::routing::post(oauth::oauth_revoke).options(oauth::oauth_cors_preflight),
         )
         .route(
             "/oauth/register",
-            axum::routing::post(oauth::oauth_register)
-                .options(oauth::oauth_cors_preflight),
+            axum::routing::post(oauth::oauth_register).options(oauth::oauth_cors_preflight),
         )
         .layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
