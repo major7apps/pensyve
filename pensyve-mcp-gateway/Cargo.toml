@@ -9,7 +9,7 @@ name = "pensyve-mcp-gateway"
 path = "src/main.rs"
 
 [dependencies]
-pensyve-core = { path = "../pensyve-core" }
+pensyve-core = { path = "../pensyve-core", features = ["postgres"] }
 pensyve-mcp-tools = { path = "../pensyve-mcp-tools" }
 rmcp = { version = "1.2", features = ["server", "transport-streamable-http-server", "macros"] }
 axum = "0.8"
