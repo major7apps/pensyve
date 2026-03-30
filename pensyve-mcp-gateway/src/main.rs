@@ -1,5 +1,6 @@
 mod auth;
 mod config;
+mod oauth;
 mod rate_limit;
 mod rest;
 mod tenant;
@@ -134,6 +135,7 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -201,6 +203,25 @@ async fn main() -> Result<()> {
         .nest_service("/mcp", mcp_service)
         .merge(rest::router())
         .route("/health", axum::routing::get(health_handler))
+        .route(
+            "/.well-known/oauth-authorization-server",
+            axum::routing::get(oauth::oauth_metadata),
+        )
+        .route(
+            "/oauth/token",
+            axum::routing::post(oauth::oauth_token)
+                .options(oauth::oauth_cors_preflight),
+        )
+        .route(
+            "/oauth/revoke",
+            axum::routing::post(oauth::oauth_revoke)
+                .options(oauth::oauth_cors_preflight),
+        )
+        .route(
+            "/oauth/register",
+            axum::routing::post(oauth::oauth_register)
+                .options(oauth::oauth_cors_preflight),
+        )
         .layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             tenant_and_usage_middleware,
