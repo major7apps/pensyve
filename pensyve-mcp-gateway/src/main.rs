@@ -52,11 +52,21 @@ struct InitResources {
 
 fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
     let storage: Arc<dyn StorageTrait> = if let Ok(database_url) = std::env::var("DATABASE_URL") {
-        tracing::info!("Using Postgres backend");
-        let pg = PostgresBackend::new(&database_url).map_err(|e| {
-            anyhow::anyhow!("Failed to connect to Postgres: {e}")
-        })?;
-        Arc::new(pg)
+        if database_url.starts_with("postgres") {
+            tracing::info!("Using Postgres backend");
+            let pg = PostgresBackend::new(&database_url).map_err(|e| {
+                anyhow::anyhow!("Failed to connect to Postgres: {e}")
+            })?;
+            Arc::new(pg)
+        } else {
+            tracing::warn!("DATABASE_URL set but not a postgres URL, falling back to SQLite");
+            let storage_path = &config.storage_path;
+            std::fs::create_dir_all(storage_path)?;
+            let sqlite = SqliteBackend::open(storage_path).map_err(|e| {
+                anyhow::anyhow!("Failed to open storage at {}: {e}", storage_path.display())
+            })?;
+            Arc::new(sqlite)
+        }
     } else {
         let storage_path = &config.storage_path;
         std::fs::create_dir_all(storage_path)?;
