@@ -133,10 +133,25 @@ Full cognitive memory layer for Claude Code with 6 commands, 4 skills, 2 agents,
 /plugin install pensyve@pensyve
 ```
 
-Then set your API key:
+Then set your API key (environment variable or inline in `.claude/settings.json`):
 
 ```bash
 export PENSYVE_API_KEY="your-api-key-here"
+```
+
+Or add it directly to your `.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "url": "https://mcp.pensyve.com/mcp",
+      "headers": {
+        "Authorization": "Bearer your-api-key-here"
+      }
+    }
+  }
+}
 ```
 
 **Pensyve Local** (self-hosted, no API key needed):

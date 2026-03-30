@@ -44,11 +44,27 @@ The plugin needs a running Pensyve MCP server. Choose one:
 **Pensyve Cloud** (managed service — no setup required):
 
 1. Sign up at [pensyve.com](https://pensyve.com) and grab your API key
-2. Set your API key so the plugin can authenticate:
+2. Supply your API key using either method:
+
+   **Option A** — environment variable (recommended):
    ```bash
    export PENSYVE_API_KEY="your-api-key-here"
    ```
-   Or add it to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
+   Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
+
+   **Option B** — inline in `.claude/settings.json`:
+   ```json
+   {
+     "mcpServers": {
+       "pensyve": {
+         "url": "https://mcp.pensyve.com/mcp",
+         "headers": {
+           "Authorization": "Bearer your-api-key-here"
+         }
+       }
+     }
+   }
+   ```
 
 The plugin ships pre-configured for Pensyve Cloud — once your API key is set, you're ready to go.
 
