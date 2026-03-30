@@ -5,6 +5,8 @@ use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use std::collections::HashMap;
 
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tower::{Layer, Service};
 
@@ -18,13 +20,22 @@ pub struct AuthContext {
     pub user_id: Option<String>,
 }
 
-/// Validates `psy_` API keys via local hash lookup or remote validation endpoint.
+/// JWT claims from an OAuth access token issued by pensyve.com.
+#[derive(Debug, Deserialize)]
+struct OAuthClaims {
+    sub: String,
+    #[serde(default)]
+    client_id: String,
+}
+
+/// Validates `psy_` API keys via local hash lookup or remote validation endpoint,
+/// and OAuth JWT access tokens issued by pensyve.com.
 ///
-/// Supports two modes:
-/// - **Local**: keys from `PENSYVE_API_KEYS` env var, hashed at startup (fast, static)
-/// - **Remote**: calls the `/api/auth/validate-key` endpoint (dynamic, DB-backed)
-///
-/// Remote validation results are cached in-memory via `DashMap` with a 5-minute TTL.
+/// Auth priority:
+/// 1. Bearer token starting with `psy_` → API key validation
+/// 2. Bearer JWT → OAuth token validation (`EdDSA` signature check)
+/// 3. `PENSYVE_API_KEY` env var → fallback
+/// 4. No auth → 401 with `WWW-Authenticate`
 pub struct AuthValidator {
     /// Pre-hashed local keys, mapped hash -> key prefix.
     valid_key_hashes: HashMap<String, String>,
@@ -34,6 +45,8 @@ pub struct AuthValidator {
     gateway_secret: Option<String>,
     /// Cache of remote validation results (`key_hash` to context + expiry).
     remote_cache: dashmap::DashMap<String, (AuthContext, std::time::Instant)>,
+    /// JWT decoding key for OAuth access tokens (loaded from `OAUTH_PUBLIC_KEY`).
+    jwt_decoding_key: Option<DecodingKey>,
 }
 
 impl AuthValidator {
@@ -56,21 +69,57 @@ impl AuthValidator {
             tracing::info!("Remote key validation enabled");
         }
 
+        // Load OAuth public key for JWT validation (Ed25519 PEM).
+        let jwt_decoding_key = std::env::var("OAUTH_PUBLIC_KEY")
+            .ok()
+            .and_then(|pem| {
+                DecodingKey::from_ed_pem(pem.as_bytes())
+                    .inspect(|_| tracing::info!("OAuth JWT validation enabled"))
+                    .inspect_err(|e| tracing::warn!("Failed to load OAUTH_PUBLIC_KEY: {e}"))
+                    .ok()
+            });
+
         Self {
             valid_key_hashes,
             validation_url,
             gateway_secret,
             remote_cache: dashmap::DashMap::new(),
+            jwt_decoding_key,
         }
     }
 
-    /// Validate an API key. Checks local keys first, then remote endpoint.
+    /// Validate a token. Checks API keys first, then JWT, then remote endpoint.
     pub fn validate(&self, key: &str) -> Option<AuthContext> {
-        if !key.starts_with("psy_") {
-            return None;
+        // 1. API key path (psy_ prefix)
+        if key.starts_with("psy_") {
+            return self.validate_api_key(key);
         }
 
-        // 1. Check local key list (from PENSYVE_API_KEYS env var)
+        // 2. JWT path (OAuth access tokens from pensyve.com)
+        if let Some(ctx) = self.validate_jwt(key) {
+            return Some(ctx);
+        }
+
+        None
+    }
+
+    fn validate_jwt(&self, token: &str) -> Option<AuthContext> {
+        let decoding_key = self.jwt_decoding_key.as_ref()?;
+
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.set_issuer(&["https://pensyve.com"]);
+        validation.set_audience(&["https://mcp.pensyve.com"]);
+
+        let token_data = decode::<OAuthClaims>(token, decoding_key, &validation).ok()?;
+
+        Some(AuthContext {
+            key_id: format!("oauth:{}", &token_data.claims.client_id),
+            user_id: Some(token_data.claims.sub),
+        })
+    }
+
+    fn validate_api_key(&self, key: &str) -> Option<AuthContext> {
+        // Check local key list (from PENSYVE_API_KEYS env var)
         let hash = hash_key(key);
         if let Some(prefix) = self.valid_key_hashes.get(&hash) {
             return Some(AuthContext {
