@@ -77,7 +77,10 @@ pub async fn oauth_cors_preflight() -> impl IntoResponse {
         .status(StatusCode::NO_CONTENT)
         .header("access-control-allow-origin", "*")
         .header("access-control-allow-methods", "POST, OPTIONS")
-        .header("access-control-allow-headers", "content-type, authorization")
+        .header(
+            "access-control-allow-headers",
+            "content-type, authorization",
+        )
         .header("access-control-max-age", "86400")
         .body(Body::empty())
         .expect("valid response")
@@ -161,10 +164,12 @@ mod tests {
         assert_eq!(json["issuer"], GATEWAY_ISSUER);
         assert_eq!(json["authorization_endpoint"], AUTHORIZATION_ENDPOINT);
         assert_eq!(json["token_endpoint"], TOKEN_ENDPOINT);
-        assert!(json["code_challenge_methods_supported"]
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("S256")));
+        assert!(
+            json["code_challenge_methods_supported"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("S256"))
+        );
     }
 
     #[tokio::test]
