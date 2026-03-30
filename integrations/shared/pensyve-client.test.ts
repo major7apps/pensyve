@@ -12,13 +12,13 @@ describe("resolveConfig", () => {
   });
 
   it("switches to cloud mode with API key", () => {
-    const cfg = resolveConfig({ apiKey: "pk-test-123" });
+    const cfg = resolveConfig({ apiKey: "psy_test_123" });
     expect(cfg.mode).toBe("cloud");
-    expect(cfg.cloud?.apiKey).toBe("pk-test-123");
+    expect(cfg.cloud?.apiKey).toBe("psy_test_123");
   });
 
   it("respects explicit mode override", () => {
-    const cfg = resolveConfig({ mode: "local", apiKey: "pk-test" });
+    const cfg = resolveConfig({ mode: "local", apiKey: "psy_test" });
     expect(cfg.mode).toBe("local");
   });
 
@@ -36,9 +36,9 @@ describe("resolveConfig", () => {
   });
 
   it("resolves API key from cloud config", () => {
-    const cfg = resolveConfig({ cloud: { apiKey: "pk-from-cloud" } });
+    const cfg = resolveConfig({ cloud: { apiKey: "psy_from_cloud" } });
     expect(cfg.mode).toBe("cloud");
-    expect(cfg.apiKey).toBe("pk-from-cloud");
+    expect(cfg.apiKey).toBe("psy_from_cloud");
   });
 });
 
@@ -51,7 +51,7 @@ describe("PensyveClient", () => {
   });
 
   it("creates remote client with API key", () => {
-    const cfg = resolveConfig({ apiKey: "pk-test" });
+    const cfg = resolveConfig({ apiKey: "psy_test" });
     const client = new PensyveClient(cfg);
     expect(client.isRemote).toBe(true);
   });

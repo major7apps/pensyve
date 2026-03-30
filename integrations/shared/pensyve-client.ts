@@ -109,7 +109,7 @@ export class PensyveClient {
     this.entity = cfg.entity;
     this.headers = { "Content-Type": "application/json" };
     if (this.isRemote && cfg.cloud.apiKey) {
-      this.headers["X-Pensyve-Key"] = cfg.cloud.apiKey;
+      this.headers["Authorization"] = `Bearer ${cfg.cloud.apiKey}`;
     }
   }
 
