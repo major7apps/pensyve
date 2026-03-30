@@ -28,8 +28,8 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Build wheels
@@ -40,7 +40,7 @@ jobs:
           manylinux: "2_28"
           before-script-linux: dnf install -y openssl-devel perl-IPC-Cmd
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: wheels-${{ matrix.target }}
           path: dist/*.whl
@@ -49,14 +49,14 @@ jobs:
     name: Build Python sdist
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: --out dist --manifest-path pensyve-python/Cargo.toml
       - name: Upload sdist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: wheels-sdist
           path: dist/*.tar.gz
@@ -68,7 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           pattern: wheels-*
           merge-multiple: true
@@ -87,16 +87,16 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
       - name: Build TypeScript SDK
         working-directory: pensyve-ts
         run: |
           bun install
           bun run build
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: "22"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
       - name: Publish to npm
         if: env.HAS_NPM_TOKEN != ''
@@ -112,7 +112,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Publish pensyve-core
         if: env.HAS_CARGO_TOKEN != ''
@@ -138,7 +138,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: pensyve-cli-windows-amd64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -159,7 +159,7 @@ jobs:
           cp target/release/pensyve.exe staging/pensyve.exe
           Compress-Archive -Path staging/pensyve.exe -DestinationPath ${{ matrix.artifact }}.zip
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.*
@@ -178,7 +178,7 @@ jobs:
             target: aarch64-apple-darwin
             artifact: pensyve-mcp-macos-arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -191,7 +191,7 @@ jobs:
           cp target/release/pensyve-mcp staging/pensyve-mcp
           cd staging && tar czf ../${{ matrix.artifact }}.tar.gz pensyve-mcp
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.*
@@ -203,8 +203,8 @@ jobs:
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
         with:
           path: artifacts/
       - name: Collect release assets
