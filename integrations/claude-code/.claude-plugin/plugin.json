@@ -8,13 +8,5 @@
   },
   "homepage": "https://pensyve.com",
   "repository": "https://github.com/major7apps/pensyve",
-  "license": "Apache-2.0",
-  "mcpServers": {
-    "pensyve": {
-      "url": "https://mcp.pensyve.com/mcp",
-      "env": {
-        "PENSYVE_API_KEY": "${PENSYVE_API_KEY}"
-      }
-    }
-  }
+  "license": "Apache-2.0"
 }
