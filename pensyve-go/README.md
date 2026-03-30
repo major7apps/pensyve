@@ -10,7 +10,7 @@ Give your agents durable memory that persists across sessions, learns from outco
 ## Install
 
 ```bash
-go get github.com/major7apps/pensyve/pensyve-go@v1.0.0
+go get github.com/major7apps/pensyve/pensyve-go@latest
 ```
 
 ## Quick Start
