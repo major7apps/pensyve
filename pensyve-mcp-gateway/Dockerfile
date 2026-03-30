@@ -16,7 +16,7 @@ RUN groupadd --gid 1001 pensyve \
     && useradd --uid 1001 --gid pensyve --shell /bin/false --create-home pensyve
 
 # Data directory owned by non-root user (writable in Fargate ephemeral storage)
-RUN mkdir -p /home/pensyve/data && chown pensyve:pensyve /home/pensyve/data
+RUN mkdir -p /home/pensyve/data && chown -R pensyve:pensyve /home/pensyve
 
 COPY target/release/pensyve-mcp-gateway /usr/local/bin/pensyve-mcp-gateway
 
@@ -27,7 +27,5 @@ EXPOSE 3000
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:${PORT}/health || exit 1
-
-USER pensyve
 
 ENTRYPOINT ["pensyve-mcp-gateway"]
