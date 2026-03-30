@@ -375,4 +375,145 @@ mod tests {
         let validator = AuthValidator::new(&test_config(vec![]));
         assert!(validator.validate("psy_anything").is_none());
     }
+
+    // Ed25519 test key pair generated for unit tests only — not a real secret.
+    const TEST_ED25519_PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+        MC4CAQAwBQYDK2VwBCIEIAPzDoD/2KJqXdOOUG6XdP1GD0tXbv1DDOFdXwhG/0DQ\n\
+        -----END PRIVATE KEY-----";
+
+    const TEST_ED25519_PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
+        MCowBQYDK2VwAyEAxGcwHbTUufFJiO1RHuU784Bjy4queMMkS9uR1NwQ85Q=\n\
+        -----END PUBLIC KEY-----";
+
+    #[derive(serde::Serialize)]
+    struct TestClaims {
+        sub: String,
+        client_id: String,
+        iss: String,
+        aud: String,
+        exp: u64,
+        iat: u64,
+    }
+
+    /// Helper: build an AuthValidator with JWT support using the test key pair.
+    fn validator_with_jwt(api_keys: Vec<String>) -> AuthValidator {
+        let config = test_config(api_keys);
+        let mut validator = AuthValidator::new(&config);
+        validator.jwt_decoding_key = Some(
+            DecodingKey::from_ed_pem(TEST_ED25519_PUBLIC_PEM.as_bytes())
+                .expect("test public key should parse"),
+        );
+        validator
+    }
+
+    /// Helper: create a signed JWT with the given claims.
+    fn sign_jwt(claims: &TestClaims) -> String {
+        let encoding_key = jsonwebtoken::EncodingKey::from_ed_pem(TEST_ED25519_PRIVATE_PEM.as_bytes())
+            .expect("test private key should parse");
+        let header = jsonwebtoken::Header::new(Algorithm::EdDSA);
+        jsonwebtoken::encode(&header, claims, &encoding_key).expect("JWT signing should succeed")
+    }
+
+    fn valid_claims() -> TestClaims {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        TestClaims {
+            sub: "user_abc123".to_string(),
+            client_id: "client_xyz".to_string(),
+            iss: "https://pensyve.com".to_string(),
+            aud: "https://mcp.pensyve.com".to_string(),
+            iat: now,
+            exp: now + 3600,
+        }
+    }
+
+    #[test]
+    fn test_auth_validator_validates_jwt_with_valid_key() {
+        let validator = validator_with_jwt(vec![]);
+        let token = sign_jwt(&valid_claims());
+
+        let ctx = validator
+            .validate(&token)
+            .expect("valid JWT should be accepted");
+        assert_eq!(ctx.user_id.as_deref(), Some("user_abc123"));
+        assert_eq!(ctx.key_id, "oauth:client_xyz");
+    }
+
+    #[test]
+    fn test_auth_validator_rejects_expired_jwt() {
+        let validator = validator_with_jwt(vec![]);
+        let mut claims = valid_claims();
+        // Set expiry in the past.
+        claims.exp = claims.iat - 3600;
+        let token = sign_jwt(&claims);
+
+        assert!(
+            validator.validate(&token).is_none(),
+            "expired JWT should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_auth_validator_rejects_wrong_issuer() {
+        let validator = validator_with_jwt(vec![]);
+        let mut claims = valid_claims();
+        claims.iss = "https://evil.com".to_string();
+        let token = sign_jwt(&claims);
+
+        assert!(
+            validator.validate(&token).is_none(),
+            "JWT with wrong issuer should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_auth_validator_rejects_wrong_audience() {
+        let validator = validator_with_jwt(vec![]);
+        let mut claims = valid_claims();
+        claims.aud = "https://wrong-audience.com".to_string();
+        let token = sign_jwt(&claims);
+
+        assert!(
+            validator.validate(&token).is_none(),
+            "JWT with wrong audience should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_auth_validator_jwt_returns_none_without_public_key() {
+        // AuthValidator created from config has no jwt_decoding_key (no env var set).
+        let validator = AuthValidator::new(&test_config(vec![]));
+        assert!(validator.jwt_decoding_key.is_none(), "precondition: no JWT key configured");
+
+        let token = sign_jwt(&valid_claims());
+        assert!(
+            validator.validate(&token).is_none(),
+            "JWT should not validate when no public key is configured"
+        );
+    }
+
+    #[test]
+    fn test_auth_validator_prefers_api_key_for_psy_prefix() {
+        // Configure both JWT validation and a valid API key.
+        let validator = validator_with_jwt(vec!["psy_testkey12345".to_string()]);
+
+        // A psy_ token should go through the API key path, not JWT.
+        let ctx = validator
+            .validate("psy_testkey12345")
+            .expect("psy_ key should be validated as API key");
+        assert!(
+            ctx.user_id.is_none(),
+            "API key auth should have no user_id (only JWT provides user_id)"
+        );
+        assert_eq!(ctx.key_id, "psy_testkey1", "key_id should be the 12-char prefix");
+
+        // And a psy_ token that is NOT in the valid list should be rejected via
+        // the API key path, never falling through to JWT validation.
+        assert!(
+            validator.validate("psy_not_a_real_key").is_none(),
+            "invalid psy_ key should be rejected even with JWT configured"
+        );
+    }
 }
