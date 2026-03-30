@@ -48,4 +48,4 @@ User: `/remember we decided to use SQLite instead of PostgreSQL for the MVP`
 ## Error Handling
 
 - If `pensyve_remember` returns an error, display the error message and suggest the user check that the Pensyve MCP server is running (`pensyve-mcp`).
-- If the MCP server is not connected, instruct the user to verify their `.mcp.json` configuration.
+- If the MCP server is not connected, instruct the user to verify their MCP server configuration.

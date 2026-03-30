@@ -113,4 +113,4 @@ Rules for full mode:
 
 - If some `pensyve_recall` queries fail but others succeed, present the successful results and note the failures briefly.
 - If all queries fail, report the error and suggest checking the MCP server connection.
-- If the MCP server is not connected, inform the user: "Pensyve MCP server is not connected. Context loading skipped. Verify your `.mcp.json` configuration."
+- If the MCP server is not connected, inform the user: "Pensyve MCP server is not connected. Context loading skipped. Verify your MCP server configuration."
