@@ -28,10 +28,14 @@ SQLite + ONNX embeddings + vector index
 
 ### Install the Plugin
 
-In Claude Code, add the marketplace and install:
+Clone the repo, then add the plugin marketplace in Claude Code:
+
+```bash
+git clone https://github.com/major7apps/pensyve.git
+```
 
 ```
-/plugin marketplace add major7apps/pensyve/integrations/claude-code
+/plugin marketplace add /path/to/pensyve/integrations/claude-code
 /plugin install pensyve@pensyve
 ```
 

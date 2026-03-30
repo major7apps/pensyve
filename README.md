@@ -182,7 +182,7 @@ Full cognitive memory layer for Claude Code with 6 commands, 4 skills, 2 agents,
 **Pensyve Cloud** (no build required):
 
 ```
-/plugin marketplace add major7apps/pensyve/integrations/claude-code
+/plugin marketplace add /path/to/pensyve/integrations/claude-code
 /plugin install pensyve@pensyve
 ```
 
