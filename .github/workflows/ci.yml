@@ -100,6 +100,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: "1.22"
+          cache-dependency-path: pensyve-go/go.mod
       - name: Run tests
         working-directory: pensyve-go
         run: go test ./... -v
