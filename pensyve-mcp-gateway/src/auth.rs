@@ -208,8 +208,12 @@ where
         Box::pin(async move {
             let path = req.uri().path();
 
-            // Skip auth for health checks.
-            if path == "/health" || path == "/v1/health" {
+            // Skip auth for health checks and OAuth endpoints.
+            if path == "/health"
+                || path == "/v1/health"
+                || path.starts_with("/.well-known/")
+                || path.starts_with("/oauth/")
+            {
                 return inner.call(req).await;
             }
 
@@ -238,11 +242,15 @@ where
                     Some(ref t) if !t.is_empty() => t.clone(),
                     _ => {
                         let body = Body::from(
-                            r#"{"error":"unauthorized","message":"Missing API key. Set PENSYVE_API_KEY or use Authorization: Bearer psy_your_key"}"#,
+                            r#"{"error":"unauthorized","message":"Authentication required. Sign in at pensyve.com or set PENSYVE_API_KEY."}"#,
                         );
                         return Ok(Response::builder()
                             .status(StatusCode::UNAUTHORIZED)
                             .header("content-type", "application/json")
+                            .header(
+                                "www-authenticate",
+                                r#"Bearer resource_metadata="https://mcp.pensyve.com/.well-known/oauth-authorization-server""#,
+                            )
                             .body(body)
                             .expect("valid response"));
                     }
