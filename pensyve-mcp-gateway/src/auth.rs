@@ -229,7 +229,7 @@ where
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
 
-            let header_token = auth_header.strip_prefix("Bearer ").map(|t| t.trim());
+            let header_token = auth_header.strip_prefix("Bearer ").map(str::trim);
             let env_token = std::env::var("PENSYVE_API_KEY").ok();
 
             let token = match header_token {
