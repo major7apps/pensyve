@@ -51,10 +51,10 @@ crew = Crew(
 
 The integration auto-detects which backend to use:
 
-| Mode | Trigger | Backend |
-|------|---------|---------|
-| Local | No API key set | Pensyve SDK (PyO3 + SQLite) |
-| Cloud | `PENSYVE_API_KEY` env var or `api_key=` param | Pensyve REST API |
+| Mode  | Trigger                                       | Backend                     |
+| ----- | --------------------------------------------- | --------------------------- |
+| Local | No API key set                                | Pensyve SDK (PyO3 + SQLite) |
+| Cloud | `PENSYVE_API_KEY` env var or `api_key=` param | Pensyve REST API            |
 
 ```python
 # Local mode (default)
@@ -75,22 +75,22 @@ print(memory.mode)  # "local" or "cloud"
 
 ### `PensyveMemory(namespace, entity_name, *, path, api_key, base_url)`
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `namespace` | `str` | `"default"` | Pensyve namespace for isolation |
-| `entity_name` | `str` | `"crew-agent"` | Entity name to scope memories to |
-| `path` | `str \| None` | `None` | Local storage path (local mode only) |
-| `api_key` | `str \| None` | `None` | Cloud API key (overrides env var) |
-| `base_url` | `str` | `"https://api.pensyve.com"` | Cloud API URL |
+| Parameter     | Type          | Default                     | Description                          |
+| ------------- | ------------- | --------------------------- | ------------------------------------ |
+| `namespace`   | `str`         | `"default"`                 | Pensyve namespace for isolation      |
+| `entity_name` | `str`         | `"crew-agent"`              | Entity name to scope memories to     |
+| `path`        | `str \| None` | `None`                      | Local storage path (local mode only) |
+| `api_key`     | `str \| None` | `None`                      | Cloud API key (overrides env var)    |
+| `base_url`    | `str`         | `"https://api.pensyve.com"` | Cloud API URL                        |
 
 ### Methods
 
-| Method | Description |
-|--------|-------------|
-| `remember(text, metadata=None)` | Store a memory with optional metadata |
-| `recall(query, limit=5)` | Search memories, returns `list[MemoryMatch]` |
-| `extract_memories(text)` | Split text into individual facts (no LLM) |
-| `reset()` | Clear all memories for this entity |
+| Method                          | Description                                  |
+| ------------------------------- | -------------------------------------------- |
+| `remember(text, metadata=None)` | Store a memory with optional metadata        |
+| `recall(query, limit=5)`        | Search memories, returns `list[MemoryMatch]` |
+| `extract_memories(text)`        | Split text into individual facts (no LLM)    |
+| `reset()`                       | Clear all memories for this entity           |
 
 ### Result Types
 

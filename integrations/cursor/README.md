@@ -52,15 +52,15 @@ Build from source: `cargo build --release -p pensyve-mcp` from the [pensyve repo
 
 ## Available Tools
 
-| Tool | Description |
-|------|-------------|
-| `pensyve_recall` | Search memories by semantic similarity |
-| `pensyve_remember` | Store a fact as semantic memory |
-| `pensyve_episode_start` | Begin tracking an interaction |
-| `pensyve_episode_end` | Close an episode |
-| `pensyve_forget` | Delete an entity's memories |
-| `pensyve_inspect` | List memories for an entity |
-| `pensyve_status` | Connection and memory stats |
-| `pensyve_account` | Plan and usage info |
+| Tool                    | Description                            |
+| ----------------------- | -------------------------------------- |
+| `pensyve_recall`        | Search memories by semantic similarity |
+| `pensyve_remember`      | Store a fact as semantic memory        |
+| `pensyve_episode_start` | Begin tracking an interaction          |
+| `pensyve_episode_end`   | Close an episode                       |
+| `pensyve_forget`        | Delete an entity's memories            |
+| `pensyve_inspect`       | List memories for an entity            |
+| `pensyve_status`        | Connection and memory stats            |
+| `pensyve_account`       | Plan and usage info                    |
 
 See [MCP Tools Reference](https://pensyve.com/docs/api-reference/mcp-tools) for full parameter details.

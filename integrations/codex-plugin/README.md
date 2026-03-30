@@ -27,12 +27,15 @@ The plugin needs a running Pensyve MCP server. Choose one:
 2. Supply your API key:
 
    **Option A** — environment variable (recommended):
+
    ```bash
    export PENSYVE_API_KEY="psy_..."
    ```
+
    Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
 
    **Option B** — in your Codex config (`~/.codex/config.toml`):
+
    ```toml
    [plugins.pensyve]
    enabled = true
@@ -70,32 +73,32 @@ context_loading = "summary"     # "off", "summary", or "full"
 
 ## Skills
 
-| Skill | When to Use | What It Does |
-|-------|-------------|--------------|
-| `session-memory` | End of a work session | Analyzes the session for decisions, outcomes, and patterns. Presents candidates for confirmation. Stores approved items. Never auto-stores. |
-| `memory-informed-refactor` | Before refactoring a module | Queries memory for past decisions, failures, and patterns related to the target. Compiles a briefing with recommendations. Offers episode tracking. |
-| `context-loader` | Session start or context switch | Loads relevant memories to prime the session. Summary mode (10-15 lines) or full mode (tables with scores). Fast and non-blocking. |
-| `memory-review` | Periodic hygiene check | Audits memory health: stale entries, contradictions, low-confidence items, consolidation candidates. Offers cleanup actions with user confirmation. |
+| Skill                      | When to Use                     | What It Does                                                                                                                                        |
+| -------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `session-memory`           | End of a work session           | Analyzes the session for decisions, outcomes, and patterns. Presents candidates for confirmation. Stores approved items. Never auto-stores.         |
+| `memory-informed-refactor` | Before refactoring a module     | Queries memory for past decisions, failures, and patterns related to the target. Compiles a briefing with recommendations. Offers episode tracking. |
+| `context-loader`           | Session start or context switch | Loads relevant memories to prime the session. Summary mode (10-15 lines) or full mode (tables with scores). Fast and non-blocking.                  |
+| `memory-review`            | Periodic hygiene check          | Audits memory health: stale entries, contradictions, low-confidence items, consolidation candidates. Offers cleanup actions with user confirmation. |
 
 ## Hooks
 
-| Event | Skill | Behavior |
-|-------|-------|----------|
-| `SessionStart` | `context-loader` | Loads relevant memories at session start (configurable: off/summary/full) |
-| `Stop` | `session-memory` | Extracts decisions and outcomes after task completion, asks before storing |
+| Event          | Skill            | Behavior                                                                   |
+| -------------- | ---------------- | -------------------------------------------------------------------------- |
+| `SessionStart` | `context-loader` | Loads relevant memories at session start (configurable: off/summary/full)  |
+| `Stop`         | `session-memory` | Extracts decisions and outcomes after task completion, asks before storing |
 
 ## Available MCP Tools
 
 All tools connect to the Pensyve cloud API via MCP. The plugin never bypasses MCP to access storage directly.
 
-| Tool | Parameters | Returns |
-|------|-----------|---------|
-| `pensyve_recall` | `query`, `entity?`, `types?`, `limit?` | Ranked array of memories with relevance scores |
-| `pensyve_remember` | `entity`, `fact`, `confidence?` | Stored memory object |
-| `pensyve_episode_start` | `participants` | `episode_id`, `started_at` |
-| `pensyve_episode_end` | `episode_id`, `outcome?` | `memories_created` count |
-| `pensyve_forget` | `entity`, `hard_delete?` | `forgotten_count` |
-| `pensyve_inspect` | `entity`, `memory_type?`, `limit?` | Array of memories with stats |
+| Tool                    | Parameters                             | Returns                                        |
+| ----------------------- | -------------------------------------- | ---------------------------------------------- |
+| `pensyve_recall`        | `query`, `entity?`, `types?`, `limit?` | Ranked array of memories with relevance scores |
+| `pensyve_remember`      | `entity`, `fact`, `confidence?`        | Stored memory object                           |
+| `pensyve_episode_start` | `participants`                         | `episode_id`, `started_at`                     |
+| `pensyve_episode_end`   | `episode_id`, `outcome?`               | `memories_created` count                       |
+| `pensyve_forget`        | `entity`, `hard_delete?`               | `forgotten_count`                              |
+| `pensyve_inspect`       | `entity`, `memory_type?`, `limit?`     | Array of memories with stats                   |
 
 ## Design Philosophy
 

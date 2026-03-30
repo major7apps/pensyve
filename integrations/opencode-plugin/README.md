@@ -6,14 +6,14 @@ Native OpenCode plugin for persistent cross-session memory, powered by Pensyve's
 
 OpenCode supports both **MCP servers** and **native plugins**. You can use Pensyve with either approach:
 
-| Capability | MCP Server (passive) | Native Plugin (active) |
-|---|---|---|
-| Explicit memory tools | Yes (`pensyve_remember`, `pensyve_recall`) | Yes (`pensyve_remember`, `pensyve_recall`) |
-| Auto-recall on session start | No | Yes (`session.created` hook) |
-| System prompt injection | No | Yes (`experimental.chat.system.transform` hook) |
-| Auto-capture assistant responses | No | Yes (`message.created` hook) |
-| Setup complexity | Minimal — add MCP server config | Copy plugin or install via npm |
-| Agent must call tools explicitly | Yes — agent decides when to recall | No — memories injected automatically |
+| Capability                       | MCP Server (passive)                       | Native Plugin (active)                          |
+| -------------------------------- | ------------------------------------------ | ----------------------------------------------- |
+| Explicit memory tools            | Yes (`pensyve_remember`, `pensyve_recall`) | Yes (`pensyve_remember`, `pensyve_recall`)      |
+| Auto-recall on session start     | No                                         | Yes (`session.created` hook)                    |
+| System prompt injection          | No                                         | Yes (`experimental.chat.system.transform` hook) |
+| Auto-capture assistant responses | No                                         | Yes (`message.created` hook)                    |
+| Setup complexity                 | Minimal — add MCP server config            | Copy plugin or install via npm                  |
+| Agent must call tools explicitly | Yes — agent decides when to recall         | No — memories injected automatically            |
 
 **Recommendation:** Use the native plugin for the richest experience. Use MCP if you want zero-config simplicity and already have the Pensyve MCP server running.
 
@@ -111,15 +111,15 @@ The plugin registers two custom tools that the agent can call explicitly:
 
 The plugin uses sensible defaults. To customize, modify the `DEFAULTS` object in `src/index.ts`:
 
-| Option | Type | Default | Description |
-|---|---|---|---|
-| `baseUrl` | `string` | `http://localhost:8000` | Pensyve API URL |
-| `apiKey` | `string` | — | API key (optional for local deployments) |
-| `entity` | `string` | `opencode-agent` | Entity name for memory storage |
-| `namespace` | `string` | `opencode` | Memory namespace for isolation |
-| `autoRecall` | `boolean` | `true` | Auto-recall memories on session start |
-| `autoCapture` | `boolean` | `true` | Auto-capture assistant responses |
-| `recallLimit` | `number` | `5` | Max memories to recall per session |
+| Option        | Type      | Default                 | Description                              |
+| ------------- | --------- | ----------------------- | ---------------------------------------- |
+| `baseUrl`     | `string`  | `http://localhost:8000` | Pensyve API URL                          |
+| `apiKey`      | `string`  | —                       | API key (optional for local deployments) |
+| `entity`      | `string`  | `opencode-agent`        | Entity name for memory storage           |
+| `namespace`   | `string`  | `opencode`              | Memory namespace for isolation           |
+| `autoRecall`  | `boolean` | `true`                  | Auto-recall memories on session start    |
+| `autoCapture` | `boolean` | `true`                  | Auto-capture assistant responses         |
+| `recallLimit` | `number`  | `5`                     | Max memories to recall per session       |
 
 ## Architecture
 
