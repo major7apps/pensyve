@@ -1,10 +1,6 @@
 ---
-name: remember
 description: "Store a fact about an entity in Pensyve memory"
-arguments:
-  - name: fact
-    description: "The fact to remember, optionally prefixed with 'entity: fact' to specify the entity"
-    required: true
+argument-hint: "<entity: fact> or <fact>"
 ---
 
 # /remember

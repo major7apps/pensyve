@@ -1,7 +1,5 @@
 ---
-name: memory-status
 description: "Show Pensyve memory namespace statistics and health overview"
-arguments: []
 ---
 
 # /memory-status

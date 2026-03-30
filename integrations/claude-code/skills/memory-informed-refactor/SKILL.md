@@ -1,10 +1,7 @@
 ---
 name: memory-informed-refactor
-description: "Pre-refactor context loading -- queries Pensyve memory for past decisions, failures, and patterns related to a refactoring target, then compiles a briefing"
-arguments:
-  - name: target
-    description: "The module, file, or component to be refactored (e.g., 'auth-service', 'database-layer', 'api-routes')"
-    required: true
+description: "Pre-refactor context loading -- queries Pensyve memory for past decisions, failures, and patterns related to a refactoring target, then compiles a briefing. Use when starting a refactor to avoid repeating past mistakes."
+version: 1.0.0
 ---
 
 # Memory-Informed Refactor

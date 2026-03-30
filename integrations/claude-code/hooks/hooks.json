@@ -1,20 +1,44 @@
 {
-  "hooks": [
-    {
-      "event": "SessionStart",
-      "command": "session-start"
-    },
-    {
-      "event": "Stop",
-      "command": "stop"
-    },
-    {
-      "event": "PreCompact",
-      "command": "pre-compact"
-    },
-    {
-      "event": "UserPromptSubmit",
-      "command": "user-prompt-submit"
-    }
-  ]
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat \"${CLAUDE_PLUGIN_ROOT}/hooks/session-start.md\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat \"${CLAUDE_PLUGIN_ROOT}/hooks/stop.md\""
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat \"${CLAUDE_PLUGIN_ROOT}/hooks/pre-compact.md\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat \"${CLAUDE_PLUGIN_ROOT}/hooks/user-prompt-submit.md\""
+          }
+        ]
+      }
+    ]
+  }
 }

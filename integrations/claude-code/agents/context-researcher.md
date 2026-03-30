@@ -1,7 +1,8 @@
 ---
 name: context-researcher
-description: "On-demand research agent that decomposes queries into multiple search angles, runs parallel memory lookups, and synthesizes a structured briefing"
-model_preference: default
+description: "On-demand research agent that decomposes queries into multiple search angles, runs parallel memory lookups, and synthesizes a structured briefing. Use when deep memory context is needed for a topic, entity, or decision."
+model: inherit
+color: cyan
 ---
 
 # Context Researcher Agent

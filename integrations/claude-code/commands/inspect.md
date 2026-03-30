@@ -1,16 +1,6 @@
 ---
-name: inspect
 description: "View all memories stored for an entity in Pensyve"
-arguments:
-  - name: entity
-    description: "The entity to inspect (optional -- lists all entities if omitted)"
-    required: false
-  - name: type
-    description: "Filter by memory type: episodic, semantic, or procedural"
-    required: false
-  - name: limit
-    description: "Maximum number of memories to show (default: 20)"
-    required: false
+argument-hint: "[entity] [--type episodic|semantic|procedural] [--limit N]"
 ---
 
 # /inspect

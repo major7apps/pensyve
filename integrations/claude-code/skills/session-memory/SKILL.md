@@ -1,10 +1,7 @@
 ---
 name: session-memory
-description: "End-of-session memory capture -- analyzes session for decisions, outcomes, and patterns worth remembering, then stores confirmed items via Pensyve"
-arguments:
-  - name: scope
-    description: "What to analyze: 'all' (default), 'decisions', 'outcomes', or 'patterns'"
-    required: false
+description: "End-of-session memory capture -- analyzes session for decisions, outcomes, and patterns worth remembering, then stores confirmed items via Pensyve. Use when ending a work session or when the user wants to capture what was learned."
+version: 1.0.0
 ---
 
 # Session Memory Capture

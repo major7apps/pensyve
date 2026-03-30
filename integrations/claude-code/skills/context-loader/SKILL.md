@@ -1,10 +1,7 @@
 ---
 name: context-loader
-description: "Session start context priming -- loads relevant memories from Pensyve at the beginning of a session to provide continuity across sessions"
-arguments:
-  - name: mode
-    description: "Loading mode: 'summary' (10-15 lines, default), 'full' (comprehensive with scores), or 'off' (skip loading)"
-    required: false
+description: "Session start context priming -- loads relevant memories from Pensyve at the beginning of a session to provide continuity across sessions. Use when switching projects or needing historical context."
+version: 1.0.0
 ---
 
 # Context Loader

@@ -1,10 +1,7 @@
 ---
 name: memory-review
-description: "Memory hygiene audit -- checks for stale, contradictory, low-confidence, and consolidation-candidate memories, then offers cleanup actions with user confirmation"
-arguments:
-  - name: entity
-    description: "Optional entity to audit. If omitted, audits all known entities."
-    required: false
+description: "Memory hygiene audit -- checks for stale, contradictory, low-confidence, and consolidation-candidate memories, then offers cleanup actions with user confirmation. Use periodically to maintain memory quality."
+version: 1.0.0
 ---
 
 # Memory Review
