@@ -29,7 +29,7 @@ petgraph = "0.8"
 dashmap = "6"
 rayon = "1.10"
 tracing = "0.1"
-sqlx-core = { version = "0.8.6", features = ["_rt-tokio", "_tls-native-tls", "json", "chrono", "uuid"], optional = true }
+sqlx-core = { version = "0.8.6", features = ["_rt-tokio", "_tls-rustls-aws-lc-rs", "json", "chrono", "uuid"], optional = true }
 sqlx-postgres = { version = "0.8.6", features = ["json", "chrono", "uuid"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 
