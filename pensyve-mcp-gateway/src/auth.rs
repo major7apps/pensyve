@@ -47,6 +47,8 @@ pub struct AuthValidator {
     remote_cache: dashmap::DashMap<String, (AuthContext, std::time::Instant)>,
     /// JWT decoding key for OAuth access tokens (loaded from `OAUTH_PUBLIC_KEY`).
     jwt_decoding_key: Option<DecodingKey>,
+    /// Async HTTP client for remote key validation.
+    http_client: reqwest::Client,
 }
 
 impl AuthValidator {
@@ -77,20 +79,26 @@ impl AuthValidator {
                 .ok()
         });
 
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .expect("HTTP client should build");
+
         Self {
             valid_key_hashes,
             validation_url,
             gateway_secret,
             remote_cache: dashmap::DashMap::new(),
             jwt_decoding_key,
+            http_client,
         }
     }
 
     /// Validate a token. Checks API keys first, then JWT, then remote endpoint.
-    pub fn validate(&self, key: &str) -> Option<AuthContext> {
+    pub async fn validate(&self, key: &str) -> Option<AuthContext> {
         // 1. API key path (psy_ prefix)
         if key.starts_with("psy_") {
-            return self.validate_api_key(key);
+            return self.validate_api_key(key).await;
         }
 
         // 2. JWT path (OAuth access tokens from pensyve.com)
@@ -116,7 +124,7 @@ impl AuthValidator {
         })
     }
 
-    fn validate_api_key(&self, key: &str) -> Option<AuthContext> {
+    async fn validate_api_key(&self, key: &str) -> Option<AuthContext> {
         // Check local key list (from PENSYVE_API_KEYS env var)
         let hash = hash_key(key);
         if let Some(prefix) = self.valid_key_hashes.get(&hash) {
@@ -136,22 +144,17 @@ impl AuthValidator {
             self.remote_cache.remove(&hash);
         }
 
-        // 3. Remote validation disabled — reqwest::blocking deadlocks inside tokio.
-        // All keys must be in the PENSYVE_API_KEYS env var or use OAuth JWT.
-        if self.validation_url.is_some() {
-            tracing::debug!("Key not in local list, remote validation skipped (blocking client incompatible with async runtime)");
+        // 3. Try remote validation
+        if let Some(url) = &self.validation_url {
+            return self.validate_remote(url, key, &hash).await;
         }
 
         None
     }
 
-    fn validate_remote(&self, url: &str, key: &str, hash: &str) -> Option<AuthContext> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(3))
-            .build()
-            .ok()?;
-
-        let mut req = client
+    async fn validate_remote(&self, url: &str, key: &str, hash: &str) -> Option<AuthContext> {
+        let mut req = self
+            .http_client
             .post(url)
             .header("authorization", format!("Bearer {key}"))
             .header("content-type", "application/json");
@@ -160,12 +163,12 @@ impl AuthValidator {
             req = req.header("x-gateway-secret", secret);
         }
 
-        let resp = req.send().ok()?;
+        let resp = req.send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }
 
-        let body: serde_json::Value = resp.json().ok()?;
+        let body: serde_json::Value = resp.json().await.ok()?;
         if body.get("valid")?.as_bool()? {
             let ctx = AuthContext {
                 key_id: body
@@ -302,7 +305,7 @@ where
                 },
             };
 
-            if let Some(ctx) = state.auth.validate(&token) {
+            if let Some(ctx) = state.auth.validate(&token).await {
                 req.extensions_mut().insert(ctx);
                 inner.call(req).await
             } else {
@@ -348,28 +351,28 @@ mod tests {
         assert_ne!(hash1, hash2);
     }
 
-    #[test]
-    fn test_auth_validator_accepts_valid_key() {
+    #[tokio::test]
+    async fn test_auth_validator_accepts_valid_key() {
         let validator = AuthValidator::new(&test_config(vec!["psy_testkey12345".into()]));
-        assert!(validator.validate("psy_testkey12345").is_some());
+        assert!(validator.validate("psy_testkey12345").await.is_some());
     }
 
-    #[test]
-    fn test_auth_validator_rejects_invalid_key() {
+    #[tokio::test]
+    async fn test_auth_validator_rejects_invalid_key() {
         let validator = AuthValidator::new(&test_config(vec!["psy_testkey12345".into()]));
-        assert!(validator.validate("psy_wrong_key").is_none());
+        assert!(validator.validate("psy_wrong_key").await.is_none());
     }
 
-    #[test]
-    fn test_auth_validator_rejects_non_psy_prefix() {
+    #[tokio::test]
+    async fn test_auth_validator_rejects_non_psy_prefix() {
         let validator = AuthValidator::new(&test_config(vec!["psy_testkey12345".into()]));
-        assert!(validator.validate("sk_testkey12345").is_none());
+        assert!(validator.validate("sk_testkey12345").await.is_none());
     }
 
-    #[test]
-    fn test_auth_validator_empty_config_rejects_all() {
+    #[tokio::test]
+    async fn test_auth_validator_empty_config_rejects_all() {
         let validator = AuthValidator::new(&test_config(vec![]));
-        assert!(validator.validate("psy_anything").is_none());
+        assert!(validator.validate("psy_anything").await.is_none());
     }
 
     // Ed25519 test key pair generated for unit tests only — not a real secret.
@@ -426,20 +429,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_auth_validator_validates_jwt_with_valid_key() {
+    #[tokio::test]
+    async fn test_auth_validator_validates_jwt_with_valid_key() {
         let validator = validator_with_jwt(vec![]);
         let token = sign_jwt(&valid_claims());
 
         let ctx = validator
             .validate(&token)
+            .await
             .expect("valid JWT should be accepted");
         assert_eq!(ctx.user_id.as_deref(), Some("user_abc123"));
         assert_eq!(ctx.key_id, "oauth:client_xyz");
     }
 
-    #[test]
-    fn test_auth_validator_rejects_expired_jwt() {
+    #[tokio::test]
+    async fn test_auth_validator_rejects_expired_jwt() {
         let validator = validator_with_jwt(vec![]);
         let mut claims = valid_claims();
         // Set expiry in the past.
@@ -447,39 +451,39 @@ mod tests {
         let token = sign_jwt(&claims);
 
         assert!(
-            validator.validate(&token).is_none(),
+            validator.validate(&token).await.is_none(),
             "expired JWT should be rejected"
         );
     }
 
-    #[test]
-    fn test_auth_validator_rejects_wrong_issuer() {
+    #[tokio::test]
+    async fn test_auth_validator_rejects_wrong_issuer() {
         let validator = validator_with_jwt(vec![]);
         let mut claims = valid_claims();
         claims.iss = "https://evil.com".to_string();
         let token = sign_jwt(&claims);
 
         assert!(
-            validator.validate(&token).is_none(),
+            validator.validate(&token).await.is_none(),
             "JWT with wrong issuer should be rejected"
         );
     }
 
-    #[test]
-    fn test_auth_validator_rejects_wrong_audience() {
+    #[tokio::test]
+    async fn test_auth_validator_rejects_wrong_audience() {
         let validator = validator_with_jwt(vec![]);
         let mut claims = valid_claims();
         claims.aud = "https://wrong-audience.com".to_string();
         let token = sign_jwt(&claims);
 
         assert!(
-            validator.validate(&token).is_none(),
+            validator.validate(&token).await.is_none(),
             "JWT with wrong audience should be rejected"
         );
     }
 
-    #[test]
-    fn test_auth_validator_jwt_returns_none_without_public_key() {
+    #[tokio::test]
+    async fn test_auth_validator_jwt_returns_none_without_public_key() {
         // AuthValidator created from config has no jwt_decoding_key (no env var set).
         let validator = AuthValidator::new(&test_config(vec![]));
         assert!(
@@ -489,19 +493,20 @@ mod tests {
 
         let token = sign_jwt(&valid_claims());
         assert!(
-            validator.validate(&token).is_none(),
+            validator.validate(&token).await.is_none(),
             "JWT should not validate when no public key is configured"
         );
     }
 
-    #[test]
-    fn test_auth_validator_prefers_api_key_for_psy_prefix() {
+    #[tokio::test]
+    async fn test_auth_validator_prefers_api_key_for_psy_prefix() {
         // Configure both JWT validation and a valid API key.
         let validator = validator_with_jwt(vec!["psy_testkey12345".to_string()]);
 
         // A psy_ token should go through the API key path, not JWT.
         let ctx = validator
             .validate("psy_testkey12345")
+            .await
             .expect("psy_ key should be validated as API key");
         assert!(
             ctx.user_id.is_none(),
@@ -515,7 +520,7 @@ mod tests {
         // And a psy_ token that is NOT in the valid list should be rejected via
         // the API key path, never falling through to JWT validation.
         assert!(
-            validator.validate("psy_not_a_real_key").is_none(),
+            validator.validate("psy_not_a_real_key").await.is_none(),
             "invalid psy_ key should be rejected even with JWT configured"
         );
     }

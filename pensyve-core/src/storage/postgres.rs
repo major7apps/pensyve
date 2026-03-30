@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use std::future::Future;
+
 use chrono::{DateTime, Utc};
 use sqlx_core::executor::Executor;
 use sqlx_core::query::query;
@@ -161,13 +163,27 @@ impl PostgresBackend {
     }
 
     fn run_schema(&self) -> StorageResult<()> {
-        self.rt.block_on(async {
+        self.block_on(async {
             self.pool
                 .execute(raw_sql(SCHEMA))
                 .await
                 .map_err(sqlx_to_io)?;
             Ok(())
         })
+    }
+
+    /// Execute an async future from a sync context.
+    ///
+    /// If we're already inside a tokio runtime (e.g. the MCP gateway), uses
+    /// `block_in_place` + the current handle to avoid the "cannot start a
+    /// runtime from within a runtime" panic. Otherwise falls back to the
+    /// backend's own runtime.
+    fn block_on<F: Future>(&self, f: F) -> F::Output {
+        if let Ok(handle) = Handle::try_current() {
+            tokio::task::block_in_place(|| handle.block_on(f))
+        } else {
+            self.rt.block_on(f)
+        }
     }
 
     /// Acquire a connection from the pool with the namespace GUC set for RLS
@@ -326,7 +342,7 @@ impl StorageTrait for PostgresBackend {
 
     fn save_namespace(&self, ns: &Namespace) -> StorageResult<()> {
         let metadata = serde_json::to_value(&ns.metadata)?;
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.scoped_conn(ns.id).await?;
             query::<Postgres>(
                 r"INSERT INTO namespaces (id, name, created_at, metadata)
@@ -345,7 +361,7 @@ impl StorageTrait for PostgresBackend {
     }
 
     fn get_namespace(&self, id: Uuid) -> StorageResult<Option<Namespace>> {
-        self.rt.block_on(async {
+        self.block_on(async {
             // Namespace lookups use the namespace's own id for RLS scoping.
             let mut conn = self.scoped_conn(id).await?;
             let row: Option<(Uuid, String, DateTime<Utc>, serde_json::Value)> =
@@ -372,7 +388,7 @@ impl StorageTrait for PostgresBackend {
 
     fn get_namespace_by_name(&self, name: &str) -> StorageResult<Option<Namespace>> {
         let name = name.to_string();
-        self.rt.block_on(async {
+        self.block_on(async {
             // Namespace-by-name lookup: RLS on namespaces table may not filter
             // by pensyve.namespace_id (it applies to memory tables). Use pool
             // directly — namespaces are not tenant-scoped via RLS.
@@ -405,7 +421,7 @@ impl StorageTrait for PostgresBackend {
     fn save_entity(&self, entity: &Entity) -> StorageResult<()> {
         let kind = entity_kind_to_str(&entity.kind);
         let metadata = serde_json::to_value(&entity.metadata)?;
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.scoped_conn(entity.namespace_id).await?;
             query::<Postgres>(
                 r"INSERT INTO entities (id, namespace_id, name, kind, metadata, created_at)
@@ -426,7 +442,7 @@ impl StorageTrait for PostgresBackend {
     }
 
     fn get_entity(&self, id: Uuid) -> StorageResult<Option<Entity>> {
-        self.rt.block_on(async {
+        self.block_on(async {
             // Trait provides only entity id; use default_namespace for RLS if set.
             let mut conn = self.maybe_scoped_conn().await?;
             let row: Option<(Uuid, Uuid, String, String, serde_json::Value, DateTime<Utc>)> =
@@ -455,7 +471,7 @@ impl StorageTrait for PostgresBackend {
 
     fn get_entity_by_name(&self, name: &str, namespace_id: Uuid) -> StorageResult<Option<Entity>> {
         let name = name.to_string();
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let row: Option<(Uuid, Uuid, String, String, serde_json::Value, DateTime<Utc>)> =
                 query_as::<Postgres, _>(
@@ -490,7 +506,7 @@ impl StorageTrait for PostgresBackend {
         let participants = serde_json::to_value(&episode.participants)?;
         let outcome = episode.outcome.as_ref().map(outcome_to_str);
         let metadata = serde_json::to_value(&episode.metadata)?;
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.scoped_conn(episode.namespace_id).await?;
             query::<Postgres>(
                 r"INSERT INTO episodes (id, namespace_id, participants, started_at, ended_at, outcome, metadata)
@@ -513,7 +529,7 @@ impl StorageTrait for PostgresBackend {
     }
 
     fn get_episode(&self, id: Uuid) -> StorageResult<Option<Episode>> {
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.maybe_scoped_conn().await?;
             #[allow(clippy::type_complexity)]
             let row: Option<(
@@ -560,7 +576,7 @@ impl StorageTrait for PostgresBackend {
 
     fn save_episodic(&self, mem: &EpisodicMemory) -> StorageResult<()> {
         let embedding_text = embedding_to_pgtext(&mem.embedding);
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.scoped_conn(mem.namespace_id).await?;
             query::<Postgres>(
                 r"INSERT INTO episodic_memories
@@ -594,7 +610,7 @@ impl StorageTrait for PostgresBackend {
     }
 
     fn get_episodic(&self, id: Uuid) -> StorageResult<Option<EpisodicMemory>> {
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.maybe_scoped_conn().await?;
             let row: Option<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
@@ -617,7 +633,7 @@ impl StorageTrait for PostgresBackend {
         limit: usize,
     ) -> StorageResult<Vec<EpisodicMemory>> {
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.maybe_scoped_conn().await?;
             let rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
@@ -643,7 +659,7 @@ impl StorageTrait for PostgresBackend {
         retrievability: f32,
     ) -> StorageResult<()> {
         let now = Utc::now();
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.maybe_scoped_conn().await?;
             query::<Postgres>(
                 r"UPDATE episodic_memories
@@ -670,7 +686,7 @@ impl StorageTrait for PostgresBackend {
     fn save_semantic(&self, mem: &SemanticMemory) -> StorageResult<()> {
         let embedding_text = embedding_to_pgtext(&mem.embedding);
         let source_episodes = serde_json::to_value(&mem.source_episodes)?;
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.scoped_conn(mem.namespace_id).await?;
             query::<Postgres>(
                 r"INSERT INTO semantic_memories
@@ -703,7 +719,7 @@ impl StorageTrait for PostgresBackend {
     }
 
     fn get_semantic(&self, id: Uuid) -> StorageResult<Option<SemanticMemory>> {
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.maybe_scoped_conn().await?;
             let row: Option<SemanticRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
@@ -725,7 +741,7 @@ impl StorageTrait for PostgresBackend {
         limit: usize,
     ) -> StorageResult<Vec<SemanticMemory>> {
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.maybe_scoped_conn().await?;
             let rows: Vec<SemanticRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
@@ -745,7 +761,7 @@ impl StorageTrait for PostgresBackend {
 
     fn invalidate_semantic(&self, id: Uuid) -> StorageResult<()> {
         let now = Utc::now();
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.maybe_scoped_conn().await?;
             query::<Postgres>("UPDATE semantic_memories SET invalid_at = $1 WHERE id = $2")
                 .bind(now)
@@ -766,7 +782,7 @@ impl StorageTrait for PostgresBackend {
         let outcome = outcome_to_str(&mem.outcome);
         let context = serde_json::to_value(&mem.context)?;
         let source_episodes = serde_json::to_value(&mem.source_episodes)?;
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.scoped_conn(mem.namespace_id).await?;
             query::<Postgres>(
                 r"INSERT INTO procedural_memories
@@ -799,7 +815,7 @@ impl StorageTrait for PostgresBackend {
     }
 
     fn get_procedural(&self, id: Uuid) -> StorageResult<Option<ProceduralMemory>> {
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.maybe_scoped_conn().await?;
             let row: Option<ProceduralRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
@@ -823,7 +839,7 @@ impl StorageTrait for PostgresBackend {
         success_count: u32,
     ) -> StorageResult<()> {
         let now = Utc::now();
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.maybe_scoped_conn().await?;
             query::<Postgres>(
                 r"UPDATE procedural_memories
@@ -856,7 +872,7 @@ impl StorageTrait for PostgresBackend {
         // Use plainto_tsquery which handles stop words and punctuation gracefully.
         let tsquery = query_str.to_string();
 
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut memories = Vec::new();
 
@@ -930,7 +946,7 @@ impl StorageTrait for PostgresBackend {
     // -----------------------------------------------------------------------
 
     fn get_all_memories_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Memory>> {
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut memories = Vec::new();
 
@@ -989,7 +1005,7 @@ impl StorageTrait for PostgresBackend {
     // -----------------------------------------------------------------------
 
     fn delete_memories_by_entity(&self, entity_id: Uuid) -> StorageResult<usize> {
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.maybe_scoped_conn().await?;
             let mut total = 0usize;
 
@@ -1018,7 +1034,7 @@ impl StorageTrait for PostgresBackend {
     }
 
     fn delete_memory_by_id(&self, id: Uuid) -> StorageResult<bool> {
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.maybe_scoped_conn().await?;
             let mut deleted = false;
 
@@ -1060,7 +1076,7 @@ impl StorageTrait for PostgresBackend {
         object: &str,
         confidence: Option<f32>,
     ) -> StorageResult<()> {
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.maybe_scoped_conn().await?;
 
             if let Some(conf) = confidence {
@@ -1095,7 +1111,7 @@ impl StorageTrait for PostgresBackend {
     // -----------------------------------------------------------------------
 
     fn list_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Entity>> {
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let rows: Vec<(Uuid, Uuid, String, String, serde_json::Value, DateTime<Utc>)> =
                 query_as::<Postgres, _>(
@@ -1130,7 +1146,7 @@ impl StorageTrait for PostgresBackend {
 
     fn save_edge(&self, edge: &Edge) -> StorageResult<()> {
         let metadata = serde_json::to_value(&edge.metadata)?;
-        self.rt.block_on(async {
+        self.block_on(async {
             // Edge has no namespace_id field; use default_namespace if configured.
             let mut conn = self.maybe_scoped_conn().await?;
             query::<Postgres>(
@@ -1156,7 +1172,7 @@ impl StorageTrait for PostgresBackend {
     }
 
     fn get_edges_for_entity(&self, entity_id: Uuid) -> StorageResult<Vec<Edge>> {
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.maybe_scoped_conn().await?;
             let rows: Vec<EdgeRow> = query_as::<Postgres, _>(
                 r"SELECT id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata
@@ -1199,7 +1215,7 @@ impl StorageTrait for PostgresBackend {
         &self,
         namespace_id: Uuid,
     ) -> StorageResult<(usize, usize, usize)> {
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
 
             let (episodic,): (i64,) = query_as::<Postgres, _>(
@@ -1231,7 +1247,7 @@ impl StorageTrait for PostgresBackend {
     }
 
     fn count_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
-        self.rt.block_on(async {
+        self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
 
             let (count,): (i64,) =
