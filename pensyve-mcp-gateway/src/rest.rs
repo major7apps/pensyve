@@ -634,8 +634,9 @@ async fn inspect(
     let ps = get_pensyve_state(&state, &auth_ctx)?;
     let limit = body.limit.unwrap_or(50);
 
-    // No entity specified → return all memories in the namespace.
-    if body.entity.is_none() {
+    // No entity specified (or empty string) → return all memories in the namespace.
+    let entity_filter = body.entity.as_deref().filter(|s| !s.is_empty());
+    if entity_filter.is_none() {
         let mut episodic = Vec::new();
         let mut semantic = Vec::new();
         let mut procedural = Vec::new();
@@ -646,12 +647,22 @@ async fn inspect(
                 if count >= limit {
                     break;
                 }
-                let mut val = serde_json::to_value(&mem).unwrap_or_default();
-                strip_embedding(&mut val);
                 match mem {
-                    Memory::Episodic(_) => episodic.push(val),
-                    Memory::Semantic(_) => semantic.push(val),
-                    Memory::Procedural(_) => procedural.push(val),
+                    Memory::Episodic(inner) => {
+                        let mut val = serde_json::to_value(&inner).unwrap_or_default();
+                        strip_embedding(&mut val);
+                        episodic.push(val);
+                    }
+                    Memory::Semantic(inner) => {
+                        let mut val = serde_json::to_value(&inner).unwrap_or_default();
+                        strip_embedding(&mut val);
+                        semantic.push(val);
+                    }
+                    Memory::Procedural(inner) => {
+                        let mut val = serde_json::to_value(&inner).unwrap_or_default();
+                        strip_embedding(&mut val);
+                        procedural.push(val);
+                    }
                 }
                 count += 1;
             }
@@ -665,7 +676,7 @@ async fn inspect(
         }));
     }
 
-    let entity_name = body.entity.as_deref().unwrap();
+    let entity_name = entity_filter.unwrap();
     let entity = match ps.storage.get_entity_by_name(entity_name, ps.namespace.id) {
         Ok(Some(e)) => e,
         Ok(None) => {
