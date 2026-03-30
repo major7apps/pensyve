@@ -89,7 +89,7 @@ impl PensyveMcpServer {
             return Err("min_confidence must be between 0.0 and 1.0".to_string());
         }
 
-        let limit = params.limit.unwrap_or(5) as usize;
+        let limit = params.limit.unwrap_or(5).clamp(1, 100) as usize;
         let state = &self.state;
 
         // Hold the mutex only for the retrieval phase, not JSON serialization.
@@ -342,7 +342,7 @@ impl PensyveMcpServer {
         Parameters(params): Parameters<InspectParams>,
     ) -> Result<String, String> {
         let state = &self.state;
-        let limit = params.limit.unwrap_or(20) as usize;
+        let limit = params.limit.unwrap_or(20).clamp(1, 100) as usize;
 
         let entity = match state
             .storage
@@ -432,18 +432,14 @@ impl PensyveMcpServer {
                 }
             }
         } else {
-            // Global stats for the namespace
-            if let Ok(memories) = state.storage.get_all_memories_by_namespace(ns.id) {
-                for mem in &memories {
-                    match mem {
-                        Memory::Semantic(_) => semantic_count += 1,
-                        Memory::Episodic(_) => episodic_count += 1,
-                        Memory::Procedural(_) => {}
-                    }
-                }
+            // Global stats for the namespace — use count queries to avoid
+            // loading all memories into memory (DoS risk on large namespaces).
+            if let Ok((ep, sem, _proc)) = state.storage.count_memories_by_namespace(ns.id) {
+                episodic_count = ep;
+                semantic_count = sem;
             }
-            if let Ok(entities) = state.storage.list_entities_by_namespace(ns.id) {
-                entity_count = entities.len();
+            if let Ok(count) = state.storage.count_entities_by_namespace(ns.id) {
+                entity_count = count;
             }
         }
 
