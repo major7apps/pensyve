@@ -124,17 +124,45 @@ cargo build --release --bin pensyve-mcp
 
 ### Claude Code Plugin
 
-Full cognitive memory layer for Claude Code — install from the marketplace or manually.
+Full cognitive memory layer for Claude Code with 6 commands, 4 skills, 2 agents, and 4 lifecycle hooks.
+
+**Pensyve Cloud** (no build required):
 
 ```
-pensyve-plugin/
+/plugin marketplace add major7apps/pensyve/integrations/claude-code
+/plugin install pensyve@pensyve
+```
+
+Then set your API key:
+
+```bash
+export PENSYVE_API_KEY="your-api-key-here"
+```
+
+**Pensyve Local** (self-hosted, no API key needed):
+
+Build the MCP binary first (see [Install](#install)), then override the MCP config in your `.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "command": "pensyve-mcp",
+      "args": ["--stdio"]
+    }
+  }
+}
+```
+
+```
+Plugin contents:
 ├── 6 slash commands   /remember, /recall, /forget, /inspect, /consolidate, /memory-status
 ├── 4 skills           session-memory, memory-informed-refactor, context-loader, memory-review
 ├── 2 agents           memory-curator (background), context-researcher (on-demand)
 └── 4 hooks            SessionStart, Stop, PreCompact, UserPromptSubmit
 ```
 
-See [`integrations/claude-code/README.md`](integrations/claude-code/README.md) for details.
+See [`integrations/claude-code/README.md`](integrations/claude-code/README.md) for full documentation.
 
 ### REST API
 

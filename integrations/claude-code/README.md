@@ -26,17 +26,6 @@ SQLite + ONNX embeddings + vector index
 
 ## Quick Start
 
-### Prerequisites
-
-1. **Build the pensyve-mcp binary:**
-   ```bash
-   git clone https://github.com/major7apps/pensyve
-   cd pensyve
-   cargo build --release -p pensyve-mcp
-   ```
-
-2. **Add the binary to your PATH** or set the full path in `.mcp.json`.
-
 ### Install the Plugin
 
 In Claude Code, add the marketplace and install:
@@ -47,6 +36,43 @@ In Claude Code, add the marketplace and install:
 ```
 
 Then restart Claude Code.
+
+### Connect to Pensyve
+
+The plugin needs a running Pensyve MCP server. Choose one:
+
+**Pensyve Cloud** (managed service — no setup required):
+
+1. Sign up at [pensyve.com](https://pensyve.com) and grab your API key
+2. Set your API key so the plugin can authenticate:
+   ```bash
+   export PENSYVE_API_KEY="your-api-key-here"
+   ```
+   Or add it to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
+
+The plugin ships pre-configured for Pensyve Cloud — once your API key is set, you're ready to go.
+
+**Pensyve Local** (self-hosted — runs entirely on your machine):
+
+1. Build the MCP binary:
+   ```bash
+   git clone https://github.com/major7apps/pensyve
+   cd pensyve
+   cargo build --release -p pensyve-mcp
+   ```
+2. Add the binary to your PATH, then override the plugin's MCP config by adding this to your project or user `.claude/settings.json`:
+   ```json
+   {
+     "mcpServers": {
+       "pensyve": {
+         "command": "pensyve-mcp",
+         "args": ["--stdio"]
+       }
+     }
+   }
+   ```
+
+No API key needed — all data stays on your machine in SQLite.
 
 ### Configure (Optional)
 
@@ -128,8 +154,9 @@ All settings are configured in `pensyve-plugin.local.md` (copy to your project r
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `PENSYVE_API_KEY` | — | API key for Pensyve Cloud (not needed for local) |
 | `PENSYVE_NAMESPACE` | `default` | Memory namespace (overrides config file) |
-| `PENSYVE_PATH` | `~/.pensyve/default` | Storage directory path |
+| `PENSYVE_PATH` | `~/.pensyve/default` | Storage directory path (local only) |
 
 ## MCP Tools
 
