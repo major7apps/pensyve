@@ -13,6 +13,7 @@ Universal memory runtime for AI agents -- recall, remember, and inspect memories
 ## Setup
 
 1. Start the Pensyve REST API server:
+
    ```bash
    cd /path/to/pensyve
    ```
@@ -25,12 +26,12 @@ Universal memory runtime for AI agents -- recall, remember, and inspect memories
 
 Open the command palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and search for:
 
-| Command | Description |
-|---|---|
-| `Pensyve: Recall Memories` | Search memories with a natural language query |
-| `Pensyve: Remember Fact` | Store a new fact for an entity |
-| `Pensyve: Memory Stats` | Display memory statistics |
-| `Pensyve: Consolidate Memories` | Run memory consolidation |
+| Command                         | Description                                   |
+| ------------------------------- | --------------------------------------------- |
+| `Pensyve: Recall Memories`      | Search memories with a natural language query |
+| `Pensyve: Remember Fact`        | Store a new fact for an entity                |
+| `Pensyve: Memory Stats`         | Display memory statistics                     |
+| `Pensyve: Consolidate Memories` | Run memory consolidation                      |
 
 ## Development
 

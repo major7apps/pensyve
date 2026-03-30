@@ -44,37 +44,37 @@ await episode.end({ summary: "Discussed deployment strategy" });
 
 ### `new Pensyve(config)`
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `baseUrl` | `string` | `"http://localhost:8000"` | Pensyve API URL |
-| `apiKey` | `string` | — | API key (`psy_...`) for authenticated access |
-| `namespace` | `string` | `"default"` | Memory namespace |
-| `timeout` | `number` | `30000` | Request timeout in ms |
+| Option      | Type     | Default                   | Description                                  |
+| ----------- | -------- | ------------------------- | -------------------------------------------- |
+| `baseUrl`   | `string` | `"http://localhost:8000"` | Pensyve API URL                              |
+| `apiKey`    | `string` | —                         | API key (`psy_...`) for authenticated access |
+| `namespace` | `string` | `"default"`               | Memory namespace                             |
+| `timeout`   | `number` | `30000`                   | Request timeout in ms                        |
 
 ### Core Methods
 
-| Method | Description |
-|--------|-------------|
-| `recall(query, options?)` | Search memories with 8-signal fusion retrieval |
-| `remember(entity, fact, confidence?)` | Store a new memory |
-| `forget(entity, hardDelete?)` | Remove an entity's memories |
-| `inspect(entity, options?)` | View an entity's memory details |
-| `consolidate()` | Trigger background memory consolidation |
-| `health()` | Check API health status |
+| Method                                | Description                                    |
+| ------------------------------------- | ---------------------------------------------- |
+| `recall(query, options?)`             | Search memories with 8-signal fusion retrieval |
+| `remember(entity, fact, confidence?)` | Store a new memory                             |
+| `forget(entity, hardDelete?)`         | Remove an entity's memories                    |
+| `inspect(entity, options?)`           | View an entity's memory details                |
+| `consolidate()`                       | Trigger background memory consolidation        |
+| `health()`                            | Check API health status                        |
 
 ### Episodes
 
-| Method | Description |
-|--------|-------------|
+| Method                       | Description                           |
+| ---------------------------- | ------------------------------------- |
 | `startEpisode(participants)` | Begin tracking a conversation episode |
-| `episode.end(options?)` | End the episode with optional summary |
+| `episode.end(options?)`      | End the episode with optional summary |
 
 ### Observability
 
-| Method | Description |
-|--------|-------------|
-| `activity(days?)` | Get memory activity over N days |
-| `recentActivity(limit?)` | Get recent memory events |
+| Method                   | Description                     |
+| ------------------------ | ------------------------------- |
+| `activity(days?)`        | Get memory activity over N days |
+| `recentActivity(limit?)` | Get recent memory events        |
 
 ## Pensyve Cloud
 

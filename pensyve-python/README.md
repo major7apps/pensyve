@@ -166,7 +166,11 @@ HTTP client with timeout, retry, and structured errors.
 ```typescript
 import { Pensyve } from "pensyve";
 
-const p = new Pensyve({ baseUrl: "http://localhost:3000", timeoutMs: 10000, retries: 2 });
+const p = new Pensyve({
+  baseUrl: "http://localhost:3000",
+  timeoutMs: 10000,
+  retries: 2,
+});
 await p.remember({ entity: "seth", fact: "Likes TypeScript", confidence: 0.9 });
 const memories = await p.recall("programming", { entity: "seth" });
 ```
@@ -318,24 +322,24 @@ python benchmarks/tuning/optimize.py --maxiter 50
 
 ## Competitive Landscape
 
-| Feature | Pensyve | Mem0 | Zep | Honcho |
-|---------|---------|------|-----|--------|
-| Offline-first (no cloud required) | **Yes** | No | No | No |
-| Procedural memory (learns from outcomes) | **Yes** | No | No | No |
-| Multi-signal fusion scoring | **8 signals** | 1 | 3 | 1 |
-| Retrieval-induced reinforcement (FSRS) | **Yes** | No | No | No |
-| Intent-aware retrieval | **Yes** | No | No | No |
-| Multimodal content types | **Yes** | Text only | Text only | Text only |
-| RBAC memory mesh | **Yes** | No | No | No |
-| Cross-platform local LLM extraction | **Yes** | No | Cloud only | Cloud only |
-| MCP server | **Yes** | No | No | Plugin |
-| Claude Code plugin | **Yes** | No | No | No |
-| VS Code extension | **Yes** | No | No | No |
-| Framework integrations | **5** | 3 | 1 | 1 |
-| Postgres backend | **Yes** (feature-gated) | Yes | Yes | Yes |
-| Go SDK | **Yes** | No | No | No |
-| WASM build | **Yes** | No | No | No |
-| Open source engine | Apache 2.0 | Yes | Partial | Yes |
+| Feature                                  | Pensyve                 | Mem0      | Zep        | Honcho     |
+| ---------------------------------------- | ----------------------- | --------- | ---------- | ---------- |
+| Offline-first (no cloud required)        | **Yes**                 | No        | No         | No         |
+| Procedural memory (learns from outcomes) | **Yes**                 | No        | No         | No         |
+| Multi-signal fusion scoring              | **8 signals**           | 1         | 3          | 1          |
+| Retrieval-induced reinforcement (FSRS)   | **Yes**                 | No        | No         | No         |
+| Intent-aware retrieval                   | **Yes**                 | No        | No         | No         |
+| Multimodal content types                 | **Yes**                 | Text only | Text only  | Text only  |
+| RBAC memory mesh                         | **Yes**                 | No        | No         | No         |
+| Cross-platform local LLM extraction      | **Yes**                 | No        | Cloud only | Cloud only |
+| MCP server                               | **Yes**                 | No        | No         | Plugin     |
+| Claude Code plugin                       | **Yes**                 | No        | No         | No         |
+| VS Code extension                        | **Yes**                 | No        | No         | No         |
+| Framework integrations                   | **5**                   | 3         | 1          | 1          |
+| Postgres backend                         | **Yes** (feature-gated) | Yes       | Yes        | Yes        |
+| Go SDK                                   | **Yes**                 | No        | No         | No         |
+| WASM build                               | **Yes**                 | No        | No         | No         |
+| Open source engine                       | Apache 2.0              | Yes       | Partial    | Yes        |
 
 ## License
 

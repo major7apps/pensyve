@@ -67,26 +67,26 @@ memory = PensyveMemory(namespace="my-app", mode="cloud")
 
 ### `PensyveMemory(namespace, entity, **kwargs)`
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `namespace` | `str` | `"default"` | Pensyve namespace for isolation |
-| `entity` | `str` | `"autogen-agent"` | Entity name for this agent's memories |
-| `path` | `str \| None` | `None` | Storage directory (local mode) |
-| `mode` | `str` | `"auto"` | `"auto"`, `"local"`, or `"cloud"` |
-| `api_key` | `str \| None` | `None` | API key for cloud mode |
-| `base_url` | `str \| None` | `None` | Cloud server URL |
-| `recall_limit` | `int` | `5` | Default number of memories to retrieve |
-| `confidence` | `float` | `0.85` | Default confidence for stored memories |
+| Parameter      | Type          | Default           | Description                            |
+| -------------- | ------------- | ----------------- | -------------------------------------- |
+| `namespace`    | `str`         | `"default"`       | Pensyve namespace for isolation        |
+| `entity`       | `str`         | `"autogen-agent"` | Entity name for this agent's memories  |
+| `path`         | `str \| None` | `None`            | Storage directory (local mode)         |
+| `mode`         | `str`         | `"auto"`          | `"auto"`, `"local"`, or `"cloud"`      |
+| `api_key`      | `str \| None` | `None`            | API key for cloud mode                 |
+| `base_url`     | `str \| None` | `None`            | Cloud server URL                       |
+| `recall_limit` | `int`         | `5`               | Default number of memories to retrieve |
+| `confidence`   | `float`       | `0.85`            | Default confidence for stored memories |
 
 ### Async Methods (AutoGen Memory ABC)
 
-| Method | Description |
-|--------|-------------|
-| `await add(content)` | Store a `MemoryContent` as a Pensyve fact |
-| `await query(query, **kwargs)` | Search memories, returns `MemoryQueryResult` |
+| Method                                | Description                                  |
+| ------------------------------------- | -------------------------------------------- |
+| `await add(content)`                  | Store a `MemoryContent` as a Pensyve fact    |
+| `await query(query, **kwargs)`        | Search memories, returns `MemoryQueryResult` |
 | `await update_context(model_context)` | Inject relevant memories as a system message |
-| `await clear()` | Delete all memories for the entity |
-| `await close()` | Clean up resources (no-op for local mode) |
+| `await clear()`                       | Delete all memories for the entity           |
+| `await close()`                       | Clean up resources (no-op for local mode)    |
 
 ## Running Tests
 

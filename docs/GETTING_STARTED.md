@@ -2,18 +2,18 @@
 
 Choose your path based on how you want to use Pensyve.
 
-| I want to... | Start here |
-|--------------|------------|
-| Add memory to Claude Code | [Claude Code Plugin](#claude-code-plugin) |
-| Add memory to Cursor, Cline, or another MCP client | [MCP Server](#mcp-server) |
-| Build a Python agent with memory | [Python SDK](#python-sdk) |
-| Build a TypeScript agent with memory | [TypeScript SDK](#typescript-sdk) |
-| Build a Go agent with memory | [Go SDK](#go-sdk) |
-| Add memory to LangChain/LangGraph | [LangChain Integration](#langchain--langgraph) |
-| Add memory to CrewAI | [CrewAI Integration](#crewai) |
-| Add memory to AutoGen | [AutoGen Integration](#autogen) |
-| Use the REST API directly | [REST API](#rest-api) |
-| Run everything locally from source | [Building from Source](#building-from-source) |
+| I want to...                                       | Start here                                     |
+| -------------------------------------------------- | ---------------------------------------------- |
+| Add memory to Claude Code                          | [Claude Code Plugin](#claude-code-plugin)      |
+| Add memory to Cursor, Cline, or another MCP client | [MCP Server](#mcp-server)                      |
+| Build a Python agent with memory                   | [Python SDK](#python-sdk)                      |
+| Build a TypeScript agent with memory               | [TypeScript SDK](#typescript-sdk)              |
+| Build a Go agent with memory                       | [Go SDK](#go-sdk)                              |
+| Add memory to LangChain/LangGraph                  | [LangChain Integration](#langchain--langgraph) |
+| Add memory to CrewAI                               | [CrewAI Integration](#crewai)                  |
+| Add memory to AutoGen                              | [AutoGen Integration](#autogen)                |
+| Use the REST API directly                          | [REST API](#rest-api)                          |
+| Run everything locally from source                 | [Building from Source](#building-from-source)  |
 
 ---
 
@@ -90,13 +90,13 @@ Add to your client's MCP config (the exact file varies by client):
 }
 ```
 
-| Client | Config file |
-|--------|-------------|
-| Cursor | `.cursor/mcp.json` |
-| Cline | Cline settings → MCP Servers |
-| Continue | `~/.continue/config.json` |
-| Windsurf | `~/.codeium/windsurf/mcp_config.json` |
-| VS Code Copilot | `.vscode/mcp.json` |
+| Client          | Config file                           |
+| --------------- | ------------------------------------- |
+| Cursor          | `.cursor/mcp.json`                    |
+| Cline           | Cline settings → MCP Servers          |
+| Continue        | `~/.continue/config.json`             |
+| Windsurf        | `~/.codeium/windsurf/mcp_config.json` |
+| VS Code Copilot | `.vscode/mcp.json`                    |
 
 ### Local
 
@@ -118,16 +118,16 @@ Build: `cargo build --release -p pensyve-mcp`
 
 ### Tools exposed
 
-| Tool | Description |
-|------|-------------|
-| `pensyve_recall` | Search memories by semantic similarity |
-| `pensyve_remember` | Store a fact as semantic memory |
-| `pensyve_episode_start` | Begin tracking an interaction |
-| `pensyve_episode_end` | Close an episode with outcome |
-| `pensyve_forget` | Delete an entity's memories |
-| `pensyve_inspect` | List memories for an entity |
-| `pensyve_status` | Connection and memory stats |
-| `pensyve_account` | Plan and usage info |
+| Tool                    | Description                            |
+| ----------------------- | -------------------------------------- |
+| `pensyve_recall`        | Search memories by semantic similarity |
+| `pensyve_remember`      | Store a fact as semantic memory        |
+| `pensyve_episode_start` | Begin tracking an interaction          |
+| `pensyve_episode_end`   | Close an episode with outcome          |
+| `pensyve_forget`        | Delete an entity's memories            |
+| `pensyve_inspect`       | List memories for an entity            |
+| `pensyve_status`        | Connection and memory stats            |
+| `pensyve_account`       | Plan and usage info                    |
 
 ---
 
@@ -169,11 +169,11 @@ p.consolidate()
 
 ### Key classes
 
-| Class | Purpose |
-|-------|---------|
+| Class     | Purpose                                                     |
+| --------- | ----------------------------------------------------------- |
 | `Pensyve` | Main entry point — namespace, recall, remember, consolidate |
-| `Entity` | A named subject of memories (user, agent, service) |
-| `Episode` | Context manager for bounded interaction sequences |
+| `Entity`  | A named subject of memories (user, agent, service)          |
+| `Episode` | Context manager for bounded interaction sequences           |
 
 ---
 
@@ -195,14 +195,18 @@ bun add pensyve
 import { Pensyve } from "pensyve";
 
 const p = new Pensyve({
-  baseUrl: "http://localhost:3000",  // local gateway
+  baseUrl: "http://localhost:3000", // local gateway
   // Or Pensyve Cloud:
   // baseUrl: "https://api.pensyve.com",
   // apiKey: "psy_your_key",
 });
 
 // Remember
-await p.remember({ entity: "user", fact: "Prefers dark mode", confidence: 0.9 });
+await p.remember({
+  entity: "user",
+  fact: "Prefers dark mode",
+  confidence: 0.9,
+});
 
 // Recall
 const memories = await p.recall("color preferences", { entity: "user" });
@@ -393,17 +397,17 @@ curl http://localhost:3000/v1/health
 
 ### Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/recall` | Search memories |
-| `POST` | `/v1/remember` | Store a memory |
-| `POST` | `/v1/inspect` | View entity memories |
-| `POST` | `/v1/consolidate` | Trigger consolidation |
-| `POST` | `/v1/entities` | Create an entity |
+| Method   | Path                  | Description              |
+| -------- | --------------------- | ------------------------ |
+| `POST`   | `/v1/recall`          | Search memories          |
+| `POST`   | `/v1/remember`        | Store a memory           |
+| `POST`   | `/v1/inspect`         | View entity memories     |
+| `POST`   | `/v1/consolidate`     | Trigger consolidation    |
+| `POST`   | `/v1/entities`        | Create an entity         |
 | `DELETE` | `/v1/entities/{name}` | Delete entity + memories |
-| `GET` | `/v1/stats` | Memory statistics |
-| `GET` | `/v1/health` | Health check |
-| `GET` | `/metrics` | Prometheus metrics |
+| `GET`    | `/v1/stats`           | Memory statistics        |
+| `GET`    | `/v1/health`          | Health check             |
+| `GET`    | `/metrics`            | Prometheus metrics       |
 
 ### Authentication
 
@@ -465,11 +469,11 @@ cd pensyve-go && go test ./...            # Go
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PENSYVE_API_KEY` | — | Cloud API key (`psy_...`) |
-| `PENSYVE_NAMESPACE` | `default` | Memory namespace |
-| `PENSYVE_PATH` | `~/.pensyve/<namespace>` | Local storage directory |
-| `PENSYVE_API_KEYS` | — | Gateway auth keys (comma-separated) |
-| `PENSYVE_REMOTE_URL` | — | Remote server URL |
-| `RUST_LOG` | `pensyve=info` | Tracing filter |
+| Variable             | Default                  | Description                         |
+| -------------------- | ------------------------ | ----------------------------------- |
+| `PENSYVE_API_KEY`    | —                        | Cloud API key (`psy_...`)           |
+| `PENSYVE_NAMESPACE`  | `default`                | Memory namespace                    |
+| `PENSYVE_PATH`       | `~/.pensyve/<namespace>` | Local storage directory             |
+| `PENSYVE_API_KEYS`   | —                        | Gateway auth keys (comma-separated) |
+| `PENSYVE_REMOTE_URL` | —                        | Remote server URL                   |
+| `RUST_LOG`           | `pensyve=info`           | Tracing filter                      |

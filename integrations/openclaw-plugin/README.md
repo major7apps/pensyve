@@ -60,15 +60,15 @@ Set Pensyve as the memory provider:
 
 ### Configuration Reference
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `baseUrl` | `string` | `http://localhost:8000` | Pensyve API URL |
-| `apiKey` | `string` | — | API key (optional for local deployments) |
-| `entity` | `string` | `openclaw-agent` | Entity name for memory storage |
-| `namespace` | `string` | `openclaw` | Memory namespace for isolation |
-| `autoRecall` | `boolean` | `true` | Inject memories before each turn |
-| `autoCapture` | `boolean` | `true` | Store conversation context after each turn |
-| `recallLimit` | `number` | `5` | Max memories to recall per turn |
+| Option        | Type      | Default                 | Description                                |
+| ------------- | --------- | ----------------------- | ------------------------------------------ |
+| `baseUrl`     | `string`  | `http://localhost:8000` | Pensyve API URL                            |
+| `apiKey`      | `string`  | —                       | API key (optional for local deployments)   |
+| `entity`      | `string`  | `openclaw-agent`        | Entity name for memory storage             |
+| `namespace`   | `string`  | `openclaw`              | Memory namespace for isolation             |
+| `autoRecall`  | `boolean` | `true`                  | Inject memories before each turn           |
+| `autoCapture` | `boolean` | `true`                  | Store conversation context after each turn |
+| `recallLimit` | `number`  | `5`                     | Max memories to recall per turn            |
 
 ## How It Works
 
@@ -101,15 +101,15 @@ The plugin registers four tools that the agent can call explicitly:
 
 ## Comparison with Default memory-core
 
-| Feature | memory-core | Pensyve |
-|---------|------------|---------|
-| Storage | Markdown files | SQLite + vector index |
-| Search | BM25 only | 8-signal fusion |
-| Memory types | Flat text | Episodic + Semantic + Procedural |
-| Retrieval quality | Keyword match | Semantic + BM25 + graph + reranker |
-| Offline | Yes | Yes |
-| Cross-encoder reranking | No | Yes (BGE) |
-| Forgetting curve | No | FSRS-based |
+| Feature                 | memory-core    | Pensyve                            |
+| ----------------------- | -------------- | ---------------------------------- |
+| Storage                 | Markdown files | SQLite + vector index              |
+| Search                  | BM25 only      | 8-signal fusion                    |
+| Memory types            | Flat text      | Episodic + Semantic + Procedural   |
+| Retrieval quality       | Keyword match  | Semantic + BM25 + graph + reranker |
+| Offline                 | Yes            | Yes                                |
+| Cross-encoder reranking | No             | Yes (BGE)                          |
+| Forgetting curve        | No             | FSRS-based                         |
 
 ## License
 

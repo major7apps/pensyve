@@ -67,11 +67,11 @@ graph = builder.compile(store=store)
 
 The store auto-detects which mode to use:
 
-| Condition | Mode | Backend |
-|-----------|------|---------|
-| No API key set | **Local** | Pensyve PyO3 engine (zero latency) |
-| `PENSYVE_API_KEY` env var set | **Cloud** | Pensyve REST API |
-| `api_key=` argument passed | **Cloud** | Pensyve REST API |
+| Condition                     | Mode      | Backend                            |
+| ----------------------------- | --------- | ---------------------------------- |
+| No API key set                | **Local** | Pensyve PyO3 engine (zero latency) |
+| `PENSYVE_API_KEY` env var set | **Cloud** | Pensyve REST API                   |
+| `api_key=` argument passed    | **Cloud** | Pensyve REST API                   |
 
 ```python
 # Local mode (default)
@@ -89,22 +89,22 @@ store = PensyveStore()
 
 ### `PensyveStore(namespace, path, api_key, base_url)`
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `namespace` | `str` | `"default"` | Pensyve namespace for isolation |
-| `path` | `str \| None` | `None` | Local storage directory (local mode) |
-| `api_key` | `str \| None` | `None` | Cloud API key (falls back to `PENSYVE_API_KEY`) |
-| `base_url` | `str \| None` | `None` | Override cloud API URL |
+| Parameter   | Type          | Default     | Description                                     |
+| ----------- | ------------- | ----------- | ----------------------------------------------- |
+| `namespace` | `str`         | `"default"` | Pensyve namespace for isolation                 |
+| `path`      | `str \| None` | `None`      | Local storage directory (local mode)            |
+| `api_key`   | `str \| None` | `None`      | Cloud API key (falls back to `PENSYVE_API_KEY`) |
+| `base_url`  | `str \| None` | `None`      | Override cloud API URL                          |
 
 ### Methods
 
-| Method | Description |
-|--------|-------------|
-| `put(namespace, key, value)` | Store a dict under namespace/key |
-| `get(namespace, key)` | Get a single item by key, or `None` |
-| `search(namespace, *, query, filter, limit)` | Semantic search within a namespace |
-| `delete(namespace, key)` | Delete memories for a namespace entity |
-| `list_namespaces(*, prefix, limit, offset)` | List known namespaces |
+| Method                                       | Description                            |
+| -------------------------------------------- | -------------------------------------- |
+| `put(namespace, key, value)`                 | Store a dict under namespace/key       |
+| `get(namespace, key)`                        | Get a single item by key, or `None`    |
+| `search(namespace, *, query, filter, limit)` | Semantic search within a namespace     |
+| `delete(namespace, key)`                     | Delete memories for a namespace entity |
+| `list_namespaces(*, prefix, limit, offset)`  | List known namespaces                  |
 
 All methods have async variants prefixed with `a` (e.g. `aput`, `aget`).
 
@@ -112,14 +112,14 @@ All methods have async variants prefixed with `a` (e.g. `aput`, `aget`).
 
 Returned by `get()` and `search()`. Matches `langgraph.store.base.Item`.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `namespace` | `tuple[str, ...]` | The namespace tuple |
-| `key` | `str` | The item key |
-| `value` | `dict[str, Any]` | The stored value dict |
-| `created_at` | `float` | Unix timestamp |
-| `updated_at` | `float` | Unix timestamp |
-| `score` | `float \| None` | Retrieval relevance score |
+| Field        | Type              | Description               |
+| ------------ | ----------------- | ------------------------- |
+| `namespace`  | `tuple[str, ...]` | The namespace tuple       |
+| `key`        | `str`             | The item key              |
+| `value`      | `dict[str, Any]`  | The stored value dict     |
+| `created_at` | `float`           | Unix timestamp            |
+| `updated_at` | `float`           | Unix timestamp            |
+| `score`      | `float \| None`   | Retrieval relevance score |
 
 ## Running Tests
 
@@ -132,8 +132,8 @@ pytest tests/ -v
 
 LangGraph namespace tuples are joined with `/` to form Pensyve entity names:
 
-| LangGraph namespace | Pensyve entity |
-|---------------------|----------------|
+| LangGraph namespace        | Pensyve entity      |
+| -------------------------- | ------------------- |
 | `("user_123", "memories")` | `user_123/memories` |
-| `("global",)` | `global` |
-| `()` | `default` |
+| `("global",)`              | `global`            |
+| `()`                       | `default`           |

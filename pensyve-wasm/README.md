@@ -35,7 +35,7 @@ wasm-pack build --target web
 ## API
 
 ```javascript
-import init, { PensyveWasm } from './pkg/pensyve_wasm';
+import init, { PensyveWasm } from "./pkg/pensyve_wasm";
 
 await init();
 const p = new PensyveWasm();

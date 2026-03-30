@@ -21,12 +21,15 @@ gemini mcp add --transport http pensyve https://mcp.pensyve.com/mcp
 The extension needs a Pensyve API key. Choose one method:
 
 **Option A** — environment variable (recommended):
+
 ```bash
 export PENSYVE_API_KEY="psy_your_key"
 ```
+
 Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
 
 **Option B** — via Gemini CLI:
+
 ```bash
 gemini extensions configure pensyve
 ```
@@ -35,34 +38,34 @@ Get an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/a
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| `/remember <fact>` | Store a fact, decision, or pattern in persistent memory |
-| `/recall <query>` | Search memories by semantic similarity |
-| `/forget <entity>` | Delete all memories for an entity (with confirmation) |
-| `/inspect [entity]` | View all memories grouped by type for an entity |
+| Command             | Description                                             |
+| ------------------- | ------------------------------------------------------- |
+| `/remember <fact>`  | Store a fact, decision, or pattern in persistent memory |
+| `/recall <query>`   | Search memories by semantic similarity                  |
+| `/forget <entity>`  | Delete all memories for an entity (with confirmation)   |
+| `/inspect [entity]` | View all memories grouped by type for an entity         |
 
 ## Skills
 
-| Skill | When to Use |
-|-------|-------------|
-| `session-memory` | End of a work session -- captures decisions and outcomes for long-term storage |
+| Skill                      | When to Use                                                                       |
+| -------------------------- | --------------------------------------------------------------------------------- |
+| `session-memory`           | End of a work session -- captures decisions and outcomes for long-term storage    |
 | `memory-informed-refactor` | Before refactoring -- loads relevant prior context, decisions, and known pitfalls |
-| `context-loader` | Session start or context switch -- loads historical context for continuity |
-| `memory-review` | Periodic -- finds stale facts, contradictions, and cleanup opportunities |
+| `context-loader`           | Session start or context switch -- loads historical context for continuity        |
+| `memory-review`            | Periodic -- finds stale facts, contradictions, and cleanup opportunities          |
 
 ## MCP Tools
 
 The extension connects to the Pensyve remote MCP server, which exposes 6 tools:
 
-| Tool | Parameters | Returns |
-|------|-----------|---------|
-| `pensyve_recall` | `query`, `entity?`, `types?`, `limit?` | Ranked array of memories with scores |
-| `pensyve_remember` | `entity`, `fact`, `confidence?` | Stored memory object |
-| `pensyve_episode_start` | `participants` | `episode_id`, `started_at` |
-| `pensyve_episode_end` | `episode_id`, `outcome?` | `memories_created` count |
-| `pensyve_forget` | `entity`, `hard_delete?` | `forgotten_count` |
-| `pensyve_inspect` | `entity`, `memory_type?`, `limit?` | Array of memories with stats |
+| Tool                    | Parameters                             | Returns                              |
+| ----------------------- | -------------------------------------- | ------------------------------------ |
+| `pensyve_recall`        | `query`, `entity?`, `types?`, `limit?` | Ranked array of memories with scores |
+| `pensyve_remember`      | `entity`, `fact`, `confidence?`        | Stored memory object                 |
+| `pensyve_episode_start` | `participants`                         | `episode_id`, `started_at`           |
+| `pensyve_episode_end`   | `episode_id`, `outcome?`               | `memories_created` count             |
+| `pensyve_forget`        | `entity`, `hard_delete?`               | `forgotten_count`                    |
+| `pensyve_inspect`       | `entity`, `memory_type?`, `limit?`     | Array of memories with stats         |
 
 ## Context File
 

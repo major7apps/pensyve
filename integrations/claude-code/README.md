@@ -47,12 +47,15 @@ The plugin needs a running Pensyve MCP server. Choose one:
 2. Supply your API key using either method:
 
    **Option A** — environment variable (recommended):
+
    ```bash
    export PENSYVE_API_KEY="your-api-key-here"
    ```
+
    Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
 
    **Option B** — inline in `.claude/settings.json`:
+
    ```json
    {
      "mcpServers": {
@@ -95,11 +98,11 @@ No API key needed — all data stays on your machine in SQLite.
 Copy `pensyve-plugin.local.md` to your project root and edit:
 
 ```yaml
-namespace: "my-project"        # Scope memories to this project
-auto_capture: false            # Enable background memory curation
+namespace: "my-project" # Scope memories to this project
+auto_capture: false # Enable background memory curation
 consolidation_frequency: manual
-context_loading: summary       # Load memories at session start
-prompt_enrichment: false       # Enrich prompts with memory (power user)
+context_loading: summary # Load memories at session start
+prompt_enrichment: false # Enrich prompts with memory (power user)
 ```
 
 ### Try It Out
@@ -120,72 +123,72 @@ prompt_enrichment: false       # Enrich prompts with memory (power user)
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| `/remember <fact>` | Store a fact, decision, or pattern |
-| `/recall <query>` | Search memories by semantic similarity |
-| `/forget <entity>` | Delete all memories for an entity |
-| `/inspect [entity]` | View all memories grouped by type |
-| `/consolidate` | Trigger memory consolidation cycle |
-| `/memory-status` | Show namespace statistics |
+| Command             | Description                            |
+| ------------------- | -------------------------------------- |
+| `/remember <fact>`  | Store a fact, decision, or pattern     |
+| `/recall <query>`   | Search memories by semantic similarity |
+| `/forget <entity>`  | Delete all memories for an entity      |
+| `/inspect [entity]` | View all memories grouped by type      |
+| `/consolidate`      | Trigger memory consolidation cycle     |
+| `/memory-status`    | Show namespace statistics              |
 
 ## Skills
 
-| Skill | When to Use |
-|-------|-------------|
-| `session-memory` | End of a work session -- captures decisions and outcomes |
-| `memory-informed-refactor` | Before refactoring -- loads relevant prior context |
-| `context-loader` | Session start or context switch -- loads historical context |
-| `memory-review` | Periodic -- finds stale facts, contradictions, cleanup opportunities |
+| Skill                      | When to Use                                                          |
+| -------------------------- | -------------------------------------------------------------------- |
+| `session-memory`           | End of a work session -- captures decisions and outcomes             |
+| `memory-informed-refactor` | Before refactoring -- loads relevant prior context                   |
+| `context-loader`           | Session start or context switch -- loads historical context          |
+| `memory-review`            | Periodic -- finds stale facts, contradictions, cleanup opportunities |
 
 ## Agents
 
-| Agent | Mode | Purpose |
-|-------|------|---------|
-| `memory-curator` | Background | Monitors sessions, suggests memorable events (requires `auto_capture: true`) |
-| `context-researcher` | On-demand | Deep memory search, returns structured briefings |
+| Agent                | Mode       | Purpose                                                                      |
+| -------------------- | ---------- | ---------------------------------------------------------------------------- |
+| `memory-curator`     | Background | Monitors sessions, suggests memorable events (requires `auto_capture: true`) |
+| `context-researcher` | On-demand  | Deep memory search, returns structured briefings                             |
 
 ## Hooks
 
-| Hook | Event | Behavior |
-|------|-------|----------|
-| Session Start | `SessionStart` | Loads relevant memories at session start (configurable: off/summary/full) |
-| Stop | `Stop` | Extracts decisions/outcomes after task completion, asks before storing |
-| Pre-Compact | `PreCompact` | Persists in-flight episode data before context compression |
-| Prompt Enrichment | `UserPromptSubmit` | Enriches prompts with memory context (disabled by default) |
+| Hook              | Event              | Behavior                                                                  |
+| ----------------- | ------------------ | ------------------------------------------------------------------------- |
+| Session Start     | `SessionStart`     | Loads relevant memories at session start (configurable: off/summary/full) |
+| Stop              | `Stop`             | Extracts decisions/outcomes after task completion, asks before storing    |
+| Pre-Compact       | `PreCompact`       | Persists in-flight episode data before context compression                |
+| Prompt Enrichment | `UserPromptSubmit` | Enriches prompts with memory context (disabled by default)                |
 
 ## Configuration Reference
 
 All settings are configured in `pensyve-plugin.local.md` (copy to your project root):
 
-| Setting | Values | Default | Description |
-|---------|--------|---------|-------------|
-| `namespace` | any string | directory name | Memory namespace. Set to your project name for project-scoped memory. |
-| `auto_capture` | `true` / `false` | `false` | Enable the memory-curator agent for background memory capture. |
-| `consolidation_frequency` | `manual` / `session_end` / `daily` | `manual` | When to run memory consolidation. |
-| `context_loading` | `off` / `summary` / `full` | `summary` | How much context to load at session start. |
-| `prompt_enrichment` | `true` / `false` | `false` | Enable the UserPromptSubmit hook to enrich prompts with memory. Opt-in only. |
+| Setting                   | Values                             | Default        | Description                                                                  |
+| ------------------------- | ---------------------------------- | -------------- | ---------------------------------------------------------------------------- |
+| `namespace`               | any string                         | directory name | Memory namespace. Set to your project name for project-scoped memory.        |
+| `auto_capture`            | `true` / `false`                   | `false`        | Enable the memory-curator agent for background memory capture.               |
+| `consolidation_frequency` | `manual` / `session_end` / `daily` | `manual`       | When to run memory consolidation.                                            |
+| `context_loading`         | `off` / `summary` / `full`         | `summary`      | How much context to load at session start.                                   |
+| `prompt_enrichment`       | `true` / `false`                   | `false`        | Enable the UserPromptSubmit hook to enrich prompts with memory. Opt-in only. |
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PENSYVE_API_KEY` | — | API key for Pensyve Cloud (not needed for local) |
-| `PENSYVE_NAMESPACE` | `default` | Memory namespace (overrides config file) |
-| `PENSYVE_PATH` | `~/.pensyve/default` | Storage directory path (local only) |
+| Variable            | Default              | Description                                      |
+| ------------------- | -------------------- | ------------------------------------------------ |
+| `PENSYVE_API_KEY`   | —                    | API key for Pensyve Cloud (not needed for local) |
+| `PENSYVE_NAMESPACE` | `default`            | Memory namespace (overrides config file)         |
+| `PENSYVE_PATH`      | `~/.pensyve/default` | Storage directory path (local only)              |
 
 ## MCP Tools
 
 The plugin wraps 6 MCP tools exposed by the `pensyve-mcp` binary:
 
-| Tool | Parameters | Returns |
-|------|-----------|---------|
-| `pensyve_recall` | `query`, `entity?`, `types?`, `limit?` | Ranked array of memories with scores |
-| `pensyve_remember` | `entity`, `fact`, `confidence?` | Stored memory object |
-| `pensyve_episode_start` | `participants` | `episode_id`, `started_at` |
-| `pensyve_episode_end` | `episode_id`, `outcome?` | `memories_created` count |
-| `pensyve_forget` | `entity`, `hard_delete?` | `forgotten_count` |
-| `pensyve_inspect` | `entity`, `memory_type?`, `limit?` | Array of memories with stats |
+| Tool                    | Parameters                             | Returns                              |
+| ----------------------- | -------------------------------------- | ------------------------------------ |
+| `pensyve_recall`        | `query`, `entity?`, `types?`, `limit?` | Ranked array of memories with scores |
+| `pensyve_remember`      | `entity`, `fact`, `confidence?`        | Stored memory object                 |
+| `pensyve_episode_start` | `participants`                         | `episode_id`, `started_at`           |
+| `pensyve_episode_end`   | `episode_id`, `outcome?`               | `memories_created` count             |
+| `pensyve_forget`        | `entity`, `hard_delete?`               | `forgotten_count`                    |
+| `pensyve_inspect`       | `entity`, `memory_type?`, `limit?`     | Array of memories with stats         |
 
 All tools communicate over MCP. The Cloud server is at `https://mcp.pensyve.com/mcp`. The plugin never bypasses MCP to access storage directly.
 

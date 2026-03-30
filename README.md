@@ -9,22 +9,43 @@
 
 Universal memory runtime for AI agents. Framework-agnostic, protocol-native, offline-first.
 
-Agents use Pensyve to remember across sessions, learn from outcomes, and share knowledge — all backed by a Rust core engine with zero cloud dependencies required.
+### Without memory
+
+```
+User: "I prefer dark mode and use vim keybindings"
+Agent: "Got it!"
+
+[next session]
+
+User: "Update my editor settings"
+Agent: "What settings would you like to change?"
+User: "I ALREADY TOLD YOU"
+```
+
+### With Pensyve
+
+```python
+# Session 1 — agent stores the preference
+p.remember(entity=user, fact="Prefers dark mode and vim keybindings", confidence=0.95)
+
+# Session 2 — agent recalls it automatically
+memories = p.recall("editor settings", entity=user)
+# → [Memory: "Prefers dark mode and vim keybindings" (score: 0.94)]
+```
+
+Your agent stops being amnesiac. Decisions, patterns, and outcomes persist across sessions — and the right context surfaces when it's needed.
 
 ## Why Pensyve
 
-Most AI agents lose all context between sessions. Pensyve gives them durable, intelligent memory:
-
-- **Three memory types** — Episodic (what happened), Semantic (what is known), Procedural (what works)
-- **Multimodal content** — Text, code, images, tool outputs, structured data
-- **8-signal fusion retrieval** — Vector similarity, BM25 lexical, graph proximity, intent classification, recency, access frequency, confidence, type boost
-- **Learns from outcomes** — Bayesian tracking on action→outcome procedures automatically surfaces what works
-- **Forgetting curve** — FSRS-based memory decay with retrieval-induced reinforcement (memories you use get stronger)
-- **Consolidation** — Background "dreaming" promotes repeated episodic facts to semantic knowledge
-- **Offline-first** — SQLite storage, ONNX embeddings, optional local LLM extraction. No API keys needed.
-- **Scales to Postgres** — Feature-gated Postgres backend with pgvector for multi-node deployments
-- **Cross-encoder reranking** — BGE reranker on top-k results for precision
-- **Access control** — RBAC memory mesh with owner/writer/reader roles and private/shared/public visibility
+| What you need                             | How Pensyve solves it                                                                                                         |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Agent forgets everything between sessions | **Three memory types** — episodic (what happened), semantic (what is known), procedural (what works)                          |
+| Agent can't find the right memory         | **8-signal fusion retrieval** — vector similarity + BM25 + graph + intent + recency + frequency + confidence + type boost     |
+| Agent repeats failed approaches           | **Procedural memory** — Bayesian tracking on action→outcome pairs surfaces what actually works                                |
+| Memory store grows unbounded              | **FSRS forgetting curve** — memories you use get stronger, unused ones fade naturally. Consolidation promotes repeated facts. |
+| Need cloud signup to get started          | **Offline-first** — SQLite + ONNX embeddings. Works on your laptop right now. No API keys needed.                             |
+| Need to scale to production               | **Postgres backend** — feature-gated pgvector for multi-node deployments. Managed service at pensyve.com.                     |
+| Only works with one framework             | **Framework-agnostic** — Python, TypeScript, Go, MCP, REST, CLI. Drop-in adapters for LangChain, CrewAI, AutoGen.             |
 
 ## Install
 
@@ -38,38 +59,70 @@ Or use the MCP server directly with Claude Code, Cursor, or any MCP client — s
 
 ## Quick Start
 
-### Prerequisites (building from source)
-
-- Rust 1.88+
-- Python 3.10+ with [uv](https://github.com/astral-sh/uv)
-- [Bun](https://bun.sh) (optional, for TypeScript SDK)
-- [Go 1.21+](https://go.dev) (optional, for Go SDK)
-
-### Install
-
 ```bash
-git clone https://github.com/major7apps/pensyve.git && cd pensyve
-
-# Set up Python environment and install deps
-uv sync --extra dev
-
-# Build the Python SDK (compiles Rust → native Python module)
-uv run maturin develop --release -m pensyve-python/Cargo.toml
-
-# Verify
-uv run python -c "import pensyve; print(pensyve.__version__)"
+pip install pensyve
 ```
 
-### 5-Line Demo
+### Episode: your agent remembers a conversation
 
 ```python
 import pensyve
 
 p = pensyve.Pensyve()
-with p.episode(p.entity("agent", kind="agent"), p.entity("user")) as ep:
+user = p.entity("user", kind="user")
+
+# Record a conversation — Pensyve captures it as episodic memory
+with p.episode(user) as ep:
     ep.message("user", "I prefer dark mode and use vim keybindings")
-print(p.recall("what editor setup does the user prefer?"))
+    ep.message("agent", "Got it — I'll remember your editor preferences")
+    ep.outcome("success")
+
+# Later (even in a new session), the agent recalls what happened
+results = p.recall("editor preferences", entity=user)
+for r in results:
+    print(f"[{r.score:.2f}] {r.content}")
 ```
+
+### Remember: store an explicit fact
+
+```python
+p.remember(entity=user, fact="Prefers Python over JavaScript", confidence=0.9)
+```
+
+### Procedural: the agent learns what works
+
+```python
+# After a debugging session that succeeded:
+ep.outcome("success")
+
+# Pensyve tracks action→outcome reliability with Bayesian updates.
+# Next time a similar issue comes up, recall surfaces the approach that worked.
+```
+
+### Consolidate: memories stay clean
+
+```python
+p.consolidate()
+# Promotes repeated episodic facts to semantic knowledge
+# Decays memories you never access via FSRS forgetting curve
+```
+
+### Building from source
+
+<details>
+<summary>Prerequisites and build steps</summary>
+
+- Rust 1.88+, Python 3.10+ with [uv](https://github.com/astral-sh/uv)
+- Optional: [Bun](https://bun.sh) (TypeScript SDK), [Go 1.21+](https://go.dev) (Go SDK)
+
+```bash
+git clone https://github.com/major7apps/pensyve.git && cd pensyve
+uv sync --extra dev
+uv run maturin develop --release -m pensyve-python/Cargo.toml
+uv run python -c "import pensyve; print(pensyve.__version__)"
+```
+
+</details>
 
 ## Interfaces
 
@@ -209,7 +262,11 @@ HTTP client with timeout, retry, and structured errors.
 ```typescript
 import { Pensyve } from "pensyve";
 
-const p = new Pensyve({ baseUrl: "http://localhost:3000", timeoutMs: 10000, retries: 2 });
+const p = new Pensyve({
+  baseUrl: "http://localhost:3000",
+  timeoutMs: 10000,
+  retries: 2,
+});
 await p.remember({ entity: "seth", fact: "Likes TypeScript", confidence: 0.9 });
 const memories = await p.recall("programming", { entity: "seth" });
 ```
@@ -251,48 +308,48 @@ Pensyve uses the following environment variables across its components:
 
 ### Core
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PENSYVE_PATH` | `~/.pensyve/<namespace>` | SQLite database directory |
-| `PENSYVE_NAMESPACE` | `default` | Memory namespace name |
-| `RUST_LOG` | `pensyve=info` | Tracing filter (e.g. `debug`, `pensyve=debug,hyper=warn`) |
-| `PENSYVE_ALLOW_MOCK_EMBEDDER` | `false` | Fall back to mock embedder if real models unavailable |
+| Variable                      | Default                  | Description                                               |
+| ----------------------------- | ------------------------ | --------------------------------------------------------- |
+| `PENSYVE_PATH`                | `~/.pensyve/<namespace>` | SQLite database directory                                 |
+| `PENSYVE_NAMESPACE`           | `default`                | Memory namespace name                                     |
+| `RUST_LOG`                    | `pensyve=info`           | Tracing filter (e.g. `debug`, `pensyve=debug,hyper=warn`) |
+| `PENSYVE_ALLOW_MOCK_EMBEDDER` | `false`                  | Fall back to mock embedder if real models unavailable     |
 
 ### Gateway / REST API
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PENSYVE_API_KEYS` | *(empty)* | Comma-separated valid API keys (standalone mode) |
-| `PENSYVE_VALIDATION_URL` | *(none)* | Remote endpoint for API key validation |
-| `PENSYVE_RATE_LIMIT` | `300` | Max requests per minute per API key |
-| `HOST` | `0.0.0.0` | Server bind address |
-| `PORT` | `3000` | Server bind port |
+| Variable                 | Default   | Description                                      |
+| ------------------------ | --------- | ------------------------------------------------ |
+| `PENSYVE_API_KEYS`       | _(empty)_ | Comma-separated valid API keys (standalone mode) |
+| `PENSYVE_VALIDATION_URL` | _(none)_  | Remote endpoint for API key validation           |
+| `PENSYVE_RATE_LIMIT`     | `300`     | Max requests per minute per API key              |
+| `HOST`                   | `0.0.0.0` | Server bind address                              |
+| `PORT`                   | `3000`    | Server bind port                                 |
 
 ### Cloud / Managed Service
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PENSYVE_API_KEY` | *(none)* | Cloud API key for remote mode |
-| `PENSYVE_REMOTE_URL` | `http://localhost:8000` | Remote server URL |
-| `PENSYVE_DATABASE_URL` | *(none)* | Postgres connection string |
-| `PENSYVE_REDIS_URL` | *(none)* | Redis URL for episode state |
+| Variable               | Default                 | Description                   |
+| ---------------------- | ----------------------- | ----------------------------- |
+| `PENSYVE_API_KEY`      | _(none)_                | Cloud API key for remote mode |
+| `PENSYVE_REMOTE_URL`   | `http://localhost:8000` | Remote server URL             |
+| `PENSYVE_DATABASE_URL` | _(none)_                | Postgres connection string    |
+| `PENSYVE_REDIS_URL`    | _(none)_                | Redis URL for episode state   |
 
 ### Quotas (managed service)
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PENSYVE_MAX_NAMESPACES` | unlimited | Max namespaces per account |
-| `PENSYVE_MAX_MEMORIES` | unlimited | Max total memories per account |
+| Variable                        | Default   | Description                     |
+| ------------------------------- | --------- | ------------------------------- |
+| `PENSYVE_MAX_NAMESPACES`        | unlimited | Max namespaces per account      |
+| `PENSYVE_MAX_MEMORIES`          | unlimited | Max total memories per account  |
 | `PENSYVE_MAX_RECALLS_PER_MONTH` | unlimited | Max recall operations per month |
-| `PENSYVE_MAX_STORAGE_BYTES` | unlimited | Max storage bytes per account |
+| `PENSYVE_MAX_STORAGE_BYTES`     | unlimited | Max storage bytes per account   |
 
 ### Optional Features
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PENSYVE_TIER2_ENABLED` | `false` | Enable Tier 2 LLM extraction |
-| `PENSYVE_TIER2_MODEL_PATH` | *(none)* | Path to GGUF model file |
-| `PENSYVE_OTEL_ENDPOINT` | *(none)* | OpenTelemetry collector URL |
+| Variable                   | Default  | Description                  |
+| -------------------------- | -------- | ---------------------------- |
+| `PENSYVE_TIER2_ENABLED`    | `false`  | Enable Tier 2 LLM extraction |
+| `PENSYVE_TIER2_MODEL_PATH` | _(none)_ | Path to GGUF model file      |
+| `PENSYVE_OTEL_ENDPOINT`    | _(none)_ | OpenTelemetry collector URL  |
 
 ## Architecture
 
@@ -413,24 +470,17 @@ python benchmarks/tuning/optimize.py --maxiter 50
 
 ## Competitive Landscape
 
-| Feature | Pensyve | Mem0 | Zep | Honcho |
-|---------|---------|------|-----|--------|
-| Offline-first (no cloud required) | **Yes** | No | No | No |
-| Procedural memory (learns from outcomes) | **Yes** | No | No | No |
-| Multi-signal fusion scoring | **8 signals** | 1 | 3 | 1 |
-| Retrieval-induced reinforcement (FSRS) | **Yes** | No | No | No |
-| Intent-aware retrieval | **Yes** | No | No | No |
-| Multimodal content types | **Yes** | Text only | Text only | Text only |
-| RBAC memory mesh | **Yes** | No | No | No |
-| Cross-platform local LLM extraction | **Yes** | No | Cloud only | Cloud only |
-| MCP server | **Yes** | No | No | Plugin |
-| Claude Code plugin | **Yes** | No | No | No |
-| VS Code extension | **Yes** | No | No | No |
-| Framework integrations | **5** | 3 | 1 | 1 |
-| Postgres backend | **Yes** (feature-gated) | Yes | Yes | Yes |
-| Go SDK | **Yes** | No | No | No |
-| WASM build | **Yes** | No | No | No |
-| Open source engine | Apache 2.0 | Yes | Partial | Yes |
+| What you need                    | Pensyve                                                       | Mem0                | Zep                  | Honcho         |
+| -------------------------------- | ------------------------------------------------------------- | ------------------- | -------------------- | -------------- |
+| Works offline, no cloud required | **Yes** — SQLite, runs on your laptop                         | No — cloud API      | No — requires server | No — cloud API |
+| Agent learns from outcomes       | **Yes** — procedural memory tracks what works                 | No                  | No                   | No             |
+| Finds memories by meaning        | **8-signal fusion** (vector + BM25 + graph + intent + 4 more) | Vector only         | Vector + temporal    | Vector only    |
+| Memories fade naturally          | **FSRS forgetting curve** with reinforcement                  | No — manual cleanup | Basic TTL            | No             |
+| Multi-turn conversation capture  | **Episodes** with outcome tracking                            | Basic               | Yes                  | Yes            |
+| Framework agnostic               | **Python, TypeScript, Go, MCP, REST, CLI**                    | Python SDK          | Python/JS            | Python         |
+| Claude Code / Cursor / VS Code   | **Native plugins + MCP**                                      | No                  | No                   | No             |
+| Production-ready at scale        | **Postgres + pgvector** (feature-gated)                       | Yes                 | Yes                  | Yes            |
+| Open source                      | **Apache 2.0**                                                | Yes                 | Partial              | Yes            |
 
 ## License
 
