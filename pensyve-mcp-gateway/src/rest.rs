@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::auth::AuthContext;
+
 use pensyve_core::retrieval::RecallEngine;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::types::{Entity, EntityKind, Memory, SemanticMemory};
@@ -225,8 +227,16 @@ fn entity_kind_str(kind: &EntityKind) -> &'static str {
     }
 }
 
-fn get_pensyve_state(state: &AppState) -> Arc<PensyveState> {
-    state.tenant_mgr.default_state()
+/// Resolve the tenant's `PensyveState` from the auth context set by the
+/// auth middleware.  Authenticated requests get an isolated namespace;
+/// unauthenticated/dev requests fall back to the default namespace.
+fn get_pensyve_state(state: &AppState, auth_ctx: &AuthContext) -> Result<Arc<PensyveState>, RestError> {
+    state.tenant_mgr.get_tenant_state(&auth_ctx.key_id).map_err(|e| {
+        RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to resolve tenant state: {e}"),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -261,9 +271,10 @@ async fn health() -> impl IntoResponse {
 
 async fn recall(
     State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
     Json(body): Json<RecallRequest>,
 ) -> Result<impl IntoResponse, RestError> {
-    let ps = get_pensyve_state(&state);
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
     let limit = body.limit.unwrap_or(5);
 
     if let Some(mc) = body.min_confidence
@@ -345,9 +356,10 @@ async fn recall(
 
 async fn remember(
     State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
     Json(body): Json<RememberRequest>,
 ) -> Result<impl IntoResponse, RestError> {
-    let ps = get_pensyve_state(&state);
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
     let confidence = body.confidence.unwrap_or(1.0) as f32;
 
     let entity = get_or_create_entity(
@@ -403,9 +415,10 @@ async fn remember(
 
 async fn create_entity(
     State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
     Json(body): Json<CreateEntityRequest>,
 ) -> Result<impl IntoResponse, RestError> {
-    let ps = get_pensyve_state(&state);
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
     let kind = body
         .kind
         .as_deref()
@@ -425,9 +438,10 @@ async fn create_entity(
 
 async fn forget_entity(
     State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
     Path(entity_name): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
-    let ps = get_pensyve_state(&state);
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
 
     let entity = match ps.storage.get_entity_by_name(&entity_name, ps.namespace.id) {
         Ok(Some(e)) => e,
@@ -474,9 +488,10 @@ async fn forget_entity(
 
 async fn delete_memory(
     State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, RestError> {
-    let ps = get_pensyve_state(&state);
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
 
     let memory_id = Uuid::parse_str(&id)
         .map_err(|_| RestError(StatusCode::BAD_REQUEST, "Invalid memory ID".to_string()))?;
@@ -517,10 +532,11 @@ async fn delete_memory(
 
 async fn update_memory(
     State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
     Path(id): Path<String>,
     Json(body): Json<UpdateMemoryRequest>,
 ) -> Result<impl IntoResponse, RestError> {
-    let ps = get_pensyve_state(&state);
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
 
     let memory_id = Uuid::parse_str(&id)
         .map_err(|_| RestError(StatusCode::BAD_REQUEST, "Invalid memory ID".to_string()))?;
@@ -574,8 +590,11 @@ async fn update_memory(
     }))
 }
 
-async fn stats(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, RestError> {
-    let ps = get_pensyve_state(&state);
+async fn stats(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
+) -> Result<impl IntoResponse, RestError> {
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
     let ns = &ps.namespace;
 
     let mut semantic_count = 0usize;
@@ -609,9 +628,10 @@ async fn stats(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, 
 
 async fn inspect(
     State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
     Json(body): Json<InspectRequest>,
 ) -> Result<impl IntoResponse, RestError> {
-    let ps = get_pensyve_state(&state);
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
     let limit = body.limit.unwrap_or(50);
 
     let entity = match ps.storage.get_entity_by_name(&body.entity, ps.namespace.id) {
