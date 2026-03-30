@@ -5,6 +5,38 @@ All notable changes to Pensyve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2026-03-30
+
+### Fixed
+
+- **Gateway auth**: support `PENSYVE_API_KEY` env var as fallback when no `Authorization` header is present — enables the env-based MCP convention used by Claude Code and Codex plugins
+- **Shared TS client**: use `Authorization: Bearer` header instead of `X-Pensyve-Key` — fixes cloud auth for OpenClaw and OpenCode native plugins
+- **API key prefix**: standardize all docs, tests, and examples to `psy_` prefix (gateway validates this prefix; old `pk_` keys were rejected)
+
+### Changed
+
+- **Claude Code plugin**: add `marketplace.json` for `/plugin marketplace add` installation; simplify `plugin.json` to metadata-only (components auto-discovered); move MCP config into `plugin.json` with env-based API key; fix `hooks.json` to standard nested format; normalize agent/command/skill frontmatter to match marketplace conventions
+- **Codex plugin**: same convention alignment — inline `mcpServers` in `plugin.json` with env pattern, delete standalone `.mcp.json`, fix hooks format
+- **Gemini extension**: update MCP URL from `api.pensyve.com` to `mcp.pensyve.com`, remove headers auth pattern
+- **MCP setup guides** (Cline, Continue, Cursor, VS Code Copilot, Windsurf): replace hardcoded `Authorization` headers with `env`-based `PENSYVE_API_KEY` pattern, add Cloud vs Local setup sections
+- **All READMEs**: clarify Cloud (API key) vs Local (self-hosted) setup paths with consistent formatting
+
+## [1.0.2] - 2026-03-28
+
+### Fixed
+
+- Use absolute GitHub URLs for README images so they render on PyPI, npm, and crates.io
+
+### Added
+
+- crates.io publishing for `pensyve-core`
+
+## [1.0.1] - 2026-03-28
+
+### Fixed
+
+- README and metadata fixes for PyPI and npm package registry display
+
 ## [1.0.0] - 2026-03-28
 
 Initial public release of Pensyve — the universal memory runtime for AI agents.
