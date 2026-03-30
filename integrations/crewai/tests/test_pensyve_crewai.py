@@ -205,14 +205,14 @@ class TestCloudModeDetection:
     def test_cloud_mode_via_api_key(self) -> None:
         with patch("pensyve_crewai._make_cloud_client") as mock_factory:
             mock_factory.return_value = MagicMock()
-            memory = PensyveMemory(namespace="test", api_key="pk_test_123")
+            memory = PensyveMemory(namespace="test", api_key="psy_test_123")
 
             assert memory.mode == "cloud"
 
     def test_cloud_mode_via_env_var(self) -> None:
         with patch("pensyve_crewai._make_cloud_client") as mock_factory:
             mock_factory.return_value = MagicMock()
-            with patch.dict(os.environ, {"PENSYVE_API_KEY": "pk_env_456"}):
+            with patch.dict(os.environ, {"PENSYVE_API_KEY": "psy_env_456"}):
                 memory = PensyveMemory(namespace="test")
 
                 assert memory.mode == "cloud"
@@ -220,13 +220,13 @@ class TestCloudModeDetection:
     def test_explicit_key_overrides_env(self) -> None:
         with patch("pensyve_crewai._make_cloud_client") as mock_factory:
             mock_factory.return_value = MagicMock()
-            with patch.dict(os.environ, {"PENSYVE_API_KEY": "pk_env_456"}):
-                PensyveMemory(namespace="test", api_key="pk_explicit_789")
+            with patch.dict(os.environ, {"PENSYVE_API_KEY": "psy_env_456"}):
+                PensyveMemory(namespace="test", api_key="psy_explicit_789")
 
                 # The explicit key should be used, not the env var.
                 mock_factory.assert_called_once()
                 call_args = mock_factory.call_args
-                assert call_args.args[0] == "pk_explicit_789"
+                assert call_args.args[0] == "psy_explicit_789"
 
     def test_no_key_uses_local(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
@@ -250,7 +250,7 @@ class TestCloudBackend:
             mock_client = MagicMock()
             mock_factory.return_value = mock_client
 
-            memory = PensyveMemory(namespace="test", api_key="pk_test")
+            memory = PensyveMemory(namespace="test", api_key="psy_test")
             memory.remember("Cloud fact", metadata={"confidence": 0.9})
 
             mock_client.remember.assert_called_once_with(
@@ -268,7 +268,7 @@ class TestCloudBackend:
             }
             mock_factory.return_value = mock_client
 
-            memory = PensyveMemory(namespace="test", api_key="pk_test")
+            memory = PensyveMemory(namespace="test", api_key="psy_test")
             matches = memory.recall("rate limit", limit=5)
 
             assert len(matches) == 2
@@ -281,7 +281,7 @@ class TestCloudBackend:
             mock_client = MagicMock()
             mock_factory.return_value = mock_client
 
-            memory = PensyveMemory(namespace="test", api_key="pk_test")
+            memory = PensyveMemory(namespace="test", api_key="psy_test")
             memory.reset()
 
             mock_client.forget.assert_called_once_with("crew-agent")

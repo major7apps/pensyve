@@ -52,15 +52,15 @@ memory = PensyveMemory(namespace="my-app")
 # Cloud mode — auto-detected from API key
 memory = PensyveMemory(
     namespace="my-app",
-    api_key="pk_live_...",
+    api_key="psy_...",
 )
 
 # Or via environment variable
-# export PENSYVE_API_KEY=pk_live_...
+# export PENSYVE_API_KEY=psy_...
 memory = PensyveMemory(namespace="my-app")
 
 # Explicit mode override
-memory = PensyveMemory(namespace="my-app", mode="cloud", base_url="https://api.pensyve.com")
+memory = PensyveMemory(namespace="my-app", mode="cloud")
 ```
 
 ## API
