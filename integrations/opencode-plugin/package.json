@@ -1,6 +1,6 @@
 {
   "name": "opencode-pensyve",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Pensyve memory plugin for OpenCode — cross-session memory with 8-signal fusion retrieval",
   "type": "module",
   "main": "src/index.ts",
