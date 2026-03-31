@@ -301,7 +301,11 @@ async fn tenant_and_usage_middleware(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let auth_ctx = req.extensions().get::<AuthContext>().cloned();
-    let tenant_id = auth_ctx.as_ref().map(|ctx| ctx.key_id.clone());
+    // Prefer user_id for tenant resolution so that OAuth (MCP plugin) and
+    // API key (dashboard) access the same namespace for the same user.
+    let tenant_id = auth_ctx
+        .as_ref()
+        .map(|ctx| ctx.user_id.as_deref().unwrap_or(&ctx.key_id).to_string());
     let is_mcp = req.uri().path().starts_with("/mcp");
 
     let response = CURRENT_TENANT.scope(tenant_id, next.run(req)).await;
