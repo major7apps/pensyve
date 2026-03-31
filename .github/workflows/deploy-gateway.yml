@@ -1,0 +1,82 @@
+name: Build & Deploy Gateway
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pensyve-core/**"
+      - "pensyve-mcp-tools/**"
+      - "pensyve-mcp-gateway/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY: pensyve-gateway
+  ECS_CLUSTER: pensyve-prod
+  ECS_SERVICE: pensyve-prod-gateway
+
+jobs:
+  test:
+    name: Test Gateway
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test -p pensyve-mcp-gateway -p pensyve-mcp-tools
+
+  build-and-deploy:
+    name: Build & Deploy
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build release binary
+        run: cargo build --release -p pensyve-mcp-gateway
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -f pensyve-mcp-gateway/Dockerfile .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --force-new-deployment
+
+      - name: Wait for stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE
+
+      - name: Verify health
+        run: |
+          sleep 5
+          curl -sf --max-time 10 https://mcp.pensyve.com/health
