@@ -257,6 +257,7 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         .route("/v1/stats", routing::get(stats))
         .route("/v1/inspect", routing::post(inspect))
+        .route("/v1/memories", routing::delete(purge_all_memories))
 }
 
 // ---------------------------------------------------------------------------
@@ -529,6 +530,40 @@ async fn delete_memory(
     *vi = new_index;
 
     Ok(Json(DeleteMemoryResponse { deleted: true, id }))
+}
+
+async fn purge_all_memories(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
+) -> Result<impl IntoResponse, RestError> {
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
+
+    let memories = ps
+        .storage
+        .get_all_memories_by_namespace(ps.namespace.id)
+        .map_err(|err| {
+            RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Error listing memories: {err}"),
+            )
+        })?;
+
+    let mut deleted_count = 0usize;
+    for mem in &memories {
+        if ps.storage.delete_memory_by_id(mem.id()).unwrap_or(false) {
+            deleted_count += 1;
+        }
+    }
+
+    // Clear the vector index.
+    let dims = {
+        let vi = ps.vector_index.lock().await;
+        vi.dimensions()
+    };
+    let mut vi = ps.vector_index.lock().await;
+    *vi = VectorIndex::new(dims, 1024);
+
+    Ok(Json(serde_json::json!({ "deleted": deleted_count })))
 }
 
 async fn update_memory(
