@@ -98,7 +98,7 @@ impl PensyveMcpServer {
         let query_embedding = tokio::task::spawn_blocking(move || embedder.embed(&query_text))
             .await
             .ok()
-            .and_then(|r| r.ok());
+            .and_then(Result::ok);
 
         // Hold the read lock only for the retrieval phase, not embedding or serialization.
         let result = {
