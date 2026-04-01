@@ -314,7 +314,7 @@ async fn recall(
     let query_embedding = tokio::task::spawn_blocking(move || embedder.embed(&query_text))
         .await
         .ok()
-        .and_then(|r| r.ok());
+        .and_then(Result::ok);
 
     // Hold read lock only for retrieval — allows concurrent recalls.
     let result = {
