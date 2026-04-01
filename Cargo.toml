@@ -9,6 +9,7 @@ members = [
     "pensyve-cli",
     "pensyve-benchmarks",
 ]
+exclude = ["loadtest"]
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
