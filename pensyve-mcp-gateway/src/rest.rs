@@ -459,6 +459,15 @@ async fn forget_entity(
         }
     };
 
+    // Collect memory IDs before deletion so we can remove them from the vector index.
+    let mut memory_ids: Vec<Uuid> = Vec::new();
+    if let Ok(mems) = ps.storage.list_episodic_by_entity(entity.id, usize::MAX) {
+        memory_ids.extend(mems.iter().map(|m| m.id));
+    }
+    if let Ok(mems) = ps.storage.list_semantic_by_entity(entity.id, usize::MAX) {
+        memory_ids.extend(mems.iter().map(|m| m.id));
+    }
+
     let forgotten_count = ps
         .storage
         .delete_memories_by_entity(entity.id)
@@ -469,23 +478,12 @@ async fn forget_entity(
             )
         })?;
 
-    // Rebuild vector index (same pattern as MCP tools).
+    // Remove deleted entries from vector index — O(1) per entry, not O(n) rebuild.
     if forgotten_count > 0 {
-        let dims = {
-            let vi = ps.vector_index.read().await;
-            vi.dimensions()
-        };
-        let mut new_index = VectorIndex::new(dims, 1024);
-        if let Ok(memories) = ps.storage.get_all_memories_by_namespace(ps.namespace.id) {
-            for mem in &memories {
-                let emb = mem.embedding();
-                if !emb.is_empty() {
-                    let _ = new_index.add(mem.id(), emb);
-                }
-            }
-        }
         let mut vi = ps.vector_index.write().await;
-        *vi = new_index;
+        for id in &memory_ids {
+            let _ = vi.remove(*id);
+        }
     }
 
     Ok(Json(ForgetResponse { forgotten_count }))
@@ -515,22 +513,11 @@ async fn delete_memory(
         ));
     }
 
-    // Rebuild vector index.
-    let dims = {
-        let vi = ps.vector_index.read().await;
-        vi.dimensions()
-    };
-    let mut new_index = VectorIndex::new(dims, 1024);
-    if let Ok(memories) = ps.storage.get_all_memories_by_namespace(ps.namespace.id) {
-        for mem in &memories {
-            let emb = mem.embedding();
-            if !emb.is_empty() {
-                let _ = new_index.add(mem.id(), emb);
-            }
-        }
+    // Remove single entry from vector index — O(1).
+    {
+        let mut vi = ps.vector_index.write().await;
+        let _ = vi.remove(memory_id);
     }
-    let mut vi = ps.vector_index.write().await;
-    *vi = new_index;
 
     Ok(Json(DeleteMemoryResponse { deleted: true, id }))
 }
