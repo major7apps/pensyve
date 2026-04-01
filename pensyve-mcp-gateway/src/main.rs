@@ -231,6 +231,10 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         .merge(rest::router())
         .route("/health", axum::routing::get(health_handler))
         .route(
+            "/.well-known/oauth-protected-resource",
+            axum::routing::get(oauth::oauth_protected_resource),
+        )
+        .route(
             "/.well-known/oauth-authorization-server",
             axum::routing::get(oauth::oauth_metadata),
         )

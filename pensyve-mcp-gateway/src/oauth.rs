@@ -29,6 +29,28 @@ const CLOUD_REVOKE_URL: &str = "https://pensyve.com/api/oauth/revoke";
 /// Cloud registration endpoint (proxy target).
 const CLOUD_REGISTER_URL: &str = "https://pensyve.com/api/oauth/register";
 
+/// `GET /.well-known/oauth-protected-resource`
+///
+/// Returns protected resource metadata per RFC 9728. MCP clients discover
+/// this first (via the `resource_metadata` WWW-Authenticate parameter),
+/// then follow `authorization_servers` to find the authorization server.
+pub async fn oauth_protected_resource() -> impl IntoResponse {
+    let metadata = serde_json::json!({
+        "resource": GATEWAY_ISSUER,
+        "authorization_servers": [GATEWAY_ISSUER],
+        "scopes_supported": ["mcp"],
+        "bearer_methods_supported": ["header"]
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .header("access-control-allow-origin", "*")
+        .header("cache-control", "public, max-age=3600")
+        .body(Body::from(serde_json::to_string(&metadata).unwrap()))
+        .expect("valid response")
+}
+
 /// `GET /.well-known/oauth-authorization-server`
 ///
 /// Returns OAuth 2.1 metadata per RFC 8414. MCP clients use this to
@@ -152,6 +174,28 @@ async fn proxy_to_cloud(req: Request<Body>, target_url: &str) -> Response<Body> 
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn test_protected_resource_returns_valid_metadata() {
+        let resp = oauth_protected_resource().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["resource"], GATEWAY_ISSUER);
+        let servers = json["authorization_servers"]
+            .as_array()
+            .expect("authorization_servers should be an array");
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0], GATEWAY_ISSUER);
+        assert!(
+            json["scopes_supported"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("mcp"))
+        );
+    }
 
     #[tokio::test]
     async fn test_oauth_metadata_returns_valid_json() {

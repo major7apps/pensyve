@@ -297,7 +297,7 @@ where
                             .header("content-type", "application/json")
                             .header(
                                 "www-authenticate",
-                                r#"Bearer resource_metadata="https://mcp.pensyve.com/.well-known/oauth-authorization-server""#,
+                                r#"Bearer resource_metadata="https://mcp.pensyve.com/.well-known/oauth-protected-resource""#,
                             )
                             .body(body)
                             .expect("valid response"));
