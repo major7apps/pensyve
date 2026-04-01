@@ -106,6 +106,19 @@ pub trait StorageTrait: Send + Sync {
     /// Delete a single memory by its UUID (episodic, semantic, or procedural).
     fn delete_memory_by_id(&self, id: Uuid) -> StorageResult<bool>;
 
+    /// Delete all memories in a namespace. Returns the count of deleted memories.
+    fn purge_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
+        // Default: fall back to loading + deleting one by one.
+        let memories = self.get_all_memories_by_namespace(namespace_id)?;
+        let mut count = 0;
+        for mem in &memories {
+            if self.delete_memory_by_id(mem.id()).unwrap_or(false) {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     /// Update a semantic memory's content and/or confidence.
     fn update_semantic_content(
         &self,

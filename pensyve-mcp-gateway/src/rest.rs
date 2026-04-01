@@ -385,15 +385,21 @@ async fn remember(
 
     let mut mem = SemanticMemory::new(ps.namespace.id, entity.id, predicate, object, confidence);
 
-    match ps.embedder.embed(&body.fact) {
-        Ok(embedding) => {
+    // Run ONNX inference on the blocking thread pool to avoid stalling the async runtime.
+    let embedder = ps.embedder.clone();
+    let fact = body.fact.clone();
+    let embed_result = tokio::task::spawn_blocking(move || embedder.embed(&fact)).await;
+
+    match embed_result {
+        Ok(Ok(embedding)) => {
             let mut vector_index = ps.vector_index.write().await;
             if let Err(err) = vector_index.add(mem.id, &embedding) {
                 tracing::warn!("Failed to add to vector index: {err}");
             }
             mem.embedding = embedding;
         }
-        Err(err) => tracing::warn!("Embedding failed: {err}"),
+        Ok(Err(err)) => tracing::warn!("Embedding failed: {err}"),
+        Err(err) => tracing::warn!("Embedding task panicked: {err}"),
     }
 
     ps.storage.save_semantic(&mem).map_err(|err| {
@@ -528,22 +534,13 @@ async fn purge_all_memories(
 ) -> Result<impl IntoResponse, RestError> {
     let ps = get_pensyve_state(&state, &auth_ctx)?;
 
-    let memories = ps
-        .storage
-        .get_all_memories_by_namespace(ps.namespace.id)
-        .map_err(|err| {
-            RestError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Error listing memories: {err}"),
-            )
-        })?;
-
-    let mut deleted_count = 0usize;
-    for mem in &memories {
-        if ps.storage.delete_memory_by_id(mem.id()).unwrap_or(false) {
-            deleted_count += 1;
-        }
-    }
+    // Bulk delete all memories in the namespace — single transaction, no per-row loop.
+    let deleted_count = ps.storage.purge_namespace(ps.namespace.id).map_err(|err| {
+        RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Error purging memories: {err}"),
+        )
+    })?;
 
     // Clear the vector index.
     let dims = {
@@ -603,10 +600,15 @@ async fn update_memory(
             )
         })?;
 
-    // Re-embed if content changed.
-    if content_changed && let Ok(embedding) = ps.embedder.embed(&content) {
-        let mut vector_index = ps.vector_index.write().await;
-        let _ = vector_index.add(memory_id, &embedding);
+    // Re-embed if content changed — run ONNX on blocking thread pool.
+    if content_changed {
+        let embedder = ps.embedder.clone();
+        let text = content.clone();
+        if let Ok(Ok(embedding)) = tokio::task::spawn_blocking(move || embedder.embed(&text)).await
+        {
+            let mut vector_index = ps.vector_index.write().await;
+            let _ = vector_index.add(memory_id, &embedding);
+        }
     }
 
     Ok(Json(UpdateMemoryResponse {

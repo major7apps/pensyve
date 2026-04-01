@@ -170,15 +170,21 @@ impl PensyveMcpServer {
         let mut mem =
             SemanticMemory::new(state.namespace.id, entity.id, predicate, object, confidence);
 
-        match state.embedder.embed(&params.fact) {
-            Ok(embedding) => {
+        // Run ONNX inference on the blocking thread pool to avoid stalling the async runtime.
+        let embedder = state.embedder.clone();
+        let fact = params.fact.clone();
+        let embed_result = tokio::task::spawn_blocking(move || embedder.embed(&fact)).await;
+
+        match embed_result {
+            Ok(Ok(embedding)) => {
                 let mut vector_index = state.vector_index.write().await;
                 if let Err(err) = vector_index.add(mem.id, &embedding) {
                     tracing::warn!("Failed to add to vector index: {err}");
                 }
                 mem.embedding = embedding;
             }
-            Err(err) => tracing::warn!("Embedding failed: {err}"),
+            Ok(Err(err)) => tracing::warn!("Embedding failed: {err}"),
+            Err(err) => tracing::warn!("Embedding task panicked: {err}"),
         }
 
         state

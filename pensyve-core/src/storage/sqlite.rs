@@ -753,43 +753,58 @@ impl StorageTrait for SqliteBackend {
         let object_entity = mem.object_entity.map(|u| u.to_string());
         let source_episodes = uuids_to_json(&mem.source_episodes);
 
-        conn.execute(
-            r"INSERT OR REPLACE INTO semantic_memories
-               (id, namespace_id, subject, predicate, object, content_type, object_entity,
-                confidence, valid_at, invalid_at, source_episodes, embedding, stability,
-                retrievability)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![
-                mem.id.to_string(),
-                mem.namespace_id.to_string(),
-                mem.subject.to_string(),
-                mem.predicate,
-                mem.object,
-                mem.content_type.as_str(),
-                object_entity,
-                f64::from(mem.confidence),
-                mem.valid_at.to_rfc3339(),
-                invalid_at,
-                source_episodes,
-                embedding_blob,
-                f64::from(mem.stability),
-                f64::from(mem.retrievability),
-            ],
-        )?;
+        // Single transaction for the memory row + FTS entry.
+        conn.execute_batch("BEGIN")?;
 
-        // FTS content: "predicate object"
-        let fts_content = format!("{} {}", mem.predicate, mem.object);
-        conn.execute(
-            "INSERT OR REPLACE INTO memory_fts (memory_id, memory_type, namespace_id, content) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                mem.id.to_string(),
-                "semantic",
-                mem.namespace_id.to_string(),
-                fts_content,
-            ],
-        )?;
+        let result = (|| -> StorageResult<()> {
+            conn.execute(
+                r"INSERT OR REPLACE INTO semantic_memories
+                   (id, namespace_id, subject, predicate, object, content_type, object_entity,
+                    confidence, valid_at, invalid_at, source_episodes, embedding, stability,
+                    retrievability)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    mem.id.to_string(),
+                    mem.namespace_id.to_string(),
+                    mem.subject.to_string(),
+                    mem.predicate,
+                    mem.object,
+                    mem.content_type.as_str(),
+                    object_entity,
+                    f64::from(mem.confidence),
+                    mem.valid_at.to_rfc3339(),
+                    invalid_at,
+                    source_episodes,
+                    embedding_blob,
+                    f64::from(mem.stability),
+                    f64::from(mem.retrievability),
+                ],
+            )?;
 
-        Ok(())
+            let fts_content = format!("{} {}", mem.predicate, mem.object);
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_fts (memory_id, memory_type, namespace_id, content) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    mem.id.to_string(),
+                    "semantic",
+                    mem.namespace_id.to_string(),
+                    fts_content,
+                ],
+            )?;
+
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     fn get_semantic(&self, id: Uuid) -> StorageResult<Option<SemanticMemory>> {
@@ -1189,6 +1204,50 @@ impl StorageTrait for SqliteBackend {
         }
 
         Ok(deleted)
+    }
+
+    fn purge_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
+        let conn = lock_conn!(self);
+        let ns_str = namespace_id.to_string();
+
+        conn.execute_batch("BEGIN")?;
+
+        let result = (|| -> StorageResult<usize> {
+            let mut total = 0usize;
+
+            // Bulk delete from each memory table by namespace_id.
+            total += conn.execute(
+                "DELETE FROM episodic_memories WHERE namespace_id = ?1",
+                params![&ns_str],
+            )?;
+            total += conn.execute(
+                "DELETE FROM semantic_memories WHERE namespace_id = ?1",
+                params![&ns_str],
+            )?;
+            total += conn.execute(
+                "DELETE FROM procedural_memories WHERE namespace_id = ?1",
+                params![&ns_str],
+            )?;
+
+            // Purge FTS entries for this namespace.
+            conn.execute(
+                "DELETE FROM memory_fts WHERE namespace_id = ?1",
+                params![&ns_str],
+            )?;
+
+            Ok(total)
+        })();
+
+        match result {
+            Ok(total) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(total)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     fn update_semantic_content(
