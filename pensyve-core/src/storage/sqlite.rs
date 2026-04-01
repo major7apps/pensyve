@@ -239,6 +239,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     tokenize='porter unicode61'
 );
 
+CREATE INDEX IF NOT EXISTS idx_semantic_subject ON semantic_memories(subject);
+CREATE INDEX IF NOT EXISTS idx_semantic_ns ON semantic_memories(namespace_id);
+CREATE INDEX IF NOT EXISTS idx_episodic_about ON episodic_memories(about_entity);
+CREATE INDEX IF NOT EXISTS idx_episodic_source ON episodic_memories(source_entity);
+CREATE INDEX IF NOT EXISTS idx_episodic_ns ON episodic_memories(namespace_id);
+
 CREATE TABLE IF NOT EXISTS edges (
     id              TEXT PRIMARY KEY,
     source          TEXT NOT NULL,
@@ -1083,63 +1089,64 @@ impl StorageTrait for SqliteBackend {
     fn delete_memories_by_entity(&self, entity_id: Uuid) -> StorageResult<usize> {
         let conn = lock_conn!(self);
         let id_str = entity_id.to_string();
-        let mut total = 0usize;
 
-        // Collect IDs to remove from FTS.
-        let episodic_ids: Vec<String> = {
-            let mut stmt = conn.prepare(
-                "SELECT id FROM episodic_memories WHERE about_entity = ?1 OR source_entity = ?1",
+        // Run the entire delete in a single transaction for atomicity and speed.
+        conn.execute_batch("BEGIN")?;
+
+        let result = (|| -> StorageResult<usize> {
+            let mut total = 0usize;
+
+            // Collect IDs to remove from FTS.
+            let episodic_ids: Vec<String> = {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM episodic_memories WHERE about_entity = ?1 OR source_entity = ?1",
+                )?;
+                stmt.query_map(params![&id_str], |row| row.get(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+
+            let semantic_ids: Vec<String> = {
+                let mut stmt =
+                    conn.prepare("SELECT id FROM semantic_memories WHERE subject = ?1")?;
+                stmt.query_map(params![&id_str], |row| row.get(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+
+            // Delete episodic.
+            let n = conn.execute(
+                "DELETE FROM episodic_memories WHERE about_entity = ?1 OR source_entity = ?1",
+                params![&id_str],
             )?;
-            stmt.query_map(params![&id_str], |row| row.get(0))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
+            total += n;
 
-        let semantic_ids: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT id FROM semantic_memories WHERE subject = ?1")?;
-            stmt.query_map(params![&id_str], |row| row.get(0))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-
-        let procedural_ids: Vec<String> = {
-            let mut stmt = conn.prepare(
-                "SELECT id FROM procedural_memories WHERE namespace_id IN (SELECT namespace_id FROM episodic_memories WHERE about_entity = ?1 OR source_entity = ?1)",
+            // Delete semantic (by subject or object_entity).
+            let n = conn.execute(
+                "DELETE FROM semantic_memories WHERE subject = ?1 OR object_entity = ?1",
+                params![&id_str],
             )?;
-            // Procedural memories aren't directly tied to a single entity in the schema,
-            // so we delete by source_entity indirectly. Instead just collect all IDs
-            // that match our criteria. For now: no direct entity link, so skip.
-            let _: Vec<String> = stmt
-                .query_map(params![&id_str], |row| row.get(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            Vec::new()
-        };
+            total += n;
 
-        // Delete episodic.
-        let n = conn.execute(
-            "DELETE FROM episodic_memories WHERE about_entity = ?1 OR source_entity = ?1",
-            params![&id_str],
-        )?;
-        total += n;
+            // Remove from FTS in bulk.
+            for fts_id in episodic_ids.iter().chain(semantic_ids.iter()) {
+                conn.execute(
+                    "DELETE FROM memory_fts WHERE memory_id = ?1",
+                    params![fts_id],
+                )?;
+            }
 
-        // Delete semantic (by subject or object_entity).
-        let n = conn.execute(
-            "DELETE FROM semantic_memories WHERE subject = ?1 OR object_entity = ?1",
-            params![&id_str],
-        )?;
-        total += n;
+            Ok(total)
+        })();
 
-        // Remove from FTS.
-        for fts_id in episodic_ids
-            .iter()
-            .chain(semantic_ids.iter())
-            .chain(procedural_ids.iter())
-        {
-            conn.execute(
-                "DELETE FROM memory_fts WHERE memory_id = ?1",
-                params![fts_id],
-            )?;
+        match result {
+            Ok(total) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(total)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
         }
-
-        Ok(total)
     }
 
     fn delete_memory_by_id(&self, id: Uuid) -> StorageResult<bool> {

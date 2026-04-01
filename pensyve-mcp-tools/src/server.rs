@@ -10,7 +10,7 @@ use uuid::Uuid;
 use pensyve_core::retrieval::RecallEngine;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::types::{Entity, EntityKind, Episode, Memory, Outcome, SemanticMemory};
-use pensyve_core::vector::VectorIndex;
+
 
 use crate::params::{
     AccountParams, EpisodeEndParams, EpisodeStartParams, ForgetParams, InspectParams, RecallParams,
@@ -295,33 +295,26 @@ impl PensyveMcpServer {
             Err(err) => return Err(format!("Error looking up entity: {err}")),
         };
 
+        // Collect memory IDs before deletion for vector index cleanup.
+        let mut memory_ids: Vec<uuid::Uuid> = Vec::new();
+        if let Ok(mems) = state.storage.list_episodic_by_entity(entity.id, usize::MAX) {
+            memory_ids.extend(mems.iter().map(|m| m.id));
+        }
+        if let Ok(mems) = state.storage.list_semantic_by_entity(entity.id, usize::MAX) {
+            memory_ids.extend(mems.iter().map(|m| m.id));
+        }
+
         let forgotten_count = state
             .storage
             .delete_memories_by_entity(entity.id)
             .map_err(|err| format!("Error deleting memories: {err}"))?;
 
-        // Rebuild vector index outside the hot path: load memories first,
-        // then swap the index under the lock to minimize mutex hold time.
+        // Remove deleted entries from vector index — O(1) per entry, not O(n) rebuild.
         if forgotten_count > 0 {
-            let dims = {
-                let vi = state.vector_index.read().await;
-                vi.dimensions()
-            };
-            let mut new_index = VectorIndex::new(dims, 1024);
-            if let Ok(memories) = state
-                .storage
-                .get_all_memories_by_namespace(state.namespace.id)
-            {
-                for mem in &memories {
-                    let emb = mem.embedding();
-                    if !emb.is_empty() {
-                        let _ = new_index.add(mem.id(), emb);
-                    }
-                }
-            }
-            // Brief write lock just to swap.
             let mut vi = state.vector_index.write().await;
-            *vi = new_index;
+            for id in &memory_ids {
+                let _ = vi.remove(*id);
+            }
         }
 
         serde_json::to_string(&serde_json::json!({
