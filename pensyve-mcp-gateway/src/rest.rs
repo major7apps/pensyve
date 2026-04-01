@@ -230,7 +230,10 @@ fn entity_kind_str(kind: &EntityKind) -> &'static str {
 /// Resolve the tenant's `PensyveState` from the auth context set by the
 /// auth middleware.  Authenticated requests get an isolated namespace;
 /// unauthenticated/dev requests fall back to the default namespace.
-fn get_pensyve_state(state: &AppState, auth_ctx: &AuthContext) -> Result<Arc<PensyveState>, RestError> {
+fn get_pensyve_state(
+    state: &AppState,
+    auth_ctx: &AuthContext,
+) -> Result<Arc<PensyveState>, RestError> {
     let tenant_key = auth_ctx.user_id.as_deref().unwrap_or(&auth_ctx.key_id);
     state.tenant_mgr.get_tenant_state(tenant_key).map_err(|e| {
         RestError(
