@@ -307,9 +307,9 @@ async fn recall(
         None
     };
 
-    // Hold mutex only for retrieval.
+    // Hold read lock only for retrieval — allows concurrent recalls.
     let result = {
-        let vector_index = ps.vector_index.lock().await;
+        let vector_index = ps.vector_index.read().await;
         let engine = RecallEngine::new(
             ps.storage.as_ref(),
             &ps.embedder,
@@ -387,7 +387,7 @@ async fn remember(
 
     match ps.embedder.embed(&body.fact) {
         Ok(embedding) => {
-            let mut vector_index = ps.vector_index.lock().await;
+            let mut vector_index = ps.vector_index.write().await;
             if let Err(err) = vector_index.add(mem.id, &embedding) {
                 tracing::warn!("Failed to add to vector index: {err}");
             }
@@ -472,7 +472,7 @@ async fn forget_entity(
     // Rebuild vector index (same pattern as MCP tools).
     if forgotten_count > 0 {
         let dims = {
-            let vi = ps.vector_index.lock().await;
+            let vi = ps.vector_index.read().await;
             vi.dimensions()
         };
         let mut new_index = VectorIndex::new(dims, 1024);
@@ -484,7 +484,7 @@ async fn forget_entity(
                 }
             }
         }
-        let mut vi = ps.vector_index.lock().await;
+        let mut vi = ps.vector_index.write().await;
         *vi = new_index;
     }
 
@@ -517,7 +517,7 @@ async fn delete_memory(
 
     // Rebuild vector index.
     let dims = {
-        let vi = ps.vector_index.lock().await;
+        let vi = ps.vector_index.read().await;
         vi.dimensions()
     };
     let mut new_index = VectorIndex::new(dims, 1024);
@@ -529,7 +529,7 @@ async fn delete_memory(
             }
         }
     }
-    let mut vi = ps.vector_index.lock().await;
+    let mut vi = ps.vector_index.write().await;
     *vi = new_index;
 
     Ok(Json(DeleteMemoryResponse { deleted: true, id }))
@@ -560,10 +560,10 @@ async fn purge_all_memories(
 
     // Clear the vector index.
     let dims = {
-        let vi = ps.vector_index.lock().await;
+        let vi = ps.vector_index.read().await;
         vi.dimensions()
     };
-    let mut vi = ps.vector_index.lock().await;
+    let mut vi = ps.vector_index.write().await;
     *vi = VectorIndex::new(dims, 1024);
 
     Ok(Json(serde_json::json!({ "deleted": deleted_count })))
@@ -618,7 +618,7 @@ async fn update_memory(
 
     // Re-embed if content changed.
     if content_changed && let Ok(embedding) = ps.embedder.embed(&content) {
-        let mut vector_index = ps.vector_index.lock().await;
+        let mut vector_index = ps.vector_index.write().await;
         let _ = vector_index.add(memory_id, &embedding);
     }
 

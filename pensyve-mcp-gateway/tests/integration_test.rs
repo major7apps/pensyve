@@ -11,7 +11,7 @@ use pensyve_mcp_tools::{PensyveMcpServer, PensyveState};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 /// Create a test server with a temporary database.
@@ -26,7 +26,7 @@ fn create_test_state(dir: &tempfile::TempDir) -> Arc<PensyveState> {
     Arc::new(PensyveState {
         storage: Arc::new(storage) as Arc<dyn StorageTrait>,
         embedder: Arc::new(embedder),
-        vector_index: Mutex::new(index),
+        vector_index: RwLock::new(index),
         namespace,
         retrieval_config: RetrievalConfig {
             default_limit: 5,

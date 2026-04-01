@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
@@ -40,7 +40,7 @@ impl TenantStateManager {
         let default_state = Arc::new(PensyveState {
             storage: storage.clone(),
             embedder: embedder.clone(),
-            vector_index: Mutex::new(default_vector_index),
+            vector_index: RwLock::new(default_vector_index),
             namespace: default_namespace,
             retrieval_config: retrieval_config.clone(),
             is_remote: true,
@@ -114,7 +114,7 @@ impl TenantStateManager {
         Ok(Arc::new(PensyveState {
             storage: self.storage.clone(),
             embedder: self.embedder.clone(),
-            vector_index: Mutex::new(index),
+            vector_index: RwLock::new(index),
             namespace,
             retrieval_config: self.retrieval_config.clone(),
             is_remote: true,

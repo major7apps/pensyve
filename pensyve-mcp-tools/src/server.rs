@@ -94,7 +94,7 @@ impl PensyveMcpServer {
 
         // Hold the mutex only for the retrieval phase, not JSON serialization.
         let result = {
-            let vector_index = state.vector_index.lock().await;
+            let vector_index = state.vector_index.read().await;
             let engine = RecallEngine::new(
                 state.storage.as_ref(),
                 &state.embedder,
@@ -141,7 +141,7 @@ impl PensyveMcpServer {
             })
             .collect();
 
-        serde_json::to_string_pretty(&memories).map_err(|e| format!("Serialization error: {e}"))
+        serde_json::to_string(&memories).map_err(|e| format!("Serialization error: {e}"))
     }
 
     /// Store an explicit semantic fact about an entity.
@@ -173,7 +173,7 @@ impl PensyveMcpServer {
 
         match state.embedder.embed(&params.fact) {
             Ok(embedding) => {
-                let mut vector_index = state.vector_index.lock().await;
+                let mut vector_index = state.vector_index.write().await;
                 if let Err(err) = vector_index.add(mem.id, &embedding) {
                     tracing::warn!("Failed to add to vector index: {err}");
                 }
@@ -189,7 +189,7 @@ impl PensyveMcpServer {
 
         let mut val = serde_json::to_value(&mem).unwrap_or_default();
         strip_embedding(&mut val);
-        serde_json::to_string_pretty(&val).map_err(|e| format!("Serialization error: {e}"))
+        serde_json::to_string(&val).map_err(|e| format!("Serialization error: {e}"))
     }
 
     /// Begin tracking an interaction episode.
@@ -215,7 +215,7 @@ impl PensyveMcpServer {
             .save_episode(&episode)
             .map_err(|err| format!("Error saving episode: {err}"))?;
 
-        serde_json::to_string_pretty(&serde_json::json!({
+        serde_json::to_string(&serde_json::json!({
             "episode_id": episode.id.to_string(),
             "participants": params.participants,
             "started_at": episode.started_at.to_rfc3339(),
@@ -262,7 +262,7 @@ impl PensyveMcpServer {
             .update_episode(&episode)
             .map_err(|err| format!("Error updating episode: {err}"))?;
 
-        serde_json::to_string_pretty(&serde_json::json!({
+        serde_json::to_string(&serde_json::json!({
             "episode_id": episode_id.to_string(),
             "memories_created": 0u32,
             "outcome": params.outcome.as_deref().unwrap_or("success"),
@@ -285,7 +285,7 @@ impl PensyveMcpServer {
         {
             Ok(Some(e)) => e,
             Ok(None) => {
-                return serde_json::to_string_pretty(&serde_json::json!({
+                return serde_json::to_string(&serde_json::json!({
                     "entity": params.entity,
                     "forgotten_count": 0u32,
                     "message": "Entity not found",
@@ -304,7 +304,7 @@ impl PensyveMcpServer {
         // then swap the index under the lock to minimize mutex hold time.
         if forgotten_count > 0 {
             let dims = {
-                let vi = state.vector_index.lock().await;
+                let vi = state.vector_index.read().await;
                 vi.dimensions()
             };
             let mut new_index = VectorIndex::new(dims, 1024);
@@ -319,12 +319,12 @@ impl PensyveMcpServer {
                     }
                 }
             }
-            // Brief lock just to swap.
-            let mut vi = state.vector_index.lock().await;
+            // Brief write lock just to swap.
+            let mut vi = state.vector_index.write().await;
             *vi = new_index;
         }
 
-        serde_json::to_string_pretty(&serde_json::json!({
+        serde_json::to_string(&serde_json::json!({
             "entity": params.entity,
             "entity_id": entity.id.to_string(),
             "forgotten_count": forgotten_count,
@@ -350,7 +350,7 @@ impl PensyveMcpServer {
         {
             Ok(Some(e)) => e,
             Ok(None) => {
-                return serde_json::to_string_pretty(&serde_json::json!({
+                return serde_json::to_string(&serde_json::json!({
                     "entity": params.entity,
                     "message": "Entity not found",
                     "memories": [],
@@ -397,7 +397,7 @@ impl PensyveMcpServer {
             }
         }
 
-        serde_json::to_string_pretty(&serde_json::json!({
+        serde_json::to_string(&serde_json::json!({
             "entity": params.entity,
             "entity_id": entity.id.to_string(),
             "memory_count": memories.len(),
@@ -444,11 +444,11 @@ impl PensyveMcpServer {
         }
 
         let vector_count = {
-            let vi = state.vector_index.lock().await;
+            let vi = state.vector_index.read().await;
             vi.len()
         };
 
-        serde_json::to_string_pretty(&serde_json::json!({
+        serde_json::to_string(&serde_json::json!({
             "mode": if state.is_remote { "remote" } else { "local" },
             "namespace": ns.name,
             "namespace_id": ns.id.to_string(),
@@ -476,7 +476,7 @@ impl PensyveMcpServer {
         let state = &self.state;
 
         if !state.is_remote {
-            return serde_json::to_string_pretty(&serde_json::json!({
+            return serde_json::to_string(&serde_json::json!({
                 "mode": "local",
                 "message": "Local mode — no account or billing. Self-hosted with no usage limits.",
             }))
@@ -486,7 +486,7 @@ impl PensyveMcpServer {
         // In remote/gateway mode, account info is injected by the gateway's
         // usage middleware. For now, return a placeholder indicating the tool
         // is available but details come from the gateway layer.
-        serde_json::to_string_pretty(&serde_json::json!({
+        serde_json::to_string(&serde_json::json!({
             "mode": "remote",
             "message": "Account information available via the Pensyve Cloud dashboard.",
             "dashboard_url": "https://pensyve.com/settings/billing",

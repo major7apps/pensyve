@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
@@ -15,7 +15,7 @@ use pensyve_core::vector::VectorIndex;
 pub struct PensyveState {
     pub storage: Arc<dyn StorageTrait>,
     pub embedder: Arc<OnnxEmbedder>,
-    pub vector_index: Mutex<VectorIndex>,
+    pub vector_index: RwLock<VectorIndex>,
     pub namespace: Namespace,
     pub retrieval_config: RetrievalConfig,
     /// True when running as a remote gateway (Streamable HTTP), false for local (stdio).
