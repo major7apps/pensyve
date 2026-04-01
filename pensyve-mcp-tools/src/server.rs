@@ -91,7 +91,16 @@ impl PensyveMcpServer {
         let limit = params.limit.unwrap_or(5).clamp(1, 100) as usize;
         let state = &self.state;
 
-        // Hold the mutex only for the retrieval phase, not JSON serialization.
+        // Embed the query BEFORE acquiring the read lock — avoids holding the
+        // vector index lock while waiting on the embedding Mutex.
+        let embedder = state.embedder.clone();
+        let query_text = params.query.clone();
+        let query_embedding = tokio::task::spawn_blocking(move || embedder.embed(&query_text))
+            .await
+            .ok()
+            .and_then(|r| r.ok());
+
+        // Hold the read lock only for the retrieval phase, not embedding or serialization.
         let result = {
             let vector_index = state.vector_index.read().await;
             let engine = RecallEngine::new(
@@ -101,7 +110,13 @@ impl PensyveMcpServer {
                 &state.retrieval_config,
             );
             engine
-                .recall(&params.query, state.namespace.id, limit)
+                .recall_with_embedding(
+                    &params.query,
+                    query_embedding.as_deref(),
+                    state.namespace.id,
+                    limit,
+                    None,
+                )
                 .map_err(|e| format!("Error recalling memories: {e}"))?
         };
 

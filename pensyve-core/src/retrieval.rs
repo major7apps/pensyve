@@ -353,6 +353,20 @@ impl<'a> RecallEngine<'a> {
         self.recall_with_entity(query, namespace_id, limit, None)
     }
 
+    /// Like `recall`, but accepts a pre-computed query embedding so callers
+    /// can embed outside a lock scope. Falls back to internal embedding if
+    /// `query_embedding` is `None`.
+    pub fn recall_with_embedding(
+        &self,
+        query: &str,
+        query_embedding: Option<&[f32]>,
+        namespace_id: Uuid,
+        limit: usize,
+        target_entity: Option<Uuid>,
+    ) -> Result<RecallResult, RecallError> {
+        self.recall_inner(query, query_embedding, namespace_id, limit, target_entity)
+    }
+
     /// Like `recall`, but allows specifying a `target_entity` for graph BFS.
     #[allow(clippy::too_many_lines)]
     #[tracing::instrument(skip_all, fields(query, namespace_id = %namespace_id, limit))]
@@ -363,12 +377,27 @@ impl<'a> RecallEngine<'a> {
         limit: usize,
         target_entity: Option<Uuid>,
     ) -> Result<RecallResult, RecallError> {
+        self.recall_inner(query, None, namespace_id, limit, target_entity)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn recall_inner(
+        &self,
+        query: &str,
+        pre_embedding: Option<&[f32]>,
+        namespace_id: Uuid,
+        limit: usize,
+        target_entity: Option<Uuid>,
+    ) -> Result<RecallResult, RecallError> {
         let start = std::time::Instant::now();
         let max_candidates = self.config.max_candidates;
 
         // Steps 1–4: embed, search, merge candidates.
-        let (candidates, vector_map) =
-            self.gather_candidates(query, namespace_id, max_candidates)?;
+        let (candidates, vector_map) = if let Some(emb) = pre_embedding {
+            self.gather_candidates_with_embedding(emb, query, namespace_id, max_candidates)?
+        } else {
+            self.gather_candidates(query, namespace_id, max_candidates)?
+        };
 
         if candidates.is_empty() {
             return Ok(RecallResult { memories: vec![] });
@@ -592,7 +621,19 @@ impl<'a> RecallEngine<'a> {
         max_candidates: usize,
     ) -> Result<CandidateMaps, RecallError> {
         let query_embedding = self.embedder.embed(query)?;
-        let vector_hits = self.vector_index.search(&query_embedding, max_candidates)?;
+        self.gather_candidates_with_embedding(&query_embedding, query, namespace_id, max_candidates)
+    }
+
+    /// Like `gather_candidates` but accepts a pre-computed embedding.
+    /// Use this when the embedding was generated outside the vector index lock.
+    fn gather_candidates_with_embedding(
+        &self,
+        query_embedding: &[f32],
+        query: &str,
+        namespace_id: Uuid,
+        max_candidates: usize,
+    ) -> Result<CandidateMaps, RecallError> {
+        let vector_hits = self.vector_index.search(query_embedding, max_candidates)?;
         let vector_map: HashMap<Uuid, f32> = vector_hits.iter().copied().collect();
 
         let fts_memories = self

@@ -307,6 +307,15 @@ async fn recall(
         None
     };
 
+    // Embed the query BEFORE acquiring the read lock — embedding serializes on
+    // a Mutex, so holding the vector index lock while waiting would block reads.
+    let embedder = ps.embedder.clone();
+    let query_text = body.query.clone();
+    let query_embedding = tokio::task::spawn_blocking(move || embedder.embed(&query_text))
+        .await
+        .ok()
+        .and_then(|r| r.ok());
+
     // Hold read lock only for retrieval — allows concurrent recalls.
     let result = {
         let vector_index = ps.vector_index.read().await;
@@ -317,7 +326,13 @@ async fn recall(
             &ps.retrieval_config,
         );
         engine
-            .recall_with_entity(&body.query, ps.namespace.id, limit, entity_id)
+            .recall_with_embedding(
+                &body.query,
+                query_embedding.as_deref(),
+                ps.namespace.id,
+                limit,
+                entity_id,
+            )
             .map_err(|e| {
                 RestError(
                     StatusCode::INTERNAL_SERVER_ERROR,
