@@ -182,12 +182,12 @@ impl AuthValidator {
                     .map(String::from),
             };
 
-            // Cache for 5 minutes
+            // Cache for 1 hour — remote validation is the #1 latency source.
             self.remote_cache.insert(
                 hash.to_string(),
                 (
                     ctx.clone(),
-                    std::time::Instant::now() + std::time::Duration::from_secs(300),
+                    std::time::Instant::now() + std::time::Duration::from_secs(3600),
                 ),
             );
 

@@ -15,7 +15,7 @@ use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::{Entity, EntityKind, Episode, Namespace, Outcome, SemanticMemory};
 use pensyve_core::vector::VectorIndex;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -27,7 +27,7 @@ use uuid::Uuid;
 struct TestState {
     storage: Arc<SqliteBackend>,
     embedder: OnnxEmbedder,
-    vector_index: Mutex<VectorIndex>,
+    vector_index: RwLock<VectorIndex>,
     namespace: Namespace,
     retrieval_config: RetrievalConfig,
     _tmpdir: tempfile::TempDir,
@@ -62,7 +62,7 @@ impl TestState {
         Self {
             storage,
             embedder,
-            vector_index: Mutex::new(vector_index),
+            vector_index: RwLock::new(vector_index),
             namespace,
             retrieval_config,
             _tmpdir: tmpdir,
@@ -119,7 +119,7 @@ async fn test_remember_creates_semantic_memory() {
     // Generate embedding and add to vector index.
     let embedding = state.embedder.embed(fact).expect("mock embed");
     {
-        let mut index = state.vector_index.lock().await;
+        let mut index = state.vector_index.write().await;
         index.add(mem.id, &embedding).expect("add to vector index");
     }
     mem.embedding = embedding;
@@ -337,14 +337,14 @@ async fn test_recall_returns_stored_semantic_memory() {
     );
     let embedding = state.embedder.embed(fact).expect("embed");
     {
-        let mut index = state.vector_index.lock().await;
+        let mut index = state.vector_index.write().await;
         index.add(mem.id, &embedding).expect("add to index");
     }
     mem.embedding = embedding;
     state.storage.save_semantic(&mem).expect("save");
 
     // Run the recall engine (same as the recall tool handler).
-    let index = state.vector_index.lock().await;
+    let index = state.vector_index.read().await;
     let engine = RecallEngine::new(
         &*state.storage,
         &state.embedder,
@@ -370,7 +370,7 @@ async fn test_recall_returns_stored_semantic_memory() {
 async fn test_recall_empty_namespace_returns_no_results() {
     let state = TestState::new();
 
-    let index = state.vector_index.lock().await;
+    let index = state.vector_index.read().await;
     let engine = RecallEngine::new(
         &*state.storage,
         &state.embedder,

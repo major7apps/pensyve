@@ -108,6 +108,14 @@ pub async fn oauth_cors_preflight() -> impl IntoResponse {
         .expect("valid response")
 }
 
+/// Shared HTTP client for OAuth proxy requests — avoids TCP+TLS handshake per call.
+static OAUTH_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("OAuth HTTP client should build")
+});
+
 /// Proxy a request to a cloud endpoint, forwarding body and content-type.
 async fn proxy_to_cloud(req: Request<Body>, target_url: &str) -> Response<Body> {
     let content_type = req
@@ -127,12 +135,7 @@ async fn proxy_to_cloud(req: Request<Body>, target_url: &str) -> Response<Body> 
             .expect("valid response");
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap();
-
-    let upstream = client
+    let upstream = OAUTH_CLIENT
         .post(target_url)
         .header("content-type", &content_type)
         .body(body_bytes.to_vec())

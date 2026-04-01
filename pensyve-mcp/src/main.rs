@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use rmcp::ServiceExt;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use pensyve_core::config::RetrievalConfig;
@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(PensyveState {
         storage: Arc::new(storage) as Arc<dyn StorageTrait>,
         embedder: Arc::new(embedder),
-        vector_index: Mutex::new(vector_index),
+        vector_index: RwLock::new(vector_index),
         namespace,
         retrieval_config,
         is_remote: false,
