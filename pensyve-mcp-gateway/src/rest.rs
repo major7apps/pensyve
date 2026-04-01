@@ -98,13 +98,13 @@ pub struct StatsResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct InspectRequest {
-    pub entity: Option<String>,
+    pub entity: String,
     pub limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct InspectResponse {
-    pub entity: Option<String>,
+    pub entity: String,
     pub episodic: Vec<serde_json::Value>,
     pub semantic: Vec<serde_json::Value>,
     pub procedural: Vec<serde_json::Value>,
@@ -231,8 +231,7 @@ fn entity_kind_str(kind: &EntityKind) -> &'static str {
 /// auth middleware.  Authenticated requests get an isolated namespace;
 /// unauthenticated/dev requests fall back to the default namespace.
 fn get_pensyve_state(state: &AppState, auth_ctx: &AuthContext) -> Result<Arc<PensyveState>, RestError> {
-    let tenant_key = auth_ctx.user_id.as_deref().unwrap_or(&auth_ctx.key_id);
-    state.tenant_mgr.get_tenant_state(tenant_key).map_err(|e| {
+    state.tenant_mgr.get_tenant_state(&auth_ctx.key_id).map_err(|e| {
         RestError(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to resolve tenant state: {e}"),
@@ -635,54 +634,11 @@ async fn inspect(
     let ps = get_pensyve_state(&state, &auth_ctx)?;
     let limit = body.limit.unwrap_or(50);
 
-    // No entity specified (or empty string) → return all memories in the namespace.
-    let entity_filter = body.entity.as_deref().filter(|s| !s.is_empty());
-    if entity_filter.is_none() {
-        let mut episodic = Vec::new();
-        let mut semantic = Vec::new();
-        let mut procedural = Vec::new();
-
-        if let Ok(memories) = ps.storage.get_all_memories_by_namespace(ps.namespace.id) {
-            let mut count = 0usize;
-            for mem in memories {
-                if count >= limit {
-                    break;
-                }
-                match mem {
-                    Memory::Episodic(inner) => {
-                        let mut val = serde_json::to_value(&inner).unwrap_or_default();
-                        strip_embedding(&mut val);
-                        episodic.push(val);
-                    }
-                    Memory::Semantic(inner) => {
-                        let mut val = serde_json::to_value(&inner).unwrap_or_default();
-                        strip_embedding(&mut val);
-                        semantic.push(val);
-                    }
-                    Memory::Procedural(inner) => {
-                        let mut val = serde_json::to_value(&inner).unwrap_or_default();
-                        strip_embedding(&mut val);
-                        procedural.push(val);
-                    }
-                }
-                count += 1;
-            }
-        }
-
-        return Ok(Json(InspectResponse {
-            entity: None,
-            episodic,
-            semantic,
-            procedural,
-        }));
-    }
-
-    let entity_name = entity_filter.unwrap();
-    let entity = match ps.storage.get_entity_by_name(entity_name, ps.namespace.id) {
+    let entity = match ps.storage.get_entity_by_name(&body.entity, ps.namespace.id) {
         Ok(Some(e)) => e,
         Ok(None) => {
             return Ok(Json(InspectResponse {
-                entity: Some(entity_name.to_string()),
+                entity: body.entity,
                 episodic: vec![],
                 semantic: vec![],
                 procedural: vec![],
@@ -718,7 +674,7 @@ async fn inspect(
     }
 
     Ok(Json(InspectResponse {
-        entity: Some(entity_name.to_string()),
+        entity: body.entity,
         episodic,
         semantic,
         procedural: vec![],
