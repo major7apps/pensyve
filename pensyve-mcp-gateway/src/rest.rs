@@ -635,6 +635,42 @@ async fn inspect(
     let ps = get_pensyve_state(&state, &auth_ctx)?;
     let limit = body.limit.unwrap_or(50);
 
+    // Empty entity → return all memories in the namespace (for dashboard browse mode).
+    if body.entity.is_empty() {
+        let mut episodic = Vec::new();
+        let mut semantic = Vec::new();
+        let mut procedural = Vec::new();
+
+        if let Ok(memories) = ps.storage.get_all_memories_by_namespace(ps.namespace.id) {
+            for mem in memories.into_iter().take(limit) {
+                match mem {
+                    pensyve_core::types::Memory::Episodic(m) => {
+                        let mut val = serde_json::to_value(&m).unwrap_or_default();
+                        strip_embedding(&mut val);
+                        episodic.push(val);
+                    }
+                    pensyve_core::types::Memory::Semantic(m) => {
+                        let mut val = serde_json::to_value(&m).unwrap_or_default();
+                        strip_embedding(&mut val);
+                        semantic.push(val);
+                    }
+                    pensyve_core::types::Memory::Procedural(m) => {
+                        let mut val = serde_json::to_value(&m).unwrap_or_default();
+                        strip_embedding(&mut val);
+                        procedural.push(val);
+                    }
+                }
+            }
+        }
+
+        return Ok(Json(InspectResponse {
+            entity: String::new(),
+            episodic,
+            semantic,
+            procedural,
+        }));
+    }
+
     let entity = match ps.storage.get_entity_by_name(&body.entity, ps.namespace.id) {
         Ok(Some(e)) => e,
         Ok(None) => {
