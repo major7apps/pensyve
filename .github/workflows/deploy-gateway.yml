@@ -33,7 +33,7 @@ jobs:
   build-and-deploy:
     name: Build & Deploy
     needs: [test]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v5
 
@@ -71,6 +71,7 @@ jobs:
             --force-new-deployment
 
       - name: Wait for stability
+        timeout-minutes: 8
         run: |
           aws ecs wait services-stable \
             --cluster $ECS_CLUSTER \
@@ -78,5 +79,5 @@ jobs:
 
       - name: Verify health
         run: |
-          sleep 5
+          sleep 10
           curl -sf --max-time 10 https://mcp.pensyve.com/health
