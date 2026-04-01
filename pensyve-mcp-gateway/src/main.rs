@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use axum::Router;
+use axum::serve::ListenerExt;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -249,6 +250,11 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
             "/oauth/register",
             axum::routing::post(oauth::oauth_register).options(oauth::oauth_cors_preflight),
         )
+        .layer(
+            tower_http::compression::CompressionLayer::new()
+                .gzip(true)
+                .br(true),
+        )
         .layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             tenant_and_usage_middleware,
@@ -272,6 +278,14 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
     let bind = format!("{}:{}", config.host, config.port);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!("pensyve-mcp-gateway listening on {bind}");
+
+    // Set TCP_NODELAY on every accepted connection — disables Nagle's algorithm
+    // to avoid 40-200ms buffering delay on small response packets.
+    let listener = listener.tap_io(|tcp_stream| {
+        if let Err(err) = tcp_stream.set_nodelay(true) {
+            tracing::warn!("Failed to set TCP_NODELAY: {err}");
+        }
+    });
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
