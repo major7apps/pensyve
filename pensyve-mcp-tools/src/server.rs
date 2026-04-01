@@ -11,7 +11,6 @@ use pensyve_core::retrieval::RecallEngine;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::types::{Entity, EntityKind, Episode, Memory, Outcome, SemanticMemory};
 
-
 use crate::params::{
     AccountParams, EpisodeEndParams, EpisodeStartParams, ForgetParams, InspectParams, RecallParams,
     RememberParams, StatusParams,
