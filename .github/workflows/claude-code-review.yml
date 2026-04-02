@@ -43,7 +43,7 @@ jobs:
                exceptions, broken SQL queries.
 
             2. **Security** — SQL injection (especially in storage/ and
-               pensyve_python/), unsafe deserialization, auth bypass, secrets in
+               pensyve_server/), unsafe deserialization, auth bypass, secrets in
                code, command injection in CI workflows.
 
             3. **Cross-language boundaries** — PyO3 bindings must match the Rust

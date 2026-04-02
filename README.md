@@ -390,7 +390,7 @@ pensyve/
 ├── pensyve-ts/         TypeScript SDK (bun) — timeout, retry, PensyveError
 ├── pensyve-go/         Go SDK — context-aware HTTP client
 ├── pensyve-wasm/       WASM build — standalone minimal in-memory Pensyve
-├── pensyve_python/       Shared Python utilities — billing, extraction
+├── pensyve_server/       Shared Python utilities — billing, extraction
 ├── integrations/       All integrations — IDE plugins, framework adapters, code harnesses
 │   ├── claude-code/    Claude Code plugin (commands, skills, agents, hooks)
 │   ├── vscode/         VS Code sidebar extension

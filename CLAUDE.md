@@ -90,7 +90,7 @@ uv run maturin develop --manifest-path pensyve-python/Cargo.toml
 | `pensyve-python` | Rust cdylib (PyO3) | Python SDK via `import pensyve` — wraps core into `Pensyve`, `Entity`, `Episode`, `Memory` classes |
 | `pensyve-mcp` | Rust binary | MCP server (stdio transport via `rmcp`) exposing recall/remember/episode tools |
 | `pensyve-cli` | Rust binary | CLI (`pensyve recall`, `pensyve stats`) via `clap` |
-| `pensyve_python/       Shared Python utilities — billing, Tier 2 extraction
+| `pensyve_server/`      | Python | Shared Python utilities — billing, Tier 2 extraction |
 | `pensyve-ts/` | TypeScript (bun) | HTTP client SDK with timeout, retry, PensyveError |
 | `pensyve-go/` | Go | HTTP client SDK with context.Context, structured errors |
 | `pensyve-wasm/` | Rust cdylib (wasm-bindgen) | Standalone minimal in-memory Pensyve for browser/edge (not in workspace) |
@@ -120,7 +120,7 @@ uv run maturin develop --manifest-path pensyve-python/Cargo.toml
 
 Namespace → Entity (agent|user|team|tool) → Episodes (bounded interaction sequences with messages) → Memories (episodic, semantic, procedural). Semantic memories are SPO triples with temporal validity (`valid_at`/`invalid_at`). Memories support multimodal content types.
 
-### Python utilities (`pensyve_python/`)
+### Python utilities (`pensyve_server/`)
 
 - `extraction.py` — Tier 2 LLM-based extraction via `llama-cpp-python` (gated by `PENSYVE_TIER2_ENABLED`)
 - `billing.py` — Usage metering with configurable limits, thread-safe tracker

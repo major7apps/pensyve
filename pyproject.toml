@@ -88,13 +88,13 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["pensyve", "pensyve_python"]
+known-first-party = ["pensyve", "pensyve_server"]
 
 [tool.pyright]
 pythonVersion = "3.10"
 typeCheckingMode = "strict"
 include = [
-    "pensyve_python",
+    "pensyve_server",
     "tests/python",
     "benchmarks",
 ]
