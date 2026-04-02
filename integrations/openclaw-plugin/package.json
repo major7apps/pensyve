@@ -1,6 +1,6 @@
 {
   "name": "@pensyve/openclaw-pensyve",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Pensyve memory plugin for OpenClaw — offline-first, 8-signal fusion retrieval",
   "type": "module",
   "main": "dist/index.js",
