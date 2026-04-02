@@ -27,7 +27,7 @@ sha2 = "0.11"
 hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 dashmap = "6"
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 tokio-util = { version = "0.7", features = ["rt"] }
 dirs = "6"
 
