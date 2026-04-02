@@ -1,6 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
@@ -24,7 +25,10 @@ pub type EmbeddingResult<T> = Result<T, EmbeddingError>;
 
 enum EmbedderInner {
     Mock,
-    Real(Box<Mutex<TextEmbedding>>),
+    Real {
+        pool: Vec<Mutex<TextEmbedding>>,
+        next: AtomicUsize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -78,13 +82,32 @@ impl OnnxEmbedder {
             }
         };
 
-        let model =
-            TextEmbedding::try_new(InitOptions::new(model_enum).with_show_download_progress(true))
-                .map_err(|e| EmbeddingError::ModelLoad(e.to_string()))?;
+        let pool_size = std::env::var("PENSYVE_EMBEDDING_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get().min(4))
+                    .unwrap_or(1)
+            });
+
+        let mut pool = Vec::with_capacity(pool_size);
+        for i in 0..pool_size {
+            let show_progress = i == 0;
+            let model = TextEmbedding::try_new(
+                InitOptions::new(model_enum.clone()).with_show_download_progress(show_progress),
+            )
+            .map_err(|e| EmbeddingError::ModelLoad(e.to_string()))?;
+            pool.push(Mutex::new(model));
+        }
 
         Ok(Self {
             dimensions: dims,
-            inner: EmbedderInner::Real(Box::new(Mutex::new(model))),
+            inner: EmbedderInner::Real {
+                pool,
+                next: AtomicUsize::new(0),
+            },
         })
     }
 
@@ -109,10 +132,11 @@ impl OnnxEmbedder {
     pub fn embed(&self, text: &str) -> EmbeddingResult<Vec<f32>> {
         match &self.inner {
             EmbedderInner::Mock => Ok(mock_embed(text, self.dimensions)),
-            EmbedderInner::Real(mutex) => {
-                let mut model = mutex
+            EmbedderInner::Real { pool, next } => {
+                let idx = next.fetch_add(1, Ordering::Relaxed) % pool.len();
+                let mut model = pool[idx]
                     .lock()
-                    .map_err(|e| EmbeddingError::Inference(format!("Mutex poisoned: {e}")))?;
+                    .map_err(|e| EmbeddingError::Inference(format!("Lock poisoned: {e}")))?;
                 let embeddings = model
                     .embed(vec![text], None)
                     .map_err(|e| EmbeddingError::Inference(e.to_string()))?;
@@ -131,10 +155,11 @@ impl OnnxEmbedder {
                 .iter()
                 .map(|t| Ok(mock_embed(t, self.dimensions)))
                 .collect(),
-            EmbedderInner::Real(mutex) => {
-                let mut model = mutex
+            EmbedderInner::Real { pool, next } => {
+                let idx = next.fetch_add(1, Ordering::Relaxed) % pool.len();
+                let mut model = pool[idx]
                     .lock()
-                    .map_err(|e| EmbeddingError::Inference(format!("Mutex poisoned: {e}")))?;
+                    .map_err(|e| EmbeddingError::Inference(format!("Lock poisoned: {e}")))?;
                 model
                     .embed(texts, None)
                     .map_err(|e| EmbeddingError::Inference(e.to_string()))
