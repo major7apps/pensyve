@@ -217,12 +217,13 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                 Ok(PensyveMcpServer::new(pensyve_state))
             },
             Arc::default(),
-            StreamableHttpServerConfig {
-                stateful_mode: false,
-                json_response: true,
-                sse_keep_alive: None,
-                cancellation_token: ct.child_token(),
-                ..Default::default()
+            {
+                let mut cfg = StreamableHttpServerConfig::default();
+                cfg.stateful_mode = false;
+                cfg.json_response = true;
+                cfg.sse_keep_alive = None;
+                cfg.cancellation_token = ct.child_token();
+                cfg
             },
         );
 
