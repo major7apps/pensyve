@@ -61,3 +61,4 @@ Thumbs.db
 *.whl
 *.tar.gz
 .superpowers/
+pensyve-plugin.local.md
