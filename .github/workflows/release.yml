@@ -40,7 +40,7 @@ jobs:
           manylinux: "2_28"
           before-script-linux: dnf install -y openssl-devel perl-IPC-Cmd
       - name: Upload wheels
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.target }}
           path: dist/*.whl
@@ -56,7 +56,7 @@ jobs:
           command: sdist
           args: --out dist --manifest-path pensyve-python/Cargo.toml
       - name: Upload sdist
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-sdist
           path: dist/*.tar.gz
@@ -159,7 +159,7 @@ jobs:
           cp target/release/pensyve.exe staging/pensyve.exe
           Compress-Archive -Path staging/pensyve.exe -DestinationPath ${{ matrix.artifact }}.zip
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.*
@@ -191,7 +191,7 @@ jobs:
           cp target/release/pensyve-mcp staging/pensyve-mcp
           cd staging && tar czf ../${{ matrix.artifact }}.tar.gz pensyve-mcp
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.*
