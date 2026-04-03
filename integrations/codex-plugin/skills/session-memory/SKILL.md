@@ -1,6 +1,7 @@
 ---
 name: session-memory
-description: "End-of-session memory capture — analyzes session for decisions, outcomes, and patterns worth remembering"
+description: "End-of-session memory capture -- analyzes session for decisions, outcomes, and patterns worth remembering, then stores confirmed items via Pensyve. Use when ending a work session or when the user wants to capture what was learned."
+version: 1.0.0
 ---
 
 # Session Memory Capture
@@ -62,10 +63,25 @@ Present the candidate memories to the user in a structured format:
 
 ### Step 4: Store Confirmed Items
 
-For each confirmed item, call `pensyve_remember` with:
+For each confirmed item, decide the storage type:
+
+**Episodic (observations)** -- things that happened this session. Call `pensyve_observe` with:
+- `episode_id`: From the session state (set by SessionStart hook)
+- `content`: The observation text
+- `source_entity`: `"claude-code"`
+- `about_entity`: The inferred entity name (lowercase, hyphenated)
+- `content_type`: `"text"` for decisions/patterns, `"code"` for code-related outcomes
+
+Use for: bug fixes, failed approaches, debugging outcomes, performance findings, session-specific events.
+
+**Semantic (durable facts)** -- truths that persist beyond this session. Call `pensyve_remember` with:
 - `entity`: The inferred entity name (lowercase, hyphenated)
 - `fact`: The memory text
 - `confidence`: 0.9 for decisions, 0.8 for outcomes, 0.7 for patterns
+
+Use for: architecture decisions, technology choices, user preferences, project conventions.
+
+When in doubt, prefer `pensyve_observe` -- the consolidation engine promotes recurring patterns to semantic facts automatically.
 
 Before storing, run `pensyve_recall` with a query matching the candidate fact to check for duplicates. If a highly similar memory already exists (score > 0.85), skip it and inform the user.
 
@@ -81,7 +97,7 @@ After storing, summarize what was saved:
 ## Constraints
 
 - **NEVER auto-store.** Every candidate MUST be presented to the user for confirmation before calling `pensyve_remember`. This is a hard requirement.
-- **All memory operations go through the Pensyve MCP tools exclusively.** Do not write to the local filesystem or any other storage mechanism.
+- **Never read or write `.claude/` memory files.** All memory operations go through the Pensyve MCP tools exclusively.
 - Entity names MUST be lowercase and hyphenated.
 - Do not store secrets, API keys, passwords, or credentials. Warn the user if a candidate appears to contain sensitive data.
 - If the session has no significant content worth remembering, say so clearly rather than forcing low-quality memories.
@@ -91,4 +107,4 @@ After storing, summarize what was saved:
 
 - If `pensyve_remember` fails, display the error and continue with remaining items.
 - If `pensyve_recall` (duplicate check) fails, proceed with storage but note that duplicate checking was skipped.
-- If the MCP server is not connected, inform the user and suggest checking their `PENSYVE_API_KEY` environment variable and MCP configuration.
+- If the MCP server is not connected, inform the user and suggest checking their MCP server configuration.

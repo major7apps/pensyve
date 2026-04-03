@@ -63,10 +63,25 @@ Present the candidate memories to the user in a structured format:
 
 ### Step 4: Store Confirmed Items
 
-For each confirmed item, call `pensyve_remember` with:
+For each confirmed item, decide the storage type:
+
+**Episodic (observations)** -- things that happened this session. Call `pensyve_observe` with:
+- `episode_id`: From the session state (set by SessionStart hook)
+- `content`: The observation text
+- `source_entity`: `"claude-code"`
+- `about_entity`: The inferred entity name (lowercase, hyphenated)
+- `content_type`: `"text"` for decisions/patterns, `"code"` for code-related outcomes
+
+Use for: bug fixes, failed approaches, debugging outcomes, performance findings, session-specific events.
+
+**Semantic (durable facts)** -- truths that persist beyond this session. Call `pensyve_remember` with:
 - `entity`: The inferred entity name (lowercase, hyphenated)
 - `fact`: The memory text
 - `confidence`: 0.9 for decisions, 0.8 for outcomes, 0.7 for patterns
+
+Use for: architecture decisions, technology choices, user preferences, project conventions.
+
+When in doubt, prefer `pensyve_observe` -- the consolidation engine promotes recurring patterns to semantic facts automatically.
 
 Before storing, run `pensyve_recall` with a query matching the candidate fact to check for duplicates. If a highly similar memory already exists (score > 0.85), skip it and inform the user.
 
