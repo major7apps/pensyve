@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -11,7 +11,7 @@ use crate::types::{
     ProceduralMemory, SemanticMemory,
 };
 
-use super::{StorageError, StorageResult, StorageTrait};
+use super::{ActivityAggregate, ActivityEvent, StorageError, StorageResult, StorageTrait};
 use crate::graph::EdgeType;
 
 // ---------------------------------------------------------------------------
@@ -1467,6 +1467,110 @@ impl StorageTrait for SqliteBackend {
             |row| row.get(0),
         )?;
         Ok(count as usize)
+    }
+
+    // -------------------------------------------------------------------
+    // Activity logging
+    // -------------------------------------------------------------------
+
+    fn log_activity(
+        &self,
+        namespace_id: Uuid,
+        event_type: &str,
+        detail: &serde_json::Value,
+    ) -> StorageResult<()> {
+        let conn = lock_conn!(self);
+        let id = Uuid::new_v4().to_string();
+        let detail_str = serde_json::to_string(detail)?;
+        conn.execute(
+            "INSERT INTO activity_events (id, event_type, namespace_id, detail_json) VALUES (?1, ?2, ?3, ?4)",
+            params![id, event_type, namespace_id.to_string(), detail_str],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn get_activity_aggregates(
+        &self,
+        namespace_id: Uuid,
+        days: u32,
+    ) -> StorageResult<Vec<ActivityAggregate>> {
+        let conn = lock_conn!(self);
+        let offset = format!("-{days} days");
+        let mut stmt = conn.prepare(
+            "SELECT date(created_at) AS day, event_type, COUNT(*) \
+             FROM activity_events \
+             WHERE namespace_id = ?1 AND created_at >= datetime('now', ?2) \
+             GROUP BY day, event_type \
+             ORDER BY day",
+        )?;
+        let rows = stmt.query_map(params![namespace_id.to_string(), offset], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+
+        let mut map: BTreeMap<String, ActivityAggregate> = BTreeMap::new();
+        for r in rows {
+            let (day, event_type, count) = r?;
+            let agg = map.entry(day.clone()).or_insert_with(|| ActivityAggregate {
+                date: day,
+                recalls: 0,
+                remembers: 0,
+                observes: 0,
+                forgets: 0,
+            });
+            let count = count as usize;
+            match event_type.as_str() {
+                "recall" => agg.recalls += count,
+                "remember" => agg.remembers += count,
+                "observe" => agg.observes += count,
+                "forget" => agg.forgets += count,
+                _ => {}
+            }
+        }
+
+        Ok(map.into_values().collect())
+    }
+
+    #[allow(clippy::cast_possible_wrap)]
+    fn get_recent_activity(
+        &self,
+        namespace_id: Uuid,
+        limit: usize,
+    ) -> StorageResult<Vec<ActivityEvent>> {
+        let conn = lock_conn!(self);
+        let mut stmt = conn.prepare(
+            "SELECT id, event_type, namespace_id, detail_json, created_at \
+             FROM activity_events \
+             WHERE namespace_id = ?1 \
+             ORDER BY created_at DESC \
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![namespace_id.to_string(), limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+
+        let mut events = Vec::new();
+        for r in rows {
+            let (id_str, event_type, ns_str, detail_str, created_str) = r?;
+            events.push(ActivityEvent {
+                id: parse_uuid(&id_str)?,
+                event_type,
+                namespace_id: parse_uuid(&ns_str)?,
+                detail_json: serde_json::from_str(&detail_str).unwrap_or_default(),
+                created_at: str_to_dt(&created_str),
+            });
+        }
+        Ok(events)
     }
 }
 

@@ -16,7 +16,7 @@ use crate::types::{
     ProceduralMemory, SemanticMemory,
 };
 
-use super::{StorageResult, StorageTrait};
+use super::{ActivityAggregate, ActivityEvent, StorageResult, StorageTrait};
 use crate::graph::EdgeType;
 
 // ---------------------------------------------------------------------------
@@ -1270,6 +1270,118 @@ impl StorageTrait for PostgresBackend {
                     .map_err(sqlx_to_io)?;
 
             Ok(count as usize)
+        })
+    }
+
+    // -------------------------------------------------------------------
+    // Activity logging
+    // -------------------------------------------------------------------
+
+    fn log_activity(
+        &self,
+        namespace_id: Uuid,
+        event_type: &str,
+        detail: &serde_json::Value,
+    ) -> StorageResult<()> {
+        let id = Uuid::new_v4();
+        let event_type = event_type.to_string();
+        let detail = detail.clone();
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            query::<Postgres>(
+                "INSERT INTO activity_events (id, event_type, namespace_id, detail_json) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(id)
+            .bind(&event_type)
+            .bind(namespace_id)
+            .bind(&detail)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(())
+        })
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn get_activity_aggregates(
+        &self,
+        namespace_id: Uuid,
+        days: u32,
+    ) -> StorageResult<Vec<ActivityAggregate>> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let rows: Vec<(String, String, i64)> = query_as::<Postgres, _>(
+                "SELECT date_trunc('day', created_at)::date::text AS day, event_type, COUNT(*) \
+                 FROM activity_events \
+                 WHERE namespace_id = $1 \
+                   AND created_at >= NOW() - make_interval(days => $2) \
+                 GROUP BY day, event_type \
+                 ORDER BY day",
+            )
+            .bind(namespace_id)
+            .bind(days as i32)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+
+            let mut map: std::collections::BTreeMap<String, ActivityAggregate> =
+                std::collections::BTreeMap::new();
+            for (day, event_type, count) in rows {
+                let agg = map.entry(day.clone()).or_insert_with(|| ActivityAggregate {
+                    date: day,
+                    recalls: 0,
+                    remembers: 0,
+                    observes: 0,
+                    forgets: 0,
+                });
+                let count = count as usize;
+                match event_type.as_str() {
+                    "recall" => agg.recalls += count,
+                    "remember" => agg.remembers += count,
+                    "observe" => agg.observes += count,
+                    "forget" => agg.forgets += count,
+                    _ => {}
+                }
+            }
+
+            Ok(map.into_values().collect())
+        })
+    }
+
+    fn get_recent_activity(
+        &self,
+        namespace_id: Uuid,
+        limit: usize,
+    ) -> StorageResult<Vec<ActivityEvent>> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let rows: Vec<(Uuid, String, Uuid, serde_json::Value, DateTime<Utc>)> =
+                query_as::<Postgres, _>(
+                    "SELECT id, event_type, namespace_id, detail_json, created_at \
+                     FROM activity_events \
+                     WHERE namespace_id = $1 \
+                     ORDER BY created_at DESC \
+                     LIMIT $2",
+                )
+                .bind(namespace_id)
+                .bind(limit as i64)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(sqlx_to_io)?;
+
+            Ok(rows
+                .into_iter()
+                .map(
+                    |(id, event_type, ns, detail_json, created_at)| ActivityEvent {
+                        id,
+                        event_type,
+                        namespace_id: ns,
+                        detail_json,
+                        created_at,
+                    },
+                )
+                .collect())
         })
     }
 }
