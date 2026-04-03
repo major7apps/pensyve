@@ -55,10 +55,25 @@ If significant items were found (maximum 5), present them for user confirmation:
 
 ### Step 4: Store Confirmed Items
 
-For each confirmed item, call `pensyve_remember` with:
+For each confirmed item, decide the storage type:
+
+**Episodic (observations)** -- things that happened this session. Call `pensyve_observe` with:
+- `episode_id`: From the session state (set by SessionStart hook)
+- `content`: The observation text
+- `source_entity`: `"claude-code"`
+- `about_entity`: The relevant entity name (lowercase, hyphenated)
+- `content_type`: `"text"` for decisions/patterns, `"code"` for code-related outcomes
+
+Use `pensyve_observe` for: bug fixes discovered, failed approaches, debugging outcomes, performance findings, session-specific events.
+
+**Semantic (durable facts)** -- truths that will remain relevant beyond this session. Call `pensyve_remember` with:
 - `entity`: The relevant entity name (lowercase, hyphenated)
 - `fact`: The fact text
 - `confidence`: Based on type -- 0.9 for decisions, 0.8 for outcomes, 0.7 for patterns
+
+Use `pensyve_remember` for: architecture decisions, technology choices, user preferences, project conventions, API design rules.
+
+When in doubt, use `pensyve_observe` -- the consolidation engine will promote recurring episodic patterns to semantic facts automatically.
 
 Report what was stored after completion.
 
@@ -67,6 +82,7 @@ Report what was stored after completion.
 If a session episode was started by the SessionStart hook:
 - Call `pensyve_episode_end` with the stored `episode_id`
 - Set `outcome` based on the task result: `"success"`, `"failure"`, or `"partial"`
+- The server will automatically trigger consolidation (episodic → semantic promotion)
 
 If no episode is active, skip this step.
 

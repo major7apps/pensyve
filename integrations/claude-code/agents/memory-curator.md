@@ -86,8 +86,11 @@ Present the candidate concisely, inline with the session flow. Do not interrupt 
 ### Step 3: Store on Confirmation
 
 If the user confirms:
-- **"yes"**: Call `pensyve_remember` with the entity, fact, and confidence as presented.
-- **"edit"**: Let the user modify the fact text, then call `pensyve_remember` with the edited version.
+- **"yes"**: Store using the appropriate tool:
+  - **Episodic** (session events, debugging outcomes, failed approaches): Call `pensyve_observe` with `episode_id` from session state, `source_entity: "claude-code"`, `about_entity` as the entity name, `content` as the fact text, and `content_type: "text"` or `"code"`.
+  - **Semantic** (durable facts, decisions, preferences): Call `pensyve_remember` with the entity, fact, and confidence as presented.
+  - When in doubt, prefer `pensyve_observe` — the consolidation engine promotes recurring patterns automatically.
+- **"edit"**: Let the user modify the fact text, then store using the appropriate tool.
 - **"no"**: Do not store. Do not suggest the same item again in this session.
 
 If the user does not respond or dismisses the suggestion, treat it as "no" and move on.
