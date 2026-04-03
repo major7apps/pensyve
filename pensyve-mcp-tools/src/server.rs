@@ -9,11 +9,13 @@ use uuid::Uuid;
 
 use pensyve_core::retrieval::RecallEngine;
 use pensyve_core::storage::StorageTrait;
-use pensyve_core::types::{Entity, EntityKind, Episode, Memory, Outcome, SemanticMemory};
+use pensyve_core::types::{
+    ContentType, Entity, EntityKind, Episode, EpisodicMemory, Memory, Outcome, SemanticMemory,
+};
 
 use crate::params::{
-    AccountParams, EpisodeEndParams, EpisodeStartParams, ForgetParams, InspectParams, RecallParams,
-    RememberParams, StatusParams,
+    AccountParams, EpisodeEndParams, EpisodeStartParams, ForgetParams, InspectParams,
+    ObserveParams, RecallParams, RememberParams, StatusParams,
 };
 use crate::state::PensyveState;
 
@@ -158,6 +160,12 @@ impl PensyveMcpServer {
             })
             .collect();
 
+        let _ = state.storage.log_activity(
+            state.namespace.id,
+            "recall",
+            &serde_json::json!({"query": params.query, "results": memories.len()}),
+        );
+
         serde_json::to_string(&memories).map_err(|e| format!("Serialization error: {e}"))
     }
 
@@ -216,6 +224,12 @@ impl PensyveMcpServer {
             .save_semantic(&mem)
             .map_err(|err| format!("Error saving semantic memory: {err}"))?;
 
+        let _ = state.storage.log_activity(
+            state.namespace.id,
+            "remember",
+            &serde_json::json!({"entity": params.entity, "preview": &params.fact[..params.fact.len().min(50)]}),
+        );
+
         let mut val = serde_json::to_value(&mem).unwrap_or_default();
         strip_embedding(&mut val);
         serde_json::to_string(&val).map_err(|e| format!("Serialization error: {e}"))
@@ -243,6 +257,12 @@ impl PensyveMcpServer {
             .storage
             .save_episode(&episode)
             .map_err(|err| format!("Error saving episode: {err}"))?;
+
+        let _ = state.storage.log_activity(
+            state.namespace.id,
+            "episode_start",
+            &serde_json::json!({"participants": params.participants}),
+        );
 
         serde_json::to_string(&serde_json::json!({
             "episode_id": episode.id.to_string(),
@@ -291,6 +311,12 @@ impl PensyveMcpServer {
             .update_episode(&episode)
             .map_err(|err| format!("Error updating episode: {err}"))?;
 
+        let _ = state.storage.log_activity(
+            state.namespace.id,
+            "episode_end",
+            &serde_json::json!({"outcome": params.outcome.as_deref().unwrap_or("success")}),
+        );
+
         serde_json::to_string(&serde_json::json!({
             "episode_id": episode_id.to_string(),
             "memories_created": 0u32,
@@ -298,6 +324,111 @@ impl PensyveMcpServer {
             "ended_at": episode.ended_at.map(|t| t.to_rfc3339()),
         }))
         .map_err(|e| format!("Serialization error: {e}"))
+    }
+
+    /// Record an observation within an episode.
+    #[tool(
+        name = "pensyve_observe",
+        description = "Record an observation within an active episode. Captures what happened, who said it, and what it's about. Returns the stored episodic memory object."
+    )]
+    async fn observe(
+        &self,
+        Parameters(params): Parameters<ObserveParams>,
+    ) -> Result<String, String> {
+        // Validate input lengths.
+        if params.content.len() > 32768 {
+            return Err("Content too long (max 32768 bytes)".to_string());
+        }
+        if params.source_entity.len() > 256 {
+            return Err("source_entity name too long (max 256 bytes)".to_string());
+        }
+        if params.about_entity.len() > 256 {
+            return Err("about_entity name too long (max 256 bytes)".to_string());
+        }
+
+        let state = &self.state;
+
+        let episode_id = params
+            .episode_id
+            .parse::<Uuid>()
+            .map_err(|_| format!("Invalid episode_id: '{}'", params.episode_id))?;
+
+        // Verify the episode exists.
+        match state.storage.get_episode(episode_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(format!("Episode not found: {episode_id}")),
+            Err(e) => return Err(format!("Error loading episode: {e}")),
+        }
+
+        // Resolve entities.
+        let source_entity = get_or_create_entity(
+            state.storage.as_ref(),
+            &params.source_entity,
+            state.namespace.id,
+        )?;
+        let about_entity = get_or_create_entity(
+            state.storage.as_ref(),
+            &params.about_entity,
+            state.namespace.id,
+        )?;
+
+        // Build the episodic memory.
+        let mut mem = EpisodicMemory::new(
+            state.namespace.id,
+            episode_id,
+            source_entity.id,
+            about_entity.id,
+            &params.content,
+        );
+        mem.content_type = match params.content_type.as_deref() {
+            Some("code") => ContentType::Code,
+            Some("tool_output") => ContentType::ToolOutput,
+            _ => ContentType::Text,
+        };
+
+        // Embed content on the blocking thread pool.
+        let embedder = state.embedder.clone();
+        let content = params.content.clone();
+        let embed_result = tokio::task::spawn_blocking(move || embedder.embed(&content)).await;
+
+        match embed_result {
+            Ok(Ok(embedding)) => {
+                let mut vector_index = state.vector_index.write().await;
+                if let Err(err) = vector_index.add(mem.id, &embedding) {
+                    tracing::warn!("Failed to add to vector index: {err}");
+                }
+                mem.embedding = embedding;
+            }
+            Ok(Err(err)) => tracing::warn!("Embedding failed: {err}"),
+            Err(err) => tracing::warn!("Embedding task panicked: {err}"),
+        }
+
+        state
+            .storage
+            .save_episodic(&mem)
+            .map_err(|err| format!("Error saving episodic memory: {err}"))?;
+
+        let _ = state.storage.log_activity(
+            state.namespace.id,
+            "observe",
+            &serde_json::json!({
+                "episode_id": episode_id.to_string(),
+                "source_entity": params.source_entity,
+                "about_entity": params.about_entity,
+                "content_type": mem.content_type.as_str(),
+                "content_len": params.content.len(),
+            }),
+        );
+
+        let mut val = serde_json::to_value(&serde_json::json!({
+            "id": mem.id.to_string(),
+            "episode_id": episode_id.to_string(),
+            "content_type": mem.content_type.as_str(),
+            "timestamp": mem.timestamp.to_rfc3339(),
+        }))
+        .unwrap_or_default();
+        strip_embedding(&mut val);
+        serde_json::to_string(&val).map_err(|e| format!("Serialization error: {e}"))
     }
 
     /// Delete memories for an entity.
@@ -345,6 +476,12 @@ impl PensyveMcpServer {
                 let _ = vi.remove(*id);
             }
         }
+
+        let _ = state.storage.log_activity(
+            state.namespace.id,
+            "forget",
+            &serde_json::json!({"entity": params.entity}),
+        );
 
         serde_json::to_string(&serde_json::json!({
             "entity": params.entity,
