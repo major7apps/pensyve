@@ -18,7 +18,7 @@ use crate::auth::AuthContext;
 use pensyve_core::retrieval::RecallEngine;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::types::{
-    ContentType, Entity, EntityKind, EpisodicMemory, Memory, SemanticMemory,
+    ContentType, Entity, EntityKind, Episode, EpisodicMemory, Memory, Outcome, SemanticMemory,
 };
 use pensyve_core::vector::VectorIndex;
 use pensyve_mcp_tools::PensyveState;
@@ -168,6 +168,29 @@ pub struct RecentActivityQuery {
     pub limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct EpisodeStartRequest {
+    pub participants: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EpisodeMessageRequest {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EpisodeEndRequest {
+    pub outcome: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FeedbackRequest {
+    pub memory_id: String,
+    pub relevant: bool,
+    pub signals: Option<Vec<f32>>,
+}
+
 // ---------------------------------------------------------------------------
 // Error helper
 // ---------------------------------------------------------------------------
@@ -303,6 +326,20 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/v1/activity/recent", routing::get(activity_recent))
         .route("/v1/inspect", routing::post(inspect))
         .route("/v1/memories", routing::delete(purge_all_memories))
+        .route("/v1/episodes/start", routing::post(episode_start))
+        .route(
+            "/v1/episodes/{id}/message",
+            routing::post(episode_message),
+        )
+        .route("/v1/episodes/{id}/end", routing::post(episode_end))
+        .route("/v1/consolidate", routing::post(consolidate))
+        .route("/v1/feedback", routing::post(feedback))
+        .route(
+            "/v1/gdpr/erase/{name}",
+            routing::delete(gdpr_erase),
+        )
+        .route("/v1/a2a/agent-card", routing::get(a2a_agent_card))
+        .route("/v1/a2a/task", routing::post(a2a_task))
 }
 
 // ---------------------------------------------------------------------------
@@ -1076,4 +1113,554 @@ async fn activity_recent(
         .collect();
 
     Ok(Json(response))
+}
+
+// ---------------------------------------------------------------------------
+// Episode handlers
+// ---------------------------------------------------------------------------
+
+async fn episode_start(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
+    Json(body): Json<EpisodeStartRequest>,
+) -> Result<impl IntoResponse, RestError> {
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
+
+    let mut participant_ids: Vec<Uuid> = Vec::new();
+    for name in &body.participants {
+        let entity = get_or_create_entity(
+            ps.storage.as_ref(),
+            name,
+            ps.namespace.id,
+            EntityKind::Agent,
+        )?;
+        participant_ids.push(entity.id);
+    }
+
+    let episode = Episode::new(ps.namespace.id, participant_ids);
+    ps.storage.save_episode(&episode).map_err(|err| {
+        RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Error saving episode: {err}"),
+        )
+    })?;
+
+    let _ = ps.storage.log_activity(
+        ps.namespace.id,
+        "episode_start",
+        &json!({"participants": body.participants}),
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "episode_id": episode.id.to_string(),
+            "participants": body.participants,
+            "started_at": episode.started_at.to_rfc3339(),
+        })),
+    ))
+}
+
+async fn episode_message(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
+    Path(id): Path<String>,
+    Json(body): Json<EpisodeMessageRequest>,
+) -> Result<impl IntoResponse, RestError> {
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
+
+    let episode_id = Uuid::parse_str(&id).map_err(|_| {
+        RestError(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid episode_id: '{id}'"),
+        )
+    })?;
+
+    // Verify the episode exists.
+    match ps.storage.get_episode(episode_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(RestError(
+                StatusCode::NOT_FOUND,
+                format!("Episode not found: {episode_id}"),
+            ));
+        }
+        Err(e) => {
+            return Err(RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Error loading episode: {e}"),
+            ));
+        }
+    }
+
+    // Resolve the role entity as both source and about.
+    let entity = get_or_create_entity(
+        ps.storage.as_ref(),
+        &body.role,
+        ps.namespace.id,
+        EntityKind::Agent,
+    )?;
+
+    let mut mem =
+        EpisodicMemory::new(ps.namespace.id, episode_id, entity.id, entity.id, &body.content);
+    mem.content_type = ContentType::Text;
+
+    // Embed content on the blocking thread pool.
+    let embedder = ps.embedder.clone();
+    let content = body.content.clone();
+    let embed_result = tokio::task::spawn_blocking(move || embedder.embed(&content)).await;
+
+    match embed_result {
+        Ok(Ok(embedding)) => {
+            let mut vector_index = ps.vector_index.write().await;
+            if let Err(err) = vector_index.add(mem.id, &embedding) {
+                tracing::warn!("Failed to add to vector index: {err}");
+            }
+            mem.embedding = embedding;
+        }
+        Ok(Err(err)) => tracing::warn!("Embedding failed: {err}"),
+        Err(err) => tracing::warn!("Embedding task panicked: {err}"),
+    }
+
+    ps.storage.save_episodic(&mem).map_err(|err| {
+        RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Error saving episodic memory: {err}"),
+        )
+    })?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": mem.id.to_string(),
+            "episode_id": episode_id.to_string(),
+            "role": body.role,
+            "timestamp": mem.timestamp.to_rfc3339(),
+        })),
+    ))
+}
+
+async fn episode_end(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
+    Path(id): Path<String>,
+    Json(body): Json<EpisodeEndRequest>,
+) -> Result<impl IntoResponse, RestError> {
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
+
+    let episode_id = Uuid::parse_str(&id).map_err(|_| {
+        RestError(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid episode_id: '{id}'"),
+        )
+    })?;
+
+    let outcome = match body.outcome.as_deref() {
+        Some("success") | None => Outcome::Success,
+        Some("failure") => Outcome::Failure,
+        Some("partial") => Outcome::Partial,
+        Some(other) => {
+            return Err(RestError(
+                StatusCode::BAD_REQUEST,
+                format!("Unknown outcome '{other}'; use success, failure, or partial"),
+            ));
+        }
+    };
+
+    let mut episode = match ps.storage.get_episode(episode_id) {
+        Ok(Some(ep)) => ep,
+        Ok(None) => {
+            return Err(RestError(
+                StatusCode::NOT_FOUND,
+                format!("Episode not found: {episode_id}"),
+            ));
+        }
+        Err(e) => {
+            return Err(RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Error loading episode: {e}"),
+            ));
+        }
+    };
+    episode.close(outcome);
+
+    ps.storage.update_episode(&episode).map_err(|err| {
+        RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Error updating episode: {err}"),
+        )
+    })?;
+
+    let _ = ps.storage.log_activity(
+        ps.namespace.id,
+        "episode_end",
+        &json!({"outcome": body.outcome.as_deref().unwrap_or("success")}),
+    );
+
+    // Trigger async consolidation for this namespace.
+    {
+        let storage = ps.storage.clone();
+        let embedder = ps.embedder.clone();
+        let ns_id = ps.namespace.id;
+        tokio::spawn(async move {
+            let config = pensyve_core::config::ConsolidationConfig::default();
+            match pensyve_core::consolidation::ConsolidationEngine::run(
+                storage.as_ref(),
+                &embedder,
+                &config,
+                ns_id,
+            ) {
+                Ok(stats) => {
+                    if stats.promoted > 0 {
+                        tracing::info!(promoted = stats.promoted, "Post-episode consolidation");
+                    }
+                    let _ = storage.log_activity(
+                        ns_id,
+                        "consolidate",
+                        &serde_json::json!({
+                            "promoted": stats.promoted,
+                            "decayed": stats.decayed,
+                            "archived": stats.archived,
+                            "trigger": "episode_end",
+                        }),
+                    );
+                }
+                Err(e) => tracing::warn!("Post-episode consolidation failed: {e}"),
+            }
+        });
+    }
+
+    Ok(Json(json!({
+        "episode_id": episode_id.to_string(),
+        "outcome": body.outcome.as_deref().unwrap_or("success"),
+        "ended_at": episode.ended_at.map(|t| t.to_rfc3339()),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Consolidation handler
+// ---------------------------------------------------------------------------
+
+async fn consolidate(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
+) -> Result<impl IntoResponse, RestError> {
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
+
+    let config = pensyve_core::config::ConsolidationConfig::default();
+    let stats = pensyve_core::consolidation::ConsolidationEngine::run(
+        ps.storage.as_ref(),
+        &ps.embedder,
+        &config,
+        ps.namespace.id,
+    )
+    .map_err(|e| {
+        RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Consolidation error: {e}"),
+        )
+    })?;
+
+    let _ = ps.storage.log_activity(
+        ps.namespace.id,
+        "consolidate",
+        &json!({
+            "promoted": stats.promoted,
+            "decayed": stats.decayed,
+            "archived": stats.archived,
+        }),
+    );
+
+    Ok(Json(json!({
+        "promoted": stats.promoted,
+        "decayed": stats.decayed,
+        "archived": stats.archived,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Feedback handler
+// ---------------------------------------------------------------------------
+
+async fn feedback(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
+    Json(body): Json<FeedbackRequest>,
+) -> Result<impl IntoResponse, RestError> {
+    let _ps = get_pensyve_state(&state, &auth_ctx)?;
+
+    let _memory_id = Uuid::parse_str(&body.memory_id).map_err(|_| {
+        RestError(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid memory_id: '{}'", body.memory_id),
+        )
+    })?;
+
+    // Build a feedback sample with default signals if not provided.
+    let signals: [f32; 6] = if let Some(ref s) = body.signals {
+        if s.len() != 6 {
+            return Err(RestError(
+                StatusCode::BAD_REQUEST,
+                "signals must have exactly 6 elements".to_string(),
+            ));
+        }
+        [s[0], s[1], s[2], s[3], s[4], s[5]]
+    } else {
+        // When no signals provided, use uniform signals so all weights
+        // are nudged equally in the relevant direction.
+        [1.0; 6]
+    };
+
+    let feedback_sample = pensyve_core::feedback::RetrievalFeedback {
+        signals,
+        relevant: body.relevant,
+    };
+
+    // Apply feedback to a fresh learner �� in production this would load
+    // persisted weights from storage, but for now we accept and acknowledge.
+    let mut learner = pensyve_core::feedback::WeightLearner::default();
+    learner.update(&feedback_sample);
+
+    Ok(Json(json!({
+        "accepted": true,
+        "memory_id": body.memory_id,
+        "relevant": body.relevant,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// GDPR handler
+// ---------------------------------------------------------------------------
+
+async fn gdpr_erase(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, RestError> {
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
+
+    let entity = match ps.storage.get_entity_by_name(&name, ps.namespace.id) {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            return Err(RestError(
+                StatusCode::NOT_FOUND,
+                format!("Entity '{name}' not found"),
+            ));
+        }
+        Err(err) => {
+            return Err(RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Error looking up entity: {err}"),
+            ));
+        }
+    };
+
+    // Collect memory IDs before deletion so we can remove them from vector index.
+    let mut memory_ids: Vec<Uuid> = Vec::new();
+    if let Ok(mems) = ps.storage.list_episodic_by_entity(entity.id, usize::MAX) {
+        memory_ids.extend(mems.iter().map(|m| m.id));
+    }
+    if let Ok(mems) = ps.storage.list_semantic_by_entity(entity.id, usize::MAX) {
+        memory_ids.extend(mems.iter().map(|m| m.id));
+    }
+
+    let result = pensyve_core::gdpr::erase_entity(ps.storage.as_ref(), entity.id).map_err(|e| {
+        RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("GDPR erasure error: {e}"),
+        )
+    })?;
+
+    // Clean vector index.
+    if result.memories_deleted > 0 {
+        let mut vi = ps.vector_index.write().await;
+        for id in &memory_ids {
+            let _ = vi.remove(*id);
+        }
+    }
+
+    Ok(Json(json!({
+        "entity": name,
+        "memories_deleted": result.memories_deleted,
+        "entities_deleted": result.entities_deleted,
+        "complete": result.complete,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// A2A handlers
+// ---------------------------------------------------------------------------
+
+async fn a2a_agent_card() -> impl IntoResponse {
+    let endpoint =
+        std::env::var("PENSYVE_GATEWAY_URL").unwrap_or_else(|_| "http://localhost:8000".to_string());
+    let card = pensyve_core::a2a::AgentCard::pensyve_default(&endpoint);
+    Json(serde_json::to_value(card).unwrap_or_default())
+}
+
+async fn a2a_task(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
+    Json(body): Json<pensyve_core::a2a::A2ATaskRequest>,
+) -> Result<impl IntoResponse, RestError> {
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
+
+    let output = match body.capability.as_str() {
+        "memory.recall" => {
+            let query = body
+                .input
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let limit = body
+                .input
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5) as usize;
+
+            let embedder = ps.embedder.clone();
+            let query_text = query.clone();
+            let query_embedding =
+                tokio::task::spawn_blocking(move || embedder.embed(&query_text))
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+
+            let vector_index = ps.vector_index.read().await;
+            let engine = RecallEngine::new(
+                ps.storage.as_ref(),
+                &ps.embedder,
+                &vector_index,
+                &ps.retrieval_config,
+            );
+
+            match engine.recall_with_embedding(
+                &query,
+                query_embedding.as_deref(),
+                ps.namespace.id,
+                limit,
+                None,
+            ) {
+                Ok(result) => {
+                    let memories: Vec<serde_json::Value> = result
+                        .memories
+                        .iter()
+                        .map(|c| {
+                            json!({
+                                "id": c.memory_id.to_string(),
+                                "content": memory_content(&c.memory),
+                                "score": c.final_score,
+                            })
+                        })
+                        .collect();
+                    json!({"memories": memories})
+                }
+                Err(e) => {
+                    return Ok(Json(serde_json::to_value(
+                        pensyve_core::a2a::A2ATaskResponse {
+                            task_id: body.task_id,
+                            status: "failed".to_string(),
+                            output: json!({}),
+                            error: Some(format!("Recall error: {e}")),
+                        },
+                    )
+                    .unwrap_or_default()));
+                }
+            }
+        }
+        "memory.remember" => {
+            let entity_name = body
+                .input
+                .get("entity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let fact = body
+                .input
+                .get("fact")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let entity = get_or_create_entity(
+                ps.storage.as_ref(),
+                &entity_name,
+                ps.namespace.id,
+                EntityKind::Agent,
+            )?;
+
+            let (predicate, object) = if let Some(pos) = fact.find(' ') {
+                (fact[..pos].to_string(), fact[pos + 1..].to_string())
+            } else {
+                ("knows".to_string(), fact.clone())
+            };
+
+            let confidence = body
+                .input
+                .get("confidence")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.8) as f32;
+
+            let mem = SemanticMemory::new(
+                ps.namespace.id,
+                entity.id,
+                predicate,
+                object,
+                confidence,
+            );
+
+            ps.storage.save_semantic(&mem).map_err(|err| {
+                RestError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Error saving memory: {err}"),
+                )
+            })?;
+
+            json!({"memory_id": mem.id.to_string()})
+        }
+        "memory.forget" => {
+            let entity_name = body
+                .input
+                .get("entity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            match ps
+                .storage
+                .get_entity_by_name(&entity_name, ps.namespace.id)
+            {
+                Ok(Some(entity)) => {
+                    let count = ps
+                        .storage
+                        .delete_memories_by_entity(entity.id)
+                        .unwrap_or(0);
+                    json!({"forgotten_count": count})
+                }
+                _ => json!({"forgotten_count": 0}),
+            }
+        }
+        other => {
+            return Ok(Json(
+                serde_json::to_value(pensyve_core::a2a::A2ATaskResponse {
+                    task_id: body.task_id,
+                    status: "failed".to_string(),
+                    output: json!({}),
+                    error: Some(format!("Unknown capability: {other}")),
+                })
+                .unwrap_or_default(),
+            ));
+        }
+    };
+
+    Ok(Json(
+        serde_json::to_value(pensyve_core::a2a::A2ATaskResponse {
+            task_id: body.task_id,
+            status: "completed".to_string(),
+            output,
+            error: None,
+        })
+        .unwrap_or_default(),
+    ))
 }
