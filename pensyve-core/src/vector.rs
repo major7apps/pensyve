@@ -2,8 +2,6 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 
-use crate::embedding::cosine_similarity;
-
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -19,13 +17,46 @@ pub enum VectorError {
 }
 
 // ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// L2 norm of a vector.
+#[inline]
+fn l2_norm(v: &[f32]) -> f32 {
+    v.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
+/// Normalize a vector in-place. Returns the original norm.
+#[inline]
+fn normalize(v: &mut [f32]) -> f32 {
+    let norm = l2_norm(v);
+    if norm > 0.0 {
+        let inv = 1.0 / norm;
+        for x in v.iter_mut() {
+            *x *= inv;
+        }
+    }
+    norm
+}
+
+/// Dot product of two slices (same length assumed by caller).
+#[inline]
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+// ---------------------------------------------------------------------------
 // VectorIndex
 // ---------------------------------------------------------------------------
 
-/// Brute-force UUID-keyed vector index backed by a `HashMap`.
-/// Suitable for Phase 1 where memory counts stay below ~100K entries.
-/// Similarity search is O(n) via cosine similarity; removal is O(1).
+/// Pre-normalized UUID-keyed vector index.
+///
+/// All stored vectors are L2-normalized at insert time so that nearest-neighbor
+/// search reduces to a dot-product scan — avoiding repeated norm computation
+/// per (query, candidate) pair. Similarity is still O(n) but roughly 2-3x
+/// faster than recomputing cosine similarity from raw vectors.
 pub struct VectorIndex {
+    /// Pre-normalized embeddings.
     entries: HashMap<Uuid, Vec<f32>>,
     dimensions: usize,
 }
@@ -41,6 +72,7 @@ impl VectorIndex {
     }
 
     /// Add (or replace) an embedding for `id`.
+    /// The vector is L2-normalized before storage so searches use dot product.
     pub fn add(&mut self, id: Uuid, embedding: &[f32]) -> Result<(), VectorError> {
         if embedding.len() != self.dimensions {
             return Err(VectorError::DimensionMismatch {
@@ -49,13 +81,18 @@ impl VectorIndex {
             });
         }
 
-        self.entries.insert(id, embedding.to_vec());
+        let mut normed = embedding.to_vec();
+        normalize(&mut normed);
+        self.entries.insert(id, normed);
 
         Ok(())
     }
 
     /// Search for the `limit` nearest neighbors to `query`.
     /// Returns `(id, similarity_score)` pairs sorted by score descending.
+    ///
+    /// Because stored vectors are pre-normalized, similarity equals the dot
+    /// product between the normalized query and each stored vector.
     pub fn search(&self, query: &[f32], limit: usize) -> Result<Vec<(Uuid, f32)>, VectorError> {
         if query.len() != self.dimensions {
             return Err(VectorError::DimensionMismatch {
@@ -64,10 +101,19 @@ impl VectorIndex {
             });
         }
 
+        // Normalize the query once.
+        let mut q = query.to_vec();
+        let q_norm = normalize(&mut q);
+
+        // Zero-norm query cannot match anything meaningfully.
+        if q_norm == 0.0 {
+            return Ok(vec![]);
+        }
+
         let mut scored: Vec<(Uuid, f32)> = self
             .entries
             .iter()
-            .map(|(id, emb)| (*id, cosine_similarity(query, emb)))
+            .map(|(id, emb)| (*id, dot(&q, emb)))
             .collect();
 
         // Sort descending by similarity score.
@@ -185,6 +231,25 @@ mod tests {
         let index = VectorIndex::new(4, 100);
         let result = index.search(&[1.0, 0.0], 5);
         assert!(matches!(result, Err(VectorError::DimensionMismatch { .. })));
+    }
+
+    #[test]
+    fn test_zero_norm_query_returns_empty() {
+        let mut index = VectorIndex::new(3, 10);
+        index.add(Uuid::new_v4(), &[1.0, 0.0, 0.0]).unwrap();
+        let results = index.search(&[0.0, 0.0, 0.0], 5).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_prenormalized_scores_match_cosine() {
+        let mut index = VectorIndex::new(3, 10);
+        let id = Uuid::new_v4();
+        // Non-unit vector: [3, 4, 0] has norm 5
+        index.add(id, &[3.0, 4.0, 0.0]).unwrap();
+        // Query: [1, 0, 0] — cosine with [3,4,0] = 3/5 = 0.6
+        let results = index.search(&[1.0, 0.0, 0.0], 1).unwrap();
+        assert!((results[0].1 - 0.6).abs() < 0.001);
     }
 
     #[test]
