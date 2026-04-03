@@ -11,6 +11,7 @@ Fires before Claude Code compresses the context window. Ensures any in-flight ep
 ## Why This Matters
 
 Context compaction can cause Claude Code to lose track of:
+
 - What was being debugged and what hypotheses were tested
 - Decisions that were verbally agreed but not yet stored
 - The "why" behind the current approach
@@ -23,6 +24,7 @@ This hook captures that context so it can be recalled after compaction.
 ### Step 1: Check for Active Context
 
 Determine if there is meaningful context worth preserving:
+
 - Is there an active episode (started by the SessionStart hook or a user command)?
 - Has significant work been done since the last save point?
 
@@ -41,6 +43,7 @@ Compile these into a concise snapshot (not a full transcript).
 ### Step 3: Store Episode Context
 
 Call `pensyve_remember` to persist the critical context:
+
 - `entity`: The project/namespace entity (lowercase, hyphenated)
 - `fact`: "Pre-compaction snapshot: [summary of current work state, pending decisions, active investigation threads]"
 - `confidence`: 0.7 (this is an automated snapshot, not a confirmed decision)

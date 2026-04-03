@@ -42,18 +42,22 @@ Present a concise briefing with the most important items:
 > **Session Context** (from Pensyve memory)
 >
 > **Recent Decisions:**
+>
 > - auth-service: Using RS256 for JWT signing to support key rotation
 > - api-design: POST endpoints return 201 with created resource
 >
 > **Known Issues:**
+>
 > - database: Migration script requires Python 3.11+
 >
 > **Active Patterns:**
+>
 > - testing: Integration tests need tmpdir cleanup after filesystem operations
 >
 > _Use `/recall <query>` to search for specific memories._
 
 Rules for summary mode:
+
 - Maximum 15 lines of content (excluding the header)
 - Show at most 3 items per category
 - Omit categories with no results
@@ -94,6 +98,7 @@ Present a detailed briefing with scores and metadata:
 > _Total memories loaded: 11 | Use `/recall <query>` for targeted search | `/inspect <entity>` for entity details_
 
 Rules for full mode:
+
 - Show all results with relevance scores
 - Include confidence values and timestamps where available
 - Group by category with counts

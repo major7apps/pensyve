@@ -32,11 +32,13 @@ When the user invokes `/forget <entity>`, follow these steps:
 ## Examples
 
 User: `/forget auth-service`
+
 - First ask: "You are about to delete all memories for entity `auth-service`. This cannot be undone. Type 'yes' to confirm."
 - After "yes": Call `pensyve_forget` with entity `auth-service`
 - Report: "Deleted 12 memories for entity `auth-service`."
 
 User: `/forget old-project`
+
 - If entity not found: "Entity `old-project` was not found. No memories were deleted."
 
 ## Constraints

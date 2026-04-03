@@ -23,29 +23,32 @@ When the user invokes `/recall <query>`, follow these steps:
    **Semantic Memories** (facts and knowledge):
    | Score | Entity | Fact | Confidence |
    |-------|--------|------|------------|
-   | 0.92  | auth-service | uses JWT tokens with RS256 | 1.0 |
+   | 0.92 | auth-service | uses JWT tokens with RS256 | 1.0 |
 
    **Episodic Memories** (interaction records):
    | Score | Summary | Created |
    |-------|---------|---------|
-   | 0.85  | Debugged auth token expiry issue | 2024-01-15 |
+   | 0.85 | Debugged auth token expiry issue | 2024-01-15 |
 
    **Procedural Memories** (action-outcome patterns):
    | Score | Action | Outcome | Reliability |
    |-------|--------|---------|-------------|
-   | 0.78  | run migrations before deploy | success | 0.95 |
+   | 0.78 | run migrations before deploy | success | 0.95 |
 
 4. **Summarize.** After the tables, provide a brief natural-language summary of the most relevant findings.
 
 ## Examples
 
 User: `/recall how does authentication work`
+
 - Searches all memory types for authentication-related memories
 
 User: `/recall auth-service: token refresh`
+
 - Searches only the `auth-service` entity for token refresh information
 
 User: `/recall database schema changes --limit 5`
+
 - Returns at most 5 results about database schema changes
 
 ## Constraints

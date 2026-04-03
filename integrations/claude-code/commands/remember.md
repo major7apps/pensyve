@@ -26,14 +26,17 @@ When the user invokes `/remember <fact>`, follow these steps:
 ## Examples
 
 User: `/remember auth-service: uses JWT tokens with RS256 signing`
+
 - entity: `auth-service`
 - fact: `uses JWT tokens with RS256 signing`
 
 User: `/remember the database migration script requires Python 3.11+`
+
 - entity: `database-migration` (inferred)
 - fact: `the database migration script requires Python 3.11+`
 
 User: `/remember we decided to use SQLite instead of PostgreSQL for the MVP`
+
 - entity: `project-decisions` (inferred)
 - fact: `we decided to use SQLite instead of PostgreSQL for the MVP`
 

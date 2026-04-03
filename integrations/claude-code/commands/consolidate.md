@@ -13,13 +13,14 @@ When the user invokes `/consolidate`, follow these steps:
 1. **Explain what consolidation does.** Before running anything, briefly explain:
 
    > **Memory Consolidation** performs three operations:
+   >
    > 1. **Promotion** -- Episodic memories that appear repeatedly are promoted to semantic memories (long-term facts).
    > 2. **Decay** -- Memories that haven't been accessed recently have their retention scores reduced using the FSRS forgetting curve.
    > 3. **Archival** -- Memories whose retention drops below the threshold are archived (soft-deleted).
 
 2. **Attempt consolidation.** The Pensyve MCP server currently exposes 6 tools. If a `pensyve_consolidate` tool is available, call it. Otherwise:
-
    - Inform the user that consolidation is available through the CLI or REST API:
+
      ```
      # Via CLI
      cargo run -p pensyve-cli -- consolidate
@@ -27,6 +28,7 @@ When the user invokes `/consolidate`, follow these steps:
      # Via REST API
      curl -X POST http://localhost:8000/v1/consolidate
      ```
+
    - Suggest running `/memory-status` to review current memory health before consolidating.
 
 3. **Report results.** If consolidation was run, report:
@@ -37,6 +39,7 @@ When the user invokes `/consolidate`, follow these steps:
 ## Examples
 
 User: `/consolidate`
+
 - Explains what consolidation does
 - Attempts to run consolidation via MCP if available
 - Falls back to CLI/API instructions if not

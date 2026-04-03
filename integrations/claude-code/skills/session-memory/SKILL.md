@@ -17,18 +17,21 @@ When this skill is invoked (typically at the end of a coding session), follow th
 Review the current session conversation for three categories of memorable content:
 
 **Decisions** (confidence: 0.9):
+
 - Architecture or design choices ("we decided to use X over Y because...")
 - Technology selections ("chose SQLite for the MVP because...")
 - API design decisions ("the endpoint should accept JSON, not form data")
 - Tradeoff resolutions ("accepted O(n) scan because dataset is small")
 
 **Outcomes** (confidence: 0.8):
+
 - Bug fixes and their root causes ("the auth failure was caused by expired refresh tokens")
 - Successful approaches ("fixed the race condition by adding a mutex")
 - Failed approaches ("tried connection pooling but it caused deadlocks")
 - Performance findings ("query time dropped from 2s to 50ms after adding the index")
 
 **Patterns** (confidence: 0.7):
+
 - Recurring issues ("this is the third time the cache invalidation was wrong")
 - Workflow discoveries ("running tests before migrations catches schema drift")
 - Cross-cutting observations ("all the timeout errors trace back to the DNS resolver")
@@ -50,14 +53,13 @@ Present the candidate memories to the user in a structured format:
 > **Session Memory Candidates**
 >
 > **Decisions** (confidence: 0.9):
+>
 > 1. `auth-service`: Chose RS256 over HS256 for JWT signing to support key rotation
 > 2. `api-design`: POST endpoints return 201 with the created resource, not 200
 >
-> **Outcomes** (confidence: 0.8):
-> 3. `database`: Migration script fails silently when Python < 3.11 -- added version check
+> **Outcomes** (confidence: 0.8): 3. `database`: Migration script fails silently when Python < 3.11 -- added version check
 >
-> **Patterns** (confidence: 0.7):
-> 4. `testing`: Integration tests that touch the filesystem need tmpdir cleanup
+> **Patterns** (confidence: 0.7): 4. `testing`: Integration tests that touch the filesystem need tmpdir cleanup
 >
 > Which items should I store? (e.g., "all", "1,3", "none")
 
@@ -66,6 +68,7 @@ Present the candidate memories to the user in a structured format:
 For each confirmed item, decide the storage type:
 
 **Episodic (observations)** -- things that happened this session. Call `pensyve_observe` with:
+
 - `episode_id`: From the session state (set by SessionStart hook)
 - `content`: The observation text
 - `source_entity`: `"claude-code"`
@@ -75,6 +78,7 @@ For each confirmed item, decide the storage type:
 Use for: bug fixes, failed approaches, debugging outcomes, performance findings, session-specific events.
 
 **Semantic (durable facts)** -- truths that persist beyond this session. Call `pensyve_remember` with:
+
 - `entity`: The inferred entity name (lowercase, hyphenated)
 - `fact`: The memory text
 - `confidence`: 0.9 for decisions, 0.8 for outcomes, 0.7 for patterns
@@ -90,6 +94,7 @@ Before storing, run `pensyve_recall` with a query matching the candidate fact to
 After storing, summarize what was saved:
 
 > **Stored 3 memories:**
+>
 > - `auth-service`: Chose RS256 over HS256 for JWT signing (confidence: 0.9)
 > - `database`: Migration script fails silently when Python < 3.11 (confidence: 0.8)
 > - `testing`: Integration tests need tmpdir cleanup (confidence: 0.7)

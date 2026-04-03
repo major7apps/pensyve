@@ -23,6 +23,7 @@ Review the conversation since the last stop event (or session start) to identify
 Apply a significance filter. Only proceed if at least one non-trivial item was identified. Exit silently if the completed work was routine:
 
 **Skip (do nothing):**
+
 - Simple typo or formatting fixes
 - Standard file edits with no architectural significance
 - Routine lint fixes, import sorting, boilerplate generation
@@ -30,6 +31,7 @@ Apply a significance filter. Only proceed if at least one non-trivial item was i
 - Very short interactions (a few exchanges) that are clearly routine
 
 **Keep:**
+
 - Debugging sessions that revealed root causes
 - Architecture or design decisions
 - Failed approaches worth documenting
@@ -58,6 +60,7 @@ If significant items were found (maximum 5), present them for user confirmation:
 For each confirmed item, decide the storage type:
 
 **Episodic (observations)** -- things that happened this session. Call `pensyve_observe` with:
+
 - `episode_id`: From the session state (set by SessionStart hook)
 - `content`: The observation text
 - `source_entity`: `"claude-code"`
@@ -67,6 +70,7 @@ For each confirmed item, decide the storage type:
 Use `pensyve_observe` for: bug fixes discovered, failed approaches, debugging outcomes, performance findings, session-specific events.
 
 **Semantic (durable facts)** -- truths that will remain relevant beyond this session. Call `pensyve_remember` with:
+
 - `entity`: The relevant entity name (lowercase, hyphenated)
 - `fact`: The fact text
 - `confidence`: Based on type -- 0.9 for decisions, 0.8 for outcomes, 0.7 for patterns
@@ -80,6 +84,7 @@ Report what was stored after completion.
 ### Step 5: Close Episode
 
 If a session episode was started by the SessionStart hook:
+
 - Call `pensyve_episode_end` with the stored `episode_id`
 - Set `outcome` based on the task result: `"success"`, `"failure"`, or `"partial"`
 - The server will automatically trigger consolidation (episodic → semantic promotion)

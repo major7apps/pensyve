@@ -20,28 +20,33 @@ This agent is active only when the `auto_capture` setting is `true` in `pensyve-
 Watch the session for events that have lasting value beyond the current interaction:
 
 **Architecture Decisions** (confidence: 0.9):
+
 - Explicit choices between alternatives ("chose X over Y because...")
 - Design pattern selections
 - Technology stack decisions
 - API contract definitions
 
 **Non-Obvious Solutions** (confidence: 0.85):
+
 - Fixes that required debugging beyond the obvious
 - Workarounds for framework or library limitations
 - Solutions that involved reading source code or documentation
 - Configuration discoveries ("setting X to Y fixes the issue")
 
 **Failed Approaches** (confidence: 0.8):
+
 - Approaches that were tried and abandoned
 - Root causes of failures
 - Dead ends worth documenting to prevent revisiting
 
 **Cross-Cutting Discoveries** (confidence: 0.8):
+
 - Findings that affect multiple components
 - Dependency relationships not previously known
 - Integration constraints between systems
 
 **Performance Findings** (confidence: 0.85):
+
 - Measurable performance changes from specific actions
 - Bottleneck identifications
 - Optimization outcomes with data
@@ -49,6 +54,7 @@ Watch the session for events that have lasting value beyond the current interact
 ### What to Skip
 
 Do not flag routine events:
+
 - Standard code edits without architectural significance
 - Formatting, linting, or style changes
 - Boilerplate or scaffolding generation
@@ -58,6 +64,7 @@ Do not flag routine events:
 ### Classification
 
 Classify each memorable event into one of these categories:
+
 - **decision**: An explicit choice that shapes the codebase
 - **outcome**: A result from an action (success or failure)
 - **pattern**: A recurring observation or workflow insight
@@ -76,6 +83,7 @@ Before suggesting storage, call `pensyve_recall` with a query matching the candi
 Present the candidate concisely, inline with the session flow. Do not interrupt complex work -- wait for a natural pause.
 
 > **Pensyve:** This looks worth remembering:
+>
 > - **Type:** decision
 > - **Entity:** `auth-service`
 > - **Fact:** Chose bcrypt over argon2 for password hashing due to broader library support
@@ -86,6 +94,7 @@ Present the candidate concisely, inline with the session flow. Do not interrupt 
 ### Step 3: Store on Confirmation
 
 If the user confirms:
+
 - **"yes"**: Store using the appropriate tool:
   - **Episodic** (session events, debugging outcomes, failed approaches): Call `pensyve_observe` with `episode_id` from session state, `source_entity: "claude-code"`, `about_entity` as the entity name, `content` as the fact text, and `content_type: "text"` or `"code"`.
   - **Semantic** (durable facts, decisions, preferences): Call `pensyve_remember` with the entity, fact, and confidence as presented.
