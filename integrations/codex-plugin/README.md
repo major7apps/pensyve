@@ -2,74 +2,74 @@
 
 Pensyve gives Codex a persistent, cognitive memory layer that spans across sessions. Your agent remembers decisions, learned patterns, debugging outcomes, and project context -- so you never repeat the same investigation twice and every session starts with the full picture.
 
+> **Note:** This plugin is not published to the Codex Plugin Directory. Install it manually using the instructions below.
+
 ## Install
 
-### From the Codex plugin registry
+### Project-level (recommended)
+
+Copy the plugin into your project's plugin directory and register it in a local marketplace file:
 
 ```bash
-codex plugin install pensyve
+mkdir -p .agents/plugins/pensyve
+cp -r /path/to/pensyve/integrations/codex-plugin/* .agents/plugins/pensyve/
 ```
 
-### Manual install
+Create or update `.agents/plugins/marketplace.json`:
+
+```json
+{
+  "name": "local-plugins",
+  "interface": {
+    "displayName": "Local Plugins"
+  },
+  "plugins": [
+    {
+      "name": "pensyve",
+      "source": {
+        "source": "local",
+        "path": "./pensyve"
+      },
+      "policy": {
+        "installation": "INSTALLED_BY_DEFAULT"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
+```
+
+### User-level (all projects)
 
 ```bash
-git clone https://github.com/major7apps/pensyve
-cp -r pensyve/integrations/codex-plugin ~/.codex/plugins/pensyve
+mkdir -p ~/.codex/plugins/pensyve
+cp -r /path/to/pensyve/integrations/codex-plugin/* ~/.codex/plugins/pensyve/
 ```
+
+Then add a matching entry in `~/.agents/plugins/marketplace.json`.
 
 ## Connect to Pensyve
 
-The plugin needs a running Pensyve MCP server. Choose one:
+The plugin needs a Pensyve API key. The MCP server is pre-configured for Pensyve Cloud -- once your key is set, you're ready to go.
 
-**Pensyve Cloud** (managed service — no setup required):
+**Option A** -- environment variable (recommended):
 
-1. Sign up at [pensyve.com](https://pensyve.com) and grab your API key
-2. Supply your API key:
+```bash
+export PENSYVE_API_KEY="psy_..."
+```
 
-   **Option A** — environment variable (recommended):
+Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
 
-   ```bash
-   export PENSYVE_API_KEY="psy_..."
-   ```
-
-   Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
-
-   **Option B** — in your Codex config (`~/.codex/config.toml`):
-
-   ```toml
-   [plugins.pensyve]
-   enabled = true
-
-   [plugins.pensyve.env]
-   PENSYVE_API_KEY = "psy_..."
-   ```
-
-The plugin ships pre-configured for Pensyve Cloud — once your API key is set, you're ready to go.
-
-**Pensyve Local** (self-hosted — runs entirely on your machine):
+**Option B** -- self-hosted (local-only, no API key needed):
 
 1. Build the MCP binary:
    ```bash
    git clone https://github.com/major7apps/pensyve
-   cd pensyve
-   cargo build --release -p pensyve-mcp
+   cd pensyve && cargo build --release -p pensyve-mcp
    ```
-2. Override the MCP server in your `~/.codex/config.toml`:
-   ```toml
-   [plugins.pensyve.mcpServers.pensyve]
-   command = "pensyve-mcp"
-   args = ["--stdio"]
-   ```
+2. Create a `.mcp.json` file in the plugin root pointing to the local binary, or override in your Codex settings.
 
-No API key needed — all data stays on your machine in SQLite.
-
-### Optional config
-
-```toml
-[plugins.pensyve.settings]
-namespace = "my-project"        # Scope memories to this project
-context_loading = "summary"     # "off", "summary", or "full"
-```
+Get an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
 
 ## Skills
 
@@ -82,23 +82,24 @@ context_loading = "summary"     # "off", "summary", or "full"
 
 ## Hooks
 
-| Event          | Skill            | Behavior                                                                   |
-| -------------- | ---------------- | -------------------------------------------------------------------------- |
-| `SessionStart` | `context-loader` | Loads relevant memories at session start (configurable: off/summary/full)  |
-| `Stop`         | `session-memory` | Extracts decisions and outcomes after task completion, asks before storing |
+| Event          | Behavior                                                                   |
+| -------------- | -------------------------------------------------------------------------- |
+| `SessionStart` | Loads relevant memories at session start (configurable: off/summary/full)  |
+| `Stop`         | Extracts decisions and outcomes after task completion, asks before storing |
 
 ## Available MCP Tools
 
-All tools connect to the Pensyve cloud API via MCP. The plugin never bypasses MCP to access storage directly.
+All tools connect to the Pensyve API via MCP. The plugin never bypasses MCP to access storage directly.
 
-| Tool                    | Parameters                             | Returns                                        |
-| ----------------------- | -------------------------------------- | ---------------------------------------------- |
-| `pensyve_recall`        | `query`, `entity?`, `types?`, `limit?` | Ranked array of memories with relevance scores |
-| `pensyve_remember`      | `entity`, `fact`, `confidence?`        | Stored memory object                           |
-| `pensyve_episode_start` | `participants`                         | `episode_id`, `started_at`                     |
-| `pensyve_episode_end`   | `episode_id`, `outcome?`               | `memories_created` count                       |
-| `pensyve_forget`        | `entity`, `hard_delete?`               | `forgotten_count`                              |
-| `pensyve_inspect`       | `entity`, `memory_type?`, `limit?`     | Array of memories with stats                   |
+| Tool                    | Parameters                                                                | Returns                                        |
+| ----------------------- | ------------------------------------------------------------------------- | ---------------------------------------------- |
+| `pensyve_recall`        | `query`, `entity?`, `types?`, `limit?`                                    | Ranked array of memories with relevance scores |
+| `pensyve_remember`      | `entity`, `fact`, `confidence?`                                           | Stored memory object                           |
+| `pensyve_observe`       | `episode_id`, `content`, `source_entity`, `about_entity`, `content_type?` | Stored episodic memory object                  |
+| `pensyve_episode_start` | `participants`                                                            | `episode_id`, `started_at`                     |
+| `pensyve_episode_end`   | `episode_id`, `outcome?`                                                  | `memories_created` count                       |
+| `pensyve_forget`        | `entity`, `hard_delete?`                                                  | `forgotten_count`                              |
+| `pensyve_inspect`       | `entity`, `memory_type?`, `limit?`                                        | Array of memories with stats                   |
 
 ## Design Philosophy
 
@@ -111,8 +112,9 @@ All tools connect to the Pensyve cloud API via MCP. The plugin never bypasses MC
 ## Links
 
 - **Website:** [pensyve.com](https://pensyve.com)
-- **Documentation:** [docs.pensyve.com](https://docs.pensyve.com)
+- **Docs:** [pensyve.com/docs](https://pensyve.com/docs)
 - **GitHub:** [github.com/major7apps/pensyve](https://github.com/major7apps/pensyve)
+- **API Keys:** [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys)
 
 ## License
 

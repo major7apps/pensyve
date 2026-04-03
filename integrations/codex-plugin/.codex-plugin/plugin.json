@@ -1,6 +1,6 @@
 {
   "name": "pensyve",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Persistent memory for Codex — your agent remembers decisions, patterns, and context across sessions",
   "author": {
     "name": "Major7 Apps",
@@ -10,6 +10,7 @@
   "repository": "https://github.com/major7apps/pensyve",
   "license": "Apache-2.0",
   "keywords": ["memory", "agents", "mcp", "retrieval", "ai"],
+  "skills": "./skills/",
   "mcpServers": {
     "pensyve": {
       "url": "https://mcp.pensyve.com/mcp",

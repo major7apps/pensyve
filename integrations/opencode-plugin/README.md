@@ -1,6 +1,8 @@
 # opencode-pensyve
 
-Native OpenCode plugin for persistent cross-session memory, powered by Pensyve's 8-signal fusion retrieval engine (vector similarity + BM25 + graph traversal + cross-encoder reranking).
+Native OpenCode plugin for persistent cross-session memory, powered by Pensyve.
+
+> **Note:** The original [opencode-ai/opencode](https://github.com/opencode-ai/opencode) repository is archived. Its successor is [Crush](https://github.com/charmbracelet/crush) by Charmbracelet. The `@opencode-ai/plugin` SDK remains actively maintained and this plugin targets that SDK.
 
 ## Two Integration Paths
 
@@ -12,22 +14,33 @@ OpenCode supports both **MCP servers** and **native plugins**. You can use Pensy
 | Auto-recall on session start     | No                                         | Yes (`session.created` hook)                    |
 | System prompt injection          | No                                         | Yes (`experimental.chat.system.transform` hook) |
 | Auto-capture assistant responses | No                                         | Yes (`message.created` hook)                    |
-| Setup complexity                 | Minimal — add MCP server config            | Copy plugin or install via npm                  |
-| Agent must call tools explicitly | Yes — agent decides when to recall         | No — memories injected automatically            |
+| Setup complexity                 | Minimal -- add MCP server config           | Copy plugin or install via npm                  |
+| Agent must call tools explicitly | Yes -- agent decides when to recall        | No -- memories injected automatically           |
 
-**Recommendation:** Use the native plugin for the richest experience. Use MCP if you want zero-config simplicity and already have the Pensyve MCP server running.
+**Recommendation:** Use the native plugin for the richest experience. Use MCP if you want zero-config simplicity.
 
 ## Prerequisites
 
-Pensyve API server must be running locally:
+You need a Pensyve server. Choose one:
+
+**Pensyve Cloud** (recommended -- no setup):
+
+1. Sign up at [pensyve.com](https://pensyve.com) and create an API key
+2. Set the environment variable:
+   ```bash
+   export PENSYVE_API_KEY="psy_..."
+   ```
+
+**Pensyve Local** (self-hosted, offline-first):
 
 ```bash
-cd /path/to/pensyve
-uv sync --extra dev
-uv run maturin develop --release -m pensyve-python/Cargo.toml
+git clone https://github.com/major7apps/pensyve
+cd pensyve && cargo build --release -p pensyve-mcp
 ```
 
-## Installation — Native Plugin
+No API key needed -- all data stays on your machine in SQLite.
+
+## Installation -- Native Plugin
 
 ### Option 1: Copy to plugins directory
 
@@ -39,7 +52,13 @@ cp -r /path/to/pensyve/integrations/opencode-plugin .opencode/plugins/pensyve
 cp -r /path/to/pensyve/integrations/opencode-plugin ~/.config/opencode/plugins/pensyve
 ```
 
-### Option 2: Configure in opencode.json
+### Option 2: npm dependency
+
+```bash
+npm install opencode-pensyve
+```
+
+Then configure in `opencode.json`:
 
 ```json
 {
@@ -47,7 +66,7 @@ cp -r /path/to/pensyve/integrations/opencode-plugin ~/.config/opencode/plugins/p
 }
 ```
 
-## Installation — MCP Server (simpler alternative)
+## Installation -- MCP Server (simpler alternative)
 
 Add to your `opencode.json`:
 
@@ -55,10 +74,10 @@ Add to your `opencode.json`:
 {
   "mcpServers": {
     "pensyve": {
-      "command": "uvx",
-      "args": ["pensyve-mcp"],
+      "type": "http",
+      "url": "https://mcp.pensyve.com/mcp",
       "env": {
-        "PENSYVE_BASE_URL": "http://localhost:8000"
+        "PENSYVE_API_KEY": "${PENSYVE_API_KEY}"
       }
     }
   }
@@ -67,59 +86,57 @@ Add to your `opencode.json`:
 
 This gives you `pensyve_remember` and `pensyve_recall` tools via MCP, but without auto-recall, system prompt injection, or auto-capture.
 
+For a local server instead:
+
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "type": "stdio",
+      "command": "pensyve-mcp",
+      "args": ["--stdio"]
+    }
+  }
+}
+```
+
 ## How It Works
 
 ### Hooks
 
-#### `session.created` — Auto-Recall
+#### `session.created` -- Auto-Recall
 
-When a new OpenCode session starts, the plugin:
+When a new session starts, the plugin queries Pensyve for memories relevant to the current project directory and caches the results for system prompt injection.
 
-1. Determines the current working directory
-2. Queries Pensyve's `/v1/recall` endpoint for memories relevant to the project
-3. Caches the results for system prompt injection
+#### `experimental.chat.system.transform` -- System Prompt Injection
 
-#### `experimental.chat.system.transform` — System Prompt Injection
+Before each message is sent to the model, the plugin appends recalled memories to the system prompt so the model has cross-session context without needing to call any tools.
 
-Before each message is sent to the model, the plugin appends recalled memories to the system prompt:
+#### `chat.message` -- Auto-Capture
 
-```
-# Pensyve Memory (cross-session context)
-The following memories are recalled from prior sessions:
-
-- User prefers Tailwind CSS over styled-components
-- Project uses PostgreSQL 16 with pgvector extension
-- Deploy target is AWS us-east-1
-
-Use this context to inform your response.
-```
-
-This means the model has cross-session context without the agent needing to explicitly call any tools.
-
-#### `message.created` — Auto-Capture
-
-After each substantive assistant response (>100 characters), the plugin stores a condensed summary via Pensyve's `/v1/remember` endpoint with moderate confidence (0.7). Pensyve's FSRS-based forgetting curve naturally deprioritizes stale memories over time.
+After each substantive assistant response (>100 characters), the plugin stores a condensed summary with moderate confidence (0.7). Pensyve's FSRS-based forgetting curve naturally deprioritizes stale memories over time.
 
 ### Tools
 
-The plugin registers two custom tools that the agent can call explicitly:
+The plugin registers three tools that the agent can call explicitly:
 
-- **`pensyve_remember`** — Store a fact in persistent memory with configurable confidence (0-1)
-- **`pensyve_recall`** — Search persistent memory with a natural language query
+| Tool               | Description                                            |
+| ------------------ | ------------------------------------------------------ |
+| `pensyve_recall`   | Search persistent memory with a natural language query |
+| `pensyve_remember` | Store a fact with configurable confidence (0-1)        |
+| `pensyve_status`   | Show connection status, memory counts, account info    |
 
 ### Configuration
 
-The plugin uses sensible defaults. To customize, modify the `DEFAULTS` object in `src/index.ts`:
-
-| Option        | Type      | Default                 | Description                              |
-| ------------- | --------- | ----------------------- | ---------------------------------------- |
-| `baseUrl`     | `string`  | `http://localhost:8000` | Pensyve API URL                          |
-| `apiKey`      | `string`  | —                       | API key (optional for local deployments) |
-| `entity`      | `string`  | `opencode-agent`        | Entity name for memory storage           |
-| `namespace`   | `string`  | `opencode`              | Memory namespace for isolation           |
-| `autoRecall`  | `boolean` | `true`                  | Auto-recall memories on session start    |
-| `autoCapture` | `boolean` | `true`                  | Auto-capture assistant responses         |
-| `recallLimit` | `number`  | `5`                     | Max memories to recall per session       |
+| Option        | Type      | Default                   | Description                           |
+| ------------- | --------- | ------------------------- | ------------------------------------- |
+| `baseUrl`     | `string`  | `https://mcp.pensyve.com` | Pensyve API URL                       |
+| `apiKey`      | `string`  | `$PENSYVE_API_KEY`        | API key for Pensyve Cloud             |
+| `entity`      | `string`  | `opencode-agent`          | Entity name for memory storage        |
+| `namespace`   | `string`  | `opencode`                | Memory namespace for isolation        |
+| `autoRecall`  | `boolean` | `true`                    | Auto-recall memories on session start |
+| `autoCapture` | `boolean` | `true`                    | Auto-capture assistant responses      |
+| `recallLimit` | `number`  | `5`                       | Max memories to recall per session    |
 
 ## Architecture
 
@@ -132,7 +149,7 @@ OpenCode Agent
     |
     |-- [user sends message] ----> LLM (with memory context)
     |                                  |
-    |-- message.created <--------- assistant response
+    |-- chat.message <------------ assistant response
     |       |
     |       +-- auto-capture -----> Pensyve /v1/remember
     |
@@ -140,6 +157,13 @@ OpenCode Agent
     |-- pensyve_recall ----------> Pensyve /v1/recall   (explicit)
 ```
 
+## Links
+
+- **Website:** [pensyve.com](https://pensyve.com)
+- **Docs:** [pensyve.com/docs](https://pensyve.com/docs)
+- **GitHub:** [github.com/major7apps/pensyve](https://github.com/major7apps/pensyve)
+- **API Keys:** [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys)
+
 ## License
 
-Apache-2.0
+Apache 2.0
