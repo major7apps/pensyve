@@ -40,6 +40,7 @@ pub struct AppState {
     pub usage_reporter: UsageReporter,
     pub tenant_mgr: TenantStateManager,
     pub auth_required: bool,
+    pub admin_key: Option<String>,
     pub ct: CancellationToken,
 }
 
@@ -199,6 +200,7 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         usage_reporter: UsageReporter::new(config.stripe_api_key.clone()),
         tenant_mgr,
         auth_required,
+        admin_key: config.admin_key.clone(),
         ct: ct.clone(),
     });
 
@@ -317,15 +319,38 @@ async fn readiness_handler(
             .status(200)
             .body(axum::body::Body::from("ready"))
             .unwrap(),
-        Err(e) => axum::response::Response::builder()
+        Err(_) => axum::response::Response::builder()
             .status(503)
-            .body(axum::body::Body::from(format!("not ready: {e}")))
+            .body(axum::body::Body::from("not ready"))
             .unwrap(),
     }
 }
 
-async fn metrics_handler() -> axum::response::Response {
+async fn metrics_handler(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+) -> axum::response::Response {
     use axum::http::header;
+
+    let not_found = || {
+        axum::response::Response::builder()
+            .status(404)
+            .body(axum::body::Body::from("not found"))
+            .unwrap()
+    };
+
+    // Require PENSYVE_ADMIN_KEY via X-Admin-Key header.
+    let Some(admin_key) = &state.admin_key else {
+        return not_found();
+    };
+    let provided = req
+        .headers()
+        .get("x-admin-key")
+        .and_then(|v| v.to_str().ok());
+    if provided != Some(admin_key.as_str()) {
+        return not_found();
+    }
+
     let body = pensyve_core::observability::metrics().prometheus_text();
     axum::response::Response::builder()
         .header(

@@ -13,6 +13,8 @@ pub struct GatewayConfig {
     pub rate_limit_per_minute: u32,
     /// Stripe API key for usage reporting (optional).
     pub stripe_api_key: Option<String>,
+    /// Admin key for operational endpoints (/metrics). If unset, these endpoints are disabled.
+    pub admin_key: Option<String>,
 }
 
 impl GatewayConfig {
@@ -48,6 +50,7 @@ impl GatewayConfig {
                 .and_then(|r| r.parse().ok())
                 .unwrap_or(300),
             stripe_api_key: std::env::var("STRIPE_API_KEY").ok(),
+            admin_key: std::env::var("PENSYVE_ADMIN_KEY").ok(),
         }
     }
 }
@@ -66,6 +69,7 @@ mod tests {
             api_keys,
             rate_limit_per_minute: 300,
             stripe_api_key: None,
+            admin_key: None,
         }
     }
 
