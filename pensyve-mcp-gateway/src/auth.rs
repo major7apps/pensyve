@@ -256,10 +256,11 @@ where
         Box::pin(async move {
             let path = req.uri().path();
 
-            // Skip auth for health/readiness checks and OAuth endpoints.
+            // Skip auth for health/readiness checks, metrics (has own admin guard), and OAuth.
             if path == "/health"
                 || path == "/v1/health"
                 || path == "/ready"
+                || path == "/metrics"
                 || path.starts_with("/.well-known/")
                 || path.starts_with("/oauth/")
             {
