@@ -173,6 +173,14 @@ class PensyveClient:
             body["outcome"] = outcome
         return self._request("POST", "/v1/episodes/end", json=body).json()
 
+    def a2a_agent_card(self) -> dict:
+        """Get the A2A agent capability card."""
+        return self._request("GET", "/v1/a2a/agent-card").json()
+
+    def a2a_task(self, task: dict) -> dict:
+        """Submit an A2A task request."""
+        return self._request("POST", "/v1/a2a/task", json=task).json()
+
     def close(self) -> None:
         """Close the HTTP client."""
         self._client.close()
@@ -346,6 +354,14 @@ class AsyncPensyveClient:
         if outcome:
             body["outcome"] = outcome
         return (await self._request("POST", "/v1/episodes/end", json=body)).json()
+
+    async def a2a_agent_card(self) -> dict:
+        """Get the A2A agent capability card."""
+        return (await self._request("GET", "/v1/a2a/agent-card")).json()
+
+    async def a2a_task(self, task: dict) -> dict:
+        """Submit an A2A task request."""
+        return (await self._request("POST", "/v1/a2a/task", json=task)).json()
 
     async def close(self) -> None:
         """Close the HTTP client."""
