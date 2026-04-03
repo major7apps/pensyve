@@ -1,4 +1,5 @@
 mod auth;
+mod cache;
 mod config;
 mod oauth;
 mod rate_limit;
@@ -42,6 +43,7 @@ pub struct AppState {
     pub auth_required: bool,
     pub admin_key: Option<String>,
     pub ct: CancellationToken,
+    pub redis: Option<redis::aio::ConnectionManager>,
 }
 
 struct InitResources {
@@ -193,6 +195,8 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
 
     let ct = CancellationToken::new();
 
+    let redis = cache::init().await;
+
     let auth_required = !config.api_keys.is_empty();
     let app_state = Arc::new(AppState {
         auth: auth::AuthValidator::new(&config),
@@ -202,6 +206,7 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         auth_required,
         admin_key: config.admin_key.clone(),
         ct: ct.clone(),
+        redis,
     });
 
     // Create per-tenant MCP service factory. In stateless mode, a new service

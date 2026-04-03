@@ -38,7 +38,7 @@ pub struct RecallRequest {
     pub min_confidence: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RecallMemory {
     pub id: String,
     pub content: String,
@@ -48,7 +48,7 @@ pub struct RecallMemory {
     pub score: f32,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RecallResponse {
     pub memories: Vec<RecallMemory>,
     pub contradictions: Vec<serde_json::Value>,
@@ -370,6 +370,28 @@ async fn recall(
         ));
     }
 
+    // Check Redis cache for recall results.
+    let cache_key = {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(body.query.as_bytes());
+        hasher.update(limit.to_le_bytes());
+        if let Some(ref e) = body.entity {
+            hasher.update(e.as_bytes());
+        }
+        let hash = hex::encode(hasher.finalize());
+        crate::cache::recall_key(&ps.namespace.id.to_string(), &hash)
+    };
+
+    if let Some(ref redis) = state.redis {
+        let mut conn = redis.clone();
+        if let Some(cached) = crate::cache::get(&mut conn, &cache_key).await {
+            if let Ok(response) = serde_json::from_str::<RecallResponse>(&cached) {
+                return Ok(Json(response));
+            }
+        }
+    }
+
     // Resolve optional entity filter to UUID.
     let entity_id = if let Some(ref name) = body.entity {
         match ps.storage.get_entity_by_name(name, ps.namespace.id) {
@@ -453,10 +475,20 @@ async fn recall(
         &json!({"query": body.query, "results": memories.len()}),
     );
 
-    Ok(Json(RecallResponse {
+    let response = RecallResponse {
         memories,
         contradictions: vec![],
-    }))
+    };
+
+    // Cache the result (60s TTL).
+    if let Some(ref redis) = state.redis {
+        let mut conn = redis.clone();
+        if let Ok(serialized) = serde_json::to_string(&response) {
+            crate::cache::set(&mut conn, &cache_key, &serialized, 60).await;
+        }
+    }
+
+    Ok(Json(response))
 }
 
 async fn remember(
@@ -514,6 +546,13 @@ async fn remember(
         "remember",
         &json!({"entity": body.entity, "preview": &body.fact[..body.fact.len().min(50)]}),
     );
+
+    // Invalidate recall cache for this namespace.
+    if let Some(ref redis) = state.redis {
+        let mut conn = redis.clone();
+        let prefix = crate::cache::namespace_prefix(&ps.namespace.id.to_string());
+        crate::cache::invalidate_prefix(&mut conn, &prefix).await;
+    }
 
     let content = format!("{} {}", mem.predicate, mem.object);
 
@@ -603,6 +642,13 @@ async fn forget_entity(
         "forget",
         &json!({"entity": entity_name, "forgotten_count": forgotten_count}),
     );
+
+    // Invalidate recall cache for this namespace.
+    if let Some(ref redis) = state.redis {
+        let mut conn = redis.clone();
+        let prefix = crate::cache::namespace_prefix(&ps.namespace.id.to_string());
+        crate::cache::invalidate_prefix(&mut conn, &prefix).await;
+    }
 
     Ok(Json(ForgetResponse { forgotten_count }))
 }
@@ -977,6 +1023,13 @@ async fn observe(
             "content_len": body.content.len(),
         }),
     );
+
+    // Invalidate recall cache for this namespace.
+    if let Some(ref redis) = state.redis {
+        let mut conn = redis.clone();
+        let prefix = crate::cache::namespace_prefix(&ps.namespace.id.to_string());
+        crate::cache::invalidate_prefix(&mut conn, &prefix).await;
+    }
 
     Ok((
         StatusCode::CREATED,
