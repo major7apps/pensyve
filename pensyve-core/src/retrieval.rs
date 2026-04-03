@@ -243,6 +243,8 @@ pub enum RecallError {
     Reranker(#[from] crate::reranker::RerankerError),
     #[error("RRF error: {0}")]
     Rrf(#[from] crate::rrf::RrfError),
+    #[error("Recall timed out after {0} seconds")]
+    Timeout(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +392,7 @@ impl<'a> RecallEngine<'a> {
         target_entity: Option<Uuid>,
     ) -> Result<RecallResult, RecallError> {
         let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(self.config.recall_timeout_secs);
         let max_candidates = self.config.max_candidates;
 
         // Steps 1–4: embed, search, merge candidates.
@@ -401,6 +404,10 @@ impl<'a> RecallEngine<'a> {
 
         if candidates.is_empty() {
             return Ok(RecallResult { memories: vec![] });
+        }
+
+        if start.elapsed() > timeout {
+            return Err(RecallError::Timeout(self.config.recall_timeout_secs));
         }
 
         // Step 5: Normalize BM25 scores (positional rank).
@@ -519,6 +526,10 @@ impl<'a> RecallEngine<'a> {
         // at small corpus sizes (k=60 was designed for web-scale IR).
         let effective_k = rrf::adaptive_k(candidates.len(), self.config.rrf_k);
         let rrf_results = rrf::reciprocal_rank_fusion(&rankings, &rrf_weights, effective_k)?;
+
+        if start.elapsed() > timeout {
+            return Err(RecallError::Timeout(self.config.recall_timeout_secs));
+        }
 
         // Pre-compute max_access for access_score normalization.
         let max_access = candidates

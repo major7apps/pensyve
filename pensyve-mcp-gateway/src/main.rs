@@ -231,6 +231,8 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         .nest_service("/mcp", mcp_service)
         .merge(rest::router())
         .route("/health", axum::routing::get(health_handler))
+        .route("/ready", axum::routing::get(readiness_handler))
+        .route("/metrics", axum::routing::get(metrics_handler))
         .route(
             "/.well-known/oauth-protected-resource",
             axum::routing::get(oauth::oauth_protected_resource),
@@ -301,6 +303,31 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
 
 async fn health_handler() -> &'static str {
     "ok"
+}
+
+async fn readiness_handler(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> axum::response::Response {
+    let default_state = state.tenant_mgr.default_state();
+    match default_state.storage.count_entities_by_namespace(default_state.namespace.id) {
+        Ok(_) => axum::response::Response::builder()
+            .status(200)
+            .body(axum::body::Body::from("ready"))
+            .unwrap(),
+        Err(e) => axum::response::Response::builder()
+            .status(503)
+            .body(axum::body::Body::from(format!("not ready: {e}")))
+            .unwrap(),
+    }
+}
+
+async fn metrics_handler() -> axum::response::Response {
+    use axum::http::header;
+    let body = pensyve_core::observability::metrics().prometheus_text();
+    axum::response::Response::builder()
+        .header(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
+        .body(axum::body::Body::from(body))
+        .unwrap()
 }
 
 // Task-local to pass tenant ID from axum middleware to the rmcp service factory.

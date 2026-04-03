@@ -82,6 +82,9 @@ impl PensyveMcpServer {
         description = "Search memories by semantic similarity and text matching. Returns ranked results from episodic, semantic, and procedural memory."
     )]
     async fn recall(&self, Parameters(params): Parameters<RecallParams>) -> Result<String, String> {
+        if params.query.len() > 4096 {
+            return Err("Query too long (max 4096 bytes)".to_string());
+        }
         if let Some(mc) = params.min_confidence
             && !(0.0..=1.0).contains(&mc)
         {
@@ -167,6 +170,12 @@ impl PensyveMcpServer {
         &self,
         Parameters(params): Parameters<RememberParams>,
     ) -> Result<String, String> {
+        if params.fact.len() > 32768 {
+            return Err("Fact too long (max 32768 bytes)".to_string());
+        }
+        if params.entity.len() > 256 {
+            return Err("Entity name too long (max 256 bytes)".to_string());
+        }
         let state = &self.state;
         let confidence = params.confidence.unwrap_or(1.0) as f32;
 

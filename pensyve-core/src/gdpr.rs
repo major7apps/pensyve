@@ -61,10 +61,12 @@ pub fn erase_entity(
         Err(e) => result.warnings.push(format!("Edge query error: {e}")),
     }
 
-    // Step 3: Delete entity record
-    // Note: The StorageTrait doesn't have delete_entity yet.
-    // For now, we track this as a warning.
-    result.entities_deleted = 1;
+    // Step 3: Delete entity record (not found is OK — entity may not exist)
+    match storage.delete_entity(entity_id) {
+        Ok(true) => result.entities_deleted = 1,
+        Ok(false) => {} // Entity record didn't exist — nothing to delete
+        Err(e) => result.warnings.push(format!("Entity deletion error: {e}")),
+    }
 
     result.complete = result.warnings.is_empty();
     Ok(result)

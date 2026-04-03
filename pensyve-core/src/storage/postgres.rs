@@ -1140,6 +1140,18 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    fn delete_entity(&self, id: Uuid) -> StorageResult<bool> {
+        self.block_on(async {
+            let mut conn = self.maybe_scoped_conn().await?;
+            let result = query::<Postgres>("DELETE FROM entities WHERE id = $1")
+                .bind(id)
+                .execute(&mut *conn)
+                .await
+                .map_err(sqlx_to_io)?;
+            Ok(result.rows_affected() > 0)
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Edges
     // -----------------------------------------------------------------------
