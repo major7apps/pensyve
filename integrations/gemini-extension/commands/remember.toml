@@ -1,14 +1,5 @@
-[command]
-name = "remember"
-description = "Store a fact in persistent memory"
-
-[[command.args]]
-name = "fact"
-description = "The fact to remember, optionally prefixed with 'entity: fact' to specify the entity"
-required = true
-
-[command.prompt]
-text = """
+description = "Store a fact, decision, or pattern in persistent memory"
+prompt = """
 Store the following fact in Pensyve memory.
 
 1. Parse the input for an entity prefix in the format `entity: fact` or `entity - fact`. If no prefix is found, infer the most appropriate entity name from the content. Use lowercase, hyphenated entity names (e.g., `auth-service`, `project-config`).
@@ -24,5 +15,5 @@ Store the following fact in Pensyve memory.
 
 Do not store secrets, API keys, passwords, or credentials. Warn the user if the input appears sensitive.
 
-Fact: {{fact}}
+Fact: {{args}}
 """

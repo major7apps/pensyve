@@ -50,12 +50,12 @@ Use **lowercase, hyphenated** names for entities:
 
 When storing memories, use these confidence levels:
 
-| Type | Confidence | Examples |
-|------|-----------|----------|
-| Decisions | 0.9 | Architecture choices, technology selections, API design |
-| Outcomes | 0.8 | Bug fixes, successful approaches, performance findings |
-| Patterns | 0.7 | Recurring issues, workflow discoveries, cross-cutting observations |
-| Speculative | 0.5 | Hypotheses, untested theories, uncertain observations |
+| Type        | Confidence | Examples                                                           |
+| ----------- | ---------- | ------------------------------------------------------------------ |
+| Decisions   | 0.9        | Architecture choices, technology selections, API design            |
+| Outcomes    | 0.8        | Bug fixes, successful approaches, performance findings             |
+| Patterns    | 0.7        | Recurring issues, workflow discoveries, cross-cutting observations |
+| Speculative | 0.5        | Hypotheses, untested theories, uncertain observations              |
 
 If the user expresses certainty ("we decided", "this is how it works"), use 0.9-1.0.
 If the user is uncertain ("I think", "maybe", "probably"), use 0.5-0.7.
@@ -75,13 +75,17 @@ If the user is uncertain ("I think", "maybe", "probably"), use 0.5-0.7.
 ## Session Workflow
 
 ### At session start:
+
 Consider running `pensyve_recall` with a broad query related to the current working directory or task to load relevant context. This gives you continuity from previous sessions.
 
 ### During the session:
+
 When you learn something significant -- a decision, an outcome, a pattern -- suggest storing it. Present the candidate to the user with the entity name, fact text, and confidence level.
 
 ### At session end:
+
 Review the session for memorable content. Look for:
+
 - Decisions that were made and their reasoning
 - Problems that were solved and their root causes
 - Patterns that emerged
@@ -91,11 +95,12 @@ Present candidates and store only what the user confirms.
 
 ## MCP Tools Reference
 
-| Tool | Purpose | Key Parameters |
-|------|---------|---------------|
-| `pensyve_recall` | Search memories by semantic similarity | `query`, `entity?`, `types?`, `limit?` |
-| `pensyve_remember` | Store a fact as semantic memory | `entity`, `fact`, `confidence?` |
-| `pensyve_episode_start` | Begin tracking a conversation | `participants` |
-| `pensyve_episode_end` | End episode with outcome summary | `episode_id`, `outcome?` |
-| `pensyve_forget` | Delete all memories for an entity | `entity`, `hard_delete?` |
-| `pensyve_inspect` | View all memories for an entity | `entity`, `memory_type?`, `limit?` |
+| Tool                    | Purpose                                        | Key Parameters                                                            |
+| ----------------------- | ---------------------------------------------- | ------------------------------------------------------------------------- |
+| `pensyve_recall`        | Search memories by semantic similarity         | `query`, `entity?`, `types?`, `limit?`                                    |
+| `pensyve_remember`      | Store a fact as semantic memory                | `entity`, `fact`, `confidence?`                                           |
+| `pensyve_observe`       | Record an observation within an active episode | `episode_id`, `content`, `source_entity`, `about_entity`, `content_type?` |
+| `pensyve_episode_start` | Begin tracking a conversation                  | `participants`                                                            |
+| `pensyve_episode_end`   | End episode with outcome summary               | `episode_id`, `outcome?`                                                  |
+| `pensyve_forget`        | Delete all memories for an entity              | `entity`, `hard_delete?`                                                  |
+| `pensyve_inspect`       | View all memories for an entity                | `entity`, `memory_type?`, `limit?`                                        |

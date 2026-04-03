@@ -56,16 +56,17 @@ Get an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/a
 
 ## MCP Tools
 
-The extension connects to the Pensyve remote MCP server, which exposes 6 tools:
+The extension connects to the Pensyve remote MCP server, which exposes 7 tools:
 
-| Tool                    | Parameters                             | Returns                              |
-| ----------------------- | -------------------------------------- | ------------------------------------ |
-| `pensyve_recall`        | `query`, `entity?`, `types?`, `limit?` | Ranked array of memories with scores |
-| `pensyve_remember`      | `entity`, `fact`, `confidence?`        | Stored memory object                 |
-| `pensyve_episode_start` | `participants`                         | `episode_id`, `started_at`           |
-| `pensyve_episode_end`   | `episode_id`, `outcome?`               | `memories_created` count             |
-| `pensyve_forget`        | `entity`, `hard_delete?`               | `forgotten_count`                    |
-| `pensyve_inspect`       | `entity`, `memory_type?`, `limit?`     | Array of memories with stats         |
+| Tool                    | Parameters                                                                | Returns                              |
+| ----------------------- | ------------------------------------------------------------------------- | ------------------------------------ |
+| `pensyve_recall`        | `query`, `entity?`, `types?`, `limit?`                                    | Ranked array of memories with scores |
+| `pensyve_remember`      | `entity`, `fact`, `confidence?`                                           | Stored memory object                 |
+| `pensyve_observe`       | `episode_id`, `content`, `source_entity`, `about_entity`, `content_type?` | Stored episodic memory object        |
+| `pensyve_episode_start` | `participants`                                                            | `episode_id`, `started_at`           |
+| `pensyve_episode_end`   | `episode_id`, `outcome?`                                                  | `memories_created` count             |
+| `pensyve_forget`        | `entity`, `hard_delete?`                                                  | `forgotten_count`                    |
+| `pensyve_inspect`       | `entity`, `memory_type?`, `limit?`                                        | Array of memories with stats         |
 
 ## Context File
 

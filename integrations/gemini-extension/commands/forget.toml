@@ -1,28 +1,21 @@
-[command]
-name = "forget"
-description = "Delete all memories for an entity"
-
-[[command.args]]
-name = "entity"
-description = "The entity whose memories should be deleted"
-required = true
-
-[command.prompt]
-text = """
+description = "Delete all memories for an entity (with confirmation)"
+prompt = """
 Delete all memories for an entity in Pensyve. This is a destructive operation.
 
 1. Normalize the entity name to lowercase, hyphenated format.
 
 2. ALWAYS confirm before deleting. Ask:
-   "You are about to delete **all memories** for entity `{{entity}}`. This cannot be undone. Type 'yes' to confirm, or anything else to cancel."
+   "You are about to delete **all memories** for entity `<entity>`. This cannot be undone. Type 'yes' to confirm, or anything else to cancel."
 
 3. Do NOT proceed unless the user explicitly confirms with "yes", "y", or equivalent.
 
 4. After confirmation, call `pensyve_forget` with:
-   - `entity`: "{{entity}}"
+   - `entity`: The normalized entity name
 
 5. Report the entity name and number of memories deleted (`forgotten_count`).
 
 If the entity is not found, report that clearly -- it is not an error.
 Never skip the confirmation step. This is a hard requirement.
+
+Entity: {{args}}
 """
