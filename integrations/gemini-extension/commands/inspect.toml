@@ -1,34 +1,22 @@
-[command]
-name = "inspect"
 description = "View all memories stored for an entity"
-
-[[command.args]]
-name = "entity"
-description = "The entity to inspect"
-required = true
-
-[[command.args]]
-name = "type"
-description = "Filter by memory type: episodic, semantic, or procedural"
-required = false
-
-[[command.args]]
-name = "limit"
-description = "Maximum number of memories to show (default: 20)"
-required = false
-
-[command.prompt]
-text = """
+prompt = """
 View all memories for an entity in Pensyve, organized by memory type.
 
+Parse the input for optional flags: `--type <episodic|semantic|procedural>` to filter, `--limit <N>` to cap results. The first plain argument is the entity name.
+
+Examples:
+- `/inspect auth-service` -- show all memories for an entity
+- `/inspect database --type semantic` -- show only semantic memories
+- `/inspect api-routes --limit 5` -- limit results
+
 1. Call `pensyve_inspect` with:
-   - `entity`: "{{entity}}"
-   - `memory_type`: "{{type}}" (if provided)
-   - `limit`: {{limit}} (if provided, otherwise 20)
+   - `entity`: The entity name (normalized to lowercase, hyphenated)
+   - `memory_type`: Value of `--type` if provided
+   - `limit`: Value of `--limit` if provided, otherwise 20
 
 2. Display results in tables grouped by type:
 
-   **Entity: `{{entity}}`**
+   **Entity: `<entity>`**
    Total memories: N
 
    **Semantic Memories** (N):
@@ -49,4 +37,6 @@ View all memories for an entity in Pensyve, organized by memory type.
 
 Do not fabricate memories -- only display what the MCP tool returns.
 Never show raw embedding vectors.
+
+Input: {{args}}
 """

@@ -1,30 +1,18 @@
-[command]
-name = "recall"
 description = "Search persistent memory by semantic similarity"
-
-[[command.args]]
-name = "query"
-description = "The search query to find relevant memories"
-required = true
-
-[[command.args]]
-name = "entity"
-description = "Optional entity name to filter results"
-required = false
-
-[[command.args]]
-name = "limit"
-description = "Maximum number of results (default: 10)"
-required = false
-
-[command.prompt]
-text = """
+prompt = """
 Search Pensyve memory for relevant memories.
 
+Parse the input for optional flags: `--entity <name>` to filter by entity, `--limit <N>` to cap results. Everything else is the search query.
+
+Examples:
+- `/recall JWT signing` -- search all memories
+- `/recall auth --entity auth-service` -- search within an entity
+- `/recall migration --limit 5` -- limit results
+
 1. Call `pensyve_recall` with:
-   - `query`: "{{query}}"
-   - `entity`: "{{entity}}" (if provided)
-   - `limit`: {{limit}} (if provided, otherwise 10)
+   - `query`: The search terms (everything except flags)
+   - `entity`: Value of `--entity` if provided
+   - `limit`: Value of `--limit` if provided, otherwise 10
 
 2. Display results grouped by memory type:
 
@@ -44,4 +32,6 @@ Search Pensyve memory for relevant memories.
 
 If no results are found, say so clearly and suggest a broader query.
 Do not fabricate memories -- only report what the MCP tool returns.
+
+Input: {{args}}
 """
