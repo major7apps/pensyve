@@ -42,7 +42,7 @@ pub struct EpisodeEndParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ObserveParams {
-    /// Episode ID from pensyve_episode_start.
+    /// Episode ID from `pensyve_episode_start`.
     pub episode_id: String,
     /// The observation content (max 32KB).
     pub content: String,
@@ -50,7 +50,7 @@ pub struct ObserveParams {
     pub source_entity: String,
     /// What the observation is about (e.g. "pensyve-cloud").
     pub about_entity: String,
-    /// Content type: "text" (default), "code", "tool_output".
+    /// Content type: "text" (default), "code", "`tool_output`".
     pub content_type: Option<String>,
 }
 
