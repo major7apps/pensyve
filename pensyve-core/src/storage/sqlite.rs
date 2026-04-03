@@ -1330,6 +1330,13 @@ impl StorageTrait for SqliteBackend {
         Ok(entities)
     }
 
+    fn delete_entity(&self, id: Uuid) -> StorageResult<bool> {
+        let conn = lock_conn!(self);
+        let id_str = id.to_string();
+        let rows = conn.execute("DELETE FROM entities WHERE id = ?1", params![&id_str])?;
+        Ok(rows > 0)
+    }
+
     // -----------------------------------------------------------------------
     // Edges
     // -----------------------------------------------------------------------

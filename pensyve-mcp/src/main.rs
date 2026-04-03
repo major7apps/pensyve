@@ -108,10 +108,16 @@ async fn main() -> Result<()> {
                     e
                 }
                 Err(mini_err) => {
-                    tracing::warn!(
-                        "ONNX embedders unavailable ({mini_err}), falling back to mock (768 dims)"
-                    );
-                    OnnxEmbedder::new_mock(768)
+                    if std::env::var("PENSYVE_ALLOW_MOCK_EMBEDDER").is_ok() {
+                        tracing::warn!(
+                            "ONNX embedders unavailable ({mini_err}), falling back to mock (768 dims)"
+                        );
+                        OnnxEmbedder::new_mock(768)
+                    } else {
+                        return Err(anyhow::anyhow!(
+                            "No ONNX model available. Set PENSYVE_ALLOW_MOCK_EMBEDDER=1 to use mock. Error: {mini_err}"
+                        ));
+                    }
                 }
             }
         }

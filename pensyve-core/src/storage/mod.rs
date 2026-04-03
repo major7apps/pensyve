@@ -128,6 +128,9 @@ pub trait StorageTrait: Send + Sync {
         confidence: Option<f32>,
     ) -> StorageResult<()>;
 
+    /// Delete an entity record by its UUID. Returns true if the entity was found and deleted.
+    fn delete_entity(&self, id: Uuid) -> StorageResult<bool>;
+
     // Entities (bulk)
     fn list_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Entity>>;
 
