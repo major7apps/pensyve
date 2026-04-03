@@ -309,7 +309,10 @@ async fn readiness_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> axum::response::Response {
     let default_state = state.tenant_mgr.default_state();
-    match default_state.storage.count_entities_by_namespace(default_state.namespace.id) {
+    match default_state
+        .storage
+        .count_entities_by_namespace(default_state.namespace.id)
+    {
         Ok(_) => axum::response::Response::builder()
             .status(200)
             .body(axum::body::Body::from("ready"))
@@ -325,7 +328,10 @@ async fn metrics_handler() -> axum::response::Response {
     use axum::http::header;
     let body = pensyve_core::observability::metrics().prometheus_text();
     axum::response::Response::builder()
-        .header(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
+        .header(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
         .body(axum::body::Body::from(body))
         .unwrap()
 }
