@@ -41,6 +41,20 @@ pub struct EpisodeEndParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ObserveParams {
+    /// Episode ID from pensyve_episode_start.
+    pub episode_id: String,
+    /// The observation content (max 32KB).
+    pub content: String,
+    /// Who made the observation (e.g. "claude-code").
+    pub source_entity: String,
+    /// What the observation is about (e.g. "pensyve-cloud").
+    pub about_entity: String,
+    /// Content type: "text" (default), "code", "tool_output".
+    pub content_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[allow(dead_code)] // Fields are read via Deserialize, not direct access
 pub struct ForgetParams {
     /// The entity whose memories to remove.
