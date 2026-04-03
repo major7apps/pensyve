@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{Json, Router, routing};
@@ -17,7 +17,9 @@ use crate::auth::AuthContext;
 
 use pensyve_core::retrieval::RecallEngine;
 use pensyve_core::storage::StorageTrait;
-use pensyve_core::types::{Entity, EntityKind, Memory, SemanticMemory};
+use pensyve_core::types::{
+    ContentType, Entity, EntityKind, EpisodicMemory, Memory, SemanticMemory,
+};
 use pensyve_core::vector::VectorIndex;
 use pensyve_mcp_tools::PensyveState;
 
@@ -127,6 +129,43 @@ pub struct UpdateMemoryResponse {
     pub id: String,
     pub content: String,
     pub confidence: f32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ActivityAggregateResponse {
+    pub date: String,
+    pub recalls: usize,
+    pub remembers: usize,
+    pub observes: usize,
+    pub forgets: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ActivityEventResponse {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub entity: Option<String>,
+    pub summary: String,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ObserveRestRequest {
+    pub episode_id: String,
+    pub content: String,
+    pub source_entity: String,
+    pub about_entity: String,
+    pub content_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ActivityQuery {
+    pub days: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecentActivityQuery {
+    pub limit: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +291,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/v1/health", routing::get(health))
         .route("/v1/recall", routing::post(recall))
         .route("/v1/remember", routing::post(remember))
+        .route("/v1/observe", routing::post(observe))
         .route("/v1/entities", routing::post(create_entity))
         .route("/v1/entities/{entity_name}", routing::delete(forget_entity))
         .route(
@@ -259,6 +299,8 @@ pub fn router() -> Router<Arc<AppState>> {
             routing::delete(delete_memory).patch(update_memory),
         )
         .route("/v1/stats", routing::get(stats))
+        .route("/v1/activity", routing::get(activity))
+        .route("/v1/activity/recent", routing::get(activity_recent))
         .route("/v1/inspect", routing::post(inspect))
         .route("/v1/memories", routing::delete(purge_all_memories))
 }
@@ -368,6 +410,12 @@ async fn recall(
         })
         .collect();
 
+    let _ = ps.storage.log_activity(
+        ps.namespace.id,
+        "recall",
+        &json!({"query": body.query, "results": memories.len()}),
+    );
+
     Ok(Json(RecallResponse {
         memories,
         contradictions: vec![],
@@ -423,6 +471,12 @@ async fn remember(
             format!("Error saving semantic memory: {err}"),
         )
     })?;
+
+    let _ = ps.storage.log_activity(
+        ps.namespace.id,
+        "remember",
+        &json!({"entity": body.entity, "preview": &body.fact[..body.fact.len().min(50)]}),
+    );
 
     let content = format!("{} {}", mem.predicate, mem.object);
 
@@ -507,6 +561,12 @@ async fn forget_entity(
         }
     }
 
+    let _ = ps.storage.log_activity(
+        ps.namespace.id,
+        "forget",
+        &json!({"entity": entity_name, "forgotten_count": forgotten_count}),
+    );
+
     Ok(Json(ForgetResponse { forgotten_count }))
 }
 
@@ -539,6 +599,12 @@ async fn delete_memory(
         let mut vi = ps.vector_index.write().await;
         let _ = vi.remove(memory_id);
     }
+
+    let _ = ps.storage.log_activity(
+        ps.namespace.id,
+        "forget",
+        &json!({"memory_id": id, "count": 1}),
+    );
 
     Ok(Json(DeleteMemoryResponse { deleted: true, id }))
 }
@@ -758,4 +824,256 @@ async fn inspect(
         semantic,
         procedural: vec![],
     }))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn observe(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
+    Json(body): Json<ObserveRestRequest>,
+) -> Result<impl IntoResponse, RestError> {
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
+
+    // Validate input lengths.
+    if body.content.len() > 32768 {
+        return Err(RestError(
+            StatusCode::BAD_REQUEST,
+            "Content too long (max 32768 bytes)".to_string(),
+        ));
+    }
+    if body.source_entity.len() > 256 {
+        return Err(RestError(
+            StatusCode::BAD_REQUEST,
+            "source_entity name too long (max 256 bytes)".to_string(),
+        ));
+    }
+    if body.about_entity.len() > 256 {
+        return Err(RestError(
+            StatusCode::BAD_REQUEST,
+            "about_entity name too long (max 256 bytes)".to_string(),
+        ));
+    }
+
+    let episode_id = Uuid::parse_str(&body.episode_id).map_err(|_| {
+        RestError(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid episode_id: '{}'", body.episode_id),
+        )
+    })?;
+
+    // Verify the episode exists.
+    match ps.storage.get_episode(episode_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(RestError(
+                StatusCode::NOT_FOUND,
+                format!("Episode not found: {episode_id}"),
+            ));
+        }
+        Err(e) => {
+            return Err(RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Error loading episode: {e}"),
+            ));
+        }
+    }
+
+    // Resolve entities.
+    let source_entity = get_or_create_entity(
+        ps.storage.as_ref(),
+        &body.source_entity,
+        ps.namespace.id,
+        EntityKind::Agent,
+    )?;
+    let about_entity = get_or_create_entity(
+        ps.storage.as_ref(),
+        &body.about_entity,
+        ps.namespace.id,
+        EntityKind::Agent,
+    )?;
+
+    // Build the episodic memory.
+    let mut mem = EpisodicMemory::new(
+        ps.namespace.id,
+        episode_id,
+        source_entity.id,
+        about_entity.id,
+        &body.content,
+    );
+    mem.content_type = body
+        .content_type
+        .as_deref()
+        .map_or(ContentType::Text, ContentType::from_str);
+
+    // Embed content on the blocking thread pool.
+    let embedder = ps.embedder.clone();
+    let content = body.content.clone();
+    let embed_result = tokio::task::spawn_blocking(move || embedder.embed(&content)).await;
+
+    match embed_result {
+        Ok(Ok(embedding)) => {
+            let mut vector_index = ps.vector_index.write().await;
+            if let Err(err) = vector_index.add(mem.id, &embedding) {
+                tracing::warn!("Failed to add to vector index: {err}");
+            }
+            mem.embedding = embedding;
+        }
+        Ok(Err(err)) => tracing::warn!("Embedding failed: {err}"),
+        Err(err) => tracing::warn!("Embedding task panicked: {err}"),
+    }
+
+    ps.storage.save_episodic(&mem).map_err(|err| {
+        RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Error saving episodic memory: {err}"),
+        )
+    })?;
+
+    let _ = ps.storage.log_activity(
+        ps.namespace.id,
+        "observe",
+        &json!({
+            "episode_id": episode_id.to_string(),
+            "source_entity": body.source_entity,
+            "about_entity": body.about_entity,
+            "content_type": mem.content_type.as_str(),
+            "content_len": body.content.len(),
+        }),
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": mem.id.to_string(),
+            "episode_id": episode_id.to_string(),
+            "content_type": mem.content_type.as_str(),
+            "timestamp": mem.timestamp.to_rfc3339(),
+        })),
+    ))
+}
+
+async fn activity(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
+    Query(params): Query<ActivityQuery>,
+) -> Result<impl IntoResponse, RestError> {
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
+    let days = params.days.unwrap_or(30);
+
+    let aggregates = ps
+        .storage
+        .get_activity_aggregates(ps.namespace.id, days)
+        .map_err(|e| {
+            RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Error fetching activity aggregates: {e}"),
+            )
+        })?;
+
+    let response: Vec<ActivityAggregateResponse> = aggregates
+        .into_iter()
+        .map(|a| ActivityAggregateResponse {
+            date: a.date,
+            recalls: a.recalls,
+            remembers: a.remembers,
+            observes: a.observes,
+            forgets: a.forgets,
+        })
+        .collect();
+
+    Ok(Json(response))
+}
+
+async fn activity_recent(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
+    Query(params): Query<RecentActivityQuery>,
+) -> Result<impl IntoResponse, RestError> {
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
+    let limit = params.limit.unwrap_or(10).min(100);
+
+    let events = ps
+        .storage
+        .get_recent_activity(ps.namespace.id, limit)
+        .map_err(|e| {
+            RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Error fetching recent activity: {e}"),
+            )
+        })?;
+
+    let response: Vec<ActivityEventResponse> = events
+        .into_iter()
+        .map(|e| {
+            let entity = e
+                .detail_json
+                .get("entity")
+                .or_else(|| e.detail_json.get("about_entity"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            let summary = match e.event_type.as_str() {
+                "recall" => e
+                    .detail_json
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("query")
+                    .to_string(),
+                "remember" => e
+                    .detail_json
+                    .get("preview")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("stored a fact")
+                    .to_string(),
+                "observe" => {
+                    let ct = e
+                        .detail_json
+                        .get("content_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("text");
+                    format!("Observed: {ct}")
+                }
+                "forget" => {
+                    let count = e
+                        .detail_json
+                        .get("forgotten_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .or_else(|| {
+                            e.detail_json
+                                .get("count")
+                                .and_then(serde_json::Value::as_u64)
+                        })
+                        .unwrap_or(0);
+                    format!("Forgot {count} memories")
+                }
+                "episode_start" => "Session started".to_string(),
+                "episode_end" => {
+                    let outcome = e
+                        .detail_json
+                        .get("outcome")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("success");
+                    format!("Session ended ({outcome})")
+                }
+                "consolidate" => {
+                    let count = e
+                        .detail_json
+                        .get("count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    format!("Consolidated {count} memories")
+                }
+                other => other.to_string(),
+            };
+
+            ActivityEventResponse {
+                event_type: e.event_type,
+                entity,
+                summary,
+                timestamp: e.created_at.to_rfc3339(),
+            }
+        })
+        .collect();
+
+    Ok(Json(response))
 }

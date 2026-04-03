@@ -1320,7 +1320,7 @@ impl StorageTrait for PostgresBackend {
                  ORDER BY day",
             )
             .bind(namespace_id)
-            .bind(days as i32)
+            .bind(days.cast_signed())
             .fetch_all(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
@@ -1349,6 +1349,7 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    #[allow(clippy::cast_possible_wrap)]
     fn get_recent_activity(
         &self,
         namespace_id: Uuid,

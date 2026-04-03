@@ -420,7 +420,7 @@ impl PensyveMcpServer {
             }),
         );
 
-        let mut val = serde_json::to_value(&serde_json::json!({
+        let mut val = serde_json::to_value(serde_json::json!({
             "id": mem.id.to_string(),
             "episode_id": episode_id.to_string(),
             "content_type": mem.content_type.as_str(),
