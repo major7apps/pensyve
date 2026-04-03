@@ -13,6 +13,7 @@ Fires when the user submits a prompt. Optionally enriches the prompt with releva
 ### Step 1: Check Configuration
 
 Read `pensyve-plugin.local.md` for the `prompt_enrichment` setting:
+
 - **false** (default): Exit immediately. Do nothing.
 - **true**: Proceed with enrichment.
 
@@ -23,6 +24,7 @@ If the configuration file is not found or the setting is absent, treat as **fals
 Determine if the prompt would benefit from memory context:
 
 **Enrich when the prompt involves:**
+
 - Architecture or design decisions ("how should we...", "what's the best way to...")
 - Debugging or troubleshooting ("why is this failing...", "this error...")
 - Referencing past work ("last time we...", "we decided to...", "what did we...")
@@ -30,6 +32,7 @@ Determine if the prompt would benefit from memory context:
 - Historical context ("previously", "before", "earlier")
 
 **Do NOT enrich when the prompt is:**
+
 - A simple command ("run tests", "lint this file", "format this")
 - A question about the current file content ("what does this function do")
 - A request to write new code with no historical context needed
@@ -41,6 +44,7 @@ If the prompt does not warrant enrichment, exit without any MCP calls.
 ### Step 3: Quick Recall
 
 If enrichment is warranted, call `pensyve_recall`:
+
 - `query`: The user's prompt text (or key phrases extracted from it)
 - `limit`: 5 (keep it lightweight)
 
@@ -51,6 +55,7 @@ This call MUST complete within 1 second. If the MCP server is slow, abandon the 
 If relevant memories are found (score > 0.3), append them as context (maximum 5 memories):
 
 > **Pensyve context:** Prior memories relevant to this prompt:
+>
 > - [entity]: [fact] (confidence: [X])
 > - [entity]: [fact] (confidence: [X])
 
@@ -63,6 +68,7 @@ If no relevant memories are found, or all scores are below 0.3, proceed without 
 ## Performance Requirements
 
 This hook runs on EVERY user prompt when enabled. It MUST be:
+
 - **Fast**: < 1 second total execution time
 - **Lightweight**: Single `pensyve_recall` query, maximum 5 results
 - **Non-blocking**: If the MCP server is slow or unavailable, skip enrichment entirely

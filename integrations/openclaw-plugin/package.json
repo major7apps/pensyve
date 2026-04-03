@@ -5,7 +5,9 @@
   "type": "module",
   "main": "dist/index.js",
   "openclaw": {
-    "extensions": ["./dist/index.js"]
+    "extensions": [
+      "./dist/index.js"
+    ]
   },
   "scripts": {
     "build": "tsc",
@@ -20,5 +22,11 @@
     "openclaw": "*"
   },
   "license": "Apache-2.0",
-  "keywords": ["openclaw", "memory", "pensyve", "ai-agent", "offline-first"]
+  "keywords": [
+    "openclaw",
+    "memory",
+    "pensyve",
+    "ai-agent",
+    "offline-first"
+  ]
 }

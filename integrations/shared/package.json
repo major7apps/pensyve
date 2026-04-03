@@ -2,5 +2,7 @@
   "name": "@pensyve/shared",
   "private": true,
   "type": "module",
-  "devDependencies": { "vitest": "^4.1.0" }
+  "devDependencies": {
+    "vitest": "^4.1.0"
+  }
 }

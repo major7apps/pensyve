@@ -34,32 +34,39 @@ Organize the findings into a structured briefing. Deduplicate results that appea
 > **Refactor Briefing: `<target>`**
 >
 > ### Known Facts
+>
 > - List of semantic memories about the target, ordered by confidence
 > - Include confidence scores
 >
 > ### Past Decisions
+>
 > - Architecture or design decisions related to this target
 > - Include the reasoning if available ("chose X because Y")
 >
 > ### Past Outcomes
+>
 > - Previous refactoring attempts and their results
 > - Bug fixes and their root causes
 > - What worked and what did not
 >
 > ### Known Pitfalls
+>
 > - Failed approaches (flagged clearly so they are not repeated)
 > - Edge cases or gotchas discovered in past sessions
 > - Dependencies that may be affected
 >
 > ### Procedural Knowledge
+>
 > - Action-outcome patterns with reliability scores
 > - Proven workflows related to this target
 >
 > ### Recommendations
+>
 > - Synthesize the above into 2-5 actionable recommendations
 > - Flag any conflicts or contradictions in the memory
 >
 > ### Memory Gaps
+>
 > - Areas where no relevant memories exist
 > - Suggest what to watch for during the refactor
 

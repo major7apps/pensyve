@@ -20,11 +20,11 @@ When the user invokes `/memory-status`, follow these steps:
 
    **Pensyve Memory Status**
 
-   | Property | Value |
-   |----------|-------|
-   | Namespace | `default` |
+   | Property     | Value                |
+   | ------------ | -------------------- |
+   | Namespace    | `default`            |
    | Storage path | `~/.pensyve/default` |
-   | MCP server | Connected |
+   | MCP server   | Connected            |
 
    **Memory Counts by Type:**
    | Type | Count |
@@ -49,6 +49,7 @@ When the user invokes `/memory-status`, follow these steps:
 ## Examples
 
 User: `/memory-status`
+
 - Shows namespace stats, memory counts by type, and entity list
 
 ## Constraints

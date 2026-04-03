@@ -14,6 +14,7 @@ On-demand agent that performs deep memory research. Decomposes a query into mult
 This agent is invoked when a user or another skill needs comprehensive memory context about a topic. It goes deeper than a single `/recall` command by decomposing the question into multiple search strategies.
 
 Typical triggers:
+
 - "What do we know about X?"
 - "Research our history with Y"
 - "Get me full context on Z"
@@ -28,15 +29,19 @@ Break the user's query into multiple search angles:
 **Direct match**: The query as stated.
 
 **Related concepts**: Synonyms, related terms, and alternative phrasings.
+
 - Example: "authentication" also searches for "auth", "login", "credentials", "JWT", "token"
 
 **Parent/child entities**: Broader and narrower scopes.
+
 - Example: "auth-service token refresh" also searches for "auth-service" (parent) and "refresh-token" (child)
 
 **Temporal angles**: Time-based variations.
+
 - Example: "authentication changes" also searches for "authentication decided", "authentication fixed", "authentication failed"
 
 **Outcome angles**: Success and failure perspectives.
+
 - Example: Also search for "authentication success", "authentication error"
 
 Generate 5-8 distinct search queries that cover the topic from multiple angles.
@@ -60,26 +65,36 @@ Organize all findings into a structured briefing with the following sections. Om
 > **Research Briefing: [topic]**
 >
 > ### Summary
+>
 > 2-3 sentence overview of what Pensyve knows about this topic. Highlight the most important findings.
 >
 > ### Key Facts
+>
 > Ranked list of semantic memories directly relevant to the query.
+>
 > - Entity: fact (confidence: X, score: Y)
 > - Entity: fact (confidence: X, score: Y)
 >
 > ### Decision History
+>
 > Chronological list of decisions related to this topic.
+>
 > - [date] Entity: decision made (confidence: X)
 >
 > ### Known Issues
+>
 > Active or past issues related to this topic.
+>
 > - Entity: issue description (confidence: X)
 >
 > ### Procedural Knowledge
+>
 > Action-outcome patterns related to this topic.
+>
 > - Trigger: action -> outcome (reliability: X, trials: N)
 >
 > ### Related Entities
+>
 > Entities connected to this topic, with their memory counts.
 > | Entity | Memories | Relevance |
 > |--------|----------|-----------|
@@ -88,17 +103,22 @@ Organize all findings into a structured briefing with the following sections. Om
 > | token-cache | 3 | Peripheral |
 >
 > ### Gaps
+>
 > Areas where memory is absent or insufficient.
+>
 > - No procedural knowledge about token rotation recovery
 > - No episodic memories about production deployment of auth changes
 >
 > ### Confidence Assessment
+>
 > Overall confidence in this briefing:
+>
 > - **High**: Multiple corroborating memories with high confidence scores
 > - **Medium**: Some relevant memories but with gaps or low confidence
 > - **Low**: Few relevant memories; briefing is based on limited data
 
 Confidence assessment criteria:
+
 - **High**: 5+ relevant memories with average confidence > 0.8 and average score > 0.7
 - **Medium**: 2-4 relevant memories or average confidence between 0.5 and 0.8
 - **Low**: 0-1 relevant memories or average confidence < 0.5

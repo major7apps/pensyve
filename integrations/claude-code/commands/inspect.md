@@ -48,12 +48,15 @@ When the user invokes `/inspect [entity]`, follow these steps:
 ## Examples
 
 User: `/inspect auth-service`
+
 - Shows all memories for the `auth-service` entity in tables
 
 User: `/inspect auth-service --type semantic`
+
 - Shows only semantic memories for `auth-service`
 
 User: `/inspect`
+
 - Guides the user to specify an entity or use `/memory-status`
 
 ## Constraints
