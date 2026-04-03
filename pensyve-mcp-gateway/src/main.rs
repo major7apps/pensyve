@@ -270,12 +270,68 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
 
     // Periodic eviction of stale rate-limit entries.
     tokio::spawn({
-        let state = app_state;
+        let state = app_state.clone();
         async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
                 state.rate_limiter.evict_stale();
+            }
+        }
+    });
+
+    // Background consolidation — runs every PENSYVE_CONSOLIDATION_INTERVAL_SECS (default 6h).
+    tokio::spawn({
+        let state = app_state;
+        async move {
+            let interval_secs: u64 = std::env::var("PENSYVE_CONSOLIDATION_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(21600);
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+            interval.tick().await; // skip immediate first tick
+            loop {
+                interval.tick().await;
+                for ns_id in state.tenant_mgr.active_namespace_ids() {
+                    if let Some(ps) = state.tenant_mgr.get_state_by_namespace_id(ns_id) {
+                        let config = pensyve_core::config::ConsolidationConfig::default();
+                        match pensyve_core::consolidation::ConsolidationEngine::run(
+                            ps.storage.as_ref(),
+                            &ps.embedder,
+                            &config,
+                            ns_id,
+                        ) {
+                            Ok(cs) => {
+                                if cs.promoted > 0 || cs.archived > 0 {
+                                    tracing::info!(
+                                        namespace_id = %ns_id,
+                                        promoted = cs.promoted,
+                                        decayed = cs.decayed,
+                                        archived = cs.archived,
+                                        "Background consolidation complete"
+                                    );
+                                }
+                                let _ = ps.storage.log_activity(
+                                    ns_id,
+                                    "consolidate",
+                                    &serde_json::json!({
+                                        "promoted": cs.promoted,
+                                        "decayed": cs.decayed,
+                                        "archived": cs.archived,
+                                    }),
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    namespace_id = %ns_id,
+                                    error = %e,
+                                    "Background consolidation failed"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     });

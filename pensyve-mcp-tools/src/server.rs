@@ -311,15 +311,59 @@ impl PensyveMcpServer {
             .update_episode(&episode)
             .map_err(|err| format!("Error updating episode: {err}"))?;
 
+        // Count episodic memories in this namespace for the response.
+        let memories_created = state
+            .storage
+            .get_all_memories_by_namespace(state.namespace.id)
+            .map(|mems| {
+                mems.iter()
+                    .filter(|m| matches!(m, Memory::Episodic(_)))
+                    .count()
+            })
+            .unwrap_or(0);
+
         let _ = state.storage.log_activity(
             state.namespace.id,
             "episode_end",
             &serde_json::json!({"outcome": params.outcome.as_deref().unwrap_or("success")}),
         );
 
+        // Trigger async consolidation for this namespace.
+        {
+            let storage = state.storage.clone();
+            let embedder = state.embedder.clone();
+            let ns_id = state.namespace.id;
+            tokio::spawn(async move {
+                let config = pensyve_core::config::ConsolidationConfig::default();
+                match pensyve_core::consolidation::ConsolidationEngine::run(
+                    storage.as_ref(),
+                    &embedder,
+                    &config,
+                    ns_id,
+                ) {
+                    Ok(stats) => {
+                        if stats.promoted > 0 {
+                            tracing::info!(promoted = stats.promoted, "Post-episode consolidation");
+                        }
+                        let _ = storage.log_activity(
+                            ns_id,
+                            "consolidate",
+                            &serde_json::json!({
+                                "promoted": stats.promoted,
+                                "decayed": stats.decayed,
+                                "archived": stats.archived,
+                                "trigger": "episode_end",
+                            }),
+                        );
+                    }
+                    Err(e) => tracing::warn!("Post-episode consolidation failed: {e}"),
+                }
+            });
+        }
+
         serde_json::to_string(&serde_json::json!({
             "episode_id": episode_id.to_string(),
-            "memories_created": 0u32,
+            "memories_created": memories_created,
             "outcome": params.outcome.as_deref().unwrap_or("success"),
             "ended_at": episode.ended_at.map(|t| t.to_rfc3339()),
         }))
