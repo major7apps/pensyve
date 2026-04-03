@@ -45,6 +45,7 @@ The prepare script downloads from HuggingFace (`leowei/LongMemEval`), converts t
 benchmark harness format, and saves to `benchmarks/longmemeval/data/`.
 
 If the dataset requires authentication, log in first:
+
 ```bash
 huggingface-cli login
 ```

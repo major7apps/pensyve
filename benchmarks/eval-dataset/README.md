@@ -11,11 +11,12 @@ A community-contributed evaluation dataset for agent memory systems.
 ## Contributing
 
 Add scenarios to `scenarios.json` following the schema:
+
 ```json
 {
   "scenario_id": "community-001",
   "category": "preference|mistake_avoidance|procedure_selection|contradiction",
-  "setup_messages": [{"role": "user|assistant", "content": "..."}],
+  "setup_messages": [{ "role": "user|assistant", "content": "..." }],
   "test_query": "...",
   "correct_action": "expected keyword",
   "incorrect_action": "wrong keyword"

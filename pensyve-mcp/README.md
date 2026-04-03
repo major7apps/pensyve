@@ -30,11 +30,11 @@ cargo install --path pensyve-mcp
 
 All configuration is via environment variables. None are required — defaults work out of the box.
 
-| Variable | Default | Description |
-|---|---|---|
-| `PENSYVE_PATH` | `~/.pensyve/default` | Directory where the SQLite database is stored |
-| `PENSYVE_NAMESPACE` | `default` | Logical namespace for memory isolation |
-| `PENSYVE_ALLOW_MOCK_EMBEDDER` | _(unset)_ | Set to any value to suppress ONNX warnings when no model is available |
+| Variable                      | Default              | Description                                                           |
+| ----------------------------- | -------------------- | --------------------------------------------------------------------- |
+| `PENSYVE_PATH`                | `~/.pensyve/default` | Directory where the SQLite database is stored                         |
+| `PENSYVE_NAMESPACE`           | `default`            | Logical namespace for memory isolation                                |
+| `PENSYVE_ALLOW_MOCK_EMBEDDER` | _(unset)_            | Set to any value to suppress ONNX warnings when no model is available |
 
 ### Embedder selection
 
@@ -101,12 +101,12 @@ Search memories using hybrid semantic + BM25 fusion. Returns ranked results acro
 
 **Parameters**
 
-| Name | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `query` | string | yes | — | Natural language search query |
-| `entity` | string | no | — | Filter results to a specific entity name |
-| `types` | string[] | no | all types | Memory types to include: `"episodic"`, `"semantic"`, `"procedural"` |
-| `limit` | integer | no | `5` | Maximum number of results to return |
+| Name     | Type     | Required | Default   | Description                                                         |
+| -------- | -------- | -------- | --------- | ------------------------------------------------------------------- |
+| `query`  | string   | yes      | —         | Natural language search query                                       |
+| `entity` | string   | no       | —         | Filter results to a specific entity name                            |
+| `types`  | string[] | no       | all types | Memory types to include: `"episodic"`, `"semantic"`, `"procedural"` |
+| `limit`  | integer  | no       | `5`       | Maximum number of results to return                                 |
 
 **Example input**
 
@@ -145,11 +145,11 @@ The `fact` string is split on the first space to derive `predicate` and `object`
 
 **Parameters**
 
-| Name | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `entity` | string | yes | — | Name of the entity this fact is about |
-| `fact` | string | yes | — | The fact to store (free-form text) |
-| `confidence` | float | no | `1.0` | Confidence level in `[0.0, 1.0]` |
+| Name         | Type   | Required | Default | Description                           |
+| ------------ | ------ | -------- | ------- | ------------------------------------- |
+| `entity`     | string | yes      | —       | Name of the entity this fact is about |
+| `fact`       | string | yes      | —       | The fact to store (free-form text)    |
+| `confidence` | float  | no       | `1.0`   | Confidence level in `[0.0, 1.0]`      |
 
 **Example input**
 
@@ -185,9 +185,9 @@ Participant entities are created automatically if they do not exist.
 
 **Parameters**
 
-| Name | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `participants` | string[] | yes | — | Names of the entities participating in this episode |
+| Name           | Type     | Required | Default | Description                                         |
+| -------------- | -------- | -------- | ------- | --------------------------------------------------- |
+| `participants` | string[] | yes      | —       | Names of the entities participating in this episode |
 
 **Example input**
 
@@ -215,10 +215,10 @@ Close an open episode and record its outcome. Returns the count of memories extr
 
 **Parameters**
 
-| Name | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `episode_id` | string | yes | — | UUID returned by `pensyve_episode_start` |
-| `outcome` | string | no | `"success"` | Episode outcome: `"success"`, `"failure"`, or `"partial"` |
+| Name         | Type   | Required | Default     | Description                                               |
+| ------------ | ------ | -------- | ----------- | --------------------------------------------------------- |
+| `episode_id` | string | yes      | —           | UUID returned by `pensyve_episode_start`                  |
+| `outcome`    | string | no       | `"success"` | Episode outcome: `"success"`, `"failure"`, or `"partial"` |
 
 **Example input**
 
@@ -248,10 +248,10 @@ Delete all memories associated with a named entity. If the entity does not exist
 
 **Parameters**
 
-| Name | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `entity` | string | yes | — | Name of the entity whose memories to remove |
-| `hard_delete` | boolean | no | `true` | If `true`, permanently deletes records |
+| Name          | Type    | Required | Default | Description                                 |
+| ------------- | ------- | -------- | ------- | ------------------------------------------- |
+| `entity`      | string  | yes      | —       | Name of the entity whose memories to remove |
+| `hard_delete` | boolean | no       | `true`  | If `true`, permanently deletes records      |
 
 **Example input**
 
@@ -289,11 +289,11 @@ List all memories stored for a named entity, optionally filtered by memory type.
 
 **Parameters**
 
-| Name | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `entity` | string | yes | — | Name of the entity to inspect |
-| `memory_type` | string | no | all types | Filter to `"episodic"`, `"semantic"`, or `"procedural"` |
-| `limit` | integer | no | `20` | Maximum number of memories to return |
+| Name          | Type    | Required | Default   | Description                                             |
+| ------------- | ------- | -------- | --------- | ------------------------------------------------------- |
+| `entity`      | string  | yes      | —         | Name of the entity to inspect                           |
+| `memory_type` | string  | no       | all types | Filter to `"episodic"`, `"semantic"`, or `"procedural"` |
+| `limit`       | integer | no       | `20`      | Maximum number of memories to return                    |
 
 **Example input**
 

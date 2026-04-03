@@ -44,14 +44,14 @@
 
 ## Subproject Map
 
-| Project | Language | Type | Depends On |
-|---------|----------|------|-----------|
-| `pensyve-core` | Rust | Library (rlib) | — |
-| `pensyve-python` | Rust + Python | PyO3 cdylib | pensyve-core |
-| `pensyve-mcp` | Rust | Binary | pensyve-core |
-| `pensyve-cli` | Rust | Binary | pensyve-core |
-| `pensyve-ts` | TypeScript | npm package | pensyve_server (REST) |
-| `pensyve_server` | Python | Shared Python utilities | pensyve (Python SDK) |
+| Project          | Language      | Type                    | Depends On            |
+| ---------------- | ------------- | ----------------------- | --------------------- |
+| `pensyve-core`   | Rust          | Library (rlib)          | —                     |
+| `pensyve-python` | Rust + Python | PyO3 cdylib             | pensyve-core          |
+| `pensyve-mcp`    | Rust          | Binary                  | pensyve-core          |
+| `pensyve-cli`    | Rust          | Binary                  | pensyve-core          |
+| `pensyve-ts`     | TypeScript    | npm package             | pensyve_server (REST) |
+| `pensyve_server` | Python        | Shared Python utilities | pensyve (Python SDK)  |
 
 ## Data Model
 
@@ -135,15 +135,15 @@ Episodic→Semantic promotion: facts appearing in 2+ episodes (cosine similarity
 
 ## Tooling
 
-| Tool | Purpose |
-|------|---------|
-| clippy (pedantic) | Rust linting |
-| rustfmt | Rust formatting |
-| ruff | Python linting + formatting |
-| pyright | Python type checking |
-| eslint | TypeScript linting |
-| uv | Python package management |
-| bun | TypeScript package management |
-| maturin | PyO3 build tool |
-| fastembed | ONNX embedding + reranking |
-| llama-cpp-python | Local LLM inference |
+| Tool              | Purpose                       |
+| ----------------- | ----------------------------- |
+| clippy (pedantic) | Rust linting                  |
+| rustfmt           | Rust formatting               |
+| ruff              | Python linting + formatting   |
+| pyright           | Python type checking          |
+| eslint            | TypeScript linting            |
+| uv                | Python package management     |
+| bun               | TypeScript package management |
+| maturin           | PyO3 build tool               |
+| fastembed         | ONNX embedding + reranking    |
+| llama-cpp-python  | Local LLM inference           |
