@@ -1,3 +1,5 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::types::{
@@ -147,4 +149,49 @@ pub trait StorageTrait: Send + Sync {
 
     /// Count entities in a namespace.
     fn count_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize>;
+
+    // Activity logging
+    /// Record an activity event (recall, remember, observe, forget, etc.).
+    fn log_activity(
+        &self,
+        namespace_id: Uuid,
+        event_type: &str,
+        detail: &serde_json::Value,
+    ) -> StorageResult<()>;
+
+    /// Aggregate activity counts by day for the last N days.
+    fn get_activity_aggregates(
+        &self,
+        namespace_id: Uuid,
+        days: u32,
+    ) -> StorageResult<Vec<ActivityAggregate>>;
+
+    /// Retrieve the most recent activity events.
+    fn get_recent_activity(
+        &self,
+        namespace_id: Uuid,
+        limit: usize,
+    ) -> StorageResult<Vec<ActivityEvent>>;
+}
+
+// ---------------------------------------------------------------------------
+// Activity event types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityEvent {
+    pub id: Uuid,
+    pub event_type: String,
+    pub namespace_id: Uuid,
+    pub detail_json: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityAggregate {
+    pub date: String,
+    pub recalls: usize,
+    pub remembers: usize,
+    pub observes: usize,
+    pub forgets: usize,
 }

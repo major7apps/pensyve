@@ -138,6 +138,20 @@ CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);
 
 -- ---------------------------------------------------------------------------
+-- Activity Events
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS activity_events (
+    id UUID PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    namespace_id UUID NOT NULL,
+    detail_json JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_activity_ns_date ON activity_events(namespace_id, created_at);
+
+-- ---------------------------------------------------------------------------
 -- Row-Level Security (Postgres only)
 -- Namespace isolation: each connection must set pensyve.namespace_id via
 --   SELECT set_config('pensyve.namespace_id', '<uuid>', true)
