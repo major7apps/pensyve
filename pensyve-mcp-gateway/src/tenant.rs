@@ -3,6 +3,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
@@ -78,6 +79,30 @@ impl TenantStateManager {
                 Ok(state)
             }
         }
+    }
+
+    /// Returns namespace UUIDs for all tenants accessed since boot.
+    pub fn active_namespace_ids(&self) -> Vec<Uuid> {
+        let mut ids: Vec<Uuid> = self
+            .tenants
+            .iter()
+            .map(|entry| entry.value().namespace.id)
+            .collect();
+        // Include the default namespace
+        ids.push(self.default_state.namespace.id);
+        ids.dedup();
+        ids
+    }
+
+    /// Find a `PensyveState` by namespace UUID.
+    pub fn get_state_by_namespace_id(&self, ns_id: Uuid) -> Option<Arc<PensyveState>> {
+        if self.default_state.namespace.id == ns_id {
+            return Some(self.default_state.clone());
+        }
+        self.tenants
+            .iter()
+            .find(|entry| entry.value().namespace.id == ns_id)
+            .map(|entry| entry.value().clone())
     }
 
     fn create_tenant_state(&self, tenant_id: &str) -> Result<Arc<PensyveState>, std::io::Error> {

@@ -101,6 +101,18 @@ pub struct ConsolidationConfig {
     pub max_duration_secs: u64,
 }
 
+impl Default for ConsolidationConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_secs: 30,
+            memory_threshold: 100,
+            cron_interval_hours: 6,
+            fsrs_decay_threshold: 0.1,
+            max_duration_secs: 60,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Root config
 // ---------------------------------------------------------------------------
