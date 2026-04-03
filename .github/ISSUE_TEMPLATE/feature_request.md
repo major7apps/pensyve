@@ -1,9 +1,9 @@
 ---
 name: Feature Request
 about: Suggest a feature for Pensyve
-title: '[Feature] '
+title: "[Feature] "
 labels: enhancement
-assignees: ''
+assignees: ""
 ---
 
 **Problem**

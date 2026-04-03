@@ -22,7 +22,15 @@
   },
   "homepage": "https://pensyve.com",
   "bugs": "https://github.com/major7apps/pensyve/issues",
-  "keywords": ["ai", "agents", "memory", "llm", "mcp", "retrieval", "embeddings"],
+  "keywords": [
+    "ai",
+    "agents",
+    "memory",
+    "llm",
+    "mcp",
+    "retrieval",
+    "embeddings"
+  ],
   "scripts": {
     "build": "bun run tsc",
     "lint": "bun run eslint src/",

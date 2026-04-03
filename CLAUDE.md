@@ -84,19 +84,19 @@ uv run maturin develop --manifest-path pensyve-python/Cargo.toml
 
 **Workspace layout** — Cargo workspace with 4 Rust crates + standalone WASM crate + Python server + TypeScript SDK + Go SDK + VS Code extension + Claude Code plugin + framework integrations:
 
-| Crate / Package | Type | Role |
-|---|---|---|
-| `pensyve-core` | Rust rlib | Core logic: storage (SQLite + Postgres), embedding, retrieval, graph, decay, consolidation, observability, mesh |
-| `pensyve-python` | Rust cdylib (PyO3) | Python SDK via `import pensyve` — wraps core into `Pensyve`, `Entity`, `Episode`, `Memory` classes |
-| `pensyve-mcp` | Rust binary | MCP server (stdio transport via `rmcp`) exposing recall/remember/episode tools |
-| `pensyve-cli` | Rust binary | CLI (`pensyve recall`, `pensyve stats`) via `clap` |
-| `pensyve_server/`      | Python | Shared Python utilities — billing, Tier 2 extraction |
-| `pensyve-ts/` | TypeScript (bun) | HTTP client SDK with timeout, retry, PensyveError |
-| `pensyve-go/` | Go | HTTP client SDK with context.Context, structured errors |
-| `pensyve-wasm/` | Rust cdylib (wasm-bindgen) | Standalone minimal in-memory Pensyve for browser/edge (not in workspace) |
-| `pensyve-vscode/` | TypeScript (VS Code) | VS Code extension with sidebar, commands, status bar |
-| `pensyve-plugin/` | Claude Code plugin | 6 commands, 4 skills, 2 agents, 4 hooks for cross-session memory |
-| `integrations/` | Python | Framework adapters for LangChain, CrewAI, OpenClaw, Autogen |
+| Crate / Package   | Type                       | Role                                                                                                            |
+| ----------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `pensyve-core`    | Rust rlib                  | Core logic: storage (SQLite + Postgres), embedding, retrieval, graph, decay, consolidation, observability, mesh |
+| `pensyve-python`  | Rust cdylib (PyO3)         | Python SDK via `import pensyve` — wraps core into `Pensyve`, `Entity`, `Episode`, `Memory` classes              |
+| `pensyve-mcp`     | Rust binary                | MCP server (stdio transport via `rmcp`) exposing recall/remember/episode tools                                  |
+| `pensyve-cli`     | Rust binary                | CLI (`pensyve recall`, `pensyve stats`) via `clap`                                                              |
+| `pensyve_server/` | Python                     | Shared Python utilities — billing, Tier 2 extraction                                                            |
+| `pensyve-ts/`     | TypeScript (bun)           | HTTP client SDK with timeout, retry, PensyveError                                                               |
+| `pensyve-go/`     | Go                         | HTTP client SDK with context.Context, structured errors                                                         |
+| `pensyve-wasm/`   | Rust cdylib (wasm-bindgen) | Standalone minimal in-memory Pensyve for browser/edge (not in workspace)                                        |
+| `pensyve-vscode/` | TypeScript (VS Code)       | VS Code extension with sidebar, commands, status bar                                                            |
+| `pensyve-plugin/` | Claude Code plugin         | 6 commands, 4 skills, 2 agents, 4 hooks for cross-session memory                                                |
+| `integrations/`   | Python                     | Framework adapters for LangChain, CrewAI, OpenClaw, Autogen                                                     |
 
 **Dependency flow**: All Rust consumers depend on `pensyve-core`. The Python server depends on the PyO3 module (`pensyve._core`). The TypeScript and Go SDKs talk to the REST API over HTTP. The VS Code extension uses its own HTTP client. The Claude Code plugin wraps the MCP server.
 
@@ -128,6 +128,7 @@ Namespace → Entity (agent|user|team|tool) → Episodes (bounded interaction se
 ### Cloud gateway (`pensyve-mcp-gateway/`)
 
 Single Rust/Axum binary serving REST (`/v1/*`) and MCP (`/mcp`) on port 3000:
+
 - `rest.rs` — REST API route handlers (recall, remember, entities, stats, inspect)
 - `auth.rs` — API key validation (local list + remote endpoint with caching)
 - `rate_limit.rs` — Per-key rate limiting
@@ -142,6 +143,7 @@ Single Rust/Axum binary serving REST (`/v1/*`) and MCP (`/mcp`) on port 3000:
 ### Claude Code Plugin (`pensyve-plugin/`)
 
 Feature-complete plugin for the Claude Code marketplace:
+
 - 6 slash commands: `/remember`, `/recall`, `/forget`, `/inspect`, `/consolidate`, `/memory-status`
 - 4 skills: session-memory, memory-informed-refactor, context-loader, memory-review
 - 2 agents: memory-curator (background), context-researcher (on-demand)
@@ -164,22 +166,22 @@ Feature-complete plugin for the Claude Code marketplace:
 
 ## Environment Variables
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `PENSYVE_PATH` | `~/.pensyve/` | SQLite database path |
-| `PENSYVE_NAMESPACE` | `default` | Memory namespace |
-| `PENSYVE_API_KEYS` | (unset) | Comma-separated API keys for auth |
-| `PENSYVE_TIER2_ENABLED` | `false` | Enable LLM-based Tier 2 extraction |
-| `PENSYVE_TIER2_MODEL_PATH` | (unset) | Path to GGUF model for Tier 2 |
-| `PENSYVE_DATABASE_URL` | (unset) | Postgres connection string (optional, for scaled deployments) |
-| `PENSYVE_REDIS_URL` | (unset) | Redis URL for episode state (optional, for scaled deployments) |
+| Variable                   | Default       | Purpose                                                        |
+| -------------------------- | ------------- | -------------------------------------------------------------- |
+| `PENSYVE_PATH`             | `~/.pensyve/` | SQLite database path                                           |
+| `PENSYVE_NAMESPACE`        | `default`     | Memory namespace                                               |
+| `PENSYVE_API_KEYS`         | (unset)       | Comma-separated API keys for auth                              |
+| `PENSYVE_TIER2_ENABLED`    | `false`       | Enable LLM-based Tier 2 extraction                             |
+| `PENSYVE_TIER2_MODEL_PATH` | (unset)       | Path to GGUF model for Tier 2                                  |
+| `PENSYVE_DATABASE_URL`     | (unset)       | Postgres connection string (optional, for scaled deployments)  |
+| `PENSYVE_REDIS_URL`        | (unset)       | Redis URL for episode state (optional, for scaled deployments) |
 
 ## Test Counts
 
-| Ecosystem | Tests | Passing |
-|-----------|-------|---------|
-| Rust | 127 | 127 (6 ignored — need model download) |
-| Python | 92 | 92 |
-| TypeScript | 38 | 38 |
-| Go | 17 | 17 |
-| **Total** | **274** | **274** |
+| Ecosystem  | Tests   | Passing                               |
+| ---------- | ------- | ------------------------------------- |
+| Rust       | 127     | 127 (6 ignored — need model download) |
+| Python     | 92      | 92                                    |
+| TypeScript | 38      | 38                                    |
+| Go         | 17      | 17                                    |
+| **Total**  | **274** | **274**                               |
