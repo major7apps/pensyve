@@ -265,6 +265,40 @@ fn memory_content(memory: &Memory) -> String {
     }
 }
 
+/// Filter and convert recall results into API response format.
+fn filter_recall_results(
+    result: &pensyve_core::retrieval::RecallResult,
+    types: Option<&[String]>,
+    min_confidence: Option<f64>,
+) -> Vec<RecallMemory> {
+    result
+        .memories
+        .iter()
+        .filter(|c| {
+            if let Some(types) = types {
+                let tn = memory_type_name(&c.memory);
+                if !types.iter().any(|t| t == tn) {
+                    return false;
+                }
+            }
+            if let Some(min_conf) = min_confidence
+                && f64::from(memory_confidence(&c.memory)) < min_conf
+            {
+                return false;
+            }
+            true
+        })
+        .map(|c| RecallMemory {
+            id: c.memory_id.to_string(),
+            content: memory_content(&c.memory),
+            memory_type: memory_type_name(&c.memory).to_string(),
+            confidence: memory_confidence(&c.memory),
+            stability: memory_stability(&c.memory),
+            score: c.final_score,
+        })
+        .collect()
+}
+
 fn strip_embedding(val: &mut serde_json::Value) {
     if let serde_json::Value::Object(map) = val {
         map.remove("embedding");
@@ -327,17 +361,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/v1/inspect", routing::post(inspect))
         .route("/v1/memories", routing::delete(purge_all_memories))
         .route("/v1/episodes/start", routing::post(episode_start))
-        .route(
-            "/v1/episodes/{id}/message",
-            routing::post(episode_message),
-        )
+        .route("/v1/episodes/{id}/message", routing::post(episode_message))
         .route("/v1/episodes/{id}/end", routing::post(episode_end))
         .route("/v1/consolidate", routing::post(consolidate))
         .route("/v1/feedback", routing::post(feedback))
-        .route(
-            "/v1/gdpr/erase/{name}",
-            routing::delete(gdpr_erase),
-        )
+        .route("/v1/gdpr/erase/{name}", routing::delete(gdpr_erase))
         .route("/v1/a2a/agent-card", routing::get(a2a_agent_card))
         .route("/v1/a2a/task", routing::post(a2a_task))
 }
@@ -385,10 +413,10 @@ async fn recall(
 
     if let Some(ref redis) = state.redis {
         let mut conn = redis.clone();
-        if let Some(cached) = crate::cache::get(&mut conn, &cache_key).await {
-            if let Ok(response) = serde_json::from_str::<RecallResponse>(&cached) {
-                return Ok(Json(response));
-            }
+        if let Some(cached) = crate::cache::get(&mut conn, &cache_key).await
+            && let Ok(response) = serde_json::from_str::<RecallResponse>(&cached)
+        {
+            return Ok(Json(response));
         }
     }
 
@@ -442,32 +470,7 @@ async fn recall(
             })?
     };
 
-    let memories: Vec<RecallMemory> = result
-        .memories
-        .iter()
-        .filter(|c| {
-            if let Some(ref types) = body.types {
-                let tn = memory_type_name(&c.memory);
-                if !types.iter().any(|t| t == tn) {
-                    return false;
-                }
-            }
-            if let Some(min_conf) = body.min_confidence
-                && f64::from(memory_confidence(&c.memory)) < min_conf
-            {
-                return false;
-            }
-            true
-        })
-        .map(|c| RecallMemory {
-            id: c.memory_id.to_string(),
-            content: memory_content(&c.memory),
-            memory_type: memory_type_name(&c.memory).to_string(),
-            confidence: memory_confidence(&c.memory),
-            stability: memory_stability(&c.memory),
-            score: c.final_score,
-        })
-        .collect();
+    let memories = filter_recall_results(&result, body.types.as_deref(), body.min_confidence);
 
     let _ = ps.storage.log_activity(
         ps.namespace.id,
@@ -1254,8 +1257,13 @@ async fn episode_message(
         EntityKind::Agent,
     )?;
 
-    let mut mem =
-        EpisodicMemory::new(ps.namespace.id, episode_id, entity.id, entity.id, &body.content);
+    let mut mem = EpisodicMemory::new(
+        ps.namespace.id,
+        episode_id,
+        entity.id,
+        entity.id,
+        &body.content,
+    );
     mem.content_type = ContentType::Text;
 
     // Embed content on the blocking thread pool.
@@ -1363,17 +1371,17 @@ async fn episode_end(
                 &config,
                 ns_id,
             ) {
-                Ok(stats) => {
-                    if stats.promoted > 0 {
-                        tracing::info!(promoted = stats.promoted, "Post-episode consolidation");
+                Ok(consolidation_stats) => {
+                    if consolidation_stats.promoted > 0 {
+                        tracing::info!(promoted = consolidation_stats.promoted, "Post-episode consolidation");
                     }
                     let _ = storage.log_activity(
                         ns_id,
                         "consolidate",
                         &serde_json::json!({
-                            "promoted": stats.promoted,
-                            "decayed": stats.decayed,
-                            "archived": stats.archived,
+                            "promoted": consolidation_stats.promoted,
+                            "decayed": consolidation_stats.decayed,
+                            "archived": consolidation_stats.archived,
                             "trigger": "episode_end",
                         }),
                     );
@@ -1401,7 +1409,7 @@ async fn consolidate(
     let ps = get_pensyve_state(&state, &auth_ctx)?;
 
     let config = pensyve_core::config::ConsolidationConfig::default();
-    let stats = pensyve_core::consolidation::ConsolidationEngine::run(
+    let consolidation_result = pensyve_core::consolidation::ConsolidationEngine::run(
         ps.storage.as_ref(),
         &ps.embedder,
         &config,
@@ -1418,16 +1426,16 @@ async fn consolidate(
         ps.namespace.id,
         "consolidate",
         &json!({
-            "promoted": stats.promoted,
-            "decayed": stats.decayed,
-            "archived": stats.archived,
+            "promoted": consolidation_result.promoted,
+            "decayed": consolidation_result.decayed,
+            "archived": consolidation_result.archived,
         }),
     );
 
     Ok(Json(json!({
-        "promoted": stats.promoted,
-        "decayed": stats.decayed,
-        "archived": stats.archived,
+        "promoted": consolidation_result.promoted,
+        "decayed": consolidation_result.decayed,
+        "archived": consolidation_result.archived,
     })))
 }
 
@@ -1544,9 +1552,104 @@ async fn gdpr_erase(
 // A2A handlers
 // ---------------------------------------------------------------------------
 
+/// Handle the `memory.recall` capability for A2A task requests.
+async fn a2a_recall(
+    ps: &PensyveState,
+    input: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let query = input
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let limit = input
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(5) as usize;
+
+    let embedder = ps.embedder.clone();
+    let query_text = query.clone();
+    let query_embedding = tokio::task::spawn_blocking(move || embedder.embed(&query_text))
+        .await
+        .ok()
+        .and_then(Result::ok);
+
+    let vector_index = ps.vector_index.read().await;
+    let engine = RecallEngine::new(
+        ps.storage.as_ref(),
+        &ps.embedder,
+        &vector_index,
+        &ps.retrieval_config,
+    );
+
+    match engine.recall_with_embedding(&query, query_embedding.as_deref(), ps.namespace.id, limit, None) {
+        Ok(result) => {
+            let memories: Vec<serde_json::Value> = result
+                .memories
+                .iter()
+                .map(|c| {
+                    json!({
+                        "id": c.memory_id.to_string(),
+                        "content": memory_content(&c.memory),
+                        "score": c.final_score,
+                    })
+                })
+                .collect();
+            Ok(json!({"memories": memories}))
+        }
+        Err(e) => Err(format!("Recall error: {e}")),
+    }
+}
+
+/// Handle the `memory.remember` capability for A2A task requests.
+fn a2a_remember(
+    ps: &PensyveState,
+    input: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Value, RestError> {
+    let entity_name = input
+        .get("entity")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let fact = input
+        .get("fact")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let entity = get_or_create_entity(
+        ps.storage.as_ref(),
+        &entity_name,
+        ps.namespace.id,
+        EntityKind::Agent,
+    )?;
+
+    let (predicate, object) = if let Some(pos) = fact.find(' ') {
+        (fact[..pos].to_string(), fact[pos + 1..].to_string())
+    } else {
+        ("knows".to_string(), fact.clone())
+    };
+
+    let confidence = input
+        .get("confidence")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.8) as f32;
+
+    let mem = SemanticMemory::new(ps.namespace.id, entity.id, predicate, object, confidence);
+
+    ps.storage.save_semantic(&mem).map_err(|err| {
+        RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Error saving memory: {err}"),
+        )
+    })?;
+
+    Ok(json!({"memory_id": mem.id.to_string()}))
+}
+
 async fn a2a_agent_card() -> impl IntoResponse {
-    let endpoint =
-        std::env::var("PENSYVE_GATEWAY_URL").unwrap_or_else(|_| "http://localhost:8000".to_string());
+    let endpoint = std::env::var("PENSYVE_GATEWAY_URL")
+        .unwrap_or_else(|_| "http://localhost:8000".to_string());
     let card = pensyve_core::a2a::AgentCard::pensyve_default(&endpoint);
     Json(serde_json::to_value(card).unwrap_or_default())
 }
@@ -1558,137 +1661,34 @@ async fn a2a_task(
 ) -> Result<impl IntoResponse, RestError> {
     let ps = get_pensyve_state(&state, &auth_ctx)?;
 
+    let input = body.input.as_object().cloned().unwrap_or_default();
+
     let output = match body.capability.as_str() {
-        "memory.recall" => {
-            let query = body
-                .input
-                .get("query")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let limit = body
-                .input
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(5) as usize;
-
-            let embedder = ps.embedder.clone();
-            let query_text = query.clone();
-            let query_embedding =
-                tokio::task::spawn_blocking(move || embedder.embed(&query_text))
-                    .await
-                    .ok()
-                    .and_then(Result::ok);
-
-            let vector_index = ps.vector_index.read().await;
-            let engine = RecallEngine::new(
-                ps.storage.as_ref(),
-                &ps.embedder,
-                &vector_index,
-                &ps.retrieval_config,
-            );
-
-            match engine.recall_with_embedding(
-                &query,
-                query_embedding.as_deref(),
-                ps.namespace.id,
-                limit,
-                None,
-            ) {
-                Ok(result) => {
-                    let memories: Vec<serde_json::Value> = result
-                        .memories
-                        .iter()
-                        .map(|c| {
-                            json!({
-                                "id": c.memory_id.to_string(),
-                                "content": memory_content(&c.memory),
-                                "score": c.final_score,
-                            })
-                        })
-                        .collect();
-                    json!({"memories": memories})
-                }
-                Err(e) => {
-                    return Ok(Json(serde_json::to_value(
-                        pensyve_core::a2a::A2ATaskResponse {
-                            task_id: body.task_id,
-                            status: "failed".to_string(),
-                            output: json!({}),
-                            error: Some(format!("Recall error: {e}")),
-                        },
-                    )
-                    .unwrap_or_default()));
-                }
+        "memory.recall" => match a2a_recall(&ps, &input).await {
+            Ok(val) => val,
+            Err(e) => {
+                return Ok(Json(
+                    serde_json::to_value(pensyve_core::a2a::A2ATaskResponse {
+                        task_id: body.task_id,
+                        status: "failed".to_string(),
+                        output: json!({}),
+                        error: Some(e),
+                    })
+                    .unwrap_or_default(),
+                ));
             }
-        }
-        "memory.remember" => {
-            let entity_name = body
-                .input
-                .get("entity")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let fact = body
-                .input
-                .get("fact")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let entity = get_or_create_entity(
-                ps.storage.as_ref(),
-                &entity_name,
-                ps.namespace.id,
-                EntityKind::Agent,
-            )?;
-
-            let (predicate, object) = if let Some(pos) = fact.find(' ') {
-                (fact[..pos].to_string(), fact[pos + 1..].to_string())
-            } else {
-                ("knows".to_string(), fact.clone())
-            };
-
-            let confidence = body
-                .input
-                .get("confidence")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.8) as f32;
-
-            let mem = SemanticMemory::new(
-                ps.namespace.id,
-                entity.id,
-                predicate,
-                object,
-                confidence,
-            );
-
-            ps.storage.save_semantic(&mem).map_err(|err| {
-                RestError(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Error saving memory: {err}"),
-                )
-            })?;
-
-            json!({"memory_id": mem.id.to_string()})
-        }
+        },
+        "memory.remember" => a2a_remember(&ps, &input)?,
         "memory.forget" => {
-            let entity_name = body
-                .input
+            let entity_name = input
                 .get("entity")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
 
-            match ps
-                .storage
-                .get_entity_by_name(&entity_name, ps.namespace.id)
-            {
+            match ps.storage.get_entity_by_name(&entity_name, ps.namespace.id) {
                 Ok(Some(entity)) => {
-                    let count = ps
-                        .storage
-                        .delete_memories_by_entity(entity.id)
-                        .unwrap_or(0);
+                    let count = ps.storage.delete_memories_by_entity(entity.id).unwrap_or(0);
                     json!({"forgotten_count": count})
                 }
                 _ => json!({"forgotten_count": 0}),
