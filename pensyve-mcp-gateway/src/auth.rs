@@ -592,7 +592,10 @@ mod tests {
         let mut config = test_config(vec!["psy_testkey12345".into()]);
         config.key_user_map = vec![("psy_testkey12345".to_string(), "user_abc".to_string())];
         let validator = AuthValidator::new(&config);
-        let ctx = validator.validate("psy_testkey12345").await.expect("valid key");
+        let ctx = validator
+            .validate("psy_testkey12345")
+            .await
+            .expect("valid key");
         assert_eq!(ctx.user_id.as_deref(), Some("user_abc"));
     }
 
@@ -600,7 +603,10 @@ mod tests {
     async fn test_local_key_without_user_map() {
         let config = test_config(vec!["psy_testkey12345".into()]);
         let validator = AuthValidator::new(&config);
-        let ctx = validator.validate("psy_testkey12345").await.expect("valid key");
+        let ctx = validator
+            .validate("psy_testkey12345")
+            .await
+            .expect("valid key");
         assert!(ctx.user_id.is_none());
     }
 }
