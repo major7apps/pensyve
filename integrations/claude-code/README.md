@@ -97,6 +97,26 @@ The plugin ships pre-configured for Pensyve Cloud — once your API key is set, 
 
 No API key needed — all data stays on your machine in SQLite.
 
+## Authentication
+
+The plugin uses OAuth for authentication. When you first connect, your browser opens automatically to sign in at pensyve.com. No API key needed.
+
+### Alternative: API Key
+
+For CI or manual auth, use `claude mcp add-json` (or equivalent):
+
+```json
+{
+  "type": "http",
+  "url": "https://mcp.pensyve.com/mcp",
+  "headers": {
+    "Authorization": "Bearer ${PENSYVE_API_KEY}"
+  }
+}
+```
+
+Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
+
 ### Configure (Optional)
 
 Copy `pensyve-plugin.local.md` to your project root and edit:

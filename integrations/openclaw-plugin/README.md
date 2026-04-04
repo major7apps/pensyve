@@ -11,6 +11,17 @@ Memory plugin for OpenClaw. Replaces the default `memory-core` with Pensyve's pe
 - **Three Memory Types** -- episodic, semantic, and procedural
 - **8-Signal Fusion Retrieval** -- vector similarity + BM25 + graph traversal + cross-encoder reranker
 
+## Authentication
+
+1. Sign up at [pensyve.com](https://pensyve.com)
+2. Create an API key at [Settings → API Keys](https://pensyve.com/settings/api-keys)
+3. Set the environment variable:
+   ```bash
+   export PENSYVE_API_KEY="psy_your_key_here"
+   ```
+
+Then configure MCP with headers (see setup instructions above).
+
 ## Prerequisites
 
 You need a Pensyve server. Choose one:
