@@ -14,16 +14,28 @@ use redis::aio::ConnectionManager;
 pub async fn init() -> Option<ConnectionManager> {
     let url = std::env::var("REDIS_URL").ok()?;
     match redis::Client::open(url.as_str()) {
-        Ok(client) => match client.get_connection_manager().await {
-            Ok(mgr) => {
-                tracing::info!("Redis cache connected at {url}");
-                Some(mgr)
+        Ok(client) => {
+            // Timeout prevents hanging if Redis is unreachable (e.g., TLS mismatch).
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.get_connection_manager(),
+            )
+            .await
+            {
+                Ok(Ok(mgr)) => {
+                    tracing::info!("Redis cache connected at {url}");
+                    Some(mgr)
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Redis connection failed, caching disabled: {e}");
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!("Redis connection timed out after 5s, caching disabled");
+                    None
+                }
             }
-            Err(e) => {
-                tracing::warn!("Redis connection failed, caching disabled: {e}");
-                None
-            }
-        },
+        }
         Err(e) => {
             tracing::warn!("Invalid REDIS_URL, caching disabled: {e}");
             None
