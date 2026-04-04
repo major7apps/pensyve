@@ -5,8 +5,8 @@
 //! relevant cache entries. Gracefully falls back to no-op when Redis is
 //! unavailable.
 
-use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
+use redis::aio::ConnectionManager;
 
 /// Initialize a Redis connection manager from the `REDIS_URL` env var.
 /// Returns `None` if the variable is unset or the connection fails —
@@ -55,15 +55,14 @@ pub async fn invalidate_prefix(conn: &mut ConnectionManager, prefix: &str) {
     let pattern = format!("{prefix}*");
     let mut cursor: u64 = 0;
     loop {
-        let result: Result<(u64, Vec<String>), _> =
-            redis::cmd("SCAN")
-                .arg(cursor)
-                .arg("MATCH")
-                .arg(&pattern)
-                .arg("COUNT")
-                .arg(100)
-                .query_async(&mut conn.clone())
-                .await;
+        let result: Result<(u64, Vec<String>), _> = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(&pattern)
+            .arg("COUNT")
+            .arg(100)
+            .query_async(&mut conn.clone())
+            .await;
 
         match result {
             Ok((next_cursor, keys)) => {
