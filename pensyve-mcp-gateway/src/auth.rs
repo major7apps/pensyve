@@ -41,6 +41,8 @@ struct OAuthClaims {
 pub struct AuthValidator {
     /// Pre-hashed local keys, mapped hash -> key prefix.
     valid_key_hashes: HashMap<String, String>,
+    /// Maps key hash -> `user_id` for self-hosted namespace unification (from `PENSYVE_KEY_USER_MAP`).
+    key_user_hashes: HashMap<String, String>,
     /// Remote validation endpoint URL (set via `PENSYVE_VALIDATION_URL`).
     validation_url: Option<String>,
     /// Shared secret for gateway-to-cloud auth.
@@ -66,6 +68,12 @@ impl AuthValidator {
             valid_key_hashes.insert(hash, prefix);
         }
 
+        let mut key_user_hashes = HashMap::with_capacity(config.key_user_map.len());
+        for (key, user_id) in &config.key_user_map {
+            let hash = hash_key(key);
+            key_user_hashes.insert(hash, user_id.clone());
+        }
+
         let validation_url = std::env::var("PENSYVE_VALIDATION_URL").ok();
         let gateway_secret = std::env::var("GATEWAY_VALIDATION_SECRET").ok();
 
@@ -88,6 +96,7 @@ impl AuthValidator {
 
         Self {
             valid_key_hashes,
+            key_user_hashes,
             validation_url,
             gateway_secret,
             remote_cache: dashmap::DashMap::new(),
@@ -131,9 +140,10 @@ impl AuthValidator {
         // Check local key list (from PENSYVE_API_KEYS env var)
         let hash = hash_key(key);
         if let Some(prefix) = self.valid_key_hashes.get(&hash) {
+            let user_id = self.key_user_hashes.get(&hash).cloned();
             return Some(AuthContext {
                 key_id: prefix.clone(),
-                user_id: None,
+                user_id,
                 scope: "mcp".to_string(),
             });
         }
@@ -347,6 +357,7 @@ mod tests {
             rate_limit_per_minute: 60,
             stripe_api_key: None,
             admin_key: None,
+            key_user_map: vec![],
         }
     }
 
@@ -557,5 +568,22 @@ mod tests {
         let token = sign_jwt(&valid_claims());
         let ctx = validator.validate(&token).await.expect("valid JWT");
         assert_eq!(ctx.scope, "mcp");
+    }
+
+    #[tokio::test]
+    async fn test_local_key_with_user_map() {
+        let mut config = test_config(vec!["psy_testkey12345".into()]);
+        config.key_user_map = vec![("psy_testkey12345".to_string(), "user_abc".to_string())];
+        let validator = AuthValidator::new(&config);
+        let ctx = validator.validate("psy_testkey12345").await.expect("valid key");
+        assert_eq!(ctx.user_id.as_deref(), Some("user_abc"));
+    }
+
+    #[tokio::test]
+    async fn test_local_key_without_user_map() {
+        let config = test_config(vec!["psy_testkey12345".into()]);
+        let validator = AuthValidator::new(&config);
+        let ctx = validator.validate("psy_testkey12345").await.expect("valid key");
+        assert!(ctx.user_id.is_none());
     }
 }

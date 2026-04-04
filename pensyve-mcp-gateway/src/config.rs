@@ -15,6 +15,9 @@ pub struct GatewayConfig {
     pub stripe_api_key: Option<String>,
     /// Admin key for operational endpoints (/metrics). If unset, these endpoints are disabled.
     pub admin_key: Option<String>,
+    /// Maps API keys to user IDs for self-hosted namespace unification.
+    /// Parsed from `PENSYVE_KEY_USER_MAP` env var: `psy_key1:user_id_1,psy_key2:user_id_2`
+    pub key_user_map: Vec<(String, String)>,
 }
 
 impl GatewayConfig {
@@ -36,6 +39,24 @@ impl GatewayConfig {
             .filter(|s| !s.is_empty())
             .collect();
 
+        let key_user_map: Vec<(String, String)> = std::env::var("PENSYVE_KEY_USER_MAP")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|entry| {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    return None;
+                }
+                let mut parts = entry.splitn(2, ':');
+                let key = parts.next()?.trim().to_string();
+                let user_id = parts.next()?.trim().to_string();
+                if key.is_empty() || user_id.is_empty() {
+                    return None;
+                }
+                Some((key, user_id))
+            })
+            .collect();
+
         Self {
             host: std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
             port: std::env::var("PORT")
@@ -45,6 +66,7 @@ impl GatewayConfig {
             storage_path,
             namespace: std::env::var("PENSYVE_NAMESPACE").unwrap_or_else(|_| "default".to_string()),
             api_keys,
+            key_user_map,
             rate_limit_per_minute: std::env::var("PENSYVE_RATE_LIMIT")
                 .ok()
                 .and_then(|r| r.parse().ok())
@@ -70,6 +92,7 @@ mod tests {
             rate_limit_per_minute: 300,
             stripe_api_key: None,
             admin_key: None,
+            key_user_map: vec![],
         }
     }
 
