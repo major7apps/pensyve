@@ -65,11 +65,37 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
       - name: Deploy to ECS
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
+          # Get the current task definition (managed by OpenTofu)
+          TASK_DEF=$(aws ecs describe-services \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          # Get the full task definition JSON, update the image
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_DEF" \
+            --query 'taskDefinition' \
+            | jq --arg IMAGE "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+              'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy, .enableFaultInjection)
+               | .containerDefinitions[0].image = $IMAGE' \
+            > /tmp/task-def.json
+
+          # Register new revision with updated image (preserves all secrets/env vars from tofu)
+          NEW_TASK_DEF=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/task-def.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          # Update service to use the new revision
           aws ecs update-service \
             --cluster $ECS_CLUSTER \
             --service $ECS_SERVICE \
-            --force-new-deployment
+            --task-definition "$NEW_TASK_DEF"
 
       - name: Wait for stability
         timeout-minutes: 15
