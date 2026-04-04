@@ -1373,7 +1373,10 @@ async fn episode_end(
             ) {
                 Ok(consolidation_stats) => {
                     if consolidation_stats.promoted > 0 {
-                        tracing::info!(promoted = consolidation_stats.promoted, "Post-episode consolidation");
+                        tracing::info!(
+                            promoted = consolidation_stats.promoted,
+                            "Post-episode consolidation"
+                        );
                     }
                     let _ = storage.log_activity(
                         ns_id,
@@ -1582,7 +1585,13 @@ async fn a2a_recall(
         &ps.retrieval_config,
     );
 
-    match engine.recall_with_embedding(&query, query_embedding.as_deref(), ps.namespace.id, limit, None) {
+    match engine.recall_with_embedding(
+        &query,
+        query_embedding.as_deref(),
+        ps.namespace.id,
+        limit,
+        None,
+    ) {
         Ok(result) => {
             let memories: Vec<serde_json::Value> = result
                 .memories
