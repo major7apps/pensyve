@@ -19,6 +19,8 @@ pub struct AuthContext {
     pub key_id: String,
     pub user_id: Option<String>,
     pub scope: String,
+    pub stripe_customer_id: Option<String>,
+    pub plan: String,
 }
 
 /// JWT claims from an OAuth access token issued by pensyve.com.
@@ -133,6 +135,8 @@ impl AuthValidator {
             key_id: format!("oauth:{}", &token_data.claims.client_id),
             user_id: Some(token_data.claims.sub),
             scope: token_data.claims.scope.unwrap_or_else(|| "mcp".to_string()),
+            stripe_customer_id: None,
+            plan: "free".to_string(),
         })
     }
 
@@ -145,6 +149,8 @@ impl AuthValidator {
                 key_id: prefix.clone(),
                 user_id,
                 scope: "mcp".to_string(),
+                stripe_customer_id: None,
+                plan: "free".to_string(),
             });
         }
 
@@ -198,6 +204,15 @@ impl AuthValidator {
                     .get("scope")
                     .and_then(|v| v.as_str())
                     .unwrap_or("mcp")
+                    .to_string(),
+                stripe_customer_id: body
+                    .get("stripeCustomerId")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                plan: body
+                    .get("plan")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("free")
                     .to_string(),
             };
 
@@ -292,6 +307,8 @@ where
                     key_id: "dev".to_string(),
                     user_id: None,
                     scope: "mcp".to_string(),
+                    stripe_customer_id: None,
+                    plan: "free".to_string(),
                 });
                 return inner.call(req).await;
             }
