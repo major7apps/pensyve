@@ -217,11 +217,14 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         StreamableHttpService::new(
             move || {
                 let tenant_id = CURRENT_TENANT.try_with(Clone::clone).ok().flatten();
+                let scope = CURRENT_SCOPE
+                    .try_with(Clone::clone)
+                    .unwrap_or_else(|_| "mcp".to_string());
                 let pensyve_state = match tenant_id {
                     Some(id) => state_for_factory.tenant_mgr.get_tenant_state(&id)?,
                     None => state_for_factory.tenant_mgr.default_state(),
                 };
-                Ok(PensyveMcpServer::new(pensyve_state))
+                Ok(PensyveMcpServer::with_scope(pensyve_state, scope))
             },
             Arc::default(),
             {
@@ -427,6 +430,7 @@ async fn metrics_handler(
 // across .await thread migrations in tokio's multi-threaded runtime.
 tokio::task_local! {
     static CURRENT_TENANT: Option<String>;
+    static CURRENT_SCOPE: String;
 }
 
 /// Axum middleware that:
@@ -443,9 +447,16 @@ async fn tenant_and_usage_middleware(
     let tenant_id = auth_ctx
         .as_ref()
         .map(|ctx| ctx.user_id.as_deref().unwrap_or(&ctx.key_id).to_string());
+    let scope = auth_ctx
+        .as_ref()
+        .map_or_else(|| "mcp".to_string(), |ctx| ctx.scope.clone());
     let is_mcp = req.uri().path().starts_with("/mcp");
 
-    let response = CURRENT_TENANT.scope(tenant_id, next.run(req)).await;
+    let response = CURRENT_SCOPE
+        .scope(scope, async {
+            CURRENT_TENANT.scope(tenant_id, next.run(req)).await
+        })
+        .await;
 
     // Report usage for successful MCP requests.
     if is_mcp

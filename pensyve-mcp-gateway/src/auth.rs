@@ -18,6 +18,7 @@ use crate::config::GatewayConfig;
 pub struct AuthContext {
     pub key_id: String,
     pub user_id: Option<String>,
+    pub scope: String,
 }
 
 /// JWT claims from an OAuth access token issued by pensyve.com.
@@ -26,6 +27,7 @@ struct OAuthClaims {
     sub: String,
     #[serde(default)]
     client_id: String,
+    scope: Option<String>,
 }
 
 /// Validates `psy_` API keys via local hash lookup or remote validation endpoint,
@@ -121,6 +123,7 @@ impl AuthValidator {
         Some(AuthContext {
             key_id: format!("oauth:{}", &token_data.claims.client_id),
             user_id: Some(token_data.claims.sub),
+            scope: token_data.claims.scope.unwrap_or_else(|| "mcp".to_string()),
         })
     }
 
@@ -131,6 +134,7 @@ impl AuthValidator {
             return Some(AuthContext {
                 key_id: prefix.clone(),
                 user_id: None,
+                scope: "mcp".to_string(),
             });
         }
 
@@ -180,6 +184,11 @@ impl AuthValidator {
                     .get("userId")
                     .and_then(|v| v.as_str())
                     .map(String::from),
+                scope: body
+                    .get("scope")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("mcp")
+                    .to_string(),
             };
 
             // Cache for 1 hour — remote validation is the #1 latency source.
@@ -272,6 +281,7 @@ where
                 req.extensions_mut().insert(AuthContext {
                     key_id: "dev".to_string(),
                     user_id: None,
+                    scope: "mcp".to_string(),
                 });
                 return inner.call(req).await;
             }
@@ -395,6 +405,8 @@ mod tests {
         aud: String,
         exp: u64,
         iat: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
     }
 
     /// Helper: build an AuthValidator with JWT support using the test key pair.
@@ -429,6 +441,7 @@ mod tests {
             aud: "https://mcp.pensyve.com".to_string(),
             iat: now,
             exp: now + 3600,
+            scope: Some("mcp".to_string()),
         }
     }
 
@@ -526,5 +539,23 @@ mod tests {
             validator.validate("psy_not_a_real_key").await.is_none(),
             "invalid psy_ key should be rejected even with JWT configured"
         );
+    }
+
+    #[tokio::test]
+    async fn test_local_api_key_gets_default_mcp_scope() {
+        let validator = AuthValidator::new(&test_config(vec!["psy_testkey12345".into()]));
+        let ctx = validator
+            .validate("psy_testkey12345")
+            .await
+            .expect("valid key");
+        assert_eq!(ctx.scope, "mcp");
+    }
+
+    #[tokio::test]
+    async fn test_jwt_extracts_scope() {
+        let validator = validator_with_jwt(vec![]);
+        let token = sign_jwt(&valid_claims());
+        let ctx = validator.validate(&token).await.expect("valid JWT");
+        assert_eq!(ctx.scope, "mcp");
     }
 }

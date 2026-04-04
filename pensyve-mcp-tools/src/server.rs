@@ -63,16 +63,47 @@ fn get_or_create_entity(
 
 pub struct PensyveMcpServer {
     pub state: Arc<PensyveState>,
+    pub scope: String,
     tool_router: ToolRouter<Self>,
 }
 
 impl PensyveMcpServer {
-    /// Create a new server with the given state.
+    /// Create a new server with the given state and default `mcp` scope.
     pub fn new(state: Arc<PensyveState>) -> Self {
+        Self::with_scope(state, "mcp".to_string())
+    }
+
+    /// Create a new server with an explicit scope for tool-level access control.
+    pub fn with_scope(state: Arc<PensyveState>, scope: String) -> Self {
         Self {
             state,
+            scope,
             tool_router: Self::tool_router(),
         }
+    }
+}
+
+const READ_TOOLS: &[&str] = &[
+    "pensyve_recall",
+    "pensyve_inspect",
+    "pensyve_status",
+    "pensyve_account",
+];
+
+pub fn check_scope(scope: &str, tool_name: &str) -> Result<(), String> {
+    if scope == "mcp" {
+        return Ok(());
+    }
+    let is_read_tool = READ_TOOLS.contains(&tool_name);
+    match (scope, is_read_tool) {
+        ("mcp:read", true) | ("mcp:write", false) => Ok(()),
+        ("mcp:read", false) => Err(format!(
+            "Insufficient scope: {tool_name} requires mcp:write, key has mcp:read"
+        )),
+        ("mcp:write", true) => Err(format!(
+            "Insufficient scope: {tool_name} requires mcp:read, key has mcp:write"
+        )),
+        _ => Err(format!("Unknown scope: {scope}")),
     }
 }
 
@@ -84,6 +115,7 @@ impl PensyveMcpServer {
         description = "Search memories by semantic similarity and text matching. Returns ranked results from episodic, semantic, and procedural memory."
     )]
     async fn recall(&self, Parameters(params): Parameters<RecallParams>) -> Result<String, String> {
+        check_scope(&self.scope, "pensyve_recall")?;
         if params.query.len() > 4096 {
             return Err("Query too long (max 4096 bytes)".to_string());
         }
@@ -178,6 +210,7 @@ impl PensyveMcpServer {
         &self,
         Parameters(params): Parameters<RememberParams>,
     ) -> Result<String, String> {
+        check_scope(&self.scope, "pensyve_remember")?;
         if params.fact.len() > 32768 {
             return Err("Fact too long (max 32768 bytes)".to_string());
         }
@@ -244,6 +277,7 @@ impl PensyveMcpServer {
         &self,
         Parameters(params): Parameters<EpisodeStartParams>,
     ) -> Result<String, String> {
+        check_scope(&self.scope, "pensyve_episode_start")?;
         let state = &self.state;
 
         let mut participant_ids: Vec<Uuid> = Vec::new();
@@ -281,6 +315,7 @@ impl PensyveMcpServer {
         &self,
         Parameters(params): Parameters<EpisodeEndParams>,
     ) -> Result<String, String> {
+        check_scope(&self.scope, "pensyve_episode_end")?;
         let state = &self.state;
 
         let episode_id = params
@@ -379,6 +414,7 @@ impl PensyveMcpServer {
         &self,
         Parameters(params): Parameters<ObserveParams>,
     ) -> Result<String, String> {
+        check_scope(&self.scope, "pensyve_observe")?;
         // Validate input lengths.
         if params.content.len() > 32768 {
             return Err("Content too long (max 32768 bytes)".to_string());
@@ -481,6 +517,7 @@ impl PensyveMcpServer {
         description = "Delete all memories associated with an entity. Returns the count of forgotten memories."
     )]
     async fn forget(&self, Parameters(params): Parameters<ForgetParams>) -> Result<String, String> {
+        check_scope(&self.scope, "pensyve_forget")?;
         let state = &self.state;
 
         let entity = match state
@@ -544,6 +581,7 @@ impl PensyveMcpServer {
         &self,
         Parameters(params): Parameters<InspectParams>,
     ) -> Result<String, String> {
+        check_scope(&self.scope, "pensyve_inspect")?;
         let state = &self.state;
         let limit = params.limit.unwrap_or(20).clamp(1, 100) as usize;
 
@@ -615,6 +653,7 @@ impl PensyveMcpServer {
         description = "Get connection status, namespace info, and memory statistics. Free — not metered."
     )]
     async fn status(&self, Parameters(params): Parameters<StatusParams>) -> Result<String, String> {
+        check_scope(&self.scope, "pensyve_status")?;
         let state = &self.state;
         let ns = &state.namespace;
 
@@ -676,6 +715,7 @@ impl PensyveMcpServer {
         &self,
         Parameters(_params): Parameters<AccountParams>,
     ) -> Result<String, String> {
+        check_scope(&self.scope, "pensyve_account")?;
         let state = &self.state;
 
         if !state.is_remote {
@@ -709,5 +749,45 @@ impl ServerHandler for PensyveMcpServer {
                 Use pensyve_recall to search memories, pensyve_remember to store facts, \
                 and pensyve_episode_start/end to track interactions.",
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_check_scope_mcp_allows_everything() {
+        assert!(check_scope("mcp", "pensyve_recall").is_ok());
+        assert!(check_scope("mcp", "pensyve_remember").is_ok());
+    }
+
+    #[test]
+    fn test_check_scope_read_allows_read_tools() {
+        assert!(check_scope("mcp:read", "pensyve_recall").is_ok());
+        assert!(check_scope("mcp:read", "pensyve_inspect").is_ok());
+        assert!(check_scope("mcp:read", "pensyve_status").is_ok());
+        assert!(check_scope("mcp:read", "pensyve_account").is_ok());
+    }
+
+    #[test]
+    fn test_check_scope_read_denies_write_tools() {
+        assert!(check_scope("mcp:read", "pensyve_remember").is_err());
+        assert!(check_scope("mcp:read", "pensyve_forget").is_err());
+        assert!(check_scope("mcp:read", "pensyve_episode_start").is_err());
+        assert!(check_scope("mcp:read", "pensyve_episode_end").is_err());
+        assert!(check_scope("mcp:read", "pensyve_observe").is_err());
+    }
+
+    #[test]
+    fn test_check_scope_write_allows_write_tools() {
+        assert!(check_scope("mcp:write", "pensyve_remember").is_ok());
+        assert!(check_scope("mcp:write", "pensyve_forget").is_ok());
+    }
+
+    #[test]
+    fn test_check_scope_write_denies_read_tools() {
+        assert!(check_scope("mcp:write", "pensyve_recall").is_err());
+        assert!(check_scope("mcp:write", "pensyve_inspect").is_err());
     }
 }
