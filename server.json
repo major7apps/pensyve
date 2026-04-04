@@ -1,0 +1,67 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.major7apps/pensyve",
+  "title": "Pensyve",
+  "description": "Universal memory runtime for AI agents — episodic, semantic, and procedural memory.",
+  "version": "1.0.4",
+  "repository": {
+    "url": "https://github.com/major7apps/pensyve",
+    "source": "github"
+  },
+  "websiteUrl": "https://pensyve.com",
+  "license": "Apache-2.0",
+  "runtime": {
+    "type": "http",
+    "url": "https://mcp.pensyve.com/mcp",
+    "transport": "streamable-http",
+    "authentication": {
+      "type": "bearer",
+      "environmentVariable": "PENSYVE_API_KEY"
+    }
+  },
+  "tools": [
+    {
+      "name": "pensyve_recall",
+      "description": "Search memories using hybrid semantic + BM25 fusion with RRF ranking"
+    },
+    {
+      "name": "pensyve_remember",
+      "description": "Store a fact about a named entity as semantic memory"
+    },
+    {
+      "name": "pensyve_episode_start",
+      "description": "Begin tracking an interaction episode with named participants"
+    },
+    {
+      "name": "pensyve_episode_end",
+      "description": "Close an episode and extract memories"
+    },
+    {
+      "name": "pensyve_forget",
+      "description": "Delete all memories for an entity"
+    },
+    {
+      "name": "pensyve_inspect",
+      "description": "List all memories stored for an entity"
+    },
+    {
+      "name": "pensyve_status",
+      "description": "Namespace info, memory counts, and connection health"
+    },
+    {
+      "name": "pensyve_account",
+      "description": "Plan, usage, and quota information"
+    }
+  ],
+  "tags": [
+    "memory",
+    "agents",
+    "semantic-search",
+    "episodic-memory",
+    "knowledge-graph",
+    "spaced-repetition",
+    "embeddings",
+    "rust",
+    "offline-first"
+  ]
+}
