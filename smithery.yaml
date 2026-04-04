@@ -1,0 +1,23 @@
+# Smithery configuration — https://smithery.ai/docs/build/project-config/smithery-yaml
+# Pensyve: Universal memory runtime for AI agents
+#
+# Primary interface: Remote MCP server (Streamable HTTP)
+#   Endpoint: https://mcp.pensyve.com/mcp
+#   Auth: API key (psy_ prefix) via PENSYVE_API_KEY env var
+#   Sign up: https://pensyve.com
+#
+# Local fallback: cargo install pensyve-mcp (stdio, offline, Apache-2.0)
+
+startCommand:
+  type: http
+  configSchema:
+    type: object
+    required:
+      - pensyveApiKey
+    properties:
+      pensyveApiKey:
+        type: string
+        description: "Pensyve API key (starts with psy_). Get one at pensyve.com/settings/api-keys"
+  url: "https://mcp.pensyve.com/mcp"
+  headers:
+    Authorization: "Bearer ${pensyveApiKey}"
