@@ -4,6 +4,17 @@ Persistent AI memory for VS Code's built-in Copilot Chat MCP support.
 
 > For the standalone Pensyve sidebar extension, see `integrations/vscode/`.
 
+## Authentication
+
+1. Sign up at [pensyve.com](https://pensyve.com)
+2. Create an API key at [Settings → API Keys](https://pensyve.com/settings/api-keys)
+3. Set the environment variable:
+   ```bash
+   export PENSYVE_API_KEY="psy_your_key_here"
+   ```
+
+Then configure MCP with headers (see setup instructions above).
+
 ## Setup
 
 Set your API key (get one at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys)):

@@ -2,6 +2,17 @@
 
 Persistent AI memory for [Cursor](https://cursor.sh) via MCP.
 
+## Authentication
+
+1. Sign up at [pensyve.com](https://pensyve.com)
+2. Create an API key at [Settings → API Keys](https://pensyve.com/settings/api-keys)
+3. Set the environment variable:
+   ```bash
+   export PENSYVE_API_KEY="psy_your_key_here"
+   ```
+
+Then configure MCP with headers (see setup instructions above).
+
 ## Setup
 
 Set your API key (get one at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys)):

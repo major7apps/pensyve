@@ -71,6 +71,26 @@ Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
 
 Get an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
 
+## Authentication
+
+The plugin uses OAuth for authentication. When you first connect, your browser opens automatically to sign in at pensyve.com. No API key needed.
+
+### Alternative: API Key
+
+For CI or manual auth, use `claude mcp add-json` (or equivalent):
+
+```json
+{
+  "type": "http",
+  "url": "https://mcp.pensyve.com/mcp",
+  "headers": {
+    "Authorization": "Bearer ${PENSYVE_API_KEY}"
+  }
+}
+```
+
+Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
+
 ## Skills
 
 | Skill                      | When to Use                     | What It Does                                                                                                                                        |

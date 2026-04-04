@@ -4,6 +4,21 @@ Drop-in Pensyve memory backend for LangGraph agents. Implements the same
 `put` / `get` / `search` / `delete` interface as LangGraph's `InMemoryStore`,
 backed by Pensyve's 8-signal fusion retrieval engine.
 
+## Authentication
+
+```python
+from pensyve import PensyveClient
+
+# Explicit API key
+client = PensyveClient(api_key="psy_your_key_here")
+
+# Or from environment variable
+# export PENSYVE_API_KEY="psy_your_key_here"
+client = PensyveClient()
+```
+
+Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
+
 ## Installation
 
 ```bash
