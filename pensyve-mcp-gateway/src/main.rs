@@ -465,7 +465,7 @@ async fn tenant_and_usage_middleware(
     {
         state.usage_reporter.report(usage::UsageEvent {
             key_id: ctx.key_id,
-            stripe_customer_id: ctx.user_id,
+            stripe_customer_id: ctx.stripe_customer_id,
             tier: usage::OperationTier::Standard,
             count: 1,
         });
