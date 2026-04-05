@@ -24,10 +24,10 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 _DEFAULT_OUTPUT_DIR = _SCRIPT_DIR / "data"
 
 # HuggingFace dataset coordinates.
-_HF_REPO_ID = "leowei/LongMemEval"
-_HF_FILENAME = "longmemeval_s.json"
+_HF_REPO_ID = "xiaowu0162/longmemeval"
+_HF_FILENAME = "longmemeval_s"
 # Fallback: the cleaned version may live under a different name.
-_HF_FILENAME_ALT = "longmemeval_s_cleaned.json"
+_HF_FILENAME_ALT = "longmemeval_s.json"
 
 # Difficulty mapping based on question_type.
 _DIFFICULTY_MAP: dict[str, str] = {
