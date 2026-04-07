@@ -1,6 +1,6 @@
 [project]
 name = "pensyve-crewai"
-version = "1.0.4"
+version = "1.0.5"
 description = "Pensyve memory backend for CrewAI"
 requires-python = ">=3.10"
 license = "Apache-2.0"

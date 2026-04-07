@@ -2,7 +2,7 @@
   "name": "pensyve-vscode",
   "displayName": "Pensyve",
   "description": "Universal memory runtime for AI agents — recall, remember, and inspect memories from VS Code",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "publisher": "major7apps",
   "engines": {
     "vscode": "^1.85.0"
