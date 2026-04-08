@@ -98,7 +98,14 @@ impl SqliteBackend {
         for stmt in &[
             "ALTER TABLE episodic_memories ADD COLUMN salience REAL DEFAULT 0.5",
             "ALTER TABLE episodic_memories ADD COLUMN storage_strength REAL DEFAULT 0.0",
-            "ALTER TABLE episodic_memories ADD COLUMN event_time REAL",
+            // Migration v3: `event_time` was originally added as REAL but
+            // the schema is inconsistent with `timestamp` (TEXT, RFC3339).
+            // Pensyve benchmark sprint Phase V (2026-04-08) identified the
+            // REAL column as dead code — never written, never read. Drop
+            // and re-add as TEXT so save_episodic/row_to_episodic can
+            // write/read RFC3339 strings matching the rest of the schema.
+            "ALTER TABLE episodic_memories DROP COLUMN event_time",
+            "ALTER TABLE episodic_memories ADD COLUMN event_time TEXT",
             "ALTER TABLE episodic_memories ADD COLUMN superseded_by TEXT",
             "ALTER TABLE edges ADD COLUMN edge_type TEXT DEFAULT 'ENTITY'",
             "ALTER TABLE edges ADD COLUMN confidence REAL DEFAULT 1.0",
@@ -638,8 +645,8 @@ impl StorageTrait for SqliteBackend {
             r"INSERT OR REPLACE INTO episodic_memories
                (id, namespace_id, episode_id, source_entity, about_entity, content, content_type,
                 summary, embedding, context_intent, timestamp, stability, retrievability,
-                access_count, last_accessed)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                access_count, last_accessed, event_time)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 mem.id.to_string(),
                 mem.namespace_id.to_string(),
@@ -656,6 +663,7 @@ impl StorageTrait for SqliteBackend {
                 f64::from(mem.retrievability),
                 mem.access_count,
                 last_accessed,
+                opt_dt_to_str(mem.event_time),
             ],
         )?;
 
@@ -679,7 +687,7 @@ impl StorageTrait for SqliteBackend {
             .query_row(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           content_type, summary, embedding, context_intent, timestamp,
-                          stability, retrievability, access_count, last_accessed
+                          stability, retrievability, access_count, last_accessed, event_time
                    FROM episodic_memories WHERE id = ?1",
                 params![id.to_string()],
                 row_to_episodic,
@@ -697,7 +705,7 @@ impl StorageTrait for SqliteBackend {
         let mut stmt = conn.prepare(
             r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                       content_type, summary, embedding, context_intent, timestamp,
-                      stability, retrievability, access_count, last_accessed
+                      stability, retrievability, access_count, last_accessed, event_time
                FROM episodic_memories WHERE about_entity = ?1
                ORDER BY timestamp DESC LIMIT ?2",
         )?;
@@ -999,7 +1007,7 @@ impl StorageTrait for SqliteBackend {
                         .query_row(
                             r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                                       content_type, summary, embedding, context_intent, timestamp,
-                                      stability, retrievability, access_count, last_accessed
+                                      stability, retrievability, access_count, last_accessed, event_time
                                FROM episodic_memories WHERE id = ?1",
                             params![id.to_string()],
                             row_to_episodic,
@@ -1058,7 +1066,7 @@ impl StorageTrait for SqliteBackend {
             let mut stmt = conn.prepare(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           content_type, summary, embedding, context_intent, timestamp,
-                          stability, retrievability, access_count, last_accessed
+                          stability, retrievability, access_count, last_accessed, event_time
                    FROM episodic_memories WHERE namespace_id = ?1",
             )?;
             let rows = stmt.query_map(params![&ns_str], row_to_episodic)?;
@@ -1601,6 +1609,7 @@ fn row_to_episodic(
     let retrievability: f64 = row.get(12)?;
     let access_count: u32 = row.get(13)?;
     let last_accessed_str: Option<String> = row.get(14)?;
+    let event_time_str: Option<String> = row.get(15)?;
 
     let id = match parse_uuid(&id_str) {
         Ok(v) => v,
@@ -1644,7 +1653,11 @@ fn row_to_episodic(
         last_accessed: str_to_opt_dt(last_accessed_str.as_deref()),
         salience: 0.5,
         storage_strength: 0.0,
-        event_time: None,
+        // Phase V benchmark sprint fix: read event_time from the DB
+        // via the existing str_to_opt_dt helper. Was hardcoded None
+        // in v1.0.5 and earlier, see
+        // pensyve-docs/research/benchmark-sprint/06-phase-v-verification.md.
+        event_time: str_to_opt_dt(event_time_str.as_deref()),
         superseded_by: None,
     }))
 }
