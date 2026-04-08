@@ -1966,6 +1966,96 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // event_time tests
+    //
+    // Phase V of the benchmark sprint
+    // (pensyve-docs/research/benchmark-sprint/06-phase-v-verification.md)
+    // found event_time was structurally dead: save_episodic's INSERT did
+    // not write the column, and row_to_episodic hardcoded None on read.
+    // These tests pin the round-trip invariant through the sqlite backend.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_episodic_event_time_roundtrip() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+
+        let when = DateTime::parse_from_rfc3339("2023-03-04T08:09:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut mem = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "I received the crystal chandelier from my aunt",
+        );
+        mem.event_time = Some(when);
+
+        db.save_episodic(&mem).unwrap();
+        let fetched = db.get_episodic(mem.id).unwrap().unwrap();
+        assert_eq!(
+            fetched.event_time,
+            Some(when),
+            "event_time must round-trip through save_episodic/get_episodic"
+        );
+    }
+
+    #[test]
+    fn test_episodic_event_time_null_roundtrip() {
+        // Regression guard: the None path must not silently become
+        // Some(Utc::now()) or Some(default) after the fix lands.
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+
+        let mem = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "no timestamp on this memory",
+        );
+        assert!(mem.event_time.is_none(), "EpisodicMemory::new default must be None");
+
+        db.save_episodic(&mem).unwrap();
+        let fetched = db.get_episodic(mem.id).unwrap().unwrap();
+        assert!(
+            fetched.event_time.is_none(),
+            "event_time must stay None through save/get when not set at construction"
+        );
+    }
+
+    #[test]
+    fn test_list_episodic_by_entity_preserves_event_time() {
+        // list_episodic_by_entity has its own SELECT statement separate
+        // from get_episodic — must also read event_time.
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let about = Uuid::new_v4();
+
+        let when = DateTime::parse_from_rfc3339("2024-06-03T10:15:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut mem = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            about,
+            "a dated event",
+        );
+        mem.event_time = Some(when);
+        db.save_episodic(&mem).unwrap();
+
+        let results = db.list_episodic_by_entity(about, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].event_time,
+            Some(when),
+            "list_episodic_by_entity must read event_time from the DB"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Semantic Memory tests
     // -----------------------------------------------------------------------
 
