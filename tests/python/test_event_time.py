@@ -13,8 +13,9 @@ through storage to Memory.event_time on recall.
 import tempfile
 from datetime import datetime, timedelta, timezone
 
-import pensyve
 import pytest
+
+import pensyve
 
 
 def _open_pensyve(path):
@@ -40,7 +41,7 @@ def test_message_with_when_persists_event_time():
     m = results[0]
     assert m.event_time is not None, (
         "event_time must persist from the `when` kwarg, "
-        f"got None (Phase V finding — the write/read path is dead)"
+        "got None (Phase V finding — the write/read path is dead)"
     )
     assert "2023-03-04" in m.event_time, (
         f"expected 2023-03-04 somewhere in event_time, got {m.event_time!r}"
@@ -75,9 +76,8 @@ def test_message_invalid_when_raises():
     """An unparseable `when` string must raise at the call site."""
     with tempfile.TemporaryDirectory() as d:
         p, user, agent = _open_pensyve(d)
-        with p.episode(user, agent) as ep:
-            with pytest.raises((ValueError, RuntimeError)) as exc_info:
-                ep.message("user", "bad date", when="definitely-not-rfc3339")
+        with p.episode(user, agent) as ep, pytest.raises((ValueError, RuntimeError)) as exc_info:
+            ep.message("user", "bad date", when="definitely-not-rfc3339")
     msg = str(exc_info.value).lower()
     assert any(
         kw in msg for kw in ("when", "rfc3339", "parse", "date", "timestamp")
