@@ -142,7 +142,9 @@ pub fn is_billable_path(path: &str) -> bool {
     if !path.starts_with("/v1/") {
         return false;
     }
-    !DENY.iter().any(|p| path == *p || path.starts_with(&format!("{p}/")))
+    !DENY
+        .iter()
+        .any(|p| path == *p || path.starts_with(&format!("{p}/")))
 }
 
 #[cfg(test)]
@@ -184,13 +186,19 @@ mod tests {
     fn period_key_format() {
         let dt = Utc.with_ymd_and_hms(2026, 4, 8, 12, 0, 0).single().unwrap();
         assert_eq!(period_key(&dt), "2026-04");
-        let dt2 = Utc.with_ymd_and_hms(2026, 12, 31, 23, 59, 59).single().unwrap();
+        let dt2 = Utc
+            .with_ymd_and_hms(2026, 12, 31, 23, 59, 59)
+            .single()
+            .unwrap();
         assert_eq!(period_key(&dt2), "2026-12");
     }
 
     #[test]
     fn month_bounds_wrap_year() {
-        let dec = Utc.with_ymd_and_hms(2026, 12, 15, 12, 0, 0).single().unwrap();
+        let dec = Utc
+            .with_ymd_and_hms(2026, 12, 15, 12, 0, 0)
+            .single()
+            .unwrap();
         let (start, end) = current_month_bounds(&dec);
         assert_eq!(start.year(), 2026);
         assert_eq!(start.month(), 12);
