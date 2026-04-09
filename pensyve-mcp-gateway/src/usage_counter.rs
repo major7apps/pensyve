@@ -11,8 +11,8 @@
 //! Resets on gateway restart. For multi-instance or persistent deployments,
 //! replace with a Redis-backed counter (the read/write contract is identical).
 //!
-//! **Period**: calendar month in UTC. Counters are keyed by (user_id, YYYY-MM,
-//! tier) so a new month automatically starts a fresh counter slot.
+//! **Period**: calendar month in UTC. Counters are keyed by (`user_id`,
+//! `YYYY-MM`, tier) so a new month automatically starts a fresh counter slot.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -122,6 +122,18 @@ fn current_month_bounds(dt: &DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
     (start, end)
 }
 
+/// REST endpoints that do *not* count as billable operations — read-only and
+/// metadata routes that the dashboard polls or that report on the system.
+const NON_BILLABLE_REST_PATHS: &[&str] = &[
+    "/v1/health",
+    "/v1/stats",
+    "/v1/activity",
+    "/v1/activity/recent",
+    "/v1/usage",
+    "/v1/a2a/agent-card",
+    "/v1/feedback",
+];
+
 /// True if a request path should count toward usage quota. Excludes read-only
 /// and bookkeeping endpoints (health, stats, activity, usage itself).
 pub fn is_billable_path(path: &str) -> bool {
@@ -129,20 +141,10 @@ pub fn is_billable_path(path: &str) -> bool {
     if path.starts_with("/mcp") {
         return true;
     }
-    // REST — explicit denylist for read-only and metadata endpoints.
-    const DENY: &[&str] = &[
-        "/v1/health",
-        "/v1/stats",
-        "/v1/activity",
-        "/v1/activity/recent",
-        "/v1/usage",
-        "/v1/a2a/agent-card",
-        "/v1/feedback",
-    ];
     if !path.starts_with("/v1/") {
         return false;
     }
-    !DENY
+    !NON_BILLABLE_REST_PATHS
         .iter()
         .any(|p| path == *p || path.starts_with(&format!("{p}/")))
 }
