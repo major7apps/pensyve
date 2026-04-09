@@ -24,7 +24,7 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 dirs = "6"
 regex = "1"
-fastembed = "^5.12"
+fastembed = "^5.13"
 petgraph = "0.8"
 dashmap = "6"
 rayon = "1.10"
