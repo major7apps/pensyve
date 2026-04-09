@@ -98,20 +98,43 @@ impl SqliteBackend {
         for stmt in &[
             "ALTER TABLE episodic_memories ADD COLUMN salience REAL DEFAULT 0.5",
             "ALTER TABLE episodic_memories ADD COLUMN storage_strength REAL DEFAULT 0.0",
-            // Migration v3: `event_time` was originally added as REAL but
-            // the schema is inconsistent with `timestamp` (TEXT, RFC3339).
-            // Pensyve benchmark sprint Phase V (2026-04-08) identified the
-            // REAL column as dead code — never written, never read. Drop
-            // and re-add as TEXT so save_episodic/row_to_episodic can
-            // write/read RFC3339 strings matching the rest of the schema.
-            "ALTER TABLE episodic_memories DROP COLUMN event_time",
-            "ALTER TABLE episodic_memories ADD COLUMN event_time TEXT",
             "ALTER TABLE episodic_memories ADD COLUMN superseded_by TEXT",
             "ALTER TABLE edges ADD COLUMN edge_type TEXT DEFAULT 'ENTITY'",
             "ALTER TABLE edges ADD COLUMN confidence REAL DEFAULT 1.0",
             "ALTER TABLE edges ADD COLUMN half_life_days REAL DEFAULT 90.0",
         ] {
             let _ = conn.execute(stmt, []);
+        }
+
+        // Migration v3: `event_time` was originally added as REAL in v2 but
+        // was never written or read (dead code). Convert to TEXT (RFC3339)
+        // to match the `timestamp` column's storage format. This is a
+        // one-time migration: once the column is TEXT, subsequent opens
+        // skip the destructive DROP.
+        {
+            let is_real = conn
+                .prepare("PRAGMA table_info(episodic_memories)")?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })?
+                .filter_map(Result::ok)
+                .any(|(name, typ)| name == "event_time" && typ.eq_ignore_ascii_case("REAL"));
+            if is_real {
+                // Column exists as REAL from v2 migration — drop and recreate as TEXT.
+                conn.execute("ALTER TABLE episodic_memories DROP COLUMN event_time", [])?;
+                conn.execute(
+                    "ALTER TABLE episodic_memories ADD COLUMN event_time TEXT",
+                    [],
+                )?;
+            } else if !Self::column_exists(conn, "episodic_memories", "event_time")? {
+                // Fresh DB (no v2 migration ran) or column was already dropped —
+                // add as TEXT directly.
+                conn.execute(
+                    "ALTER TABLE episodic_memories ADD COLUMN event_time TEXT",
+                    [],
+                )?;
+            }
+            // If column already exists as TEXT, do nothing — migration complete.
         }
 
         Ok(())
@@ -2028,7 +2051,10 @@ mod tests {
             Uuid::new_v4(),
             "no timestamp on this memory",
         );
-        assert!(mem.event_time.is_none(), "EpisodicMemory::new default must be None");
+        assert!(
+            mem.event_time.is_none(),
+            "EpisodicMemory::new default must be None"
+        );
 
         db.save_episodic(&mem).unwrap();
         let fetched = db.get_episodic(mem.id).unwrap().unwrap();
