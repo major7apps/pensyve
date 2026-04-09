@@ -824,11 +824,9 @@ async fn stats(
 
 /// Return current-period usage (calendar month UTC) for the authenticated user.
 ///
-/// Reads from the gateway's in-memory `UsageCounter`, which is incremented by
-/// the `tenant_and_usage_middleware` on every successful billable request.
-/// This endpoint is the dashboard's source of truth for "Usage This Period" —
-/// it works for both free-tier and paying users, unlike the Stripe meter
-/// pipeline which only applies to paying customers.
+/// When Neon is configured, reads from the `usage_counters` table
+/// (authoritative, persistent across deploys). Falls back to the in-memory
+/// `DashMap` when the DB is unreachable or unconfigured.
 async fn usage_summary(
     State(state): State<Arc<AppState>>,
     axum::Extension(auth_ctx): axum::Extension<AuthContext>,
@@ -836,7 +834,7 @@ async fn usage_summary(
     // Prefer user_id (JWT flow) so the dashboard and MCP clients share
     // counts; fall back to key_id for API-key-only authenticated requests.
     let counter_key = auth_ctx.user_id.as_deref().unwrap_or(&auth_ctx.key_id);
-    let summary = state.usage_counter.get_summary(counter_key);
+    let summary = state.usage_counter.get_summary(counter_key).await;
     Ok(Json(summary))
 }
 

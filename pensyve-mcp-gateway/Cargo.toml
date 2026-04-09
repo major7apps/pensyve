@@ -32,6 +32,8 @@ jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 dirs = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+sqlx-core = { version = "0.8.6", features = ["_rt-tokio", "_tls-rustls-aws-lc-rs"] }
+sqlx-postgres = { version = "0.8.6" }
 
 [dev-dependencies]
 tempfile = "3"

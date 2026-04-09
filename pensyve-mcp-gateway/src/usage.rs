@@ -11,6 +11,25 @@ pub enum OperationTier {
 }
 
 impl OperationTier {
+    /// Short lowercase name used as the DB value in `usage_counters.tier`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Multimodal => "multimodal",
+            Self::Extraction => "extraction",
+        }
+    }
+
+    /// Parse from the DB tier column. Returns `None` on unrecognised values.
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "standard" => Some(Self::Standard),
+            "multimodal" => Some(Self::Multimodal),
+            "extraction" => Some(Self::Extraction),
+            _ => None,
+        }
+    }
+
     fn event_name(self) -> &'static str {
         match self {
             Self::Standard => "pensyve_operation",

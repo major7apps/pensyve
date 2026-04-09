@@ -200,12 +200,38 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
 
     let redis = cache::init().await;
 
+    // Usage counter — Neon-persisted when DATABASE_URL is set (production),
+    // DashMap-only otherwise (local dev with SQLite backend).
+    let usage_counter = match std::env::var("DATABASE_URL") {
+        Ok(url) if url.starts_with("postgres") => {
+            tracing::info!("Usage counter: connecting to Neon for persistent counters");
+            match sqlx_postgres::PgPoolOptions::new()
+                .max_connections(2) // lightweight — only counter upserts + reads
+                .acquire_timeout(std::time::Duration::from_secs(10))
+                .connect(&url)
+                .await
+            {
+                Ok(pool) => UsageCounter::with_postgres(pool).await,
+                Err(e) => {
+                    tracing::warn!(
+                        "Usage counter: Neon connection failed ({e}), falling back to in-memory"
+                    );
+                    UsageCounter::new()
+                }
+            }
+        }
+        _ => {
+            tracing::info!("Usage counter: in-memory only (no DATABASE_URL)");
+            UsageCounter::new()
+        }
+    };
+
     let auth_required = !config.api_keys.is_empty();
     let app_state = Arc::new(AppState {
         auth: auth::AuthValidator::new(&config),
         rate_limiter: rate_limit::RateLimiter::new(config.rate_limit_per_minute),
         usage_reporter: UsageReporter::new(config.stripe_api_key.clone()),
-        usage_counter: UsageCounter::new(),
+        usage_counter,
         tenant_mgr,
         auth_required,
         admin_key: config.admin_key.clone(),
