@@ -82,21 +82,24 @@ uv run maturin develop --manifest-path pensyve-python/Cargo.toml
 
 ## Architecture
 
-**Workspace layout** — Cargo workspace with 4 Rust crates + standalone WASM crate + Python server + TypeScript SDK + Go SDK + VS Code extension + Claude Code plugin + framework integrations:
+**Workspace layout** — Cargo workspace with 7 Rust crates + standalone WASM crate + Python utilities + TypeScript SDK + Go SDK + VS Code extension + Claude Code plugin + framework integrations:
 
-| Crate / Package   | Type                       | Role                                                                                                            |
-| ----------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `pensyve-core`    | Rust rlib                  | Core logic: storage (SQLite + Postgres), embedding, retrieval, graph, decay, consolidation, observability, mesh |
-| `pensyve-python`  | Rust cdylib (PyO3)         | Python SDK via `import pensyve` — wraps core into `Pensyve`, `Entity`, `Episode`, `Memory` classes              |
-| `pensyve-mcp`     | Rust binary                | MCP server (stdio transport via `rmcp`) exposing recall/remember/episode tools                                  |
-| `pensyve-cli`     | Rust binary                | CLI (`pensyve recall`, `pensyve stats`) via `clap`                                                              |
-| `pensyve_server/` | Python                     | Shared Python utilities — billing, Tier 2 extraction                                                            |
-| `pensyve-ts/`     | TypeScript (bun)           | HTTP client SDK with timeout, retry, PensyveError                                                               |
-| `pensyve-go/`     | Go                         | HTTP client SDK with context.Context, structured errors                                                         |
-| `pensyve-wasm/`   | Rust cdylib (wasm-bindgen) | Standalone minimal in-memory Pensyve for browser/edge (not in workspace)                                        |
-| `pensyve-vscode/` | TypeScript (VS Code)       | VS Code extension with sidebar, commands, status bar                                                            |
-| `pensyve-plugin/` | Claude Code plugin         | 6 commands, 4 skills, 2 agents, 4 hooks for cross-session memory                                                |
-| `integrations/`   | Python                     | Framework adapters for LangChain, CrewAI, OpenClaw, Autogen                                                     |
+| Crate / Package         | Type                       | Role                                                                                                                         |
+| ----------------------- | -------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `pensyve-core`          | Rust rlib                  | Core logic: storage (SQLite + Postgres), embedding, retrieval, graph, decay, consolidation, observability, mesh              |
+| `pensyve-python`        | Rust cdylib (PyO3)         | Python SDK via `import pensyve` — wraps core into `Pensyve`, `Entity`, `Episode`, `Memory` classes                           |
+| `pensyve-mcp`           | Rust binary                | MCP server (stdio transport via `rmcp`) exposing recall/remember/episode tools                                               |
+| `pensyve-mcp-tools`     | Rust rlib                  | Shared tool definitions + `PensyveMcpServer` used by both `pensyve-mcp` (stdio) and `pensyve-mcp-gateway` (streamable HTTP) |
+| `pensyve-mcp-gateway`   | Rust binary                | **Cloud HTTP gateway** — serves REST (`/v1/*`) + MCP (`/mcp`) on port 3000, with auth, rate limit, usage metering, tenant isolation, OAuth |
+| `pensyve-cli`           | Rust binary                | CLI (`pensyve recall`, `pensyve stats`) via `clap`                                                                           |
+| `pensyve-benchmarks`    | Rust bench harness         | LongMemEval and tuning entry points                                                                                          |
+| `pensyve_server/`       | Python utilities           | Shared Python utilities — billing helpers, Tier 2 extraction. *Not a standalone server — the HTTP API is `pensyve-mcp-gateway`.* |
+| `pensyve-ts/`           | TypeScript (bun)           | HTTP client SDK with timeout, retry, PensyveError                                                                            |
+| `pensyve-go/`           | Go                         | HTTP client SDK with context.Context, structured errors                                                                      |
+| `pensyve-wasm/`         | Rust cdylib (wasm-bindgen) | Standalone minimal in-memory Pensyve for browser/edge (not in workspace)                                                     |
+| `pensyve-vscode/`       | TypeScript (VS Code)       | VS Code extension with sidebar, commands, status bar                                                                         |
+| `pensyve-plugin/`       | Claude Code plugin         | 6 commands, 4 skills, 2 agents, 4 hooks for cross-session memory                                                             |
+| `integrations/`         | Python                     | Framework adapters for LangChain, CrewAI, OpenClaw, Autogen                                                                  |
 
 **Dependency flow**: All Rust consumers depend on `pensyve-core`. The Python server depends on the PyO3 module (`pensyve._core`). The TypeScript and Go SDKs talk to the REST API over HTTP. The VS Code extension uses its own HTTP client. The Claude Code plugin wraps the MCP server.
 
@@ -129,11 +132,14 @@ Namespace → Entity (agent|user|team|tool) → Episodes (bounded interaction se
 
 Single Rust/Axum binary serving REST (`/v1/*`) and MCP (`/mcp`) on port 3000:
 
-- `rest.rs` — REST API route handlers (recall, remember, entities, stats, inspect)
-- `auth.rs` — API key validation (local list + remote endpoint with caching)
+- `rest.rs` — REST API route handlers (recall, remember, entities, stats, inspect, usage)
+- `auth.rs` — API key validation (local list + remote endpoint with caching) and OAuth JWT (EdDSA via `OAUTH_PUBLIC_KEY`)
 - `rate_limit.rs` — Per-key rate limiting
-- `usage.rs` — Stripe usage event reporting
+- `usage.rs` — Stripe usage event reporting (fire-and-forget, batched)
+- `usage_counter.rs` — In-memory per-(user, month, tier) operation counter exposed via `GET /v1/usage` for the dashboard's "Usage This Period"
 - `tenant.rs` — Multi-tenant state management
+- `cache.rs` — Optional Redis cache for recall responses (`REDIS_URL`)
+- `oauth.rs` — OAuth 2.1 authorization server endpoints
 
 ### Benchmarks (`benchmarks/`)
 
