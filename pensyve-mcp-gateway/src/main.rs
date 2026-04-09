@@ -6,6 +6,7 @@ mod rate_limit;
 mod rest;
 mod tenant;
 mod usage;
+mod usage_counter;
 
 use std::sync::Arc;
 
@@ -33,12 +34,14 @@ use crate::config::GatewayConfig;
 use crate::rate_limit::RateLimitLayer;
 use crate::tenant::TenantStateManager;
 use crate::usage::UsageReporter;
+use crate::usage_counter::UsageCounter;
 
 /// Application state shared across all requests.
 pub struct AppState {
     pub auth: auth::AuthValidator,
     pub rate_limiter: rate_limit::RateLimiter,
     pub usage_reporter: UsageReporter,
+    pub usage_counter: UsageCounter,
     pub tenant_mgr: TenantStateManager,
     pub auth_required: bool,
     pub admin_key: Option<String>,
@@ -202,6 +205,7 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         auth: auth::AuthValidator::new(&config),
         rate_limiter: rate_limit::RateLimiter::new(config.rate_limit_per_minute),
         usage_reporter: UsageReporter::new(config.stripe_api_key.clone()),
+        usage_counter: UsageCounter::new(),
         tenant_mgr,
         auth_required,
         admin_key: config.admin_key.clone(),
@@ -435,7 +439,9 @@ tokio::task_local! {
 
 /// Axum middleware that:
 /// 1. Sets the tenant ID task-local from the auth context (for rmcp service factory)
-/// 2. Reports usage to Stripe after the request completes
+/// 2. Records usage for successful billable requests — both to the local
+///    in-memory counter (for the dashboard's "Usage This Period") and to the
+///    Stripe meter pipeline (for invoicing paying customers).
 async fn tenant_and_usage_middleware(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     req: axum::http::Request<axum::body::Body>,
@@ -450,7 +456,9 @@ async fn tenant_and_usage_middleware(
     let scope = auth_ctx
         .as_ref()
         .map_or_else(|| "mcp".to_string(), |ctx| ctx.scope.clone());
-    let is_mcp = req.uri().path().starts_with("/mcp");
+    let path = req.uri().path().to_string();
+    let is_mcp = path.starts_with("/mcp");
+    let is_billable = usage_counter::is_billable_path(&path);
 
     let response = CURRENT_SCOPE
         .scope(scope, async {
@@ -458,17 +466,33 @@ async fn tenant_and_usage_middleware(
         })
         .await;
 
-    // Report usage for successful MCP requests.
-    if is_mcp
-        && response.status().is_success()
+    if response.status().is_success()
+        && is_billable
         && let Some(ctx) = auth_ctx
     {
-        state.usage_reporter.report(usage::UsageEvent {
-            key_id: ctx.key_id,
-            stripe_customer_id: ctx.stripe_customer_id,
-            tier: usage::OperationTier::Standard,
-            count: 1,
-        });
+        // Local counter: tracks usage for *every* authenticated user so the
+        // dashboard can show a current-period count even for free-tier users
+        // who don't have a Stripe subscription. Keyed on user_id when the
+        // request came through JWT/OAuth, falling back to key_id for raw
+        // API-key auth — the `/v1/usage` handler uses the same rule so both
+        // sides agree on the lookup key.
+        let counter_key = ctx.user_id.as_deref().unwrap_or(&ctx.key_id);
+        state
+            .usage_counter
+            .increment(counter_key, usage::OperationTier::Standard, 1);
+
+        // Stripe meter pipeline: only meaningful for users with a Stripe
+        // customer ID. The reporter drops events with no customer ID.
+        // Only MCP requests are currently reported here to preserve existing
+        // billing semantics; REST-path metering can be enabled later.
+        if is_mcp {
+            state.usage_reporter.report(usage::UsageEvent {
+                key_id: ctx.key_id,
+                stripe_customer_id: ctx.stripe_customer_id,
+                tier: usage::OperationTier::Standard,
+                count: 1,
+            });
+        }
     }
 
     response
