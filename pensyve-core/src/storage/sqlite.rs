@@ -98,13 +98,43 @@ impl SqliteBackend {
         for stmt in &[
             "ALTER TABLE episodic_memories ADD COLUMN salience REAL DEFAULT 0.5",
             "ALTER TABLE episodic_memories ADD COLUMN storage_strength REAL DEFAULT 0.0",
-            "ALTER TABLE episodic_memories ADD COLUMN event_time REAL",
             "ALTER TABLE episodic_memories ADD COLUMN superseded_by TEXT",
             "ALTER TABLE edges ADD COLUMN edge_type TEXT DEFAULT 'ENTITY'",
             "ALTER TABLE edges ADD COLUMN confidence REAL DEFAULT 1.0",
             "ALTER TABLE edges ADD COLUMN half_life_days REAL DEFAULT 90.0",
         ] {
             let _ = conn.execute(stmt, []);
+        }
+
+        // Migration v3: `event_time` was originally added as REAL in v2 but
+        // was never written or read (dead code). Convert to TEXT (RFC3339)
+        // to match the `timestamp` column's storage format. This is a
+        // one-time migration: once the column is TEXT, subsequent opens
+        // skip the destructive DROP.
+        {
+            let is_real = conn
+                .prepare("PRAGMA table_info(episodic_memories)")?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })?
+                .filter_map(Result::ok)
+                .any(|(name, typ)| name == "event_time" && typ.eq_ignore_ascii_case("REAL"));
+            if is_real {
+                // Column exists as REAL from v2 migration — drop and recreate as TEXT.
+                conn.execute("ALTER TABLE episodic_memories DROP COLUMN event_time", [])?;
+                conn.execute(
+                    "ALTER TABLE episodic_memories ADD COLUMN event_time TEXT",
+                    [],
+                )?;
+            } else if !Self::column_exists(conn, "episodic_memories", "event_time")? {
+                // Fresh DB (no v2 migration ran) or column was already dropped —
+                // add as TEXT directly.
+                conn.execute(
+                    "ALTER TABLE episodic_memories ADD COLUMN event_time TEXT",
+                    [],
+                )?;
+            }
+            // If column already exists as TEXT, do nothing — migration complete.
         }
 
         Ok(())
@@ -638,8 +668,8 @@ impl StorageTrait for SqliteBackend {
             r"INSERT OR REPLACE INTO episodic_memories
                (id, namespace_id, episode_id, source_entity, about_entity, content, content_type,
                 summary, embedding, context_intent, timestamp, stability, retrievability,
-                access_count, last_accessed)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                access_count, last_accessed, event_time)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 mem.id.to_string(),
                 mem.namespace_id.to_string(),
@@ -656,6 +686,7 @@ impl StorageTrait for SqliteBackend {
                 f64::from(mem.retrievability),
                 mem.access_count,
                 last_accessed,
+                opt_dt_to_str(mem.event_time),
             ],
         )?;
 
@@ -679,7 +710,7 @@ impl StorageTrait for SqliteBackend {
             .query_row(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           content_type, summary, embedding, context_intent, timestamp,
-                          stability, retrievability, access_count, last_accessed
+                          stability, retrievability, access_count, last_accessed, event_time
                    FROM episodic_memories WHERE id = ?1",
                 params![id.to_string()],
                 row_to_episodic,
@@ -697,7 +728,7 @@ impl StorageTrait for SqliteBackend {
         let mut stmt = conn.prepare(
             r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                       content_type, summary, embedding, context_intent, timestamp,
-                      stability, retrievability, access_count, last_accessed
+                      stability, retrievability, access_count, last_accessed, event_time
                FROM episodic_memories WHERE about_entity = ?1
                ORDER BY timestamp DESC LIMIT ?2",
         )?;
@@ -999,7 +1030,7 @@ impl StorageTrait for SqliteBackend {
                         .query_row(
                             r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                                       content_type, summary, embedding, context_intent, timestamp,
-                                      stability, retrievability, access_count, last_accessed
+                                      stability, retrievability, access_count, last_accessed, event_time
                                FROM episodic_memories WHERE id = ?1",
                             params![id.to_string()],
                             row_to_episodic,
@@ -1058,7 +1089,7 @@ impl StorageTrait for SqliteBackend {
             let mut stmt = conn.prepare(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           content_type, summary, embedding, context_intent, timestamp,
-                          stability, retrievability, access_count, last_accessed
+                          stability, retrievability, access_count, last_accessed, event_time
                    FROM episodic_memories WHERE namespace_id = ?1",
             )?;
             let rows = stmt.query_map(params![&ns_str], row_to_episodic)?;
@@ -1601,6 +1632,7 @@ fn row_to_episodic(
     let retrievability: f64 = row.get(12)?;
     let access_count: u32 = row.get(13)?;
     let last_accessed_str: Option<String> = row.get(14)?;
+    let event_time_str: Option<String> = row.get(15)?;
 
     let id = match parse_uuid(&id_str) {
         Ok(v) => v,
@@ -1644,7 +1676,11 @@ fn row_to_episodic(
         last_accessed: str_to_opt_dt(last_accessed_str.as_deref()),
         salience: 0.5,
         storage_strength: 0.0,
-        event_time: None,
+        // Phase V benchmark sprint fix: read event_time from the DB
+        // via the existing str_to_opt_dt helper. Was hardcoded None
+        // in v1.0.5 and earlier, see
+        // pensyve-docs/research/benchmark-sprint/06-phase-v-verification.md.
+        event_time: str_to_opt_dt(event_time_str.as_deref()),
         superseded_by: None,
     }))
 }
@@ -1963,6 +1999,99 @@ mod tests {
         assert!((fetched.retrievability - 0.7).abs() < 0.001);
         assert_eq!(fetched.access_count, 1);
         assert!(fetched.last_accessed.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // event_time tests
+    //
+    // Phase V of the benchmark sprint
+    // (pensyve-docs/research/benchmark-sprint/06-phase-v-verification.md)
+    // found event_time was structurally dead: save_episodic's INSERT did
+    // not write the column, and row_to_episodic hardcoded None on read.
+    // These tests pin the round-trip invariant through the sqlite backend.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_episodic_event_time_roundtrip() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+
+        let when = DateTime::parse_from_rfc3339("2023-03-04T08:09:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut mem = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "I received the crystal chandelier from my aunt",
+        );
+        mem.event_time = Some(when);
+
+        db.save_episodic(&mem).unwrap();
+        let fetched = db.get_episodic(mem.id).unwrap().unwrap();
+        assert_eq!(
+            fetched.event_time,
+            Some(when),
+            "event_time must round-trip through save_episodic/get_episodic"
+        );
+    }
+
+    #[test]
+    fn test_episodic_event_time_null_roundtrip() {
+        // Regression guard: the None path must not silently become
+        // Some(Utc::now()) or Some(default) after the fix lands.
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+
+        let mem = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "no timestamp on this memory",
+        );
+        assert!(
+            mem.event_time.is_none(),
+            "EpisodicMemory::new default must be None"
+        );
+
+        db.save_episodic(&mem).unwrap();
+        let fetched = db.get_episodic(mem.id).unwrap().unwrap();
+        assert!(
+            fetched.event_time.is_none(),
+            "event_time must stay None through save/get when not set at construction"
+        );
+    }
+
+    #[test]
+    fn test_list_episodic_by_entity_preserves_event_time() {
+        // list_episodic_by_entity has its own SELECT statement separate
+        // from get_episodic — must also read event_time.
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let about = Uuid::new_v4();
+
+        let when = DateTime::parse_from_rfc3339("2024-06-03T10:15:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut mem = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            about,
+            "a dated event",
+        );
+        mem.event_time = Some(when);
+        db.save_episodic(&mem).unwrap();
+
+        let results = db.list_episodic_by_entity(about, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].event_time,
+            Some(when),
+            "list_episodic_by_entity must read event_time from the DB"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -121,12 +121,23 @@ class Entity:
 class Episode:
     """An episode context manager that records messages and creates memories on exit."""
 
-    def message(self, role: str, content: str) -> None:
+    def message(
+        self,
+        role: str,
+        content: str,
+        when: str | None = None,
+    ) -> None:
         """Record a message in this episode.
 
         Args:
             role: The role of the speaker (e.g. "user", "assistant").
             content: The message content.
+            when: Optional RFC3339 / ISO 8601 timestamp describing when the
+                event in this message occurred (e.g. "2023-03-04T08:09:00Z").
+                Defaults to the current UTC time at episode commit. Pass an
+                explicit value when ingesting historical or backfilled data
+                where the real-world event time differs from the encoding
+                time. Raises `ValueError` if the string is not parseable.
         """
         ...
 

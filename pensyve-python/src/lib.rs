@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use pyo3::exceptions::PyRuntimeError;
+use chrono::{DateTime, Utc};
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use uuid::Uuid;
@@ -618,7 +619,10 @@ pub struct PyEpisode {
     episode_id: Uuid,
     namespace_id: Uuid,
     participants: Vec<Uuid>,
-    messages: Vec<(String, String)>, // (role, content)
+    // (role, content, optional per-message event time).
+    // `event_time` is `None` when the caller did not pass `when=...`; the
+    // default (`Utc::now()` at commit) is applied in `__exit__`.
+    messages: Vec<(String, String, Option<DateTime<Utc>>)>,
     outcome: Option<String>,
     closed: bool,
 }
@@ -630,11 +634,30 @@ impl PyEpisode {
     /// Args:
     ///     role: The role of the speaker (e.g. "user", "assistant").
     ///     content: The message content.
-    fn message(&mut self, role: &str, content: &str) -> PyResult<()> {
+    ///     when: Optional RFC3339 / ISO 8601 timestamp describing when the
+    ///         event in this message occurred (e.g. "2023-03-04T08:09:00Z").
+    ///         Defaults to `Utc::now()` at episode commit. Pass an explicit
+    ///         value when ingesting historical / backfilled data where the
+    ///         encoding time differs from the real-world event time.
+    #[pyo3(signature = (role, content, when=None))]
+    fn message(&mut self, role: &str, content: &str, when: Option<&str>) -> PyResult<()> {
         if self.closed {
             return Err(PyRuntimeError::new_err("Episode is already closed"));
         }
-        self.messages.push((role.to_string(), content.to_string()));
+        let parsed_when = match when {
+            None => None,
+            Some(s) => Some(
+                DateTime::parse_from_rfc3339(s)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| {
+                        PyValueError::new_err(format!(
+                            "`when` must be an RFC3339 timestamp, got {s:?}: {e}"
+                        ))
+                    })?,
+            ),
+        };
+        self.messages
+            .push((role.to_string(), content.to_string(), parsed_when));
         Ok(())
     }
 
@@ -690,7 +713,7 @@ impl PyEpisode {
         let source_entity = self.participants.first().copied().unwrap_or(Uuid::nil());
         let about_entity = self.participants.get(1).copied().unwrap_or(source_entity);
 
-        for (_role, content) in &self.messages {
+        for (_role, content, when) in &self.messages {
             let mut mem = EpisodicMemory::new(
                 self.namespace_id,
                 self.episode_id,
@@ -698,6 +721,11 @@ impl PyEpisode {
                 about_entity,
                 content,
             );
+            // Populate event_time. Explicit `when` from the caller takes
+            // precedence; otherwise default to Utc::now() at commit,
+            // matching real-time conversational ingest semantics.
+            // `Option<DateTime<Utc>>` is Copy so `*when` works.
+            mem.event_time = Some((*when).unwrap_or_else(Utc::now));
 
             // Embed the content.
             let embedding = self
