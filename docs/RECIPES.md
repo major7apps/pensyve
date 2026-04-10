@@ -174,8 +174,9 @@ Add to your MCP config:
 {
   "mcpServers": {
     "pensyve": {
+      "type": "http",
       "url": "https://mcp.pensyve.com/mcp",
-      "env": { "PENSYVE_API_KEY": "${PENSYVE_API_KEY}" }
+      "headers": { "Authorization": "Bearer ${PENSYVE_API_KEY}" }
     }
   }
 }
