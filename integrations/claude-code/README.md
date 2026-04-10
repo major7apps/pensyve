@@ -58,20 +58,23 @@ The plugin needs a running Pensyve MCP server. Choose one:
 
    Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
 
-   **Option B** — inline in `.claude/settings.json`:
+   **Option B** — override MCP config in `.claude/settings.json`:
 
    ```json
    {
      "mcpServers": {
        "pensyve": {
+         "type": "http",
          "url": "https://mcp.pensyve.com/mcp",
-         "env": {
-           "PENSYVE_API_KEY": "your-api-key-here"
+         "headers": {
+           "Authorization": "Bearer ${PENSYVE_API_KEY}"
          }
        }
      }
    }
    ```
+
+   > Use `headers` with `Authorization: Bearer` for remote MCP (HTTP transport). The `env` block is for local stdio servers.
 
 The plugin ships pre-configured for Pensyve Cloud — once your API key is set, you're ready to go.
 

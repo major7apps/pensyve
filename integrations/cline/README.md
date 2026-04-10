@@ -31,14 +31,17 @@ Open Cline settings → MCP Servers, or add to your Cline MCP config file:
 {
   "mcpServers": {
     "pensyve": {
+      "type": "http",
       "url": "https://mcp.pensyve.com/mcp",
-      "env": {
-        "PENSYVE_API_KEY": "${PENSYVE_API_KEY}"
+      "headers": {
+        "Authorization": "Bearer ${PENSYVE_API_KEY}"
       }
     }
   }
 }
 ```
+
+> Use `headers` with `Authorization: Bearer` for remote MCP. The `env` block is for local stdio servers.
 
 ## Local (Offline)
 
