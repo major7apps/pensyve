@@ -369,6 +369,33 @@ impl<'a> RecallEngine<'a> {
         self.recall_inner(query, query_embedding, namespace_id, limit, target_entity)
     }
 
+    /// Run the recall pipeline and cluster the results by source session.
+    ///
+    /// Runs the same RRF fusion pipeline as [`recall`](Self::recall) to
+    /// produce a candidate pool of up to `config.limit` memories, then
+    /// post-processes them into `SessionGroup`s via
+    /// [`crate::recall_grouped::group_by_session`]. Memories from the same
+    /// episode cluster into a single group and are sorted in conversation
+    /// order within the group; semantic and procedural memories appear as
+    /// singleton groups.
+    ///
+    /// This is the canonical entry point for the "memory for an AI reader"
+    /// use case: the returned `Vec<SessionGroup>` can be formatted directly
+    /// into a reader prompt without any extra SDK-side grouping logic.
+    pub fn recall_grouped(
+        &self,
+        query: &str,
+        namespace_id: Uuid,
+        config: &crate::recall_grouped::RecallGroupedConfig,
+    ) -> Result<Vec<crate::recall_grouped::SessionGroup>, RecallError> {
+        let result = self.recall(query, namespace_id, config.limit)?;
+        Ok(crate::recall_grouped::group_by_session(
+            result.memories,
+            config.order,
+            config.max_groups,
+        ))
+    }
+
     /// Like `recall`, but allows specifying a `target_entity` for graph BFS.
     #[allow(clippy::too_many_lines)]
     #[tracing::instrument(skip_all, fields(query, namespace_id = %namespace_id, limit))]
