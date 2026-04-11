@@ -1,5 +1,9 @@
 """Type stubs for pensyve._core (PyO3 extension module)."""
 
+from __future__ import annotations
+
+from typing import Literal
+
 __version__: str
 
 def embedding_info() -> tuple[str, int]:
@@ -53,6 +57,35 @@ class Pensyve:
             entity: Optional entity to filter by.
             limit: Maximum number of results (default: 5).
             types: Optional list of memory type strings to filter by.
+        """
+        ...
+
+    def recall_grouped(
+        self,
+        query: str,
+        *,
+        limit: int = 50,
+        order: Literal["chronological", "relevance"] = "chronological",
+        max_groups: int | None = None,
+    ) -> list[SessionGroup]:
+        """Recall memories matching a query, clustered by source session.
+
+        Runs the normal RRF fusion pipeline and then groups the top-``limit``
+        results by ``episode_id``. Memories from the same session cluster
+        into a single :class:`SessionGroup` sorted by event time within the
+        group. Semantic and procedural memories (which have no episode)
+        appear as singleton groups with ``session_id=None``.
+
+        Args:
+            query: Search query string.
+            limit: Maximum number of memories to consider across all groups
+                (default: 50).
+            order: "chronological" (default, oldest session first) or
+                "relevance" (highest-scoring session first).
+            max_groups: Optional cap on the number of groups returned.
+
+        Raises:
+            ValueError: If ``order`` is not one of the supported values.
         """
         ...
 
@@ -209,3 +242,34 @@ class Memory:
     def superseded_by(self) -> str | None:
         """ID of the memory that superseded this one, if any. Only set for episodic memories."""
         ...
+
+class SessionGroup:
+    """A cluster of recalled memories sharing a source conversation session.
+
+    Returned by :meth:`Pensyve.recall_grouped`. Memories from the same
+    episode are clustered into one group, sorted by event time within the
+    group. Semantic and procedural memories surface as singleton groups
+    with ``session_id=None``.
+    """
+
+    @property
+    def session_id(self) -> str | None:
+        """Episode UUID as a string, or ``None`` for semantic / procedural memories."""
+        ...
+
+    @property
+    def session_time(self) -> str:
+        """Representative timestamp (ISO 8601 / RFC 3339). Earliest event time in the group."""
+        ...
+
+    @property
+    def memories(self) -> list[Memory]:
+        """Memories in conversation order (sorted by event time ascending)."""
+        ...
+
+    @property
+    def group_score(self) -> float:
+        """Max RRF score across the group's memories."""
+        ...
+
+    def __len__(self) -> int: ...
