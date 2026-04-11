@@ -46,6 +46,14 @@ pub struct RecallMemory {
     pub confidence: f32,
     pub stability: f32,
     pub score: f32,
+    /// When the described event occurred (ISO 8601 / RFC 3339 string).
+    /// Only set for episodic memories that were ingested with an explicit
+    /// `when=` kwarg. `None` for semantic / procedural memories. The TS,
+    /// Python, and integration SDKs all expose this field on their
+    /// `Memory` types — exposing it on the wire keeps the cross-language
+    /// contract consistent.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub event_time: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -319,6 +327,17 @@ fn memory_content(memory: &Memory) -> String {
     }
 }
 
+/// Extract the optional `event_time` from a memory as an ISO 8601 string.
+/// Returns `None` for semantic / procedural memories (which have no event
+/// time concept) and for episodic memories that were ingested without an
+/// explicit `when=` kwarg.
+fn memory_event_time(memory: &Memory) -> Option<String> {
+    match memory {
+        Memory::Episodic(m) => m.event_time.map(|t| t.to_rfc3339()),
+        Memory::Semantic(_) | Memory::Procedural(_) => None,
+    }
+}
+
 /// Filter and convert recall results into API response format.
 fn filter_recall_results(
     result: &pensyve_core::retrieval::RecallResult,
@@ -349,6 +368,7 @@ fn filter_recall_results(
             confidence: memory_confidence(&c.memory),
             stability: memory_stability(&c.memory),
             score: c.final_score,
+            event_time: memory_event_time(&c.memory),
         })
         .collect()
 }
@@ -554,9 +574,9 @@ async fn recall(
 ///
 /// Same retrieval pipeline as `/v1/recall`, post-processed by
 /// `pensyve_core::recall_grouped::group_by_session`. Returns a list of
-/// `RecallGroupedGroup`s instead of a flat memory list. The TS, Python, and
-/// Go SDKs all map this endpoint to a `recallGrouped` / `recall_grouped`
-/// method.
+/// `RecallGroupedGroup`s instead of a flat memory list. The TS and Python
+/// SDKs map this endpoint to `recallGrouped` / `recall_grouped`; a Go SDK
+/// equivalent is a follow-up.
 async fn recall_grouped(
     State(state): State<Arc<AppState>>,
     axum::Extension(auth_ctx): axum::Extension<AuthContext>,
@@ -618,16 +638,20 @@ async fn recall_grouped(
             session_id: g.session_id.map(|id| id.to_string()),
             session_time: g.session_time.to_rfc3339(),
             group_score: g.group_score,
+            // Each ScoredMemory carries its own per-member RRF score —
+            // surface that on the wire rather than overwriting every member
+            // with the group's max.
             memories: g
                 .memories
                 .iter()
-                .map(|m| RecallMemory {
-                    id: m.id().to_string(),
-                    content: memory_content(m),
-                    memory_type: memory_type_name(m).to_string(),
-                    confidence: memory_confidence(m),
-                    stability: memory_stability(m),
-                    score: g.group_score,
+                .map(|sm| RecallMemory {
+                    id: sm.memory.id().to_string(),
+                    content: memory_content(&sm.memory),
+                    memory_type: memory_type_name(&sm.memory).to_string(),
+                    confidence: memory_confidence(&sm.memory),
+                    stability: memory_stability(&sm.memory),
+                    score: sm.score,
+                    event_time: memory_event_time(&sm.memory),
                 })
                 .collect(),
         })
@@ -1934,6 +1958,7 @@ mod tests {
                     confidence: 1.0,
                     stability: 0.8,
                     score: 0.92,
+                    event_time: Some("2026-01-01T10:00:00+00:00".to_string()),
                 }],
             }],
         };
@@ -1946,7 +1971,90 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0]["session_id"], "ep-1");
         assert_eq!(groups[0]["session_time"], "2026-01-01T10:00:00+00:00");
-        assert_eq!(groups[0]["memories"].as_array().unwrap().len(), 1);
+        let mems = groups[0]["memories"].as_array().unwrap();
+        assert_eq!(mems.len(), 1);
+        assert_eq!(mems[0]["event_time"], "2026-01-01T10:00:00+00:00");
+    }
+
+    #[test]
+    fn recall_memory_event_time_skipped_when_none() {
+        // Semantic / procedural memories have no event_time concept and
+        // must NOT serialize the field at all (clients distinguish "absent"
+        // from "explicit null" via the field's presence on the wire).
+        let mem = RecallMemory {
+            id: "m-x".to_string(),
+            content: "Alice prefers Python".to_string(),
+            memory_type: "semantic".to_string(),
+            confidence: 0.9,
+            stability: 1.0,
+            score: 0.5,
+            event_time: None,
+        };
+        let v = serde_json::to_value(&mem).unwrap();
+        assert!(
+            v.get("event_time").is_none(),
+            "RecallMemory.event_time must be skipped when None, got: {v}"
+        );
+    }
+
+    #[test]
+    fn recall_memory_event_time_serialized_when_some() {
+        let mem = RecallMemory {
+            id: "m-y".to_string(),
+            content: "user: hi".to_string(),
+            memory_type: "episodic".to_string(),
+            confidence: 1.0,
+            stability: 0.8,
+            score: 0.7,
+            event_time: Some("2026-04-11T18:00:00+00:00".to_string()),
+        };
+        let v = serde_json::to_value(&mem).unwrap();
+        assert_eq!(v["event_time"], "2026-04-11T18:00:00+00:00");
+    }
+
+    #[test]
+    fn recall_grouped_group_preserves_distinct_member_scores_on_the_wire() {
+        // Regression for the PR #54 review: per-member RRF scores must
+        // survive grouping. Two memories in the same session that scored
+        // 0.92 and 0.11 in RRF should not both look like 0.92 to the client.
+        let resp = RecallGroupedResponse {
+            groups: vec![RecallGroupedGroup {
+                session_id: Some("ep-1".to_string()),
+                session_time: "2026-01-01T10:00:00+00:00".to_string(),
+                group_score: 0.92,
+                memories: vec![
+                    RecallMemory {
+                        id: "m-1".to_string(),
+                        content: "high relevance".to_string(),
+                        memory_type: "episodic".to_string(),
+                        confidence: 1.0,
+                        stability: 0.8,
+                        score: 0.92,
+                        event_time: Some("2026-01-01T10:00:00+00:00".to_string()),
+                    },
+                    RecallMemory {
+                        id: "m-2".to_string(),
+                        content: "carried-along turn".to_string(),
+                        memory_type: "episodic".to_string(),
+                        confidence: 1.0,
+                        stability: 0.8,
+                        score: 0.11,
+                        event_time: Some("2026-01-01T10:00:30+00:00".to_string()),
+                    },
+                ],
+            }],
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        let mems = v["groups"][0]["memories"].as_array().unwrap();
+        assert_eq!(mems.len(), 2);
+        // f32 → f64 widening adds tiny mantissa noise; compare with ε.
+        assert!((mems[0]["score"].as_f64().unwrap() - 0.92).abs() < 1e-6);
+        assert!((mems[1]["score"].as_f64().unwrap() - 0.11).abs() < 1e-6);
+        // The scores must be distinct end-to-end, which is the actual claim.
+        assert_ne!(
+            mems[0]["score"].as_f64().unwrap(),
+            mems[1]["score"].as_f64().unwrap()
+        );
     }
 
     #[test]

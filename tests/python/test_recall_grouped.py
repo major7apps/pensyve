@@ -201,3 +201,59 @@ def test_recall_grouped_semantic_memory_is_singleton_group():
         "expected at least one singleton group with session_id=None for the "
         f"semantic `remember` memory, got {[(g.session_id, len(g.memories)) for g in groups]}"
     )
+
+
+def test_recall_grouped_members_keep_distinct_per_memory_scores():
+    """Per-member RRF scores survive grouping; they are NOT all overwritten with group_score.
+
+    Regression for the PR #54 review feedback (Codex P2, Claude Bot ×3,
+    Sentry MEDIUM): two memories in the same session can have very
+    different per-member RRF scores (a top-ranked hit vs. a "carried-along"
+    turn), and the binding must surface the distinct values so consumers
+    can rank or filter within a group.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        p, user, agent = _open_pensyve(d)
+        # A multi-turn episode where the question is highly specific to one
+        # turn — so RRF should give that turn a noticeably higher score
+        # than the others in the same session.
+        with p.episode(user, agent) as ep:
+            ep.message(
+                "user",
+                "I bought a quantum computing textbook by Nielsen and Chuang yesterday",
+                when="2026-01-01T10:00:00Z",
+            )
+            ep.message(
+                "assistant",
+                "Nice — that's a classic",
+                when="2026-01-01T10:00:30Z",
+            )
+            ep.message(
+                "user",
+                "Also picked up some milk on the way home",
+                when="2026-01-01T10:01:00Z",
+            )
+            ep.outcome("success")
+
+        groups = p.recall_grouped("quantum computing textbook", limit=20)
+
+    # The episode should surface as a single group containing all turns.
+    multi = [g for g in groups if len(g.memories) >= 2]
+    assert multi, f"expected a multi-turn group, got {[len(g.memories) for g in groups]}"
+    g = multi[0]
+
+    # group_score is the max across members.
+    member_scores = [m.score for m in g.memories]
+    assert g.group_score == max(member_scores), (
+        f"group_score should be max(member scores); got group_score={g.group_score}, "
+        f"members={member_scores}"
+    )
+
+    # The actual claim under test: members should NOT all share the same score.
+    # If the binding clobbers per-member score with group_score, every member
+    # in the group looks identical — that's the bug we're guarding against.
+    distinct = set(member_scores)
+    assert len(distinct) > 1, (
+        "all member scores collapsed to a single value — per-member RRF "
+        f"signal was lost during grouping. Got: {member_scores}"
+    )

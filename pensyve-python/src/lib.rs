@@ -493,10 +493,13 @@ impl PyPensyve {
             .map(|g| PySessionGroup {
                 session_id: g.session_id.map(|id| id.to_string()),
                 session_time: g.session_time.to_rfc3339(),
+                // Each ScoredMemory carries its own per-member RRF score —
+                // surface that on the wrapped PyMemory rather than overwriting
+                // every member with the group's max.
                 memories: g
                     .memories
                     .iter()
-                    .map(|m| py_memory_from(m, g.group_score))
+                    .map(|sm| py_memory_from(&sm.memory, sm.score))
                     .collect(),
                 group_score: g.group_score,
             })

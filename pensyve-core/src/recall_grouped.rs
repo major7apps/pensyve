@@ -72,6 +72,23 @@ impl Default for RecallGroupedConfig {
     }
 }
 
+/// A retrieved memory paired with its individual RRF fusion score.
+///
+/// `SessionGroup.memories` carries `ScoredMemory` instead of bare `Memory`
+/// so per-member relevance signal survives the grouping step. Two members
+/// of the same session can have very different RRF scores (a top-ranked
+/// hit and a "carried along" turn) — collapsing both to the group's max
+/// score would mislead any downstream code that thresholds, ranks, or
+/// filters within a group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoredMemory {
+    /// The retrieved memory.
+    pub memory: Memory,
+    /// The individual RRF fusion score (`ScoredCandidate::final_score`)
+    /// this memory had when it was surfaced by [`crate::retrieval::RecallEngine::recall`].
+    pub score: f32,
+}
+
 /// A cluster of memories retrieved for the same query that share a source
 /// session (episode).
 ///
@@ -93,10 +110,12 @@ pub struct SessionGroup {
     /// timestamp when `event_time` is absent). Used for chronological
     /// ordering of groups.
     pub session_time: DateTime<Utc>,
-    /// Memories belonging to this group, sorted by event time ascending —
-    /// i.e. conversation order within the session. The sort is stable, so
-    /// ties preserve the original RRF ranking.
-    pub memories: Vec<Memory>,
+    /// Memories belonging to this group as `ScoredMemory` pairs, sorted by
+    /// event time ascending — i.e. conversation order within the session.
+    /// Each member retains its own RRF `score` so consumers can rank or
+    /// filter within a group; the sort is stable, so ties preserve the
+    /// original RRF ranking.
+    pub memories: Vec<ScoredMemory>,
     /// Aggregated relevance score for the group. Currently the max RRF
     /// `final_score` across the group's memories. Used when ordering by
     /// [`OrderBy::Relevance`].
@@ -187,7 +206,15 @@ pub fn group_by_session(
                 .iter()
                 .map(|c| c.final_score)
                 .fold(f32::NEG_INFINITY, f32::max);
-            let memories = members.into_iter().map(|c| c.memory).collect();
+            // Pair each member with its individual RRF score so the
+            // per-member relevance signal survives the grouping step.
+            let memories: Vec<ScoredMemory> = members
+                .into_iter()
+                .map(|c| ScoredMemory {
+                    memory: c.memory,
+                    score: c.final_score,
+                })
+                .collect();
 
             SessionGroup {
                 session_id,
@@ -316,7 +343,45 @@ mod tests {
         assert_eq!(g.session_time, t(2026, 1, 1));
         // max(0.5, 0.9, 0.7) = 0.9
         assert!((g.group_score - 0.9).abs() < f32::EPSILON);
-        let contents: Vec<_> = g.memories.iter().map(memory_content).collect();
+        let contents: Vec<_> = g
+            .memories
+            .iter()
+            .map(|m| memory_content(&m.memory))
+            .collect();
+        assert_eq!(contents, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn per_member_scores_survive_grouping() {
+        // Regression for the PR #54 review feedback (Codex P2, Claude Bot ×3,
+        // Sentry MEDIUM): the grouping step must NOT collapse every member's
+        // score to the group's max. Two members of the same session can have
+        // very different RRF scores, and downstream callers (Python binding,
+        // gateway REST handler, SDK consumers) need the per-member signal to
+        // rank or filter within a group.
+        let ep = Uuid::new_v4();
+        let candidates = vec![
+            scored(ep_at(ep, t(2026, 1, 1), "first"), 0.92),
+            scored(ep_at(ep, t(2026, 1, 2), "second"), 0.11),
+            scored(ep_at(ep, t(2026, 1, 3), "third"), 0.45),
+        ];
+        let groups = group_by_session(candidates, OrderBy::Chronological, None);
+
+        assert_eq!(groups.len(), 1);
+        let g = &groups[0];
+        assert_eq!(g.memories.len(), 3);
+        // group_score is still the max (0.92), unchanged.
+        assert!((g.group_score - 0.92).abs() < f32::EPSILON);
+        // But each member retains its own original RRF score.
+        assert!((g.memories[0].score - 0.92).abs() < f32::EPSILON);
+        assert!((g.memories[1].score - 0.11).abs() < f32::EPSILON);
+        assert!((g.memories[2].score - 0.45).abs() < f32::EPSILON);
+        // And the underlying memory content is still correct.
+        let contents: Vec<_> = g
+            .memories
+            .iter()
+            .map(|m| memory_content(&m.memory))
+            .collect();
         assert_eq!(contents, vec!["first", "second", "third"]);
     }
 
