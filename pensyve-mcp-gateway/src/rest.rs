@@ -103,9 +103,7 @@ fn parse_recall_grouped_order(
         Some("relevance") => Ok(OrderBy::Relevance),
         Some(other) => Err(RestError(
             StatusCode::BAD_REQUEST,
-            format!(
-                "order must be 'chronological' or 'relevance', got '{other}'"
-            ),
+            format!("order must be 'chronological' or 'relevance', got '{other}'"),
         )),
     }
 }
@@ -1940,7 +1938,10 @@ mod tests {
             }],
         };
         let v = serde_json::to_value(&resp).unwrap();
-        assert!(v.get("groups").is_some(), "response must have a `groups` key");
+        assert!(
+            v.get("groups").is_some(),
+            "response must have a `groups` key"
+        );
         let groups = v["groups"].as_array().unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0]["session_id"], "ep-1");

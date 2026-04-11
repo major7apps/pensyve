@@ -445,7 +445,7 @@ impl PyPensyve {
     ///         (default: 50).
     ///     order: "chronological" (default, oldest session first) or
     ///         "relevance" (highest group score first).
-    ///     max_groups: Optional cap on the number of groups returned.
+    ///     `max_groups`: Optional cap on the number of groups returned.
     #[pyo3(signature = (query, *, limit=50, order="chronological", max_groups=None))]
     fn recall_grouped(
         &self,

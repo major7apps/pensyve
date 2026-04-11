@@ -261,11 +261,7 @@ mod tests {
 
     /// Build an episodic memory with a null `event_time`; `timestamp` is set
     /// explicitly so we can assert the fallback behaviour.
-    fn ep_no_event_time(
-        episode_id: Uuid,
-        timestamp: DateTime<Utc>,
-        content: &str,
-    ) -> Memory {
+    fn ep_no_event_time(episode_id: Uuid, timestamp: DateTime<Utc>, content: &str) -> Memory {
         let ns = Uuid::nil();
         let mut m = EpisodicMemory::new(ns, episode_id, Uuid::new_v4(), Uuid::new_v4(), content);
         m.event_time = None;
@@ -274,7 +270,13 @@ mod tests {
     }
 
     fn sem(subject: Uuid, predicate: &str, object: &str) -> Memory {
-        Memory::Semantic(SemanticMemory::new(Uuid::nil(), subject, predicate, object, 0.9))
+        Memory::Semantic(SemanticMemory::new(
+            Uuid::nil(),
+            subject,
+            predicate,
+            object,
+            0.9,
+        ))
     }
 
     fn proc(trigger: &str, action: &str) -> Memory {
