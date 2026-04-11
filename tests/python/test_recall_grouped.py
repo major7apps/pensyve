@@ -206,7 +206,7 @@ def test_recall_grouped_semantic_memory_is_singleton_group():
 def test_recall_grouped_members_keep_distinct_per_memory_scores():
     """Per-member RRF scores survive grouping; they are NOT all overwritten with group_score.
 
-    Regression for the PR #54 review feedback (Codex P2, Claude Bot ×3,
+    Regression for the PR #54 review feedback (Codex P2, Claude Bot x3,
     Sentry MEDIUM): two memories in the same session can have very
     different per-member RRF scores (a top-ranked hit vs. a "carried-along"
     turn), and the binding must surface the distinct values so consumers
