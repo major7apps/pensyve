@@ -525,7 +525,7 @@ No fine-tuning, prompt-tuning on the test set, or per-question adaptation is use
 
 The runtime is Apache 2.0 licensed and all the pipeline components (retrieval fusion, embedding model, grouping logic) are in this repository. Reader calls against Anthropic's API are reproducible to the precision of the model serving and temperature 0 determinism.
 
-For the full methodology, ablation tables, failure audit, and discussion of each finding, see the [technical report (PDF)](docs/benchmarks/longmemeval-reader-ablation.pdf). The typst source is at [docs/benchmarks/longmemeval-reader-ablation.typ](docs/benchmarks/longmemeval-reader-ablation.typ) and can be rebuilt with `typst compile longmemeval-reader-ablation.typ`.
+For the full methodology, ablation tables, failure audit, and discussion of each finding, see the [technical report (PDF)](docs/benchmarks/longmemeval-reader-ablation.pdf). The typst source is at [docs/benchmarks/longmemeval-reader-ablation.typ](docs/benchmarks/longmemeval-reader-ablation.typ) and can be rebuilt from the repository root with `typst compile docs/benchmarks/longmemeval-reader-ablation.typ`.
 
 ## Competitive Landscape
 
