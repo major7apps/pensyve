@@ -312,12 +312,13 @@ cd pensyve-wasm && cargo check     # WASM (standalone)
 
 ### Benchmarks
 
-```bash
-# Run LongMemEval_S evaluation (builtin dataset: 87.5% baseline)
-python benchmarks/longmemeval/run.py --verbose
+The published LongMemEval_S benchmark methodology and results
+(91.0% Sonnet 4.6, 86.8% Haiku 4.5) live in the top-level repo at
+[`docs/benchmarks/longmemeval-reader-ablation.pdf`](../docs/benchmarks/longmemeval-reader-ablation.pdf).
 
-# Run weight optimization
-python benchmarks/tuning/optimize.py --maxiter 50
+```bash
+# Synthetic recall smoke test (planted facts, no external dataset required)
+python benchmarks/synthetic/run.py --generate --evaluate --verbose
 ```
 
 ## Competitive Landscape

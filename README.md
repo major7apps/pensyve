@@ -464,11 +464,8 @@ cd pensyve-wasm && cargo check     # WASM (standalone)
 ### Benchmarks
 
 ```bash
-# Run LongMemEval_S evaluation
-python benchmarks/longmemeval/run.py --verbose
-
-# Run weight optimization
-python benchmarks/tuning/optimize.py --maxiter 50
+# Synthetic recall smoke test (planted facts, no external dataset required)
+python benchmarks/synthetic/run.py --generate --evaluate --verbose
 ```
 
 ## Competitive Landscape
