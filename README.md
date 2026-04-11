@@ -471,62 +471,6 @@ python benchmarks/longmemeval/run.py --verbose
 python benchmarks/tuning/optimize.py --maxiter 50
 ```
 
-See the [Benchmark Results](#benchmark-results) section below for the current published scores and methodology.
-
-## Benchmark Results
-
-**Pensyve scores 91.0% on LongMemEval_S**, placing it #4 on the public leaderboard and ahead of Honcho (90.4%) on the same reader class.
-
-| System | Score | Reader | Approach |
-|---|---:|---|---|
-| MemPalace | 96.6% | unpublished | Raw verbatim + ChromaDB |
-| OMEGA | 95.4% | GPT-4.1 | Classification + extraction |
-| Mastra | 94.9% | gpt-5-mini | Observer + reflector |
-| **Pensyve** | **91.0%** | **Sonnet 4.6** | **RRF fusion + session grouping + multi-mode prompt** |
-| Honcho | 90.4% | Haiku 4.5 | Agentic multi-tool |
-| Zep/Graphiti | 71.2% | GPT-4o | Temporal knowledge graph |
-| GPT-4o full context | 60.6% | GPT-4o | All 115k tokens in-context |
-| Mem0 | ~49% | GPT-4o | Fact extraction |
-
-### Per-category breakdown (Sonnet 4.6)
-
-| Category | Score |
-|---|---:|
-| single-session-assistant | 100.0% (56/56) |
-| single-session-user | 98.6% (69/70) |
-| single-session-preference | 93.3% (28/30) |
-| knowledge-update | 93.6% (73/78) |
-| temporal-reasoning | 91.0% (121/133) |
-| multi-session | 81.2% (108/133) |
-| **Total** | **91.0% (455/500)** |
-
-### Key findings from the controlled ablation
-
-The full write-up is available at [docs/benchmarks/longmemeval-reader-ablation.pdf](docs/benchmarks/longmemeval-reader-ablation.pdf). Headline findings from isolating the reader, prompt, and sampling axes:
-
-1. **Reader model choice dominates prompt engineering.** Upgrading from Haiku 4.5 to Sonnet 4.6 with no other changes yields +4.2 percentage points. No single prompt change contributed more than +2 points in isolation.
-2. **The reader capability ceiling is ~91.4%** (Opus 4.6). Opus adds only +0.4 over Sonnet 4.6 at roughly 5× the inference cost, ruling out "scale up the reader" as a lever for further gains.
-3. **Per-question-type prompt routing underperforms** a monolithic multi-mode prompt for every reader tested. Shorter targeted prompts strip reasoning scaffolding that readers need for multi-step memory tasks.
-4. **Self-consistency voting fails** on this benchmark. Sampling at temperature 0.3 with majority voting reduces accuracy by 1.4 points — Sonnet's remaining errors are systematic, not stochastic.
-5. **95.6% of remaining errors are reader-confusion**, concentrated in multi-session counting questions. Retrieval is not the bottleneck; architectural changes (observation extraction, tool-assisted counting) are needed for further gains.
-
-### Methodology
-
-The pipeline has three stages, held constant across all ablations except where explicitly varied:
-
-1. **Retrieval** — 8-signal RRF fusion (vector + BM25 + graph + intent + recency + frequency + confidence + type boost) at k=50, one fresh Pensyve instance per question, event_time populated from per-session dates
-2. **Presentation** — Memories grouped by source session and sorted chronologically within each group, serialized as session blocks in the reader prompt
-3. **Reading** — LLM reader (Claude Sonnet 4.6, temperature 0) consumes grouped memories + question + current date, produces chain-of-thought answer
-4. **Judging** — GPT-4o via the upstream LongMemEval `evaluate_qa.py` script (commit `982fbd7` of the reference repo), matching the judge used by all published competitors
-
-No fine-tuning, prompt-tuning on the test set, or per-question adaptation is used. All reader calls are executed via the Anthropic Message Batch API.
-
-### Reproducibility
-
-The runtime is Apache 2.0 licensed and all the pipeline components (retrieval fusion, embedding model, grouping logic) are in this repository. Reader calls against Anthropic's API are reproducible to the precision of the model serving and temperature 0 determinism.
-
-For the full methodology, ablation tables, failure audit, and discussion of each finding, see the [technical report (PDF)](docs/benchmarks/longmemeval-reader-ablation.pdf). The typst source is at [docs/benchmarks/longmemeval-reader-ablation.typ](docs/benchmarks/longmemeval-reader-ablation.typ) and can be rebuilt from the repository root with `typst compile docs/benchmarks/longmemeval-reader-ablation.typ`.
-
 ## Competitive Landscape
 
 | What you need                    | Pensyve                                                       | Mem0                | Zep                  | Honcho         |
