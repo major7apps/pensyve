@@ -198,7 +198,7 @@ Several observations:
 
 - *Opus buys only +0.4 over Sonnet.* Despite being the most capable Claude model available at the time of this study, Opus 4.6 adds only 2 correct answers over Sonnet 4.6 at approximately 5× the inference cost. Sonnet 4.6 is effectively at the *reader capability ceiling* for this pipeline — further gains must come from elsewhere.
 
-- *The gap between Haiku and Sonnet exceeds our prompt-engineering gains.* The largest single-prompt gain we measured (V3 → V4 on Haiku) was +0.2 points. The reader upgrade is 20× larger.
+- *The gap between Haiku and Sonnet exceeds any single prompt-engineering gain we measured.* The largest single-prompt gain in our ablation was V3 → V4 on Sonnet 4.6 at +1.6 points (see Table 4, §3.3). The reader upgrade is $tilde.eq 2.6$× that — the single largest lever in the study.
 
 === Per-category behavior
 
@@ -223,7 +223,7 @@ Table 3 decomposes the ablation by question type. The single-row summary hides a
   )
 ) <tab-percategory>
 
-*Opus gains on counting (+3 multi-session) and recency (+3 knowledge-update), but loses on temporal ordering (−4 temporal-reasoning)* relative to Sonnet. For a category with $n=133$ the 4-point swing is at the edge of noise, but the direction is consistent with other evidence from our failure audit: Opus produces longer, more hedged chains of thought that occasionally introduce small arithmetic or chronological drift on precise-date questions. Multi-row aggregation hides this — the total shows Opus as strictly better by 2 points, but a category-routed reader could theoretically combine the best of Sonnet (temporal) and Opus (counting + recency) to reach an upper bound of 462/500 = 92.4%, an additional +1.4 points over our best single-reader run. This is a small absolute gain but a publishable methodology point: *scaling up the reader is not a monotone win on memory tasks — model capability is task-dependent.*
+*Opus gains on counting (+3 multi-session) and recency (+3 knowledge-update), but loses on temporal ordering (−4 temporal-reasoning)* relative to Sonnet. For a category with $n=133$ the 4-point swing is at the edge of noise, but the direction is consistent with other evidence from our failure audit: Opus produces longer, more hedged chains of thought that occasionally introduce small arithmetic or chronological drift on precise-date questions. Multi-row aggregation hides this — the total shows Opus as strictly better by 2 points, but a category-routed reader could theoretically combine the best of Sonnet (temporal) and Opus (counting + recency) to reach an upper bound of 461/500 = 92.2%, an additional +1.2 points over our best single-reader run. This is a small absolute gain but a publishable methodology point: *scaling up the reader is not a monotone win on memory tasks — model capability is task-dependent.*
 
 == Prompt ablation
 
