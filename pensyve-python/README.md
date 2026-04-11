@@ -88,8 +88,16 @@ entity = p.entity("user", kind="user")
 # Remember a fact
 p.remember(entity=entity, fact="User prefers Python", confidence=0.95)
 
-# Recall memories
+# Recall memories (flat list)
 results = p.recall("programming language", entity=entity)
+
+# Recall memories clustered by source session — the canonical entry point
+# for "memory as input to an LLM reader" workflows. Each SessionGroup
+# corresponds to one conversation episode and is sorted chronologically.
+groups = p.recall_grouped("programming language", limit=50)
+for g in groups:
+    for m in g.memories:
+        print(f"[{g.session_time}] {m.content}")
 
 # Record an episode
 with p.episode(entity) as ep:
@@ -313,11 +321,8 @@ cd pensyve-wasm && cargo check     # WASM (standalone)
 ### Benchmarks
 
 ```bash
-# Run LongMemEval_S evaluation (builtin dataset: 87.5% baseline)
-python benchmarks/longmemeval/run.py --verbose
-
-# Run weight optimization
-python benchmarks/tuning/optimize.py --maxiter 50
+# Synthetic recall smoke test (planted facts, no external dataset required)
+python benchmarks/synthetic/run.py --generate --evaluate --verbose
 ```
 
 ## Competitive Landscape

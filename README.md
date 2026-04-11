@@ -83,6 +83,29 @@ for r in results:
     print(f"[{r.score:.2f}] {r.content}")
 ```
 
+### Recall grouped: feed an LLM reader without rebuilding session blocks
+
+When the consumer of recalled memories is another LLM (the dominant
+"memory for an AI agent" pattern), `recall_grouped()` returns memories
+already clustered by source session and ordered chronologically — ready
+to format as session blocks in a reader prompt.
+
+```python
+import pensyve
+
+p = pensyve.Pensyve()
+groups = p.recall_grouped("How many projects have I led this year?", limit=50)
+
+# Each group is one conversation session — feed it to a reader directly.
+for i, g in enumerate(groups, start=1):
+    print(f"### Session {i} ({g.session_time}):")
+    for m in g.memories:
+        print(f"  {m.content}")
+```
+
+No more manual `OrderedDict` clustering, no more reordering by date string,
+no more boilerplate every consumer has to reinvent.
+
 ### Remember: store an explicit fact
 
 ```python
@@ -141,8 +164,12 @@ entity = p.entity("user", kind="user")
 # Remember a fact
 p.remember(entity=entity, fact="User prefers Python", confidence=0.95)
 
-# Recall memories
+# Recall memories (flat list)
 results = p.recall("programming language", entity=entity)
+
+# Recall memories clustered by source session — the canonical entry point
+# for "memory as input to an LLM reader" workflows.
+groups = p.recall_grouped("programming language", limit=50)
 
 # Record an episode
 with p.episode(entity) as ep:
@@ -254,9 +281,14 @@ curl -X POST http://localhost:3000/v1/remember \
 curl -X POST http://localhost:3000/v1/recall \
   -H "Content-Type: application/json" \
   -d '{"query": "programming language", "entity": "seth"}'
+
+# Recall, clustered by source session (canonical for LLM-reader workflows)
+curl -X POST http://localhost:3000/v1/recall_grouped \
+  -H "Content-Type: application/json" \
+  -d '{"query": "How many books did I buy?", "limit": 50, "order": "chronological"}'
 ```
 
-**Endpoints:** `GET /v1/health`, `POST /v1/recall`, `POST /v1/remember`, `POST /v1/entities`, `DELETE /v1/entities/{name}`, `POST /v1/inspect`, `GET /v1/stats`, `PATCH /v1/memories/{id}`, `DELETE /v1/memories/{id}`
+**Endpoints:** `GET /v1/health`, `POST /v1/recall`, `POST /v1/recall_grouped`, `POST /v1/remember`, `POST /v1/entities`, `DELETE /v1/entities/{name}`, `POST /v1/inspect`, `GET /v1/stats`, `PATCH /v1/memories/{id}`, `DELETE /v1/memories/{id}`
 
 ### TypeScript SDK
 
@@ -272,6 +304,16 @@ const p = new Pensyve({
 });
 await p.remember({ entity: "seth", fact: "Likes TypeScript", confidence: 0.9 });
 const memories = await p.recall("programming", { entity: "seth" });
+
+// Session-grouped recall — feed an LLM reader without rebuilding session blocks.
+const { groups } = await p.recallGrouped("how many projects did I lead?", {
+  limit: 50,
+  order: "chronological",
+});
+for (const g of groups) {
+  console.log(`### Session ${g.sessionId} (${g.sessionTime})`);
+  for (const m of g.memories) console.log(`  ${m.content}`);
+}
 ```
 
 ### Go SDK
@@ -464,11 +506,8 @@ cd pensyve-wasm && cargo check     # WASM (standalone)
 ### Benchmarks
 
 ```bash
-# Run LongMemEval_S evaluation
-python benchmarks/longmemeval/run.py --verbose
-
-# Run weight optimization
-python benchmarks/tuning/optimize.py --maxiter 50
+# Synthetic recall smoke test (planted facts, no external dataset required)
+python benchmarks/synthetic/run.py --generate --evaluate --verbose
 ```
 
 ## Competitive Landscape

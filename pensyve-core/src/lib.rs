@@ -13,6 +13,7 @@ pub mod multimodal;
 pub mod observability;
 pub mod ocr;
 pub mod procedural;
+pub mod recall_grouped;
 pub mod reranker;
 pub mod retrieval;
 pub mod rrf;

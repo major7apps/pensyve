@@ -105,6 +105,11 @@ export interface Memory {
   confidence: number;
   stability: number;
   score?: number;
+  /**
+   * When the described event occurred (ISO 8601 / RFC 3339). Only set for
+   * episodic memories that were ingested with an explicit `when=`.
+   */
+  eventTime?: string;
 }
 
 export interface RecallOptions {
@@ -120,6 +125,54 @@ export interface RecallResult {
   memories: Memory[];
   /** Opaque cursor for fetching the next page of results. */
   cursor?: string;
+}
+
+/** Ordering used by `recallGrouped()`. */
+export type RecallGroupedOrder = "chronological" | "relevance";
+
+/** Options for `recallGrouped()`. */
+export interface RecallGroupedOptions {
+  /**
+   * Maximum number of memories to consider across all groups combined.
+   * Same semantics as `RecallOptions.limit`. Default: 50.
+   */
+  limit?: number;
+  /**
+   * `"chronological"` (default, oldest session first) or `"relevance"`
+   * (highest-scoring session first).
+   */
+  order?: RecallGroupedOrder;
+  /** Optional cap on the number of groups returned. */
+  maxGroups?: number;
+}
+
+/**
+ * A cluster of recalled memories sharing a source conversation session.
+ *
+ * Returned by `recallGrouped()`. Memories from the same episode cluster
+ * into one group sorted by event time within the group; semantic and
+ * procedural memories appear as singleton groups with `sessionId = null`.
+ */
+export interface SessionGroup {
+  /**
+   * Episode (session) UUID, or `null` for semantic / procedural memories
+   * that don't belong to an episode.
+   */
+  sessionId: string | null;
+  /**
+   * Representative timestamp for the group (ISO 8601 / RFC 3339). Earliest
+   * event time across the group's memories.
+   */
+  sessionTime: string;
+  /** Memories in conversation order (event time ascending within the group). */
+  memories: Memory[];
+  /** Aggregated relevance score for the group (max RRF score across members). */
+  groupScore: number;
+}
+
+/** Result returned by `recallGrouped()`. */
+export interface RecallGroupedResult {
+  groups: SessionGroup[];
 }
 
 export interface RememberOptions {
@@ -346,6 +399,57 @@ export class Pensyve {
       memories: body.memories ?? [],
       cursor: body.cursor,
     };
+  }
+
+  /**
+   * Recall memories matching a query, clustered by source session.
+   *
+   * Runs the normal RRF fusion pipeline server-side and then clusters the
+   * top-`limit` memories by source episode. Memories from the same session
+   * cluster into a single {@link SessionGroup}, sorted in conversation order
+   * within the group; semantic and procedural memories surface as singleton
+   * groups with `sessionId = null`.
+   *
+   * This is the canonical entry point for "memory for an AI reader" — the
+   * returned `groups` can be formatted directly into a reader prompt with
+   * no SDK-side grouping logic. Validated by the LongMemEval R6 benchmark
+   * replay (see pensyve-docs/research/benchmark-sprint/18-session-grouped-recall-parity.md).
+   *
+   * @param query - The search query.
+   * @param options - Optional limit, ordering, and group cap.
+   * @returns A {@link RecallGroupedResult} containing matched session groups.
+   * @throws {Error} on empty query.
+   * @throws {PensyveError} on API error.
+   */
+  async recallGrouped(
+    query: string,
+    options: RecallGroupedOptions = {},
+  ): Promise<RecallGroupedResult> {
+    if (!query) {
+      throw new Error("recallGrouped: query must not be empty");
+    }
+    const res = await this.request(
+      `${this.baseUrl}/v1/recall_grouped`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query,
+          limit: options.limit ?? 50,
+          order: options.order ?? "chronological",
+          max_groups: options.maxGroups,
+        }),
+      },
+      "RecallGrouped",
+    );
+    const raw = await res.json();
+    const body = camelCaseKeys(raw) as
+      | { groups?: SessionGroup[] }
+      | SessionGroup[];
+    if (Array.isArray(body)) {
+      return { groups: body as SessionGroup[] };
+    }
+    return { groups: body.groups ?? [] };
   }
 
   /**

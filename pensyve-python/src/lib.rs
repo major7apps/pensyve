@@ -10,6 +10,7 @@ use uuid::Uuid;
 use pensyve_core::config::{PensyveConfig, RetrievalConfig};
 use pensyve_core::consolidation::ConsolidationEngine;
 use pensyve_core::embedding::OnnxEmbedder;
+use pensyve_core::recall_grouped::{OrderBy, RecallGroupedConfig};
 use pensyve_core::retrieval::RecallEngine;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
@@ -58,6 +59,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEntity>()?;
     m.add_class::<PyEpisode>()?;
     m.add_class::<PyMemory>()?;
+    m.add_class::<PySessionGroup>()?;
     m.add_function(wrap_pyfunction!(embedding_info, m)?)?;
     Ok(())
 }
@@ -113,6 +115,25 @@ fn memory_confidence(mem: &types::Memory) -> f32 {
         types::Memory::Episodic(_) => 1.0,
         types::Memory::Semantic(m) => m.confidence,
         types::Memory::Procedural(m) => m.reliability,
+    }
+}
+
+/// Build a `PyMemory` from a core `Memory` and the RRF score it was
+/// retrieved with. Centralises the conversion logic so `recall`,
+/// `recall_grouped`, and any future retrieval entry points stay consistent.
+fn py_memory_from(memory: &types::Memory, score: f32) -> PyMemory {
+    let (salience, storage_strength, event_time, superseded_by) = episodic_fields(memory);
+    PyMemory {
+        id: memory.id().to_string(),
+        content: memory_content(memory),
+        memory_type: memory_type_str(memory).to_string(),
+        confidence: memory_confidence(memory),
+        stability: memory.stability(),
+        score,
+        salience,
+        storage_strength,
+        event_time,
+        superseded_by,
     }
 }
 
@@ -404,6 +425,85 @@ impl PyPensyve {
         }
 
         Ok(memories)
+    }
+
+    /// Recall memories matching a query, clustered by source session.
+    ///
+    /// Runs the normal RRF fusion pipeline and then groups the top-`limit`
+    /// results by `episode_id`. Memories from the same session cluster into a
+    /// single `SessionGroup` sorted by event time within the group. Semantic
+    /// and procedural memories (which have no episode) appear as singleton
+    /// groups with `session_id=None`, so callers can iterate uniformly.
+    ///
+    /// This is the canonical entry point for "memory for an AI reader": the
+    /// returned groups can be formatted directly into a reader prompt with no
+    /// SDK-side grouping logic.
+    ///
+    /// Args:
+    ///     query: Search query string.
+    ///     limit: Maximum number of memories to consider across all groups
+    ///         (default: 50).
+    ///     order: "chronological" (default, oldest session first) or
+    ///         "relevance" (highest group score first).
+    ///     `max_groups`: Optional cap on the number of groups returned.
+    #[pyo3(signature = (query, *, limit=50, order="chronological", max_groups=None))]
+    fn recall_grouped(
+        &self,
+        query: &str,
+        limit: usize,
+        order: &str,
+        max_groups: Option<usize>,
+    ) -> PyResult<Vec<PySessionGroup>> {
+        if query.is_empty() {
+            return Err(PyRuntimeError::new_err("query must not be empty"));
+        }
+
+        let order_by = match order {
+            "chronological" => OrderBy::Chronological,
+            "relevance" => OrderBy::Relevance,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "order must be 'chronological' or 'relevance', got '{other}'"
+                )));
+            }
+        };
+
+        let config = RecallGroupedConfig {
+            limit,
+            order: order_by,
+            max_groups,
+        };
+
+        // Lock held across recall, same as `recall()` — RecallEngine borrows
+        // &VectorIndex for the duration of the call.
+        let vi = self.inner.vector_index.lock().unwrap();
+        let engine = RecallEngine::new(
+            self.inner.storage.as_ref(),
+            self.inner.embedder.as_ref(),
+            &vi,
+            &self.inner.retrieval_config,
+        );
+
+        let groups = engine
+            .recall_grouped(query, self.inner.namespace.id, &config)
+            .map_err(|e| PyRuntimeError::new_err(format!("Recall failed: {e}")))?;
+
+        Ok(groups
+            .into_iter()
+            .map(|g| PySessionGroup {
+                session_id: g.session_id.map(|id| id.to_string()),
+                session_time: g.session_time.to_rfc3339(),
+                // Each ScoredMemory carries its own per-member RRF score —
+                // surface that on the wrapped PyMemory rather than overwriting
+                // every member with the group's max.
+                memories: g
+                    .memories
+                    .iter()
+                    .map(|sm| py_memory_from(&sm.memory, sm.score))
+                    .collect(),
+                group_score: g.group_score,
+            })
+            .collect())
     }
 
     /// Store an explicit semantic memory.
@@ -824,5 +924,55 @@ impl PyMemory {
         }
         s.push(')');
         s
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PySessionGroup
+// ---------------------------------------------------------------------------
+
+/// A cluster of memories from the same conversation session.
+///
+/// Returned by `Pensyve.recall_grouped()`. Memories from the same episode
+/// are clustered into one group, sorted by event time within the group.
+/// Semantic and procedural memories surface as singleton groups with
+/// `session_id = None`.
+#[pyclass(name = "SessionGroup", skip_from_py_object)]
+#[derive(Clone)]
+pub struct PySessionGroup {
+    /// Episode (session) UUID as a string, or `None` for semantic /
+    /// procedural memories that don't belong to an episode.
+    #[pyo3(get)]
+    session_id: Option<String>,
+    /// Representative timestamp for the group, as an ISO 8601 / RFC 3339
+    /// string. Equals the earliest event time across the group's memories.
+    #[pyo3(get)]
+    session_time: String,
+    /// Memories belonging to this group, sorted by event time ascending
+    /// (conversation order within the session).
+    #[pyo3(get)]
+    memories: Vec<PyMemory>,
+    /// Aggregated relevance score for the group — the max RRF score across
+    /// the group's member memories.
+    #[pyo3(get)]
+    group_score: f32,
+}
+
+#[pymethods]
+impl PySessionGroup {
+    fn __repr__(&self) -> String {
+        format!(
+            "SessionGroup(session_id={}, n_memories={}, session_time='{}', group_score={:.4})",
+            self.session_id
+                .as_deref()
+                .map_or("None".to_string(), |id| format!("'{id}'")),
+            self.memories.len(),
+            self.session_time,
+            self.group_score,
+        )
+    }
+
+    fn __len__(&self) -> usize {
+        self.memories.len()
     }
 }

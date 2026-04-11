@@ -30,9 +30,22 @@ const pensyve = new Pensyve({
 // Remember a fact
 await pensyve.remember("user", "Prefers dark mode and TypeScript");
 
-// Recall relevant memories
+// Recall relevant memories (flat list)
 const memories = await pensyve.recall("What are the user's preferences?");
 console.log(memories);
+
+// Recall memories clustered by source session — the canonical entry point
+// for "memory as input to an LLM reader" workflows. Each SessionGroup is one
+// conversation episode, sorted chronologically and ready to format as a
+// reader prompt block.
+const { groups } = await pensyve.recallGrouped("how many projects this year?", {
+  limit: 50,
+  order: "chronological",
+});
+for (const g of groups) {
+  console.log(`### Session ${g.sessionId} (${g.sessionTime})`);
+  for (const m of g.memories) console.log(`  ${m.content}`);
+}
 
 // Track a conversation episode
 const episode = await pensyve.startEpisode(["user", "assistant"]);
@@ -53,14 +66,15 @@ await episode.end({ summary: "Discussed deployment strategy" });
 
 ### Core Methods
 
-| Method                                | Description                                    |
-| ------------------------------------- | ---------------------------------------------- |
-| `recall(query, options?)`             | Search memories with 8-signal fusion retrieval |
-| `remember(entity, fact, confidence?)` | Store a new memory                             |
-| `forget(entity, hardDelete?)`         | Remove an entity's memories                    |
-| `inspect(entity, options?)`           | View an entity's memory details                |
-| `consolidate()`                       | Trigger background memory consolidation        |
-| `health()`                            | Check API health status                        |
+| Method                                | Description                                                         |
+| ------------------------------------- | ------------------------------------------------------------------- |
+| `recall(query, options?)`             | Search memories with 8-signal fusion retrieval (flat list)          |
+| `recallGrouped(query, options?)`      | Same retrieval, clustered by source session (`SessionGroup[]`)      |
+| `remember(entity, fact, confidence?)` | Store a new memory                                                  |
+| `forget(entity, hardDelete?)`         | Remove an entity's memories                                         |
+| `inspect(entity, options?)`           | View an entity's memory details                                     |
+| `consolidate()`                       | Trigger background memory consolidation                             |
+| `health()`                            | Check API health status                                             |
 
 ### Episodes
 

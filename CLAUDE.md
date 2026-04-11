@@ -66,11 +66,8 @@ cargo run -p pensyve-cli -- recall "query text"
 # Build and run the MCP server
 cargo run -p pensyve-mcp
 
-# Run benchmarks
-.venv/bin/python benchmarks/longmemeval/run.py --verbose
-
-# Run weight tuning (requires scipy)
-.venv/bin/python benchmarks/tuning/optimize.py
+# Run synthetic recall smoke test (planted facts)
+.venv/bin/python benchmarks/synthetic/run.py --generate --evaluate --verbose
 ```
 
 ### Python environment setup
