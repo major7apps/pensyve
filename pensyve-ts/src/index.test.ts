@@ -1,6 +1,6 @@
 import { describe, expect, test, mock } from "bun:test";
 import { Pensyve, PensyveError } from "./index";
-import type { PensyveConfig, RecallResult } from "./index";
+import type { PensyveConfig, RecallGroupedResult, RecallResult, SessionGroup } from "./index";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -20,14 +20,26 @@ function textResponse(text: string, status = 500, statusText = "Internal Server 
   return new Response(text, { status, statusText });
 }
 
+/**
+ * Mock fetch signature accepted by `makeClient`. The SDK only ever calls
+ * its injected `fetch` with a string URL, so narrowing `url` to `string`
+ * (rather than the full `string | URL | Request` of `globalThis.fetch`)
+ * lets call sites declare their parameter types naturally without
+ * triggering parameter-contravariance complaints from the type checker.
+ */
+type MockFetch = (
+  url: string,
+  init?: RequestInit,
+) => Promise<Response>;
+
 /** Build a Pensyve client with a mock fetch. */
 function makeClient(
-  fetchFn: (...args: unknown[]) => Promise<Response>,
+  fetchFn: MockFetch,
   extra: Partial<PensyveConfig> = {},
 ): Pensyve {
   return new Pensyve({
     baseUrl: "http://localhost:8000",
-    fetch: fetchFn as typeof globalThis.fetch,
+    fetch: fetchFn as unknown as typeof globalThis.fetch,
     retries: 0, // disable retries by default in tests for predictability
     ...extra,
   });
@@ -266,7 +278,7 @@ describe("entity()", () => {
     const client = makeClient(fetchFn);
     await client.entity("bob", "agent");
 
-    expect(captured).toEqual({ name: "bob", kind: "agent" });
+    expect(captured!).toEqual({ name: "bob", kind: "agent" });
   });
 
   test("defaults kind to user", async () => {
@@ -406,6 +418,175 @@ describe("recall()", () => {
     await client.recall("test");
 
     expect(captured!.limit).toBe(5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// recallGrouped()
+// ---------------------------------------------------------------------------
+
+describe("recallGrouped()", () => {
+  test("posts to /v1/recall_grouped with chronological default order", async () => {
+    const calls: { url: string; body: Record<string, unknown> }[] = [];
+    const fetchFn = mock(async (url: string, init?: RequestInit) => {
+      calls.push({ url, body: JSON.parse(init?.body as string) });
+      return jsonResponse({ groups: [] });
+    });
+
+    const client = makeClient(fetchFn);
+    await client.recallGrouped("books");
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe("http://localhost:8000/v1/recall_grouped");
+    expect(calls[0].body.query).toBe("books");
+    expect(calls[0].body.limit).toBe(50);
+    expect(calls[0].body.order).toBe("chronological");
+    expect(calls[0].body.max_groups).toBeUndefined();
+  });
+
+  test("parses groups response with camelCase keys", async () => {
+    const fetchFn = mock(async () =>
+      jsonResponse({
+        groups: [
+          {
+            session_id: "ep-1",
+            session_time: "2026-01-01T10:00:00+00:00",
+            group_score: 0.92,
+            memories: [
+              {
+                id: "m-a",
+                content: "user: hello",
+                memory_type: "episodic",
+                confidence: 1.0,
+                stability: 0.7,
+                event_time: "2026-01-01T10:00:00+00:00",
+              },
+              {
+                id: "m-b",
+                content: "assistant: hi",
+                memory_type: "episodic",
+                confidence: 1.0,
+                stability: 0.7,
+                event_time: "2026-01-01T10:00:30+00:00",
+              },
+            ],
+          },
+          {
+            session_id: null,
+            session_time: "2026-02-01T09:00:00+00:00",
+            group_score: 0.51,
+            memories: [
+              {
+                id: "m-c",
+                content: "the user prefers hardcover",
+                memory_type: "semantic",
+                confidence: 0.9,
+                stability: 1.0,
+              },
+            ],
+          },
+        ],
+      })
+    );
+
+    const client = makeClient(fetchFn);
+    const result: RecallGroupedResult = await client.recallGrouped("books");
+
+    expect(result.groups).toHaveLength(2);
+    const [first, second] = result.groups;
+    expect(first.sessionId).toBe("ep-1");
+    expect(first.sessionTime).toBe("2026-01-01T10:00:00+00:00");
+    expect(first.groupScore).toBeCloseTo(0.92);
+    expect(first.memories).toHaveLength(2);
+    expect(first.memories[0].memoryType).toBe("episodic");
+    expect(first.memories[0].eventTime).toBe("2026-01-01T10:00:00+00:00");
+    expect(second.sessionId).toBeNull();
+    expect(second.memories[0].memoryType).toBe("semantic");
+  });
+
+  test("forwards limit, order, and maxGroups in body", async () => {
+    let captured: Record<string, unknown> | null = null;
+    const fetchFn = mock(async (_url: string, init?: RequestInit) => {
+      captured = JSON.parse(init?.body as string);
+      return jsonResponse({ groups: [] });
+    });
+
+    const client = makeClient(fetchFn);
+    await client.recallGrouped("books", {
+      limit: 25,
+      order: "relevance",
+      maxGroups: 5,
+    });
+
+    expect(captured!.limit).toBe(25);
+    expect(captured!.order).toBe("relevance");
+    expect(captured!.max_groups).toBe(5);
+  });
+
+  test("handles empty groups response", async () => {
+    const fetchFn = mock(async () => jsonResponse({ groups: [] }));
+    const client = makeClient(fetchFn);
+    const result = await client.recallGrouped("nothing matches");
+    expect(result.groups).toEqual([]);
+  });
+
+  test("handles bare-array groups response (legacy shape)", async () => {
+    const fetchFn = mock(async () =>
+      jsonResponse([
+        {
+          session_id: "ep-only",
+          session_time: "2026-01-01T00:00:00+00:00",
+          group_score: 0.5,
+          memories: [],
+        },
+      ])
+    );
+    const client = makeClient(fetchFn);
+    const result = await client.recallGrouped("legacy");
+    expect(result.groups).toHaveLength(1);
+    expect(result.groups[0].sessionId).toBe("ep-only");
+  });
+
+  test("session group exposes a usable shape for downstream code", async () => {
+    const fetchFn = mock(async () =>
+      jsonResponse({
+        groups: [
+          {
+            session_id: "ep-1",
+            session_time: "2026-03-01T00:00:00+00:00",
+            group_score: 0.7,
+            memories: [
+              {
+                id: "m-x",
+                content: "single turn",
+                memory_type: "episodic",
+                confidence: 1.0,
+                stability: 0.8,
+              },
+            ],
+          },
+        ],
+      })
+    );
+    const client = makeClient(fetchFn);
+    const result = await client.recallGrouped("anything");
+    const g: SessionGroup = result.groups[0];
+    // The reader-prompt formatting pattern: iterate groups, then memories.
+    const blocks = result.groups.map((group) =>
+      `### Session ${group.sessionId}: ${group.memories.map((m) => m.content).join(" | ")}`
+    );
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toBe("### Session ep-1: single turn");
+    // sessionId is typed as string | null at the consumer level too.
+    const id: string | null = g.sessionId;
+    expect(id).toBe("ep-1");
+  });
+
+  test("rejects empty query before issuing a request", async () => {
+    const fetchFn = mock(async () => jsonResponse({ groups: [] }));
+    const client = makeClient(fetchFn);
+    await expect(client.recallGrouped("")).rejects.toThrow();
+    expect(fetchFn).not.toHaveBeenCalled();
   });
 });
 
@@ -754,49 +935,39 @@ describe("Error propagation", () => {
 describe("Authentication", () => {
   test("injects Authorization Bearer header when apiKey is set", async () => {
     let capturedHeaders: Record<string, string> = {};
-    const mockFetch = async (url: string | URL | Request, init?: RequestInit) => {
+    const mockFetch: MockFetch = async (_url, init) => {
       const h = new Headers(init?.headers);
       capturedHeaders = Object.fromEntries(h.entries());
       return new Response(JSON.stringify({ status: "ok", version: "0.1.0" }));
     };
 
-    const client = new Pensyve({
-      baseUrl: "http://localhost:8000",
-      apiKey: "test-key-123",
-      fetch: mockFetch as typeof fetch,
-      retries: 0,
-    });
+    const client = makeClient(mockFetch, { apiKey: "test-key-123" });
     await client.health();
     expect(capturedHeaders["authorization"]).toBe("Bearer test-key-123");
   });
 
   test("does not inject header when apiKey is empty", async () => {
     let capturedHeaders: Record<string, string> = {};
-    const mockFetch = async (url: string | URL | Request, init?: RequestInit) => {
+    const mockFetch: MockFetch = async (_url, init) => {
       const h = new Headers(init?.headers);
       capturedHeaders = Object.fromEntries(h.entries());
       return new Response(JSON.stringify({ status: "ok", version: "0.1.0" }));
     };
 
-    const client = new Pensyve({
-      baseUrl: "http://localhost:8000",
-      fetch: mockFetch as typeof fetch,
-      retries: 0,
-    });
+    const client = makeClient(mockFetch);
     await client.health();
     expect(capturedHeaders["x-pensyve-key"]).toBeUndefined();
   });
 
   test("calls onDebug callback", async () => {
     const debugLogs: string[] = [];
-    const mockFetch = async () =>
+    const mockFetch: MockFetch = async () =>
       new Response(JSON.stringify({ status: "ok", version: "0.1.0" }));
 
-    const client = new Pensyve({
-      baseUrl: "http://localhost:8000",
-      fetch: mockFetch as typeof fetch,
-      retries: 0,
-      onDebug: (msg) => debugLogs.push(msg),
+    const client = makeClient(mockFetch, {
+      onDebug: (msg: string): void => {
+        debugLogs.push(msg);
+      },
     });
     await client.health();
     expect(debugLogs.length).toBeGreaterThan(0);

@@ -54,6 +54,62 @@ pub struct RecallResponse {
     pub contradictions: Vec<serde_json::Value>,
 }
 
+/// Request body for `POST /v1/recall_grouped`.
+///
+/// Same underlying recall pipeline as `/v1/recall`, post-processed by
+/// `pensyve_core::recall_grouped::group_by_session` to cluster memories by
+/// source episode. See `pensyve-docs/specs/2026-04-11-pensyve-session-grouped-recall.md`.
+#[derive(Debug, Deserialize)]
+pub struct RecallGroupedRequest {
+    pub query: String,
+    /// Maximum memories to consider across all groups. Default: 50.
+    pub limit: Option<usize>,
+    /// `"chronological"` (default, oldest session first) or `"relevance"`.
+    pub order: Option<String>,
+    /// Optional cap on the number of returned groups.
+    pub max_groups: Option<usize>,
+}
+
+/// One group in a `recall_grouped` response — corresponds to a
+/// `pensyve_core::recall_grouped::SessionGroup` flattened for JSON transport.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RecallGroupedGroup {
+    /// Episode UUID, or `null` for semantic / procedural memories that
+    /// have no episode ancestor.
+    pub session_id: Option<String>,
+    /// Earliest event time across the group's members (ISO 8601 / RFC 3339).
+    pub session_time: String,
+    /// Aggregated relevance score (max RRF score across the group).
+    pub group_score: f32,
+    /// Memories belonging to this group, in conversation (event time) order.
+    pub memories: Vec<RecallMemory>,
+}
+
+/// Response body for `POST /v1/recall_grouped`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RecallGroupedResponse {
+    pub groups: Vec<RecallGroupedGroup>,
+}
+
+/// Parse the `order` field of a `RecallGroupedRequest` into the core
+/// `OrderBy` enum. Treats a missing value as `Chronological` (the default
+/// from the spec) and rejects unknown strings with a `BAD_REQUEST`-bound error.
+fn parse_recall_grouped_order(
+    order: Option<&str>,
+) -> Result<pensyve_core::recall_grouped::OrderBy, RestError> {
+    use pensyve_core::recall_grouped::OrderBy;
+    match order {
+        None | Some("chronological") => Ok(OrderBy::Chronological),
+        Some("relevance") => Ok(OrderBy::Relevance),
+        Some(other) => Err(RestError(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "order must be 'chronological' or 'relevance', got '{other}'"
+            ),
+        )),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RememberRequest {
     pub entity: String,
@@ -347,6 +403,7 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/v1/health", routing::get(health))
         .route("/v1/recall", routing::post(recall))
+        .route("/v1/recall_grouped", routing::post(recall_grouped))
         .route("/v1/remember", routing::post(remember))
         .route("/v1/observe", routing::post(observe))
         .route("/v1/entities", routing::post(create_entity))
@@ -493,6 +550,92 @@ async fn recall(
     }
 
     Ok(Json(response))
+}
+
+/// `POST /v1/recall_grouped` — RRF recall + session clustering server-side.
+///
+/// Same retrieval pipeline as `/v1/recall`, post-processed by
+/// `pensyve_core::recall_grouped::group_by_session`. Returns a list of
+/// `RecallGroupedGroup`s instead of a flat memory list. The TS, Python, and
+/// Go SDKs all map this endpoint to a `recallGrouped` / `recall_grouped`
+/// method.
+async fn recall_grouped(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
+    Json(body): Json<RecallGroupedRequest>,
+) -> Result<impl IntoResponse, RestError> {
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
+    let limit = body.limit.unwrap_or(50);
+    let order = parse_recall_grouped_order(body.order.as_deref())?;
+    let max_groups = body.max_groups;
+
+    // Embed the query off the lock — embedding serializes on a Mutex, so
+    // holding the vector index lock during embedding would block reads.
+    let embedder = ps.embedder.clone();
+    let query_text = body.query.clone();
+    let query_embedding = tokio::task::spawn_blocking(move || embedder.embed(&query_text))
+        .await
+        .ok()
+        .and_then(Result::ok);
+
+    // Hold the read lock only for the actual retrieval call.
+    let result = {
+        let vector_index = ps.vector_index.read().await;
+        let engine = RecallEngine::new(
+            ps.storage.as_ref(),
+            &ps.embedder,
+            &vector_index,
+            &ps.retrieval_config,
+        );
+        let flat = engine
+            .recall_with_embedding(
+                &body.query,
+                query_embedding.as_deref(),
+                ps.namespace.id,
+                limit,
+                None,
+            )
+            .map_err(|e| {
+                RestError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Recall error: {e}"),
+                )
+            })?;
+        pensyve_core::recall_grouped::group_by_session(flat.memories, order, max_groups)
+    };
+
+    let _ = ps.storage.log_activity(
+        ps.namespace.id,
+        "recall_grouped",
+        &json!({
+            "query": body.query,
+            "groups": result.len(),
+            "limit": limit,
+        }),
+    );
+
+    let groups: Vec<RecallGroupedGroup> = result
+        .into_iter()
+        .map(|g| RecallGroupedGroup {
+            session_id: g.session_id.map(|id| id.to_string()),
+            session_time: g.session_time.to_rfc3339(),
+            group_score: g.group_score,
+            memories: g
+                .memories
+                .iter()
+                .map(|m| RecallMemory {
+                    id: m.id().to_string(),
+                    content: memory_content(m),
+                    memory_type: memory_type_name(m).to_string(),
+                    confidence: memory_confidence(m),
+                    stability: memory_stability(m),
+                    score: g.group_score,
+                })
+                .collect(),
+        })
+        .collect();
+
+    Ok(Json(RecallGroupedResponse { groups }))
 }
 
 async fn remember(
@@ -1742,4 +1885,109 @@ async fn a2a_task(
         })
         .unwrap_or_default(),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn recall_grouped_request_deserializes_with_defaults() {
+        // Only `query` is required; all other fields have sensible defaults.
+        let raw = json!({"query": "books"});
+        let req: RecallGroupedRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.query, "books");
+        assert_eq!(req.limit, None);
+        assert_eq!(req.order, None);
+        assert_eq!(req.max_groups, None);
+    }
+
+    #[test]
+    fn recall_grouped_request_deserializes_full_payload() {
+        let raw = json!({
+            "query": "books",
+            "limit": 25,
+            "order": "relevance",
+            "max_groups": 5,
+        });
+        let req: RecallGroupedRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.query, "books");
+        assert_eq!(req.limit, Some(25));
+        assert_eq!(req.order.as_deref(), Some("relevance"));
+        assert_eq!(req.max_groups, Some(5));
+    }
+
+    #[test]
+    fn recall_grouped_response_serializes_to_groups_key() {
+        let resp = RecallGroupedResponse {
+            groups: vec![RecallGroupedGroup {
+                session_id: Some("ep-1".to_string()),
+                session_time: "2026-01-01T10:00:00+00:00".to_string(),
+                group_score: 0.92,
+                memories: vec![RecallMemory {
+                    id: "m-a".to_string(),
+                    content: "user: hi".to_string(),
+                    memory_type: "episodic".to_string(),
+                    confidence: 1.0,
+                    stability: 0.8,
+                    score: 0.92,
+                }],
+            }],
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert!(v.get("groups").is_some(), "response must have a `groups` key");
+        let groups = v["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["session_id"], "ep-1");
+        assert_eq!(groups[0]["session_time"], "2026-01-01T10:00:00+00:00");
+        assert_eq!(groups[0]["memories"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recall_grouped_response_serializes_null_session_id_for_singletons() {
+        let resp = RecallGroupedResponse {
+            groups: vec![RecallGroupedGroup {
+                session_id: None,
+                session_time: "2026-02-01T00:00:00+00:00".to_string(),
+                group_score: 0.5,
+                memories: vec![],
+            }],
+        };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert!(v["groups"][0]["session_id"].is_null());
+    }
+
+    #[test]
+    fn parse_order_kind_chronological() {
+        assert!(matches!(
+            parse_recall_grouped_order(Some("chronological")),
+            Ok(pensyve_core::recall_grouped::OrderBy::Chronological)
+        ));
+    }
+
+    #[test]
+    fn parse_order_kind_relevance() {
+        assert!(matches!(
+            parse_recall_grouped_order(Some("relevance")),
+            Ok(pensyve_core::recall_grouped::OrderBy::Relevance)
+        ));
+    }
+
+    #[test]
+    fn parse_order_kind_default_is_chronological_when_omitted() {
+        assert!(matches!(
+            parse_recall_grouped_order(None),
+            Ok(pensyve_core::recall_grouped::OrderBy::Chronological)
+        ));
+    }
+
+    #[test]
+    fn parse_order_kind_rejects_unknown_value() {
+        assert!(parse_recall_grouped_order(Some("bogus")).is_err());
+    }
 }
