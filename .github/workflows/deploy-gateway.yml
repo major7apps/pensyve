@@ -76,13 +76,18 @@ jobs:
             --query 'services[0].taskDefinition' \
             --output text)
 
-          # Get the full task definition JSON, update the image
+          # Get the full task definition JSON, update the image and ensure
+          # MCP_ALLOWED_HOSTS is present (required by rmcp ≥1.4 for DNS
+          # rebinding protection on public endpoints).
           aws ecs describe-task-definition \
             --task-definition "$TASK_DEF" \
             --query 'taskDefinition' \
             | jq --arg IMAGE "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
               'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy, .enableFaultInjection)
-               | .containerDefinitions[0].image = $IMAGE' \
+               | .containerDefinitions[0].image = $IMAGE
+               | if (.containerDefinitions[0].environment | map(.name) | index("MCP_ALLOWED_HOSTS") | not)
+                 then .containerDefinitions[0].environment += [{"name":"MCP_ALLOWED_HOSTS","value":"mcp.pensyve.com"}]
+                 else . end' \
             > /tmp/task-def.json
 
           # Register new revision with updated image (preserves all secrets/env vars from tofu)
