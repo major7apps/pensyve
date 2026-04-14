@@ -1,0 +1,20 @@
+{
+  "name": "pensyve",
+  "version": "1.0.3",
+  "description": "Persistent memory for Gemini CLI — your agent remembers decisions, patterns, and context across sessions",
+  "mcpServers": {
+    "pensyve": {
+      "httpUrl": "https://mcp.pensyve.com/mcp",
+      "timeout": 30000
+    }
+  },
+  "settings": [
+    {
+      "name": "apiKey",
+      "description": "Pensyve API key (get one at pensyve.com/settings/api-keys)",
+      "envVar": "PENSYVE_API_KEY",
+      "sensitive": true
+    }
+  ],
+  "contextFileName": "GEMINI.md"
+}

@@ -4,11 +4,21 @@
   "description": "Universal memory runtime for AI agents — recall, remember, and inspect memories from VS Code",
   "version": "1.0.5",
   "publisher": "major7apps",
+  "icon": "resources/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/major7apps/pensyve",
+    "directory": "integrations/vscode"
+  },
+  "homepage": "https://pensyve.com",
+  "license": "Apache-2.0",
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
-    "Other"
+    "AI",
+    "Machine Learning",
+    "Data Science"
   ],
   "activationEvents": [
     "onStartupFinished"
@@ -75,6 +85,7 @@
   "devDependencies": {
     "@types/node": "^25.5.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.0.0",
     "typescript": "^5.3.0"
   }
 }
