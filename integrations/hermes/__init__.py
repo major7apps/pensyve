@@ -12,12 +12,13 @@ Or via $HERMES_HOME/pensyve.json:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
@@ -64,7 +65,7 @@ class _MCPClient:
     def __init__(self, api_key: str, base_url: str = _MCP_BASE_URL):
         self._api_key = api_key
         self._base_url = base_url
-        self._session_id: Optional[str] = None
+        self._session_id: str | None = None
         self._request_id = 0
         self._client = None
         self._initialized = False
@@ -236,15 +237,15 @@ class PensyveMemoryProvider(MemoryProvider):
     """Pensyve semantic memory with recall, episodes, and entity-scoped facts."""
 
     def __init__(self):
-        self._config: Optional[dict] = None
-        self._mcp: Optional[_MCPClient] = None
+        self._config: dict | None = None
+        self._mcp: _MCPClient | None = None
         self._mcp_lock = threading.Lock()
         self._entity = "hermes-user"
-        self._episode_id: Optional[str] = None
+        self._episode_id: str | None = None
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
-        self._prefetch_thread: Optional[threading.Thread] = None
-        self._sync_thread: Optional[threading.Thread] = None
+        self._prefetch_thread: threading.Thread | None = None
+        self._sync_thread: threading.Thread | None = None
         self._cron_skipped = False
         # Circuit breaker
         self._consecutive_failures = 0
@@ -280,10 +281,8 @@ class PensyveMemoryProvider(MemoryProvider):
         config_path = Path(hermes_home) / "pensyve.json"
         existing = {}
         if config_path.exists():
-            try:
+            with contextlib.suppress(Exception):
                 existing = json.loads(config_path.read_text())
-            except Exception:
-                pass
         existing.update(values)
         config_path.write_text(json.dumps(existing, indent=2))
 
@@ -451,7 +450,7 @@ class PensyveMemoryProvider(MemoryProvider):
         t = threading.Thread(target=_mirror, daemon=True, name="pensyve-mirror")
         t.start()
 
-    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+    def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         if self._cron_skipped:
             return
         # End episode
@@ -465,7 +464,7 @@ class PensyveMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.debug("Pensyve episode_end failed: %s", e)
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         # Tools available in ALL contexts including cron — cron jobs
         # use pensyve_remember to persist findings for future sessions.
         return list(ALL_TOOL_SCHEMAS)
@@ -545,12 +544,10 @@ class PensyveMemoryProvider(MemoryProvider):
                 t.join(timeout=5.0)
         # End episode if still open
         if self._episode_id and self._mcp:
-            try:
+            with contextlib.suppress(Exception):
                 self._mcp.call_tool("pensyve_episode_end", {
                     "episode_id": self._episode_id,
                 })
-            except Exception:
-                pass
         with self._mcp_lock:
             if self._mcp:
                 self._mcp.close()
