@@ -18,6 +18,10 @@ pub struct GatewayConfig {
     /// Maps API keys to user IDs for self-hosted namespace unification.
     /// Parsed from `PENSYVE_KEY_USER_MAP` env var: `psy_key1:user_id_1,psy_key2:user_id_2`
     pub key_user_map: Vec<(String, String)>,
+    /// Allowed `Host` header values for DNS rebinding protection.
+    /// Parsed from `MCP_ALLOWED_HOSTS` env var (comma-separated).
+    /// If empty, only loopback hosts are allowed (rmcp default).
+    pub allowed_hosts: Vec<String>,
 }
 
 impl GatewayConfig {
@@ -73,6 +77,12 @@ impl GatewayConfig {
                 .unwrap_or(300),
             stripe_api_key: std::env::var("STRIPE_API_KEY").ok(),
             admin_key: std::env::var("PENSYVE_ADMIN_KEY").ok(),
+            allowed_hosts: std::env::var("MCP_ALLOWED_HOSTS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
         }
     }
 }
@@ -93,6 +103,7 @@ mod tests {
             stripe_api_key: None,
             admin_key: None,
             key_user_map: vec![],
+            allowed_hosts: vec![],
         }
     }
 

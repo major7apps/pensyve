@@ -263,6 +263,9 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                 cfg.json_response = true;
                 cfg.sse_keep_alive = None;
                 cfg.cancellation_token = ct.child_token();
+                if !config.allowed_hosts.is_empty() {
+                    cfg = cfg.with_allowed_hosts(config.allowed_hosts.iter().cloned());
+                }
                 cfg
             },
         );

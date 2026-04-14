@@ -375,6 +375,7 @@ mod tests {
             stripe_api_key: None,
             admin_key: None,
             key_user_map: vec![],
+            allowed_hosts: vec![],
         }
     }
 
