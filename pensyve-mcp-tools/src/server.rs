@@ -64,6 +64,7 @@ fn get_or_create_entity(
 pub struct PensyveMcpServer {
     pub state: Arc<PensyveState>,
     pub scope: String,
+    #[expect(dead_code, reason = "used by #[tool_router] macro via rmcp framework")]
     tool_router: ToolRouter<Self>,
 }
 
