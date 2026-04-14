@@ -7,14 +7,14 @@
   },
   "metadata": {
     "description": "Universal memory runtime — cross-session cognitive memory for Claude Code with 6 commands, 4 skills, 2 agents, and 4 lifecycle hooks",
-    "version": "1.0.4"
+    "version": "1.0.6"
   },
   "plugins": [
     {
       "name": "pensyve",
       "source": "./",
       "description": "Universal memory runtime — cross-session cognitive memory for Claude Code. Remembers decisions, patterns, and context across coding sessions.",
-      "version": "1.0.4",
+      "version": "1.0.6",
       "author": {
         "name": "Seth Hobson",
         "email": "seth@major7apps.com"
