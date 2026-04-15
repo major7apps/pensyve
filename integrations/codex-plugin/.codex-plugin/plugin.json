@@ -1,6 +1,6 @@
 {
   "name": "pensyve",
-  "version": "1.0.4",
+  "version": "1.1.0",
   "description": "Persistent memory for Codex — your agent remembers decisions, patterns, and context across sessions",
   "author": {
     "name": "Major7 Apps",

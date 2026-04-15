@@ -17,7 +17,8 @@
             "type": "command",
             "command": "session-memory"
           }
-        ]
+        ],
+        "description": "Processes buffered signals from the session using tiered classification. Tier 1 (decisions, corrections, constraints) are recommended for auto-store. Tier 2 (root causes, failed approaches, performance findings) are presented for review. Formatting, typos, and boilerplate are discarded."
       }
     ]
   }

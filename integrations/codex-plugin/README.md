@@ -91,21 +91,31 @@ For CI or manual auth, use `claude mcp add-json` (or equivalent):
 
 Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
 
+## Intelligent Memory Capture (v1.1.0)
+
+Pensyve uses a tiered classification system to identify what is worth remembering:
+
+- **Tier 1** (auto-store, confidence 0.9+): Explicit decisions, corrections, constraints -- high-signal items that should almost always be captured
+- **Tier 2** (batch review, confidence 0.7-0.89): Root causes, failed approaches, performance findings -- medium-signal items that benefit from user confirmation
+- **Discard**: Formatting, typos, boilerplate -- noise that should never be stored
+
+The Stop hook processes buffered observations from the session and classifies them using this taxonomy before presenting candidates for storage.
+
 ## Skills
 
 | Skill                      | When to Use                     | What It Does                                                                                                                                        |
 | -------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `session-memory`           | End of a work session           | Analyzes the session for decisions, outcomes, and patterns. Presents candidates for confirmation. Stores approved items. Never auto-stores.         |
+| `session-memory`           | End of a work session           | Classifies session signals using tiered taxonomy. Presents tier 1 and tier 2 candidates for confirmation. Stores approved items with provenance.    |
 | `memory-informed-refactor` | Before refactoring a module     | Queries memory for past decisions, failures, and patterns related to the target. Compiles a briefing with recommendations. Offers episode tracking. |
 | `context-loader`           | Session start or context switch | Loads relevant memories to prime the session. Summary mode (10-15 lines) or full mode (tables with scores). Fast and non-blocking.                  |
 | `memory-review`            | Periodic hygiene check          | Audits memory health: stale entries, contradictions, low-confidence items, consolidation candidates. Offers cleanup actions with user confirmation. |
 
 ## Hooks
 
-| Event          | Behavior                                                                   |
-| -------------- | -------------------------------------------------------------------------- |
-| `SessionStart` | Loads relevant memories at session start (configurable: off/summary/full)  |
-| `Stop`         | Extracts decisions and outcomes after task completion, asks before storing |
+| Event          | Behavior                                                                                              |
+| -------------- | ----------------------------------------------------------------------------------------------------- |
+| `SessionStart` | Loads relevant memories at session start (configurable: off/summary/full)                             |
+| `Stop`         | Classifies buffered signals using tiered taxonomy, presents candidates for review, stores with provenance |
 
 ## Available MCP Tools
 
