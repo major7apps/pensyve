@@ -252,7 +252,7 @@ class MemoryCaptureCore:
                 return None
 
         # 2. Tier 1 patterns
-        for pattern, classification, confidence in self._TIER1_PATTERNS:
+        for pattern, _classification, confidence in self._TIER1_PATTERNS:
             if re.search(pattern, content, re.IGNORECASE):
                 return ClassifiedMemory(
                     tier=1,
@@ -270,7 +270,7 @@ class MemoryCaptureCore:
                 )
 
         # 3. Tier 2 patterns
-        for pattern, classification, confidence in self._TIER2_PATTERNS:
+        for pattern, _classification, confidence in self._TIER2_PATTERNS:
             if re.search(pattern, content, re.IGNORECASE):
                 return ClassifiedMemory(
                     tier=2,
