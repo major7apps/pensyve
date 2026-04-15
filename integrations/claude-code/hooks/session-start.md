@@ -75,6 +75,10 @@ If `context_loading` is not "off", silently start an episode to track the sessio
 - Store the returned `episode_id` for use by the Stop hook
 - If the episode fails to start, continue without episode tracking -- do not report the failure to the user
 
+### Step 6: Initialize Signal Buffer
+
+Note that PostToolUse hooks will begin buffering signals for this session. The buffer is processed at Stop and PreCompact events. No action needed here -- this is informational context for the Stop hook.
+
 ## Performance
 
 - This hook MUST complete quickly (< 2 seconds for summary mode)

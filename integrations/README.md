@@ -4,33 +4,39 @@ Pensyve integrations connect the memory runtime to AI coding agents, IDEs, and a
 
 ## AI Coding Agents
 
-| Integration                     | Directory           | Status | Description                                                   |
-| ------------------------------- | ------------------- | ------ | ------------------------------------------------------------- |
-| [Claude Code](claude-code/)     | `claude-code/`      | Stable | Plugin with hooks, skills, commands, and memory-curator agent |
-| [Gemini CLI](gemini-extension/) | `gemini-extension/` | Stable | Extension with skills, commands, and context injection        |
-| [Codex](codex-plugin/)          | `codex-plugin/`     | Stable | Plugin with hooks and skills                                  |
-| [OpenCode](opencode-plugin/)    | `opencode-plugin/`  | Stable | Plugin with MCP integration                                   |
-| [OpenClaw](openclaw-plugin/)    | `openclaw-plugin/`  | Stable | Plugin with MCP integration                                   |
+| Integration                     | Directory           | Status   | Description                                                   |
+| ------------------------------- | ------------------- | -------- | ------------------------------------------------------------- |
+| [Claude Code](claude-code/)     | `claude-code/`      | Stable   | Plugin with hooks, skills, commands, and memory-curator agent |
+| [Gemini CLI](gemini-extension/) | `gemini-extension/` | Stable   | Extension with skills, commands, and context injection        |
+| [Codex](codex-plugin/)          | `codex-plugin/`     | Stable   | Plugin with hooks and skills                                  |
+| [OpenCode](opencode-plugin/)    | `opencode-plugin/`  | Stable   | Plugin with MCP integration                                   |
+| [OpenClaw](openclaw-plugin/)    | `openclaw-plugin/`  | Stable   | Plugin with MCP integration                                   |
+| [Amazon Q](amazon-q/)           | `amazon-q/`         | Scaffold | Memory for Amazon Q Developer via MCP                         |
+| [Kiro](kiro/)                   | `kiro/`             | Scaffold | Memory for Kiro IDE via MCP                                   |
 
 ## IDEs
 
-| Integration                        | Directory         | Status | Description                                     |
-| ---------------------------------- | ----------------- | ------ | ----------------------------------------------- |
-| [VS Code](vscode/)                 | `vscode/`         | Stable | Extension with memory panel and inline commands |
-| [VS Code Copilot](vscode-copilot/) | `vscode-copilot/` | MCP    | Copilot Chat with memory via MCP                |
-| [Cursor](cursor/)                  | `cursor/`         | MCP    | Memory for Cursor agent via MCP                 |
-| [Cline](cline/)                    | `cline/`          | MCP    | Memory for Cline via MCP                        |
-| [Continue](continue/)              | `continue/`       | MCP    | Memory for Continue via MCP                     |
-| [Windsurf](windsurf/)              | `windsurf/`       | MCP    | Memory for Windsurf via MCP                     |
+| Integration                        | Directory         | Status   | Description                                     |
+| ---------------------------------- | ----------------- | -------- | ----------------------------------------------- |
+| [VS Code](vscode/)                 | `vscode/`         | Stable   | Extension with memory panel and inline commands |
+| [VS Code Copilot](vscode-copilot/) | `vscode-copilot/` | MCP      | Copilot Chat with memory via MCP                |
+| [Cursor](cursor/)                  | `cursor/`         | MCP      | Memory for Cursor agent via MCP                 |
+| [Cline](cline/)                    | `cline/`          | MCP      | Memory for Cline via MCP                        |
+| [Continue](continue/)              | `continue/`       | MCP      | Memory for Continue via MCP                     |
+| [Windsurf](windsurf/)              | `windsurf/`       | MCP      | Memory for Windsurf via MCP                     |
+| [JetBrains](jetbrains/)            | `jetbrains/`      | Scaffold | Memory for JetBrains AI Assistant via MCP       |
+| [Neovim](neovim/)                  | `neovim/`         | Scaffold | Memory for Neovim via MCPHub.nvim               |
 
 ## Agent Frameworks
 
-| Integration                             | Directory       | Status | Description                                     |
-| --------------------------------------- | --------------- | ------ | ----------------------------------------------- |
-| [LangChain (Python)](langchain/)        | `langchain/`    | Stable | `PensyveMemory` for LangChain agents            |
-| [LangChain (TypeScript)](langchain-ts/) | `langchain-ts/` | Stable | TypeScript LangChain memory provider            |
-| [CrewAI](crewai/)                       | `crewai/`       | Stable | Memory backend for CrewAI agents                |
-| [AutoGen](autogen/)                     | `autogen/`      | Stable | Memory provider for AutoGen multi-agent systems |
+| Integration                             | Directory       | Status   | Description                                      |
+| --------------------------------------- | --------------- | -------- | ------------------------------------------------ |
+| [LangChain (Python)](langchain/)        | `langchain/`    | Stable   | `PensyveMemory` for LangChain agents             |
+| [LangChain (TypeScript)](langchain-ts/) | `langchain-ts/` | Stable   | TypeScript LangChain memory provider             |
+| [CrewAI](crewai/)                       | `crewai/`       | Stable   | Memory backend for CrewAI agents                 |
+| [AutoGen](autogen/)                     | `autogen/`      | Stable   | Memory provider for AutoGen multi-agent systems  |
+| [Pydantic AI](pydantic-ai/)            | `pydantic-ai/`  | Scaffold | Memory for Pydantic AI agents via MCP            |
+| [Google ADK](google-adk/)              | `google-adk/`   | Scaffold | Memory for Google ADK agents via MCP             |
 
 ## Shared
 

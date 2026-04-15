@@ -143,6 +143,36 @@ cd integrations/langchain
 pytest tests/ -v
 ```
 
+## Intelligent Memory Capture
+
+The `PensyveCaptureHandler` is a LangChain callback handler that automatically
+captures decisions, errors, and tool outputs during chain execution. Signals are
+classified into tiers:
+
+- **Tier 1** — high-confidence memories (architecture decisions, constraints) are auto-stored
+- **Tier 2** — lower-confidence candidates (root causes, failed approaches) are held for review
+
+```python
+from pensyve_capture import PensyveCaptureHandler
+
+handler = PensyveCaptureHandler(client=my_pensyve_client)
+
+# Attach to any chain
+result = chain.invoke(inputs, config={"callbacks": [handler]})
+
+# Review tier 2 candidates after execution
+for mem in handler.get_pending_review():
+    print(f"[review] {mem.fact} (confidence={mem.confidence})")
+
+handler.clear_pending_review()
+```
+
+Install with capture dependencies:
+
+```bash
+pip install pensyve-langchain[capture]
+```
+
 ## Namespace Mapping
 
 LangGraph namespace tuples are joined with `/` to form Pensyve entity names:

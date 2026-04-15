@@ -5,7 +5,7 @@ Pensyve memory provider plugin for [Hermes Agent](https://github.com/hermes-agen
 ## Features
 
 - **MemoryProvider interface** — drop-in replacement for Hermes's built-in memory
-- **4 agent tools** — `pensyve_recall`, `pensyve_remember`, `pensyve_inspect`, `pensyve_forget`
+- **9 agent tools** — `pensyve_recall`, `pensyve_remember`, `pensyve_inspect`, `pensyve_forget`, `pensyve_episode_start`, `pensyve_episode_end`, `pensyve_observe`, `pensyve_status`, `pensyve_account`
 - **Auto-prefetch** — relevant memories injected before each turn (interactive mode)
 - **Episode tracking** — sessions tracked as episodes with start/end lifecycle
 - **Memory mirroring** — built-in Hermes memory writes automatically synced to Pensyve
@@ -67,13 +67,27 @@ The plugin registers on startup. You'll see `Pensyve MCP session initialized` in
 
 1. **Session start** → MCP session initialized, episode started
 2. **Before each turn** → `queue_prefetch()` fires a background recall, results injected via `prefetch()`
-3. **During turns** → Agent can use `pensyve_recall/remember/inspect/forget` tools explicitly
+3. **During turns** → Agent can use all 9 Pensyve tools explicitly
 4. **Memory writes** → Built-in Hermes `memory add` commands mirrored to Pensyve
 5. **Session end** → Episode ended, connections closed
 
 ### Cron Jobs
 
 Tools are available but auto-behaviors (prefetch, mirroring, episodes) are disabled. Cron jobs use `pensyve_remember` explicitly to persist findings.
+
+### Tool Reference
+
+| Tool | Description |
+|------|-------------|
+| `pensyve_recall` | Search memories by semantic similarity and text matching |
+| `pensyve_remember` | Store an explicit fact about an entity |
+| `pensyve_inspect` | List all memories for an entity |
+| `pensyve_forget` | Delete all memories for an entity |
+| `pensyve_episode_start` | Begin tracking an interaction episode |
+| `pensyve_episode_end` | Close an episode and trigger consolidation |
+| `pensyve_observe` | Record an observation within an active episode |
+| `pensyve_status` | Get namespace statistics and health |
+| `pensyve_account` | Get account info, usage, and limits |
 
 ## Authentication
 

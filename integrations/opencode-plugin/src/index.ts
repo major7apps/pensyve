@@ -13,6 +13,26 @@
  *   pensyve_remember                       — store a fact
  *   pensyve_recall                         — search memories
  *   pensyve_status                         — connection, health, account info
+ *
+ * Intelligent Memory Capture — Tiered Classification Taxonomy (v1.0.7)
+ *
+ *   Tier 1 (auto-store, confidence 0.9+):
+ *     Explicit decisions, corrections, constraints, architecture choices,
+ *     dependency version pins, security rules. High-signal items that should
+ *     almost always be captured without prompting the user.
+ *
+ *   Tier 2 (review, confidence 0.7–0.89):
+ *     Root causes, failed approaches, performance findings, debugging outcomes,
+ *     environment quirks. Medium-signal items that benefit from user confirmation
+ *     before storage.
+ *
+ *   Discard:
+ *     Formatting, typos, boilerplate, ephemeral status messages.
+ *     Noise that should never be stored.
+ *
+ *   The auto-capture hook (chat.message) currently stores all substantive
+ *   responses at confidence 0.7 (tier 2). Future versions will integrate the
+ *   shared memory-capture-core classifier for full tiered classification.
  */
 
 import type { Plugin } from "@opencode-ai/plugin";
@@ -86,7 +106,10 @@ export const PensyvePlugin: Plugin = async (ctx) => {
 
       pensyve_remember: tool({
         description:
-          "Store a fact in persistent memory. Use present tense.",
+          "Store a fact in persistent memory. Use present tense. " +
+          "Prefer high confidence (0.9+) for decisions, corrections, and constraints (tier 1). " +
+          "Use moderate confidence (0.7-0.89) for root causes, failed approaches, and findings (tier 2). " +
+          "Do not store formatting, typos, or boilerplate.",
         args: {
           fact: tool.schema.string().describe("The fact to store"),
           confidence: tool.schema

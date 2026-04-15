@@ -1,93 +1,99 @@
 ---
 name: session-memory
-description: "End-of-session memory capture -- analyzes session for decisions, outcomes, and patterns worth remembering, then stores confirmed items via Pensyve. Use when ending a work session or when the user wants to capture what was learned."
-version: 1.0.0
+description: "End-of-session memory capture -- classifies session signals using a tiered taxonomy and stores confirmed items via Pensyve. Use when ending a work session or when the user wants to capture what was learned."
+version: 1.1.0
 ---
 
 # Session Memory Capture
 
-Analyze the current session for memorable decisions, outcomes, and patterns, then store confirmed items in Pensyve memory.
+Analyze the current session using the tiered capture taxonomy, then store confirmed items in Pensyve memory.
 
 ## Instructions
 
 When this skill is invoked (typically at the end of a coding session), follow these steps:
 
-### Step 1: Analyze the Session
+### Step 1: Analyze the Session Using Tiered Classification
 
-Review the current session conversation for three categories of memorable content:
+Review the current session conversation and classify memorable content into two tiers:
 
-**Decisions** (confidence: 0.9):
+**Tier 1 -- Auto-store candidates (confidence >= 0.9):**
 
-- Architecture or design choices ("we decided to use X over Y because...")
-- Technology selections ("chose SQLite for the MVP because...")
-- API design decisions ("the endpoint should accept JSON, not form data")
-- Tradeoff resolutions ("accepted O(n) scan because dataset is small")
+These are high-signal items that should almost always be stored:
 
-**Outcomes** (confidence: 0.8):
+- User explicitly states a decision ("let's use X", "we decided Y", "we chose Z")
+- User corrects agent behavior ("don't do X", "stop doing Y", "no, not that")
+- User states a project constraint ("we can't use X because Y", "must not use Z")
+- Technology migrations ("switching to X", "migrating from Y to Z")
 
-- Bug fixes and their root causes ("the auth failure was caused by expired refresh tokens")
-- Successful approaches ("fixed the race condition by adding a mutex")
-- Failed approaches ("tried connection pooling but it caused deadlocks")
-- Performance findings ("query time dropped from 2s to 50ms after adding the index")
+**Tier 2 -- Review candidates (confidence 0.7-0.89):**
 
-**Patterns** (confidence: 0.7):
+These are medium-signal items that benefit from user confirmation:
 
-- Recurring issues ("this is the third time the cache invalidation was wrong")
-- Workflow discoveries ("running tests before migrations catches schema drift")
-- Cross-cutting observations ("all the timeout errors trace back to the DNS resolver")
+- Debugging session reveals root cause ("the bug was caused by...", "root cause is...")
+- Approach tried and abandoned with reason ("tried X but it failed because...")
+- Performance finding with measurable result ("query time dropped from 2s to 50ms")
+- Cross-component dependency discovered ("X depends on Y", "blocked by Z")
+- Workaround for framework/tool limitation ("workaround: use X instead of Y")
 
-### Step 2: Filter for Significance
+**Discard -- Never store:**
 
-Skip routine, low-signal content that does not warrant long-term storage:
-
-- Simple typo fixes or formatting changes
-- Routine file edits with no architectural significance
-- Standard boilerplate or scaffolding without decisions
-- Repeated application of known patterns (unless the pattern itself is new)
+- Simple typo or formatting fixes
+- Routine lint fixes, import sorting, boilerplate
+- Standard file edits with no architectural significance
+- Repeated application of already-known patterns
+- Very short interactions that are clearly routine
 - Content that is already stored in Pensyve (check via `pensyve_recall` with targeted queries)
 
 ### Step 3: Present Candidates for Confirmation
 
-Present the candidate memories to the user in a structured format:
+Present the candidate memories to the user in a structured format, grouped by tier:
 
 > **Session Memory Candidates**
 >
-> **Decisions** (confidence: 0.9):
+> **Tier 1 -- High confidence (auto-store recommended):**
 >
-> 1. `auth-service`: Chose RS256 over HS256 for JWT signing to support key rotation
-> 2. `api-design`: POST endpoints return 201 with the created resource, not 200
+> 1. `auth-service`: Chose RS256 over HS256 for JWT signing to support key rotation (0.95)
+> 2. `api-design`: POST endpoints return 201 with the created resource, not 200 (0.9)
 >
-> **Outcomes** (confidence: 0.8): 3. `database`: Migration script fails silently when Python < 3.11 -- added version check
+> **Tier 2 -- For review:**
 >
-> **Patterns** (confidence: 0.7): 4. `testing`: Integration tests that touch the filesystem need tmpdir cleanup
+> 3. `database`: Migration script fails silently when Python < 3.11 -- added version check (0.8)
+> 4. `testing`: Integration tests that touch the filesystem need tmpdir cleanup (0.7)
 >
 > Which items should I store? (e.g., "all", "1,3", "none")
 
 ### Step 4: Store Confirmed Items
 
-For each confirmed item, decide the storage type:
+For each confirmed item, decide the storage type based on its tier:
 
-**Episodic (observations)** -- things that happened this session. Call `pensyve_observe` with:
+**Tier 1 items -> Semantic (durable facts).** Call `pensyve_remember` with:
 
-- `episode_id`: From the session state (set by SessionStart hook)
-- `content`: The observation text
-- `source_entity`: `"claude-code"`
+- `entity`: The inferred entity name (lowercase, hyphenated)
+- `fact`: `"[capture/session-memory/tier-1] <fact text>"`
+- `confidence`: 0.9-0.95 (based on classification)
+
+Use for: architecture decisions, technology choices, user preferences, project constraints.
+
+**Tier 2 items -> Episodic (observations).** Call `pensyve_observe` with:
+
+- `episode_id`: From the session state (if episode tracking is active)
+- `content`: `"[capture/session-memory/tier-2] <observation text>"`
+- `source_entity`: `"gemini-cli"`
 - `about_entity`: The inferred entity name (lowercase, hyphenated)
 - `content_type`: `"text"` for decisions/patterns, `"code"` for code-related outcomes
 
-Use for: bug fixes, failed approaches, debugging outcomes, performance findings, session-specific events.
+Use for: root causes, failed approaches, performance findings, dependency discoveries.
 
-**Semantic (durable facts)** -- truths that persist beyond this session. Call `pensyve_remember` with:
-
-- `entity`: The inferred entity name (lowercase, hyphenated)
-- `fact`: The memory text
-- `confidence`: 0.9 for decisions, 0.8 for outcomes, 0.7 for patterns
-
-Use for: architecture decisions, technology choices, user preferences, project conventions.
+If no episode is active, fall back to `pensyve_remember` with confidence 0.7-0.8.
 
 When in doubt, prefer `pensyve_observe` -- the consolidation engine promotes recurring patterns to semantic facts automatically.
 
 Before storing, run `pensyve_recall` with a query matching the candidate fact to check for duplicates. If a highly similar memory already exists (score > 0.85), skip it and inform the user.
+
+**Content sanitization:** Before storing any candidate:
+- Strip anything that looks like an API key, token, password, or credential
+- Truncate individual facts to 512 characters maximum
+- Summarize long code blocks rather than including them verbatim
 
 ### Step 5: Report Results
 

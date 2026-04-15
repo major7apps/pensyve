@@ -121,6 +121,49 @@ class MemoryRecord:
     metadata: dict[str, Any] = {}   # Additional metadata
 ```
 
+## Intelligent Capture (v1.1.0+)
+
+Automatically capture decisions, preferences, and findings from CrewAI task execution into Pensyve memory.
+
+```python
+from pensyve_crewai import PensyveMemory, PensyveCaptureCallbacks
+
+memory = PensyveMemory(namespace="my-crew")
+capture = PensyveCaptureCallbacks(memory=memory)
+
+# Wire into CrewAI
+from crewai import Crew
+crew = Crew(
+    agents=[...],
+    tasks=[...],
+    memory=True,
+    memory_config={"provider": "custom", "config": {"instance": memory}},
+    callbacks=[capture],
+)
+```
+
+### How It Works
+
+- **Task start/end** and **tool use** events are buffered as raw signals
+- At each task end, signals are classified into tiered memory candidates:
+  - **Tier 1** (auto-stored): architecture decisions, behavioral preferences, project constraints
+  - **Tier 2** (review): root causes, failed approaches, performance findings, dependencies
+- Secrets are automatically redacted; long code blocks are stripped
+- Capture **never breaks** CrewAI execution (all callbacks fail silently)
+
+### Reviewing Tier-2 Candidates
+
+```python
+# After crew execution
+pending = capture.get_pending_review()
+for candidate in pending:
+    print(f"[tier {candidate.tier}] {candidate.entity}: {candidate.fact}")
+    # Manually approve:
+    memory.remember(candidate.fact, metadata={"confidence": candidate.confidence})
+
+capture.clear_pending_review()
+```
+
 ## Running Tests
 
 ```bash

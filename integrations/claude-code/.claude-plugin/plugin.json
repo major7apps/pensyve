@@ -1,6 +1,6 @@
 {
   "name": "pensyve",
-  "version": "1.0.6",
+  "version": "1.1.0",
   "description": "Universal memory runtime — cross-session cognitive memory for Claude Code. Remembers decisions, patterns, and context across coding sessions.",
   "author": {
     "name": "Major7 Apps",
