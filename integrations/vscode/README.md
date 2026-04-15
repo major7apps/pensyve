@@ -9,6 +9,7 @@ Universal memory runtime for AI agents -- recall, remember, and inspect memories
 - **Memory Stats**: View memory statistics at a glance
 - **Consolidate**: Trigger memory consolidation (promote episodic to semantic, decay stale memories)
 - **Sidebar Browser**: Browse and search memories from the activity bar
+- **Intelligent Capture** (new in v1.1.0): Automatically captures meaningful signals from your workflow (e.g., file saves) and classifies them into tiered memory candidates. Tier-1 decisions are stored automatically; tier-2 candidates are logged for review in the "Pensyve Capture" output channel.
 
 ## Authentication
 

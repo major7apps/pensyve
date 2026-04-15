@@ -2,9 +2,11 @@ import * as vscode from "vscode";
 import { PensyveClient } from "./client";
 import { recallCommand, rememberCommand, statsCommand, consolidateCommand, disposeOutputChannel } from "./commands";
 import { SidebarProvider } from "./sidebar";
+import { CaptureIntegration } from "./capture";
 
 let statusBarItem: vscode.StatusBarItem | undefined;
 let client: PensyveClient;
+let capture: CaptureIntegration | undefined;
 
 /**
  * Called when the extension is activated.
@@ -51,6 +53,9 @@ export function activate(context: vscode.ExtensionContext): void {
             }
         })
     );
+
+    // Initialize intelligent memory capture (buffers file-save signals)
+    capture = new CaptureIntegration(client, context);
 }
 
 /** Check server health and update the status bar text accordingly. */
@@ -75,7 +80,12 @@ async function updateStatusBar(): Promise<void> {
 }
 
 /** Called when the extension is deactivated. */
-export function deactivate(): void {
+export async function deactivate(): Promise<void> {
+    // Flush any buffered capture signals before shutting down
+    if (capture) {
+        await capture.flush();
+        capture = undefined;
+    }
     disposeOutputChannel();
     if (statusBarItem) {
         statusBarItem.dispose();
