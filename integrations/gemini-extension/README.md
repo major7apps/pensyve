@@ -56,11 +56,21 @@ Then configure MCP with headers (see setup instructions above).
 | `/forget <entity>`  | Delete all memories for an entity (with confirmation)   |
 | `/inspect [entity]` | View all memories grouped by type for an entity         |
 
+## Intelligent Memory Capture (v1.1.0)
+
+Pensyve uses a tiered classification system to identify what is worth remembering:
+
+- **Tier 1** (auto-store, confidence 0.9+): Explicit decisions, corrections, constraints -- high-signal items that should almost always be captured
+- **Tier 2** (batch review, confidence 0.7-0.89): Root causes, failed approaches, performance findings -- medium-signal items that benefit from user confirmation
+- **Discard**: Formatting, typos, boilerplate -- noise that should never be stored
+
+The `GEMINI.md` context file teaches the agent to buffer signals during a session and classify them at task boundaries, reducing MCP call overhead and producing higher-quality memories.
+
 ## Skills
 
 | Skill                      | When to Use                                                                       |
 | -------------------------- | --------------------------------------------------------------------------------- |
-| `session-memory`           | End of a work session -- captures decisions and outcomes for long-term storage    |
+| `session-memory`           | End of a work session -- classifies signals and stores confirmed items            |
 | `memory-informed-refactor` | Before refactoring -- loads relevant prior context, decisions, and known pitfalls |
 | `context-loader`           | Session start or context switch -- loads historical context for continuity        |
 | `memory-review`            | Periodic -- finds stale facts, contradictions, and cleanup opportunities          |

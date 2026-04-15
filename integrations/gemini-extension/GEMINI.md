@@ -46,19 +46,57 @@ Use **lowercase, hyphenated** names for entities:
 - `project-decisions`, `user-preferences`, `deployment-config`
 - NOT `AuthService`, `auth service`, `AUTH_SERVICE`
 
-## Confidence Levels
+## Intelligent Capture -- Tiered Classification
 
-When storing memories, use these confidence levels:
+When evaluating what to store, apply this tiered taxonomy:
+
+### Tier 1 (auto-store, confidence >= 0.9)
+
+High-signal items that should almost always be captured:
+
+- **Explicit decisions**: "let's use X", "we decided Y", "we chose Z"
+- **Behavioral corrections**: "don't do X", "stop doing Y", "no, not that"
+- **Project constraints**: "we can't use X because Y", "must not use Z"
+- **Technology migrations**: "switching to X", "migrating from Y to Z"
+
+### Tier 2 (batch for review, confidence 0.7-0.89)
+
+Medium-signal items that benefit from user confirmation:
+
+- **Root causes**: "the bug was caused by...", "the issue is..."
+- **Failed approaches**: "tried X but it failed because..."
+- **Performance findings**: measurable results (timing, memory, throughput)
+- **Dependency discoveries**: "X depends on Y", "blocked by Z"
+- **Non-obvious solutions**: workarounds for framework/tool limitations
+
+### Discard (never store)
+
+- Simple typo or formatting fixes
+- Routine lint fixes, import sorting, boilerplate
+- Standard file edits with no architectural significance
+- Repeated application of already-known patterns
+
+### Confidence Reference
 
 | Type        | Confidence | Examples                                                           |
 | ----------- | ---------- | ------------------------------------------------------------------ |
-| Decisions   | 0.9        | Architecture choices, technology selections, API design            |
+| Decisions   | 0.9-0.95   | Architecture choices, technology selections, API design            |
 | Outcomes    | 0.8        | Bug fixes, successful approaches, performance findings             |
 | Patterns    | 0.7        | Recurring issues, workflow discoveries, cross-cutting observations |
 | Speculative | 0.5        | Hypotheses, untested theories, uncertain observations              |
 
 If the user expresses certainty ("we decided", "this is how it works"), use 0.9-1.0.
 If the user is uncertain ("I think", "maybe", "probably"), use 0.5-0.7.
+
+## Signal Buffering
+
+During a session, buffer observations rather than storing them immediately:
+
+1. **Buffer signals** as you work -- note decisions, corrections, errors, and outcomes mentally without making MCP calls
+2. **Classify at task boundaries** -- when a task completes or the session ends, classify all buffered signals using the tiered taxonomy above
+3. **Flush at session end** -- present tier 1 and tier 2 candidates to the user for confirmation, then store approved items
+
+This approach reduces MCP call overhead and produces higher-quality memories by capturing signals in context rather than in isolation.
 
 ## Rules
 
