@@ -104,7 +104,7 @@ class _MCPClient:
             "params": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "hermes-pensyve-plugin", "version": "1.0.0"},
+                "clientInfo": {"name": "hermes-pensyve-plugin", "version": "1.1.0"},
             },
         }, headers=self._headers())
         resp.raise_for_status()
@@ -192,8 +192,45 @@ REMEMBER_SCHEMA = {
         "properties": {
             "entity": {"type": "string", "description": "Entity this fact is about (e.g. 'seth', 'hermes-agent')."},
             "fact": {"type": "string", "description": "The fact to store."},
+            "confidence": {"type": "number", "description": "Confidence level in [0.0, 1.0]."},
         },
         "required": ["entity", "fact"],
+    },
+}
+
+EPISODE_START_SCHEMA = {
+    "name": "pensyve_episode_start",
+    "description": (
+        "Begin tracking an interaction episode with named participants. "
+        "Returns an episode_id needed to record observations and close the episode. "
+        "Use at the start of a session to enable episode-based memory tracking."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "participants": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Entity names of the participants (e.g. ['hermes-user', 'hermes-agent']).",
+            },
+        },
+        "required": ["participants"],
+    },
+}
+
+EPISODE_END_SCHEMA = {
+    "name": "pensyve_episode_end",
+    "description": (
+        "Close an episode and trigger memory consolidation. "
+        "Returns the count of memories created from the episode."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "episode_id": {"type": "string", "description": "Episode ID from pensyve_episode_start."},
+            "outcome": {"type": "string", "description": "Outcome: 'success', 'failure', or 'partial'."},
+        },
+        "required": ["episode_id"],
     },
 }
 
@@ -221,12 +258,64 @@ FORGET_SCHEMA = {
         "type": "object",
         "properties": {
             "entity": {"type": "string", "description": "Entity to forget."},
+            "hard_delete": {"type": "boolean", "description": "If true, permanently deletes rather than soft-deleting."},
         },
         "required": ["entity"],
     },
 }
 
-ALL_TOOL_SCHEMAS = [RECALL_SCHEMA, REMEMBER_SCHEMA, INSPECT_SCHEMA, FORGET_SCHEMA]
+OBSERVE_SCHEMA = {
+    "name": "pensyve_observe",
+    "description": (
+        "Record an observation within an active episode. "
+        "Captures what happened, who said it, and what it's about. "
+        "Use to log specific events or facts during a session."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "episode_id": {"type": "string", "description": "Episode ID from pensyve_episode_start."},
+            "content": {"type": "string", "description": "The observation content (max 32KB)."},
+            "source_entity": {"type": "string", "description": "Who made the observation (e.g. 'hermes-agent')."},
+            "about_entity": {"type": "string", "description": "What the observation is about (e.g. 'hermes-user')."},
+            "content_type": {"type": "string", "description": "Content type: 'text' (default), 'code', 'tool_output'."},
+        },
+        "required": ["episode_id", "content", "source_entity", "about_entity"],
+    },
+}
+
+STATUS_SCHEMA = {
+    "name": "pensyve_status",
+    "description": (
+        "Get status and statistics for the Pensyve namespace. "
+        "Returns memory counts, entity counts, and system health."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "entity": {"type": "string", "description": "Optional entity name to get stats for a specific entity."},
+        },
+        "required": [],
+    },
+}
+
+ACCOUNT_SCHEMA = {
+    "name": "pensyve_account",
+    "description": (
+        "Get account information including usage, tier, and limits. "
+        "Use to check subscription status and quota usage."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+ALL_TOOL_SCHEMAS = [
+    RECALL_SCHEMA, REMEMBER_SCHEMA, INSPECT_SCHEMA, FORGET_SCHEMA,
+    EPISODE_START_SCHEMA, EPISODE_END_SCHEMA, OBSERVE_SCHEMA, STATUS_SCHEMA, ACCOUNT_SCHEMA
+]
 
 
 # ---------------------------------------------------------------------------
@@ -511,9 +600,37 @@ class PensyveMemoryProvider(MemoryProvider):
                 result = mcp.call_tool("pensyve_remember", {
                     "entity": args["entity"],
                     "fact": args["fact"],
+                    "confidence": args.get("confidence"),
                 })
                 self._record_success()
                 return json.dumps({"result": "Fact stored.", "details": result})
+
+            elif tool_name == "pensyve_episode_start":
+                participants = args.get("participants", [])
+                if not participants:
+                    return tool_error("Missing required parameter: participants")
+                result = mcp.call_tool("pensyve_episode_start", {
+                    "participants": participants,
+                })
+                self._record_success()
+                # Store the episode_id for later use
+                if isinstance(result, dict):
+                    self._episode_id = result.get("episode_id")
+                return json.dumps(result if isinstance(result, (dict, list)) else {"result": result})
+
+            elif tool_name == "pensyve_episode_end":
+                episode_id = args.get("episode_id", "")
+                if not episode_id:
+                    return tool_error("Missing required parameter: episode_id")
+                result = mcp.call_tool("pensyve_episode_end", {
+                    "episode_id": episode_id,
+                    "outcome": args.get("outcome"),
+                })
+                self._record_success()
+                # Clear the episode_id after closing
+                if episode_id == self._episode_id:
+                    self._episode_id = None
+                return json.dumps(result if isinstance(result, (dict, list)) else {"result": result})
 
             elif tool_name == "pensyve_inspect":
                 entity = args.get("entity", "")
@@ -527,9 +644,38 @@ class PensyveMemoryProvider(MemoryProvider):
                 entity = args.get("entity", "")
                 if not entity:
                     return tool_error("Missing required parameter: entity")
-                result = mcp.call_tool("pensyve_forget", {"entity": entity})
+                result = mcp.call_tool("pensyve_forget", {
+                    "entity": entity,
+                    "hard_delete": args.get("hard_delete"),
+                })
                 self._record_success()
                 return json.dumps({"result": f"Memories for '{entity}' deleted.", "details": result})
+
+            elif tool_name == "pensyve_observe":
+                for field in ("episode_id", "content", "source_entity", "about_entity"):
+                    if not args.get(field):
+                        return tool_error(f"Missing required parameter: {field}")
+                result = mcp.call_tool("pensyve_observe", {
+                    "episode_id": args["episode_id"],
+                    "content": args["content"],
+                    "source_entity": args["source_entity"],
+                    "about_entity": args["about_entity"],
+                    "content_type": args.get("content_type"),
+                })
+                self._record_success()
+                return json.dumps({"result": "Observation recorded.", "details": result})
+
+            elif tool_name == "pensyve_status":
+                result = mcp.call_tool("pensyve_status", {
+                    "entity": args.get("entity"),
+                })
+                self._record_success()
+                return json.dumps(result if isinstance(result, (dict, list)) else {"result": result})
+
+            elif tool_name == "pensyve_account":
+                result = mcp.call_tool("pensyve_account", {})
+                self._record_success()
+                return json.dumps(result if isinstance(result, (dict, list)) else {"result": result})
 
             return tool_error(f"Unknown tool: {tool_name}")
 
