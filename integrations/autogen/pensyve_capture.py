@@ -27,6 +27,7 @@ Usage::
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from typing import Any
@@ -81,6 +82,7 @@ class PensyveCaptureHandler:
         self._session_id = session_id
         self._auto_flush_interval = auto_flush_interval
         self._event_count: int = 0
+        self._auto_flushed: list[ClassifiedMemory] = []
 
     # ------------------------------------------------------------------
     # AutoGen event hooks
@@ -189,6 +191,9 @@ class PensyveCaptureHandler:
     async def _do_flush(self) -> tuple[list[ClassifiedMemory], list[ClassifiedMemory]]:
         """Internal flush implementation."""
         auto_store, review = self._core.flush()
+        # Include tier-1 memories accumulated by periodic auto-flush
+        auto_store = self._auto_flushed + auto_store
+        self._auto_flushed.clear()
 
         if self._memory is not None:
             for mem in auto_store:
@@ -237,20 +242,14 @@ class PensyveCaptureHandler:
             return [], []
 
     def _maybe_auto_flush(self) -> None:
-        """Auto-flush if the event count hits the configured interval."""
+        """Periodic classification -- accumulate tier 1 for next explicit flush."""
         if self._auto_flush_interval <= 0:
             return
         self._event_count += 1
         if self._event_count >= self._auto_flush_interval:
             self._event_count = 0
-            # Synchronous classification only — storage requires async
             auto_store, _review = self._core.flush()
-            if auto_store:
-                logger.info(
-                    "pensyve capture: auto-flush classified %d tier-1 candidates "
-                    "(call flush() to persist)",
-                    len(auto_store),
-                )
+            self._auto_flushed.extend(auto_store)
 
     # ------------------------------------------------------------------
     # Public introspection
@@ -265,10 +264,8 @@ class PensyveCaptureHandler:
 
     def clear_pending_review(self) -> None:
         """Clear all pending review candidates."""
-        try:
+        with contextlib.suppress(Exception):
             self._core.clear_pending_review()
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------

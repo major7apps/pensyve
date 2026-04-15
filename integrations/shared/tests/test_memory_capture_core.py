@@ -1,9 +1,9 @@
 """Tests for memory_capture_core data types and signal buffer."""
 from memory_capture_core import (
-    RawSignal,
-    ClassifiedMemory,
     CaptureConfig,
+    ClassifiedMemory,
     MemoryCaptureCore,
+    RawSignal,
 )
 
 

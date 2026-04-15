@@ -18,6 +18,7 @@ Usage::
 
 from __future__ import annotations
 
+import contextlib
 from datetime import datetime, timezone
 from typing import Any
 
@@ -40,12 +41,12 @@ class PensyveCaptureHandler(BaseCallbackHandler):
         self._episode_id: str | None = None
 
     def on_chain_start(self, serialized: dict, inputs: dict, **kwargs: Any) -> None:
-        try:
+        # PensyveClient is synchronous (urllib.request); episode_start may not
+        # exist on all client implementations, so suppress any errors.
+        with contextlib.suppress(Exception):
             self._episode_id = self._client.episode_start(
                 participants=["langchain", self._client.entity_name]
             )
-        except Exception:
-            pass  # Episode tracking is optional
 
     def on_tool_end(self, output: str, **kwargs: Any) -> None:
         self._core.buffer_signal(RawSignal(
@@ -82,15 +83,11 @@ class PensyveCaptureHandler(BaseCallbackHandler):
     def on_chain_end(self, outputs: dict, **kwargs: Any) -> None:
         auto_store, _review = self._core.flush()
         for mem in auto_store:
-            try:
+            with contextlib.suppress(Exception):
                 self._client.remember(mem.fact, mem.confidence)
-            except Exception:
-                pass  # Silent failure — capture should never break chains
         if self._episode_id:
-            try:
+            with contextlib.suppress(Exception):
                 self._client.episode_end(self._episode_id, outcome="success")
-            except Exception:
-                pass
 
     def get_pending_review(self):
         """Get tier 2 candidates for review."""

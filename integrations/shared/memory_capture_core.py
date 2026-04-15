@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-
+from typing import ClassVar
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -91,14 +91,14 @@ class MemoryCaptureCore:
     # Classification patterns (class-level)
     # ------------------------------------------------------------------
 
-    _TIER1_PATTERNS: list[tuple[str, str, float]] = [
+    _TIER1_PATTERNS: ClassVar[list[tuple[str, str, float]]] = [
         (r"\b(?:let'?s use|we (?:decided|chose|agreed|should use|will use))\b", "architecture-decision", 0.95),
         (r"\b(?:don'?t|do not|stop|never|no,? (?:don'?t|not))\b.*\b(?:mock|use|do|add|create)\b", "behavioral-preference", 0.9),
         (r"\b(?:we can'?t|cannot|must not)\b.*\b(?:use|because|since|due to)\b", "project-constraint", 0.9),
         (r"\b(?:switching|migrating|moving) (?:to|from)\b", "architecture-decision", 0.9),
     ]
 
-    _TIER2_PATTERNS: list[tuple[str, str, float]] = [
+    _TIER2_PATTERNS: ClassVar[list[tuple[str, str, float]]] = [
         (r"\b(?:root cause|caused by|the (?:issue|problem|bug) (?:was|is))\b", "root-cause", 0.8),
         (r"\b(?:tried|attempted|approach .* (?:failed|didn'?t work))\b", "failed-approach", 0.8),
         (r"\b(?:performance|latency|throughput|speed|memory usage).*\b(?:\d+\s*(?:ms|s|MB|GB|%|x))\b", "performance-finding", 0.8),
@@ -106,7 +106,7 @@ class MemoryCaptureCore:
         (r"\b(?:depends on|dependency|requires|blocks|blocked by)\b", "dependency-finding", 0.75),
     ]
 
-    _DISCARD_PATTERNS: list[str] = [
+    _DISCARD_PATTERNS: ClassVar[list[str]] = [
         r"\b(?:fix(?:ed)? (?:typo|whitespace|spacing|indent))\b",
         r"\b(?:format(?:ted|ting)?|prettier|black|ruff format)\b",
         r"\b(?:lint(?:ed|ing)?|eslint|ruff check)\b",
@@ -124,7 +124,7 @@ class MemoryCaptureCore:
     # Keyword → entity mapping for content-based extraction
     # ------------------------------------------------------------------
 
-    _KEYWORD_ENTITY_MAP: dict[str, str] = {
+    _KEYWORD_ENTITY_MAP: ClassVar[dict[str, str]] = {
         "postgres": "database",
         "sqlite": "database",
         "mysql": "database",
@@ -150,7 +150,7 @@ class MemoryCaptureCore:
         "redis": "cache",
     }
 
-    _TRIVIAL_DIRS: set[str] = {"src", "lib", "app", "packages", "internal", "cmd"}
+    _TRIVIAL_DIRS: ClassVar[set[str]] = {"src", "lib", "app", "packages", "internal", "cmd"}
 
     # ------------------------------------------------------------------
     # Public / internal API
