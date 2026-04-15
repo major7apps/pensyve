@@ -103,6 +103,66 @@ memory = PensyveMemory(namespace="my-app", mode="cloud")
 | `await clear()`                       | Delete all memories for the entity           |
 | `await close()`                       | Clean up resources (no-op for local mode)    |
 
+## Intelligent Capture (v1.1.0+)
+
+Automatically capture decisions, preferences, and findings from AutoGen conversations into Pensyve memory.
+
+```python
+from pensyve_autogen import PensyveMemory, PensyveCaptureHandler
+
+memory = PensyveMemory(namespace="my-team", entity="assistant")
+capture = PensyveCaptureHandler(memory=memory)
+
+# Buffer signals during agent execution
+capture.on_message(role="user", content="Let's use Postgres for the DB")
+capture.on_tool_call(tool_name="search", tool_input={"q": "postgres setup"})
+capture.on_agent_reply(content="I'll set up the Postgres schema.", agent_name="assistant")
+
+# Flush at conversation end (async)
+auto_stored, review = await capture.flush()
+```
+
+### How It Works
+
+- **Messages**, **tool calls**, and **agent replies** are buffered as raw signals
+- On flush, signals are classified into tiered memory candidates:
+  - **Tier 1** (auto-stored): architecture decisions, behavioral preferences, project constraints
+  - **Tier 2** (review): root causes, failed approaches, performance findings, dependencies
+- Secrets are automatically redacted; long code blocks are stripped
+- Capture **never breaks** AutoGen execution (all event hooks fail silently)
+
+### Auto-flush
+
+```python
+# Flush every 20 events (classification only — call flush() to persist)
+capture = PensyveCaptureHandler(memory=memory, auto_flush_interval=20)
+```
+
+### Reviewing Tier-2 Candidates
+
+```python
+pending = capture.get_pending_review()
+for candidate in pending:
+    print(f"[tier {candidate.tier}] {candidate.entity}: {candidate.fact}")
+    # Manually approve:
+    await memory.add(MemoryContent(
+        content=candidate.fact,
+        mime_type=MemoryMimeType.TEXT,
+        metadata={"confidence": candidate.confidence},
+    ))
+
+capture.clear_pending_review()
+```
+
+### Synchronous Flush
+
+If you cannot use ``await``, use ``flush_sync()`` to classify without persisting:
+
+```python
+auto_store, review = capture.flush_sync()
+# Persist manually later
+```
+
 ## Running Tests
 
 ```bash
