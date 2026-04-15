@@ -1,5 +1,4 @@
 # Vendored from integrations/shared/memory_capture_core.py — do not edit directly
-"""Memory capture core — data types, signal buffer, and shared constants.
 
 Pure-logic library with no I/O or external dependencies beyond stdlib.
 Used by integration adapters (LangChain, VS Code, Claude Code, etc.)
@@ -159,7 +158,7 @@ class MemoryCaptureCore:
 
     def buffer_signal(self, signal: RawSignal) -> None:
         """Add a signal to the buffer unless capture is disabled."""
-        if self._config.mode == "off":
+        if self._config.mode == "off" or not self._config.buffer_enabled:
             return
         self._buffer.append(signal)
 

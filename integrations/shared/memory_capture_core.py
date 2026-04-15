@@ -158,7 +158,7 @@ class MemoryCaptureCore:
 
     def buffer_signal(self, signal: RawSignal) -> None:
         """Add a signal to the buffer unless capture is disabled."""
-        if self._config.mode == "off":
+        if self._config.mode == "off" or not self._config.buffer_enabled:
             return
         self._buffer.append(signal)
 

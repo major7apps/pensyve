@@ -72,6 +72,16 @@ class TestMemoryCaptureCore:
         core.buffer_signal(sig)
         assert len(core._buffer) == 0
 
+    def test_buffer_skipped_when_buffer_disabled(self):
+        core = MemoryCaptureCore(CaptureConfig(buffer_enabled=False))
+        sig = RawSignal(
+            type="conversation",
+            content="hello",
+            timestamp="2026-04-15T10:00:00Z",
+        )
+        core.buffer_signal(sig)
+        assert len(core._buffer) == 0
+
     def test_multiple_signals_buffered(self):
         core = MemoryCaptureCore(CaptureConfig())
         for i in range(5):

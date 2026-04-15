@@ -41,12 +41,11 @@ class PensyveCaptureHandler(BaseCallbackHandler):
         self._episode_id: str | None = None
 
     def on_chain_start(self, serialized: dict, inputs: dict, **kwargs: Any) -> None:
-        # PensyveClient is synchronous (urllib.request); episode_start may not
-        # exist on all client implementations, so suppress any errors.
-        with contextlib.suppress(Exception):
-            self._episode_id = self._client.episode_start(
-                participants=["langchain", self._client.entity_name]
-            )
+        if hasattr(self._client, "episode_start"):
+            with contextlib.suppress(Exception):
+                self._episode_id = self._client.episode_start(
+                    participants=["langchain", self._client.entity_name]
+                )
 
     def on_tool_end(self, output: str, **kwargs: Any) -> None:
         self._core.buffer_signal(RawSignal(
@@ -85,7 +84,7 @@ class PensyveCaptureHandler(BaseCallbackHandler):
         for mem in auto_store:
             with contextlib.suppress(Exception):
                 self._client.remember(mem.fact, mem.confidence)
-        if self._episode_id:
+        if self._episode_id and hasattr(self._client, "episode_end"):
             with contextlib.suppress(Exception):
                 self._client.episode_end(self._episode_id, outcome="success")
 
