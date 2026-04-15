@@ -41,7 +41,7 @@ log_info() { printf "       %s\n" "$1"; }
 vendor_py() {
   local integration="$1"
   local target_dir="${SCRIPT_DIR}/${integration}/src/_vendor"
-  local py_files=("memory_capture_core.py" "pensyve_client.py")
+  local py_files=("memory_capture_core.py")
   local header="# Vendored from integrations/shared/ — do not edit directly"
 
   if $VALIDATE_ONLY; then
@@ -70,7 +70,7 @@ vendor_ts() {
   local integration="$1"
   local target_subdir="$2"
   local target_dir="${SCRIPT_DIR}/${integration}/${target_subdir}"
-  local ts_files=("memory-capture-core.ts" "pensyve-client.ts")
+  local ts_files=("memory-capture-core.ts")
   local header="// Vendored from integrations/shared/ — do not edit directly"
 
   if $VALIDATE_ONLY; then

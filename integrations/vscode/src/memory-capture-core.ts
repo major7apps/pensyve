@@ -1,4 +1,4 @@
-// Vendored from integrations/shared/memory-capture-core.ts — do not edit directly
+// Vendored from integrations/shared/memory-capture-core.ts -- do not edit directly
 /**
  * Memory capture core — data types, signal buffer, and shared constants.
  *
@@ -208,7 +208,7 @@ export class MemoryCaptureCore {
   }
 
   bufferSignal(signal: RawSignal): void {
-    if (this.config.mode === "off") {
+    if (this.config.mode === "off" || !this.config.bufferEnabled) {
       return;
     }
     this.buffer.push(signal);

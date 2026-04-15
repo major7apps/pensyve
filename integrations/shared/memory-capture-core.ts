@@ -207,7 +207,7 @@ export class MemoryCaptureCore {
   }
 
   bufferSignal(signal: RawSignal): void {
-    if (this.config.mode === "off") {
+    if (this.config.mode === "off" || !this.config.bufferEnabled) {
       return;
     }
     this.buffer.push(signal);

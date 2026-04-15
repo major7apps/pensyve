@@ -25,7 +25,7 @@ from typing import Any
 from langchain_core.callbacks import BaseCallbackHandler
 
 # Import from vendored copy
-from src._vendor.memory_capture_core import (
+from .src._vendor.memory_capture_core import (
     CaptureConfig,
     MemoryCaptureCore,
     RawSignal,
