@@ -106,6 +106,31 @@ The store auto-detects which mode to use:
 | `search(namespace, { query, filter?, limit? })` | Semantic search within a namespace      |
 | `delete(namespace, key)`                        | Delete a specific item                  |
 
+## Intelligent Memory Capture
+
+The `PensyveCaptureHandler` is a LangChain.js callback handler that automatically
+captures decisions, errors, and tool outputs during chain execution. Signals are
+classified into tiers:
+
+- **Tier 1** — high-confidence memories (architecture decisions, constraints) are auto-stored
+- **Tier 2** — lower-confidence candidates (root causes, failed approaches) are held for review
+
+```typescript
+import { PensyveCaptureHandler } from "@pensyve/langchain/capture-handler";
+
+const handler = new PensyveCaptureHandler(client);
+
+// Attach to any chain
+const result = await chain.invoke(inputs, { callbacks: [handler] });
+
+// Review tier 2 candidates after execution
+for (const mem of handler.getPendingReview()) {
+  console.log(`[review] ${mem.fact} (confidence=${mem.confidence})`);
+}
+
+handler.clearPendingReview();
+```
+
 ## Running Tests
 
 ```bash
