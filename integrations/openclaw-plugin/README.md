@@ -89,6 +89,16 @@ For local-only mode, set `"baseUrl": "http://localhost:8000"` and omit the API k
 | `autoCapture` | `boolean` | `true`                    | Store conversation context after each turn |
 | `recallLimit` | `number`  | `5`                       | Max memories to recall per turn            |
 
+## Intelligent Memory Capture (v1.0.7)
+
+Pensyve uses a tiered classification system to identify what is worth remembering:
+
+- **Tier 1** (auto-store, confidence 0.9+): Explicit decisions, corrections, constraints -- high-signal items that should almost always be captured
+- **Tier 2** (batch review, confidence 0.7-0.89): Root causes, failed approaches, performance findings -- medium-signal items that benefit from user confirmation
+- **Discard**: Formatting, typos, boilerplate -- noise that should never be stored
+
+The auto-capture hook (`after_agent_response`) currently stores exchanges at tier 2 confidence. The `memory_store` tool description guides the agent to apply the appropriate confidence tier when storing facts explicitly. Future versions will integrate the shared memory-capture-core classifier for full tiered classification with signal buffering.
+
 ## How It Works
 
 ### Auto-Recall (`before_prompt_build`)
