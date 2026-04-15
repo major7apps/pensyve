@@ -102,34 +102,29 @@ No API key needed — all data stays on your machine in SQLite.
 
 ## Authentication
 
-The plugin uses OAuth for authentication. When you first connect, your browser opens automatically to sign in at pensyve.com. No API key needed.
+The plugin authenticates using the `PENSYVE_API_KEY` environment variable. Set it in your shell profile:
 
-### Alternative: API Key
-
-For CI or manual auth, use `claude mcp add-json` (or equivalent):
-
-```json
-{
-  "type": "http",
-  "url": "https://mcp.pensyve.com/mcp",
-  "headers": {
-    "Authorization": "Bearer ${PENSYVE_API_KEY}"
-  }
-}
+```bash
+export PENSYVE_API_KEY="psy_your_key_here"
 ```
 
-Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
+Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys). Add the export to `~/.bashrc` or `~/.zshrc` to persist across sessions.
+
+The plugin's MCP server reads this env var automatically -- no additional configuration needed.
 
 ### Configure (Optional)
 
 Copy `pensyve-plugin.local.md` to your project root and edit:
 
 ```yaml
-namespace: "my-project" # Scope memories to this project
-auto_capture: false # Enable background memory curation
-consolidation_frequency: manual
-context_loading: summary # Load memories at session start
-prompt_enrichment: false # Enrich prompts with memory (power user)
+namespace: "my-project"            # Scope memories to this project
+auto_capture: "tiered"             # off | tiered | full | confirm-all
+capture_buffer: true               # Buffer signals from Write/Edit/Bash
+capture_review_point: "stop"       # When to review tier 2 candidates
+max_auto_memories_per_session: 10  # Cap on auto-stored memories
+consolidation_frequency: "session_end"
+context_loading: "summary"         # off | summary | full
+prompt_enrichment: false           # Enrich prompts with memory (power user)
 ```
 
 ### Try It Out
@@ -177,24 +172,40 @@ prompt_enrichment: false # Enrich prompts with memory (power user)
 
 ## Hooks
 
-| Hook              | Event              | Behavior                                                                  |
-| ----------------- | ------------------ | ------------------------------------------------------------------------- |
-| Session Start     | `SessionStart`     | Loads relevant memories at session start (configurable: off/summary/full) |
-| Stop              | `Stop`             | Extracts decisions/outcomes after task completion, asks before storing    |
-| Pre-Compact       | `PreCompact`       | Persists in-flight episode data before context compression                |
-| Prompt Enrichment | `UserPromptSubmit` | Enriches prompts with memory context (disabled by default)                |
+| Hook              | Event              | Behavior                                                                                    |
+| ----------------- | ------------------ | ------------------------------------------------------------------------------------------- |
+| Session Start     | `SessionStart`     | Loads relevant memories at session start (configurable: off/summary/full)                   |
+| Post-Tool Write   | `PostToolUse`      | Buffers file change signals from Write/Edit (silent, no MCP calls)                          |
+| Post-Tool Bash    | `PostToolUse`      | Buffers command outcome signals from Bash (silent, no MCP calls)                            |
+| Stop              | `Stop`             | Processes signal buffer with tiered auto-store; tier 1 stored silently, tier 2 batched      |
+| Pre-Compact       | `PreCompact`       | Flushes signal buffer before context compression; preserves in-flight episode data           |
+| Prompt Enrichment | `UserPromptSubmit` | Enriches prompts with memory context (disabled by default)                                  |
 
 ## Configuration Reference
 
 All settings are configured in `pensyve-plugin.local.md` (copy to your project root):
 
-| Setting                   | Values                             | Default        | Description                                                                  |
-| ------------------------- | ---------------------------------- | -------------- | ---------------------------------------------------------------------------- |
-| `namespace`               | any string                         | directory name | Memory namespace. Set to your project name for project-scoped memory.        |
-| `auto_capture`            | `true` / `false`                   | `false`        | Enable the memory-curator agent for background memory capture.               |
-| `consolidation_frequency` | `manual` / `session_end` / `daily` | `manual`       | When to run memory consolidation.                                            |
-| `context_loading`         | `off` / `summary` / `full`         | `summary`      | How much context to load at session start.                                   |
-| `prompt_enrichment`       | `true` / `false`                   | `false`        | Enable the UserPromptSubmit hook to enrich prompts with memory. Opt-in only. |
+| Setting                        | Values                                    | Default          | Description                                                                  |
+| ------------------------------ | ----------------------------------------- | ---------------- | ---------------------------------------------------------------------------- |
+| `namespace`                    | any string                                | directory name   | Memory namespace. Set to your project name for project-scoped memory.        |
+| `auto_capture`                 | `"off"` / `"tiered"` / `"full"` / `"confirm-all"` | `"tiered"` | Memory capture mode. See below.                                              |
+| `capture_buffer`               | `true` / `false`                          | `true`           | Enable PostToolUse signal buffering for richer memory context.               |
+| `capture_review_point`         | `"stop"` / `"pre-compact"` / `"both"`    | `"stop"`         | When to present tier 2 candidates for batch review.                          |
+| `max_auto_memories_per_session`| integer                                   | `10`             | Maximum tier 1 (auto-stored) memories per session.                           |
+| `consolidation_frequency`      | `"manual"` / `"session_end"` / `"daily"` | `"session_end"`  | When to run memory consolidation.                                            |
+| `context_loading`              | `"off"` / `"summary"` / `"full"`         | `"summary"`      | How much context to load at session start.                                   |
+| `prompt_enrichment`            | `true` / `false`                          | `false`          | Enable the UserPromptSubmit hook to enrich prompts with memory. Opt-in only. |
+
+### Capture Modes
+
+| Mode          | Tier 1 (high confidence)       | Tier 2 (medium confidence)                 | User Interruption |
+| ------------- | ------------------------------ | ------------------------------------------ | ----------------- |
+| `"off"`       | Not stored                     | Not stored                                 | None              |
+| `"tiered"`    | Auto-stored silently           | Batched for review at stop/pre-compact     | Minimal           |
+| `"full"`      | Auto-stored silently           | Auto-stored silently                       | None              |
+| `"confirm-all"` | Presented for confirmation  | Presented for confirmation                 | Every memory      |
+
+**Migration from v1.0.x:** `auto_capture: false` is treated as `"off"`, `auto_capture: true` is treated as `"confirm-all"`.
 
 ## Environment Variables
 
@@ -224,7 +235,7 @@ All tools communicate over MCP. The Cloud server is at `https://mcp.pensyve.com/
 - **CLAUDE.md owns static conventions** -- project setup, commands, architecture
 - **Pensyve owns dynamic memory** -- decisions, outcomes, patterns, context
 - **Never duplicates** -- Pensyve will not store what belongs in CLAUDE.md
-- **Always asks** -- no memory is stored without user confirmation
+- **Tiered capture** -- high-confidence memories stored silently, medium-confidence batched for review
 - **Local-first** -- all data stays on your machine in SQLite
 
 ## Links
