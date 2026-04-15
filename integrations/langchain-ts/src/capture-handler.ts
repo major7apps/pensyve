@@ -99,11 +99,17 @@ export class PensyveCaptureHandler extends BaseCallbackHandler {
       timestamp: new Date().toISOString(),
       metadata: {},
     });
+    // Flush and close episode on error — prevents data loss and resource leaks
+    await this.flushAndClose("failure");
   }
 
   async handleChainEnd(
     _outputs: Record<string, unknown>,
   ): Promise<void> {
+    await this.flushAndClose("success");
+  }
+
+  private async flushAndClose(outcome: string): Promise<void> {
     const [autoStore] = this.core.flush();
     for (const mem of autoStore) {
       try {
@@ -114,10 +120,11 @@ export class PensyveCaptureHandler extends BaseCallbackHandler {
     }
     if (this.episodeId) {
       try {
-        await this.client.episodeEnd?.(this.episodeId, "success");
+        await this.client.episodeEnd?.(this.episodeId, outcome);
       } catch {
         // Silent failure
       }
+      this.episodeId = null;
     }
   }
 

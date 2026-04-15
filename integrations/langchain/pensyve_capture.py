@@ -99,6 +99,7 @@ class PensyveCaptureHandler(BaseCallbackHandler):
         if self._episode_id and hasattr(self._client, "episode_end"):
             with contextlib.suppress(Exception):
                 self._client.episode_end(self._episode_id, outcome=outcome)
+            self._episode_id = None
 
     def get_pending_review(self):
         """Get tier 2 candidates for review."""
