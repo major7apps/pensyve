@@ -49,8 +49,9 @@ class PensyveCaptureHandler(BaseCallbackHandler):
     def on_chain_start(self, serialized: dict, inputs: dict, **kwargs: Any) -> None:
         if hasattr(self._client, "episode_start"):
             with contextlib.suppress(Exception):
+                entity = getattr(self._client, "entity_name", "langchain-agent")
                 self._episode_id = self._client.episode_start(
-                    participants=["langchain", self._client.entity_name]
+                    participants=["langchain", entity]
                 )
 
     def on_tool_end(self, output: str, **kwargs: Any) -> None:
