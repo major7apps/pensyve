@@ -84,15 +84,21 @@ class PensyveCaptureHandler(BaseCallbackHandler):
             timestamp=datetime.now(timezone.utc).isoformat(),
             metadata={},
         ))
+        # Flush and close episode on error — prevents data loss and resource leaks
+        self._flush_and_close(outcome="failure")
 
     def on_chain_end(self, outputs: dict, **kwargs: Any) -> None:
+        self._flush_and_close(outcome="success")
+
+    def _flush_and_close(self, outcome: str = "success") -> None:
+        """Flush buffered signals and close the episode."""
         auto_store, _review = self._core.flush()
         for mem in auto_store:
             with contextlib.suppress(Exception):
                 self._client.remember(mem.fact, mem.confidence)
         if self._episode_id and hasattr(self._client, "episode_end"):
             with contextlib.suppress(Exception):
-                self._client.episode_end(self._episode_id, outcome="success")
+                self._client.episode_end(self._episode_id, outcome=outcome)
 
     def get_pending_review(self):
         """Get tier 2 candidates for review."""
