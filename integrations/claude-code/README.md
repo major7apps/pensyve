@@ -102,15 +102,39 @@ No API key needed — all data stays on your machine in SQLite.
 
 ## Authentication
 
-The plugin authenticates using the `PENSYVE_API_KEY` environment variable. Set it in your shell profile:
+The plugin supports two authentication methods for Pensyve Cloud:
 
-```bash
-export PENSYVE_API_KEY="psy_your_key_here"
-```
+### Option A: OAuth (default — zero configuration)
 
-Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys). Add the export to `~/.bashrc` or `~/.zshrc` to persist across sessions.
+The plugin uses OAuth out of the box. On first connection, Claude Code opens your browser to sign in at pensyve.com. The session is managed automatically -- no keys to create or manage.
 
-The plugin's MCP server reads this env var automatically -- no additional configuration needed.
+Best for: individual developers who want the simplest setup.
+
+### Option B: API Key (for CI, headless, or team setups)
+
+If you prefer explicit API key auth, or need to run in environments without a browser:
+
+1. Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys)
+2. Set the environment variable:
+   ```bash
+   export PENSYVE_API_KEY="psy_your_key_here"
+   ```
+3. Add a settings override to pass the key as a header. In your project or user `.claude/settings.json`:
+   ```json
+   {
+     "mcpServers": {
+       "pensyve": {
+         "type": "http",
+         "url": "https://mcp.pensyve.com/mcp",
+         "headers": {
+           "Authorization": "Bearer ${PENSYVE_API_KEY}"
+         }
+       }
+     }
+   }
+   ```
+
+This overrides the plugin's default OAuth config with explicit Bearer token auth. Add the export to `~/.bashrc` or `~/.zshrc` to persist across sessions.
 
 ### Configure (Optional)
 

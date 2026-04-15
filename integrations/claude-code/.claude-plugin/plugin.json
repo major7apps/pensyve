@@ -12,10 +12,7 @@
   "mcpServers": {
     "pensyve": {
       "type": "http",
-      "url": "https://mcp.pensyve.com/mcp",
-      "headers": {
-        "Authorization": "Bearer ${PENSYVE_API_KEY}"
-      }
+      "url": "https://mcp.pensyve.com/mcp"
     }
   }
 }
