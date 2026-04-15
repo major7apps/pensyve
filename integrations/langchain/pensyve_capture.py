@@ -33,7 +33,13 @@ from .src._vendor.memory_capture_core import (
 
 
 class PensyveCaptureHandler(BaseCallbackHandler):
-    """Buffers signals during chain execution, flushes at chain end."""
+    """Buffers signals during chain execution, flushes at chain end.
+
+    This is a synchronous callback handler. The client passed to __init__
+    must have synchronous methods (e.g. PensyveClient from the shared lib).
+    If episode_start/episode_end methods are absent or async, they are
+    safely skipped via hasattr checks and contextlib.suppress.
+    """
 
     def __init__(self, client: Any, config: CaptureConfig | None = None):
         self._core = MemoryCaptureCore(config or CaptureConfig(platform="langchain"))

@@ -1,4 +1,4 @@
-# Vendored from integrations/shared/memory_capture_core.py -- do not edit directly
+# Vendored from integrations/shared/ — do not edit directly
 """Memory capture core — data types, signal buffer, and shared constants.
 
 Pure-logic library with no I/O or external dependencies beyond stdlib.

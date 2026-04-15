@@ -136,9 +136,12 @@ check_no_shared_imports() {
     -print0 2>/dev/null)
 
   # TypeScript: from '../shared/' or from '../../shared/' patterns
+  # Exclude opencode-plugin and openclaw-plugin — they use shared client directly (not vendored)
   while IFS= read -r -d '' file; do
     case "${file}" in
       "${SHARED_DIR}"/*) continue ;;
+      *opencode-plugin*) continue ;;
+      *openclaw-plugin*) continue ;;
     esac
 
     if grep -qE "from\s+['\"]\.\.\/.*shared\/" "${file}" 2>/dev/null; then

@@ -613,9 +613,9 @@ class PensyveMemoryProvider(MemoryProvider):
                     "participants": participants,
                 })
                 self._record_success()
-                # Store the episode_id for later use
-                if isinstance(result, dict):
-                    self._episode_id = result.get("episode_id")
+                # Return the episode_id but do NOT overwrite self._episode_id —
+                # that tracks the session-level episode started in initialize().
+                # Agent-initiated episodes are tracked by the caller via the returned ID.
                 return json.dumps(result if isinstance(result, (dict, list)) else {"result": result})
 
             elif tool_name == "pensyve_episode_end":
@@ -627,9 +627,6 @@ class PensyveMemoryProvider(MemoryProvider):
                     "outcome": args.get("outcome"),
                 })
                 self._record_success()
-                # Clear the episode_id after closing
-                if episode_id == self._episode_id:
-                    self._episode_id = None
                 return json.dumps(result if isinstance(result, (dict, list)) else {"result": result})
 
             elif tool_name == "pensyve_inspect":
