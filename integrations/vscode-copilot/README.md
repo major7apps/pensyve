@@ -79,3 +79,26 @@ Build from source: `cargo build --release -p pensyve-mcp` from the [pensyve repo
 | `pensyve_inspect`       | List memories for an entity            |
 | `pensyve_status`        | Connection and memory stats            |
 | `pensyve_account`       | Plan and usage info                    |
+
+See [MCP Tools Reference](https://pensyve.com/docs/api-reference/mcp-tools) for full parameter details.
+
+## Intelligent Memory Capture
+
+Pensyve uses a tiered classification system to identify what is worth remembering. Since VS Code Copilot Chat connects via MCP only, the LLM follows the MCP tool descriptions to decide when and how to call memory tools.
+
+### Tiered Capture System
+
+- **Tier 1** (auto-store, confidence 0.9+): Explicit decisions, corrections, constraints, architecture choices, dependency version pins, security rules. High-signal items that should almost always be captured.
+- **Tier 2** (review, confidence 0.7-0.89): Root causes, failed approaches, performance findings, debugging outcomes, environment quirks. Medium-signal items that benefit from user confirmation.
+- **Discard**: Formatting, typos, boilerplate, ephemeral status messages. Noise that should never be stored.
+
+### Best Practices
+
+For the best experience with Copilot Chat, guide the LLM to use Pensyve's memory tools effectively:
+
+- Use `pensyve_observe` to record significant events during an episode (architecture decisions, failed approaches, key findings)
+- Use `pensyve_remember` for durable facts that should persist across sessions (project conventions, environment constraints, resolved issues)
+- Use `pensyve_recall` at the start of a task to load relevant context from prior sessions
+- Wrap multi-step work in `pensyve_episode_start` / `pensyve_episode_end` to capture episodic context
+
+The MCP tool descriptions include guidance on confidence levels so the LLM can classify memories into the appropriate tier automatically.
