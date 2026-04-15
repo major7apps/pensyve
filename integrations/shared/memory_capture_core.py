@@ -87,11 +87,38 @@ _MAX_CODE_INLINE_LENGTH = 100
 class MemoryCaptureCore:
     """Stateful capture engine that buffers raw signals for classification."""
 
+    # ------------------------------------------------------------------
+    # Classification patterns (class-level)
+    # ------------------------------------------------------------------
+
+    _TIER1_PATTERNS: list[tuple[str, str, float]] = [
+        (r"\b(?:let'?s use|we (?:decided|chose|agreed|should use|will use))\b", "architecture-decision", 0.95),
+        (r"\b(?:don'?t|do not|stop|never|no,? (?:don'?t|not))\b.*\b(?:mock|use|do|add|create)\b", "behavioral-preference", 0.9),
+        (r"\b(?:we can'?t|cannot|must not)\b.*\b(?:use|because|since|due to)\b", "project-constraint", 0.9),
+        (r"\b(?:switching|migrating|moving) (?:to|from)\b", "architecture-decision", 0.9),
+    ]
+
+    _TIER2_PATTERNS: list[tuple[str, str, float]] = [
+        (r"\b(?:root cause|caused by|the (?:issue|problem|bug) (?:was|is))\b", "root-cause", 0.8),
+        (r"\b(?:tried|attempted|approach .* (?:failed|didn'?t work))\b", "failed-approach", 0.8),
+        (r"\b(?:performance|latency|throughput|speed|memory usage).*\b(?:\d+\s*(?:ms|s|MB|GB|%|x))\b", "performance-finding", 0.8),
+        (r"\b(?:workaround|hack|work[- ]?around)\b", "non-obvious-solution", 0.8),
+        (r"\b(?:depends on|dependency|requires|blocks|blocked by)\b", "dependency-finding", 0.75),
+    ]
+
+    _DISCARD_PATTERNS: list[str] = [
+        r"\b(?:fix(?:ed)? (?:typo|whitespace|spacing|indent))\b",
+        r"\b(?:format(?:ted|ting)?|prettier|black|ruff format)\b",
+        r"\b(?:lint(?:ed|ing)?|eslint|ruff check)\b",
+        r"\b(?:import sort|isort|organize imports)\b",
+        r"\b(?:boilerplate|scaffold|template)\b",
+    ]
+
     def __init__(self, config: CaptureConfig) -> None:
         self._config = config
         self._buffer: list[RawSignal] = []
         self._auto_stored_count: int = 0
-        self._pending_review: list = []
+        self._pending_review: list[ClassifiedMemory] = []
 
     # ------------------------------------------------------------------
     # Keyword → entity mapping for content-based extraction
@@ -201,3 +228,144 @@ class MemoryCaptureCore:
         result = re.sub(r"[^a-zA-Z0-9-]", "", result)
         # Lowercase and strip leading/trailing hyphens
         return result.lower().strip("-")
+
+    # ------------------------------------------------------------------
+    # Classification
+    # ------------------------------------------------------------------
+
+    def classify(self) -> list[ClassifiedMemory]:
+        """Classify all buffered signals, returning tier 1 and tier 2 candidates."""
+        results: list[ClassifiedMemory] = []
+        for signal in self._buffer:
+            classified = self._classify_signal(signal)
+            if classified is not None:
+                results.append(classified)
+        return results
+
+    def _classify_signal(self, signal: RawSignal) -> ClassifiedMemory | None:
+        """Classify a single signal into a tiered memory candidate or None."""
+        content = signal.content
+
+        # 1. Fast reject: discard patterns
+        for pattern in self._DISCARD_PATTERNS:
+            if re.search(pattern, content, re.IGNORECASE):
+                return None
+
+        # 2. Tier 1 patterns
+        for pattern, classification, confidence in self._TIER1_PATTERNS:
+            if re.search(pattern, content, re.IGNORECASE):
+                return ClassifiedMemory(
+                    tier=1,
+                    memory_type="semantic",
+                    entity=self._extract_entity(signal),
+                    fact=self._sanitize(content),
+                    confidence=confidence,
+                    provenance=MemoryProvenance(
+                        source="auto-capture",
+                        trigger="",
+                        platform=self._config.platform,
+                        tier=1,
+                    ),
+                    source_signal=signal,
+                )
+
+        # 3. Tier 2 patterns
+        for pattern, classification, confidence in self._TIER2_PATTERNS:
+            if re.search(pattern, content, re.IGNORECASE):
+                return ClassifiedMemory(
+                    tier=2,
+                    memory_type="episodic",
+                    entity=self._extract_entity(signal),
+                    fact=self._sanitize(content),
+                    confidence=confidence,
+                    provenance=MemoryProvenance(
+                        source="auto-capture",
+                        trigger="",
+                        platform=self._config.platform,
+                        tier=2,
+                    ),
+                    source_signal=signal,
+                )
+
+        # 4. Long user statements that didn't match any pattern → tier 2
+        if signal.type == "user_statement" and len(content) > 50:
+            return ClassifiedMemory(
+                tier=2,
+                memory_type="episodic",
+                entity=self._extract_entity(signal),
+                fact=self._sanitize(content),
+                confidence=0.7,
+                provenance=MemoryProvenance(
+                    source="auto-capture",
+                    trigger="",
+                    platform=self._config.platform,
+                    tier=2,
+                ),
+                source_signal=signal,
+            )
+
+        # 5. Everything else → None
+        return None
+
+    # ------------------------------------------------------------------
+    # Flush
+    # ------------------------------------------------------------------
+
+    def flush(self) -> tuple[list[ClassifiedMemory], list[ClassifiedMemory]]:
+        """Classify buffer, clear it, and split into auto-store and review lists."""
+        candidates = self.classify()
+        self._buffer.clear()
+
+        auto_store: list[ClassifiedMemory] = []
+        review: list[ClassifiedMemory] = []
+
+        for c in candidates:
+            if c.tier == 1:
+                auto_store.append(c)
+            else:
+                review.append(c)
+
+        # Respect session caps
+        remaining_auto = max(0, self._config.max_auto_per_session - self._auto_stored_count)
+        auto_store = auto_store[:remaining_auto]
+        self._auto_stored_count += len(auto_store)
+
+        review = review[:self._config.max_review_candidates]
+        self._pending_review.extend(review)
+
+        return auto_store, review
+
+    # ------------------------------------------------------------------
+    # Pending review management
+    # ------------------------------------------------------------------
+
+    def get_pending_review(self) -> list[ClassifiedMemory]:
+        """Return the accumulated pending-review candidates."""
+        return self._pending_review
+
+    def clear_pending_review(self) -> None:
+        """Clear all pending-review candidates."""
+        self._pending_review.clear()
+
+    # ------------------------------------------------------------------
+    # Duplicate detection
+    # ------------------------------------------------------------------
+
+    def check_duplicate(self, candidate: ClassifiedMemory, existing: list[dict]) -> bool:
+        """Return True if candidate overlaps > 70% with any existing memory."""
+        candidate_words = set(candidate.fact.lower().split())
+        if not candidate_words:
+            return False
+
+        for mem in existing:
+            obj = mem.get("object", "")
+            existing_words = set(obj.lower().split())
+            if not existing_words:
+                continue
+            overlap = candidate_words & existing_words
+            # Use the smaller set as denominator for overlap ratio
+            ratio = len(overlap) / min(len(candidate_words), len(existing_words))
+            if ratio > 0.7:
+                return True
+
+        return False
