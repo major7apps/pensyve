@@ -22,18 +22,25 @@ If the configuration file is not found, default to **"summary"**.
 
 ### Step 2: Determine Context
 
-Identify the current project/namespace:
+Detect the current project name using this hierarchy (first match wins):
 
-1. Use the `PENSYVE_NAMESPACE` environment variable if set.
-2. Otherwise, use the current working directory name as the namespace.
+1. **`PENSYVE_NAMESPACE` environment variable** — if set, use its value (explicit override).
+2. **Git repository root directory name** — run `git rev-parse --show-toplevel` and take the basename of the result.
+3. **Current working directory name** — basename of the CWD.
+4. **`"default"`** — last resort when none of the above yield a value.
+
+Normalize the detected name: lowercase and hyphenate (e.g., `"PensyveCloud"` → `"pensyve-cloud"`, `"AI_Primitives"` → `"ai-primitives"`). This is the **detected project name**, used as the `entity` parameter in subsequent MCP calls.
 
 ### Step 3: Load Memories
 
-Call `pensyve_recall` with a broad query based on the namespace/project name:
+Call `pensyve_recall` with entity-scoped recall using the detected project name:
 
-- `query`: "[namespace] recent decisions issues patterns"
+- `query`: `"recent decisions issues patterns"`
+- `entity`: The detected project name from Step 2
 - `limit`: 10 for summary mode, 25 for full mode
 - No type filter (get all types)
+
+The `entity` parameter handles project scoping — do not prefix the query with the project name.
 
 Use a single recall query to keep execution fast.
 
@@ -71,7 +78,7 @@ Present comprehensive context with scores and entity relationships, as described
 
 If `context_loading` is not "off", silently start an episode to track the session:
 
-- Call `pensyve_episode_start` with participants: `["claude-code", "[namespace]"]`
+- Call `pensyve_episode_start` with participants: `["claude-code", "<detected_project_name>"]` (using the project name from Step 2)
 - Store the returned `episode_id` for use by the Stop hook
 - If the episode fails to start, continue without episode tracking -- do not report the failure to the user
 

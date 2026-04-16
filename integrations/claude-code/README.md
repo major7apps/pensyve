@@ -151,6 +151,8 @@ context_loading: "summary"         # off | summary | full
 prompt_enrichment: false           # Enrich prompts with memory (power user)
 ```
 
+**Automatic project detection:** The plugin automatically detects the current project for entity-scoped memory. It uses the git repository root directory name (via `git rev-parse --show-toplevel`) as the project identity, falling back to the current working directory name if not in a git repo. Set the `PENSYVE_NAMESPACE` environment variable to override automatic detection. Detected names are normalized to lowercase and hyphenated (e.g., `"pensyve-cloud"`).
+
 ### Try It Out
 
 ```
@@ -236,7 +238,7 @@ All settings are configured in `pensyve-plugin.local.md` (copy to your project r
 | Variable            | Default              | Description                                      |
 | ------------------- | -------------------- | ------------------------------------------------ |
 | `PENSYVE_API_KEY`   | —                    | API key for Pensyve Cloud (not needed for local) |
-| `PENSYVE_NAMESPACE` | `default`            | Memory namespace (overrides config file)         |
+| `PENSYVE_NAMESPACE` | auto-detected        | Memory namespace. Overrides automatic git/CWD-based project detection. |
 | `PENSYVE_PATH`      | `~/.pensyve/default` | Storage directory path (local only)              |
 
 ## MCP Tools
@@ -245,7 +247,7 @@ The plugin wraps 6 MCP tools exposed by the `pensyve-mcp` binary:
 
 | Tool                    | Parameters                             | Returns                              |
 | ----------------------- | -------------------------------------- | ------------------------------------ |
-| `pensyve_recall`        | `query`, `entity?`, `types?`, `limit?` | Ranked array of memories with scores |
+| `pensyve_recall`        | `query`, `entity?`, `types?`, `limit?` | Ranked array of memories with scores. When `entity` is provided, results are scoped to prefer memories linked to that entity. Hooks auto-detect the project name and pass it as `entity`. |
 | `pensyve_remember`      | `entity`, `fact`, `confidence?`        | Stored memory object                 |
 | `pensyve_episode_start` | `participants`                         | `episode_id`, `started_at`           |
 | `pensyve_episode_end`   | `episode_id`, `outcome?`               | `memories_created` count             |

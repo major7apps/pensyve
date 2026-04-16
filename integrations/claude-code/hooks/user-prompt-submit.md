@@ -43,9 +43,21 @@ If the prompt does not warrant enrichment, exit without any MCP calls.
 
 ### Step 3: Quick Recall
 
-If enrichment is warranted, call `pensyve_recall`:
+If enrichment is warranted, detect the current project name and call `pensyve_recall` with entity-scoped recall:
+
+**Detect project name** using this hierarchy (first match wins):
+
+1. **`PENSYVE_NAMESPACE` environment variable** — if set, use its value.
+2. **Git repository root directory name** — run `git rev-parse --show-toplevel` and take the basename.
+3. **Current working directory name** — basename of the CWD.
+4. **`"default"`** — last resort.
+
+Normalize the name: lowercase and hyphenated.
+
+**Call `pensyve_recall`:**
 
 - `query`: The user's prompt text (or key phrases extracted from it)
+- `entity`: The detected project name
 - `limit`: 5 (keep it lightweight)
 
 This call MUST complete within 1 second. If the MCP server is slow, abandon the call and proceed without enrichment.
