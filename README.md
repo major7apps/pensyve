@@ -204,22 +204,23 @@ cargo build --release --bin pensyve-mcp
 
 ### Claude Code Plugin
 
-Full cognitive memory layer for Claude Code with 6 commands, 4 skills, 2 agents, and 4 lifecycle hooks.
+Full cognitive memory layer for Claude Code with 7 commands, 4 skills, 2 agents, and 6 lifecycle hooks.
 
-**Pensyve Cloud** (no build required):
+Install from the marketplace:
 
 ```
-/plugin marketplace add /path/to/pensyve/integrations/claude-code
-/plugin install pensyve@pensyve
+/plugin marketplace add major7apps/pensyve
+/plugin install pensyve@major7apps-pensyve
+/reload-plugins
 ```
 
-Then set your API key:
+The plugin does not bundle an MCP server config — auth method and backend are user choices. Add an `mcpServers.pensyve` entry to your `~/.claude/settings.json` (user-level) or `.claude/settings.json` (project-level). Pick one:
+
+**Pensyve Cloud — API key (recommended):**
 
 ```bash
 export PENSYVE_API_KEY="psy_your_key_here"
 ```
-
-The plugin reads `PENSYVE_API_KEY` from your environment and passes it as a Bearer token in the `Authorization` header. To override the MCP config explicitly, add to `.claude/settings.json`:
 
 ```json
 {
@@ -235,11 +236,22 @@ The plugin reads `PENSYVE_API_KEY` from your environment and passes it as a Bear
 }
 ```
 
-> **Note:** Use `headers` with `Authorization: Bearer` for remote MCP (HTTP transport). The `env` block is for local stdio servers that read environment variables at startup.
+**Pensyve Cloud — OAuth (browser sign-in):**
 
-**Pensyve Local** (self-hosted, no API key needed):
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "type": "http",
+      "url": "https://mcp.pensyve.com/mcp"
+    }
+  }
+}
+```
 
-Build the MCP binary first (see [Install](#install)), then override the MCP config in your `.claude/settings.json`:
+**Pensyve Local (self-hosted, no API key):**
+
+Build the MCP binary first (see [Install](#install)), then:
 
 ```json
 {
@@ -252,12 +264,14 @@ Build the MCP binary first (see [Install](#install)), then override the MCP conf
 }
 ```
 
+> **Note:** Use `headers` with `Authorization: Bearer` for remote MCP (HTTP transport). Use the top-level `env` block (Claude Code MCP schema) for local stdio servers that read environment variables at startup.
+
 ```
 Plugin contents:
-├── 6 slash commands   /remember, /recall, /forget, /inspect, /consolidate, /memory-status
+├── 7 slash commands   /remember, /recall, /forget, /inspect, /consolidate, /memory-status, /using-pensyve
 ├── 4 skills           session-memory, memory-informed-refactor, context-loader, memory-review
 ├── 2 agents           memory-curator (background), context-researcher (on-demand)
-└── 4 hooks            SessionStart, Stop, PreCompact, UserPromptSubmit
+└── 6 hooks            SessionStart, Stop, PreCompact, UserPromptSubmit, PostToolUse (Write/Edit, Bash)
 ```
 
 See [`integrations/claude-code/README.md`](integrations/claude-code/README.md) for full documentation.

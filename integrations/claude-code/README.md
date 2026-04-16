@@ -28,115 +28,86 @@ SQLite + ONNX embeddings + vector index
 
 ### Install the Plugin
 
-Clone the repo, then add the plugin marketplace in Claude Code:
+Add the Pensyve marketplace and install:
+
+```
+/plugin marketplace add major7apps/pensyve
+/plugin install pensyve@major7apps-pensyve
+/reload-plugins
+```
+
+### Configure the MCP Server
+
+The plugin ships commands, skills, hooks, and agents — but does **not** bundle an MCP server config. This is intentional: your MCP auth (API key vs OAuth) and backend (Cloud vs Local) are personal choices, so you configure them once in your own settings and they follow you across Claude Code updates without surprise.
+
+Add an `mcpServers.pensyve` entry to your `~/.claude/settings.json` (for all projects) or `.claude/settings.json` in a project (for project-only scope). Pick **one** of these three options:
+
+**Option 1 — Pensyve Cloud with API key (recommended for most users)**
 
 ```bash
-git clone https://github.com/major7apps/pensyve.git
+export PENSYVE_API_KEY="psy_your_key_here"
 ```
 
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "type": "http",
+      "url": "https://mcp.pensyve.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${PENSYVE_API_KEY}"
+      }
+    }
+  }
+}
 ```
-/plugin marketplace add /path/to/pensyve/integrations/claude-code
-/plugin install pensyve@pensyve
+
+Create your key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys). Put the `export` in `~/.bashrc` or `~/.zshrc` to persist. Works everywhere (local dev, CI, headless boxes, containers).
+
+**Option 2 — Pensyve Cloud with OAuth (browser sign-in)**
+
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "type": "http",
+      "url": "https://mcp.pensyve.com/mcp"
+    }
+  }
+}
 ```
 
-Then restart Claude Code.
+On first connection Claude Code opens a browser and you sign in at pensyve.com. Session is managed automatically — no keys to create or rotate. Requires a browser on the machine; not suitable for CI or remote/headless setups.
 
-### Connect to Pensyve
+**Option 3 — Pensyve Local (self-hosted, offline)**
 
-The plugin needs a running Pensyve MCP server. Choose one:
+Build and install the MCP binary:
 
-**Pensyve Cloud** (managed service — no setup required):
+```bash
+git clone https://github.com/major7apps/pensyve
+cd pensyve
+cargo build --release -p pensyve-mcp
+# Copy target/release/pensyve-mcp into your PATH
+```
 
-1. Sign up at [pensyve.com](https://pensyve.com) and grab your API key
-2. Supply your API key using either method:
+Then in settings:
 
-   **Option A** — environment variable (recommended):
-
-   ```bash
-   export PENSYVE_API_KEY="your-api-key-here"
-   ```
-
-   Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
-
-   **Option B** — override MCP config in `.claude/settings.json`:
-
-   ```json
-   {
-     "mcpServers": {
-       "pensyve": {
-         "type": "http",
-         "url": "https://mcp.pensyve.com/mcp",
-         "headers": {
-           "Authorization": "Bearer ${PENSYVE_API_KEY}"
-         }
-       }
-     }
-   }
-   ```
-
-   > Use `headers` with `Authorization: Bearer` for remote MCP (HTTP transport). The `env` block is for local stdio servers.
-
-The plugin ships pre-configured for Pensyve Cloud — once your API key is set, you're ready to go.
-
-**Pensyve Local** (self-hosted — runs entirely on your machine):
-
-1. Build the MCP binary:
-   ```bash
-   git clone https://github.com/major7apps/pensyve
-   cd pensyve
-   cargo build --release -p pensyve-mcp
-   ```
-2. Add the binary to your PATH, then override the plugin's MCP config by adding this to your project or user `.claude/settings.json`:
-   ```json
-   {
-     "mcpServers": {
-       "pensyve": {
-         "command": "pensyve-mcp",
-         "args": ["--stdio"]
-       }
-     }
-   }
-   ```
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "command": "pensyve-mcp",
+      "args": ["--stdio"]
+    }
+  }
+}
+```
 
 No API key needed — all data stays on your machine in SQLite.
 
-## Authentication
+> **Why `headers` for HTTP and `env` for stdio?** The `headers` block only applies to remote MCP servers (HTTP transport). The `env` block passes environment variables into locally-launched subprocess MCP servers (stdio transport). They don't mix.
 
-The plugin supports two authentication methods for Pensyve Cloud:
-
-### Option A: OAuth (default — zero configuration)
-
-The plugin uses OAuth out of the box. On first connection, Claude Code opens your browser to sign in at pensyve.com. The session is managed automatically -- no keys to create or manage.
-
-Best for: individual developers who want the simplest setup.
-
-### Option B: API Key (for CI, headless, or team setups)
-
-If you prefer explicit API key auth, or need to run in environments without a browser:
-
-1. Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys)
-2. Set the environment variable:
-   ```bash
-   export PENSYVE_API_KEY="psy_your_key_here"
-   ```
-3. Add a settings override to pass the key as a header. In your project or user `.claude/settings.json`:
-   ```json
-   {
-     "mcpServers": {
-       "pensyve": {
-         "type": "http",
-         "url": "https://mcp.pensyve.com/mcp",
-         "headers": {
-           "Authorization": "Bearer ${PENSYVE_API_KEY}"
-         }
-       }
-     }
-   }
-   ```
-
-This overrides the plugin's default OAuth config with explicit Bearer token auth. Add the export to `~/.bashrc` or `~/.zshrc` to persist across sessions.
-
-### Configure (Optional)
+### Configure the Plugin (Optional)
 
 Copy `pensyve-plugin.local.md` to your project root and edit:
 
