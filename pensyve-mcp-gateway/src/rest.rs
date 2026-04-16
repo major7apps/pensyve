@@ -975,8 +975,7 @@ async fn stats(
     let entity_count = ps
         .storage
         .list_entities_by_namespace(ns.id)
-        .map(|v| v.len())
-        .unwrap_or(0);
+        .map_or(0, |v| v.len());
 
     Ok(Json(StatsResponse {
         namespace: ns.name.clone(),

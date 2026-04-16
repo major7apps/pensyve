@@ -86,11 +86,7 @@ impl OnnxEmbedder {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get().min(4))
-                    .unwrap_or(1)
-            });
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get().min(4)));
 
         let mut pool = Vec::with_capacity(pool_size);
         for i in 0..pool_size {

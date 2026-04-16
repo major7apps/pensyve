@@ -363,12 +363,11 @@ impl PensyveMcpServer {
         let memories_created = state
             .storage
             .get_all_memories_by_namespace(state.namespace.id)
-            .map(|mems| {
+            .map_or(0, |mems| {
                 mems.iter()
                     .filter(|m| matches!(m, Memory::Episodic(_)))
                     .count()
-            })
-            .unwrap_or(0);
+            });
 
         let _ = state.storage.log_activity(
             state.namespace.id,

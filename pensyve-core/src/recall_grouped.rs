@@ -192,7 +192,7 @@ pub fn group_by_session(
         .into_iter()
         .map(|key| {
             let mut members = buckets.remove(&key).expect("bucket populated above");
-            members.sort_by(|a, b| memory_time(&a.memory).cmp(&memory_time(&b.memory)));
+            members.sort_by_key(|c| memory_time(&c.memory));
 
             // All members share the same episode id (or all lack one), so
             // the first member's id is authoritative for the group.
@@ -227,7 +227,7 @@ pub fn group_by_session(
 
     match order {
         OrderBy::Chronological => {
-            groups.sort_by(|a, b| a.session_time.cmp(&b.session_time));
+            groups.sort_by_key(|g| g.session_time);
         }
         OrderBy::Relevance => {
             groups.sort_by(|a, b| {

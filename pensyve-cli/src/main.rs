@@ -232,9 +232,7 @@ fn count_memories(
 }
 
 fn db_size(path: &std::path::Path) -> u64 {
-    std::fs::metadata(path.join("memories.db"))
-        .map(|m| m.len())
-        .unwrap_or(0)
+    std::fs::metadata(path.join("memories.db")).map_or(0, |m| m.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -421,8 +419,7 @@ fn cmd_status(
 
     let entities = storage
         .list_entities_by_namespace(ns.id)
-        .map(|v| v.len())
-        .unwrap_or(0);
+        .map_or(0, |v| v.len());
 
     let storage_bytes = db_size(&path);
 

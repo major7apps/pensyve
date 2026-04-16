@@ -235,8 +235,7 @@ impl PyPensyve {
                     }
                     Err(e2) => {
                         let allow_mock = std::env::var("PENSYVE_ALLOW_MOCK_EMBEDDER")
-                            .map(|v| v == "true" || v == "1")
-                            .unwrap_or(false);
+                            .is_ok_and(|v| v == "true" || v == "1");
                         if allow_mock {
                             tracing::warn!(
                                 embedding_model = "mock",

@@ -57,6 +57,7 @@ struct InitResources {
     retrieval_config: RetrievalConfig,
 }
 
+#[allow(clippy::too_many_lines)]
 fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
     let storage: Arc<dyn StorageTrait> = if let Ok(database_url) = std::env::var("DATABASE_URL") {
         if database_url.starts_with("postgres") {
@@ -324,7 +325,7 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
     tokio::spawn({
         let state = app_state.clone();
         async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_mins(1));
             loop {
                 interval.tick().await;
                 state.rate_limiter.evict_stale();

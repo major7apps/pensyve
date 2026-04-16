@@ -221,7 +221,7 @@ impl AuthValidator {
                 hash.to_string(),
                 (
                     ctx.clone(),
-                    std::time::Instant::now() + std::time::Duration::from_secs(3600),
+                    std::time::Instant::now() + std::time::Duration::from_hours(1),
                 ),
             );
 
