@@ -129,8 +129,21 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
         let mut loaded = 0usize;
         for memory in &memories {
             let embedding = memory.embedding();
-            if !embedding.is_empty() && index.add(memory.id(), embedding).is_ok() {
-                loaded += 1;
+            if !embedding.is_empty() {
+                let result = match memory {
+                    pensyve_core::types::Memory::Semantic(s) => {
+                        index.add_with_entity(memory.id(), embedding, s.subject)
+                    }
+                    pensyve_core::types::Memory::Episodic(e) => {
+                        index.add_with_entity(memory.id(), embedding, e.about_entity)
+                    }
+                    pensyve_core::types::Memory::Procedural(_) => {
+                        index.add(memory.id(), embedding)
+                    }
+                };
+                if result.is_ok() {
+                    loaded += 1;
+                }
             }
         }
         tracing::info!(
@@ -145,7 +158,7 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
         weights: [0.30, 0.15, 0.20, 0.10, 0.10, 0.05, 0.05, 0.05],
         recall_timeout_secs: 5,
         rrf_k: 60,
-        rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5],
+        rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2],
         beam_width: 10,
         max_depth: 4,
     };

@@ -43,7 +43,18 @@ fn load_vector_index(
             for memory in &memories {
                 let embedding = memory.embedding();
                 if !embedding.is_empty() {
-                    if let Err(e) = index.add(memory.id(), embedding) {
+                    let result = match memory {
+                        pensyve_core::types::Memory::Semantic(s) => {
+                            index.add_with_entity(memory.id(), embedding, s.subject)
+                        }
+                        pensyve_core::types::Memory::Episodic(e) => {
+                            index.add_with_entity(memory.id(), embedding, e.about_entity)
+                        }
+                        pensyve_core::types::Memory::Procedural(_) => {
+                            index.add(memory.id(), embedding)
+                        }
+                    };
+                    if let Err(e) = result {
                         tracing::warn!("Skipping memory in index load: {e}");
                     } else {
                         loaded += 1;
@@ -134,7 +145,7 @@ async fn main() -> Result<()> {
         weights: [0.30, 0.15, 0.20, 0.10, 0.10, 0.05, 0.05, 0.05],
         recall_timeout_secs: 5,
         rrf_k: 60,
-        rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5],
+        rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2],
         beam_width: 10,
         max_depth: 4,
     };

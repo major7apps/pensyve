@@ -129,6 +129,18 @@ impl PensyveMcpServer {
         let limit = params.limit.unwrap_or(5).clamp(1, 100) as usize;
         let state = &self.state;
 
+        // Resolve the optional entity parameter to an entity UUID for entity-affinity ranking.
+        let target_entity = if let Some(ref entity_name) = params.entity {
+            state
+                .storage
+                .get_entity_by_name(entity_name, state.namespace.id)
+                .ok()
+                .flatten()
+                .map(|e| e.id)
+        } else {
+            None
+        };
+
         // Embed the query BEFORE acquiring the read lock — avoids holding the
         // vector index lock while waiting on the embedding Mutex.
         let embedder = state.embedder.clone();
@@ -153,7 +165,7 @@ impl PensyveMcpServer {
                     query_embedding.as_deref(),
                     state.namespace.id,
                     limit,
-                    None,
+                    target_entity,
                 )
                 .map_err(|e| format!("Error recalling memories: {e}"))?
         };
@@ -244,7 +256,7 @@ impl PensyveMcpServer {
         match embed_result {
             Ok(Ok(embedding)) => {
                 let mut vector_index = state.vector_index.write().await;
-                if let Err(err) = vector_index.add(mem.id, &embedding) {
+                if let Err(err) = vector_index.add_with_entity(mem.id, &embedding, entity.id) {
                     tracing::warn!("Failed to add to vector index: {err}");
                 }
                 mem.embedding = embedding;
@@ -475,7 +487,9 @@ impl PensyveMcpServer {
         match embed_result {
             Ok(Ok(embedding)) => {
                 let mut vector_index = state.vector_index.write().await;
-                if let Err(err) = vector_index.add(mem.id, &embedding) {
+                if let Err(err) =
+                    vector_index.add_with_entity(mem.id, &embedding, about_entity.id)
+                {
                     tracing::warn!("Failed to add to vector index: {err}");
                 }
                 mem.embedding = embedding;

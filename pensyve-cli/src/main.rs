@@ -183,7 +183,15 @@ fn build_vector_index(
         let emb = mem.embedding();
         if emb.len() == dimensions && !emb.is_empty() {
             // Best-effort: skip entries whose dimensions don't match.
-            let _ = index.add(mem.id(), emb);
+            let _ = match mem {
+                pensyve_core::types::Memory::Semantic(s) => {
+                    index.add_with_entity(mem.id(), emb, s.subject)
+                }
+                pensyve_core::types::Memory::Episodic(e) => {
+                    index.add_with_entity(mem.id(), emb, e.about_entity)
+                }
+                pensyve_core::types::Memory::Procedural(_) => index.add(mem.id(), emb),
+            };
         }
     }
     Ok(index)
@@ -263,7 +271,7 @@ fn cmd_recall(
         weights: [0.30, 0.15, 0.20, 0.10, 0.10, 0.05, 0.05, 0.05],
         recall_timeout_secs: 5,
         rrf_k: 60,
-        rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5],
+        rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2],
         beam_width: 10,
         max_depth: 4,
     };

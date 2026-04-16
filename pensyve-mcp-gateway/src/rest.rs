@@ -694,7 +694,7 @@ async fn remember(
     match embed_result {
         Ok(Ok(embedding)) => {
             let mut vector_index = ps.vector_index.write().await;
-            if let Err(err) = vector_index.add(mem.id, &embedding) {
+            if let Err(err) = vector_index.add_with_entity(mem.id, &embedding, entity.id) {
                 tracing::warn!("Failed to add to vector index: {err}");
             }
             mem.embedding = embedding;
@@ -940,7 +940,7 @@ async fn update_memory(
         if let Ok(Ok(embedding)) = tokio::task::spawn_blocking(move || embedder.embed(&text)).await
         {
             let mut vector_index = ps.vector_index.write().await;
-            let _ = vector_index.add(memory_id, &embedding);
+            let _ = vector_index.add_with_entity(memory_id, &embedding, mem.subject);
         }
     }
 
@@ -1181,7 +1181,9 @@ async fn observe(
     match embed_result {
         Ok(Ok(embedding)) => {
             let mut vector_index = ps.vector_index.write().await;
-            if let Err(err) = vector_index.add(mem.id, &embedding) {
+            if let Err(err) =
+                vector_index.add_with_entity(mem.id, &embedding, about_entity.id)
+            {
                 tracing::warn!("Failed to add to vector index: {err}");
             }
             mem.embedding = embedding;
@@ -1456,7 +1458,7 @@ async fn episode_message(
     match embed_result {
         Ok(Ok(embedding)) => {
             let mut vector_index = ps.vector_index.write().await;
-            if let Err(err) = vector_index.add(mem.id, &embedding) {
+            if let Err(err) = vector_index.add_with_entity(mem.id, &embedding, entity.id) {
                 tracing::warn!("Failed to add to vector index: {err}");
             }
             mem.embedding = embedding;

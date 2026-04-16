@@ -99,6 +99,20 @@ pub trait StorageTrait: Send + Sync {
         limit: usize,
     ) -> StorageResult<Vec<Memory>>;
 
+    /// Entity-scoped full-text search.
+    ///
+    /// Like `search_fts`, but only returns semantic memories whose `subject`
+    /// matches `entity_id` and episodic memories whose `about_entity` or
+    /// `source_entity` matches `entity_id`. Procedural memories are excluded
+    /// (they are project-agnostic).
+    fn search_fts_scoped(
+        &self,
+        query: &str,
+        namespace_id: Uuid,
+        entity_id: Uuid,
+        limit: usize,
+    ) -> StorageResult<Vec<Memory>>;
+
     // Bulk
     fn get_all_memories_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Memory>>;
 

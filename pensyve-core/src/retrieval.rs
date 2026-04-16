@@ -270,6 +270,8 @@ pub struct ScoredCandidate {
     pub access_score: f32,
     /// Memory confidence (episodic: 1.0, semantic: confidence, procedural: reliability).
     pub confidence_score: f32,
+    /// Entity-affinity score: 1.0 if memory belongs to the target entity, 0.0 otherwise.
+    pub entity_score: f32,
     /// 1.0 default; can boost specific memory types.
     pub type_boost: f32,
     /// Weighted fusion of all signals.
@@ -424,9 +426,30 @@ impl<'a> RecallEngine<'a> {
 
         // Steps 1–4: embed, search, merge candidates.
         let (candidates, vector_map) = if let Some(emb) = pre_embedding {
-            self.gather_candidates_with_embedding(emb, query, namespace_id, max_candidates)?
+            if target_entity.is_some() {
+                self.gather_candidates_dual_path(
+                    emb,
+                    query,
+                    namespace_id,
+                    max_candidates,
+                    target_entity,
+                )?
+            } else {
+                self.gather_candidates_with_embedding(emb, query, namespace_id, max_candidates)?
+            }
         } else {
-            self.gather_candidates(query, namespace_id, max_candidates)?
+            if target_entity.is_some() {
+                let query_embedding = self.embedder.embed(query)?;
+                self.gather_candidates_dual_path(
+                    &query_embedding,
+                    query,
+                    namespace_id,
+                    max_candidates,
+                    target_entity,
+                )?
+            } else {
+                self.gather_candidates(query, namespace_id, max_candidates)?
+            }
         };
 
         if candidates.is_empty() {
@@ -532,6 +555,26 @@ impl<'a> RecallEngine<'a> {
         ranking_confidence
             .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
+        // 7. Entity-affinity ranking
+        let mut ranking_entity: Vec<(Uuid, f32)> = if let Some(entity_id) = target_entity {
+            candidates
+                .iter()
+                .map(|(&id, mem)| {
+                    let affinity = match mem {
+                        Memory::Semantic(s) if s.subject == entity_id => 1.0,
+                        Memory::Episodic(e) if e.about_entity == entity_id => 1.0,
+                        Memory::Episodic(e) if e.source_entity == entity_id => 0.8,
+                        _ => 0.0,
+                    };
+                    (id, affinity)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        ranking_entity
+            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
         // Merge via RRF — only include rankings with discriminative signal.
         // A ranking where all scores are identical (e.g., empty graph, no access history)
         // adds noise and dilutes the strong signals like vector similarity.
@@ -542,6 +585,7 @@ impl<'a> RecallEngine<'a> {
             (ranking_spread, self.config.rrf_weights[3]),
             (ranking_intent, self.config.rrf_weights[4]),
             (ranking_confidence, self.config.rrf_weights[5]),
+            (ranking_entity, self.config.rrf_weights[6]),
         ];
 
         let (rankings, rrf_weights): (Vec<_>, Vec<_>) = all_rankings
@@ -611,6 +655,17 @@ impl<'a> RecallEngine<'a> {
                         ((access_count + 1) as f32).ln() / ((max_access + 1) as f32).ln()
                     };
 
+                    let entity_score = if let Some(entity_id) = target_entity {
+                        match mem {
+                            Memory::Semantic(s) if s.subject == entity_id => 1.0,
+                            Memory::Episodic(e) if e.about_entity == entity_id => 1.0,
+                            Memory::Episodic(e) if e.source_entity == entity_id => 0.8,
+                            _ => 0.0,
+                        }
+                    } else {
+                        0.0
+                    };
+
                     ScoredCandidate {
                         memory_id: id,
                         memory: mem.clone(),
@@ -621,6 +676,7 @@ impl<'a> RecallEngine<'a> {
                         recency_score,
                         access_score,
                         confidence_score,
+                        entity_score,
                         type_boost: 1.0,
                         final_score: rrf_score,
                     }
@@ -683,6 +739,91 @@ impl<'a> RecallEngine<'a> {
             candidates.entry(mem.id()).or_insert(mem);
         }
         for (id, _) in &vector_hits {
+            if !candidates.contains_key(id) {
+                if let Ok(Some(m)) = self.storage.get_episodic(*id) {
+                    candidates.insert(*id, Memory::Episodic(m));
+                } else if let Ok(Some(m)) = self.storage.get_semantic(*id) {
+                    candidates.insert(*id, Memory::Semantic(m));
+                } else if let Ok(Some(m)) = self.storage.get_procedural(*id) {
+                    candidates.insert(*id, Memory::Procedural(m));
+                }
+            }
+        }
+
+        Ok((candidates, vector_map))
+    }
+
+    /// Dual-path candidate gathering for entity-aware recall.
+    ///
+    /// - Path A (entity-scoped): filtered vector search + entity-scoped FTS
+    /// - Path B (broad): standard vector search + standard FTS, each capped at max/4
+    ///
+    /// Results are merged into a single candidate map (duplicates deduped by UUID).
+    fn gather_candidates_dual_path(
+        &self,
+        query_embedding: &[f32],
+        query: &str,
+        namespace_id: Uuid,
+        max_candidates: usize,
+        target_entity: Option<Uuid>,
+    ) -> Result<CandidateMaps, RecallError> {
+        let mut candidates: HashMap<Uuid, Memory> = HashMap::new();
+        let mut vector_map: HashMap<Uuid, f32> = HashMap::new();
+
+        // Path A: entity-scoped search
+        if let Some(entity_id) = target_entity {
+            // Filtered vector search — only memories belonging to the target entity.
+            let entity_map_ref = &self.vector_index;
+            let entity_hits = entity_map_ref.filtered_search(
+                query_embedding,
+                max_candidates,
+                |id| entity_map_ref.entity_for(id) == Some(entity_id),
+            )?;
+            for &(id, score) in &entity_hits {
+                vector_map.insert(id, score);
+            }
+
+            // Entity-scoped FTS.
+            let scoped_fts = self.storage.search_fts_scoped(
+                query,
+                namespace_id,
+                entity_id,
+                max_candidates,
+            )?;
+            for mem in scoped_fts {
+                candidates.entry(mem.id()).or_insert(mem);
+            }
+
+            // Hydrate vector hits into candidate map.
+            for (id, _) in &entity_hits {
+                if !candidates.contains_key(id) {
+                    if let Ok(Some(m)) = self.storage.get_episodic(*id) {
+                        candidates.insert(*id, Memory::Episodic(m));
+                    } else if let Ok(Some(m)) = self.storage.get_semantic(*id) {
+                        candidates.insert(*id, Memory::Semantic(m));
+                    } else if let Ok(Some(m)) = self.storage.get_procedural(*id) {
+                        candidates.insert(*id, Memory::Procedural(m));
+                    }
+                }
+            }
+        }
+
+        // Path B: broad search (capped at max/4 to avoid drowning entity-scoped results).
+        let broad_limit = max_candidates / 4;
+        let broad_vector_hits = self.vector_index.search(query_embedding, broad_limit)?;
+        for &(id, score) in &broad_vector_hits {
+            vector_map.entry(id).or_insert(score);
+        }
+
+        let broad_fts = self
+            .storage
+            .search_fts(query, namespace_id, broad_limit)?;
+        for mem in broad_fts {
+            candidates.entry(mem.id()).or_insert(mem);
+        }
+
+        // Hydrate broad vector hits into candidate map.
+        for (id, _) in &broad_vector_hits {
             if !candidates.contains_key(id) {
                 if let Ok(Some(m)) = self.storage.get_episodic(*id) {
                     candidates.insert(*id, Memory::Episodic(m));
@@ -844,6 +985,7 @@ fn score_candidate(
         recency_score,
         access_score,
         confidence_score,
+        entity_score: 0.0,
         type_boost,
         final_score,
     }
@@ -906,7 +1048,7 @@ mod tests {
             weights: TEST_WEIGHTS,
             recall_timeout_secs: 5,
             rrf_k: 60,
-            rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5],
+            rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2],
             beam_width: 10,
             max_depth: 4,
         }

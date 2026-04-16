@@ -599,7 +599,7 @@ fn main() {
             .save_episodic(&emem)
             .expect("Failed to save episodic memory");
         vector_index
-            .add(emem.id, &emem.embedding)
+            .add_with_entity(emem.id, &emem.embedding, about_entity.id)
             .expect("Failed to add to vector index");
         memory_ids.push(emem.id);
     }
@@ -613,7 +613,7 @@ fn main() {
         weights: [0.25, 0.10, 0.15, 0.05, 0.20, 0.10, 0.10, 0.05],
         recall_timeout_secs: 5,
         rrf_k: 60,
-        rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5],
+        rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2],
         beam_width: 10,
         max_depth: 4,
     };

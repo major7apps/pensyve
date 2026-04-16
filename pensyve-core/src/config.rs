@@ -68,9 +68,9 @@ pub struct RetrievalConfig {
     /// RRF constant k. Default 60.
     #[serde(default = "default_rrf_k")]
     pub rrf_k: u32,
-    /// Per-signal RRF weights [vec, bm25, activation, spread, intent, confidence].
+    /// Per-signal RRF weights: vec, bm25, activation, spread, intent, confidence, entity affinity.
     #[serde(default = "default_rrf_weights")]
-    pub rrf_weights: [f32; 6],
+    pub rrf_weights: [f32; 7],
     /// Beam search width. Default 10.
     #[serde(default = "default_beam_width")]
     pub beam_width: usize,
@@ -82,8 +82,8 @@ pub struct RetrievalConfig {
 fn default_rrf_k() -> u32 {
     60
 }
-fn default_rrf_weights() -> [f32; 6] {
-    [1.0, 0.8, 1.0, 0.8, 0.5, 0.5]
+fn default_rrf_weights() -> [f32; 7] {
+    [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2]
 }
 fn default_beam_width() -> usize {
     10
@@ -151,7 +151,7 @@ impl Default for PensyveConfig {
                 weights: [0.25, 0.10, 0.15, 0.05, 0.20, 0.10, 0.10, 0.05],
                 recall_timeout_secs: 5,
                 rrf_k: 60,
-                rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5],
+                rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2],
                 beam_width: 10,
                 max_depth: 4,
             },

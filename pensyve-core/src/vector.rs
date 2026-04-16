@@ -59,6 +59,8 @@ pub struct VectorIndex {
     /// Pre-normalized embeddings.
     entries: HashMap<Uuid, Vec<f32>>,
     dimensions: usize,
+    /// Maps memory IDs to their owning entity UUID for filtered search.
+    entity_map: HashMap<Uuid, Uuid>,
 }
 
 impl VectorIndex {
@@ -68,6 +70,7 @@ impl VectorIndex {
         Self {
             entries: HashMap::new(),
             dimensions,
+            entity_map: HashMap::new(),
         }
     }
 
@@ -86,6 +89,24 @@ impl VectorIndex {
         self.entries.insert(id, normed);
 
         Ok(())
+    }
+
+    /// Add (or replace) an embedding for `id`, also recording the owning entity.
+    /// The vector is L2-normalized before storage so searches use dot product.
+    pub fn add_with_entity(
+        &mut self,
+        id: Uuid,
+        embedding: &[f32],
+        entity_id: Uuid,
+    ) -> Result<(), VectorError> {
+        self.add(id, embedding)?;
+        self.entity_map.insert(id, entity_id);
+        Ok(())
+    }
+
+    /// Look up the entity associated with a memory ID, if any.
+    pub fn entity_for(&self, id: Uuid) -> Option<Uuid> {
+        self.entity_map.get(&id).copied()
     }
 
     /// Search for the `limit` nearest neighbors to `query`.
@@ -123,9 +144,49 @@ impl VectorIndex {
         Ok(scored)
     }
 
+    /// Search for the `limit` nearest neighbors to `query`, but only consider
+    /// entries where `predicate(id)` returns true. The original `search()` method
+    /// is unchanged; this variant enables entity-scoped vector retrieval.
+    pub fn filtered_search(
+        &self,
+        query: &[f32],
+        limit: usize,
+        predicate: impl Fn(Uuid) -> bool,
+    ) -> Result<Vec<(Uuid, f32)>, VectorError> {
+        if query.len() != self.dimensions {
+            return Err(VectorError::DimensionMismatch {
+                expected: self.dimensions,
+                got: query.len(),
+            });
+        }
+
+        // Normalize the query once.
+        let mut q = query.to_vec();
+        let q_norm = normalize(&mut q);
+
+        // Zero-norm query cannot match anything meaningfully.
+        if q_norm == 0.0 {
+            return Ok(vec![]);
+        }
+
+        let mut scored: Vec<(Uuid, f32)> = self
+            .entries
+            .iter()
+            .filter(|(id, _)| predicate(**id))
+            .map(|(id, emb)| (*id, dot(&q, emb)))
+            .collect();
+
+        // Sort descending by similarity score.
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+
+        Ok(scored)
+    }
+
     /// Remove the entry for `id`. Returns `NotFound` if `id` is absent.
     pub fn remove(&mut self, id: Uuid) -> Result<(), VectorError> {
         if self.entries.remove(&id).is_some() {
+            self.entity_map.remove(&id);
             Ok(())
         } else {
             Err(VectorError::NotFound(id))

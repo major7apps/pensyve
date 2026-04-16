@@ -269,6 +269,7 @@ mod tests {
             recency_score: 0.0,
             access_score: 0.0,
             confidence_score: 0.0,
+            entity_score: 0.0,
             type_boost: 1.0,
             final_score,
         }

@@ -1075,6 +1075,112 @@ impl StorageTrait for SqliteBackend {
         Ok(memories)
     }
 
+    fn search_fts_scoped(
+        &self,
+        query: &str,
+        namespace_id: Uuid,
+        entity_id: Uuid,
+        limit: usize,
+    ) -> StorageResult<Vec<Memory>> {
+        // Escape the query for FTS5 (same as search_fts).
+        let escaped_query: String = query
+            .split_whitespace()
+            .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if escaped_query.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = lock_conn!(self);
+        let entity_str = entity_id.to_string();
+        let ns_str = namespace_id.to_string();
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut memories = Vec::new();
+
+        // Semantic memories: subject = entity_id
+        {
+            let mut stmt = conn.prepare(
+                r"SELECT f.memory_id FROM memory_fts f
+                   JOIN semantic_memories s ON s.id = f.memory_id
+                   WHERE f.memory_fts MATCH ?1
+                     AND f.namespace_id = ?2
+                     AND f.memory_type = 'semantic'
+                     AND s.subject = ?3
+                   LIMIT ?4",
+            )?;
+            let rows: Vec<String> = stmt
+                .query_map(
+                    params![&escaped_query, &ns_str, &entity_str, limit_i64],
+                    |row| row.get(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            for id_str in rows {
+                let Ok(id) = Uuid::parse_str(&id_str) else {
+                    continue;
+                };
+                let result = conn
+                    .query_row(
+                        r"SELECT id, namespace_id, subject, predicate, object, content_type,
+                                  object_entity, confidence, valid_at, invalid_at,
+                                  source_episodes, embedding, stability, retrievability
+                           FROM semantic_memories WHERE id = ?1",
+                        params![id.to_string()],
+                        row_to_semantic,
+                    )
+                    .optional()?;
+                if let Some(Ok(m)) = result {
+                    memories.push(Memory::Semantic(m));
+                }
+            }
+        }
+
+        // Episodic memories: about_entity = entity_id OR source_entity = entity_id
+        let remaining = limit.saturating_sub(memories.len());
+        if remaining > 0 {
+            let remaining_i64 = i64::try_from(remaining).unwrap_or(i64::MAX);
+            let mut stmt = conn.prepare(
+                r"SELECT f.memory_id FROM memory_fts f
+                   JOIN episodic_memories e ON e.id = f.memory_id
+                   WHERE f.memory_fts MATCH ?1
+                     AND f.namespace_id = ?2
+                     AND f.memory_type = 'episodic'
+                     AND (e.about_entity = ?3 OR e.source_entity = ?3)
+                   LIMIT ?4",
+            )?;
+            let rows: Vec<String> = stmt
+                .query_map(
+                    params![&escaped_query, &ns_str, &entity_str, remaining_i64],
+                    |row| row.get(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            for id_str in rows {
+                let Ok(id) = Uuid::parse_str(&id_str) else {
+                    continue;
+                };
+                let result = conn
+                    .query_row(
+                        r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
+                                  content_type, summary, embedding, context_intent, timestamp,
+                                  stability, retrievability, access_count, last_accessed, event_time
+                           FROM episodic_memories WHERE id = ?1",
+                        params![id.to_string()],
+                        row_to_episodic,
+                    )
+                    .optional()?;
+                if let Some(Ok(m)) = result {
+                    memories.push(Memory::Episodic(m));
+                }
+            }
+        }
+
+        // Procedural memories are excluded (project-agnostic).
+        Ok(memories)
+    }
+
     // -----------------------------------------------------------------------
     // Bulk
     // -----------------------------------------------------------------------

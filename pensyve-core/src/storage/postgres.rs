@@ -941,6 +941,74 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    fn search_fts_scoped(
+        &self,
+        query_str: &str,
+        namespace_id: Uuid,
+        entity_id: Uuid,
+        limit: usize,
+    ) -> StorageResult<Vec<Memory>> {
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let tsquery = query_str.to_string();
+
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut memories = Vec::new();
+
+            // Semantic memories: subject = entity_id
+            let semantic_rows: Vec<SemanticRow> = query_as::<Postgres, _>(
+                r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
+                          valid_at, invalid_at, source_episodes, embedding::text, stability, retrievability
+                   FROM semantic_memories
+                   WHERE namespace_id = $1 AND subject = $2
+                     AND fts_content @@ plainto_tsquery('english', $3)
+                   ORDER BY ts_rank(fts_content, plainto_tsquery('english', $3)) DESC
+                   LIMIT $4",
+            )
+            .bind(namespace_id)
+            .bind(entity_id)
+            .bind(&tsquery)
+            .bind(limit_i64)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+
+            for row in semantic_rows {
+                memories.push(Memory::Semantic(row_to_semantic(row)));
+            }
+
+            // Episodic memories: about_entity = entity_id OR source_entity = entity_id
+            let remaining = limit.saturating_sub(memories.len());
+            let remaining_i64 = i64::try_from(remaining).unwrap_or(i64::MAX);
+
+            let episodic_rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
+                r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
+                          summary, embedding::text, context_intent, timestamp, stability, retrievability,
+                          access_count, last_accessed
+                   FROM episodic_memories
+                   WHERE namespace_id = $1
+                     AND (about_entity = $2 OR source_entity = $2)
+                     AND fts_content @@ plainto_tsquery('english', $3)
+                   ORDER BY ts_rank(fts_content, plainto_tsquery('english', $3)) DESC
+                   LIMIT $4",
+            )
+            .bind(namespace_id)
+            .bind(entity_id)
+            .bind(&tsquery)
+            .bind(remaining_i64)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+
+            for row in episodic_rows {
+                memories.push(Memory::Episodic(row_to_episodic(row)));
+            }
+
+            // Procedural memories excluded (project-agnostic).
+            Ok(memories)
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Bulk
     // -----------------------------------------------------------------------
