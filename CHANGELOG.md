@@ -5,6 +5,21 @@ All notable changes to Pensyve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-04-16 (Claude Code plugin only)
+
+### Changed
+
+- **Claude Code plugin**: removed the bundled `mcpServers.pensyve` entry from the plugin's `plugin.json`. MCP auth (API key vs OAuth) and backend (Cloud vs Local) are now user-owned decisions configured in `.claude/settings.json`. This eliminates the "MCP server skipped — same command/URL as already-configured" warning that users saw when they had a settings override, and makes install behavior consistent across auth paths.
+- **Plugin README**: rewrote the Install + Configure sections to document three explicit MCP options (Cloud + API key, Cloud + OAuth, Local stdio) with copyable JSON snippets. Root repo README updated to match.
+
+### Breaking (for OAuth zero-config users)
+
+- The plugin no longer auto-configures the MCP server on install. All users must add an `mcpServers.pensyve` entry to their `~/.claude/settings.json` (user-level) or `.claude/settings.json` (project-level). Previously, users with no config got an OAuth browser sign-in by default; now they need a two-line settings block.
+
+### Unchanged
+
+- No changes to the core engine, Python/TypeScript/Go SDKs, MCP server binary, or MCP gateway. PyPI/npm/crates.io/Go-module versions stay at 1.2.0.
+
 ## [1.2.0] - 2026-04-16
 
 ### Added
