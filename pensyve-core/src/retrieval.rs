@@ -572,8 +572,7 @@ impl<'a> RecallEngine<'a> {
         } else {
             Vec::new()
         };
-        ranking_entity
-            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranking_entity.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Merge via RRF — only include rankings with discriminative signal.
         // A ranking where all scores are identical (e.g., empty graph, no access history)
@@ -774,22 +773,18 @@ impl<'a> RecallEngine<'a> {
         if let Some(entity_id) = target_entity {
             // Filtered vector search — only memories belonging to the target entity.
             let entity_map_ref = &self.vector_index;
-            let entity_hits = entity_map_ref.filtered_search(
-                query_embedding,
-                max_candidates,
-                |id| entity_map_ref.entity_for(id) == Some(entity_id),
-            )?;
+            let entity_hits =
+                entity_map_ref.filtered_search(query_embedding, max_candidates, |id| {
+                    entity_map_ref.entity_for(id) == Some(entity_id)
+                })?;
             for &(id, score) in &entity_hits {
                 vector_map.insert(id, score);
             }
 
             // Entity-scoped FTS.
-            let scoped_fts = self.storage.search_fts_scoped(
-                query,
-                namespace_id,
-                entity_id,
-                max_candidates,
-            )?;
+            let scoped_fts =
+                self.storage
+                    .search_fts_scoped(query, namespace_id, entity_id, max_candidates)?;
             for mem in scoped_fts {
                 candidates.entry(mem.id()).or_insert(mem);
             }
@@ -815,9 +810,7 @@ impl<'a> RecallEngine<'a> {
             vector_map.entry(id).or_insert(score);
         }
 
-        let broad_fts = self
-            .storage
-            .search_fts(query, namespace_id, broad_limit)?;
+        let broad_fts = self.storage.search_fts(query, namespace_id, broad_limit)?;
         for mem in broad_fts {
             candidates.entry(mem.id()).or_insert(mem);
         }

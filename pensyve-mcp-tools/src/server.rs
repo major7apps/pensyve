@@ -487,8 +487,7 @@ impl PensyveMcpServer {
         match embed_result {
             Ok(Ok(embedding)) => {
                 let mut vector_index = state.vector_index.write().await;
-                if let Err(err) =
-                    vector_index.add_with_entity(mem.id, &embedding, about_entity.id)
+                if let Err(err) = vector_index.add_with_entity(mem.id, &embedding, about_entity.id)
                 {
                     tracing::warn!("Failed to add to vector index: {err}");
                 }
