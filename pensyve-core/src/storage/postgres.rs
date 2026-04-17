@@ -24,20 +24,21 @@ use crate::graph::EdgeType;
 // ---------------------------------------------------------------------------
 
 type EpisodicRow = (
-    Uuid,
-    Uuid,
-    Uuid,
-    Uuid,
-    Uuid,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    DateTime<Utc>,
-    f32,
-    f32,
-    i32,
-    Option<DateTime<Utc>>,
+    Uuid,                  // id
+    Uuid,                  // namespace_id
+    Uuid,                  // episode_id
+    Uuid,                  // source_entity
+    Uuid,                  // about_entity
+    String,                // content
+    Option<String>,        // summary
+    Option<String>,        // embedding::text
+    Option<String>,        // context_intent
+    DateTime<Utc>,         // timestamp
+    f32,                   // stability
+    f32,                   // retrievability
+    i32,                   // access_count
+    Option<DateTime<Utc>>, // last_accessed
+    Option<DateTime<Utc>>, // event_time
 );
 
 type SemanticRow = (
@@ -596,15 +597,20 @@ impl StorageTrait for PostgresBackend {
         let embedding_text = embedding_to_pgtext(&mem.embedding);
         self.block_on(async {
             let mut conn = self.scoped_conn(mem.namespace_id).await?;
+            // Note: the `episodic_memories` table was provisioned without an
+            // `event_time` column in the original schema. Runs `ALTER TABLE
+            // … ADD COLUMN IF NOT EXISTS` inside `run_schema` to keep this
+            // INSERT compatible with both fresh and upgraded databases.
             query::<Postgres>(
                 r"INSERT INTO episodic_memories
                    (id, namespace_id, episode_id, source_entity, about_entity, content, summary,
                     embedding, context_intent, timestamp, stability, retrievability,
-                    access_count, last_accessed)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13, $14)
+                    access_count, last_accessed, event_time)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13, $14, $15)
                    ON CONFLICT (id) DO UPDATE SET
                        content = $6, summary = $7, embedding = $8::vector, context_intent = $9,
-                       stability = $11, retrievability = $12, access_count = $13, last_accessed = $14",
+                       stability = $11, retrievability = $12, access_count = $13,
+                       last_accessed = $14, event_time = $15",
             )
             .bind(mem.id)
             .bind(mem.namespace_id)
@@ -620,6 +626,7 @@ impl StorageTrait for PostgresBackend {
             .bind(mem.retrievability)
             .bind(i32::try_from(mem.access_count).unwrap_or(i32::MAX))
             .bind(mem.last_accessed)
+            .bind(mem.event_time)
             .execute(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
@@ -633,7 +640,7 @@ impl StorageTrait for PostgresBackend {
             let row: Option<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           summary, embedding::text, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed
+                          access_count, last_accessed, event_time
                    FROM episodic_memories WHERE id = $1",
             )
             .bind(id)
@@ -656,7 +663,7 @@ impl StorageTrait for PostgresBackend {
             let rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           summary, embedding::text, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed
+                          access_count, last_accessed, event_time
                    FROM episodic_memories WHERE about_entity = $1
                    ORDER BY timestamp DESC LIMIT $2",
             )
@@ -678,12 +685,15 @@ impl StorageTrait for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
+                // Match SQLite: order by `event_time` when populated, else
+                // encoding `timestamp`. Observation extraction relies on
+                // chronological order across the episode.
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           summary, embedding::text, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed
+                          access_count, last_accessed, event_time
                    FROM episodic_memories
                    WHERE namespace_id = $1 AND episode_id = $2
-                   ORDER BY timestamp ASC",
+                   ORDER BY COALESCE(event_time, timestamp) ASC",
             )
             .bind(namespace_id)
             .bind(episode_id)
@@ -966,22 +976,39 @@ impl StorageTrait for PostgresBackend {
             return Ok(Vec::new());
         }
         let ids = episode_ids.to_vec();
+        // Defensive: if the backend has a `default_namespace` configured,
+        // add an explicit `namespace_id` filter to the query as a second
+        // line of defence beyond RLS. Callers without a default namespace
+        // (test fixtures, one-off scripts) still work via RLS alone —
+        // production deployments should always set the namespace either
+        // via `with_default_namespace` or by using `scoped_conn` upstream.
+        let namespace_filter = self.default_namespace;
         self.block_on(async move {
             let mut conn = self.maybe_scoped_conn().await?;
-            let rows: Vec<ObservationRow> = query_as::<Postgres, _>(
+            let sql = if namespace_filter.is_some() {
+                r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
+                          unit, content, embedding::text, confidence, event_time, created_at,
+                          stability, retrievability
+                   FROM observation_memories
+                   WHERE episode_id = ANY($1) AND namespace_id = $3
+                   ORDER BY created_at ASC
+                   LIMIT $2"
+            } else {
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
                           unit, content, embedding::text, confidence, event_time, created_at,
                           stability, retrievability
                    FROM observation_memories
                    WHERE episode_id = ANY($1)
                    ORDER BY created_at ASC
-                   LIMIT $2",
-            )
-            .bind(&ids)
-            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
+                   LIMIT $2"
+            };
+            let mut q = query_as::<Postgres, ObservationRow>(sql)
+                .bind(&ids)
+                .bind(i64::try_from(limit).unwrap_or(i64::MAX));
+            if let Some(ns) = namespace_filter {
+                q = q.bind(ns);
+            }
+            let rows: Vec<ObservationRow> = q.fetch_all(&mut *conn).await.map_err(sqlx_to_io)?;
             Ok(rows.into_iter().map(row_to_observation).collect())
         })
     }
@@ -1039,7 +1066,7 @@ impl StorageTrait for PostgresBackend {
             let episodic_rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           summary, embedding::text, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed
+                          access_count, last_accessed, event_time
                    FROM episodic_memories
                    WHERE namespace_id = $1 AND fts_content @@ plainto_tsquery('english', $2)
                    ORDER BY ts_rank(fts_content, plainto_tsquery('english', $2)) DESC
@@ -1143,7 +1170,7 @@ impl StorageTrait for PostgresBackend {
             let episodic_rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           summary, embedding::text, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed
+                          access_count, last_accessed, event_time
                    FROM episodic_memories
                    WHERE namespace_id = $1
                      AND (about_entity = $2 OR source_entity = $2)
@@ -1181,7 +1208,7 @@ impl StorageTrait for PostgresBackend {
             let episodic_rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           summary, embedding::text, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed
+                          access_count, last_accessed, event_time
                    FROM episodic_memories WHERE namespace_id = $1",
             )
             .bind(namespace_id)
@@ -1659,6 +1686,7 @@ fn row_to_episodic(row: EpisodicRow) -> EpisodicMemory {
         retrievability,
         access_count,
         last_accessed,
+        event_time,
     ) = row;
     EpisodicMemory {
         id,
@@ -1678,7 +1706,7 @@ fn row_to_episodic(row: EpisodicRow) -> EpisodicMemory {
         last_accessed,
         salience: 0.5,
         storage_strength: 0.0,
-        event_time: None,
+        event_time,
         superseded_by: None,
     }
 }

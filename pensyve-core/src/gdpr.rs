@@ -119,62 +119,88 @@ pub fn erase_namespace(
     Ok(result)
 }
 
-/// Export all data for an entity (DSAR -- Data Subject Access Request).
+/// Export all data for an entity (DSAR — Data Subject Access Request).
+///
+/// Under GDPR Art. 15 the data subject has the right to receive all personal
+/// data, including data **derived** from their conversations. Observations
+/// extracted from episodes the entity participated in are derived personal
+/// data and must be included in the export.
 pub fn export_entity_data(
     storage: &dyn StorageTrait,
     entity_id: Uuid,
     namespace_id: Uuid,
 ) -> Result<ExportResult, StorageError> {
+    use std::collections::HashSet;
+
     let all_memories = storage.get_all_memories_by_namespace(namespace_id)?;
 
-    let entity_memories: Vec<String> = all_memories
-        .into_iter()
-        .filter(|m| match m {
-            Memory::Episodic(e) => e.about_entity == entity_id || e.source_entity == entity_id,
-            Memory::Semantic(s) => s.subject == entity_id,
-            // Procedurals carry no entity reference; observations cascade
-            // with their source episode via the storage FK and are included
-            // indirectly when their parent episode matches.
-            Memory::Procedural(_) | Memory::Observation(_) => false,
-        })
-        .map(|m| {
-            let json = match m {
-                Memory::Episodic(e) => serde_json::json!({
-                    "type": "episodic",
-                    "id": e.id.to_string(),
-                    "content": e.content,
-                    "timestamp": e.timestamp.to_rfc3339(),
-                }),
-                Memory::Semantic(s) => serde_json::json!({
-                    "type": "semantic",
-                    "id": s.id.to_string(),
-                    "subject": s.subject.to_string(),
-                    "predicate": s.predicate,
-                    "object": s.object,
-                }),
-                Memory::Procedural(p) => serde_json::json!({
-                    "type": "procedural",
-                    "id": p.id.to_string(),
-                    "trigger": p.trigger,
-                    "action": p.action,
-                }),
-                Memory::Observation(o) => serde_json::json!({
+    // First pass: collect the entity's episodic + semantic memories AND the
+    // set of episode IDs that the entity participated in.
+    let mut entity_episode_ids: HashSet<Uuid> = HashSet::new();
+    let mut exports: Vec<String> = Vec::new();
+
+    for m in &all_memories {
+        match m {
+            Memory::Episodic(e) if e.about_entity == entity_id || e.source_entity == entity_id => {
+                entity_episode_ids.insert(e.episode_id);
+                exports.push(
+                    serde_json::json!({
+                        "type": "episodic",
+                        "id": e.id.to_string(),
+                        "episode_id": e.episode_id.to_string(),
+                        "content": e.content,
+                        "timestamp": e.timestamp.to_rfc3339(),
+                    })
+                    .to_string(),
+                );
+            }
+            Memory::Semantic(s) if s.subject == entity_id => {
+                exports.push(
+                    serde_json::json!({
+                        "type": "semantic",
+                        "id": s.id.to_string(),
+                        "subject": s.subject.to_string(),
+                        "predicate": s.predicate,
+                        "object": s.object,
+                    })
+                    .to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // Second pass: include observations whose source episode the entity
+    // participated in. Under GDPR these are derived personal data and must
+    // be part of the DSAR response.
+    for m in &all_memories {
+        if let Memory::Observation(o) = m
+            && entity_episode_ids.contains(&o.episode_id)
+        {
+            exports.push(
+                serde_json::json!({
                     "type": "observation",
                     "id": o.id.to_string(),
                     "episode_id": o.episode_id.to_string(),
                     "entity_type": o.entity_type,
                     "instance": o.instance,
                     "action": o.action,
-                }),
-            };
-            json.to_string()
-        })
-        .collect();
+                    "quantity": o.quantity,
+                    "unit": o.unit,
+                    "content": o.content,
+                    "confidence": o.confidence,
+                    "event_time": o.event_time.map(|t| t.to_rfc3339()),
+                    "created_at": o.created_at.to_rfc3339(),
+                })
+                .to_string(),
+            );
+        }
+    }
 
-    let total = entity_memories.len();
+    let total = exports.len();
 
     Ok(ExportResult {
-        memories: entity_memories,
+        memories: exports,
         entities: vec![serde_json::json!({"id": entity_id.to_string()}).to_string()],
         total_records: total + 1,
     })

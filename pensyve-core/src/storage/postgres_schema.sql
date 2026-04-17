@@ -62,8 +62,15 @@ CREATE TABLE IF NOT EXISTS episodic_memories (
     retrievability  REAL NOT NULL DEFAULT 1.0,
     access_count    INTEGER NOT NULL DEFAULT 0,
     last_accessed   TIMESTAMPTZ,
+    event_time      TIMESTAMPTZ,
     fts_content     tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
 );
+
+-- Idempotent migration for databases provisioned before `event_time` was
+-- added to the CREATE TABLE statement. Observation extraction relies on
+-- this column — without it the extractor sees `[unknown]` dates and can't
+-- build temporal context.
+ALTER TABLE episodic_memories ADD COLUMN IF NOT EXISTS event_time TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_episodic_about_entity ON episodic_memories(about_entity);
 CREATE INDEX IF NOT EXISTS idx_episodic_namespace ON episodic_memories(namespace_id);
