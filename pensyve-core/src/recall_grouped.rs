@@ -248,6 +248,79 @@ pub fn group_by_session(
 }
 
 // ---------------------------------------------------------------------------
+// Observation attachment
+// ---------------------------------------------------------------------------
+
+/// Attach per-episode observations to the given session groups.
+///
+/// Observations are loaded by joining on the `session_id` of each group
+/// (which is the source `episode_id`). They are appended to the group's
+/// `memories` vector *after* the episodic memories, so readers see the raw
+/// conversation first and the structured observations as a trailing
+/// appendix — the format the R7 benchmark prompt was validated against.
+///
+/// Observations do NOT participate in RRF candidate selection. Each attached
+/// observation carries the group's `group_score` as a surrogate `ScoredMemory.score`
+/// so downstream filters that threshold on score don't drop them
+/// indiscriminately; callers needing the extractor's original confidence can
+/// pattern-match on `Memory::Observation(o)` and read `o.confidence`.
+///
+/// Returns the groups unchanged on storage error (observations are optional
+/// enrichment; a failed lookup should never break recall).
+pub fn attach_observations_to_groups(
+    storage: &dyn crate::storage::StorageTrait,
+    groups: Vec<SessionGroup>,
+) -> Vec<SessionGroup> {
+    // Collect unique episode IDs across all groups that carry one.
+    let episode_ids: Vec<Uuid> = groups.iter().filter_map(|g| g.session_id).collect();
+    if episode_ids.is_empty() {
+        return groups;
+    }
+
+    // `limit` is set generously; at our expected 50-top-k workload the
+    // per-group observation count is typically 2-5, so a few hundred is
+    // well above ceiling. Future phase: configurable cap.
+    let observations = match storage.list_observations_by_episode_ids(&episode_ids, 1024) {
+        Ok(obs) => obs,
+        Err(e) => {
+            tracing::warn!(
+                target: "pensyve::observation",
+                error = %e,
+                "failed to load observations for session groups — returning groups unchanged"
+            );
+            return groups;
+        }
+    };
+
+    if observations.is_empty() {
+        return groups;
+    }
+
+    // Bucket observations by episode id.
+    let mut by_episode: HashMap<Uuid, Vec<crate::types::ObservationMemory>> = HashMap::new();
+    for obs in observations {
+        by_episode.entry(obs.episode_id).or_default().push(obs);
+    }
+
+    groups
+        .into_iter()
+        .map(|mut g| {
+            if let Some(sid) = g.session_id
+                && let Some(obs_for_group) = by_episode.remove(&sid)
+            {
+                for obs in obs_for_group {
+                    g.memories.push(ScoredMemory {
+                        memory: Memory::Observation(obs),
+                        score: g.group_score,
+                    });
+                }
+            }
+            g
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -534,5 +607,165 @@ mod tests {
             Memory::Procedural(p) => format!("{}:{}", p.trigger, p.action),
             Memory::Observation(o) => o.content.clone(),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // attach_observations_to_groups — integration with storage
+    // -----------------------------------------------------------------------
+
+    use crate::storage::StorageTrait;
+    use crate::storage::sqlite::SqliteBackend;
+    use crate::types::{Namespace, ObservationMemory};
+    use tempfile::TempDir;
+
+    fn setup_storage_with_namespace() -> (TempDir, SqliteBackend, Namespace) {
+        let dir = TempDir::new().unwrap();
+        let db = SqliteBackend::open(dir.path()).unwrap();
+        let ns = Namespace::new("test-attach");
+        db.save_namespace(&ns).unwrap();
+        (dir, db, ns)
+    }
+
+    fn save_obs(
+        db: &SqliteBackend,
+        ns: Uuid,
+        episode_id: Uuid,
+        instance: &str,
+    ) -> Uuid {
+        let obs = ObservationMemory::new(
+            ns,
+            episode_id,
+            "game_played",
+            instance,
+            "played",
+            format!("played {instance}"),
+        );
+        let id = obs.id;
+        db.save_observation(&obs).unwrap();
+        id
+    }
+
+    #[test]
+    fn attach_appends_observations_after_episodic_memories() {
+        let (_dir, db, ns) = setup_storage_with_namespace();
+        let ep = Uuid::new_v4();
+        let obs_id = save_obs(&db, ns.id, ep, "AC Odyssey");
+
+        let candidates = vec![
+            scored(ep_at(ep, t(2026, 1, 1), "turn 1"), 0.9),
+            scored(ep_at(ep, t(2026, 1, 2), "turn 2"), 0.8),
+        ];
+        let groups = group_by_session(candidates, OrderBy::Chronological, None);
+        let attached = attach_observations_to_groups(&db, groups);
+
+        assert_eq!(attached.len(), 1);
+        let g = &attached[0];
+        assert_eq!(g.memories.len(), 3);
+        // Episodic memories first in event-time order, observation last.
+        match &g.memories[0].memory {
+            Memory::Episodic(e) => assert_eq!(e.content, "turn 1"),
+            _ => panic!("expected episodic first"),
+        }
+        match &g.memories[1].memory {
+            Memory::Episodic(e) => assert_eq!(e.content, "turn 2"),
+            _ => panic!("expected episodic second"),
+        }
+        match &g.memories[2].memory {
+            Memory::Observation(o) => {
+                assert_eq!(o.id, obs_id);
+                assert_eq!(o.instance, "AC Odyssey");
+            }
+            _ => panic!("expected observation last"),
+        }
+        // Attached observations carry the group score as their ScoredMemory score.
+        assert!((g.memories[2].score - g.group_score).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn attach_scopes_observations_to_their_own_episode() {
+        let (_dir, db, ns) = setup_storage_with_namespace();
+        let ep_a = Uuid::new_v4();
+        let ep_b = Uuid::new_v4();
+        save_obs(&db, ns.id, ep_a, "game A");
+        save_obs(&db, ns.id, ep_b, "game B");
+
+        let candidates = vec![
+            scored(ep_at(ep_a, t(2026, 1, 1), "a1"), 0.5),
+            scored(ep_at(ep_b, t(2026, 1, 2), "b1"), 0.5),
+        ];
+        let groups = group_by_session(candidates, OrderBy::Chronological, None);
+        let attached = attach_observations_to_groups(&db, groups);
+
+        assert_eq!(attached.len(), 2);
+        for g in &attached {
+            let obs_count = g
+                .memories
+                .iter()
+                .filter(|m| matches!(m.memory, Memory::Observation(_)))
+                .count();
+            assert_eq!(obs_count, 1, "each group gets exactly its own obs");
+            let matching_instance = g.memories.iter().find_map(|m| match &m.memory {
+                Memory::Observation(o) => Some(o.instance.clone()),
+                _ => None,
+            });
+            let expected = if g.session_id == Some(ep_a) {
+                "game A"
+            } else {
+                "game B"
+            };
+            assert_eq!(matching_instance.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn attach_leaks_no_observations_from_non_topk_episodes() {
+        // Key architectural guarantee: observations from episodes NOT in the
+        // top-k recall must never surface. This is what broke Phase 0b.
+        let (_dir, db, ns) = setup_storage_with_namespace();
+        let topk_ep = Uuid::new_v4();
+        let unseen_ep = Uuid::new_v4();
+        save_obs(&db, ns.id, topk_ep, "visible");
+        save_obs(&db, ns.id, unseen_ep, "LEAKED");
+
+        let candidates = vec![scored(ep_at(topk_ep, t(2026, 1, 1), "x"), 0.5)];
+        let groups = group_by_session(candidates, OrderBy::Chronological, None);
+        let attached = attach_observations_to_groups(&db, groups);
+
+        assert_eq!(attached.len(), 1);
+        let leaked = attached[0].memories.iter().any(|m| match &m.memory {
+            Memory::Observation(o) => o.instance == "LEAKED",
+            _ => false,
+        });
+        assert!(!leaked, "observations from non-top-k episodes leaked through");
+    }
+
+    #[test]
+    fn attach_is_noop_when_no_observations_stored() {
+        let (_dir, db, ns) = setup_storage_with_namespace();
+        let _ = ns;
+        let ep = Uuid::new_v4();
+
+        let candidates = vec![scored(ep_at(ep, t(2026, 1, 1), "x"), 0.5)];
+        let groups = group_by_session(candidates, OrderBy::Chronological, None);
+        let attached = attach_observations_to_groups(&db, groups);
+
+        assert_eq!(attached.len(), 1);
+        assert_eq!(attached[0].memories.len(), 1);
+    }
+
+    #[test]
+    fn attach_skips_singleton_semantic_groups() {
+        let (_dir, db, ns) = setup_storage_with_namespace();
+        let _ = ns;
+        let subj = Uuid::new_v4();
+
+        let candidates = vec![scored(sem(subj, "knows", "Rust"), 0.9)];
+        let groups = group_by_session(candidates, OrderBy::Chronological, None);
+        // Semantic memories don't have a session_id so the attach lookup
+        // never runs for them.
+        let attached = attach_observations_to_groups(&db, groups);
+        assert_eq!(attached.len(), 1);
+        assert_eq!(attached[0].session_id, None);
+        assert_eq!(attached[0].memories.len(), 1);
     }
 }

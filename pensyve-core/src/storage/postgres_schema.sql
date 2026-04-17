@@ -67,6 +67,8 @@ CREATE TABLE IF NOT EXISTS episodic_memories (
 
 CREATE INDEX IF NOT EXISTS idx_episodic_about_entity ON episodic_memories(about_entity);
 CREATE INDEX IF NOT EXISTS idx_episodic_namespace ON episodic_memories(namespace_id);
+CREATE INDEX IF NOT EXISTS idx_episodic_episode
+    ON episodic_memories(namespace_id, episode_id);
 CREATE INDEX IF NOT EXISTS idx_episodic_fts ON episodic_memories USING GIN(fts_content);
 
 -- ---------------------------------------------------------------------------

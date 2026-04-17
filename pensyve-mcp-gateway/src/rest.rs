@@ -1498,6 +1498,7 @@ async fn episode_message(
     ))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn episode_end(
     State(state): State<Arc<AppState>>,
     axum::Extension(auth_ctx): axum::Extension<AuthContext>,
@@ -1587,6 +1588,41 @@ async fn episode_end(
                     );
                 }
                 Err(e) => tracing::warn!("Post-episode consolidation failed: {e}"),
+            }
+        });
+    }
+
+    // Trigger async observation extraction. Non-fatal: if the extractor isn't
+    // configured (ANTHROPIC_API_KEY unset) or the call fails, the episode
+    // still persists — observations are opportunistic enrichment.
+    if let Some(extractor) = state.extractor.clone() {
+        let storage = ps.storage.clone();
+        let embedder = ps.embedder.clone();
+        let ns_id = ps.namespace.id;
+        tokio::spawn(async move {
+            let persisted = pensyve_core::observation::commit_extraction_for_episode(
+                storage.as_ref(),
+                extractor.as_ref(),
+                ns_id,
+                episode_id,
+                |text| embedder.embed(text),
+            )
+            .await;
+            if persisted > 0 {
+                tracing::info!(
+                    observations = persisted,
+                    episode_id = %episode_id,
+                    "Post-episode extraction"
+                );
+                let _ = storage.log_activity(
+                    ns_id,
+                    "observation_extract",
+                    &serde_json::json!({
+                        "episode_id": episode_id.to_string(),
+                        "observations": persisted,
+                        "trigger": "episode_end",
+                    }),
+                );
             }
         });
     }

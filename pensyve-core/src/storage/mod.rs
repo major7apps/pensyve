@@ -64,6 +64,31 @@ pub trait StorageTrait: Send + Sync {
         about_entity: Uuid,
         limit: usize,
     ) -> StorageResult<Vec<EpisodicMemory>>;
+
+    /// Fetch every episodic memory tied to the given episode, ordered by
+    /// `event_time` (falling back to `timestamp`). Used by the observation
+    /// extraction ingest hook — the extractor sees the full conversation,
+    /// not just the turns the caller happens to still have in memory.
+    ///
+    /// Default implementation walks `get_all_memories_by_namespace` for
+    /// backends that don't provide a direct index; override for performance.
+    fn list_episodic_by_episode(
+        &self,
+        namespace_id: Uuid,
+        episode_id: Uuid,
+    ) -> StorageResult<Vec<EpisodicMemory>> {
+        let all = self.get_all_memories_by_namespace(namespace_id)?;
+        let mut out: Vec<EpisodicMemory> = all
+            .into_iter()
+            .filter_map(|m| match m {
+                Memory::Episodic(e) if e.episode_id == episode_id => Some(e),
+                _ => None,
+            })
+            .collect();
+        out.sort_by_key(|e| e.event_time.unwrap_or(e.timestamp));
+        Ok(out)
+    }
+
     fn update_episodic_access(
         &self,
         id: Uuid,

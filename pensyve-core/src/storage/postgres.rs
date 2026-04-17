@@ -670,6 +670,30 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    fn list_episodic_by_episode(
+        &self,
+        namespace_id: Uuid,
+        episode_id: Uuid,
+    ) -> StorageResult<Vec<EpisodicMemory>> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
+                r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
+                          summary, embedding::text, context_intent, timestamp, stability, retrievability,
+                          access_count, last_accessed
+                   FROM episodic_memories
+                   WHERE namespace_id = $1 AND episode_id = $2
+                   ORDER BY timestamp ASC",
+            )
+            .bind(namespace_id)
+            .bind(episode_id)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(rows.into_iter().map(row_to_episodic).collect())
+        })
+    }
+
     fn update_episodic_access(
         &self,
         id: Uuid,

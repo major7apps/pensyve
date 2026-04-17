@@ -47,6 +47,9 @@ pub struct AppState {
     pub admin_key: Option<String>,
     pub ct: CancellationToken,
     pub redis: Option<redis::aio::ConnectionManager>,
+    /// Process-wide observation extractor. `None` when `ANTHROPIC_API_KEY`
+    /// is unset — ingest still works, observations are simply not produced.
+    pub extractor: Option<Arc<dyn pensyve_core::observation::ObservationExtractor>>,
 }
 
 struct InitResources {
@@ -242,6 +245,23 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
     };
 
     let auth_required = !config.api_keys.is_empty();
+
+    // Observation extractor — initialized only when ANTHROPIC_API_KEY is set.
+    // Ingest still works without it; observations are simply not produced.
+    let extractor: Option<Arc<dyn pensyve_core::observation::ObservationExtractor>> =
+        match pensyve_core::observation::AnthropicHaikuExtractor::from_env() {
+            Ok(e) => {
+                tracing::info!("Observation extractor: AnthropicHaikuExtractor (Haiku 4.5)");
+                Some(Arc::new(e))
+            }
+            Err(e) => {
+                tracing::info!(
+                    "Observation extractor disabled: {e}. Set ANTHROPIC_API_KEY to enable."
+                );
+                None
+            }
+        };
+
     let app_state = Arc::new(AppState {
         auth: auth::AuthValidator::new(&config),
         rate_limiter: rate_limit::RateLimiter::new(config.rate_limit_per_minute),
@@ -252,6 +272,7 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         admin_key: config.admin_key.clone(),
         ct: ct.clone(),
         redis,
+        extractor,
     });
 
     // Create per-tenant MCP service factory. In stateless mode, a new service

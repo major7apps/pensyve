@@ -636,6 +636,119 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
 pub use haiku::{AnthropicHaikuExtractor, EXTRACTION_PROMPT_V1};
 
 // ---------------------------------------------------------------------------
+// Ingest helper — canonical post-episode-close extraction flow
+// ---------------------------------------------------------------------------
+
+/// Errors are logged via `tracing::warn!` and swallowed; the caller's
+/// episode is already durable regardless of what happens here.
+///
+/// `embed` receives each observation's `content` string and must return an
+/// embedding vector (or a boxed error). Taking a closure keeps `pensyve-core`
+/// independent of the concrete embedder implementation.
+///
+/// Returns the number of observations successfully persisted.
+pub async fn commit_extraction_for_episode<F, E>(
+    storage: &(dyn crate::storage::StorageTrait + Send + Sync),
+    extractor: &dyn ObservationExtractor,
+    namespace_id: Uuid,
+    episode_id: Uuid,
+    mut embed: F,
+) -> usize
+where
+    F: FnMut(&str) -> Result<Vec<f32>, E>,
+    E: std::fmt::Display,
+{
+    let raw_messages = match storage.list_episodic_by_episode(namespace_id, episode_id) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                target: "pensyve::observation",
+                error = %e,
+                episode_id = %episode_id,
+                "failed to load episode messages for extraction"
+            );
+            return 0;
+        }
+    };
+
+    if raw_messages.is_empty() {
+        return 0;
+    }
+
+    let extraction_messages: Vec<ExtractionMessage> = raw_messages
+        .iter()
+        .map(|m| {
+            // Strip the "role: " prefix ingested by callers (see
+            // `run_pensyve_retrieve.py` / PyEpisode ingest pattern). If the
+            // content doesn't start with a role marker, keep as-is.
+            let (role, content) = split_role_prefix(&m.content);
+            ExtractionMessage {
+                role: role.to_string(),
+                content: content.to_string(),
+                event_time: m.event_time,
+            }
+        })
+        .collect();
+
+    let observations = match extractor
+        .extract(namespace_id, episode_id, &extraction_messages)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                target: "pensyve::observation",
+                error = %e,
+                episode_id = %episode_id,
+                "extractor failed — episode persists without observations"
+            );
+            return 0;
+        }
+    };
+
+    let mut persisted = 0usize;
+    for mut obs in observations {
+        match embed(&obs.content) {
+            Ok(v) => obs.embedding = v,
+            Err(e) => {
+                tracing::warn!(
+                    target: "pensyve::observation",
+                    error = %e,
+                    observation_id = %obs.id,
+                    "failed to embed observation content"
+                );
+                continue;
+            }
+        }
+        if let Err(e) = storage.save_observation(&obs) {
+            tracing::warn!(
+                target: "pensyve::observation",
+                error = %e,
+                observation_id = %obs.id,
+                "failed to persist observation"
+            );
+            continue;
+        }
+        persisted += 1;
+    }
+    persisted
+}
+
+/// Split `"role: content"` ingested form back into its two parts. If no
+/// colon is present or the prefix is empty, returns `("user", full)`.
+fn split_role_prefix(raw: &str) -> (&str, &str) {
+    let Some(idx) = raw.find(':') else {
+        return ("user", raw);
+    };
+    let (role, rest) = raw.split_at(idx);
+    if role.is_empty() {
+        return ("user", raw);
+    }
+    let content = rest.trim_start_matches(':').trim_start();
+    (role, content)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -739,5 +852,139 @@ mod tests {
             .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
             .await;
         assert!(matches!(result, Err(ExtractionError::Transport(_))));
+    }
+
+    // -----------------------------------------------------------------------
+    // commit_extraction_for_episode — integration with storage
+    // -----------------------------------------------------------------------
+
+    use crate::storage::StorageTrait;
+    use crate::storage::sqlite::SqliteBackend;
+    use crate::types::{EpisodicMemory, Namespace, ObservationMemory};
+    use tempfile::TempDir;
+
+    /// Closure that pretends to embed — returns a fixed-size vector of 1.0s.
+    /// Real flows plug in `OnnxEmbedder::embed`; this keeps the core test
+    /// independent of the embedding model.
+    fn fake_embed(_text: &str) -> Result<Vec<f32>, std::io::Error> {
+        Ok(vec![1.0_f32; 4])
+    }
+
+    fn setup_storage() -> (TempDir, SqliteBackend, Namespace, Uuid) {
+        let dir = TempDir::new().unwrap();
+        let db = SqliteBackend::open(dir.path()).unwrap();
+        let ns = Namespace::new("test-obs-ingest");
+        db.save_namespace(&ns).unwrap();
+
+        let episode_id = Uuid::new_v4();
+        let src = Uuid::new_v4();
+        let about = Uuid::new_v4();
+        // Two messages in the episode — the extractor should see both.
+        for content in ["user: I played AC Odyssey", "user: I finished Dune"] {
+            let mut mem = EpisodicMemory::new(ns.id, episode_id, src, about, content);
+            mem.event_time = Some(Utc::now());
+            db.save_episodic(&mem).unwrap();
+        }
+        (dir, db, ns, episode_id)
+    }
+
+    #[tokio::test]
+    async fn commit_extraction_noop_persists_nothing() {
+        let (_dir, db, ns, ep) = setup_storage();
+        let persisted =
+            commit_extraction_for_episode(&db, &NoopExtractor, ns.id, ep, fake_embed).await;
+        assert_eq!(persisted, 0);
+    }
+
+    #[tokio::test]
+    async fn commit_extraction_persists_mock_observations_with_embeddings() {
+        let (_dir, db, ns, ep) = setup_storage();
+        let fixed = vec![
+            ObservationMemory::new(ns.id, ep, "game_played", "AC Odyssey", "played", "played AC Odyssey"),
+            ObservationMemory::new(ns.id, ep, "book_read", "Dune", "read", "read Dune"),
+        ];
+        let extractor = MockExtractor { fixed };
+        let persisted =
+            commit_extraction_for_episode(&db, &extractor, ns.id, ep, fake_embed).await;
+        assert_eq!(persisted, 2);
+
+        // Verify the observations landed with embeddings attached.
+        let stored = db.list_observations_by_episode_ids(&[ep], 100).unwrap();
+        assert_eq!(stored.len(), 2);
+        for obs in &stored {
+            assert_eq!(obs.namespace_id, ns.id);
+            assert_eq!(obs.episode_id, ep);
+            assert_eq!(obs.embedding, vec![1.0_f32; 4]);
+        }
+        let instances: std::collections::HashSet<_> =
+            stored.iter().map(|o| o.instance.clone()).collect();
+        assert!(instances.contains("AC Odyssey"));
+        assert!(instances.contains("Dune"));
+    }
+
+    #[tokio::test]
+    async fn commit_extraction_swallows_extractor_failure() {
+        let (_dir, db, ns, ep) = setup_storage();
+        let persisted =
+            commit_extraction_for_episode(&db, &FailingExtractor, ns.id, ep, fake_embed).await;
+        assert_eq!(persisted, 0);
+
+        // Episode's raw memories are untouched — ingest is non-fatal.
+        let raw = db.list_episodic_by_episode(ns.id, ep).unwrap();
+        assert_eq!(raw.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn commit_extraction_swallows_embedding_failure() {
+        let (_dir, db, ns, ep) = setup_storage();
+        let extractor = MockExtractor {
+            fixed: vec![ObservationMemory::new(
+                ns.id, ep, "x", "y", "z", "z y",
+            )],
+        };
+        let fail_embed = |_: &str| -> Result<Vec<f32>, std::io::Error> {
+            Err(std::io::Error::other("embedder down"))
+        };
+        let persisted =
+            commit_extraction_for_episode(&db, &extractor, ns.id, ep, fail_embed).await;
+        assert_eq!(persisted, 0);
+
+        let stored = db.list_observations_by_episode_ids(&[ep], 100).unwrap();
+        assert!(stored.is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_extraction_skips_when_episode_has_no_messages() {
+        let dir = TempDir::new().unwrap();
+        let db = SqliteBackend::open(dir.path()).unwrap();
+        let ns = Namespace::new("empty");
+        db.save_namespace(&ns).unwrap();
+        let ep = Uuid::new_v4();
+
+        let extractor = MockExtractor {
+            fixed: vec![ObservationMemory::new(
+                ns.id, ep, "should", "not", "persist", "",
+            )],
+        };
+        let persisted =
+            commit_extraction_for_episode(&db, &extractor, ns.id, ep, fake_embed).await;
+        assert_eq!(persisted, 0);
+    }
+
+    #[test]
+    fn split_role_prefix_handles_role_colon_content() {
+        assert_eq!(split_role_prefix("user: hi"), ("user", "hi"));
+        assert_eq!(split_role_prefix("assistant: hello"), ("assistant", "hello"));
+    }
+
+    #[test]
+    fn split_role_prefix_handles_missing_prefix() {
+        assert_eq!(split_role_prefix("no prefix"), ("user", "no prefix"));
+        assert_eq!(split_role_prefix(""), ("user", ""));
+    }
+
+    #[test]
+    fn split_role_prefix_trims_trailing_whitespace_after_colon() {
+        assert_eq!(split_role_prefix("user:   spaces"), ("user", "spaces"));
     }
 }

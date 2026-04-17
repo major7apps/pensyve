@@ -391,10 +391,16 @@ impl<'a> RecallEngine<'a> {
         config: &crate::recall_grouped::RecallGroupedConfig,
     ) -> Result<Vec<crate::recall_grouped::SessionGroup>, RecallError> {
         let result = self.recall(query, namespace_id, config.limit)?;
-        Ok(crate::recall_grouped::group_by_session(
+        let groups = crate::recall_grouped::group_by_session(
             result.memories,
             config.order,
             config.max_groups,
+        );
+        // Observations attach post-grouping — they don't participate in RRF
+        // candidate selection, only enrich the sessions that already won.
+        Ok(crate::recall_grouped::attach_observations_to_groups(
+            self.storage,
+            groups,
         ))
     }
 

@@ -292,6 +292,8 @@ CREATE INDEX IF NOT EXISTS idx_semantic_ns ON semantic_memories(namespace_id);
 CREATE INDEX IF NOT EXISTS idx_episodic_about ON episodic_memories(about_entity);
 CREATE INDEX IF NOT EXISTS idx_episodic_source ON episodic_memories(source_entity);
 CREATE INDEX IF NOT EXISTS idx_episodic_ns ON episodic_memories(namespace_id);
+CREATE INDEX IF NOT EXISTS idx_episodic_episode
+    ON episodic_memories(namespace_id, episode_id);
 CREATE INDEX IF NOT EXISTS idx_observation_episode ON observation_memories(episode_id);
 CREATE INDEX IF NOT EXISTS idx_observation_ns ON observation_memories(namespace_id);
 CREATE INDEX IF NOT EXISTS idx_observation_entity_type
@@ -894,6 +896,31 @@ impl StorageTrait for SqliteBackend {
                 i64::try_from(limit).unwrap_or(i64::MAX)
             ],
             row_to_semantic,
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row??);
+        }
+        Ok(out)
+    }
+
+    fn list_episodic_by_episode(
+        &self,
+        namespace_id: Uuid,
+        episode_id: Uuid,
+    ) -> StorageResult<Vec<EpisodicMemory>> {
+        let conn = lock_conn!(self);
+        let mut stmt = conn.prepare(
+            r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
+                      content_type, summary, embedding, context_intent, timestamp,
+                      stability, retrievability, access_count, last_accessed, event_time
+               FROM episodic_memories
+               WHERE namespace_id = ?1 AND episode_id = ?2
+               ORDER BY COALESCE(event_time, timestamp) ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![namespace_id.to_string(), episode_id.to_string()],
+            row_to_episodic,
         )?;
         let mut out = Vec::new();
         for row in rows {
