@@ -2886,6 +2886,7 @@ dependencies = [
  "pensyve-core",
  "pyo3",
  "serde_json",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
