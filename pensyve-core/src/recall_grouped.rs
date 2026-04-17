@@ -626,12 +626,7 @@ mod tests {
         (dir, db, ns)
     }
 
-    fn save_obs(
-        db: &SqliteBackend,
-        ns: Uuid,
-        episode_id: Uuid,
-        instance: &str,
-    ) -> Uuid {
+    fn save_obs(db: &SqliteBackend, ns: Uuid, episode_id: Uuid, instance: &str) -> Uuid {
         let obs = ObservationMemory::new(
             ns,
             episode_id,
@@ -736,7 +731,10 @@ mod tests {
             Memory::Observation(o) => o.instance == "LEAKED",
             _ => false,
         });
-        assert!(!leaked, "observations from non-top-k episodes leaked through");
+        assert!(
+            !leaked,
+            "observations from non-top-k episodes leaked through"
+        );
     }
 
     #[test]

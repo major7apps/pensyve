@@ -150,6 +150,16 @@ pub trait StorageTrait: Send + Sync {
         Ok(0)
     }
 
+    /// Delete every observation whose source episode is associated with the
+    /// given entity (either as `source_entity` or `about_entity` on an
+    /// episodic memory). Used by GDPR cascade-delete paths — called BEFORE
+    /// `delete_memories_by_entity` so the episodic→entity join still exists.
+    ///
+    /// Returns the row count of deleted observations.
+    fn delete_observations_by_entity(&self, _entity_id: Uuid) -> StorageResult<usize> {
+        Ok(0)
+    }
+
     // Full-text search (BM25)
     fn search_fts(
         &self,

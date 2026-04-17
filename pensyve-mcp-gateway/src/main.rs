@@ -132,6 +132,12 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
     if let Ok(memories) = storage.get_all_memories_by_namespace(namespace.id) {
         let mut loaded = 0usize;
         for memory in &memories {
+            // Observations are recall-time enrichment — they attach to
+            // top-k session groups via `recall_grouped::attach_observations_to_groups`
+            // and MUST NOT enter the RRF candidate pool.
+            if matches!(memory, pensyve_core::types::Memory::Observation(_)) {
+                continue;
+            }
             let embedding = memory.embedding();
             if !embedding.is_empty() {
                 let result = match memory {
@@ -141,10 +147,8 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
                     pensyve_core::types::Memory::Episodic(e) => {
                         index.add_with_entity(memory.id(), embedding, e.about_entity)
                     }
-                    pensyve_core::types::Memory::Procedural(_)
-                    | pensyve_core::types::Memory::Observation(_) => {
-                        index.add(memory.id(), embedding)
-                    }
+                    pensyve_core::types::Memory::Procedural(_) => index.add(memory.id(), embedding),
+                    pensyve_core::types::Memory::Observation(_) => unreachable!(),
                 };
                 if result.is_ok() {
                     loaded += 1;

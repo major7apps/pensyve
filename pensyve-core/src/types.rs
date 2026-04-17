@@ -646,14 +646,8 @@ mod tests {
     fn test_observation_memory_serde_roundtrip() {
         let ns_id = Uuid::new_v4();
         let ep_id = Uuid::new_v4();
-        let mut obs = ObservationMemory::new(
-            ns_id,
-            ep_id,
-            "book_read",
-            "Dune",
-            "read",
-            "User read Dune",
-        );
+        let mut obs =
+            ObservationMemory::new(ns_id, ep_id, "book_read", "Dune", "read", "User read Dune");
         obs.quantity = Some(512.0);
         obs.unit = Some("pages".into());
         obs.embedding = vec![0.1, 0.2, 0.3];
@@ -677,14 +671,8 @@ mod tests {
     fn test_memory_enum_observation_accessors() {
         let ns_id = Uuid::new_v4();
         let ep_id = Uuid::new_v4();
-        let mut obs = ObservationMemory::new(
-            ns_id,
-            ep_id,
-            "game_played",
-            "AC Odyssey",
-            "played",
-            "x",
-        );
+        let mut obs =
+            ObservationMemory::new(ns_id, ep_id, "game_played", "AC Odyssey", "played", "x");
         obs.embedding = vec![1.0, 2.0];
         let obs_id = obs.id;
         let mem = Memory::Observation(obs);

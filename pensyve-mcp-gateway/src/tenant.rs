@@ -129,6 +129,12 @@ impl TenantStateManager {
         let mut index = VectorIndex::new(self.dimensions, 1024);
         if let Ok(memories) = self.storage.get_all_memories_by_namespace(namespace.id) {
             for mem in &memories {
+                // Observations are recall-time enrichment — they attach to
+                // top-k session groups via `recall_grouped::attach_observations_to_groups`
+                // and MUST NOT enter the RRF candidate pool.
+                if matches!(mem, pensyve_core::types::Memory::Observation(_)) {
+                    continue;
+                }
                 let emb = mem.embedding();
                 if !emb.is_empty() {
                     let _ = match mem {
@@ -138,10 +144,8 @@ impl TenantStateManager {
                         pensyve_core::types::Memory::Episodic(e) => {
                             index.add_with_entity(mem.id(), emb, e.about_entity)
                         }
-                        pensyve_core::types::Memory::Procedural(_)
-                        | pensyve_core::types::Memory::Observation(_) => {
-                            index.add(mem.id(), emb)
-                        }
+                        pensyve_core::types::Memory::Procedural(_) => index.add(mem.id(), emb),
+                        pensyve_core::types::Memory::Observation(_) => unreachable!(),
                     };
                 }
             }

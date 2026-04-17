@@ -210,9 +210,8 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
         ///
         /// Returns `ExtractionError::Config` if the env var is missing.
         pub fn from_env() -> ExtractionResult<Self> {
-            let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
-                ExtractionError::Config("ANTHROPIC_API_KEY env var not set".into())
-            })?;
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .map_err(|_| ExtractionError::Config("ANTHROPIC_API_KEY env var not set".into()))?;
             Self::new(api_key)
         }
 
@@ -256,7 +255,16 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
                     || "unknown".to_string(),
                     |t| t.format("%Y-%m-%d").to_string(),
                 );
-                let _ = writeln!(body, "[{date}] {}: {}", m.role, m.content);
+                // Skip the role prefix when empty — engine ingest paths don't
+                // store role on `EpisodicMemory` (it lives in `source_entity`
+                // + `about_entity` UUIDs instead). Harness callers that DO
+                // know the role can still set it and get the
+                // `[date] role: content` format.
+                if m.role.is_empty() {
+                    let _ = writeln!(body, "[{date}] {}", m.content);
+                } else {
+                    let _ = writeln!(body, "[{date}] {}: {}", m.role, m.content);
+                }
             }
             format!(
                 "{EXTRACTION_PROMPT_V1}\n\n--- Recalled memories ---\n{body}--- End memories ---"
@@ -312,20 +320,15 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
     /// Strip markdown fences, extract the outermost `[ ... ]` JSON array,
     /// parse. Returns an empty vec on any failure — matches the harness's
     /// graceful-degradation behavior.
+    ///
+    /// Fence stripping handles the common triple-backtick shapes (with or
+    /// without a `json` language tag) by finding the opening fence, trimming
+    /// the language marker, and cutting at the closing fence. Bracket
+    /// extraction below is a second line of defence when the response
+    /// contains prose before/after the array.
     fn parse_response(text: &str) -> Vec<RawObservation> {
         let trimmed = text.trim();
-        let no_fence = if let (Some(start), Some(end)) = (trimmed.find("```"), trimmed.rfind("```"))
-            && end > start
-        {
-            let inner = &trimmed[start..=end];
-            inner
-                .trim_start_matches("```json")
-                .trim_start_matches("```")
-                .trim_end_matches("```")
-                .trim()
-        } else {
-            trimmed
-        };
+        let no_fence = strip_markdown_fence(trimmed);
 
         let bracket_start = no_fence.find('[');
         let bracket_end = no_fence.rfind(']');
@@ -335,6 +338,27 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
         };
 
         serde_json::from_str(slice).unwrap_or_default()
+    }
+
+    /// Remove ```` ``` ```` / ```` ```json ```` / ```` ```\n ```` wrappers
+    /// from an LLM response. Handles the common shapes without regex.
+    fn strip_markdown_fence(s: &str) -> &str {
+        let Some(start) = s.find("```") else {
+            return s;
+        };
+        // Advance past opening fence + optional "json" tag + newline.
+        let after_open = &s[start + 3..];
+        let after_lang = after_open
+            .strip_prefix("json")
+            .unwrap_or(after_open)
+            .trim_start();
+        // Find the CLOSING fence. rfind("```") finds the last one; if the
+        // opening fence is the only one (response wasn't closed), fall back
+        // to the trimmed remainder.
+        let Some(close_rel) = after_lang.rfind("```") else {
+            return after_lang.trim();
+        };
+        after_lang[..close_rel].trim()
     }
 
     fn raw_to_observation(
@@ -407,9 +431,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
-                return Err(ExtractionError::Transport(format!(
-                    "HTTP {status}: {body}"
-                )));
+                return Err(ExtractionError::Transport(format!("HTTP {status}: {body}")));
             }
 
             let parsed: AnthropicResponse = response
@@ -481,7 +503,9 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
                 .and(path("/v1/messages"))
                 .and(header("x-api-key", "test-key"))
                 .and(header("anthropic-version", ANTHROPIC_VERSION))
-                .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response_body(&canned)))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(anthropic_response_body(&canned)),
+                )
                 .mount(&server)
                 .await;
 
@@ -622,10 +646,33 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
         }
 
         #[test]
+        fn prompt_omits_role_prefix_when_role_empty() {
+            // Engine ingest path: `EpisodicMemory.content` has no role
+            // prefix. `commit_extraction_for_episode` passes role="" so the
+            // extractor prompt renders `[date] content` without mis-parsing
+            // URLs or timestamps as roles.
+            let msgs = [ExtractionMessage {
+                role: String::new(),
+                content: "Check http://example.com at 10:30".to_string(),
+                event_time: None,
+            }];
+            let prompt = AnthropicHaikuExtractor::build_prompt(&msgs);
+            assert!(prompt.contains("[unknown] Check http://example.com at 10:30"));
+            // And NO "10:" or "http:" being (mis)interpreted as a role marker.
+            assert!(!prompt.contains("10: 30"));
+            assert!(!prompt.contains("http: //"));
+        }
+
+        #[test]
         fn parse_response_clamps_confidence() {
             let raw = r#"[{"entity_type":"x","instance":"y","action":"z","confidence":1.5}]"#;
             let parsed = parse_response(raw);
-            let obs = raw_to_observation(parsed.into_iter().next().unwrap(), Uuid::new_v4(), Uuid::new_v4(), None);
+            let obs = raw_to_observation(
+                parsed.into_iter().next().unwrap(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                None,
+            );
             assert!(obs.confidence <= 1.0);
             assert!(obs.confidence >= 0.0);
         }
@@ -677,16 +724,16 @@ where
 
     let extraction_messages: Vec<ExtractionMessage> = raw_messages
         .iter()
-        .map(|m| {
-            // Strip the "role: " prefix ingested by callers (see
-            // `run_pensyve_retrieve.py` / PyEpisode ingest pattern). If the
-            // content doesn't start with a role marker, keep as-is.
-            let (role, content) = split_role_prefix(&m.content);
-            ExtractionMessage {
-                role: role.to_string(),
-                content: content.to_string(),
-                event_time: m.event_time,
-            }
+        .map(|m| ExtractionMessage {
+            // `EpisodicMemory.content` is the raw user/assistant turn with
+            // no role prefix — role lives in `source_entity` / `about_entity`
+            // UUIDs and would require an extra lookup we don't do here.
+            // The extractor prompt is self-guarding ("Only extract things
+            // the USER actually did…") so omitting role is safe; the
+            // extractor reads the text and decides.
+            role: String::new(),
+            content: m.content.clone(),
+            event_time: m.event_time,
         })
         .collect();
 
@@ -732,20 +779,6 @@ where
         persisted += 1;
     }
     persisted
-}
-
-/// Split `"role: content"` ingested form back into its two parts. If no
-/// colon is present or the prefix is empty, returns `("user", full)`.
-fn split_role_prefix(raw: &str) -> (&str, &str) {
-    let Some(idx) = raw.find(':') else {
-        return ("user", raw);
-    };
-    let (role, rest) = raw.split_at(idx);
-    if role.is_empty() {
-        return ("user", raw);
-    }
-    let content = rest.trim_start_matches(':').trim_start();
-    (role, content)
 }
 
 // ---------------------------------------------------------------------------
@@ -848,9 +881,7 @@ mod tests {
     #[tokio::test]
     async fn failing_extractor_returns_error() {
         let extractor = FailingExtractor;
-        let result = extractor
-            .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
-            .await;
+        let result = extractor.extract(Uuid::new_v4(), Uuid::new_v4(), &[]).await;
         assert!(matches!(result, Err(ExtractionError::Transport(_))));
     }
 
@@ -900,12 +931,18 @@ mod tests {
     async fn commit_extraction_persists_mock_observations_with_embeddings() {
         let (_dir, db, ns, ep) = setup_storage();
         let fixed = vec![
-            ObservationMemory::new(ns.id, ep, "game_played", "AC Odyssey", "played", "played AC Odyssey"),
+            ObservationMemory::new(
+                ns.id,
+                ep,
+                "game_played",
+                "AC Odyssey",
+                "played",
+                "played AC Odyssey",
+            ),
             ObservationMemory::new(ns.id, ep, "book_read", "Dune", "read", "read Dune"),
         ];
         let extractor = MockExtractor { fixed };
-        let persisted =
-            commit_extraction_for_episode(&db, &extractor, ns.id, ep, fake_embed).await;
+        let persisted = commit_extraction_for_episode(&db, &extractor, ns.id, ep, fake_embed).await;
         assert_eq!(persisted, 2);
 
         // Verify the observations landed with embeddings attached.
@@ -938,15 +975,12 @@ mod tests {
     async fn commit_extraction_swallows_embedding_failure() {
         let (_dir, db, ns, ep) = setup_storage();
         let extractor = MockExtractor {
-            fixed: vec![ObservationMemory::new(
-                ns.id, ep, "x", "y", "z", "z y",
-            )],
+            fixed: vec![ObservationMemory::new(ns.id, ep, "x", "y", "z", "z y")],
         };
         let fail_embed = |_: &str| -> Result<Vec<f32>, std::io::Error> {
             Err(std::io::Error::other("embedder down"))
         };
-        let persisted =
-            commit_extraction_for_episode(&db, &extractor, ns.id, ep, fail_embed).await;
+        let persisted = commit_extraction_for_episode(&db, &extractor, ns.id, ep, fail_embed).await;
         assert_eq!(persisted, 0);
 
         let stored = db.list_observations_by_episode_ids(&[ep], 100).unwrap();
@@ -966,25 +1000,7 @@ mod tests {
                 ns.id, ep, "should", "not", "persist", "",
             )],
         };
-        let persisted =
-            commit_extraction_for_episode(&db, &extractor, ns.id, ep, fake_embed).await;
+        let persisted = commit_extraction_for_episode(&db, &extractor, ns.id, ep, fake_embed).await;
         assert_eq!(persisted, 0);
-    }
-
-    #[test]
-    fn split_role_prefix_handles_role_colon_content() {
-        assert_eq!(split_role_prefix("user: hi"), ("user", "hi"));
-        assert_eq!(split_role_prefix("assistant: hello"), ("assistant", "hello"));
-    }
-
-    #[test]
-    fn split_role_prefix_handles_missing_prefix() {
-        assert_eq!(split_role_prefix("no prefix"), ("user", "no prefix"));
-        assert_eq!(split_role_prefix(""), ("user", ""));
-    }
-
-    #[test]
-    fn split_role_prefix_trims_trailing_whitespace_after_colon() {
-        assert_eq!(split_role_prefix("user:   spaces"), ("user", "spaces"));
     }
 }

@@ -623,7 +623,14 @@ async fn recall_grouped(
                     format!("Recall error: {e}"),
                 )
             })?;
-        pensyve_core::recall_grouped::group_by_session(flat.memories, order, max_groups)
+        let groups =
+            pensyve_core::recall_grouped::group_by_session(flat.memories, order, max_groups);
+        // Attach per-episode observations to the top-k groups. Must mirror
+        // `RecallEngine::recall_grouped` (pensyve-core/src/retrieval.rs) so
+        // REST, MCP, and SDK callers all see the same response shape — the
+        // 89.2% benchmark number is reproducible only when observations are
+        // surfaced here.
+        pensyve_core::recall_grouped::attach_observations_to_groups(ps.storage.as_ref(), groups)
     };
 
     let _ = ps.storage.log_activity(

@@ -180,6 +180,12 @@ fn build_vector_index(
     let all_memories = storage.get_all_memories_by_namespace(namespace_id)?;
     let mut index = VectorIndex::new(dimensions, all_memories.len().max(16));
     for mem in &all_memories {
+        // Observations are recall-time enrichment — they attach to top-k
+        // session groups via `recall_grouped::attach_observations_to_groups`
+        // and MUST NOT enter the RRF candidate pool.
+        if matches!(mem, pensyve_core::types::Memory::Observation(_)) {
+            continue;
+        }
         let emb = mem.embedding();
         if emb.len() == dimensions && !emb.is_empty() {
             // Best-effort: skip entries whose dimensions don't match.
@@ -190,9 +196,8 @@ fn build_vector_index(
                 pensyve_core::types::Memory::Episodic(e) => {
                     index.add_with_entity(mem.id(), emb, e.about_entity)
                 }
-                // Procedural + Observation carry no direct entity link.
-                pensyve_core::types::Memory::Procedural(_)
-                | pensyve_core::types::Memory::Observation(_) => index.add(mem.id(), emb),
+                pensyve_core::types::Memory::Procedural(_) => index.add(mem.id(), emb),
+                pensyve_core::types::Memory::Observation(_) => unreachable!(),
             };
         }
     }

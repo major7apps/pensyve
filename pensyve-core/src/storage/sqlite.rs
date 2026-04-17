@@ -1146,6 +1146,47 @@ impl StorageTrait for SqliteBackend {
         Ok(out)
     }
 
+    fn delete_observations_by_entity(&self, entity_id: Uuid) -> StorageResult<usize> {
+        let conn = lock_conn!(self);
+        let id_str = entity_id.to_string();
+        conn.execute_batch("BEGIN")?;
+        let result = (|| -> StorageResult<usize> {
+            // Strip FTS entries first — we need the observation IDs before
+            // the rows are gone.
+            conn.execute(
+                "DELETE FROM memory_fts \
+                 WHERE memory_type = 'observation' \
+                   AND memory_id IN (\
+                     SELECT id FROM observation_memories \
+                      WHERE episode_id IN (\
+                        SELECT DISTINCT episode_id FROM episodic_memories \
+                         WHERE about_entity = ?1 OR source_entity = ?1\
+                      )\
+                   )",
+                params![&id_str],
+            )?;
+            let deleted = conn.execute(
+                "DELETE FROM observation_memories \
+                 WHERE episode_id IN (\
+                   SELECT DISTINCT episode_id FROM episodic_memories \
+                    WHERE about_entity = ?1 OR source_entity = ?1\
+                 )",
+                params![&id_str],
+            )?;
+            Ok(deleted)
+        })();
+        match result {
+            Ok(n) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(n)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     fn delete_observations_by_episode(&self, episode_id: Uuid) -> StorageResult<usize> {
         let conn = lock_conn!(self);
         let ep_str = episode_id.to_string();
@@ -2936,8 +2977,7 @@ mod tests {
         let ns = make_namespace(&db);
         let ep = Uuid::new_v4();
 
-        let obs =
-            ObservationMemory::new(ns.id, ep, "thing", "instance", "did", "content");
+        let obs = ObservationMemory::new(ns.id, ep, "thing", "instance", "did", "content");
         db.save_observation(&obs).unwrap();
 
         let all = db.get_all_memories_by_namespace(ns.id).unwrap();
@@ -2993,10 +3033,8 @@ mod tests {
 
         let ep_a = Uuid::new_v4();
         let ep_b = Uuid::new_v4();
-        let obs_a =
-            ObservationMemory::new(ns_a.id, ep_a, "x", "a-instance", "did", "c");
-        let obs_b =
-            ObservationMemory::new(ns_b.id, ep_b, "x", "b-instance", "did", "c");
+        let obs_a = ObservationMemory::new(ns_a.id, ep_a, "x", "a-instance", "did", "c");
+        let obs_b = ObservationMemory::new(ns_b.id, ep_b, "x", "b-instance", "did", "c");
         db.save_observation(&obs_a).unwrap();
         db.save_observation(&obs_b).unwrap();
 

@@ -73,21 +73,21 @@ type ProceduralRow = (
 );
 
 type ObservationRow = (
-    Uuid,                    // id
-    Uuid,                    // namespace_id
-    Uuid,                    // episode_id
-    String,                  // entity_type
-    String,                  // instance
-    String,                  // action
-    Option<f64>,             // quantity
-    Option<String>,          // unit
-    String,                  // content
-    Option<String>,          // embedding::text
-    f32,                     // confidence
-    Option<DateTime<Utc>>,   // event_time
-    DateTime<Utc>,           // created_at
-    f32,                     // stability
-    f32,                     // retrievability
+    Uuid,                  // id
+    Uuid,                  // namespace_id
+    Uuid,                  // episode_id
+    String,                // entity_type
+    String,                // instance
+    String,                // action
+    Option<f64>,           // quantity
+    Option<String>,        // unit
+    String,                // content
+    Option<String>,        // embedding::text
+    f32,                   // confidence
+    Option<DateTime<Utc>>, // event_time
+    DateTime<Utc>,         // created_at
+    f32,                   // stability
+    f32,                   // retrievability
 );
 
 type EdgeRow = (
@@ -989,10 +989,27 @@ impl StorageTrait for PostgresBackend {
     fn delete_observations_by_episode(&self, episode_id: Uuid) -> StorageResult<usize> {
         self.block_on(async {
             let mut conn = self.maybe_scoped_conn().await?;
+            let result =
+                query::<Postgres>("DELETE FROM observation_memories WHERE episode_id = $1")
+                    .bind(episode_id)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(sqlx_to_io)?;
+            Ok(usize::try_from(result.rows_affected()).unwrap_or(0))
+        })
+    }
+
+    fn delete_observations_by_entity(&self, entity_id: Uuid) -> StorageResult<usize> {
+        self.block_on(async {
+            let mut conn = self.maybe_scoped_conn().await?;
             let result = query::<Postgres>(
-                "DELETE FROM observation_memories WHERE episode_id = $1",
+                "DELETE FROM observation_memories \
+                 WHERE episode_id IN (\
+                   SELECT DISTINCT episode_id FROM episodic_memories \
+                    WHERE about_entity = $1 OR source_entity = $1\
+                 )",
             )
-            .bind(episode_id)
+            .bind(entity_id)
             .execute(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;

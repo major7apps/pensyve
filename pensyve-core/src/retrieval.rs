@@ -500,9 +500,7 @@ impl<'a> RecallEngine<'a> {
                             .collect();
                         activation::base_level_activation(&times, now.timestamp() as f64, 0.5)
                     }
-                    Memory::Semantic(_)
-                    | Memory::Procedural(_)
-                    | Memory::Observation(_) => 0.0,
+                    Memory::Semantic(_) | Memory::Procedural(_) | Memory::Observation(_) => 0.0,
                 };
                 (id, b)
             })
@@ -608,9 +606,7 @@ impl<'a> RecallEngine<'a> {
             .values()
             .map(|m| match m {
                 Memory::Episodic(e) => e.access_count,
-                Memory::Semantic(_)
-                | Memory::Procedural(_)
-                | Memory::Observation(_) => 0,
+                Memory::Semantic(_) | Memory::Procedural(_) | Memory::Observation(_) => 0,
             })
             .max()
             .unwrap_or(0);
@@ -650,9 +646,7 @@ impl<'a> RecallEngine<'a> {
 
                     let access_count = match mem {
                         Memory::Episodic(e) => e.access_count,
-                        Memory::Semantic(_)
-                        | Memory::Procedural(_)
-                        | Memory::Observation(_) => 0,
+                        Memory::Semantic(_) | Memory::Procedural(_) | Memory::Observation(_) => 0,
                     };
                     let access_score = if max_access == 0 {
                         0.0_f32

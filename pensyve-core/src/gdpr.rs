@@ -12,8 +12,11 @@ use crate::types::Memory;
 /// Result of a GDPR erasure operation.
 #[derive(Debug, Clone, Default)]
 pub struct ErasureResult {
-    /// Number of memories deleted.
+    /// Number of memories deleted (episodic + semantic + procedural).
     pub memories_deleted: usize,
+    /// Number of observation memories deleted (derived from episodes the
+    /// entity participated in).
+    pub observations_deleted: usize,
     /// Number of graph edges deleted.
     pub edges_deleted: usize,
     /// Number of entities deleted.
@@ -49,19 +52,30 @@ pub fn erase_entity(
 ) -> Result<ErasureResult, StorageError> {
     let mut result = ErasureResult::default();
 
-    // Step 1: Delete all memories about this entity
+    // Step 1: Delete observations derived from episodes the entity
+    // participated in. MUST run BEFORE `delete_memories_by_entity` because
+    // the join uses `episodic_memories.about_entity / source_entity` — once
+    // the episodic rows are gone the association is lost.
+    match storage.delete_observations_by_entity(entity_id) {
+        Ok(count) => result.observations_deleted = count,
+        Err(e) => result
+            .warnings
+            .push(format!("Observation deletion error: {e}")),
+    }
+
+    // Step 2: Delete all episodic / semantic memories about this entity.
     match storage.delete_memories_by_entity(entity_id) {
         Ok(count) => result.memories_deleted = count,
         Err(e) => result.warnings.push(format!("Memory deletion error: {e}")),
     }
 
-    // Step 2: Delete graph edges
+    // Step 3: Delete graph edges
     match storage.get_edges_for_entity(entity_id) {
         Ok(edges) => result.edges_deleted = edges.len(),
         Err(e) => result.warnings.push(format!("Edge query error: {e}")),
     }
 
-    // Step 3: Delete entity record (not found is OK — entity may not exist)
+    // Step 4: Delete entity record (not found is OK — entity may not exist)
     match storage.delete_entity(entity_id) {
         Ok(true) => result.entities_deleted = 1,
         Ok(false) => {} // Entity record didn't exist — nothing to delete
@@ -88,6 +102,7 @@ pub fn erase_namespace(
         match erase_entity(storage, entity.id) {
             Ok(entity_result) => {
                 result.memories_deleted += entity_result.memories_deleted;
+                result.observations_deleted += entity_result.observations_deleted;
                 result.edges_deleted += entity_result.edges_deleted;
                 result.entities_deleted += entity_result.entities_deleted;
                 result.warnings.extend(entity_result.warnings);

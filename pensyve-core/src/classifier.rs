@@ -79,11 +79,10 @@ fn contains_whole_phrase(haystack: &str, phrase: &str) -> bool {
     let mut start = 0;
     while let Some(idx) = haystack[start..].find(phrase) {
         let abs = start + idx;
-        let before_ok = abs == 0
-            || !haystack.as_bytes()[abs - 1].is_ascii_alphanumeric();
+        let before_ok = abs == 0 || !haystack.as_bytes()[abs - 1].is_ascii_alphanumeric();
         let after_pos = abs + phrase.len();
-        let after_ok = after_pos >= haystack.len()
-            || !haystack.as_bytes()[after_pos].is_ascii_alphanumeric();
+        let after_ok =
+            after_pos >= haystack.len() || !haystack.as_bytes()[after_pos].is_ascii_alphanumeric();
         if before_ok && after_ok {
             return true;
         }
@@ -240,9 +239,8 @@ lookup, prefer `inject`. Respond with exactly one word (`inject` or \
         /// Build using the `ANTHROPIC_API_KEY` env var. Returns
         /// `ClassifierError::Config` when the var is missing.
         pub fn from_env() -> ClassifierResult<Self> {
-            let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
-                ClassifierError::Config("ANTHROPIC_API_KEY env var not set".into())
-            })?;
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .map_err(|_| ClassifierError::Config("ANTHROPIC_API_KEY env var not set".into()))?;
             Self::new(api_key)
         }
 
@@ -279,10 +277,24 @@ lookup, prefer `inject`. Respond with exactly one word (`inject` or \
         /// in isolation (benchmarking, calibration, test fixtures).
         pub async fn classify_haiku_only(&self, query: &str) -> Route {
             let key = normalize_query(query);
-            if let Ok(mut cache) = self.cache.lock()
-                && let Some(hit) = cache.get(&key)
-            {
-                return hit;
+            match self.cache.lock() {
+                Ok(mut cache) => {
+                    if let Some(hit) = cache.get(&key) {
+                        return hit;
+                    }
+                }
+                Err(e) => {
+                    // Poisoned mutex — some prior caller panicked inside the
+                    // critical section. We can keep serving by bypassing the
+                    // cache, but a long-running process sees every request as
+                    // a miss from here on. Log once per occurrence so ops
+                    // has signal to investigate.
+                    tracing::warn!(
+                        target: "pensyve::classifier",
+                        error = %e,
+                        "classifier cache lock poisoned on get; bypassing cache"
+                    );
+                }
             }
 
             let route = match self.call_api(&key).await {
@@ -297,8 +309,15 @@ lookup, prefer `inject`. Respond with exactly one word (`inject` or \
                 }
             };
 
-            if let Ok(mut cache) = self.cache.lock() {
-                cache.put(key, route);
+            match self.cache.lock() {
+                Ok(mut cache) => cache.put(key, route),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "pensyve::classifier",
+                        error = %e,
+                        "classifier cache lock poisoned on put; result not cached"
+                    );
+                }
             }
             route
         }
@@ -353,7 +372,11 @@ lookup, prefer `inject`. Respond with exactly one word (`inject` or \
     /// whitespace. Two semantically identical queries typed by different
     /// users should hit the same cache entry.
     fn normalize_query(q: &str) -> String {
-        q.trim().to_ascii_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+        q.trim()
+            .to_ascii_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Parse Haiku's single-token response. Accepts any variant that
@@ -438,7 +461,10 @@ lookup, prefer `inject`. Respond with exactly one word (`inject` or \
             let c = HaikuQueryClassifier::new("test-key")
                 .unwrap()
                 .with_base_url(server.uri());
-            assert_eq!(c.classify("how many books did I read?").await, Route::Inject);
+            assert_eq!(
+                c.classify("how many books did I read?").await,
+                Route::Inject
+            );
         }
 
         #[tokio::test]
@@ -446,9 +472,7 @@ lookup, prefer `inject`. Respond with exactly one word (`inject` or \
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/v1/messages"))
-                .respond_with(
-                    ResponseTemplate::new(200).set_body_json(anthropic_response("skip")),
-                )
+                .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response("skip")))
                 .mount(&server)
                 .await;
             let c = HaikuQueryClassifier::new("test-key")
@@ -463,8 +487,7 @@ lookup, prefer `inject`. Respond with exactly one word (`inject` or \
             Mock::given(method("POST"))
                 .and(path("/v1/messages"))
                 .respond_with(
-                    ResponseTemplate::new(200)
-                        .set_body_json(anthropic_response("inject.\n")),
+                    ResponseTemplate::new(200).set_body_json(anthropic_response("inject.\n")),
                 )
                 .mount(&server)
                 .await;
@@ -510,15 +533,18 @@ lookup, prefer `inject`. Respond with exactly one word (`inject` or \
                 .unwrap()
                 .with_base_url(server.uri());
             assert_eq!(
-                c.classify_haiku_only("what was the last book I read?").await,
+                c.classify_haiku_only("what was the last book I read?")
+                    .await,
                 Route::Inject
             );
             assert_eq!(
-                c.classify_haiku_only("what was the last book I read?").await,
+                c.classify_haiku_only("what was the last book I read?")
+                    .await,
                 Route::Inject
             );
             assert_eq!(
-                c.classify_haiku_only("  What Was The  Last  Book I Read?  ").await,
+                c.classify_haiku_only("  What Was The  Last  Book I Read?  ")
+                    .await,
                 Route::Inject
             );
         }
@@ -536,7 +562,10 @@ lookup, prefer `inject`. Respond with exactly one word (`inject` or \
             let c = HaikuQueryClassifier::new("k")
                 .unwrap()
                 .with_base_url(server.uri());
-            assert_eq!(c.classify("How many books did I read?").await, Route::Inject);
+            assert_eq!(
+                c.classify("How many books did I read?").await,
+                Route::Inject
+            );
         }
 
         #[tokio::test]

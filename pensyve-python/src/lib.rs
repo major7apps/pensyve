@@ -209,7 +209,9 @@ fn build_extractor(
                 Some(k) => pensyve_core::observation::AnthropicHaikuExtractor::new(k),
                 None => pensyve_core::observation::AnthropicHaikuExtractor::from_env(),
             }
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to build haiku extractor: {e}")))?;
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("Failed to build haiku extractor: {e}"))
+            })?;
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
                 .enable_all()
@@ -931,9 +933,10 @@ impl PyEpisode {
         // Observation extraction — runs only when a haiku extractor was
         // configured. All failures are logged + swallowed; episode stays
         // durable regardless.
-        if let (Some(extractor), Some(runtime)) =
-            (self.inner.extractor.clone(), self.inner.extractor_runtime.clone())
-        {
+        if let (Some(extractor), Some(runtime)) = (
+            self.inner.extractor.clone(),
+            self.inner.extractor_runtime.clone(),
+        ) {
             let storage = self.inner.storage.clone();
             let embedder = self.inner.embedder.clone();
             let ns_id = self.namespace_id;
