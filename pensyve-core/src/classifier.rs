@@ -253,14 +253,31 @@ lookup, prefer `inject`. Respond with exactly one word (`inject` or \
             self
         }
 
-        /// Classify a query. Cache hits are ~nanoseconds; cache misses do
-        /// one Haiku request (~100 ms typical, ~$0.0002).
+        /// Classify a query using hybrid routing: `Inject` if EITHER the
+        /// naive regex OR the Haiku classifier says `Inject`. This is the
+        /// R7/Phase-3 calibrated default — pure Haiku loses obvious
+        /// "how many" counting questions it reads as single-session
+        /// lookups, and pure naive misses temporal/chronology questions
+        /// without counting keywords.
         ///
-        /// On any transport/parse error, degrades to the naive regex
-        /// classifier rather than returning an error — the caller already
-        /// has a usable fallback, surfacing the error would force every
-        /// SDK consumer to write the same degrade logic.
+        /// Phase 3 benchmark regression (89.2% on `LongMemEval_S` Haiku 4.5)
+        /// validated this composition vs. pure Haiku (87.6%) and pure naive
+        /// (~86.8% approximated).
+        ///
+        /// Cache hits are ~nanoseconds; cache misses do one Haiku request
+        /// (~100 ms typical, ~$0.0002). On any Haiku transport/parse error,
+        /// falls back to naive alone.
         pub async fn classify(&self, query: &str) -> Route {
+            if super::classify_naive(query) == Route::Inject {
+                return Route::Inject;
+            }
+            self.classify_haiku_only(query).await
+        }
+
+        /// Pure Haiku classification without the naive-OR hybrid. Use
+        /// `classify` instead unless you need to inspect Haiku's decision
+        /// in isolation (benchmarking, calibration, test fixtures).
+        pub async fn classify_haiku_only(&self, query: &str) -> Route {
             let key = normalize_query(query);
             if let Ok(mut cache) = self.cache.lock()
                 && let Some(hit) = cache.get(&key)
@@ -476,22 +493,71 @@ lookup, prefer `inject`. Respond with exactly one word (`inject` or \
 
         #[tokio::test]
         async fn classifier_caches_repeat_queries() {
-            // Wiremock server: second call would fail if the cache didn't hit.
+            // Wiremock server: the API must be called exactly once despite
+            // three `classify_haiku_only` invocations. Uses a non-counting
+            // phrasing so the hybrid `classify` would NOT short-circuit to
+            // naive — but this test exercises the pure-Haiku path directly.
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/v1/messages"))
                 .respond_with(
                     ResponseTemplate::new(200).set_body_json(anthropic_response("inject")),
                 )
-                .expect(1) // HARD bound — must be called exactly once
+                .expect(1)
                 .mount(&server)
                 .await;
             let c = HaikuQueryClassifier::new("k")
                 .unwrap()
                 .with_base_url(server.uri());
-            assert_eq!(c.classify("how many books?").await, Route::Inject);
-            assert_eq!(c.classify("how many books?").await, Route::Inject);
-            assert_eq!(c.classify("  How Many  Books?  ").await, Route::Inject);
+            assert_eq!(
+                c.classify_haiku_only("what was the last book I read?").await,
+                Route::Inject
+            );
+            assert_eq!(
+                c.classify_haiku_only("what was the last book I read?").await,
+                Route::Inject
+            );
+            assert_eq!(
+                c.classify_haiku_only("  What Was The  Last  Book I Read?  ").await,
+                Route::Inject
+            );
+        }
+
+        #[tokio::test]
+        async fn hybrid_classify_short_circuits_on_naive_inject() {
+            // "how many" trips the naive regex; Haiku API must NOT be called.
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(ResponseTemplate::new(500).set_body_string("should not be hit"))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let c = HaikuQueryClassifier::new("k")
+                .unwrap()
+                .with_base_url(server.uri());
+            assert_eq!(c.classify("How many books did I read?").await, Route::Inject);
+        }
+
+        #[tokio::test]
+        async fn hybrid_classify_falls_through_to_haiku_when_naive_skips() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(anthropic_response("inject")),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let c = HaikuQueryClassifier::new("k")
+                .unwrap()
+                .with_base_url(server.uri());
+            // Temporal phrasing — naive misses it, Haiku catches it.
+            assert_eq!(
+                c.classify("When did I first start using Rust?").await,
+                Route::Inject
+            );
         }
 
         #[test]
