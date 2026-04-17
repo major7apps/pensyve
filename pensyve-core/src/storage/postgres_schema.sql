@@ -119,6 +119,36 @@ CREATE INDEX IF NOT EXISTS idx_procedural_namespace ON procedural_memories(names
 CREATE INDEX IF NOT EXISTS idx_procedural_fts ON procedural_memories USING GIN(fts_content);
 
 -- ---------------------------------------------------------------------------
+-- Observation Memories — derived countable-entity artifacts.
+-- Always cascade-deleted with their source episode via application logic
+-- (delete_observations_by_episode / delete_memory_by_id / purge_namespace).
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS observation_memories (
+    id              UUID PRIMARY KEY,
+    namespace_id    UUID NOT NULL,
+    episode_id      UUID NOT NULL,
+    entity_type     TEXT NOT NULL,
+    instance        TEXT NOT NULL,
+    action          TEXT NOT NULL,
+    quantity        DOUBLE PRECISION,
+    unit            TEXT,
+    content         TEXT NOT NULL,
+    embedding       vector,
+    confidence      REAL NOT NULL DEFAULT 0.8,
+    event_time      TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    stability       REAL NOT NULL DEFAULT 1.0,
+    retrievability  REAL NOT NULL DEFAULT 1.0,
+    fts_content     tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
+);
+
+CREATE INDEX IF NOT EXISTS idx_observation_episode ON observation_memories(episode_id);
+CREATE INDEX IF NOT EXISTS idx_observation_namespace ON observation_memories(namespace_id);
+CREATE INDEX IF NOT EXISTS idx_observation_entity_type
+    ON observation_memories(namespace_id, entity_type);
+
+-- ---------------------------------------------------------------------------
 -- Edges (entity relationship graph)
 -- ---------------------------------------------------------------------------
 
@@ -165,6 +195,7 @@ ALTER TABLE episodes             ENABLE ROW LEVEL SECURITY;
 ALTER TABLE episodic_memories    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE semantic_memories    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE procedural_memories  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE observation_memories ENABLE ROW LEVEL SECURITY;
 
 DO $$ BEGIN
   CREATE POLICY namespace_isolation_entities ON entities
@@ -188,5 +219,10 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 DO $$ BEGIN
   CREATE POLICY namespace_isolation_procedural ON procedural_memories
+    USING (namespace_id::text = current_setting('pensyve.namespace_id', true));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+  CREATE POLICY namespace_isolation_observation ON observation_memories
     USING (namespace_id::text = current_setting('pensyve.namespace_id', true));
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;

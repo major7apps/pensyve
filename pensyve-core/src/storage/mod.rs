@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::types::{
-    Edge, Entity, Episode, EpisodicMemory, Memory, Namespace, ProceduralMemory, SemanticMemory,
+    Edge, Entity, Episode, EpisodicMemory, Memory, Namespace, ObservationMemory, ProceduralMemory,
+    SemanticMemory,
 };
 
 pub mod sqlite;
@@ -90,6 +91,39 @@ pub trait StorageTrait: Send + Sync {
         trial_count: u32,
         success_count: u32,
     ) -> StorageResult<()>;
+
+    // Observation Memory (derived per-episode artifacts)
+    //
+    // Observations are extracted from episodic messages at ingest time and
+    // surfaced at recall time by joining on the top-k episodes' IDs. They do
+    // not participate in RRF candidate selection. Default implementations
+    // are no-ops so existing backends keep working without observation support.
+    fn save_observation(&self, _mem: &ObservationMemory) -> StorageResult<()> {
+        Err(StorageError::Context(
+            "save_observation not implemented on this backend".into(),
+        ))
+    }
+
+    fn get_observation(&self, _id: Uuid) -> StorageResult<Option<ObservationMemory>> {
+        Ok(None)
+    }
+
+    /// Fetch all observations attached to any of the given episode IDs,
+    /// bounded by `limit` (applied after fetch). Used by `recall_grouped` to
+    /// attach observations to top-k session groups.
+    fn list_observations_by_episode_ids(
+        &self,
+        _episode_ids: &[Uuid],
+        _limit: usize,
+    ) -> StorageResult<Vec<ObservationMemory>> {
+        Ok(Vec::new())
+    }
+
+    /// Delete every observation tied to the given episode. Returns the row count.
+    /// Called as part of episode cascade-delete paths.
+    fn delete_observations_by_episode(&self, _episode_id: Uuid) -> StorageResult<usize> {
+        Ok(0)
+    }
 
     // Full-text search (BM25)
     fn search_fts(

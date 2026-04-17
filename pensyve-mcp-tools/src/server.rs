@@ -20,11 +20,7 @@ use crate::params::{
 use crate::state::PensyveState;
 
 fn memory_type_name(memory: &Memory) -> &'static str {
-    match memory {
-        Memory::Episodic(_) => "episodic",
-        Memory::Semantic(_) => "semantic",
-        Memory::Procedural(_) => "procedural",
-    }
+    memory.type_name()
 }
 
 fn memory_confidence(memory: &Memory) -> f32 {
@@ -32,6 +28,7 @@ fn memory_confidence(memory: &Memory) -> f32 {
         Memory::Episodic(_) => 1.0,
         Memory::Semantic(m) => m.confidence,
         Memory::Procedural(m) => m.reliability,
+        Memory::Observation(m) => m.confidence,
     }
 }
 

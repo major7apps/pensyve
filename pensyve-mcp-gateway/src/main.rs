@@ -138,7 +138,10 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
                     pensyve_core::types::Memory::Episodic(e) => {
                         index.add_with_entity(memory.id(), embedding, e.about_entity)
                     }
-                    pensyve_core::types::Memory::Procedural(_) => index.add(memory.id(), embedding),
+                    pensyve_core::types::Memory::Procedural(_)
+                    | pensyve_core::types::Memory::Observation(_) => {
+                        index.add(memory.id(), embedding)
+                    }
                 };
                 if result.is_ok() {
                     loaded += 1;

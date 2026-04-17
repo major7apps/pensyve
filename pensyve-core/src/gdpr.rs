@@ -117,7 +117,10 @@ pub fn export_entity_data(
         .filter(|m| match m {
             Memory::Episodic(e) => e.about_entity == entity_id || e.source_entity == entity_id,
             Memory::Semantic(s) => s.subject == entity_id,
-            Memory::Procedural(_) => false,
+            // Procedurals carry no entity reference; observations cascade
+            // with their source episode via the storage FK and are included
+            // indirectly when their parent episode matches.
+            Memory::Procedural(_) | Memory::Observation(_) => false,
         })
         .map(|m| {
             let json = match m {
@@ -139,6 +142,14 @@ pub fn export_entity_data(
                     "id": p.id.to_string(),
                     "trigger": p.trigger,
                     "action": p.action,
+                }),
+                Memory::Observation(o) => serde_json::json!({
+                    "type": "observation",
+                    "id": o.id.to_string(),
+                    "episode_id": o.episode_id.to_string(),
+                    "entity_type": o.entity_type,
+                    "instance": o.instance,
+                    "action": o.action,
                 }),
             };
             json.to_string()

@@ -7,8 +7,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::types::{
-    ContentType, Edge, Entity, EntityKind, Episode, EpisodicMemory, Memory, Namespace, Outcome,
-    ProceduralMemory, SemanticMemory,
+    ContentType, Edge, Entity, EntityKind, Episode, EpisodicMemory, Memory, Namespace,
+    ObservationMemory, Outcome, ProceduralMemory, SemanticMemory,
 };
 
 use super::{ActivityAggregate, ActivityEvent, StorageError, StorageResult, StorageTrait};
@@ -261,6 +261,24 @@ CREATE TABLE IF NOT EXISTS procedural_memories (
     last_used       TEXT
 );
 
+CREATE TABLE IF NOT EXISTS observation_memories (
+    id              TEXT PRIMARY KEY,
+    namespace_id    TEXT NOT NULL,
+    episode_id      TEXT NOT NULL,
+    entity_type     TEXT NOT NULL,
+    instance        TEXT NOT NULL,
+    action          TEXT NOT NULL,
+    quantity        REAL,
+    unit            TEXT,
+    content         TEXT NOT NULL,
+    embedding       BLOB,
+    confidence      REAL NOT NULL DEFAULT 0.8,
+    event_time      TEXT,
+    created_at      TEXT NOT NULL,
+    stability       REAL NOT NULL DEFAULT 1.0,
+    retrievability  REAL NOT NULL DEFAULT 1.0
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     memory_id,
     memory_type,
@@ -274,6 +292,10 @@ CREATE INDEX IF NOT EXISTS idx_semantic_ns ON semantic_memories(namespace_id);
 CREATE INDEX IF NOT EXISTS idx_episodic_about ON episodic_memories(about_entity);
 CREATE INDEX IF NOT EXISTS idx_episodic_source ON episodic_memories(source_entity);
 CREATE INDEX IF NOT EXISTS idx_episodic_ns ON episodic_memories(namespace_id);
+CREATE INDEX IF NOT EXISTS idx_observation_episode ON observation_memories(episode_id);
+CREATE INDEX IF NOT EXISTS idx_observation_ns ON observation_memories(namespace_id);
+CREATE INDEX IF NOT EXISTS idx_observation_entity_type
+    ON observation_memories(namespace_id, entity_type);
 
 CREATE TABLE IF NOT EXISTS edges (
     id              TEXT PRIMARY KEY,
@@ -981,6 +1003,152 @@ impl StorageTrait for SqliteBackend {
     }
 
     // -----------------------------------------------------------------------
+    // Observation Memory — derived per-episode artifacts.
+    // Surfaced at recall time by episode-id join in `recall_grouped`; not as
+    // RRF candidates. Cascade-deleted with their source episode.
+    // -----------------------------------------------------------------------
+
+    fn save_observation(&self, mem: &ObservationMemory) -> StorageResult<()> {
+        let conn = lock_conn!(self);
+        let embedding_blob = if mem.embedding.is_empty() {
+            None
+        } else {
+            Some(embedding_to_blob(&mem.embedding))
+        };
+        let event_time = opt_dt_to_str(mem.event_time);
+
+        // One fsync for row + FTS rather than two.
+        conn.execute_batch("BEGIN")?;
+        let result = (|| -> StorageResult<()> {
+            conn.execute(
+                r"INSERT OR REPLACE INTO observation_memories
+                   (id, namespace_id, episode_id, entity_type, instance, action, quantity, unit,
+                    content, embedding, confidence, event_time, created_at, stability, retrievability)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    mem.id.to_string(),
+                    mem.namespace_id.to_string(),
+                    mem.episode_id.to_string(),
+                    mem.entity_type,
+                    mem.instance,
+                    mem.action,
+                    mem.quantity,
+                    mem.unit,
+                    mem.content,
+                    embedding_blob,
+                    f64::from(mem.confidence),
+                    event_time,
+                    mem.created_at.to_rfc3339(),
+                    f64::from(mem.stability),
+                    f64::from(mem.retrievability),
+                ],
+            )?;
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_fts (memory_id, memory_type, namespace_id, content) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    mem.id.to_string(),
+                    "observation",
+                    mem.namespace_id.to_string(),
+                    mem.content,
+                ],
+            )?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    fn get_observation(&self, id: Uuid) -> StorageResult<Option<ObservationMemory>> {
+        let conn = lock_conn!(self);
+        let result = conn
+            .query_row(
+                r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
+                          unit, content, embedding, confidence, event_time, created_at,
+                          stability, retrievability
+                   FROM observation_memories WHERE id = ?1",
+                params![id.to_string()],
+                row_to_observation,
+            )
+            .optional()?;
+        result.transpose()
+    }
+
+    fn list_observations_by_episode_ids(
+        &self,
+        episode_ids: &[Uuid],
+        limit: usize,
+    ) -> StorageResult<Vec<ObservationMemory>> {
+        if episode_ids.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = lock_conn!(self);
+        let placeholders: String = vec!["?"; episode_ids.len()].join(",");
+        let sql = format!(
+            "SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity, \
+              unit, content, embedding, confidence, event_time, created_at, \
+              stability, retrievability \
+             FROM observation_memories \
+             WHERE episode_id IN ({placeholders}) \
+             ORDER BY created_at ASC \
+             LIMIT ?"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = episode_ids
+            .iter()
+            .map(|u| Box::new(u.to_string()) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        params_vec.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(std::convert::AsRef::as_ref).collect();
+
+        let rows = stmt.query_map(param_refs.as_slice(), row_to_observation)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row??);
+        }
+        Ok(out)
+    }
+
+    fn delete_observations_by_episode(&self, episode_id: Uuid) -> StorageResult<usize> {
+        let conn = lock_conn!(self);
+        let ep_str = episode_id.to_string();
+        conn.execute_batch("BEGIN")?;
+        let result = (|| -> StorageResult<usize> {
+            conn.execute(
+                "DELETE FROM memory_fts \
+                 WHERE memory_type = 'observation' \
+                   AND memory_id IN (SELECT id FROM observation_memories WHERE episode_id = ?1)",
+                params![&ep_str],
+            )?;
+            let deleted = conn.execute(
+                "DELETE FROM observation_memories WHERE episode_id = ?1",
+                params![&ep_str],
+            )?;
+            Ok(deleted)
+        })();
+        match result {
+            Ok(n) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(n)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Full-text search
     // -----------------------------------------------------------------------
 
@@ -1003,9 +1171,13 @@ impl StorageTrait for SqliteBackend {
         }
 
         let conn = lock_conn!(self);
+        // The excluded `'observation'` literal must match `Memory::type_name()`
+        // for `Memory::Observation(_)`. Observations are surfaced at recall
+        // time by joining on top-k episode IDs, not as RRF candidates.
         let mut stmt = conn.prepare(
             r"SELECT memory_id, memory_type FROM memory_fts
                WHERE memory_fts MATCH ?1 AND namespace_id = ?2
+                 AND memory_type != 'observation'
                LIMIT ?3",
         )?;
         let rows: Vec<(String, String)> = stmt
@@ -1231,6 +1403,20 @@ impl StorageTrait for SqliteBackend {
             }
         }
 
+        // Observation
+        {
+            let mut stmt = conn.prepare(
+                r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
+                          unit, content, embedding, confidence, event_time, created_at,
+                          stability, retrievability
+                   FROM observation_memories WHERE namespace_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![&ns_str], row_to_observation)?;
+            for row in rows {
+                memories.push(Memory::Observation(row??));
+            }
+        }
+
         Ok(memories)
     }
 
@@ -1332,6 +1518,14 @@ impl StorageTrait for SqliteBackend {
             deleted = true;
         }
 
+        let n = conn.execute(
+            "DELETE FROM observation_memories WHERE id = ?1",
+            params![&id_str],
+        )?;
+        if n > 0 {
+            deleted = true;
+        }
+
         // Remove from FTS index.
         if deleted {
             conn.execute(
@@ -1363,6 +1557,10 @@ impl StorageTrait for SqliteBackend {
             )?;
             total += conn.execute(
                 "DELETE FROM procedural_memories WHERE namespace_id = ?1",
+                params![&ns_str],
+            )?;
+            total += conn.execute(
+                "DELETE FROM observation_memories WHERE namespace_id = ?1",
                 params![&ns_str],
             )?;
 
@@ -1895,6 +2093,60 @@ fn row_to_procedural(
             .unwrap_or_default(),
         created_at: str_to_dt(&created_at_str),
         last_used: str_to_opt_dt(last_used_str.as_deref()),
+    }))
+}
+
+fn row_to_observation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<Result<ObservationMemory, StorageError>> {
+    let id_str: String = row.get(0)?;
+    let ns_str: String = row.get(1)?;
+    let episode_id_str: String = row.get(2)?;
+    let entity_type: String = row.get(3)?;
+    let instance: String = row.get(4)?;
+    let action: String = row.get(5)?;
+    let quantity: Option<f64> = row.get(6)?;
+    let unit: Option<String> = row.get(7)?;
+    let content: String = row.get(8)?;
+    let embedding_bytes: Option<Vec<u8>> = row.get(9)?;
+    let confidence: f64 = row.get(10)?;
+    let event_time_str: Option<String> = row.get(11)?;
+    let created_at_str: String = row.get(12)?;
+    let stability: f64 = row.get(13)?;
+    let retrievability: f64 = row.get(14)?;
+
+    let id = match parse_uuid(&id_str) {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(e)),
+    };
+    let namespace_id = match parse_uuid(&ns_str) {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(e)),
+    };
+    let episode_id = match parse_uuid(&episode_id_str) {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(e)),
+    };
+
+    Ok(Ok(ObservationMemory {
+        id,
+        namespace_id,
+        episode_id,
+        entity_type,
+        instance,
+        action,
+        quantity,
+        unit,
+        content,
+        embedding: embedding_bytes
+            .as_deref()
+            .map(blob_to_embedding)
+            .unwrap_or_default(),
+        confidence: confidence as f32,
+        event_time: str_to_opt_dt(event_time_str.as_deref()),
+        created_at: str_to_dt(&created_at_str),
+        stability: stability as f32,
+        retrievability: retrievability as f32,
     }))
 }
 
@@ -2522,5 +2774,213 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM acl", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Observation memory tests (Phase 1.2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_observation_save_and_get() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let episode_id = Uuid::new_v4();
+
+        let mut obs = ObservationMemory::new(
+            ns.id,
+            episode_id,
+            "game_played",
+            "Assassin's Creed Odyssey",
+            "played",
+            "User played Assassin's Creed Odyssey for 70 hours",
+        );
+        obs.quantity = Some(70.0);
+        obs.unit = Some("hours".into());
+        obs.embedding = vec![0.1, 0.2, 0.3];
+        db.save_observation(&obs).unwrap();
+
+        let fetched = db.get_observation(obs.id).unwrap().unwrap();
+        assert_eq!(fetched.id, obs.id);
+        assert_eq!(fetched.episode_id, episode_id);
+        assert_eq!(fetched.entity_type, "game_played");
+        assert_eq!(fetched.instance, "Assassin's Creed Odyssey");
+        assert_eq!(fetched.action, "played");
+        assert_eq!(fetched.quantity, Some(70.0));
+        assert_eq!(fetched.unit.as_deref(), Some("hours"));
+        assert_eq!(fetched.embedding, vec![0.1, 0.2, 0.3]);
+        assert!((fetched.confidence - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_observation_missing_returns_none() {
+        let (_dir, db) = setup();
+        let result = db.get_observation(Uuid::new_v4()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_observations_list_by_episode_ids() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let ep_a = Uuid::new_v4();
+        let ep_b = Uuid::new_v4();
+        let ep_c = Uuid::new_v4();
+
+        // 2 obs for ep_a, 1 for ep_b, 1 for ep_c
+        for (ep, name) in [
+            (ep_a, "AC Odyssey"),
+            (ep_a, "Elden Ring"),
+            (ep_b, "Dune"),
+            (ep_c, "off-topic"),
+        ] {
+            let obs = ObservationMemory::new(ns.id, ep, "thing", name, "did", name);
+            db.save_observation(&obs).unwrap();
+        }
+
+        // Fetch ep_a + ep_b only
+        let fetched = db
+            .list_observations_by_episode_ids(&[ep_a, ep_b], 100)
+            .unwrap();
+        assert_eq!(fetched.len(), 3);
+        let instances: std::collections::HashSet<_> =
+            fetched.iter().map(|o| o.instance.clone()).collect();
+        assert!(instances.contains("AC Odyssey"));
+        assert!(instances.contains("Elden Ring"));
+        assert!(instances.contains("Dune"));
+        assert!(!instances.contains("off-topic"));
+    }
+
+    #[test]
+    fn test_observations_list_respects_limit() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let ep = Uuid::new_v4();
+
+        for i in 0..10 {
+            let name = format!("item_{i}");
+            let obs = ObservationMemory::new(ns.id, ep, "thing", &name, "did", &name);
+            db.save_observation(&obs).unwrap();
+        }
+
+        let fetched = db.list_observations_by_episode_ids(&[ep], 3).unwrap();
+        assert_eq!(fetched.len(), 3);
+    }
+
+    #[test]
+    fn test_observations_list_empty_inputs() {
+        let (_dir, db) = setup();
+        assert!(
+            db.list_observations_by_episode_ids(&[], 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.list_observations_by_episode_ids(&[Uuid::new_v4()], 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_delete_observations_by_episode() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let ep_a = Uuid::new_v4();
+        let ep_b = Uuid::new_v4();
+
+        for (ep, name) in [(ep_a, "a1"), (ep_a, "a2"), (ep_b, "b1")] {
+            let obs = ObservationMemory::new(ns.id, ep, "thing", name, "did", name);
+            db.save_observation(&obs).unwrap();
+        }
+
+        let deleted = db.delete_observations_by_episode(ep_a).unwrap();
+        assert_eq!(deleted, 2);
+
+        let remaining = db
+            .list_observations_by_episode_ids(&[ep_a, ep_b], 100)
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].instance, "b1");
+    }
+
+    #[test]
+    fn test_observations_included_in_get_all_memories_by_namespace() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let ep = Uuid::new_v4();
+
+        let obs =
+            ObservationMemory::new(ns.id, ep, "thing", "instance", "did", "content");
+        db.save_observation(&obs).unwrap();
+
+        let all = db.get_all_memories_by_namespace(ns.id).unwrap();
+        let found_obs = all
+            .iter()
+            .any(|m| matches!(m, Memory::Observation(o) if o.id == obs.id));
+        assert!(found_obs, "Observation missing from get_all_memories");
+    }
+
+    #[test]
+    fn test_observations_excluded_from_fts_candidates() {
+        // Observations must NOT surface through search_fts — they attach via
+        // top-k episode-id join at recall time, not as RRF candidates.
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let ep = Uuid::new_v4();
+
+        let obs = ObservationMemory::new(
+            ns.id,
+            ep,
+            "game_played",
+            "AC Odyssey",
+            "played",
+            "unique_fts_token_xyz123 assassin odyssey",
+        );
+        db.save_observation(&obs).unwrap();
+
+        let hits = db.search_fts("unique_fts_token_xyz123", ns.id, 10).unwrap();
+        assert!(hits.is_empty(), "Observation leaked into FTS results");
+    }
+
+    #[test]
+    fn test_delete_memory_by_id_handles_observation() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let ep = Uuid::new_v4();
+
+        let obs = ObservationMemory::new(ns.id, ep, "x", "y", "z", "c");
+        db.save_observation(&obs).unwrap();
+        let obs_id = obs.id;
+
+        let deleted = db.delete_memory_by_id(obs_id).unwrap();
+        assert!(deleted);
+        assert!(db.get_observation(obs_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_observation_namespace_isolation() {
+        let (_dir, db) = setup();
+        let ns_a = make_namespace(&db);
+        let ns_b = Namespace::new("other");
+        db.save_namespace(&ns_b).unwrap();
+
+        let ep_a = Uuid::new_v4();
+        let ep_b = Uuid::new_v4();
+        let obs_a =
+            ObservationMemory::new(ns_a.id, ep_a, "x", "a-instance", "did", "c");
+        let obs_b =
+            ObservationMemory::new(ns_b.id, ep_b, "x", "b-instance", "did", "c");
+        db.save_observation(&obs_a).unwrap();
+        db.save_observation(&obs_b).unwrap();
+
+        let all_a = db.get_all_memories_by_namespace(ns_a.id).unwrap();
+        let instances_a: Vec<_> = all_a
+            .iter()
+            .filter_map(|m| match m {
+                Memory::Observation(o) => Some(o.instance.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(instances_a, vec!["a-instance"]);
     }
 }

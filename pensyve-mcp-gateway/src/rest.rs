@@ -158,6 +158,8 @@ pub struct StatsResponse {
     pub episodic_memories: usize,
     pub semantic_memories: usize,
     pub procedural_memories: usize,
+    #[serde(default)]
+    pub observation_memories: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +174,8 @@ pub struct InspectResponse {
     pub episodic: Vec<serde_json::Value>,
     pub semantic: Vec<serde_json::Value>,
     pub procedural: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observation: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,11 +300,7 @@ fn get_or_create_entity(
 }
 
 fn memory_type_name(memory: &Memory) -> &'static str {
-    match memory {
-        Memory::Episodic(_) => "episodic",
-        Memory::Semantic(_) => "semantic",
-        Memory::Procedural(_) => "procedural",
-    }
+    memory.type_name()
 }
 
 fn memory_confidence(memory: &Memory) -> f32 {
@@ -308,6 +308,7 @@ fn memory_confidence(memory: &Memory) -> f32 {
         Memory::Episodic(_) => 1.0,
         Memory::Semantic(m) => m.confidence,
         Memory::Procedural(m) => m.reliability,
+        Memory::Observation(m) => m.confidence,
     }
 }
 
@@ -316,6 +317,7 @@ fn memory_stability(memory: &Memory) -> f32 {
         Memory::Episodic(m) => m.stability,
         Memory::Semantic(m) => m.stability,
         Memory::Procedural(_) => 1.0,
+        Memory::Observation(m) => m.stability,
     }
 }
 
@@ -324,6 +326,7 @@ fn memory_content(memory: &Memory) -> String {
         Memory::Episodic(m) => m.content.clone(),
         Memory::Semantic(m) => format!("{} {}", m.predicate, m.object),
         Memory::Procedural(m) => format!("{} -> {}", m.trigger, m.action),
+        Memory::Observation(m) => m.content.clone(),
     }
 }
 
@@ -334,6 +337,7 @@ fn memory_content(memory: &Memory) -> String {
 fn memory_event_time(memory: &Memory) -> Option<String> {
     match memory {
         Memory::Episodic(m) => m.event_time.map(|t| t.to_rfc3339()),
+        Memory::Observation(m) => m.event_time.map(|t| t.to_rfc3339()),
         Memory::Semantic(_) | Memory::Procedural(_) => None,
     }
 }
@@ -961,6 +965,7 @@ async fn stats(
     let mut semantic_count = 0usize;
     let mut episodic_count = 0usize;
     let mut procedural_count = 0usize;
+    let mut observation_count = 0usize;
 
     if let Ok(memories) = ps.storage.get_all_memories_by_namespace(ns.id) {
         for mem in &memories {
@@ -968,6 +973,7 @@ async fn stats(
                 Memory::Semantic(_) => semantic_count += 1,
                 Memory::Episodic(_) => episodic_count += 1,
                 Memory::Procedural(_) => procedural_count += 1,
+                Memory::Observation(_) => observation_count += 1,
             }
         }
     }
@@ -983,6 +989,7 @@ async fn stats(
         episodic_memories: episodic_count,
         semantic_memories: semantic_count,
         procedural_memories: procedural_count,
+        observation_memories: observation_count,
     }))
 }
 
@@ -1015,6 +1022,7 @@ async fn inspect(
         let mut episodic = Vec::new();
         let mut semantic = Vec::new();
         let mut procedural = Vec::new();
+        let mut observation = Vec::new();
 
         if let Ok(memories) = ps.storage.get_all_memories_by_namespace(ps.namespace.id) {
             for mem in memories.into_iter().take(limit) {
@@ -1034,6 +1042,11 @@ async fn inspect(
                         strip_embedding(&mut val);
                         procedural.push(val);
                     }
+                    pensyve_core::types::Memory::Observation(m) => {
+                        let mut val = serde_json::to_value(&m).unwrap_or_default();
+                        strip_embedding(&mut val);
+                        observation.push(val);
+                    }
                 }
             }
         }
@@ -1043,6 +1056,7 @@ async fn inspect(
             episodic,
             semantic,
             procedural,
+            observation,
         }));
     }
 
@@ -1054,6 +1068,7 @@ async fn inspect(
                 episodic: vec![],
                 semantic: vec![],
                 procedural: vec![],
+                observation: vec![],
             }));
         }
         Err(err) => {
@@ -1090,6 +1105,7 @@ async fn inspect(
         episodic,
         semantic,
         procedural: vec![],
+        observation: vec![],
     }))
 }
 

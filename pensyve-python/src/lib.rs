@@ -93,11 +93,7 @@ fn entity_kind_str(kind: &EntityKind) -> &'static str {
 
 /// Convert a memory type variant name to a string.
 fn memory_type_str(mem: &types::Memory) -> &'static str {
-    match mem {
-        types::Memory::Episodic(_) => "episodic",
-        types::Memory::Semantic(_) => "semantic",
-        types::Memory::Procedural(_) => "procedural",
-    }
+    mem.type_name()
 }
 
 /// Extract the content string from a Memory variant.
@@ -106,6 +102,7 @@ fn memory_content(mem: &types::Memory) -> String {
         types::Memory::Episodic(m) => m.content.clone(),
         types::Memory::Semantic(m) => format!("{} {}", m.predicate, m.object),
         types::Memory::Procedural(m) => format!("{} -> {}", m.trigger, m.action),
+        types::Memory::Observation(m) => m.content.clone(),
     }
 }
 
@@ -115,6 +112,7 @@ fn memory_confidence(mem: &types::Memory) -> f32 {
         types::Memory::Episodic(_) => 1.0,
         types::Memory::Semantic(m) => m.confidence,
         types::Memory::Procedural(m) => m.reliability,
+        types::Memory::Observation(m) => m.confidence,
     }
 }
 
@@ -394,7 +392,10 @@ impl PyPensyve {
                             m.about_entity == eid || m.source_entity == eid
                         }
                         types::Memory::Semantic(m) => m.subject == eid,
-                        types::Memory::Procedural(_) => true,
+                        // Procedural + Observation carry no direct entity;
+                        // keep them through the filter (entity-scoped recall
+                        // already handled by the engine).
+                        types::Memory::Procedural(_) | types::Memory::Observation(_) => true,
                     }
                 } else {
                     true

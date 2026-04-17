@@ -138,7 +138,10 @@ impl TenantStateManager {
                         pensyve_core::types::Memory::Episodic(e) => {
                             index.add_with_entity(mem.id(), emb, e.about_entity)
                         }
-                        pensyve_core::types::Memory::Procedural(_) => index.add(mem.id(), emb),
+                        pensyve_core::types::Memory::Procedural(_)
+                        | pensyve_core::types::Memory::Observation(_) => {
+                            index.add(mem.id(), emb)
+                        }
                     };
                 }
             }

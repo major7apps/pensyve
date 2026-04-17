@@ -50,7 +50,8 @@ fn load_vector_index(
                         pensyve_core::types::Memory::Episodic(e) => {
                             index.add_with_entity(memory.id(), embedding, e.about_entity)
                         }
-                        pensyve_core::types::Memory::Procedural(_) => {
+                        pensyve_core::types::Memory::Procedural(_)
+                        | pensyve_core::types::Memory::Observation(_) => {
                             index.add(memory.id(), embedding)
                         }
                     };

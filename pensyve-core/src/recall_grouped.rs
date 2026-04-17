@@ -133,6 +133,7 @@ fn memory_time(memory: &Memory) -> DateTime<Utc> {
         Memory::Episodic(e) => e.event_time.unwrap_or(e.timestamp),
         Memory::Semantic(s) => s.valid_at,
         Memory::Procedural(p) => p.created_at,
+        Memory::Observation(o) => o.event_time.unwrap_or(o.created_at),
     }
 }
 
@@ -140,6 +141,7 @@ fn memory_time(memory: &Memory) -> DateTime<Utc> {
 fn memory_episode_id(memory: &Memory) -> Option<Uuid> {
     match memory {
         Memory::Episodic(e) => Some(e.episode_id),
+        Memory::Observation(o) => Some(o.episode_id),
         Memory::Semantic(_) | Memory::Procedural(_) => None,
     }
 }
@@ -530,6 +532,7 @@ mod tests {
             Memory::Episodic(e) => e.content.clone(),
             Memory::Semantic(s) => format!("{} {}", s.predicate, s.object),
             Memory::Procedural(p) => format!("{}:{}", p.trigger, p.action),
+            Memory::Observation(o) => o.content.clone(),
         }
     }
 }

@@ -190,7 +190,9 @@ fn build_vector_index(
                 pensyve_core::types::Memory::Episodic(e) => {
                     index.add_with_entity(mem.id(), emb, e.about_entity)
                 }
-                pensyve_core::types::Memory::Procedural(_) => index.add(mem.id(), emb),
+                // Procedural + Observation carry no direct entity link.
+                pensyve_core::types::Memory::Procedural(_)
+                | pensyve_core::types::Memory::Observation(_) => index.add(mem.id(), emb),
             };
         }
     }
@@ -205,6 +207,7 @@ struct MemoryCounts {
     episodic: usize,
     semantic: usize,
     procedural: usize,
+    observation: usize,
     total: usize,
 }
 
@@ -216,18 +219,21 @@ fn count_memories(
     let mut episodic = 0usize;
     let mut semantic = 0usize;
     let mut procedural = 0usize;
+    let mut observation = 0usize;
     for mem in &all_memories {
         match mem {
             Memory::Episodic(_) => episodic += 1,
             Memory::Semantic(_) => semantic += 1,
             Memory::Procedural(_) => procedural += 1,
+            Memory::Observation(_) => observation += 1,
         }
     }
     Ok(MemoryCounts {
         episodic,
         semantic,
         procedural,
-        total: episodic + semantic + procedural,
+        observation,
+        total: episodic + semantic + procedural + observation,
     })
 }
 
@@ -296,7 +302,9 @@ fn cmd_recall(
                 match &c.memory {
                     Memory::Episodic(m) => m.about_entity == eid || m.source_entity == eid,
                     Memory::Semantic(m) => m.subject == eid,
-                    Memory::Procedural(_) => true,
+                    // Keep procedural / observation through the entity filter
+                    // — they don't carry a direct entity reference.
+                    Memory::Procedural(_) | Memory::Observation(_) => true,
                 }
             } else {
                 true
@@ -313,6 +321,7 @@ fn cmd_recall(
                         Memory::Episodic(_) => "episodic",
                         Memory::Semantic(_) => "semantic",
                         Memory::Procedural(_) => "procedural",
+                        Memory::Observation(_) => "observation",
                     };
                     let content = match &c.memory {
                         Memory::Episodic(m) => m.content.clone(),
@@ -320,6 +329,7 @@ fn cmd_recall(
                             format!("{} {} {}", m.subject, m.predicate, m.object)
                         }
                         Memory::Procedural(m) => format!("{} -> {}", m.trigger, m.action),
+                        Memory::Observation(m) => m.content.clone(),
                     };
                     serde_json::json!({
                         "id": c.memory_id.to_string(),
@@ -346,6 +356,7 @@ fn cmd_recall(
                         Memory::Episodic(_) => "episodic",
                         Memory::Semantic(_) => "semantic",
                         Memory::Procedural(_) => "procedural",
+                        Memory::Observation(_) => "observation",
                     };
                     let content = match &c.memory {
                         Memory::Episodic(m) => m.content.clone(),
@@ -353,6 +364,7 @@ fn cmd_recall(
                             format!("{} {} {}", m.subject, m.predicate, m.object)
                         }
                         Memory::Procedural(m) => format!("{} -> {}", m.trigger, m.action),
+                        Memory::Observation(m) => m.content.clone(),
                     };
                     println!(
                         "{:<6} {:<12} {:<8.4} {}",
@@ -385,6 +397,7 @@ fn cmd_stats(namespace_name: &str, format: OutputFormat) -> Result<(), Box<dyn s
                     "episodic": counts.episodic,
                     "semantic": counts.semantic,
                     "procedural": counts.procedural,
+                    "observation": counts.observation,
                     "total": counts.total,
                 },
                 "storage_bytes": storage_bytes,
@@ -401,6 +414,7 @@ fn cmd_stats(namespace_name: &str, format: OutputFormat) -> Result<(), Box<dyn s
             println!("{:<14} {}", "episodic", counts.episodic);
             println!("{:<14} {}", "semantic", counts.semantic);
             println!("{:<14} {}", "procedural", counts.procedural);
+            println!("{:<14} {}", "observation", counts.observation);
             println!("{:<14} {}", "total", counts.total);
         }
     }
@@ -434,6 +448,7 @@ fn cmd_status(
                     "episodic": counts.episodic,
                     "semantic": counts.semantic,
                     "procedural": counts.procedural,
+                    "observation": counts.observation,
                     "total": counts.total,
                 },
                 "storage_bytes": storage_bytes,
@@ -452,6 +467,7 @@ fn cmd_status(
             println!("{:<14} {}", "episodic", counts.episodic);
             println!("{:<14} {}", "semantic", counts.semantic);
             println!("{:<14} {}", "procedural", counts.procedural);
+            println!("{:<14} {}", "observation", counts.observation);
             println!("{:<14} {}", "total", counts.total);
         }
     }

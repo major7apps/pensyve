@@ -494,7 +494,9 @@ impl<'a> RecallEngine<'a> {
                             .collect();
                         activation::base_level_activation(&times, now.timestamp() as f64, 0.5)
                     }
-                    Memory::Semantic(_) | Memory::Procedural(_) => 0.0,
+                    Memory::Semantic(_)
+                    | Memory::Procedural(_)
+                    | Memory::Observation(_) => 0.0,
                 };
                 (id, b)
             })
@@ -527,14 +529,7 @@ impl<'a> RecallEngine<'a> {
         let mut ranking_intent: Vec<(Uuid, f32)> = candidates
             .iter()
             .map(|(&id, mem)| {
-                let score = intent_score_for_type(
-                    &intent,
-                    match mem {
-                        Memory::Episodic(_) => "episodic",
-                        Memory::Semantic(_) => "semantic",
-                        Memory::Procedural(_) => "procedural",
-                    },
-                );
+                let score = intent_score_for_type(&intent, mem.type_name());
                 (id, score)
             })
             .collect();
@@ -548,6 +543,7 @@ impl<'a> RecallEngine<'a> {
                     Memory::Episodic(_) => 1.0,
                     Memory::Semantic(s) => s.confidence,
                     Memory::Procedural(p) => p.reliability,
+                    Memory::Observation(o) => o.confidence,
                 };
                 (id, conf)
             })
@@ -606,7 +602,9 @@ impl<'a> RecallEngine<'a> {
             .values()
             .map(|m| match m {
                 Memory::Episodic(e) => e.access_count,
-                Memory::Semantic(_) | Memory::Procedural(_) => 0,
+                Memory::Semantic(_)
+                | Memory::Procedural(_)
+                | Memory::Observation(_) => 0,
             })
             .max()
             .unwrap_or(0);
@@ -631,22 +629,24 @@ impl<'a> RecallEngine<'a> {
                             p.reliability,
                             decay::elapsed_days(p.created_at, now),
                         ),
+                        Memory::Observation(o) => decay::retrievability(
+                            o.stability,
+                            decay::elapsed_days(o.created_at, now),
+                        ),
                     };
                     let confidence_score = match mem {
                         Memory::Episodic(_) => 1.0_f32,
                         Memory::Semantic(s) => s.confidence,
                         Memory::Procedural(p) => p.reliability,
+                        Memory::Observation(o) => o.confidence,
                     };
-                    let memory_type_str = match mem {
-                        Memory::Episodic(_) => "episodic",
-                        Memory::Semantic(_) => "semantic",
-                        Memory::Procedural(_) => "procedural",
-                    };
-                    let intent_score = intent_score_for_type(&intent, memory_type_str);
+                    let intent_score = intent_score_for_type(&intent, mem.type_name());
 
                     let access_count = match mem {
                         Memory::Episodic(e) => e.access_count,
-                        Memory::Semantic(_) | Memory::Procedural(_) => 0,
+                        Memory::Semantic(_)
+                        | Memory::Procedural(_)
+                        | Memory::Observation(_) => 0,
                     };
                     let access_score = if max_access == 0 {
                         0.0_f32
@@ -923,11 +923,14 @@ fn score_candidate(
         Memory::Procedural(p) => {
             decay::retrievability(p.reliability, decay::elapsed_days(p.created_at, now))
         }
+        Memory::Observation(o) => {
+            decay::retrievability(o.stability, decay::elapsed_days(o.created_at, now))
+        }
     };
 
     let access_count = match &memory {
         Memory::Episodic(e) => e.access_count,
-        Memory::Semantic(_) | Memory::Procedural(_) => 0,
+        Memory::Semantic(_) | Memory::Procedural(_) | Memory::Observation(_) => 0,
     };
     let access_score = if max_access == 0 {
         0.0_f32
@@ -939,22 +942,20 @@ fn score_candidate(
         Memory::Episodic(_) => 1.0_f32,
         Memory::Semantic(s) => s.confidence,
         Memory::Procedural(p) => p.reliability,
+        Memory::Observation(o) => o.confidence,
     };
 
     let direct = graph_map.get(&id).copied().unwrap_or(0.0);
     let entity_linked = match &memory {
         Memory::Episodic(e) => graph_map.get(&e.about_entity).copied().unwrap_or(0.0),
         Memory::Semantic(s) => graph_map.get(&s.subject).copied().unwrap_or(0.0),
-        Memory::Procedural(_) => 0.0,
+        // Procedural has no entity link; Observation is derived from episodes
+        // so its entity link would flow through the parent — not modeled here.
+        Memory::Procedural(_) | Memory::Observation(_) => 0.0,
     };
     let graph_score = direct.max(entity_linked);
 
-    let memory_type_str = match &memory {
-        Memory::Episodic(_) => "episodic",
-        Memory::Semantic(_) => "semantic",
-        Memory::Procedural(_) => "procedural",
-    };
-    let intent_score = intent_score_for_type(intent, memory_type_str);
+    let intent_score = intent_score_for_type(intent, memory.type_name());
     let type_boost = 1.0_f32;
 
     // weights[0]=vector, [1]=bm25, [2]=graph, [3]=intent,
@@ -999,6 +1000,7 @@ fn apply_reranking(
             Memory::Episodic(e) => e.content.clone(),
             Memory::Semantic(s) => format!("{} {} {}", s.subject, s.predicate, s.object),
             Memory::Procedural(p) => format!("trigger: {} action: {}", p.trigger, p.action),
+            Memory::Observation(o) => o.content.clone(),
         })
         .collect();
     let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();

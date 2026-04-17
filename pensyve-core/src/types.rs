@@ -321,6 +321,101 @@ impl ProceduralMemory {
 }
 
 // ---------------------------------------------------------------------------
+// ObservationMemory
+// ---------------------------------------------------------------------------
+//
+// Derived artifact: a structured countable-entity observation extracted from
+// one or more episodic memories within a single episode. Observations exist
+// to move multi-instance counting out of the reader's mental arithmetic and
+// into deterministic lookup at reader-format time.
+//
+// Always tied to exactly one `episode_id` (cascade-deleted with the source).
+
+fn default_confidence() -> f32 {
+    0.8
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservationMemory {
+    pub id: Uuid,
+    pub namespace_id: Uuid,
+
+    /// Source episode. Observations are always derived from an episode;
+    /// cascade-deleted when the episode is removed.
+    pub episode_id: Uuid,
+
+    /// Category noun phrase: `"game_played"`, `"citrus_fruit_used"`,
+    /// `"clothing_item_to_return"`, ...
+    pub entity_type: String,
+
+    /// Specific instance: `"Assassin's Creed Odyssey"`, `"lemon"`, `"boots"`.
+    pub instance: String,
+
+    /// Verb or relationship: `"played"`, `"used in cocktail"`, `"needs pickup"`.
+    pub action: String,
+
+    /// Optional numeric quantity: `70` (hours), `3` (items), `15.5` (miles).
+    pub quantity: Option<f64>,
+
+    /// Optional unit for `quantity`: "hours", "items", "miles".
+    pub unit: Option<String>,
+
+    /// Human-readable summary used for embedding + display.
+    /// Example: "User played Assassin's Creed Odyssey for 70 hours".
+    pub content: String,
+
+    /// Embedding of `content` for semantic search. Empty until indexed.
+    pub embedding: Vec<f32>,
+
+    /// Extractor-assigned confidence in [0, 1]. Lower for hedged or
+    /// hypothetical mentions. Defaults to 0.8 when deserialized without it.
+    #[serde(default = "default_confidence")]
+    pub confidence: f32,
+
+    /// Inherited from the source episode's `event_time` when available.
+    #[serde(default)]
+    pub event_time: Option<DateTime<Utc>>,
+
+    /// When the observation was extracted (not when the event occurred).
+    pub created_at: DateTime<Utc>,
+
+    /// Stability in [0, 1]; starts at 1.0 and decays (mirrors `EpisodicMemory`).
+    pub stability: f32,
+
+    /// Retrievability in [0, 1]; starts at 1.0 and decays with disuse.
+    pub retrievability: f32,
+}
+
+impl ObservationMemory {
+    pub fn new(
+        namespace_id: Uuid,
+        episode_id: Uuid,
+        entity_type: impl Into<String>,
+        instance: impl Into<String>,
+        action: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            namespace_id,
+            episode_id,
+            entity_type: entity_type.into(),
+            instance: instance.into(),
+            action: action.into(),
+            quantity: None,
+            unit: None,
+            content: content.into(),
+            embedding: Vec::new(),
+            confidence: default_confidence(),
+            event_time: None,
+            created_at: Utc::now(),
+            stability: 1.0,
+            retrievability: 1.0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Edge
 // ---------------------------------------------------------------------------
 
@@ -371,6 +466,10 @@ pub enum Memory {
     Episodic(EpisodicMemory),
     Semantic(SemanticMemory),
     Procedural(ProceduralMemory),
+    /// Structured fact derived from one or more episodic memories at ingest
+    /// time (e.g. "user played Assassin's Creed Odyssey for 70 hours").
+    /// Surfaced at recall time alongside the source episode's raw turns.
+    Observation(ObservationMemory),
 }
 
 impl Memory {
@@ -379,6 +478,7 @@ impl Memory {
             Memory::Episodic(m) => m.id,
             Memory::Semantic(m) => m.id,
             Memory::Procedural(m) => m.id,
+            Memory::Observation(m) => m.id,
         }
     }
 
@@ -387,6 +487,7 @@ impl Memory {
             Memory::Episodic(m) => &m.embedding,
             Memory::Semantic(m) => &m.embedding,
             Memory::Procedural(m) => &m.embedding,
+            Memory::Observation(m) => &m.embedding,
         }
     }
 
@@ -395,6 +496,20 @@ impl Memory {
             Memory::Episodic(m) => m.stability,
             Memory::Semantic(m) => m.stability,
             Memory::Procedural(m) => m.reliability,
+            Memory::Observation(m) => m.stability,
+        }
+    }
+
+    /// Short discriminator string used for logging, API responses, FTS rows,
+    /// and intent scoring. Single source of truth — SQL string literals that
+    /// must match this (e.g. `memory_fts.memory_type`) reference
+    /// [`Memory::type_name`] in their surrounding code, not hard-coded strings.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Memory::Episodic(_) => "episodic",
+            Memory::Semantic(_) => "semantic",
+            Memory::Procedural(_) => "procedural",
+            Memory::Observation(_) => "observation",
         }
     }
 }
@@ -482,6 +597,127 @@ mod tests {
     fn test_content_type_unknown_fallback() {
         assert_eq!(ContentType::from_str("unknown"), ContentType::Text);
         assert_eq!(ContentType::from_str(""), ContentType::Text);
+    }
+
+    #[test]
+    fn test_observation_memory_creation() {
+        let ns_id = Uuid::new_v4();
+        let ep_id = Uuid::new_v4();
+        let obs = ObservationMemory::new(
+            ns_id,
+            ep_id,
+            "game_played",
+            "Assassin's Creed Odyssey",
+            "played",
+            "User played Assassin's Creed Odyssey for 70 hours",
+        );
+        assert_eq!(obs.entity_type, "game_played");
+        assert_eq!(obs.instance, "Assassin's Creed Odyssey");
+        assert_eq!(obs.action, "played");
+        assert!(obs.quantity.is_none());
+        assert!(obs.unit.is_none());
+        assert!((obs.confidence - 0.8).abs() < f32::EPSILON);
+        assert!((obs.stability - 1.0).abs() < f32::EPSILON);
+        assert_eq!(obs.episode_id, ep_id);
+        assert_eq!(obs.namespace_id, ns_id);
+    }
+
+    #[test]
+    fn test_observation_memory_quantity_and_unit() {
+        let ns_id = Uuid::new_v4();
+        let ep_id = Uuid::new_v4();
+        let mut obs = ObservationMemory::new(
+            ns_id,
+            ep_id,
+            "driving_hours",
+            "commute",
+            "drove",
+            "User drove 4 hours",
+        );
+        obs.quantity = Some(4.0);
+        obs.unit = Some("hours".into());
+        obs.confidence = 0.4;
+        assert_eq!(obs.quantity, Some(4.0));
+        assert_eq!(obs.unit.as_deref(), Some("hours"));
+        assert!((obs.confidence - 0.4).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_observation_memory_serde_roundtrip() {
+        let ns_id = Uuid::new_v4();
+        let ep_id = Uuid::new_v4();
+        let mut obs = ObservationMemory::new(
+            ns_id,
+            ep_id,
+            "book_read",
+            "Dune",
+            "read",
+            "User read Dune",
+        );
+        obs.quantity = Some(512.0);
+        obs.unit = Some("pages".into());
+        obs.embedding = vec![0.1, 0.2, 0.3];
+
+        let json = serde_json::to_string(&obs).expect("serialize");
+        let round: ObservationMemory = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(round.id, obs.id);
+        assert_eq!(round.episode_id, obs.episode_id);
+        assert_eq!(round.entity_type, obs.entity_type);
+        assert_eq!(round.instance, obs.instance);
+        assert_eq!(round.action, obs.action);
+        assert_eq!(round.quantity, obs.quantity);
+        assert_eq!(round.unit, obs.unit);
+        assert_eq!(round.content, obs.content);
+        assert_eq!(round.embedding, obs.embedding);
+        assert!((round.confidence - obs.confidence).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_memory_enum_observation_accessors() {
+        let ns_id = Uuid::new_v4();
+        let ep_id = Uuid::new_v4();
+        let mut obs = ObservationMemory::new(
+            ns_id,
+            ep_id,
+            "game_played",
+            "AC Odyssey",
+            "played",
+            "x",
+        );
+        obs.embedding = vec![1.0, 2.0];
+        let obs_id = obs.id;
+        let mem = Memory::Observation(obs);
+        assert_eq!(mem.id(), obs_id);
+        assert_eq!(mem.embedding(), &[1.0, 2.0]);
+        assert!((mem.stability() - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_observation_memory_backfills_confidence_on_deserialize() {
+        // Historical rows written before `confidence` existed should default to 0.8.
+        let ns_id = Uuid::new_v4();
+        let ep_id = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let created_at = Utc::now();
+        let json = serde_json::json!({
+            "id": id,
+            "namespace_id": ns_id,
+            "episode_id": ep_id,
+            "entity_type": "game_played",
+            "instance": "AC",
+            "action": "played",
+            "quantity": null,
+            "unit": null,
+            "content": "x",
+            "embedding": [],
+            "created_at": created_at,
+            "stability": 1.0,
+            "retrievability": 1.0,
+        });
+        let obs: ObservationMemory = serde_json::from_value(json).expect("deserialize");
+        assert!((obs.confidence - 0.8).abs() < f32::EPSILON);
+        assert!(obs.event_time.is_none());
     }
 
     #[test]

@@ -12,8 +12,8 @@ use tokio::runtime::{Handle, Runtime};
 use uuid::Uuid;
 
 use crate::types::{
-    Edge, Entity, EntityKind, Episode, EpisodicMemory, Memory, Namespace, Outcome,
-    ProceduralMemory, SemanticMemory,
+    Edge, Entity, EntityKind, Episode, EpisodicMemory, Memory, Namespace, ObservationMemory,
+    Outcome, ProceduralMemory, SemanticMemory,
 };
 
 use super::{ActivityAggregate, ActivityEvent, StorageResult, StorageTrait};
@@ -70,6 +70,24 @@ type ProceduralRow = (
     Option<String>,
     DateTime<Utc>,
     Option<DateTime<Utc>>,
+);
+
+type ObservationRow = (
+    Uuid,                    // id
+    Uuid,                    // namespace_id
+    Uuid,                    // episode_id
+    String,                  // entity_type
+    String,                  // instance
+    String,                  // action
+    Option<f64>,             // quantity
+    Option<String>,          // unit
+    String,                  // content
+    Option<String>,          // embedding::text
+    f32,                     // confidence
+    Option<DateTime<Utc>>,   // event_time
+    DateTime<Utc>,           // created_at
+    f32,                     // stability
+    f32,                     // retrievability
 );
 
 type EdgeRow = (
@@ -859,6 +877,106 @@ impl StorageTrait for PostgresBackend {
     }
 
     // -----------------------------------------------------------------------
+    // Observation Memory
+    // -----------------------------------------------------------------------
+
+    fn save_observation(&self, mem: &ObservationMemory) -> StorageResult<()> {
+        let embedding_text = embedding_to_pgtext(&mem.embedding);
+        self.block_on(async {
+            let mut conn = self.scoped_conn(mem.namespace_id).await?;
+            query::<Postgres>(
+                r"INSERT INTO observation_memories
+                   (id, namespace_id, episode_id, entity_type, instance, action, quantity, unit,
+                    content, embedding, confidence, event_time, created_at, stability, retrievability)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::vector, $11, $12, $13, $14, $15)
+                   ON CONFLICT (id) DO UPDATE SET
+                       entity_type = $4, instance = $5, action = $6, quantity = $7, unit = $8,
+                       content = $9, embedding = $10::vector, confidence = $11,
+                       event_time = $12, stability = $14, retrievability = $15",
+            )
+            .bind(mem.id)
+            .bind(mem.namespace_id)
+            .bind(mem.episode_id)
+            .bind(&mem.entity_type)
+            .bind(&mem.instance)
+            .bind(&mem.action)
+            .bind(mem.quantity)
+            .bind(&mem.unit)
+            .bind(&mem.content)
+            .bind(&embedding_text)
+            .bind(mem.confidence)
+            .bind(mem.event_time)
+            .bind(mem.created_at)
+            .bind(mem.stability)
+            .bind(mem.retrievability)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(())
+        })
+    }
+
+    fn get_observation(&self, id: Uuid) -> StorageResult<Option<ObservationMemory>> {
+        self.block_on(async {
+            let mut conn = self.maybe_scoped_conn().await?;
+            let row: Option<ObservationRow> = query_as::<Postgres, _>(
+                r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
+                          unit, content, embedding::text, confidence, event_time, created_at,
+                          stability, retrievability
+                   FROM observation_memories WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(row.map(row_to_observation))
+        })
+    }
+
+    fn list_observations_by_episode_ids(
+        &self,
+        episode_ids: &[Uuid],
+        limit: usize,
+    ) -> StorageResult<Vec<ObservationMemory>> {
+        if episode_ids.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let ids = episode_ids.to_vec();
+        self.block_on(async move {
+            let mut conn = self.maybe_scoped_conn().await?;
+            let rows: Vec<ObservationRow> = query_as::<Postgres, _>(
+                r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
+                          unit, content, embedding::text, confidence, event_time, created_at,
+                          stability, retrievability
+                   FROM observation_memories
+                   WHERE episode_id = ANY($1)
+                   ORDER BY created_at ASC
+                   LIMIT $2",
+            )
+            .bind(&ids)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(rows.into_iter().map(row_to_observation).collect())
+        })
+    }
+
+    fn delete_observations_by_episode(&self, episode_id: Uuid) -> StorageResult<usize> {
+        self.block_on(async {
+            let mut conn = self.maybe_scoped_conn().await?;
+            let result = query::<Postgres>(
+                "DELETE FROM observation_memories WHERE episode_id = $1",
+            )
+            .bind(episode_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(usize::try_from(result.rows_affected()).unwrap_or(0))
+        })
+    }
+
+    // -----------------------------------------------------------------------
     // Full-text search
     // -----------------------------------------------------------------------
 
@@ -1064,6 +1182,22 @@ impl StorageTrait for PostgresBackend {
                 memories.push(Memory::Procedural(row_to_procedural(row)));
             }
 
+            // Observation
+            let observation_rows: Vec<ObservationRow> = query_as::<Postgres, _>(
+                r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
+                          unit, content, embedding::text, confidence, event_time, created_at,
+                          stability, retrievability
+                   FROM observation_memories WHERE namespace_id = $1",
+            )
+            .bind(namespace_id)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+
+            for row in observation_rows {
+                memories.push(Memory::Observation(row_to_observation(row)));
+            }
+
             Ok(memories)
         })
     }
@@ -1125,6 +1259,15 @@ impl StorageTrait for PostgresBackend {
             }
 
             let result = query::<Postgres>("DELETE FROM procedural_memories WHERE id = $1")
+                .bind(id)
+                .execute(&mut *conn)
+                .await
+                .map_err(sqlx_to_io)?;
+            if result.rows_affected() > 0 {
+                deleted = true;
+            }
+
+            let result = query::<Postgres>("DELETE FROM observation_memories WHERE id = $1")
                 .bind(id)
                 .execute(&mut *conn)
                 .await
@@ -1569,5 +1712,42 @@ fn row_to_procedural(row: ProceduralRow) -> ProceduralMemory {
         embedding: pgtext_to_embedding(embedding_text.as_deref()),
         created_at,
         last_used,
+    }
+}
+
+fn row_to_observation(row: ObservationRow) -> ObservationMemory {
+    let (
+        id,
+        namespace_id,
+        episode_id,
+        entity_type,
+        instance,
+        action,
+        quantity,
+        unit,
+        content,
+        embedding_text,
+        confidence,
+        event_time,
+        created_at,
+        stability,
+        retrievability,
+    ) = row;
+    ObservationMemory {
+        id,
+        namespace_id,
+        episode_id,
+        entity_type,
+        instance,
+        action,
+        quantity,
+        unit,
+        content,
+        embedding: pgtext_to_embedding(embedding_text.as_deref()),
+        confidence,
+        event_time,
+        created_at,
+        stability,
+        retrievability,
     }
 }
