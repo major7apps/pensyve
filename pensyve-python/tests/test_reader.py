@@ -12,8 +12,10 @@ from types import SimpleNamespace
 import pytest
 
 from pensyve.reader import (
+    COUNTING_TRIGGERS,
     V7_OBSERVATION_WRAPPER_PREFIX,
     V7_OBSERVATION_WRAPPER_SUFFIX,
+    classify_query_naive,
     format_observations_block,
     format_session_history,
 )
@@ -191,6 +193,55 @@ def test_v7_wrapper_composes_observation_block_without_extra_separators() -> Non
     composed = V7_OBSERVATION_WRAPPER_PREFIX + obs_block + V7_OBSERVATION_WRAPPER_SUFFIX
     # The wrapper provides its own leading \n\n and trailing \n — no double-newlines.
     assert "\n\n\n\n" not in composed
+
+
+# ---------------------------------------------------------------------------
+# classify_query_naive
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "how many games did I play?",
+        "How many books?",
+        "HOW MANY??",
+        "list every place I've visited",
+        "List all of the games",
+        "count the total items",
+        "what's the total number of hours?",
+        "spent in total 40 hours",
+        "across all my sessions",
+        "over the course of a year",
+        "so far this year",
+        "the count was off",
+    ],
+)
+def test_naive_classifier_catches_counting_phrases(query: str) -> None:
+    assert classify_query_naive(query) == "inject"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "what is my favorite color?",
+        "who is my boss?",
+        "remember to pick up milk tomorrow",
+        "my favorite counter",
+        "a discounted meal",
+        "",
+        "   ",
+    ],
+)
+def test_naive_classifier_skips_non_counting(query: str) -> None:
+    assert classify_query_naive(query) == "skip"
+
+
+def test_naive_classifier_triggers_are_non_empty() -> None:
+    assert len(COUNTING_TRIGGERS) > 0
+    assert "how many" in COUNTING_TRIGGERS
+    # Parity check against the Rust module — both lists must match length and order.
+    # (See `pensyve-core/src/classifier.rs::COUNTING_TRIGGERS`.)
 
 
 if __name__ == "__main__":

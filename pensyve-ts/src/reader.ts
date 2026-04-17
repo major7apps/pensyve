@@ -114,3 +114,65 @@ export function formatSessionHistory(groups: Iterable<SessionGroup>): string {
 function formatQuantity(q: number): string {
   return String(q);
 }
+
+// ---------------------------------------------------------------------------
+// Query routing classifier — naive regex path
+// ---------------------------------------------------------------------------
+//
+// Mirror of `pensyve_core::classifier::classify_naive` (Rust) and
+// `pensyve.reader.classify_query_naive` (Python). Keep the three trigger
+// lists in lockstep — any drift invalidates the cross-language parity
+// guarantee claimed in the v1.3.0 release notes.
+
+/**
+ * Counting/aggregation trigger phrases. Case-insensitive, whole-word match.
+ * Exported so tests can assert parity with the Rust + Python implementations.
+ */
+export const COUNTING_TRIGGERS: readonly string[] = [
+  "how many",
+  "how often",
+  "how much",
+  "list every",
+  "list all",
+  "count",
+  "total number",
+  "in total",
+  "altogether",
+  "over the course",
+  "across sessions",
+  "across all",
+  "across the",
+  "so far",
+  "sum of",
+  "aggregate",
+];
+
+/** Routing decision. `"inject"` = render the observation block; `"skip"` = skip it. */
+export type Route = "inject" | "skip";
+
+/**
+ * Return `"inject"` if the query is a counting/aggregation question,
+ * `"skip"` otherwise. Deterministic, case-insensitive, whole-word match
+ * against {@link COUNTING_TRIGGERS}.
+ */
+export function classifyQueryNaive(query: string): Route {
+  const q = query.toLowerCase();
+  for (const phrase of COUNTING_TRIGGERS) {
+    if (containsWholePhrase(q, phrase)) return "inject";
+  }
+  return "skip";
+}
+
+function containsWholePhrase(haystack: string, phrase: string): boolean {
+  let start = 0;
+  while (true) {
+    const idx = haystack.indexOf(phrase, start);
+    if (idx < 0) return false;
+    const beforeOk = idx === 0 || !/[a-z0-9]/i.test(haystack[idx - 1]);
+    const afterPos = idx + phrase.length;
+    const afterOk =
+      afterPos >= haystack.length || !/[a-z0-9]/i.test(haystack[afterPos]);
+    if (beforeOk && afterOk) return true;
+    start = idx + 1;
+  }
+}

@@ -32,8 +32,10 @@ from collections.abc import Iterable
 from typing import Any
 
 __all__ = [
+    "COUNTING_TRIGGERS",
     "V7_OBSERVATION_WRAPPER_PREFIX",
     "V7_OBSERVATION_WRAPPER_SUFFIX",
+    "classify_query_naive",
     "format_observations_block",
     "format_session_history",
 ]
@@ -107,6 +109,69 @@ def format_session_history(groups: Iterable[Any]) -> str:
         session_content = "\n" + json.dumps(turns)
         history += f"### Session {i}: (Date: {group.session_time}) {session_content}\n\n"
     return history
+
+
+# ---------------------------------------------------------------------------
+# Query routing classifier — naive regex path
+# ---------------------------------------------------------------------------
+#
+# Mirror of `pensyve_core::classifier::classify_naive` (Rust). Keep these two
+# trigger lists in lockstep — any drift invalidates the cross-language parity
+# guarantee claimed in the v1.3.0 release notes. The Haiku-backed classifier
+# is not ported to Python here; callers that want Haiku routing should proxy
+# through the Pensyve gateway's classifier path (Phase 5+) or call the
+# Anthropic SDK directly.
+
+COUNTING_TRIGGERS: tuple[str, ...] = (
+    "how many",
+    "how often",
+    "how much",
+    "list every",
+    "list all",
+    "count",
+    "total number",
+    "in total",
+    "altogether",
+    "over the course",
+    "across sessions",
+    "across all",
+    "across the",
+    "so far",
+    "sum of",
+    "aggregate",
+)
+
+
+def classify_query_naive(query: str) -> str:
+    """Return `"inject"` if the query is a counting/aggregation question,
+    `"skip"` otherwise. Deterministic regex over a small trigger list,
+    case-insensitive, whole-word.
+
+    Matches `classify_naive` in `pensyve-core/src/classifier.rs` byte-for-byte
+    on the same input. If that guarantee is ever broken, update both modules
+    together — the v1.3.0 docs call this parity out explicitly.
+    """
+    q = query.lower()
+    for phrase in COUNTING_TRIGGERS:
+        if _contains_whole_phrase(q, phrase):
+            return "inject"
+    return "skip"
+
+
+def _contains_whole_phrase(haystack: str, phrase: str) -> bool:
+    """Substring match with word-boundary guards on both ends."""
+    start = 0
+    n = len(haystack)
+    while True:
+        idx = haystack.find(phrase, start)
+        if idx < 0:
+            return False
+        before_ok = idx == 0 or not haystack[idx - 1].isalnum()
+        after_pos = idx + len(phrase)
+        after_ok = after_pos >= n or not haystack[after_pos].isalnum()
+        if before_ok and after_ok:
+            return True
+        start = idx + 1
 
 
 # ---------------------------------------------------------------------------

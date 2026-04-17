@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
+  COUNTING_TRIGGERS,
   V7_OBSERVATION_WRAPPER_PREFIX,
   V7_OBSERVATION_WRAPPER_SUFFIX,
+  classifyQueryNaive,
   formatObservationsBlock,
   formatSessionHistory,
 } from "./reader";
@@ -161,6 +163,46 @@ describe("formatSessionHistory", () => {
 // ---------------------------------------------------------------------------
 // V7 wrapper constants
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// classifyQueryNaive
+// ---------------------------------------------------------------------------
+
+describe("classifyQueryNaive", () => {
+  test.each([
+    "how many games did I play?",
+    "How many books?",
+    "HOW MANY??",
+    "list every place I've visited",
+    "List all of the games",
+    "count the total items",
+    "what's the total number of hours?",
+    "spent in total 40 hours",
+    "across all my sessions",
+    "over the course of a year",
+    "so far this year",
+    "the count was off",
+  ])("inject for counting phrase: %p", (q: string) => {
+    expect(classifyQueryNaive(q)).toBe("inject");
+  });
+
+  test.each([
+    "what is my favorite color?",
+    "who is my boss?",
+    "remember to pick up milk tomorrow",
+    "my favorite counter",
+    "a discounted meal",
+    "",
+    "   ",
+  ])("skip for non-counting: %p", (q: string) => {
+    expect(classifyQueryNaive(q)).toBe("skip");
+  });
+
+  test("COUNTING_TRIGGERS list is non-empty and includes how many", () => {
+    expect(COUNTING_TRIGGERS.length).toBeGreaterThan(0);
+    expect(COUNTING_TRIGGERS).toContain("how many");
+  });
+});
 
 describe("V7 wrapper constants", () => {
   test("wrapper constants are non-empty", () => {

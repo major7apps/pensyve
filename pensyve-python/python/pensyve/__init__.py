@@ -10,6 +10,7 @@ from pensyve._core import (
 from pensyve.reader import (
     V7_OBSERVATION_WRAPPER_PREFIX,
     V7_OBSERVATION_WRAPPER_SUFFIX,
+    classify_query_naive,
     format_observations_block,
     format_session_history,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "V7_OBSERVATION_WRAPPER_PREFIX",
     "V7_OBSERVATION_WRAPPER_SUFFIX",
     "__version__",
+    "classify_query_naive",
     "embedding_info",
     "format_observations_block",
     "format_session_history",

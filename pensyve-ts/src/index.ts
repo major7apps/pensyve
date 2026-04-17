@@ -807,8 +807,11 @@ export class Pensyve {
 export default Pensyve;
 
 export {
+  COUNTING_TRIGGERS,
   V7_OBSERVATION_WRAPPER_PREFIX,
   V7_OBSERVATION_WRAPPER_SUFFIX,
+  classifyQueryNaive,
   formatObservationsBlock,
   formatSessionHistory,
 } from "./reader";
+export type { Route } from "./reader";
