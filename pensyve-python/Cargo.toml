@@ -15,13 +15,14 @@ name = "pensyve_python"
 crate-type = ["cdylib"]
 
 [dependencies]
-pensyve-core = { path = "../pensyve-core" }
+pensyve-core = { path = "../pensyve-core", features = ["observation-extraction"] }
 pyo3 = { version = "^0.28.3", features = ["extension-module"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [lints]
 workspace = true

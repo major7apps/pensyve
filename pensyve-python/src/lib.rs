@@ -93,11 +93,7 @@ fn entity_kind_str(kind: &EntityKind) -> &'static str {
 
 /// Convert a memory type variant name to a string.
 fn memory_type_str(mem: &types::Memory) -> &'static str {
-    match mem {
-        types::Memory::Episodic(_) => "episodic",
-        types::Memory::Semantic(_) => "semantic",
-        types::Memory::Procedural(_) => "procedural",
-    }
+    mem.type_name()
 }
 
 /// Extract the content string from a Memory variant.
@@ -106,6 +102,7 @@ fn memory_content(mem: &types::Memory) -> String {
         types::Memory::Episodic(m) => m.content.clone(),
         types::Memory::Semantic(m) => format!("{} {}", m.predicate, m.object),
         types::Memory::Procedural(m) => format!("{} -> {}", m.trigger, m.action),
+        types::Memory::Observation(m) => m.content.clone(),
     }
 }
 
@@ -115,6 +112,7 @@ fn memory_confidence(mem: &types::Memory) -> f32 {
         types::Memory::Episodic(_) => 1.0,
         types::Memory::Semantic(m) => m.confidence,
         types::Memory::Procedural(m) => m.reliability,
+        types::Memory::Observation(m) => m.confidence,
     }
 }
 
@@ -123,6 +121,8 @@ fn memory_confidence(mem: &types::Memory) -> f32 {
 /// `recall_grouped`, and any future retrieval entry points stay consistent.
 fn py_memory_from(memory: &types::Memory, score: f32) -> PyMemory {
     let (salience, storage_strength, event_time, superseded_by) = episodic_fields(memory);
+    let (entity_type, instance, action, quantity, unit, episode_id, obs_event_time) =
+        observation_fields(memory);
     PyMemory {
         id: memory.id().to_string(),
         content: memory_content(memory),
@@ -132,8 +132,16 @@ fn py_memory_from(memory: &types::Memory, score: f32) -> PyMemory {
         score,
         salience,
         storage_strength,
-        event_time,
+        // Observation event_time takes precedence when this is an observation;
+        // otherwise fall back to the episodic field (None for semantic/procedural).
+        event_time: obs_event_time.or(event_time),
         superseded_by,
+        entity_type,
+        instance,
+        action,
+        quantity,
+        unit,
+        episode_id,
     }
 }
 
@@ -152,9 +160,70 @@ fn episodic_fields(
     }
 }
 
+/// Extract observation-only fields:
+/// `(entity_type, instance, action, quantity, unit, episode_id, event_time)`.
+#[allow(clippy::type_complexity)]
+fn observation_fields(
+    mem: &types::Memory,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<f64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    match mem {
+        types::Memory::Observation(o) => (
+            Some(o.entity_type.clone()),
+            Some(o.instance.clone()),
+            Some(o.action.clone()),
+            o.quantity,
+            o.unit.clone(),
+            Some(o.episode_id.to_string()),
+            o.event_time.map(|t| t.to_rfc3339()),
+        ),
+        _ => (None, None, None, None, None, None, None),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared inner state for Pensyve
 // ---------------------------------------------------------------------------
+
+/// Build the optional observation extractor and its backing runtime from
+/// constructor kwargs. Returns `(None, None)` when no extractor is requested.
+#[allow(clippy::type_complexity)]
+fn build_extractor(
+    kind: Option<&str>,
+    api_key: Option<&str>,
+) -> PyResult<(
+    Option<Arc<dyn pensyve_core::observation::ObservationExtractor>>,
+    Option<Arc<tokio::runtime::Runtime>>,
+)> {
+    match kind {
+        None => Ok((None, None)),
+        Some("haiku") => {
+            let built = match api_key {
+                Some(k) => pensyve_core::observation::AnthropicHaikuExtractor::new(k),
+                None => pensyve_core::observation::AnthropicHaikuExtractor::from_env(),
+            }
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("Failed to build haiku extractor: {e}"))
+            })?;
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
+            Ok((Some(Arc::new(built)), Some(Arc::new(rt))))
+        }
+        Some(other) => Err(PyValueError::new_err(format!(
+            "unknown extractor: {other:?}; supported: \"haiku\""
+        ))),
+    }
+}
 
 struct PensyveInner {
     namespace: Namespace,
@@ -163,6 +232,13 @@ struct PensyveInner {
     vector_index: Arc<Mutex<VectorIndex>>,
     retrieval_config: RetrievalConfig,
     consolidation_config: pensyve_core::config::ConsolidationConfig,
+    /// Optional extractor wired at construction time. When `Some`,
+    /// `PyEpisode::__exit__` runs extraction + persistence after saving raw
+    /// memories. `None` is the zero-cost default.
+    extractor: Option<Arc<dyn pensyve_core::observation::ObservationExtractor>>,
+    /// Shared tokio runtime used to drive the async extractor from the sync
+    /// `PyO3` dispatch. Lazily created only when an extractor is configured.
+    extractor_runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -182,9 +258,21 @@ impl PyPensyve {
     /// Args:
     ///     path: Directory for storage files (default: ~/.pensyve/default).
     ///     namespace: Namespace name (default: "default").
+    ///     extractor: Optional observation extractor. `"haiku"` wires the
+    ///         Anthropic Haiku 4.5 extractor (requires `ANTHROPIC_API_KEY`
+    ///         env var unless `extractor_api_key` is provided). `None` (default)
+    ///         skips extraction entirely — zero cost.
+    ///     `extractor_api_key`: Explicit API key for the haiku extractor.
+    ///         Overrides `ANTHROPIC_API_KEY`.
     #[new]
-    #[pyo3(signature = (path=None, namespace=None))]
-    fn new(path: Option<String>, namespace: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (path=None, namespace=None, extractor=None, extractor_api_key=None))]
+    #[allow(clippy::needless_pass_by_value)]
+    fn new(
+        path: Option<String>,
+        namespace: Option<String>,
+        extractor: Option<String>,
+        extractor_api_key: Option<String>,
+    ) -> PyResult<Self> {
         let config = PensyveConfig::default();
 
         let storage_path = match path {
@@ -275,6 +363,9 @@ impl PyPensyve {
             }
         }
 
+        let (extractor_impl, extractor_runtime) =
+            build_extractor(extractor.as_deref(), extractor_api_key.as_deref())?;
+
         Ok(Self {
             inner: Arc::new(PensyveInner {
                 namespace: ns,
@@ -283,6 +374,8 @@ impl PyPensyve {
                 vector_index,
                 retrieval_config: config.retrieval,
                 consolidation_config: config.consolidation,
+                extractor: extractor_impl,
+                extractor_runtime,
             }),
         })
     }
@@ -394,28 +487,16 @@ impl PyPensyve {
                             m.about_entity == eid || m.source_entity == eid
                         }
                         types::Memory::Semantic(m) => m.subject == eid,
-                        types::Memory::Procedural(_) => true,
+                        // Procedural + Observation carry no direct entity;
+                        // keep them through the filter (entity-scoped recall
+                        // already handled by the engine).
+                        types::Memory::Procedural(_) | types::Memory::Observation(_) => true,
                     }
                 } else {
                     true
                 }
             })
-            .map(|c| {
-                let (salience, storage_strength, event_time, superseded_by) =
-                    episodic_fields(&c.memory);
-                PyMemory {
-                    id: c.memory_id.to_string(),
-                    content: memory_content(&c.memory),
-                    memory_type: memory_type_str(&c.memory).to_string(),
-                    confidence: memory_confidence(&c.memory),
-                    stability: c.memory.stability(),
-                    score: c.final_score,
-                    salience,
-                    storage_strength,
-                    event_time,
-                    superseded_by,
-                }
-            })
+            .map(|c| py_memory_from(&c.memory, c.final_score))
             .collect();
 
         // Filter by memory types if provided.
@@ -557,18 +638,7 @@ impl PyPensyve {
             .save_semantic(&mem)
             .map_err(|e| PyRuntimeError::new_err(format!("Storage error: {e}")))?;
 
-        Ok(PyMemory {
-            id: mem.id.to_string(),
-            content: format!("{} {}", mem.predicate, mem.object),
-            memory_type: "semantic".to_string(),
-            confidence: mem.confidence,
-            stability: mem.stability,
-            score: 0.0,
-            salience: None,
-            storage_strength: None,
-            event_time: None,
-            superseded_by: None,
-        })
+        Ok(py_memory_from(&types::Memory::Semantic(mem), 0.0))
     }
 
     /// Run the consolidation engine (episodic→semantic promotion + FSRS decay).
@@ -860,6 +930,39 @@ impl PyEpisode {
             .update_episode(&episode)
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to update episode: {e}")))?;
 
+        // Observation extraction — runs only when a haiku extractor was
+        // configured. All failures are logged + swallowed; episode stays
+        // durable regardless.
+        if let (Some(extractor), Some(runtime)) = (
+            self.inner.extractor.clone(),
+            self.inner.extractor_runtime.clone(),
+        ) {
+            let storage = self.inner.storage.clone();
+            let embedder = self.inner.embedder.clone();
+            let ns_id = self.namespace_id;
+            let ep_id = self.episode_id;
+            // Block on the runtime here so callers see a consistent post-exit
+            // world (observations present before __exit__ returns). Run time
+            // is dominated by a single Haiku API call.
+            let persisted = runtime.block_on(async move {
+                pensyve_core::observation::commit_extraction_for_episode(
+                    storage.as_ref(),
+                    extractor.as_ref(),
+                    ns_id,
+                    ep_id,
+                    |text| embedder.embed(text),
+                )
+                .await
+            });
+            if persisted > 0 {
+                tracing::info!(
+                    observations = persisted,
+                    episode_id = %self.episode_id,
+                    "post-episode extraction"
+                );
+            }
+        }
+
         // Do not suppress exceptions.
         Ok(false)
     }
@@ -891,12 +994,34 @@ pub struct PyMemory {
     /// Storage strength — monotonically increases. Only set for episodic memories.
     #[pyo3(get)]
     storage_strength: Option<f32>,
-    /// When the described event occurred (ISO 8601). Only set for episodic memories.
+    /// When the described event occurred (ISO 8601). Set for episodic and
+    /// observation memories; `None` for semantic / procedural.
     #[pyo3(get)]
     event_time: Option<String>,
     /// ID of the memory that superseded this one, if any. Only set for episodic memories.
     #[pyo3(get)]
     superseded_by: Option<String>,
+    /// Observation category, e.g. `"game_played"`. Only set when
+    /// `memory_type == "observation"`.
+    #[pyo3(get)]
+    entity_type: Option<String>,
+    /// Specific instance referenced by the observation,
+    /// e.g. `"Assassin's Creed Odyssey"`. Only set for observations.
+    #[pyo3(get)]
+    instance: Option<String>,
+    /// User action for the observation, e.g. `"played"`. Only set for observations.
+    #[pyo3(get)]
+    action: Option<String>,
+    /// Numeric quantity (hours, items, pages, ...) when the observation
+    /// recorded one. Only set for observations.
+    #[pyo3(get)]
+    quantity: Option<f64>,
+    /// Unit paired with `quantity`, e.g. `"hours"`. Only set for observations.
+    #[pyo3(get)]
+    unit: Option<String>,
+    /// Source episode for the observation. Only set for observations.
+    #[pyo3(get)]
+    episode_id: Option<String>,
 }
 
 #[pymethods]

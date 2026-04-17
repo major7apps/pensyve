@@ -17,12 +17,20 @@ class Pensyve:
         self,
         path: str | None = None,
         namespace: str | None = None,
+        extractor: str | None = None,
+        extractor_api_key: str | None = None,
     ) -> None:
         """Create or open a Pensyve instance.
 
         Args:
             path: Directory for storage files (default: ~/.pensyve/default).
             namespace: Namespace name (default: "default").
+            extractor: Optional observation extractor. `"haiku"` wires the
+                Anthropic Haiku 4.5 extractor (requires `ANTHROPIC_API_KEY`
+                env var unless `extractor_api_key` is provided). `None`
+                (default) skips extraction entirely.
+            extractor_api_key: Explicit API key for the haiku extractor.
+                Overrides `ANTHROPIC_API_KEY`.
         """
         ...
 
@@ -205,7 +213,7 @@ class Memory:
 
     @property
     def memory_type(self) -> str:
-        """Type of this memory: 'episodic', 'semantic', or 'procedural'."""
+        """Type of this memory: 'episodic', 'semantic', 'procedural', or 'observation'."""
         ...
 
     @property
@@ -235,12 +243,43 @@ class Memory:
 
     @property
     def event_time(self) -> str | None:
-        """When the described event occurred (ISO 8601). Only set for episodic memories."""
+        """When the described event occurred (ISO 8601). Set for episodic and
+        observation memories; None for semantic / procedural."""
         ...
 
     @property
     def superseded_by(self) -> str | None:
         """ID of the memory that superseded this one, if any. Only set for episodic memories."""
+        ...
+
+    @property
+    def entity_type(self) -> str | None:
+        """Observation category, e.g. 'game_played'. Only set when memory_type == 'observation'."""
+        ...
+
+    @property
+    def instance(self) -> str | None:
+        """Specific instance named by the observation. Only set for observations."""
+        ...
+
+    @property
+    def action(self) -> str | None:
+        """User action for the observation, e.g. 'played'. Only set for observations."""
+        ...
+
+    @property
+    def quantity(self) -> float | None:
+        """Numeric quantity when the observation recorded one. Only set for observations."""
+        ...
+
+    @property
+    def unit(self) -> str | None:
+        """Unit paired with `quantity`, e.g. 'hours'. Only set for observations."""
+        ...
+
+    @property
+    def episode_id(self) -> str | None:
+        """Source episode for the observation. Only set for observations."""
         ...
 
 class SessionGroup:

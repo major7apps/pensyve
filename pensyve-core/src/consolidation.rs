@@ -277,6 +277,9 @@ impl ConsolidationEngine {
                     }
                     decayed += 1;
                 }
+
+                // Observations decay with their source episode, not independently.
+                Memory::Observation(_) => {}
             }
         }
 

@@ -1,5 +1,6 @@
 pub mod a2a;
 pub mod activation;
+pub mod classifier;
 pub mod config;
 pub mod consolidation;
 pub mod decay;
@@ -11,6 +12,7 @@ pub mod graph;
 pub mod mesh;
 pub mod multimodal;
 pub mod observability;
+pub mod observation;
 pub mod ocr;
 pub mod procedural;
 pub mod recall_grouped;

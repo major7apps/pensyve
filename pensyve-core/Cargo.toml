@@ -29,6 +29,8 @@ petgraph = "0.8"
 dashmap = "6"
 rayon = "1.10"
 tracing = "0.1"
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 sqlx-core = { version = "0.8.6", features = ["_rt-tokio", "_tls-rustls-aws-lc-rs", "json", "chrono", "uuid"], optional = true }
 sqlx-postgres = { version = "0.8.6", features = ["json", "chrono", "uuid"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
@@ -36,10 +38,15 @@ tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 [features]
 default = []
 postgres = ["dep:sqlx-core", "dep:sqlx-postgres", "dep:tokio"]
+# Feature-gate the Anthropic-API-backed observation extractor so users
+# who don't need observations pay no HTTP-client compile cost.
+observation-extraction = ["dep:reqwest", "dep:tokio"]
 
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.8", features = ["html_reports"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"
 
 [lints]
 workspace = true

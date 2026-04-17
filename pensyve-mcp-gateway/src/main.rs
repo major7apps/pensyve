@@ -47,6 +47,9 @@ pub struct AppState {
     pub admin_key: Option<String>,
     pub ct: CancellationToken,
     pub redis: Option<redis::aio::ConnectionManager>,
+    /// Process-wide observation extractor. `None` when `ANTHROPIC_API_KEY`
+    /// is unset — ingest still works, observations are simply not produced.
+    pub extractor: Option<Arc<dyn pensyve_core::observation::ObservationExtractor>>,
 }
 
 struct InitResources {
@@ -129,6 +132,12 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
     if let Ok(memories) = storage.get_all_memories_by_namespace(namespace.id) {
         let mut loaded = 0usize;
         for memory in &memories {
+            // Observations are recall-time enrichment — they attach to
+            // top-k session groups via `recall_grouped::attach_observations_to_groups`
+            // and MUST NOT enter the RRF candidate pool.
+            if matches!(memory, pensyve_core::types::Memory::Observation(_)) {
+                continue;
+            }
             let embedding = memory.embedding();
             if !embedding.is_empty() {
                 let result = match memory {
@@ -139,6 +148,7 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
                         index.add_with_entity(memory.id(), embedding, e.about_entity)
                     }
                     pensyve_core::types::Memory::Procedural(_) => index.add(memory.id(), embedding),
+                    pensyve_core::types::Memory::Observation(_) => unreachable!(),
                 };
                 if result.is_ok() {
                     loaded += 1;
@@ -239,6 +249,23 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
     };
 
     let auth_required = !config.api_keys.is_empty();
+
+    // Observation extractor — initialized only when ANTHROPIC_API_KEY is set.
+    // Ingest still works without it; observations are simply not produced.
+    let extractor: Option<Arc<dyn pensyve_core::observation::ObservationExtractor>> =
+        match pensyve_core::observation::AnthropicHaikuExtractor::from_env() {
+            Ok(e) => {
+                tracing::info!("Observation extractor: AnthropicHaikuExtractor (Haiku 4.5)");
+                Some(Arc::new(e))
+            }
+            Err(e) => {
+                tracing::info!(
+                    "Observation extractor disabled: {e}. Set ANTHROPIC_API_KEY to enable."
+                );
+                None
+            }
+        };
+
     let app_state = Arc::new(AppState {
         auth: auth::AuthValidator::new(&config),
         rate_limiter: rate_limit::RateLimiter::new(config.rate_limit_per_minute),
@@ -249,6 +276,7 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         admin_key: config.admin_key.clone(),
         ct: ct.clone(),
         redis,
+        extractor,
     });
 
     // Create per-tenant MCP service factory. In stateless mode, a new service

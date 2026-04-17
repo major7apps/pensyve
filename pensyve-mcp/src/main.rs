@@ -41,6 +41,12 @@ fn load_vector_index(
         Ok(memories) => {
             let mut loaded = 0usize;
             for memory in &memories {
+                // Observations are recall-time enrichment — they attach to
+                // top-k session groups via `recall_grouped::attach_observations_to_groups`
+                // and MUST NOT enter the RRF candidate pool.
+                if matches!(memory, pensyve_core::types::Memory::Observation(_)) {
+                    continue;
+                }
                 let embedding = memory.embedding();
                 if !embedding.is_empty() {
                     let result = match memory {
@@ -53,6 +59,7 @@ fn load_vector_index(
                         pensyve_core::types::Memory::Procedural(_) => {
                             index.add(memory.id(), embedding)
                         }
+                        pensyve_core::types::Memory::Observation(_) => unreachable!(),
                     };
                     if let Err(e) = result {
                         tracing::warn!("Skipping memory in index load: {e}");

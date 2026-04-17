@@ -98,24 +98,45 @@ export interface Entity {
   kind: string;
 }
 
+export type MemoryType = "episodic" | "semantic" | "procedural" | "observation";
+
 export interface Memory {
   id: string;
   content: string;
-  memoryType: "episodic" | "semantic" | "procedural";
+  memoryType: MemoryType;
   confidence: number;
   stability: number;
   score?: number;
   /**
-   * When the described event occurred (ISO 8601 / RFC 3339). Only set for
-   * episodic memories that were ingested with an explicit `when=`.
+   * When the described event occurred (ISO 8601 / RFC 3339). Set for
+   * episodic memories ingested with an explicit `when=`, and for
+   * observations that inherited the timestamp from their source episode.
    */
   eventTime?: string;
+  /**
+   * Observation category, e.g. `"game_played"`. Only set when
+   * `memoryType === "observation"`.
+   */
+  entityType?: string;
+  /**
+   * Specific instance named by the observation,
+   * e.g. `"Assassin's Creed Odyssey"`. Observations only.
+   */
+  instance?: string;
+  /** User action for the observation, e.g. `"played"`. Observations only. */
+  action?: string;
+  /** Numeric quantity when the observation recorded one. Observations only. */
+  quantity?: number;
+  /** Unit paired with `quantity`, e.g. `"hours"`. Observations only. */
+  unit?: string;
+  /** Source episode UUID. Observations only. */
+  episodeId?: string;
 }
 
 export interface RecallOptions {
   entity?: string;
   limit?: number;
-  types?: Array<"episodic" | "semantic" | "procedural">;
+  types?: MemoryType[];
   /** Pagination cursor returned from a previous recall() call. */
   cursor?: string;
 }
@@ -784,3 +805,13 @@ export class Pensyve {
 }
 
 export default Pensyve;
+
+export {
+  COUNTING_TRIGGERS,
+  V7_OBSERVATION_WRAPPER_PREFIX,
+  V7_OBSERVATION_WRAPPER_SUFFIX,
+  classifyQueryNaive,
+  formatObservationsBlock,
+  formatSessionHistory,
+} from "./reader";
+export type { Route } from "./reader";
