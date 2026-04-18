@@ -53,3 +53,18 @@ When a capture is both procedural AND a proactive in-flight write, the `content`
 `[procedural] [proactive/in-flight/tier-1] trigger=..., action=..., outcome=...`
 
 The `[procedural]` marker identifies the memory type for consolidation. The provenance tag identifies origin and trigger.
+
+## Provenance tag vocabulary (canonical)
+
+All provenance tags across hooks and skills use the format `[<origin>/<trigger>/<tier>]`:
+
+- **origin:** `proactive` (in-flight from reasoning layer) or `auto-capture` (hook-driven residual)
+- **trigger:** `in-flight`, `stop`, `pre-compact`, `curator`, `user`
+- **tier:** `tier-1`, `tier-2`, `residual`, `open-question`
+
+Examples:
+- `[proactive/in-flight/tier-1]` — memory-woven skill captured during reasoning
+- `[auto-capture/stop/residual/tier-1]` — Stop hook residual flush, high-confidence
+- `[auto-capture/stop/residual/tier-2]` — Stop hook residual flush, medium-confidence
+- `[auto-capture/pre-compact/residual/tier-1]` — pre-compact flush, high-confidence
+- `[proactive/in-flight/open-question]` — open question captured in-flight
