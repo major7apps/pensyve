@@ -10,6 +10,8 @@ Load relevant memories from Pensyve at the start of a session to provide cross-s
 
 ## Instructions
 
+> **Note on invocation:** The SessionStart hook has already performed a scoped recall and (if applicable) injected a continuity primer. Invoking this skill adds deeper on-demand context — not a replacement for the hook's work. Expect to see both.
+
 When this skill is invoked (typically at session start), follow these steps:
 
 ### Step 0: Determine Loading Mode

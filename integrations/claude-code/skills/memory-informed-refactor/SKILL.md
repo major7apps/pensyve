@@ -74,15 +74,9 @@ Organize the findings into a structured briefing. Deduplicate results that appea
 
 If no relevant memories are found for a section, omit that section entirely rather than showing an empty one. If no memories are found at all, say so clearly and proceed without historical context.
 
-### Step 4: Offer Episode Tracking
+### Step 4: Episode Tracking
 
-After presenting the briefing, offer to track the refactor as an episode:
-
-> Would you like me to track this refactor as an episode? This will let Pensyve capture the decisions and outcomes from this session for future reference.
->
-> If yes, I will call `pensyve_episode_start` with participants `["claude-code", "<target>"]`.
-
-If the user accepts, call `pensyve_episode_start`. Remind the user to close the episode at the end of the refactor (or suggest using `/consolidate` or the session-memory skill).
+The current session's episode is already active (started by the SessionStart hook). This refactor's observations and any captured lessons will be part of that episode — no additional `pensyve_episode_start` call is needed.
 
 ### Capture refactor lessons as they land
 
