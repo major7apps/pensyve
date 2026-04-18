@@ -6,7 +6,7 @@ capture_review_point: "stop"
 max_auto_memories_per_session: 10
 consolidation_frequency: "session_end"
 context_loading: "summary"
-prompt_enrichment: false
+prompt_enrichment: true
 ---
 
 # Pensyve Plugin Configuration
@@ -26,7 +26,7 @@ This file controls Pensyve plugin behavior. Copy to your project root and edit.
 - **max_auto_memories_per_session** -- Maximum tier 1 (auto-stored) memories per session. Prevents runaway storage. Default: 10.
 - **consolidation_frequency** -- When to run memory consolidation: `"manual"`, `"session_end"`, or `"daily"`. Default: `"session_end"`.
 - **context_loading** -- How much context to load at session start: `"off"`, `"summary"`, or `"full"`. Default: `"summary"`.
-- **prompt_enrichment** -- Enable automatic prompt enrichment with memory context. Default: false (opt-in only).
+- **prompt_enrichment** -- Enable automatic prompt enrichment with memory context. Default: true (opt-out via false).
 
 ## Migration from v1.0.x
 
