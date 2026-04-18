@@ -29,6 +29,8 @@ Residuals are signals from the buffer that were NOT captured in-flight. Common c
 
 Review the buffer + session conversation since the last Stop (or SessionStart) for residual candidates.
 
+- **Check Pensyve for `[tier-2-pending]` items from pre-compact.** Before scanning the conversation, call `pensyve_recall` with `query: "tier-2-pending"`, `entity: <project entity>`, `limit: 10`. Any returned items are residuals from a prior pre-compact flush that deferred their tier-2 review to Stop. Include them in the residual candidate pool for Step 2 classification.
+
 ### Step 2: Classify residuals
 
 Apply tier taxonomy:

@@ -66,10 +66,22 @@ If there are buffered signals from PostToolUse hooks (file_change, outcome, tool
 - Routine lint fixes, import sorting, boilerplate
 - Standard file edits with no architectural significance
 
-**For tier 1 candidates:** Auto-store silently via `pensyve_remember` with:
-- `entity`: The relevant entity name (lowercase, hyphenated)
-- `fact`: `"[auto-capture/pre-compact/residual/tier-1] <fact text>"`
-- `confidence`: 0.9
+**For tier 1 candidates:** Tier-1 candidates flush to Pensyve using the appropriate MCP tool based on memory type:
+
+- **Semantic** — durable decisions, preferences, conventions — call `pensyve_remember`:
+  - `entity`: the relevant entity (lowercase-hyphenated)
+  - `fact`: `[auto-capture/pre-compact/residual/tier-1] <fact text>`
+  - `confidence`: 0.9
+- **Episodic** — session-scoped events, outcomes, root causes — call `pensyve_observe`:
+  - `episode_id`: the current session's episode_id
+  - `about_entity`: the relevant entity (lowercase-hyphenated)
+  - `content`: `[auto-capture/pre-compact/residual/tier-1] <observation>`
+  - `content_type`: `"text"` (or `"code"` for code-related outcomes)
+- **Procedural** — reusable workflows, sequences, recipes (per Task 1 spec addendum) — call `pensyve_observe`:
+  - `episode_id`: current session's episode_id
+  - `about_entity`: relevant entity
+  - `content`: `[procedural] [auto-capture/pre-compact/residual/tier-1] trigger=..., action=..., outcome=...`
+  - `content_type`: `"text"`
 
 **For tier 2 candidates:** Do NOT present for user review (compaction should not be delayed by user interaction). Instead, include them in the pre-compaction snapshot in Step 3 with a `[tier-2-pending]` marker so the Stop hook can review them later.
 

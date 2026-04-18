@@ -46,6 +46,20 @@ Do not narrate memory operations the user did not care about (e.g., empty recall
 - Capture: max one in-flight capture per turn; additional candidates go to the Stop residual flush.
 - Noise: respect `max_auto_memories_per_session` from plugin config (default 10).
 
+### Relationship to UserPromptSubmit enrichment
+
+When `prompt_enrichment` is on, UserPromptSubmit may have already injected scoped memory context before your turn. Your skill's own recall is **additive**, not redundant: your skill uses `types` hints and entity scoping that the hook enrichment cannot. If the two sets overlap, dedupe visible surfaces — only surface your skill's recall (one line) to the user, not both.
+
+## In-flight trigger consumption
+
+The post-tool-bash and post-tool-write-edit hooks buffer signals with strength scores and, when the accumulated strength in the last 5 turns reaches ≥4 with at least one strength-3 signal, emit an `in_flight_trigger` marker (`type: "in_flight_trigger"`, `should_capture: true`) in the local signal buffer.
+
+Memory-woven skills check for this marker before each substantive turn. When the marker is present AND a candidate lesson has landed in the conversation, the skill captures the candidate **immediately** rather than deferring based on its own heuristics alone. If no candidate has landed, the marker does not force capture — it just raises the priority.
+
+The marker is consumed (cleared) after any skill acts on it. If no skill acts within 2 turns, the hook re-emits on the next crossing.
+
+This is how the platform layer (hooks) and reasoning layer (skills) cooperate: hooks provide the signal-strength signal; skills decide whether a concrete lesson has landed worth capturing.
+
 ## Composition
 
 When a capture is both procedural AND a proactive in-flight write, the `content` field begins with both markers, `[procedural]` first, then the provenance tag. Example:
@@ -67,4 +81,5 @@ Examples:
 - `[auto-capture/stop/residual/tier-1]` — Stop hook residual flush, high-confidence
 - `[auto-capture/stop/residual/tier-2]` — Stop hook residual flush, medium-confidence
 - `[auto-capture/pre-compact/residual/tier-1]` — pre-compact flush, high-confidence
+- `[auto-capture/pre-compact/residual/tier-2]` — pre-compact flush, medium-confidence (handed off to Stop for review)
 - `[proactive/in-flight/open-question]` — open question captured in-flight

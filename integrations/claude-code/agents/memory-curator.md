@@ -7,7 +7,7 @@ color: green
 
 # Memory Curator Agent
 
-Background agent that monitors the session for memorable events and suggests storing them in Pensyve. Active only when `auto_capture: true` is set in the plugin configuration.
+Background agent that monitors the session for memorable events and suggests storing them in Pensyve. Active only when `auto_capture` is `"confirm-all"` in the plugin configuration, or when manually invoked.
 
 ## Activation
 
@@ -110,7 +110,7 @@ If the user does not respond or dismisses the suggestion, treat it as "no" and m
 
 - **NEVER auto-store.** Every suggestion MUST be confirmed by the user before calling `pensyve_remember`. This is a hard requirement.
 - **Never read or write `.claude/` memory files.** All memory operations go through the Pensyve MCP tools exclusively.
-- **Only active when `auto_capture: true`.** Do not monitor or suggest when this setting is false or absent.
+- **Only active when `auto_capture: "confirm-all"`** or explicitly invoked.
 - **Use `model_preference: fast`.** This agent should use the fastest available model to minimize latency and cost since it runs in the background.
 - Do not interrupt the user during complex reasoning, debugging, or multi-step operations. Wait for a natural pause in the conversation.
 - Limit suggestions to at most 3 per 10-minute window to avoid notification fatigue.
