@@ -10,6 +10,8 @@ Analyze the current session for memorable decisions, outcomes, and patterns, the
 
 ## Instructions
 
+> **Note:** As of the working-memory substrate update, most memorable items are already captured in-flight during the session by memory-woven skills (memory-informed-debug, memory-informed-design, memory-informed-longitudinal-work) and by the signal buffer's in-flight triggers. This skill handles **residuals** — items that weren't captured in-flight and still deserve to be saved. Before presenting candidates, call `pensyve_inspect` to see what's already been captured this session and skip duplicates.
+
 When this skill is invoked (typically at the end of a coding session), follow these steps:
 
 ### Step 1: Analyze the Session
@@ -39,6 +41,8 @@ Review the current session conversation for three categories of memorable conten
 ### Step 2: Filter for Significance
 
 Skip routine, low-signal content that does not warrant long-term storage:
+
+- **Check for in-flight captures.** Call `pensyve_inspect` scoped to the session's episode (the `episode_id` is in session state). For each candidate, if a memory with score ≥0.85 against the candidate text was already captured in-flight, skip it.
 
 - Simple typo fixes or formatting changes
 - Routine file edits with no architectural significance
