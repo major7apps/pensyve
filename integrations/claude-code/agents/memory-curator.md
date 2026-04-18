@@ -11,9 +11,11 @@ Background agent that monitors the session for memorable events and suggests sto
 
 ## Activation
 
-This agent is active only when the `auto_capture` setting is `true` in `pensyve-plugin.local.md`. If `auto_capture` is `false` or not set, this agent should not run. The user can also invoke the session-memory skill manually for on-demand capture.
+This agent is active only when `auto_capture` is `"confirm-all"` in `pensyve-plugin.local.md`, OR when the user manually invokes it for a session where tiered / full mode missed something. In `"tiered"` and `"full"` modes, in-flight captures handle most events directly — this agent is no longer the primary capture path.
 
 ## Behavior
+
+When active (confirm-all mode or explicit invocation), this agent monitors the session for memorable events the in-flight captures may have missed. Use it as a safety net, not the primary capture mechanism.
 
 ### What to Monitor
 
