@@ -4,11 +4,14 @@ Pensyve gives Claude Code a persistent, cognitive memory layer that spans across
 
 ## What It Does
 
-- **Remembers decisions and their reasoning** across coding sessions
-- **Recalls relevant context** when you start a new session or switch tasks
-- **Tracks outcomes** -- what worked, what failed, and why
-- **Consolidates knowledge** -- promotes repeated patterns to long-term facts, decays stale information
-- **Never forgets the hard-won lessons** from debugging sessions
+Pensyve makes Claude Code feel continuous across sessions — like working with a colleague who actually remembers your last conversation. Memory is not a feature you invoke; it is the substrate the agent operates on.
+
+- **Proactive memory during work** — lessons are captured the moment they land, not at session end
+- **Thread-aware continuity** — sessions that continue prior work resume with relevant context, no re-briefing
+- **Default-on recall with guardrails** — substantive questions are grounded in prior decisions; simple commands stay fast
+- **Three memory types** — durable facts (semantic), session-specific events (episodic), reusable procedures (procedural)
+- **Lightly visible** — one-line surfaces when memory is used; never interrupts your flow
+- **Opt-out, not opt-in** — users who prefer manual control set `auto_capture: off` and `prompt_enrichment: false`
 
 ## How It Works
 
@@ -23,6 +26,18 @@ pensyve-mcp server
     |
 SQLite + ONNX embeddings + vector index
 ```
+
+## Memory Behavior Model
+
+Pensyve behaves as working memory for the agent — always-on, ambient, continuous.
+
+**Writes happen in-flight.** When a root cause is confirmed, a decision is made, or a reusable procedure emerges, it's captured the moment it lands via memory-woven skills (memory-informed-debug, memory-informed-design, memory-informed-longitudinal-work). The Stop hook catches residuals.
+
+**Reads happen at decision points.** Before substantive answers, the model consults memory scoped to the detected entities. Simple commands (run tests, format file) skip recall to stay fast.
+
+**Sessions continue.** At session start, Pensyve checks whether the current work continues a prior episode (shared entities + temporal proximity). If yes, you resume with the prior episode's most recent lessons — no re-briefing needed.
+
+See `/remember`, `/recall`, `/inspect` for manual control, or `/memory-status` for namespace stats.
 
 ## Quick Start
 
@@ -119,7 +134,7 @@ capture_review_point: "stop"       # When to review tier 2 candidates
 max_auto_memories_per_session: 10  # Cap on auto-stored memories
 consolidation_frequency: "session_end"
 context_loading: "summary"         # off | summary | full
-prompt_enrichment: false           # Enrich prompts with memory (power user)
+prompt_enrichment: true            # Enrich prompts with memory (opt-out via false)
 ```
 
 **Automatic project detection:** The plugin automatically detects the current project for entity-scoped memory. It uses the git repository root directory name (via `git rev-parse --show-toplevel`) as the project identity, falling back to the current working directory name if not in a git repo. Set the `PENSYVE_NAMESPACE` environment variable to override automatic detection. Detected names are normalized to lowercase and hyphenated (e.g., `"pensyve-cloud"`).
@@ -153,12 +168,15 @@ prompt_enrichment: false           # Enrich prompts with memory (power user)
 
 ## Skills
 
-| Skill                      | When to Use                                                          |
-| -------------------------- | -------------------------------------------------------------------- |
-| `session-memory`           | End of a work session -- captures decisions and outcomes             |
-| `memory-informed-refactor` | Before refactoring -- loads relevant prior context                   |
-| `context-loader`           | Session start or context switch -- loads historical context          |
-| `memory-review`            | Periodic -- finds stale facts, contradictions, cleanup opportunities |
+| Skill                                | When to Use                                                          |
+| ------------------------------------ | -------------------------------------------------------------------- |
+| `memory-informed-debug`              | During any non-trivial debugging flow                                |
+| `memory-informed-design`             | During any substantive design/architecture question                  |
+| `memory-informed-longitudinal-work`  | Multi-session research, eval loops, iterative benchmarks             |
+| `memory-informed-refactor`           | Before refactoring — loads relevant prior context                    |
+| `session-memory`                     | End-of-session residual capture (not the primary capture path anymore)|
+| `context-loader`                     | Session start or context switch — loads historical context           |
+| `memory-review`                      | Periodic — finds stale facts, contradictions, cleanup opportunities  |
 
 ## Agents
 
@@ -169,14 +187,14 @@ prompt_enrichment: false           # Enrich prompts with memory (power user)
 
 ## Hooks
 
-| Hook              | Event              | Behavior                                                                                    |
-| ----------------- | ------------------ | ------------------------------------------------------------------------------------------- |
-| Session Start     | `SessionStart`     | Loads relevant memories at session start (configurable: off/summary/full)                   |
-| Post-Tool Write   | `PostToolUse`      | Buffers file change signals from Write/Edit (silent, no MCP calls)                          |
-| Post-Tool Bash    | `PostToolUse`      | Buffers command outcome signals from Bash (silent, no MCP calls)                            |
-| Stop              | `Stop`             | Processes signal buffer with tiered auto-store; tier 1 stored silently, tier 2 batched      |
-| Pre-Compact       | `PreCompact`       | Flushes signal buffer before context compression; preserves in-flight episode data           |
-| Prompt Enrichment | `UserPromptSubmit` | Enriches prompts with memory context (disabled by default)                                  |
+| Hook              | Event              | Behavior                                                                                                    |
+| ----------------- | ------------------ | ----------------------------------------------------------------------------------------------------------- |
+| Session Start     | `SessionStart`     | Loads memories + thread-continuity check — resumes prior episodes when score ≥0.7 on shared entities        |
+| Post-Tool Write   | `PostToolUse`      | Scores file-change signal strength; emits in-flight capture marker when accumulated strength ≥4             |
+| Post-Tool Bash    | `PostToolUse`      | Scores command outcome signal strength; emits in-flight marker on strong signals (confirmed failures, etc.) |
+| Stop              | `Stop`             | Residual flush only — most captures happen in-flight; closes episode via `pensyve_episode_end`              |
+| Pre-Compact       | `PreCompact`       | Flushes residual buffer before context compression; episode stays open (not Stop)                           |
+| Prompt Enrichment | `UserPromptSubmit` | Enriches prompts with memory context (default-on; opt out via `prompt_enrichment: false`)                   |
 
 ## Configuration Reference
 
@@ -191,7 +209,7 @@ All settings are configured in `pensyve-plugin.local.md` (copy to your project r
 | `max_auto_memories_per_session`| integer                                   | `10`             | Maximum tier 1 (auto-stored) memories per session.                           |
 | `consolidation_frequency`      | `"manual"` / `"session_end"` / `"daily"` | `"session_end"`  | When to run memory consolidation.                                            |
 | `context_loading`              | `"off"` / `"summary"` / `"full"`         | `"summary"`      | How much context to load at session start.                                   |
-| `prompt_enrichment`            | `true` / `false`                          | `false`          | Enable the UserPromptSubmit hook to enrich prompts with memory. Opt-in only. |
+| `prompt_enrichment`            | `true` / `false`                          | `true`           | Enable the UserPromptSubmit hook to enrich prompts with memory. Opt-out via `false`. |
 
 ### Capture Modes
 
