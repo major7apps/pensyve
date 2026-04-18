@@ -33,6 +33,21 @@ Run the following `pensyve_recall` queries to gather session context:
 
 Deduplicate results across queries (same memory ID should appear only once).
 
+### Continuity-aware primer
+
+If the SessionStart hook detected a continuation (check session state for `continuation_of` on the current episode), structure the primer around continuity rather than fresh recall:
+
+> **Continuing:** `<entity-set>` — prior episode <short-date>
+>
+> **Last lessons:**
+> - [recent observation 1]
+> - [recent observation 2]
+>
+> **Open questions carried forward:**
+> - [if any observations had `open-question` provenance]
+
+If no continuation was detected, present a standard recall-based primer.
+
 ### Step 2: Present Context
 
 #### Summary Mode (10-15 lines max)
