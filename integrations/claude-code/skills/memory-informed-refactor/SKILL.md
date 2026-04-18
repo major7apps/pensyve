@@ -10,6 +10,8 @@ Load historical context from Pensyve memory before starting a refactor. Surfaces
 
 ## Instructions
 
+> This skill follows the memory reflex defined in `skills/shared/memory-reflex.md`. Recall before refactoring; observe when a refactor insight lands (abandoned approach, invariant discovered, regression cause).
+
 When this skill is invoked with a refactoring target, follow these steps:
 
 ### Step 1: Query Memory for Context
@@ -81,6 +83,17 @@ After presenting the briefing, offer to track the refactor as an episode:
 > If yes, I will call `pensyve_episode_start` with participants `["claude-code", "<target>"]`.
 
 If the user accepts, call `pensyve_episode_start`. Remind the user to close the episode at the end of the refactor (or suggest using `/consolidate` or the session-memory skill).
+
+### Capture refactor lessons as they land
+
+When any of these occur during the refactor, call the memory reflex immediately:
+
+- An invariant is discovered (semantic)
+- An abandoned approach is confirmed not-viable (episodic)
+- A dependency chain was traced that surprised us (episodic)
+- A known-good refactoring sequence emerged (procedural)
+
+Do not batch these to Stop — capture at landing, surface one-line.
 
 ## Constraints
 
