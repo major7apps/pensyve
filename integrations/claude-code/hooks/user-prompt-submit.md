@@ -6,7 +6,7 @@ event: UserPromptSubmit
 
 # User Prompt Submit Hook
 
-Fires when the user submits a prompt. Optionally enriches the prompt with relevant memory context from Pensyve. **Disabled by default** -- must be explicitly enabled via `prompt_enrichment: true` in `pensyve-plugin.local.md`.
+Fires when the user submits a prompt. Enriches the prompt with relevant memory context from Pensyve when the prompt warrants it. **Enabled by default** — opt out via `prompt_enrichment: false` in `pensyve-plugin.local.md`.
 
 ## Behavior
 
