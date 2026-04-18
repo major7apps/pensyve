@@ -22,6 +22,8 @@ This hook captures that context so it can be recalled after compaction.
 
 ## Behavior
 
+Primary memory captures now happen in-flight during the session via the memory reflex. This hook exists to flush any residual buffered signals before context compression, so nothing is lost across the compaction boundary. The episode remains open — this is not Stop.
+
 ### Step 0: Read Configuration
 
 Read `pensyve-plugin.local.md` for the `auto_capture` setting.
@@ -66,7 +68,7 @@ If there are buffered signals from PostToolUse hooks (file_change, outcome, tool
 
 **For tier 1 candidates:** Auto-store silently via `pensyve_remember` with:
 - `entity`: The relevant entity name (lowercase, hyphenated)
-- `fact`: `"[auto-capture/pre-compact/tier-1] <fact text>"`
+- `fact`: `"[auto-capture/pre-compact/residual/tier-1] <fact text>"`
 - `confidence`: 0.9
 
 **For tier 2 candidates:** Do NOT present for user review (compaction should not be delayed by user interaction). Instead, include them in the pre-compaction snapshot in Step 3 with a `[tier-2-pending]` marker so the Stop hook can review them later.
@@ -86,7 +88,7 @@ Compile these into a concise snapshot (not a full transcript).
 Call `pensyve_remember` to persist the critical context:
 
 - `entity`: The project/namespace entity (lowercase, hyphenated)
-- `fact`: `"[auto-capture/pre-compact/snapshot] Pre-compaction snapshot: [summary of current work state, pending decisions, active investigation threads]. [Any tier-2-pending items from Step 1.5]"`
+- `fact`: `"[auto-capture/pre-compact/residual/tier-2] Pre-compaction snapshot: [summary of current work state, pending decisions, active investigation threads]. [Any tier-2-pending items from Step 1.5]"`
 - `confidence`: 0.7 (this is an automated snapshot, not a confirmed decision)
 
 Keep the stored memory concise -- capture the essential state, not the full conversation. Aim for 2-4 sentences maximum.
