@@ -19,6 +19,8 @@ Read `pensyve-plugin.local.md` for `auto_capture`:
 - `"full"` — flush both tiers silently
 - `"confirm-all"` — present all residuals for individual confirmation
 
+**Backward compatibility:** treat boolean `false` as `"off"` and boolean `true` as `"confirm-all"`. Matches the same logic in pre-compact.md.
+
 ### Step 1: Identify residual candidates
 
 Residuals are signals from the buffer that were NOT captured in-flight. Common causes:
@@ -29,7 +31,7 @@ Residuals are signals from the buffer that were NOT captured in-flight. Common c
 
 Review the buffer + session conversation since the last Stop (or SessionStart) for residual candidates.
 
-- **Check Pensyve for `[tier-2-pending]` items from pre-compact.** Before scanning the conversation, call `pensyve_recall` with `query: "tier-2-pending"`, `entity: <project entity>`, `limit: 10`. Any returned items are residuals from a prior pre-compact flush that deferred their tier-2 review to Stop. Include them in the residual candidate pool for Step 2 classification.
+- **Check Pensyve for `[tier-2-pending]` items from pre-compact.** Before scanning the conversation, call `pensyve_recall` with `query: "tier-2-pending"`, `entity: <project entity>`, `limit: 10`. **<1s latency budget** — if the call exceeds 1 second or fails, skip this check and proceed with conversation-buffer residuals only (pending items will be re-surfaced on next Stop). Any returned items are residuals from a prior pre-compact flush; include them in the residual candidate pool for Step 2 classification.
 
 ### Step 2: Classify residuals
 

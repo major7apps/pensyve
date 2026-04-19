@@ -182,7 +182,7 @@ prompt_enrichment: true            # Enrich prompts with memory (opt-out via fal
 
 | Agent                | Mode       | Purpose                                                                      |
 | -------------------- | ---------- | ---------------------------------------------------------------------------- |
-| `memory-curator`     | Background | Monitors sessions, suggests memorable events (requires `auto_capture: true`) |
+| `memory-curator`     | On-demand / confirm-all mode | Presents memorable events for individual confirmation. Active when `auto_capture: "confirm-all"` or manually invoked. In tiered/full modes, in-flight captures handle events directly. |
 | `context-researcher` | On-demand  | Deep memory search, returns structured briefings                             |
 
 ## Hooks
@@ -232,12 +232,13 @@ All settings are configured in `pensyve-plugin.local.md` (copy to your project r
 
 ## MCP Tools
 
-The plugin wraps 6 MCP tools exposed by the `pensyve-mcp` binary:
+The plugin wraps 7 MCP tools exposed by the `pensyve-mcp` binary:
 
 | Tool                    | Parameters                             | Returns                              |
 | ----------------------- | -------------------------------------- | ------------------------------------ |
-| `pensyve_recall`        | `query`, `entity?`, `types?`, `limit?` | Ranked array of memories with scores. When `entity` is provided, results are scoped to prefer memories linked to that entity. Hooks auto-detect the project name and pass it as `entity`. |
+| `pensyve_recall`        | `query`, `entity?`, `types?`, `limit?`, `min_confidence?` | Ranked array of memories with scores. When `entity` is provided, results are scoped to prefer memories linked to that entity. Hooks auto-detect the project name and pass it as `entity`. |
 | `pensyve_remember`      | `entity`, `fact`, `confidence?`        | Stored memory object                 |
+| `pensyve_observe`       | `episode_id`, `content`, `source_entity`, `about_entity`, `content_type?` | Stored observation object. Primary episodic-capture path used by in-flight memory-woven skills. `source_entity` and `about_entity` are required. |
 | `pensyve_episode_start` | `participants`                         | `episode_id`, `started_at`           |
 | `pensyve_episode_end`   | `episode_id`, `outcome?`               | `memories_created` count             |
 | `pensyve_forget`        | `entity`, `hard_delete?`               | `forgotten_count`                    |

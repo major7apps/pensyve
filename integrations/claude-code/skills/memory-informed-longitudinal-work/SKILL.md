@@ -19,8 +19,9 @@ Rely on the SessionStart hook's thread-continuity check for the primer. If this 
 When the session pivots to a new sub-topic (new phase, new eval subset, new failure mode), call `pensyve_recall`:
 - `query`: short description of the new sub-topic
 - `entity`: project + sub-topic entity (per `skills/shared/entity-detection.md` canonicalization rules)
-- `types`: `["semantic", "episodic", "procedural"]` (longitudinal work benefits from all three)
 - `limit`: 5
+
+No `types` filter — longitudinal work benefits from all three memory types; omit to query all. (Passing all three explicitly is equivalent to no filter; omitting is cleaner.)
 
 Surface: `Recalled N prior findings on <sub-topic>.`
 
