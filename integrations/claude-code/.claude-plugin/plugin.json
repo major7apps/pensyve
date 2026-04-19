@@ -1,7 +1,7 @@
 {
   "name": "pensyve",
-  "version": "1.2.1",
-  "description": "Universal memory runtime — cross-session cognitive memory for Claude Code. Remembers decisions, patterns, and context across coding sessions.",
+  "version": "1.3.0",
+  "description": "Universal memory runtime — ambient working-memory substrate for Claude Code. Memory is not a feature you invoke — it's the substrate the agent operates on.",
   "author": {
     "name": "Major7 Apps",
     "email": "seth@major7apps.com"
