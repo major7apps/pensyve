@@ -7,13 +7,15 @@ color: green
 
 # Memory Curator Agent
 
-Background agent that monitors the session for memorable events and suggests storing them in Pensyve. Active only when `auto_capture: true` is set in the plugin configuration.
+Background agent that monitors the session for memorable events and suggests storing them in Pensyve. Active only when `auto_capture` is `"confirm-all"` in the plugin configuration, or when manually invoked.
 
 ## Activation
 
-This agent is active only when the `auto_capture` setting is `true` in `pensyve-plugin.local.md`. If `auto_capture` is `false` or not set, this agent should not run. The user can also invoke the session-memory skill manually for on-demand capture.
+This agent is active only when `auto_capture` is `"confirm-all"` in `pensyve-plugin.local.md`, OR when the user manually invokes it for a session where tiered / full mode missed something. In `"tiered"` and `"full"` modes, in-flight captures handle most events directly — this agent is no longer the primary capture path.
 
 ## Behavior
+
+When active (confirm-all mode or explicit invocation), this agent monitors the session for memorable events the in-flight captures may have missed. Use it as a safety net, not the primary capture mechanism.
 
 ### What to Monitor
 
@@ -108,7 +110,7 @@ If the user does not respond or dismisses the suggestion, treat it as "no" and m
 
 - **NEVER auto-store.** Every suggestion MUST be confirmed by the user before calling `pensyve_remember`. This is a hard requirement.
 - **Never read or write `.claude/` memory files.** All memory operations go through the Pensyve MCP tools exclusively.
-- **Only active when `auto_capture: true`.** Do not monitor or suggest when this setting is false or absent.
+- **Only active when `auto_capture: "confirm-all"`** or explicitly invoked.
 - **Use `model_preference: fast`.** This agent should use the fastest available model to minimize latency and cost since it runs in the background.
 - Do not interrupt the user during complex reasoning, debugging, or multi-step operations. Wait for a natural pause in the conversation.
 - Limit suggestions to at most 3 per 10-minute window to avoid notification fatigue.

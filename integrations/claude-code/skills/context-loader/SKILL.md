@@ -10,6 +10,8 @@ Load relevant memories from Pensyve at the start of a session to provide cross-s
 
 ## Instructions
 
+> **Note on invocation:** The SessionStart hook has already performed a scoped recall and (if applicable) injected a continuity primer. Invoking this skill adds deeper on-demand context — not a replacement for the hook's work. Expect to see both.
+
 When this skill is invoked (typically at session start), follow these steps:
 
 ### Step 0: Determine Loading Mode
@@ -32,6 +34,21 @@ Run the following `pensyve_recall` queries to gather session context:
 4. **Recent activity**: `pensyve_recall` with query `"*"` (limit: 10) -- broad query to capture recent memories by recency
 
 Deduplicate results across queries (same memory ID should appear only once).
+
+### Continuity-aware primer
+
+If the SessionStart hook detected a continuation (check plugin session state for `prior_episode_id` — this is set by the hook when shared-entity score ≥0.7; it is a plugin-layer concept, not a field on the server-side episode), structure the primer around continuity rather than fresh recall:
+
+> **Continuing:** `<entity-set>` — prior episode <short-date>
+>
+> **Last lessons:**
+> - [recent observation 1]
+> - [recent observation 2]
+>
+> **Open questions carried forward:**
+> - [if any observations had `open-question` provenance]
+
+If no continuation was detected, present a standard recall-based primer.
 
 ### Step 2: Present Context
 

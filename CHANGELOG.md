@@ -5,6 +5,37 @@ All notable changes to Pensyve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-04-18 (Claude Code plugin only)
+
+### Added
+
+- **Working-memory substrate**: the Claude Code plugin now behaves as ambient working memory rather than a feature users invoke. Lessons are captured in-flight the moment they land; recalls are woven into the agent's reasoning loop; sessions that continue prior work resume with a relevant primer. Spec: `pensyve-docs/specs/2026-04-18-pensyve-working-memory-substrate-design.md`; plan: `pensyve-docs/plans/2026-04-18-pensyve-claude-code-working-memory.md`.
+- **Three new memory-woven skills**: `memory-informed-debug`, `memory-informed-design`, `memory-informed-longitudinal-work` — each has non-optional "consult memory" and "capture lesson" steps baked into its flow. The longitudinal-work skill targets multi-session research/eval loops where lessons must accumulate across runs.
+- **Shared skill references**: `skills/shared/entity-detection.md` (canonicalization + fallback rules for scoping recalls and observations) and `skills/shared/memory-reflex.md` (the reasoning discipline every memory-woven skill inherits, plus the canonical provenance tag vocabulary).
+- **Thread-aware session continuity**: the `session-start` hook now detects whether the current session continues a prior episode (shared entities + temporal proximity) and resumes with a primer of prior lessons. Continuity is a plugin-layer concept today; server-side persistence of the link is a candidate for a future MCP extension (see spec addendum).
+- **In-flight capture markers**: the `post-tool-bash` and `post-tool-write-edit` hooks now score signal strength and emit `in_flight_trigger` markers when accumulated strength crosses a threshold. Memory-woven skills check for these markers and capture immediately when a concrete lesson has landed.
+- **First-class procedural memory**: all three memory types (semantic, episodic, procedural) are now represented across the skill templates. Procedural captures use `pensyve_observe` with a `[procedural]` content prefix (integration-layer convention; Task 1 addendum to the spec covers the decision).
+
+### Changed
+
+- **`prompt_enrichment` default-on**: the `user-prompt-submit` hook's prompt-enrichment is now on by default with guardrails (<1s budget, scored threshold, entity-scoped recall, max 5 memories, silent failure). Opt out via `prompt_enrichment: false` in `pensyve-plugin.local.md`.
+- **Stop hook narrowed**: the `Stop` hook is no longer the primary write path. In-flight captures handle the substantive writes; `Stop` now handles residuals and closes the episode. Also scans Pensyve for `[tier-2-pending]` items from pre-compact handoff (with a <1s latency budget).
+- **`memory-curator` narrowed**: active only when `auto_capture: "confirm-all"` or on explicit invocation. In `tiered`/`full` modes, in-flight captures handle events directly.
+- **Provenance tags formalized**: canonical format `[<origin>/<trigger>/<tier>]` where origin ∈ {`proactive`, `auto-capture`}, trigger ∈ {`in-flight`, `stop`, `pre-compact`, `curator`, `user`}, tier ∈ {`tier-1`, `tier-2`, `residual`, `open-question`}. For procedural captures, `[procedural]` precedes the provenance tag.
+- **Existing skills refreshed**: `memory-informed-refactor`, `session-memory`, `context-loader` updated to reference the shared memory-reflex rule, add in-flight capture steps, and align with the new platform/reasoning layer split.
+
+### Fixed
+
+- **MCP contract mismatches** (pre-merge via PR #58 review): removed `related_entities` from all `pensyve_recall` call sites (not a real param; secondary entities now fold into the query string); removed `continuation_of` from `pensyve_episode_start` (not a real param; thread continuity is plugin-layer only); added required `source_entity` and `about_entity` to every `pensyve_observe` call example across hooks and skills.
+- **Backward-compat consistency**: restored boolean `auto_capture` legacy handling in `stop.md` to match `pre-compact.md`.
+
+### Backward Compatibility
+
+- `auto_capture: false` → treated as `"off"` (no proactive behavior).
+- `auto_capture: true` → treated as `"confirm-all"` (presents every capture for confirmation).
+- Users who had no `prompt_enrichment` setting will experience the new default-on behavior; set `prompt_enrichment: false` to restore v1.2 behavior.
+- No schema migrations, no SDK changes, no MCP server changes. PyPI/npm/crates.io/Go-module versions stay at 1.2.0.
+
 ## [1.2.1] - 2026-04-16 (Claude Code plugin only)
 
 ### Changed
