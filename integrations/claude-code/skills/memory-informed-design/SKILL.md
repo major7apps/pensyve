@@ -17,11 +17,12 @@ Identify the relevant entity/entities (service, module, subsystem under design) 
 ### Step 2: Consult memory (required)
 
 Call `pensyve_recall`:
-- `query`: a short description of the design question
+- `query`: a short description of the design question, including secondary entity names where known (e.g., "auth-service jwt signing rs256 hs256")
 - `entity`: primary detected entity
-- `related_entities`: secondary entities
 - `types`: `["semantic", "episodic"]` (design benefits most from durable decisions and prior decision-contexts)
 - `limit`: 5
+
+Secondary entities are folded into the query string since the MCP server scopes results by single primary entity only.
 
 Surface one line: `Recalled N prior decisions on <entity>.` (Skip if N=0.)
 
@@ -36,13 +37,13 @@ Shape your recommendation using the recalled decisions. If the user's current qu
 When the user accepts a design or states a decision ("let's go with X", "we'll use Y"), call the memory reflex:
 
 - **Semantic** — `pensyve_remember` with `entity: <primary_entity>`, `fact: "[proactive/in-flight/tier-1] <decision text>"`, confidence 0.9.
-- **Episodic** — `pensyve_observe` for the decision context (what alternatives were considered, what tipped the balance). This enables future "why did we decide X?" queries.
+- **Episodic** — `pensyve_observe` with `episode_id: <session episode_id>`, `source_entity: "claude-code"`, `about_entity: <primary_entity>`, `content: "[proactive/in-flight/tier-1] <decision context: alternatives considered, what tipped the balance>"`, `content_type: "text"`. This enables future "why did we decide X?" queries.
 
 Surface one line: `↳ captured decision on <entity>: <short>`.
 
 ### Step 5: Capture evaluation procedures
 
-If the design process revealed a reusable way to evaluate similar decisions (e.g., "run spike vs. prototype", "check latency first"), capture it as procedural: `pensyve_observe` with `content: "[procedural] [proactive/in-flight/tier-1] trigger=..., action=..., outcome=..."`.
+If the design process revealed a reusable way to evaluate similar decisions (e.g., "run spike vs. prototype", "check latency first"), capture it as procedural: `pensyve_observe` with `episode_id: <session episode_id>`, `source_entity: "claude-code"`, `about_entity: <primary_entity>`, `content: "[procedural] [proactive/in-flight/tier-1] trigger=..., action=..., outcome=..."`, `content_type: "text"`.
 
 ## Constraints
 

@@ -36,16 +36,20 @@ During the session, classify emerging knowledge into the three memory types and 
 
 Apply the memory reflex the moment a finding is confirmed. Do not batch — capture at landing.
 
-For procedural captures: `pensyve_observe` with `content: "[procedural] [proactive/in-flight/tier-1] trigger=..., action=..., outcome=..."`.
+For procedural captures: `pensyve_observe` with `episode_id: <session episode_id>`, `source_entity: "claude-code"`, `about_entity: <relevant entity>`, `content: "[procedural] [proactive/in-flight/tier-1] trigger=..., action=..., outcome=..."`, `content_type: "text"`.
 
 ### Step 4: Capture open questions
 
 When a run ends with an unresolved question ("X improved but we don't know why"), capture it as an episodic observation with open-question provenance:
 
 ```
-pensyve_observe(episode_id, about_entity: <entity>,
-               content: "[proactive/in-flight/open-question] <question>",
-               content_type: "text")
+pensyve_observe(
+  episode_id: <session episode_id>,
+  source_entity: "claude-code",
+  about_entity: <entity>,
+  content: "[proactive/in-flight/open-question] <question>",
+  content_type: "text"
+)
 ```
 
 This populates the "open questions" surface in the next session's primer.

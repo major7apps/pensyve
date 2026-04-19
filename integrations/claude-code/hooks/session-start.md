@@ -32,10 +32,11 @@ Combine into a candidate entity list per `skills/shared/entity-detection.md`.
 ### Step 3: Scoped recall
 
 Call `pensyve_recall`:
-- `query`: `"recent decisions issues patterns"`
+- `query`: `"recent decisions issues patterns <entity-1> <entity-2> <entity-3>"` — append the top 3 candidate entities from Step 2 directly into the query string
 - `entity`: detected project name
-- `related_entities`: candidate entity list from Step 2 (top 3)
 - `limit`: 10 (summary) or 25 (full)
+
+Secondary entities are folded into the query string since the MCP server scopes results by single primary entity only.
 
 ### Step 4: Thread-continuity check
 
@@ -44,10 +45,10 @@ Query recent episodes for this namespace:
 - Find the most recent episode in the last 48 hours
 - Compute shared-entity score: fraction of current session's candidate entities that also appear in that episode's observations
 - If score ≥ 0.7, treat the current session as a **continuation**:
-  - Store `continuation_of: <prior_episode_id>` for use in Step 6
+  - Store `prior_episode_id` in local session state (used by context-loader and memory-woven skills for in-session queries — this is a plugin-layer concept only, not a server-side field)
   - Include that episode's most recent 3 observations in the primer
 
-If no continuation is detected, this is a fresh episode — no `continuation_of` link.
+If no continuation is detected, this is a fresh episode.
 
 ### Step 5: Present context
 
@@ -77,9 +78,10 @@ Otherwise:
 
 Call `pensyve_episode_start`:
 - `participants`: `["claude-code", "<detected_project_name>"]`
-- `continuation_of`: `<prior_episode_id>` if Step 4 detected continuation, else omit
 
 Store the returned `episode_id` for use by other hooks and skills. If the call fails, continue without episode tracking (do not report failure to user).
+
+Thread continuity is surfaced in the primer (Step 5) and reflected in session state used by context-loader and memory-woven skills. The server-side episode has no `continuation_of` field today — this is a plugin-layer concept deferred to a future MCP extension.
 
 ### Step 7: Signal buffer init
 

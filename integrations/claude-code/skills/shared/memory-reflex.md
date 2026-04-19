@@ -31,6 +31,22 @@ Not substantive: formatting fixes, trivial lookups, reading a file, running a co
 
 When in doubt, prefer episodic. Consolidation will promote recurring patterns to semantic automatically.
 
+### Canonical `pensyve_observe` call template
+
+All `pensyve_observe` calls — in-flight, residual, or procedural — must include **all required fields**:
+
+```
+pensyve_observe(
+  episode_id: <current session's episode_id>,
+  content: "[proactive/in-flight/tier-1] <observation text>",
+  source_entity: "claude-code",
+  about_entity: "<relevant entity, e.g. 'hybrid-router'>",
+  content_type: "text"  # or "code" for code-related outcomes
+)
+```
+
+`source_entity` and `about_entity` are **required** by the MCP server (`ObserveParams`). Omitting either will cause the call to fail silently. `source_entity` is always `"claude-code"` for plugin-originated observations. `about_entity` is the lowercase-hyphenated entity the observation is about.
+
 ## Surface style
 
 Lightly visible. One line when memory is used. Examples:

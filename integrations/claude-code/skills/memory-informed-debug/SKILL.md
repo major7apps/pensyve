@@ -17,11 +17,12 @@ Identify the relevant entity/entities (failing test, failing module, error sourc
 ### Step 2: Consult memory (required)
 
 Call `pensyve_recall`:
-- `query`: a short description of the failure ("hybrid-router threshold regression" rather than full stack traces)
+- `query`: a short description of the failure, including secondary entity names where known (e.g., "hybrid-router threshold regression phase-4.3" rather than full stack traces)
 - `entity`: primary detected entity
-- `related_entities`: secondary entities
 - `types`: `["procedural", "episodic"]` (debugging benefits most from known-good diagnostic procedures and prior incident outcomes)
 - `limit`: 5
+
+Secondary entities are folded into the query string since the MCP server scopes results by single primary entity only.
 
 Surface one line: `Recalled N memories from prior debug sessions on <entity>.` (Skip if N=0.)
 
@@ -35,8 +36,8 @@ Proceed with the diagnostic work. Use recalled procedural memories as a starting
 
 When a root cause is **confirmed** (not just hypothesized), call the memory reflex per `skills/shared/memory-reflex.md`:
 
-- **Episodic** — `pensyve_observe` with the session `episode_id`, `about_entity: <primary_entity>`, `content: "[proactive/in-flight/tier-1] <one-sentence root cause>"`, `content_type: "text"`.
-- **Procedural** — if the debug produced a reusable diagnostic sequence, capture it: `pensyve_observe` with `content: "[procedural] [proactive/in-flight/tier-1] trigger=..., action=..., outcome=..."`.
+- **Episodic** — `pensyve_observe` with `episode_id: <session episode_id>`, `source_entity: "claude-code"`, `about_entity: <primary_entity>`, `content: "[proactive/in-flight/tier-1] <one-sentence root cause>"`, `content_type: "text"`.
+- **Procedural** — if the debug produced a reusable diagnostic sequence, capture it: `pensyve_observe` with `episode_id: <session episode_id>`, `source_entity: "claude-code"`, `about_entity: <primary_entity>`, `content: "[procedural] [proactive/in-flight/tier-1] trigger=..., action=..., outcome=..."`, `content_type: "text"`.
 - **Semantic** — if the root cause reveals a durable truth (e.g., "our CI runner's Python 3.10 cannot handle the new syntax"), also call `pensyve_remember`.
 
 Surface one line: `↳ captured: <one-sentence>`.

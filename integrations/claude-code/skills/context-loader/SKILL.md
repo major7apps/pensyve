@@ -37,7 +37,7 @@ Deduplicate results across queries (same memory ID should appear only once).
 
 ### Continuity-aware primer
 
-If the SessionStart hook detected a continuation (check session state for `continuation_of` on the current episode), structure the primer around continuity rather than fresh recall:
+If the SessionStart hook detected a continuation (check plugin session state for `prior_episode_id` — this is set by the hook when shared-entity score ≥0.7; it is a plugin-layer concept, not a field on the server-side episode), structure the primer around continuity rather than fresh recall:
 
 > **Continuing:** `<entity-set>` — prior episode <short-date>
 >

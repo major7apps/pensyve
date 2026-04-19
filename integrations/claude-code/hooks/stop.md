@@ -56,8 +56,8 @@ Apply tier taxonomy:
 
 Tier 1 residuals: auto-store silently.
 - Semantic → `pensyve_remember` with `[auto-capture/stop/residual/tier-1]` provenance
-- Episodic → `pensyve_observe` with the session's `episode_id` and same provenance
-- Procedural → `pensyve_observe` with content beginning `[procedural] [auto-capture/stop/residual/tier-1]`
+- Episodic → `pensyve_observe` with `episode_id: <session episode_id>`, `source_entity: "claude-code"`, `about_entity: <entity>`, `content: "[auto-capture/stop/residual/tier-1] <observation>"`, `content_type: "text"`
+- Procedural → `pensyve_observe` with `episode_id: <session episode_id>`, `source_entity: "claude-code"`, `about_entity: <entity>`, `content: "[procedural] [auto-capture/stop/residual/tier-1] trigger=..., action=..., outcome=..."`, `content_type: "text"`
 
 Tier 2 residuals: batch for review:
 

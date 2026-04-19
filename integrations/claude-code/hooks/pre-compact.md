@@ -74,11 +74,13 @@ If there are buffered signals from PostToolUse hooks (file_change, outcome, tool
   - `confidence`: 0.9
 - **Episodic** — session-scoped events, outcomes, root causes — call `pensyve_observe`:
   - `episode_id`: the current session's episode_id
+  - `source_entity`: `"claude-code"`
   - `about_entity`: the relevant entity (lowercase-hyphenated)
   - `content`: `[auto-capture/pre-compact/residual/tier-1] <observation>`
   - `content_type`: `"text"` (or `"code"` for code-related outcomes)
 - **Procedural** — reusable workflows, sequences, recipes (per Task 1 spec addendum) — call `pensyve_observe`:
   - `episode_id`: current session's episode_id
+  - `source_entity`: `"claude-code"`
   - `about_entity`: relevant entity
   - `content`: `[procedural] [auto-capture/pre-compact/residual/tier-1] trigger=..., action=..., outcome=...`
   - `content_type`: `"text"`
