@@ -38,17 +38,26 @@ Call `pensyve_recall`:
 
 Secondary entities are folded into the query string since the MCP server scopes results by single primary entity only.
 
-### Step 4: Thread-continuity check
+### Step 4: Thread-continuity check (best-effort via recall)
 
-Query recent episodes for this namespace:
-- `pensyve_inspect` on the project entity, filter `memory_type: episodic`, limit 5
-- Find the most recent episode in the last 48 hours
-- Compute shared-entity score: fraction of current session's candidate entities that also appear in that episode's observations
-- If score ≥ 0.7, treat the current session as a **continuation**:
-  - Store `prior_episode_id` in local session state (used by context-loader and memory-woven skills for in-session queries — this is a plugin-layer concept only, not a server-side field)
-  - Include that episode's most recent 3 observations in the primer
+There is no MCP surface to list episodes directly. Instead, use `pensyve_recall` with an episodic-type filter to surface recent observations for the project — the recall ranker's activation signal boosts recent memories naturally.
 
-If no continuation is detected, this is a fresh episode.
+Call `pensyve_recall`:
+- `query`: the same `"recent decisions issues patterns"` string from Step 3, optionally augmented with current-session entity candidates
+- `entity`: the detected project name
+- `types`: `["episodic"]`
+- `limit`: 5
+
+Compute a shared-entity score: of the candidate entities detected in Step 2, how many appear as the `about_entity` (or mentioned in content) of the returned observations? If ≥70% of the top observations reference at least one shared entity, treat the current session as a **continuation**.
+
+**Continuity signal fidelity is limited:**
+- No episode-record listing exists, so we cannot positively link sessions via a structured `episode_id`.
+- The ranker's activation signal tends to prefer recent items, but there is no hard temporal guarantee.
+- This is a pragmatic best-effort — good enough for the user-facing primer, not a formal persisted link.
+
+If the continuity check succeeds, remember the top 3 observations for use in the primer (Step 5). Store them as plugin-layer session state under a `recent_context` key; downstream skills (especially `context-loader`) will consume it.
+
+If the check is inconclusive (fewer than 70% entity overlap, empty recall, or MCP timeout), present a standard fresh-session primer in Step 5.
 
 ### Step 5: Present context
 
@@ -90,7 +99,7 @@ PostToolUse hooks will begin buffering signals. No action needed here — inform
 ## Constraints
 
 - Complete in <2s for summary mode.
-- Use one `pensyve_recall` call + one `pensyve_inspect` call (continuity check). No more.
+- Use two `pensyve_recall` calls maximum (Step 3 + Step 4 continuity check). No `pensyve_inspect` for continuity.
 - If MCP unavailable or slow, skip context loading entirely — fail silently.
 - Never read or write `.claude/` memory files.
 - Detected project + entity names MUST be lowercase-hyphenated.
@@ -99,6 +108,6 @@ PostToolUse hooks will begin buffering signals. No action needed here — inform
 ## Error handling
 
 - `pensyve_recall` fails/times out: exit silently. Do not block session.
-- `pensyve_inspect` continuity check fails: start fresh episode (no link).
+- Continuity recall (Step 4) fails or returns empty: treat as fresh session (no link).
 - `pensyve_episode_start` fails: continue without episode tracking.
 - MCP not connected: single brief note ("Pensyve MCP not available — context loading skipped.") then exit.
