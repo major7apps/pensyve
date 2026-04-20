@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "pensyve": {
+      "serverUrl": "https://mcp.pensyve.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${PENSYVE_API_KEY}"
+      }
+    }
+  }
+}
