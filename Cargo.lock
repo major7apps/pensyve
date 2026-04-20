@@ -2765,7 +2765,7 @@ dependencies = [
 
 [[package]]
 name = "pensyve-benchmarks"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "chrono",
  "pensyve-core",
@@ -2780,7 +2780,7 @@ dependencies = [
 
 [[package]]
 name = "pensyve-cli"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "clap",
  "dirs",
@@ -2791,7 +2791,7 @@ dependencies = [
 
 [[package]]
 name = "pensyve-core"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2818,7 +2818,7 @@ dependencies = [
 
 [[package]]
 name = "pensyve-mcp"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2834,7 +2834,7 @@ dependencies = [
 
 [[package]]
 name = "pensyve-mcp-gateway"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2866,7 +2866,7 @@ dependencies = [
 
 [[package]]
 name = "pensyve-mcp-tools"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "pensyve-core",
  "rmcp",
@@ -2880,7 +2880,7 @@ dependencies = [
 
 [[package]]
 name = "pensyve-python"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "chrono",
  "pensyve-core",

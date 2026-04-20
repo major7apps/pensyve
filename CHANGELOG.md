@@ -5,6 +5,19 @@ All notable changes to Pensyve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-04-20
+
+### Fixed
+
+- **Release metadata**: `pensyve-python/pyproject.toml` was missed in the v1.3.0 manifest bump, so the `pensyve` Python wheel built at version 1.2.0 and PyPI rejected the publish as already-existing. All 12 version-bearing files now at 1.3.1 in lockstep. No code changes from 1.3.0 — this is a metadata-only correction.
+
+### Notes
+
+- `@pensyve/sdk` on npm moves 1.3.0 → 1.3.1 even though 1.3.0 published successfully, to keep core packages in lockstep.
+- `pensyve-core` on crates.io moves 1.3.0 → 1.3.1 for the same reason.
+- `pensyve 1.3.0` Python wheel was never published to PyPI (the 1.3.0 release.yml publish failed); 1.3.1 is the first pip-installable release with observation extractor + hybrid classifier features.
+- Integration packages (cursor, cline, langchain-ts, autogen, etc.) stay at 1.3.0 — per the version strategy, integrations version independently from core.
+
 ## [1.3.0] - 2026-04-20
 
 ### Added
