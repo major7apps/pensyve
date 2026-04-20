@@ -1,172 +1,135 @@
 # Pensyve AutoGen Integration
 
-Async memory backend for Microsoft AutoGen, implementing the `Memory` ABC so it can be passed directly to `AssistantAgent(memory=[...])`.
+Persistent AI memory for [Microsoft AutoGen](https://microsoft.github.io/autogen/) agents via Pensyve. Two complementary features:
 
-## Authentication
+1. **Working-memory substrate** — A system-prompt document (`SUBSTRATE_PROMPT.md`) that gives your AutoGen agent the reasoning discipline to recall before answering and capture lessons as they land.
+2. **Memory backend** — `PensyveMemory`: an async `Memory` ABC implementation backed by Pensyve's 8-signal fusion retrieval engine.
 
-```python
-from pensyve import PensyveClient
+---
 
-# Explicit API key
-client = PensyveClient(api_key="psy_your_key_here")
+## What It Does
 
-# Or from environment variable
-# export PENSYVE_API_KEY="psy_your_key_here"
-client = PensyveClient()
+The working-memory substrate is a reasoning layer — not a library — that you load into your agent's `system_message`. Once loaded, the agent will:
+
+- **Recall before substantive answers** using `pensyve_recall`, scoped by entity.
+- **Capture lessons in-flight** using `pensyve_observe` when a root cause is confirmed, a decision lands, or an approach is abandoned.
+- **Manage episode lifecycle** lazily: open an episode on the first observe, reuse it throughout the conversation.
+- **Surface memory lightly** — one line per recall or capture, never narrating empty recalls.
+- **Wrap up sessions** by presenting memory candidates for user confirmation before storage.
+
+---
+
+## Install
+
+```bash
+pip install autogen-agentchat autogen-ext[mcp]
+```
+
+Set your API key:
+
+```bash
+export PENSYVE_API_KEY="psy_your_key_here"
+export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
 Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
 
-## Installation
-
-```bash
-pip install pensyve-autogen
-
-# With AutoGen (recommended):
-pip install pensyve-autogen[autogen]
-```
-
-Or copy `pensyve_autogen.py` into your project (works standalone without autogen-core installed).
+---
 
 ## Quick Start
 
-```python
-from pensyve_autogen import PensyveMemory, MemoryContent, MemoryMimeType
-
-memory = PensyveMemory(namespace="my-team", entity="assistant")
-
-# Store a memory
-await memory.add(MemoryContent(
-    content="User prefers TypeScript",
-    mime_type=MemoryMimeType.TEXT,
-    metadata={"category": "preferences"},
-))
-
-# Query memories
-result = await memory.query("language preferences")
-for entry in result.results:
-    print(f"{entry.content} (score: {entry.score:.2f})")
-
-# Use with AutoGen agent
-from autogen_ext.models.openai import OpenAIChatCompletionClient
-from autogen_agentchat.agents import AssistantAgent
-
-agent = AssistantAgent(
-    name="assistant",
-    model_client=OpenAIChatCompletionClient(model="gpt-4o"),
-    memory=[memory],
-)
-```
-
-## Dual-Mode: Local and Cloud
-
-```python
-# Local mode (default) — PyO3 engine, zero latency
-memory = PensyveMemory(namespace="my-app")
-
-# Cloud mode — auto-detected from API key
-memory = PensyveMemory(
-    namespace="my-app",
-    api_key="psy_...",
-)
-
-# Or via environment variable
-# export PENSYVE_API_KEY=psy_...
-memory = PensyveMemory(namespace="my-app")
-
-# Explicit mode override
-memory = PensyveMemory(namespace="my-app", mode="cloud")
-```
-
-## API
-
-### `PensyveMemory(namespace, entity, **kwargs)`
-
-| Parameter      | Type          | Default           | Description                            |
-| -------------- | ------------- | ----------------- | -------------------------------------- |
-| `namespace`    | `str`         | `"default"`       | Pensyve namespace for isolation        |
-| `entity`       | `str`         | `"autogen-agent"` | Entity name for this agent's memories  |
-| `path`         | `str \| None` | `None`            | Storage directory (local mode)         |
-| `mode`         | `str`         | `"auto"`          | `"auto"`, `"local"`, or `"cloud"`      |
-| `api_key`      | `str \| None` | `None`            | API key for cloud mode                 |
-| `base_url`     | `str \| None` | `None`            | Cloud server URL                       |
-| `recall_limit` | `int`         | `5`               | Default number of memories to retrieve |
-| `confidence`   | `float`       | `0.85`            | Default confidence for stored memories |
-
-### Async Methods (AutoGen Memory ABC)
-
-| Method                                | Description                                  |
-| ------------------------------------- | -------------------------------------------- |
-| `await add(content)`                  | Store a `MemoryContent` as a Pensyve fact    |
-| `await query(query, **kwargs)`        | Search memories, returns `MemoryQueryResult` |
-| `await update_context(model_context)` | Inject relevant memories as a system message |
-| `await clear()`                       | Delete all memories for the entity           |
-| `await close()`                       | Clean up resources (no-op for local mode)    |
-
-## Intelligent Capture (v1.1.0+)
-
-Automatically capture decisions, preferences, and findings from AutoGen conversations into Pensyve memory.
-
-```python
-from pensyve_autogen import PensyveMemory, PensyveCaptureHandler
-
-memory = PensyveMemory(namespace="my-team", entity="assistant")
-capture = PensyveCaptureHandler(memory=memory)
-
-# Buffer signals during agent execution
-capture.on_message(role="user", content="Let's use Postgres for the DB")
-capture.on_tool_call(tool_name="search", tool_input={"q": "postgres setup"})
-capture.on_agent_reply(content="I'll set up the Postgres schema.", agent_name="assistant")
-
-# Flush at conversation end (async)
-auto_stored, review = await capture.flush()
-```
-
-### How It Works
-
-- **Messages**, **tool calls**, and **agent replies** are buffered as raw signals
-- On flush, signals are classified into tiered memory candidates:
-  - **Tier 1** (auto-stored): architecture decisions, behavioral preferences, project constraints
-  - **Tier 2** (review): root causes, failed approaches, performance findings, dependencies
-- Secrets are automatically redacted; long code blocks are stripped
-- Capture **never breaks** AutoGen execution (all event hooks fail silently)
-
-### Auto-flush
-
-```python
-# Flush every 20 events (classification only — call flush() to persist)
-capture = PensyveCaptureHandler(memory=memory, auto_flush_interval=20)
-```
-
-### Reviewing Tier-2 Candidates
-
-```python
-pending = capture.get_pending_review()
-for candidate in pending:
-    print(f"[tier {candidate.tier}] {candidate.entity}: {candidate.fact}")
-    # Manually approve:
-    await memory.add(MemoryContent(
-        content=candidate.fact,
-        mime_type=MemoryMimeType.TEXT,
-        metadata={"confidence": candidate.confidence},
-    ))
-
-capture.clear_pending_review()
-```
-
-### Synchronous Flush
-
-If you cannot use ``await``, use ``flush_sync()`` to classify without persisting:
-
-```python
-auto_store, review = capture.flush_sync()
-# Persist manually later
-```
-
-## Running Tests
-
 ```bash
 cd integrations/autogen
-pip install -e ".[dev]"
-pytest tests/ -v
+python examples/pensyve_agent.py
 ```
+
+The example creates an AutoGen `AssistantAgent` with Pensyve MCP tools registered via `McpWorkbench` and `SUBSTRATE_PROMPT.md` as the `system_message`.
+
+---
+
+## System Prompt
+
+`SUBSTRATE_PROMPT.md` consolidates all eight substrate rules into a single document. Load it into your agent:
+
+```python
+from pathlib import Path
+from autogen_agentchat.agents import AssistantAgent
+
+substrate = Path("SUBSTRATE_PROMPT.md").read_text()
+agent = AssistantAgent(
+    name="agent",
+    model_client=model_client,
+    tools=tools,
+    system_message=substrate,
+)
+```
+
+---
+
+## MCP Connection
+
+```python
+from autogen_ext.tools.mcp import McpWorkbench, StreamableHttpServerParams
+
+pensyve_server_params = StreamableHttpServerParams(
+    url="https://mcp.pensyve.com/mcp",
+    headers={"Authorization": f"Bearer {os.environ['PENSYVE_API_KEY']}"},
+)
+
+async with McpWorkbench(pensyve_server_params) as workbench:
+    tools = await workbench.list_tools()
+    # Build agent with tools...
+```
+
+---
+
+## Memory Behavior Model
+
+| Trigger | Action | MCP call |
+|---|---|---|
+| Before substantive answer | Recall by entity | `pensyve_recall(query, entity, types, limit=5)` |
+| Root cause confirmed | Capture episodic | `pensyve_observe(episode_id, content, source_entity="autogen", about_entity)` |
+| Decision accepted | Capture semantic | `pensyve_remember(entity, fact, confidence=0.9)` |
+| Reusable workflow found | Capture procedural | `pensyve_observe(... content="[procedural] ...")` |
+| Session ending | Present candidates | User confirms before storage |
+
+---
+
+## Memory Types
+
+- **Semantic** — durable facts that remain true across sessions.
+- **Episodic** — what happened in this thread (outcomes, root causes, abandoned approaches).
+- **Procedural** — reusable workflows stored via `pensyve_observe` with a `[procedural]` prefix.
+
+---
+
+## Memory Backend
+
+Separate from the substrate, `PensyveMemory` is a drop-in `Memory` ABC implementation:
+
+```python
+from pensyve_autogen import PensyveMemory
+
+memory = PensyveMemory()
+agent = AssistantAgent(name="agent", memory=[memory], ...)
+```
+
+See `pensyve_autogen.py` for the full API.
+
+---
+
+## Opt-Out
+
+To disable the substrate, remove `system_message=substrate` from agent construction. The `PensyveMemory` backend is unaffected.
+
+---
+
+## Links
+
+- [Pensyve](https://pensyve.com) — managed memory service
+- [API Keys](https://pensyve.com/settings/api-keys)
+- [AutoGen docs](https://microsoft.github.io/autogen/)
+
+## License
+
+Apache 2.0 — see [LICENSE](LICENSE).
