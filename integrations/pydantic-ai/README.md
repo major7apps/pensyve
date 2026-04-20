@@ -1,123 +1,120 @@
 # Pensyve for Pydantic AI
 
-Persistent AI memory for [Pydantic AI](https://ai.pydantic.dev/) agents via MCP. Gives your Pydantic AI agents cross-session memory so they remember user preferences, past interactions, and learned context across runs.
+Persistent AI memory for [Pydantic AI](https://ai.pydantic.dev/) agents via Pensyve MCP. Gives your Pydantic AI agents cross-session memory so they remember user preferences, past interactions, and learned context across runs.
 
-> **Status:** Scaffold — MCP configuration and documentation. Full integration planned.
+---
 
-## Authentication
+## What It Does
 
-1. Sign up at [pensyve.com](https://pensyve.com)
-2. Create an API key at [Settings → API Keys](https://pensyve.com/settings/api-keys)
-3. Set the environment variable:
-   ```bash
-   export PENSYVE_API_KEY="psy_your_key_here"
-   ```
+The working-memory substrate is a reasoning layer — not a library — that you load into your Pydantic AI agent's `system_prompt`. Once loaded, the agent will:
 
-## Setup
+- **Recall before substantive answers** using `pensyve_recall`, scoped by entity.
+- **Capture lessons in-flight** using `pensyve_observe` when a root cause is confirmed, a decision lands, or an approach is abandoned.
+- **Manage episode lifecycle** lazily: open an episode on the first observe, reuse it throughout the conversation.
+- **Surface memory lightly** — one line per recall or capture, never narrating empty recalls.
+- **Wrap up sessions** by presenting memory candidates for user confirmation before storage.
 
-Set your API key (get one at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys)):
+---
+
+## Install
 
 ```bash
-export PENSYVE_API_KEY="psy_your_key"
+pip install pydantic-ai
 ```
 
-Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
+Set your API key:
 
-## Cloud (Recommended)
+```bash
+export PENSYVE_API_KEY="psy_your_key_here"
+```
 
-Connect your Pydantic AI agent to Pensyve via MCP tool integration:
+Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
+
+---
+
+## Quick Start
+
+```bash
+cd integrations/pydantic-ai
+python examples/pensyve_agent.py
+```
+
+The example creates a Pydantic AI `Agent` with `MCPServerHTTP` registered and `SUBSTRATE_PROMPT.md` as the `system_prompt`.
+
+---
+
+## System Prompt
+
+`SUBSTRATE_PROMPT.md` consolidates all eight substrate rules into a single document. Pydantic AI's `system_prompt` parameter is the direct injection point:
 
 ```python
+from pathlib import Path
 from pydantic_ai import Agent
 from pydantic_ai.mcp import MCPServerHTTP
 
-pensyve_server = MCPServerHTTP(
+substrate = Path("SUBSTRATE_PROMPT.md").read_text()
+
+pensyve = MCPServerHTTP(
     url="https://mcp.pensyve.com/mcp",
     headers={"Authorization": f"Bearer {os.environ['PENSYVE_API_KEY']}"},
 )
 
 agent = Agent(
-    "openai:gpt-4o",
-    mcp_servers=[pensyve_server],
+    "anthropic:claude-sonnet-4-6",
+    system_prompt=substrate,
+    mcp_servers=[pensyve],
 )
-
-async with agent.run_mcp_servers():
-    result = await agent.run("What do you remember about this project?")
-    print(result.output)
 ```
 
-### MCP Server Config
+---
 
-If your setup uses a JSON config file instead:
+## MCP Connection
 
-```json
-{
-  "mcpServers": {
-    "pensyve": {
-      "type": "http",
-      "url": "https://mcp.pensyve.com/mcp",
-      "headers": {
-        "Authorization": "Bearer ${PENSYVE_API_KEY}"
-      }
-    }
-  }
-}
-```
-
-## Local (Offline)
-
-No API key needed — all data stays on your machine.
+Pydantic AI's `MCPServerHTTP` manages the MCP connection lifecycle natively via `agent.run_mcp_servers()`:
 
 ```python
-from pydantic_ai import Agent
-from pydantic_ai.mcp import MCPServerStdio
-
-pensyve_server = MCPServerStdio(
-    command="pensyve-mcp",
-    args=["--stdio"],
-    env={
-        "PENSYVE_PATH": "~/.pensyve/",
-        "PENSYVE_NAMESPACE": "default",
-    },
-)
-
-agent = Agent(
-    "openai:gpt-4o",
-    mcp_servers=[pensyve_server],
-)
+async with agent.run_mcp_servers():
+    result = await agent.run("Your query here")
+    print(result.data)
 ```
 
-Build from source: `cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
+No separate client setup required — Pydantic AI handles connection and tool registration automatically.
 
-## Available Tools
+---
 
-| Tool                    | Description                            |
-| ----------------------- | -------------------------------------- |
-| `pensyve_recall`        | Search memories by semantic similarity |
-| `pensyve_remember`      | Store a fact as semantic memory        |
-| `pensyve_observe`       | Record an event during an episode      |
-| `pensyve_episode_start` | Begin tracking an interaction          |
-| `pensyve_episode_end`   | Close an episode                       |
-| `pensyve_forget`        | Delete an entity's memories            |
-| `pensyve_inspect`       | List memories for an entity            |
+## Memory Behavior Model
 
-See [MCP Tools Reference](https://pensyve.com/docs/api-reference/mcp-tools) for full parameter details.
+| Trigger | Action | MCP call |
+|---|---|---|
+| Before substantive answer | Recall by entity | `pensyve_recall(query, entity, types, limit=5)` |
+| Root cause confirmed | Capture episodic | `pensyve_observe(episode_id, content, source_entity="pydantic-ai", about_entity)` |
+| Decision accepted | Capture semantic | `pensyve_remember(entity, fact, confidence=0.9)` |
+| Reusable workflow found | Capture procedural | `pensyve_observe(... content="[procedural] ...")` |
+| Session ending | Present candidates | User confirms before storage |
 
-## Intelligent Memory Capture
+---
 
-Pensyve uses a tiered classification system to identify what is worth remembering. When connected to a Pydantic AI agent, the LLM follows the MCP tool descriptions to decide when and how to call memory tools.
+## Memory Types
 
-### Tiered Capture System
+- **Semantic** — durable facts that remain true across sessions.
+- **Episodic** — what happened in this thread (outcomes, root causes, abandoned approaches).
+- **Procedural** — reusable workflows stored via `pensyve_observe` with a `[procedural]` prefix.
 
-- **Tier 1** (auto-store, confidence 0.9+): Explicit decisions, corrections, constraints, architecture choices, dependency version pins, security rules. High-signal items that should almost always be captured.
-- **Tier 2** (review, confidence 0.7-0.89): Root causes, failed approaches, performance findings, debugging outcomes, environment quirks. Medium-signal items that benefit from user confirmation.
-- **Discard**: Formatting, typos, boilerplate, ephemeral status messages. Noise that should never be stored.
+---
 
-### Best Practices
+## Opt-Out
 
-- Use `pensyve_observe` to record significant events during an episode (architecture decisions, failed approaches, key findings)
-- Use `pensyve_remember` for durable facts that should persist across sessions (project conventions, environment constraints, resolved issues)
-- Use `pensyve_recall` at the start of a task to load relevant context from prior sessions
-- Wrap multi-step work in `pensyve_episode_start` / `pensyve_episode_end` to capture episodic context
+To disable the substrate, remove `system_prompt=substrate` from agent construction. The Pensyve MCP server can remain registered for direct tool use without the substrate reasoning layer.
 
-The MCP tool descriptions include guidance on confidence levels so the LLM can classify memories into the appropriate tier automatically.
+---
+
+## Links
+
+- [Pensyve](https://pensyve.com) — managed memory service
+- [API Keys](https://pensyve.com/settings/api-keys)
+- [MCP Server docs](https://docs.pensyve.com/mcp)
+- [Pydantic AI docs](https://ai.pydantic.dev/)
+
+## License
+
+Apache 2.0
