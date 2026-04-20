@@ -1,118 +1,125 @@
 # Pensyve for Google Agent Development Kit
 
-Persistent AI memory for [Google Agent Development Kit (ADK)](https://google.github.io/adk-docs/) agents via MCP. Gives your ADK agents cross-session memory so they remember user preferences, past interactions, and learned context across runs.
+Persistent AI memory for [Google Agent Development Kit (ADK)](https://google.github.io/adk-docs/) agents via Pensyve MCP. Gives your ADK agents cross-session memory so they remember user preferences, past interactions, and learned context across runs.
 
-> **Status:** Scaffold — MCP configuration and documentation. Full integration planned.
+---
 
-## Authentication
+## What It Does
 
-1. Sign up at [pensyve.com](https://pensyve.com)
-2. Create an API key at [Settings → API Keys](https://pensyve.com/settings/api-keys)
-3. Set the environment variable:
-   ```bash
-   export PENSYVE_API_KEY="psy_your_key_here"
-   ```
+The working-memory substrate is a reasoning layer — not a library — that you load into your ADK agent's `instruction`. Once loaded, the agent will:
 
-## Setup
+- **Recall before substantive answers** using `pensyve_recall`, scoped by entity.
+- **Capture lessons in-flight** using `pensyve_observe` when a root cause is confirmed, a decision lands, or an approach is abandoned.
+- **Manage episode lifecycle** lazily: open an episode on the first observe, reuse it throughout the conversation.
+- **Surface memory lightly** — one line per recall or capture, never narrating empty recalls.
+- **Wrap up sessions** by presenting memory candidates for user confirmation before storage.
 
-Set your API key (get one at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys)):
+---
+
+## Install
 
 ```bash
-export PENSYVE_API_KEY="psy_your_key"
+pip install google-adk
 ```
 
-Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
+Set your API key:
 
-## Cloud (Recommended)
+```bash
+export PENSYVE_API_KEY="psy_your_key_here"
+export GOOGLE_API_KEY="your-google-ai-studio-key"
+# Or for Vertex AI: configure GOOGLE_APPLICATION_CREDENTIALS
+```
 
-Connect your Google ADK agent to Pensyve via MCP tool integration:
+Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
+
+---
+
+## Quick Start
+
+```bash
+cd integrations/google-adk
+python examples/pensyve_agent.py
+```
+
+The example creates a Google ADK `LlmAgent` with `MCPToolset` using `StreamableHTTPConnectionParams` and `SUBSTRATE_PROMPT.md` as the `instruction`.
+
+---
+
+## System Prompt
+
+`SUBSTRATE_PROMPT.md` consolidates all eight substrate rules into a single document. ADK's `instruction` field is the per-agent system-level prompt:
 
 ```python
-from google.adk import Agent
-from google.adk.tools.mcp_tool import MCPToolset, SseServerParams
+from pathlib import Path
+from google.adk.agents import LlmAgent
+from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StreamableHTTPConnectionParams
 
-pensyve_tools = MCPToolset(
-    connection_params=SseServerParams(
+substrate = Path("SUBSTRATE_PROMPT.md").read_text()
+
+pensyve_toolset = MCPToolset(
+    connection_params=StreamableHTTPConnectionParams(
         url="https://mcp.pensyve.com/mcp",
         headers={"Authorization": f"Bearer {os.environ['PENSYVE_API_KEY']}"},
-    ),
+    )
 )
 
-agent = Agent(
+agent = LlmAgent(
+    name="pensyve_agent",
     model="gemini-2.0-flash",
-    name="my_agent",
-    tools=[pensyve_tools],
+    instruction=substrate,
+    tools=[pensyve_toolset],
 )
 ```
 
-### MCP Server Config
+---
 
-If your setup uses a JSON config file instead:
+## MCP Connection
 
-```json
-{
-  "mcpServers": {
-    "pensyve": {
-      "type": "http",
-      "url": "https://mcp.pensyve.com/mcp",
-      "headers": {
-        "Authorization": "Bearer ${PENSYVE_API_KEY}"
-      }
-    }
-  }
-}
-```
-
-## Local (Offline)
-
-No API key needed — all data stays on your machine.
+ADK's `MCPToolset` with `StreamableHTTPConnectionParams` handles MCP discovery and tool registration automatically. The `Runner` manages session and event lifecycle:
 
 ```python
-from google.adk.tools.mcp_tool import MCPToolset, StdioServerParams
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
 
-pensyve_tools = MCPToolset(
-    connection_params=StdioServerParams(
-        command="pensyve-mcp",
-        args=["--stdio"],
-        env={
-            "PENSYVE_PATH": "~/.pensyve/",
-            "PENSYVE_NAMESPACE": "default",
-        },
-    ),
-)
+session_service = InMemorySessionService()
+runner = Runner(agent=agent, app_name="my-app", session_service=session_service)
 ```
 
-Build from source: `cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
+---
 
-## Available Tools
+## Memory Behavior Model
 
-| Tool                    | Description                            |
-| ----------------------- | -------------------------------------- |
-| `pensyve_recall`        | Search memories by semantic similarity |
-| `pensyve_remember`      | Store a fact as semantic memory        |
-| `pensyve_observe`       | Record an event during an episode      |
-| `pensyve_episode_start` | Begin tracking an interaction          |
-| `pensyve_episode_end`   | Close an episode                       |
-| `pensyve_forget`        | Delete an entity's memories            |
-| `pensyve_inspect`       | List memories for an entity            |
+| Trigger | Action | MCP call |
+|---|---|---|
+| Before substantive answer | Recall by entity | `pensyve_recall(query, entity, types, limit=5)` |
+| Root cause confirmed | Capture episodic | `pensyve_observe(episode_id, content, source_entity="google-adk", about_entity)` |
+| Decision accepted | Capture semantic | `pensyve_remember(entity, fact, confidence=0.9)` |
+| Reusable workflow found | Capture procedural | `pensyve_observe(... content="[procedural] ...")` |
+| Session ending | Present candidates | User confirms before storage |
 
-See [MCP Tools Reference](https://pensyve.com/docs/api-reference/mcp-tools) for full parameter details.
+---
 
-## Intelligent Memory Capture
+## Memory Types
 
-Pensyve uses a tiered classification system to identify what is worth remembering. When connected to a Google ADK agent, the LLM follows the MCP tool descriptions to decide when and how to call memory tools.
+- **Semantic** — durable facts that remain true across sessions.
+- **Episodic** — what happened in this thread (outcomes, root causes, abandoned approaches).
+- **Procedural** — reusable workflows stored via `pensyve_observe` with a `[procedural]` prefix.
 
-### Tiered Capture System
+---
 
-- **Tier 1** (auto-store, confidence 0.9+): Explicit decisions, corrections, constraints, architecture choices, dependency version pins, security rules. High-signal items that should almost always be captured.
-- **Tier 2** (review, confidence 0.7-0.89): Root causes, failed approaches, performance findings, debugging outcomes, environment quirks. Medium-signal items that benefit from user confirmation.
-- **Discard**: Formatting, typos, boilerplate, ephemeral status messages. Noise that should never be stored.
+## Opt-Out
 
-### Best Practices
+To disable the substrate, remove the substrate content from `LlmAgent(instruction=...)`. The Pensyve MCP toolset can remain registered for direct tool use without the substrate reasoning layer.
 
-- Use `pensyve_observe` to record significant events during an episode (architecture decisions, failed approaches, key findings)
-- Use `pensyve_remember` for durable facts that should persist across sessions (project conventions, environment constraints, resolved issues)
-- Use `pensyve_recall` at the start of a task to load relevant context from prior sessions
-- Wrap multi-step work in `pensyve_episode_start` / `pensyve_episode_end` to capture episodic context
+---
 
-The MCP tool descriptions include guidance on confidence levels so the LLM can classify memories into the appropriate tier automatically.
+## Links
+
+- [Pensyve](https://pensyve.com) — managed memory service
+- [API Keys](https://pensyve.com/settings/api-keys)
+- [MCP Server docs](https://docs.pensyve.com/mcp)
+- [Google ADK docs](https://google.github.io/adk-docs/)
+
+## License
+
+Apache 2.0
