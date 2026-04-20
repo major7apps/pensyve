@@ -5,6 +5,36 @@ All notable changes to Pensyve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-04-20
+
+### Added
+
+- **Observation extractor** (PR #57): engine-side lift that turns raw user/agent turns into structured observations with content-type, entity, and provenance metadata. Phase 1 lift in `pensyve-core` + Phase 2 SDK bindings (Python/TypeScript). Integrated into the ingest hook and recall scoring so observations participate as first-class episodic memories alongside manually-authored content.
+- **Hybrid routing classifier** (Phase 3): `pensyve_recall` now routes queries between naive lexical scoring and a Haiku-backed classifier based on a learned routing signal. Benchmark reaches 89.2% on Phase 3 validation set. Shipped in the production managed service (Rust gateway on ECS) with `ANTHROPIC_API_KEY` in Secrets Manager; Pensyve-side costs cover extraction (~$0.0015/episode).
+- **Phase 4 Haiku query-routing classifier**: explicit routing decisions for harder queries; V2 reaches 79.7% on V7r-category questions after phase 4.3 calibration.
+- **Working-memory substrate** for all 21 Pensyve integrations (see per-integration CHANGELOGs for details; this is an integration-layer release reference, the core itself shipped no substrate-specific code — substrate lives in integration rule/prompt content).
+
+### Changed
+
+- Core crates (`pensyve-core`, `pensyve-mcp`, `pensyve-mcp-tools`, `pensyve-cli`, `pensyve-python`, `pensyve-wasm`), Python wheel (`pensyve`), TypeScript SDK (`@pensyve/sdk`), and internal crates (`pensyve-benchmarks`, `pensyve-mcp-gateway`) all bumped to 1.3.0 together.
+- `MemoryRecord` / recall response shape extended with observation-extracted fields (backward compatible — new optional fields).
+
+### Fixed
+
+- PR #57 review follow-ups: observation-extractor edge cases around empty content, extraction latency guarding, and Rust lint cleanliness (2 rounds).
+
+### Backward Compatibility
+
+- SDK callers using `pensyve_recall` see richer scoring without code changes.
+- Existing serialized memories remain readable — no schema migration required.
+- `pensyve-mcp-tools/src/params.rs` MCP contract is unchanged (still no `related_entities`, no `continuation_of`; `source_entity` + `about_entity` still required on `pensyve_observe`).
+
+### Unchanged from 1.2.x
+
+- MCP tool surface (same 8 tools: `pensyve_recall`, `pensyve_remember`, `pensyve_observe`, `pensyve_episode_start`, `pensyve_episode_end`, `pensyve_inspect`, `pensyve_forget`, `pensyve_status`).
+- Storage format (SQLite and Postgres schemas unchanged).
+- Claude Code plugin shipped its own v1.3.0 (working-memory substrate) independently via `integrations/claude-code/CHANGELOG.md` — that release is plugin-only and unrelated to this core release's feature set.
+
 ## [1.3.0] - 2026-04-18 (Claude Code plugin only)
 
 ### Added
