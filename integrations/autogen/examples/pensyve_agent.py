@@ -24,10 +24,9 @@ from pathlib import Path
 
 # autogen-ext provides MCP integration adapters
 from autogen_agentchat.agents import AssistantAgent
-from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_agentchat.ui import Console
-from autogen_ext.tools.mcp import McpWorkbench, StreamableHttpServerParams
 from autogen_ext.models.anthropic import AnthropicChatCompletionClient
+from autogen_ext.tools.mcp import McpWorkbench, StreamableHttpServerParams
 
 # ---------------------------------------------------------------------------
 # 1. Load the substrate — the reasoning layer injected as the system prompt.
