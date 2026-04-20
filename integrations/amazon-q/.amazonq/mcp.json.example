@@ -1,0 +1,14 @@
+{
+  "_comment": "Pensyve MCP configuration for Amazon Q Developer. Copy to .amazonq/mcp.json in your project root or home directory. Choose Cloud or Local below.",
+
+  "mcpServers": {
+    "pensyve": {
+      "_comment_cloud": "Cloud (recommended) — requires PENSYVE_API_KEY env var. Get a key at https://pensyve.com/settings/api-keys",
+      "type": "http",
+      "url": "https://mcp.pensyve.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${PENSYVE_API_KEY}"
+      }
+    }
+  }
+}

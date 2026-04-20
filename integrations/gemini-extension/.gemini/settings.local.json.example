@@ -1,0 +1,14 @@
+{
+  "_comment": "Local (offline) Pensyve MCP configuration for Gemini CLI. No API key needed — all data stays on your machine. Build from source: cargo build --release -p pensyve-mcp",
+
+  "mcpServers": {
+    "pensyve": {
+      "command": "pensyve-mcp",
+      "args": ["--stdio"],
+      "env": {
+        "PENSYVE_PATH": "~/.pensyve/",
+        "PENSYVE_NAMESPACE": "default"
+      }
+    }
+  }
+}

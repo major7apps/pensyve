@@ -1,0 +1,23 @@
+# Continue config.yaml — Pensyve MCP server configuration
+# Merge this fragment into your ~/.continue/config.yaml
+
+# Cloud (recommended) — requires PENSYVE_API_KEY env var
+mcpServers:
+  - name: pensyve
+    transport:
+      type: streamable-http
+      url: https://mcp.pensyve.com/mcp
+      headers:
+        Authorization: "Bearer ${PENSYVE_API_KEY}"
+
+# Local (offline) — uncomment to use local stdio server instead
+# mcpServers:
+#   - name: pensyve
+#     transport:
+#       type: stdio
+#       command: pensyve-mcp
+#       args:
+#         - --stdio
+#       env:
+#         PENSYVE_PATH: ~/.pensyve/
+#         PENSYVE_NAMESPACE: default

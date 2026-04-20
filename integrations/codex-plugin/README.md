@@ -1,150 +1,138 @@
-# Pensyve -- Persistent Memory for OpenAI Codex CLI
+# Pensyve for OpenAI Codex CLI
 
-Pensyve gives Codex a persistent, cognitive memory layer that spans across sessions. Your agent remembers decisions, learned patterns, debugging outcomes, and project context -- so you never repeat the same investigation twice and every session starts with the full picture.
+Persistent working-memory substrate for the [OpenAI Codex CLI](https://github.com/openai/codex) — memory is not a feature you invoke, it is the substrate the agent operates on.
 
-> **Note:** This plugin is not published to the Codex Plugin Directory. Install it manually using the instructions below.
+## What It Does
+
+- **Proactive memory during work** — lessons are captured the moment they land, not at session end
+- **Thread-aware continuity** — sessions that continue prior work resume with relevant context, no re-briefing
+- **Entity-scoped recall** — substantive questions are grounded in prior decisions; simple commands stay fast
+- **Three memory types** — durable facts (semantic), session-specific events (episodic), reusable procedures (procedural)
+- **Lightly visible** — one-line surfaces when memory is used; never interrupts your flow
 
 ## Install
 
-### Project-level (recommended)
+Two steps: configure the MCP server, then install the instructions file.
 
-Copy the plugin into your project's plugin directory and register it in a local marketplace file:
+### 1. Configure the MCP server
+
+Copy `.agents/mcp.json.example` to `.agents/mcp.json` in your project root and edit for your setup.
+
+**Cloud with API key (recommended):**
 
 ```bash
-mkdir -p .agents/plugins/pensyve
-cp -r /path/to/pensyve/integrations/codex-plugin/* .agents/plugins/pensyve/
+export PENSYVE_API_KEY="psy_your_key_here"
 ```
-
-Create or update `.agents/plugins/marketplace.json`:
 
 ```json
 {
-  "name": "local-plugins",
-  "interface": {
-    "displayName": "Local Plugins"
-  },
-  "plugins": [
-    {
-      "name": "pensyve",
-      "source": {
-        "source": "local",
-        "path": "./pensyve"
-      },
-      "policy": {
-        "installation": "INSTALLED_BY_DEFAULT"
-      },
-      "category": "Productivity"
+  "mcpServers": {
+    "pensyve": {
+      "type": "http",
+      "url": "https://mcp.pensyve.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${PENSYVE_API_KEY}"
+      }
     }
-  ]
-}
-```
-
-### User-level (all projects)
-
-```bash
-mkdir -p ~/.codex/plugins/pensyve
-cp -r /path/to/pensyve/integrations/codex-plugin/* ~/.codex/plugins/pensyve/
-```
-
-Then add a matching entry in `~/.agents/plugins/marketplace.json`.
-
-## Connect to Pensyve
-
-The plugin needs a Pensyve API key. The MCP server is pre-configured for Pensyve Cloud -- once your key is set, you're ready to go.
-
-**Option A** -- environment variable (recommended):
-
-```bash
-export PENSYVE_API_KEY="psy_..."
-```
-
-Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
-
-**Option B** -- self-hosted (local-only, no API key needed):
-
-1. Build the MCP binary:
-   ```bash
-   git clone https://github.com/major7apps/pensyve
-   cd pensyve && cargo build --release -p pensyve-mcp
-   ```
-2. Create a `.mcp.json` file in the plugin root pointing to the local binary, or override in your Codex settings.
-
-Get an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
-
-## Authentication
-
-The plugin uses OAuth for authentication. When you first connect, your browser opens automatically to sign in at pensyve.com. No API key needed.
-
-### Alternative: API Key
-
-For CI or manual auth, use `claude mcp add-json` (or equivalent):
-
-```json
-{
-  "type": "http",
-  "url": "https://mcp.pensyve.com/mcp",
-  "headers": {
-    "Authorization": "Bearer ${PENSYVE_API_KEY}"
   }
 }
 ```
 
-Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
+Create your key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys). Put the `export` in `~/.bashrc` or `~/.zshrc` to persist.
 
-## Intelligent Memory Capture (v1.1.0)
+**Local (offline, self-hosted):**
 
-Pensyve uses a tiered classification system to identify what is worth remembering:
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "command": "pensyve-mcp",
+      "args": ["--stdio"],
+      "env": {
+        "PENSYVE_PATH": "~/.pensyve/",
+        "PENSYVE_NAMESPACE": "default"
+      }
+    }
+  }
+}
+```
 
-- **Tier 1** (auto-store, confidence 0.9+): Explicit decisions, corrections, constraints -- high-signal items that should almost always be captured
-- **Tier 2** (batch review, confidence 0.7-0.89): Root causes, failed approaches, performance findings -- medium-signal items that benefit from user confirmation
-- **Discard**: Formatting, typos, boilerplate -- noise that should never be stored
+Build the binary: `cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
 
-The Stop hook processes buffered observations from the session and classifies them using this taxonomy before presenting candidates for storage.
+### 2. Install the instructions file
 
-## Skills
+Copy `AGENTS.md` to your project root (Codex CLI loads `AGENTS.md` automatically as its agent instruction file):
 
-| Skill                      | When to Use                     | What It Does                                                                                                                                        |
-| -------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `session-memory`           | End of a work session           | Classifies session signals using tiered taxonomy. Presents tier 1 and tier 2 candidates for confirmation. Stores approved items with provenance.    |
-| `memory-informed-refactor` | Before refactoring a module     | Queries memory for past decisions, failures, and patterns related to the target. Compiles a briefing with recommendations. Offers episode tracking. |
-| `context-loader`           | Session start or context switch | Loads relevant memories to prime the session. Summary mode (10-15 lines) or full mode (tables with scores). Fast and non-blocking.                  |
-| `memory-review`            | Periodic hygiene check          | Audits memory health: stale entries, contradictions, low-confidence items, consolidation candidates. Offers cleanup actions with user confirmation. |
+```bash
+cp /path/to/pensyve/integrations/codex-plugin/AGENTS.md .
+```
 
-## Hooks
+Codex CLI automatically loads `AGENTS.md` from the project root into every agent context.
 
-| Event          | Behavior                                                                                              |
-| -------------- | ----------------------------------------------------------------------------------------------------- |
-| `SessionStart` | Loads relevant memories at session start (configurable: off/summary/full)                             |
-| `Stop`         | Classifies buffered signals using tiered taxonomy, presents candidates for review, stores with provenance |
+**Note:** All 8 substrate rules are consolidated into a single `AGENTS.md` with clear section headings — same approach as the VS Code Copilot adapter.
+
+## How It Works
+
+Codex CLI has no hook/event surface, so the entire substrate is delivered through `AGENTS.md`. The Memory Reflex Rule section establishes the discipline: *before substantive answers, recall by entity; when a lesson lands, observe immediately with a one-line surface*. Flow sections (When Debugging, When Designing, When Refactoring, Longitudinal Work) guide the model through consult-memory + capture-lesson steps.
+
+**Episode lifecycle:** Codex CLI has no session-start/session-end hooks, so episodes open lazily on the first `pensyve_observe` call and are not explicitly closed under normal operation. Server-side consolidation handles aging.
+
+**Continuity primer:** The Context Loader section runs a best-effort recall at the start of substantive conversations to surface prior relevant observations.
+
+## Memory Behavior Model
+
+Pensyve behaves as working memory for the agent — always-on, ambient, continuous.
+
+**Writes happen in-flight.** When a root cause is confirmed, a decision is made, or a reusable procedure emerges, it's captured the moment it lands via the memory reflex. No batching to session end.
+
+**Reads happen at decision points.** Before substantive answers, the model consults memory scoped to the detected entities. Simple commands (run tests, format file) skip recall to stay fast.
+
+**Sessions continue.** At the start of a substantive conversation, Pensyve checks whether the current work continues prior memories (shared entities + recent activity). If yes, you resume with a primer — no re-briefing needed.
+
+## Memory Types
+
+| Type | Definition | MCP call | Example |
+|---|---|---|---|
+| **Semantic** | Durable truths, decisions, preferences | `pensyve_remember` | "We chose RS256 over HS256 for JWT signing" |
+| **Episodic** | Temporal events, session-scoped observations | `pensyve_observe` (with lazy-opened `episode_id`) | "Phase-3 regression root cause: hybrid-router threshold" |
+| **Procedural** | Reusable workflows, sequences, recipes | `pensyve_observe` with `[procedural]` content prefix | "To calibrate V7r: freeze Haiku config, run suite, diff baseline" |
+
+## Opt-Out
+
+Codex CLI's native pattern is to edit or delete `AGENTS.md`:
+
+- **Full opt-out** — delete `AGENTS.md` from your project root
+- **Partial opt-out** — delete specific sections from the file (e.g., remove the "Longitudinal Work" section if you don't do research work)
+- **Silent mode** — edit the Memory Reflex Rule section to remove the "one-line surface" guidance; captures stay silent
+- **Recall-only mode** — edit flow sections to drop the `Capture lesson` steps while keeping `Consult memory`
 
 ## Available MCP Tools
 
-All tools connect to the Pensyve API via MCP. The plugin never bypasses MCP to access storage directly.
+| Tool | Description |
+|---|---|
+| `pensyve_recall` | Search memories by semantic similarity |
+| `pensyve_remember` | Store a durable fact (semantic memory) |
+| `pensyve_observe` | Record a session observation (episodic / procedural via `[procedural]` prefix) |
+| `pensyve_episode_start` | Begin tracking an episode |
+| `pensyve_episode_end` | Close an episode with outcome |
+| `pensyve_forget` | Delete an entity's memories |
+| `pensyve_inspect` | List memories for an entity |
 
-| Tool                    | Parameters                                                                | Returns                                        |
-| ----------------------- | ------------------------------------------------------------------------- | ---------------------------------------------- |
-| `pensyve_recall`        | `query`, `entity?`, `types?`, `limit?`                                    | Ranked array of memories with relevance scores |
-| `pensyve_remember`      | `entity`, `fact`, `confidence?`                                           | Stored memory object                           |
-| `pensyve_observe`       | `episode_id`, `content`, `source_entity`, `about_entity`, `content_type?` | Stored episodic memory object                  |
-| `pensyve_episode_start` | `participants`                                                            | `episode_id`, `started_at`                     |
-| `pensyve_episode_end`   | `episode_id`, `outcome?`                                                  | `memories_created` count                       |
-| `pensyve_forget`        | `entity`, `hard_delete?`                                                  | `forgotten_count`                              |
-| `pensyve_inspect`       | `entity`, `memory_type?`, `limit?`                                        | Array of memories with stats                   |
+See [MCP Tools Reference](https://pensyve.com/docs/api-reference/mcp-tools) for full parameter details.
 
 ## Design Philosophy
 
-- **Your agent gets smarter over time** -- decisions, outcomes, and patterns compound across sessions
-- **Always asks, never assumes** -- no memory is stored without explicit user confirmation
-- **Cloud-native** -- all memory is stored in Pensyve Cloud, accessible from any machine
-- **MCP-native** -- all tools communicate via the Model Context Protocol, no proprietary wiring
-- **Privacy-first** -- memories are scoped to your namespace and encrypted at rest
+- **Memory as substrate** — not a feature the user invokes; always there, continuous, carried across sessions
+- **Reasoning-layer only** — no platform-layer code in v1; the entire adapter is the `AGENTS.md` file
+- **1:1 with Claude Code** — same skill structure, same conventions, same memory types
+- **MCP contract-respecting** — every rule's call examples verified against `pensyve-mcp-tools/src/params.rs`
+- **Single-file delivery** — Codex CLI's `AGENTS.md` is a single file; all 8 rules consolidated with clear section headings
 
 ## Links
 
 - **Website:** [pensyve.com](https://pensyve.com)
-- **Docs:** [pensyve.com/docs](https://pensyve.com/docs)
 - **GitHub:** [github.com/major7apps/pensyve](https://github.com/major7apps/pensyve)
-- **API Keys:** [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys)
+- **Spec:** [Working-memory substrate design](https://github.com/major7apps/pensyve-docs/blob/main/specs/2026-04-18-pensyve-working-memory-substrate-design.md)
 
 ## License
 

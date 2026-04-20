@@ -1,139 +1,122 @@
 # @pensyve/langchain
 
-Pensyve memory store for LangChain.js / LangGraph.js. Implements the `BaseStore` interface (`put` / `get` / `search` / `delete`) backed by Pensyve's 8-signal fusion retrieval engine.
+Persistent AI memory for [LangChain.js](https://js.langchain.com/) / [LangGraph.js](https://langchain-ai.github.io/langgraphjs/) agents via Pensyve. Two complementary features:
 
-## Authentication
+1. **Working-memory substrate** — A system-prompt document (`SUBSTRATE_PROMPT.md`) that gives your LangGraph.js agent the reasoning discipline to recall before answering and capture lessons as they land.
+2. **Memory store backend** — `PensyveStore`: a drop-in `BaseStore`-compatible backend backed by Pensyve's 8-signal fusion retrieval engine.
 
-```typescript
-import { PensyveStore } from "@pensyve/langchain";
+---
 
-// Explicit API key
-const store = new PensyveStore({ apiKey: "psy_your_key_here" });
+## What It Does
 
-// Or from environment variable
-// export PENSYVE_API_KEY="psy_your_key_here"
-const store = new PensyveStore();
+The working-memory substrate is a reasoning layer — not a library — that you load into your agent's system prompt. Once loaded, the agent will:
+
+- **Recall before substantive answers** using `pensyve_recall`, scoped by entity.
+- **Capture lessons in-flight** using `pensyve_observe` when a root cause is confirmed, a decision lands, or an approach is abandoned.
+- **Manage episode lifecycle** lazily: open an episode on the first observe, reuse it throughout the conversation.
+- **Surface memory lightly** — one line per recall or capture, never narrating empty recalls.
+- **Wrap up sessions** by presenting memory candidates for user confirmation before storage.
+
+---
+
+## Install
+
+```bash
+bun add @langchain/anthropic @langchain/langgraph @langchain/mcp-adapters
+
+# Memory store backend (optional — separate from the substrate)
+bun add @pensyve/langchain
+```
+
+Set your API key:
+
+```bash
+export PENSYVE_API_KEY="psy_your_key_here"
+export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
 Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
 
-## Installation
-
-```bash
-bun add @pensyve/langchain
-# or
-npm install @pensyve/langchain
-```
+---
 
 ## Quick Start
 
-```typescript
-import { PensyveStore } from "@pensyve/langchain";
-
-const store = new PensyveStore();
-
-// Store memories
-await store.put(["user_123", "memories"], "pref-1", { text: "likes dark mode" });
-await store.put(["user_123", "memories"], "pref-2", { text: "prefers TypeScript" });
-
-// Search by semantic query
-const items = await store.search(["user_123", "memories"], { query: "color preferences" });
-for (const item of items) {
-  console.log(`${item.key}: ${JSON.stringify(item.value)}`);
-}
-
-// Get by exact key
-const item = await store.get(["user_123", "memories"], "pref-1");
-console.log(item?.value); // { text: "likes dark mode" }
-
-// Delete
-await store.delete(["user_123", "memories"], "pref-1");
-```
-
-## Usage with LangGraph
-
-```typescript
-import { StateGraph, START, END } from "@langchain/langgraph";
-import { PensyveStore } from "@pensyve/langchain";
-
-const store = new PensyveStore();
-
-// Pre-populate some user preferences
-await store.put(["preferences"], "user-42", { theme: "dark", lang: "en" });
-
-async function myNode(state: any, { store }: { store: PensyveStore }) {
-  const prefs = await store.get(["preferences"], "user-42");
-  const theme = prefs?.value?.theme ?? "light";
-
-  await store.put(["user-42", "memories"], "last-query", { q: state.query });
-
-  return { response: `Using ${theme} theme` };
-}
-
-const builder = new StateGraph({ /* ... */ });
-builder.addNode("node", myNode);
-// ...
-const graph = builder.compile({ store });
-```
-
-## Local vs Cloud Mode
-
-The store auto-detects which mode to use:
-
-| Condition                     | Mode      | Backend                             |
-| ----------------------------- | --------- | ----------------------------------- |
-| No API key set                | **Local** | Pensyve local server (zero latency) |
-| `PENSYVE_API_KEY` env var set | **Cloud** | Pensyve REST API                    |
-| `apiKey` argument passed      | **Cloud** | Pensyve REST API                    |
-
-## API Reference
-
-### `new PensyveStore(config?)`
-
-| Option      | Type     | Default                   | Description                                      |
-| ----------- | -------- | ------------------------- | ------------------------------------------------ |
-| `namespace` | `string` | `"default"`               | Pensyve namespace for isolation                  |
-| `apiKey`    | `string` | `undefined`               | Cloud API key (falls back to `PENSYVE_API_KEY`)  |
-| `baseUrl`   | `string` | `https://api.pensyve.com` | Override cloud API URL                           |
-| `entity`    | `string` | `"langgraph-agent"`       | Default entity name for memories                 |
-
-### Methods
-
-| Method                                          | Description                             |
-| ----------------------------------------------- | --------------------------------------- |
-| `put(namespace, key, value)`                    | Store a value under namespace/key       |
-| `get(namespace, key)`                           | Get a single item by key, or `null`     |
-| `search(namespace, { query, filter?, limit? })` | Semantic search within a namespace      |
-| `delete(namespace, key)`                        | Delete a specific item                  |
-
-## Intelligent Memory Capture
-
-The `PensyveCaptureHandler` is a LangChain.js callback handler that automatically
-captures decisions, errors, and tool outputs during chain execution. Signals are
-classified into tiers:
-
-- **Tier 1** — high-confidence memories (architecture decisions, constraints) are auto-stored
-- **Tier 2** — lower-confidence candidates (root causes, failed approaches) are held for review
-
-```typescript
-import { PensyveCaptureHandler } from "@pensyve/langchain/capture-handler";
-
-const handler = new PensyveCaptureHandler(client);
-
-// Attach to any chain
-const result = await chain.invoke(inputs, { callbacks: [handler] });
-
-// Review tier 2 candidates after execution
-for (const mem of handler.getPendingReview()) {
-  console.log(`[review] ${mem.fact} (confidence=${mem.confidence})`);
-}
-
-handler.clearPendingReview();
-```
-
-## Running Tests
-
 ```bash
 cd integrations/langchain-ts
-bun test
+bun run examples/pensyve-agent.ts
 ```
+
+The example connects a LangGraph.js ReAct agent to the Pensyve MCP server and loads `SUBSTRATE_PROMPT.md` as the system prompt.
+
+---
+
+## System Prompt
+
+`SUBSTRATE_PROMPT.md` consolidates all eight substrate rules into a single document. Load it into your agent:
+
+```typescript
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { createReactAgent } from "@langchain/langgraph/prebuilt";
+
+const substrate = readFileSync(join(__dirname, "SUBSTRATE_PROMPT.md"), "utf-8");
+const agent = createReactAgent({ llm, tools, prompt: substrate });
+```
+
+---
+
+## MCP Connection
+
+```typescript
+import { MultiServerMCPClient } from "@langchain/mcp-adapters";
+
+const client = new MultiServerMCPClient({
+  pensyve: {
+    transport: "streamable_http",
+    url: "https://mcp.pensyve.com/mcp",
+    headers: { Authorization: `Bearer ${process.env.PENSYVE_API_KEY}` },
+  },
+});
+const tools = await client.getTools();
+// ... use agent, then:
+await client.close();
+```
+
+---
+
+## Memory Behavior Model
+
+| Trigger | Action | MCP call |
+|---|---|---|
+| Before substantive answer | Recall by entity | `pensyve_recall(query, entity, types, limit=5)` |
+| Root cause confirmed | Capture episodic | `pensyve_observe(episode_id, content, source_entity="langchain-ts", about_entity)` |
+| Decision accepted | Capture semantic | `pensyve_remember(entity, fact, confidence=0.9)` |
+| Reusable workflow found | Capture procedural | `pensyve_observe(... content="[procedural] ...")` |
+| Session ending | Present candidates | User confirms before storage |
+
+---
+
+## Memory Types
+
+- **Semantic** — durable facts that remain true across sessions.
+- **Episodic** — what happened in this thread (outcomes, root causes, abandoned approaches).
+- **Procedural** — reusable workflows stored via `pensyve_observe` with a `[procedural]` prefix.
+
+---
+
+## Opt-Out
+
+To disable the substrate, remove `SUBSTRATE_PROMPT.md` from the agent's `prompt` argument. The `PensyveStore` backend is unaffected.
+
+---
+
+## Links
+
+- [Pensyve](https://pensyve.com) — managed memory service
+- [API Keys](https://pensyve.com/settings/api-keys)
+- [LangChain.js docs](https://js.langchain.com/)
+- [LangGraph.js docs](https://langchain-ai.github.io/langgraphjs/)
+
+## License
+
+Apache 2.0 — see [LICENSE](LICENSE).

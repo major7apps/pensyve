@@ -1,173 +1,136 @@
 # Pensyve CrewAI Integration
 
-Pensyve memory backend for CrewAI, providing persistent memory with 8-signal fusion retrieval.
+Persistent AI memory for [CrewAI](https://docs.crewai.com/) agents via Pensyve. Two complementary features:
 
-## Authentication
+1. **Working-memory substrate** — A system-prompt document (`SUBSTRATE_PROMPT.md`) that gives your CrewAI agents the reasoning discipline to recall before answering and capture lessons as they land.
+2. **Memory backend** — `PensyveCrewAIMemory`: a persistent memory provider backed by Pensyve's 8-signal fusion retrieval engine.
 
-```python
-from pensyve import PensyveClient
+---
 
-# Explicit API key
-client = PensyveClient(api_key="psy_your_key_here")
+## What It Does
 
-# Or from environment variable
-# export PENSYVE_API_KEY="psy_your_key_here"
-client = PensyveClient()
+The working-memory substrate is a reasoning layer — not a library — that you load into a CrewAI agent's `backstory`. Once loaded, the agent will:
+
+- **Recall before substantive answers** using `pensyve_recall`, scoped by entity.
+- **Capture lessons in-flight** using `pensyve_observe` when a root cause is confirmed, a decision lands, or an approach is abandoned.
+- **Manage episode lifecycle** lazily: open an episode on the first observe, reuse it throughout the conversation.
+- **Surface memory lightly** — one line per recall or capture, never narrating empty recalls.
+- **Wrap up sessions** by presenting memory candidates for user confirmation before storage.
+
+---
+
+## Install
+
+```bash
+pip install crewai crewai-tools langchain-anthropic
+```
+
+Set your API key:
+
+```bash
+export PENSYVE_API_KEY="psy_your_key_here"
+export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
 Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
 
-## Installation
-
-```bash
-pip install pensyve
-```
-
-Copy this directory into your project, or add it to your Python path.
+---
 
 ## Quick Start
 
-```python
-from pensyve_crewai import PensyveMemory
-
-memory = PensyveMemory(namespace="my-crew")
-
-# Store memories
-memory.remember("The API rate limit is 1000 requests per minute.")
-memory.remember("Authentication uses Bearer tokens.", metadata={"confidence": 0.95})
-
-# Search memories
-matches = memory.recall("What are our API limits?", limit=5)
-for m in matches:
-    print(f"[{m.score:.2f}] {m.record.content}")
-
-# Extract facts from unstructured text
-facts = memory.extract_memories("Meeting notes: We decided to migrate to Postgres. Deadline is Friday.")
-for fact in facts:
-    memory.remember(fact)
-```
-
-## Usage with CrewAI
-
-```python
-from pensyve_crewai import PensyveMemory
-from crewai import Crew
-
-memory = PensyveMemory(namespace="my-crew")
-crew = Crew(
-    agents=[...],
-    tasks=[...],
-    memory=True,
-    memory_config={"provider": "custom", "config": {"instance": memory}},
-)
-```
-
-## Local vs. Cloud Mode
-
-The integration auto-detects which backend to use:
-
-| Mode  | Trigger                                       | Backend                     |
-| ----- | --------------------------------------------- | --------------------------- |
-| Local | No API key set                                | Pensyve SDK (PyO3 + SQLite) |
-| Cloud | `PENSYVE_API_KEY` env var or `api_key=` param | Pensyve REST API            |
-
-```python
-# Local mode (default)
-memory = PensyveMemory(namespace="my-crew")
-
-# Cloud mode (explicit key)
-memory = PensyveMemory(namespace="my-crew", api_key="psy_...")
-
-# Cloud mode (env var)
-# export PENSYVE_API_KEY=psy_...
-memory = PensyveMemory(namespace="my-crew")
-
-# Check active mode
-print(memory.mode)  # "local" or "cloud"
-```
-
-## API
-
-### `PensyveMemory(namespace, entity_name, *, path, api_key, base_url)`
-
-| Parameter     | Type          | Default                     | Description                          |
-| ------------- | ------------- | --------------------------- | ------------------------------------ |
-| `namespace`   | `str`         | `"default"`                 | Pensyve namespace for isolation      |
-| `entity_name` | `str`         | `"crew-agent"`              | Entity name to scope memories to     |
-| `path`        | `str \| None` | `None`                      | Local storage path (local mode only) |
-| `api_key`     | `str \| None` | `None`                      | Cloud API key (overrides env var)    |
-| `base_url`    | `str`         | `"https://api.pensyve.com"` | Cloud API URL                        |
-
-### Methods
-
-| Method                          | Description                                  |
-| ------------------------------- | -------------------------------------------- |
-| `remember(text, metadata=None)` | Store a memory with optional metadata        |
-| `recall(query, limit=5)`        | Search memories, returns `list[MemoryMatch]` |
-| `extract_memories(text)`        | Split text into individual facts (no LLM)    |
-| `reset()`                       | Clear all memories for this entity           |
-
-### Result Types
-
-```python
-@dataclass
-class MemoryMatch:
-    score: float          # Relevance score (0.0 - 1.0)
-    record: MemoryRecord  # The stored memory
-
-@dataclass
-class MemoryRecord:
-    content: str                    # Memory text
-    metadata: dict[str, Any] = {}   # Additional metadata
-```
-
-## Intelligent Capture (v1.1.0+)
-
-Automatically capture decisions, preferences, and findings from CrewAI task execution into Pensyve memory.
-
-```python
-from pensyve_crewai import PensyveMemory, PensyveCaptureCallbacks
-
-memory = PensyveMemory(namespace="my-crew")
-capture = PensyveCaptureCallbacks(memory=memory)
-
-# Wire into CrewAI
-from crewai import Crew
-crew = Crew(
-    agents=[...],
-    tasks=[...],
-    memory=True,
-    memory_config={"provider": "custom", "config": {"instance": memory}},
-    callbacks=[capture],
-)
-```
-
-### How It Works
-
-- **Task start/end** and **tool use** events are buffered as raw signals
-- At each task end, signals are classified into tiered memory candidates:
-  - **Tier 1** (auto-stored): architecture decisions, behavioral preferences, project constraints
-  - **Tier 2** (review): root causes, failed approaches, performance findings, dependencies
-- Secrets are automatically redacted; long code blocks are stripped
-- Capture **never breaks** CrewAI execution (all callbacks fail silently)
-
-### Reviewing Tier-2 Candidates
-
-```python
-# After crew execution
-pending = capture.get_pending_review()
-for candidate in pending:
-    print(f"[tier {candidate.tier}] {candidate.entity}: {candidate.fact}")
-    # Manually approve:
-    memory.remember(candidate.fact, metadata={"confidence": candidate.confidence})
-
-capture.clear_pending_review()
-```
-
-## Running Tests
-
 ```bash
 cd integrations/crewai
-pip install pytest
-pytest tests/ -v
+python examples/pensyve_crew.py
 ```
+
+The example creates a CrewAI `Agent` with Pensyve MCP tools from `MCPServerAdapter` and `SUBSTRATE_PROMPT.md` as the `backstory`.
+
+---
+
+## System Prompt
+
+`SUBSTRATE_PROMPT.md` consolidates all eight substrate rules into a single document. In CrewAI, the `backstory` field is the closest equivalent to a per-agent system prompt:
+
+```python
+from pathlib import Path
+from crewai import Agent
+
+substrate = Path("SUBSTRATE_PROMPT.md").read_text()
+agent = Agent(
+    role="Memory-Augmented Developer",
+    goal="Answer questions grounded in prior project knowledge.",
+    backstory=substrate,
+    tools=pensyve_tools,
+    llm=llm,
+)
+```
+
+---
+
+## MCP Connection
+
+```python
+from crewai_tools import MCPServerAdapter
+
+pensyve_server_config = {
+    "url": "https://mcp.pensyve.com/mcp",
+    "transport": "streamable_http",
+    "headers": {"Authorization": f"Bearer {os.environ['PENSYVE_API_KEY']}"},
+}
+
+with MCPServerAdapter(pensyve_server_config) as mcp_adapter:
+    pensyve_tools = mcp_adapter.tools
+    # Build agents and crew...
+```
+
+---
+
+## Memory Behavior Model
+
+| Trigger | Action | MCP call |
+|---|---|---|
+| Before substantive answer | Recall by entity | `pensyve_recall(query, entity, types, limit=5)` |
+| Root cause confirmed | Capture episodic | `pensyve_observe(episode_id, content, source_entity="crewai", about_entity)` |
+| Decision accepted | Capture semantic | `pensyve_remember(entity, fact, confidence=0.9)` |
+| Reusable workflow found | Capture procedural | `pensyve_observe(... content="[procedural] ...")` |
+| Session ending | Present candidates | User confirms before storage |
+
+---
+
+## Memory Types
+
+- **Semantic** — durable facts that remain true across sessions.
+- **Episodic** — what happened in this thread (outcomes, root causes, abandoned approaches).
+- **Procedural** — reusable workflows stored via `pensyve_observe` with a `[procedural]` prefix.
+
+---
+
+## Memory Backend
+
+Separate from the substrate, `PensyveCrewAIMemory` provides persistent memory storage:
+
+```python
+from pensyve_crewai import PensyveCrewAIMemory
+
+memory = PensyveCrewAIMemory()
+```
+
+See `pensyve_crewai.py` for the full API.
+
+---
+
+## Opt-Out
+
+To disable the substrate, remove the substrate content from the agent's `backstory`. The memory backend is unaffected.
+
+---
+
+## Links
+
+- [Pensyve](https://pensyve.com) — managed memory service
+- [API Keys](https://pensyve.com/settings/api-keys)
+- [CrewAI docs](https://docs.crewai.com/)
+
+## License
+
+Apache 2.0 — see [LICENSE](LICENSE).

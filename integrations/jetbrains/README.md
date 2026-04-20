@@ -2,7 +2,7 @@
 
 Persistent AI memory for [JetBrains AI Assistant](https://www.jetbrains.com/ai/) via MCP. Gives your JetBrains IDE (IntelliJ IDEA, PyCharm, WebStorm, etc.) cross-session memory so the AI assistant remembers your project conventions, architecture decisions, and debugging history.
 
-> **Status:** Scaffold — MCP configuration and documentation. Full integration planned.
+> **Status:** Working-memory substrate v1.0.0 — MCP configuration, instruction files, and documentation. Full plugin integration planned.
 
 ## Authentication
 
@@ -98,3 +98,74 @@ Pensyve uses a tiered classification system to identify what is worth rememberin
 - Wrap multi-step work in `pensyve_episode_start` / `pensyve_episode_end` to capture episodic context
 
 The MCP tool descriptions include guidance on confidence levels so the LLM can classify memories into the appropriate tier automatically.
+
+## Memory Behavior Model
+
+The working-memory substrate defines how JetBrains AI Assistant should behave across coding sessions when Pensyve is connected. It is documented in the [`instructions/`](./instructions/) directory as 8 rule files:
+
+| Rule file | Behavior |
+| --------- | -------- |
+| `memory-reflex.md` | Non-optional reasoning discipline — recall before substantive answers, observe when lessons land. Always active. |
+| `entity-detection.md` | Canonicalization rules for extracting entity names from file paths, prompts, and code context. Always active. |
+| `memory-informed-debug.md` | Debug flow: recall prior incidents and procedures, capture root causes the moment they are confirmed. |
+| `memory-informed-design.md` | Design/architecture flow: recall prior decisions, flag contradictions, capture new decisions on acceptance. |
+| `memory-informed-refactor.md` | Refactor flow: briefing from prior memory, capture invariants and abandoned approaches as they surface. |
+| `memory-informed-longitudinal-work.md` | Multi-session research/eval flow: resume context at session start, capture per-run outcomes and open questions. |
+| `session-memory.md` | Manual wrap-up: review the conversation for residual lessons not captured in-flight, confirm with user before storing. |
+| `context-loader.md` | Session continuity primer: recall recent episodic memories at conversation start to surface relevant context. |
+
+### How to configure JetBrains AI Assistant with these instructions
+
+JetBrains AI Assistant reads context files you configure in **Settings → AI Assistant → Context**. Reference the `instructions/*.md` files there, or copy their contents into a combined context document for the AI assistant to use as its system prompt.
+
+### MCP config
+
+Copy `jetbrains-mcp.json.example` to the JetBrains MCP servers configuration (**Settings → AI Assistant → MCP Servers**) and edit for your setup.
+
+**Cloud with API key (recommended):**
+
+```bash
+export PENSYVE_API_KEY="psy_your_key_here"
+```
+
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "type": "http",
+      "url": "https://mcp.pensyve.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${PENSYVE_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+**Local (offline, self-hosted):**
+
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "command": "pensyve-mcp",
+      "args": ["--stdio"],
+      "env": {
+        "PENSYVE_PATH": "~/.pensyve/",
+        "PENSYVE_NAMESPACE": "default"
+      }
+    }
+  }
+}
+```
+
+### MCP tool schema
+
+All substrate rules use the correct MCP contract:
+
+- `pensyve_recall(query, entity?, types?, limit?, min_confidence?)`
+- `pensyve_episode_start(participants)`
+- `pensyve_observe(episode_id, content, source_entity, about_entity, content_type?)`
+- `pensyve_inspect(entity, memory_type?, limit?)`
+
+`source_entity` is `"jetbrains"` in all substrate rule examples. Run `scripts/lint-mcp-refs.sh` to verify the rule files conform to the schema.
