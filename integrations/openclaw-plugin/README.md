@@ -1,57 +1,86 @@
 # @pensyve/openclaw-pensyve
 
-Memory plugin for OpenClaw. Replaces the default `memory-core` with Pensyve's persistent, cross-session memory backed by 8-signal fusion retrieval.
+Persistent working-memory substrate for [OpenClaw](https://github.com/openclaw/openclaw) — memory is not a feature you invoke, it is the substrate the agent operates on.
 
-## Features
+Replaces the default `memory-core` with Pensyve's persistent, cross-session memory backed by 8-signal fusion retrieval, and extends it with the full working-memory substrate (proactive in-flight capture, entity-scoped recall, procedural memory, episodic threading).
 
-- **Auto-Recall** -- relevant memories injected before each turn via `before_prompt_build` hook
-- **Auto-Capture** -- conversation context stored after each turn via `after_agent_response` hook
-- **5 Agent Tools** -- `memory_recall`, `memory_store`, `memory_get`, `memory_forget`, `memory_status`
-- **CLI Commands** -- `openclaw pensyve search <query>`, `openclaw pensyve stats`
-- **Three Memory Types** -- episodic, semantic, and procedural
-- **8-Signal Fusion Retrieval** -- vector similarity + BM25 + graph traversal + cross-encoder reranker
+## What It Does
 
-## Authentication
+- **Proactive memory during work** — lessons are captured the moment they land, not at session end
+- **Thread-aware continuity** — sessions that continue prior work resume with relevant context, no re-briefing
+- **Entity-scoped recall** — substantive questions are grounded in prior decisions; simple commands stay fast
+- **Three memory types** — durable facts (semantic), session-specific events (episodic), reusable procedures (procedural)
+- **Lightly visible** — one-line surfaces when memory is used; never interrupts your flow
+- **Auto-Recall** — relevant memories injected before each turn via `before_prompt_build` hook
+- **Auto-Capture** — conversation context stored after each turn via `after_agent_response` hook
+- **5 Agent Tools** — `memory_recall`, `memory_store`, `memory_get`, `memory_forget`, `memory_status`
 
-1. Sign up at [pensyve.com](https://pensyve.com)
-2. Create an API key at [Settings → API Keys](https://pensyve.com/settings/api-keys)
-3. Set the environment variable:
-   ```bash
-   export PENSYVE_API_KEY="psy_your_key_here"
-   ```
+## Install
 
-Then configure MCP with headers (see setup instructions above).
+Two steps: configure the MCP server, then install the instructions file.
 
-## Prerequisites
+### 1. Configure the MCP server
 
-You need a Pensyve server. Choose one:
+Merge the following into your `openclaw.json`:
 
-**Pensyve Cloud** (recommended -- no setup):
-
-1. Sign up at [pensyve.com](https://pensyve.com) and create an API key
-2. Set the environment variable:
-   ```bash
-   export PENSYVE_API_KEY="psy_..."
-   ```
-
-**Pensyve Local** (self-hosted, offline-first):
+**Cloud with API key (recommended):**
 
 ```bash
-git clone https://github.com/major7apps/pensyve
-cd pensyve && cargo build --release -p pensyve-mcp
+export PENSYVE_API_KEY="psy_your_key_here"
 ```
 
-No API key needed -- all data stays on your machine in SQLite.
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "type": "http",
+      "url": "https://mcp.pensyve.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${PENSYVE_API_KEY}"
+      }
+    }
+  }
+}
+```
 
-## Installation
+A ready-to-use example is at `openclaw.mcp.json.example`. Create your key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys). Put the `export` in `~/.bashrc` or `~/.zshrc` to persist.
+
+**Local (offline, self-hosted):**
+
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "type": "stdio",
+      "command": "pensyve-mcp",
+      "args": ["--stdio"]
+    }
+  }
+}
+```
+
+Build the binary: `cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
+
+### 2. Install the instructions file
+
+Copy `AGENTS.md` to your project root (OpenClaw loads `AGENTS.md` automatically as its agent instruction file):
 
 ```bash
-# From the plugin directory
+cp /path/to/pensyve/integrations/openclaw-plugin/AGENTS.md .
+```
+
+**Note:** All 8 substrate rules are consolidated into a single `AGENTS.md` with clear section headings.
+
+### 3. (Optional) Enable the native plugin
+
+The native plugin provides auto-recall and auto-capture hooks on top of the substrate instructions. Build and enable:
+
+```bash
 cd /path/to/pensyve/integrations/openclaw-plugin
 npm install && npm run build
 ```
 
-Then add the plugin to your `openclaw.json`:
+Then add to your `openclaw.json`:
 
 ```json5
 // plugins.entries
@@ -75,85 +104,69 @@ Set Pensyve as the memory provider:
 "memory": "pensyve"
 ```
 
-For local-only mode, set `"baseUrl": "http://localhost:8000"` and omit the API key.
-
-## Configuration Reference
-
-| Option        | Type      | Default                   | Description                                |
-| ------------- | --------- | ------------------------- | ------------------------------------------ |
-| `baseUrl`     | `string`  | `https://mcp.pensyve.com` | Pensyve API URL                            |
-| `apiKey`      | `string`  | `$PENSYVE_API_KEY`        | API key for Pensyve Cloud                  |
-| `entity`      | `string`  | `openclaw-agent`          | Entity name for memory storage             |
-| `namespace`   | `string`  | `openclaw`                | Memory namespace for isolation             |
-| `autoRecall`  | `boolean` | `true`                    | Inject memories before each turn           |
-| `autoCapture` | `boolean` | `true`                    | Store conversation context after each turn |
-| `recallLimit` | `number`  | `5`                       | Max memories to recall per turn            |
-
-## Intelligent Memory Capture (v1.0.7)
-
-Pensyve uses a tiered classification system to identify what is worth remembering:
-
-- **Tier 1** (auto-store, confidence 0.9+): Explicit decisions, corrections, constraints -- high-signal items that should almost always be captured
-- **Tier 2** (batch review, confidence 0.7-0.89): Root causes, failed approaches, performance findings -- medium-signal items that benefit from user confirmation
-- **Discard**: Formatting, typos, boilerplate -- noise that should never be stored
-
-The auto-capture hook (`after_agent_response`) currently stores exchanges at tier 2 confidence. The `memory_store` tool description guides the agent to apply the appropriate confidence tier when storing facts explicitly. Future versions will integrate the shared memory-capture-core classifier for full tiered classification with signal buffering.
-
 ## How It Works
 
-### Auto-Recall (`before_prompt_build`)
+The substrate is delivered through `AGENTS.md`. The Memory Reflex Rule section establishes the discipline: *before substantive answers, recall by entity; when a lesson lands, observe immediately with a one-line surface*. Flow sections (When Debugging, When Designing, When Refactoring, Longitudinal Work) guide the model through consult-memory + capture-lesson steps.
 
-Before each agent turn, the plugin:
+When the native plugin is also enabled, the `before_prompt_build` hook injects top recalled memories before each turn and `after_agent_response` auto-captures substantive exchanges.
 
-1. Extracts the latest user message
-2. Queries Pensyve's recall endpoint with the message as the search query
-3. Receives ranked memories scored by 8-signal fusion
-4. Prepends the top results as context so the agent can reference prior sessions without explicit tool calls
+**Episode lifecycle:** Episodes open lazily on the first `pensyve_observe` call and are not explicitly closed under normal operation. Server-side consolidation handles aging.
 
-### Auto-Capture (`after_agent_response`)
+**Continuity primer:** The Context Loader section runs a best-effort recall at the start of substantive conversations to surface prior relevant observations.
 
-After each agent turn, the plugin:
+## Memory Behavior Model
 
-1. Extracts the user message and assistant response
-2. Creates a condensed episodic memory of the exchange
-3. Stores it via Pensyve with moderate confidence (0.7)
-4. Pensyve's FSRS-based forgetting curve naturally deprioritizes stale memories over time
+Pensyve behaves as working memory for the agent — always-on, ambient, continuous.
 
-### Agent Tools
+**Writes happen in-flight.** When a root cause is confirmed, a decision is made, or a reusable procedure emerges, it's captured the moment it lands via the memory reflex. No batching to session end.
 
-| Tool            | Description                                         |
-| --------------- | --------------------------------------------------- |
-| `memory_recall` | Semantic search across all memory types             |
-| `memory_store`  | Persist a fact with configurable confidence         |
-| `memory_get`    | List all stored memories for the current entity     |
-| `memory_forget` | Clear all memories (requires explicit confirmation) |
-| `memory_status` | Show connection status, memory counts, account info |
+**Reads happen at decision points.** Before substantive answers, the model consults memory scoped to the detected entities. Simple commands (run tests, format file) skip recall to stay fast.
 
-### CLI Commands
+**Sessions continue.** At the start of a substantive conversation, Pensyve checks whether the current work continues prior memories (shared entities + recent activity). If yes, you resume with a primer — no re-briefing needed.
 
-```bash
-openclaw pensyve search "JWT signing decision"
-openclaw pensyve stats
-```
+## Memory Types
 
-## Comparison with Default memory-core
+| Type | Definition | MCP call | Example |
+|---|---|---|---|
+| **Semantic** | Durable truths, decisions, preferences | `pensyve_remember` | "We chose RS256 over HS256 for JWT signing" |
+| **Episodic** | Temporal events, session-scoped observations | `pensyve_observe` (with lazy-opened `episode_id`) | "Phase-3 regression root cause: hybrid-router threshold" |
+| **Procedural** | Reusable workflows, sequences, recipes | `pensyve_observe` with `[procedural]` content prefix | "To calibrate V7r: freeze Haiku config, run suite, diff baseline" |
 
-| Feature                 | memory-core    | Pensyve                            |
-| ----------------------- | -------------- | ---------------------------------- |
-| Storage                 | Markdown files | SQLite + vector index              |
-| Search                  | BM25 only      | 8-signal fusion                    |
-| Memory types            | Flat text      | Episodic + Semantic + Procedural   |
-| Retrieval quality       | Keyword match  | Semantic + BM25 + graph + reranker |
-| Offline                 | Yes            | Yes                                |
-| Cross-encoder reranking | No             | Yes (BGE)                          |
-| Forgetting curve        | No             | FSRS-based                         |
+## Opt-Out
+
+- **Full opt-out** — delete `AGENTS.md` from your project root and disable the plugin in `openclaw.json`
+- **Partial opt-out** — delete specific sections from `AGENTS.md` (e.g., remove the "Longitudinal Work" section)
+- **Silent mode** — edit the Memory Reflex Rule section to remove the "one-line surface" guidance; captures stay silent
+- **Recall-only mode** — edit flow sections to drop the `Capture lesson` steps while keeping `Consult memory`
+
+## Available MCP Tools
+
+| Tool | Description |
+|---|---|
+| `pensyve_recall` | Search memories by semantic similarity |
+| `pensyve_remember` | Store a durable fact (semantic memory) |
+| `pensyve_observe` | Record a session observation (episodic / procedural via `[procedural]` prefix) |
+| `pensyve_episode_start` | Begin tracking an episode |
+| `pensyve_episode_end` | Close an episode with outcome |
+| `pensyve_forget` | Delete an entity's memories |
+| `pensyve_inspect` | List memories for an entity |
+
+See [MCP Tools Reference](https://pensyve.com/docs/api-reference/mcp-tools) for full parameter details.
+
+## Design Philosophy
+
+- **Memory as substrate** — not a feature the user invokes; always there, continuous, carried across sessions
+- **Reasoning-layer first** — `AGENTS.md` delivers the substrate even without the native plugin
+- **1:1 with Claude Code** — same skill structure, same conventions, same memory types
+- **MCP contract-respecting** — every rule's call examples verified against `pensyve-mcp-tools/src/params.rs`
+- **Single-file delivery** — all 8 rules consolidated into `AGENTS.md` with clear section headings
 
 ## Links
 
 - **Website:** [pensyve.com](https://pensyve.com)
-- **Docs:** [pensyve.com/docs](https://pensyve.com/docs)
 - **GitHub:** [github.com/major7apps/pensyve](https://github.com/major7apps/pensyve)
 - **API Keys:** [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys)
+- **Spec:** [Working-memory substrate design](https://github.com/major7apps/pensyve-docs/blob/main/specs/2026-04-18-pensyve-working-memory-substrate-design.md)
 
 ## License
 
