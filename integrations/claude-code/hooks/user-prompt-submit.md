@@ -6,7 +6,7 @@ event: UserPromptSubmit
 
 # User Prompt Submit Hook
 
-Fires when the user submits a prompt. Optionally enriches the prompt with relevant memory context from Pensyve. **Disabled by default** -- must be explicitly enabled via `prompt_enrichment: true` in `pensyve-plugin.local.md`.
+Fires when the user submits a prompt. Enriches the prompt with relevant memory context from Pensyve when the prompt warrants it. **Enabled by default** — opt out via `prompt_enrichment: false` in `pensyve-plugin.local.md`.
 
 ## Behavior
 
@@ -14,10 +14,10 @@ Fires when the user submits a prompt. Optionally enriches the prompt with releva
 
 Read `pensyve-plugin.local.md` for the `prompt_enrichment` setting:
 
-- **false** (default): Exit immediately. Do nothing.
-- **true**: Proceed with enrichment.
+- **false**: Exit immediately. Do nothing.
+- **true** (default): Proceed with enrichment.
 
-If the configuration file is not found or the setting is absent, treat as **false** and exit.
+If the configuration file is not found or the setting is absent, treat as **true** and proceed.
 
 ### Step 2: Analyze the Prompt
 
@@ -86,16 +86,22 @@ This hook runs on EVERY user prompt when enabled. It MUST be:
 - **Non-blocking**: If the MCP server is slow or unavailable, skip enrichment entirely
 - **Silent**: No user-visible output unless memories are injected as context
 
-## Why Disabled by Default
+## Why Guardrails Matter
 
-- Adds latency to every prompt
-- Can inject irrelevant context if memory quality is low
-- Users should build up a quality memory corpus first (via `/remember`, session-memory skill)
-- Power users enable this after they trust their stored memories
+This hook runs on every user prompt. The guardrails keep it useful, not annoying:
+
+- **<1s latency budget** — abandon if slow
+- **Heuristic prompt filter** — only recall when the prompt warrants it (see Step 2)
+- **Scored threshold** — only inject when score >0.3
+- **Entity-scoped recall** — avoid unrelated memory noise
+- **Silent on empty results** — no "no memories found" messages
+- **Max 5 memories** in any enrichment to avoid context bloat
+
+Users who prefer opt-in can set `prompt_enrichment: false` in `pensyve-plugin.local.md`.
 
 ## Constraints
 
-- **NEVER enabled by default.** Requires explicit opt-in via `prompt_enrichment: true`. This is a hard requirement.
+- **Default on.** Users opt out via `prompt_enrichment: false`. Guardrails (latency budget, scored threshold, prompt filter) ensure it remains useful.
 - **Never read or write `.claude/` memory files.** All memory operations go through the Pensyve MCP tools exclusively.
 - **Never show "no memories found" messages.** Fail silently on no results.
 - **Maximum 5 memories** in the enrichment context to avoid context bloat.

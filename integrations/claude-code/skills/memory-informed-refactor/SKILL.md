@@ -10,6 +10,8 @@ Load historical context from Pensyve memory before starting a refactor. Surfaces
 
 ## Instructions
 
+> This skill follows the memory reflex defined in `skills/shared/memory-reflex.md`. Recall before refactoring; observe when a refactor insight lands (abandoned approach, invariant discovered, regression cause).
+
 When this skill is invoked with a refactoring target, follow these steps:
 
 ### Step 1: Query Memory for Context
@@ -72,15 +74,20 @@ Organize the findings into a structured briefing. Deduplicate results that appea
 
 If no relevant memories are found for a section, omit that section entirely rather than showing an empty one. If no memories are found at all, say so clearly and proceed without historical context.
 
-### Step 4: Offer Episode Tracking
+### Step 4: Episode Tracking
 
-After presenting the briefing, offer to track the refactor as an episode:
+The current session's episode is already active (started by the SessionStart hook). This refactor's observations and any captured lessons will be part of that episode — no additional `pensyve_episode_start` call is needed.
 
-> Would you like me to track this refactor as an episode? This will let Pensyve capture the decisions and outcomes from this session for future reference.
->
-> If yes, I will call `pensyve_episode_start` with participants `["claude-code", "<target>"]`.
+### Capture refactor lessons as they land
 
-If the user accepts, call `pensyve_episode_start`. Remind the user to close the episode at the end of the refactor (or suggest using `/consolidate` or the session-memory skill).
+When any of these occur during the refactor, call the memory reflex immediately:
+
+- An invariant is discovered (semantic)
+- An abandoned approach is confirmed not-viable (episodic)
+- A dependency chain was traced that surprised us (episodic)
+- A known-good refactoring sequence emerged (procedural)
+
+Do not batch these to Stop — capture at landing, surface one-line.
 
 ## Constraints
 
@@ -96,4 +103,3 @@ If the user accepts, call `pensyve_episode_start`. Remind the user to close the 
 - If `pensyve_recall` returns errors on some queries, present results from the successful queries and note the failures.
 - If `pensyve_inspect` fails, skip the entity inspection and rely on recall results.
 - If the MCP server is not connected, inform the user and suggest checking their MCP server configuration.
-- If `pensyve_episode_start` fails when the user accepts tracking, report the error but do not block the refactor.
