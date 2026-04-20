@@ -1,0 +1,13 @@
+{
+  "_comment": "Pensyve MCP configuration for Gemini CLI. Copy to ~/.gemini/settings.json or your project's .gemini/settings.json. Choose Cloud or Local below.",
+
+  "mcpServers": {
+    "pensyve": {
+      "_comment_cloud": "Cloud (recommended) — requires PENSYVE_API_KEY env var. Get a key at https://pensyve.com/settings/api-keys",
+      "httpUrl": "https://mcp.pensyve.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${PENSYVE_API_KEY}"
+      }
+    }
+  }
+}

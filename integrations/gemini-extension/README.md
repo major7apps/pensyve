@@ -1,6 +1,14 @@
-# Pensyve -- Persistent Memory for Gemini CLI
+# Pensyve -- Persistent Working-Memory Substrate for Gemini CLI
 
-Pensyve gives Gemini CLI a persistent, cognitive memory layer that spans across sessions. It remembers your decisions, learned patterns, debugging outcomes, and project context -- so your agent never repeats the same investigation twice. Memory is stored in the cloud via the Pensyve managed service and accessed through the MCP protocol.
+Pensyve gives Gemini CLI a persistent, cognitive working-memory layer that spans across sessions. Memory is not a feature you invoke at session end — it is the substrate the agent operates on: proactive capture when lessons land, entity-scoped recall before substantive answers, and continuity across sessions. Memory is stored in the cloud via the Pensyve managed service and accessed through the MCP protocol.
+
+## What It Does
+
+- **Proactive memory during work** — lessons are captured the moment they land, not at session end
+- **Thread-aware continuity** — sessions that continue prior work resume with relevant context, no re-briefing
+- **Entity-scoped recall** — substantive questions are grounded in prior decisions; simple commands stay fast
+- **Three memory types** — durable facts (semantic), session-specific events (episodic), reusable procedures (procedural)
+- **Lightly visible** — one-line surfaces when memory is used; never interrupts your flow
 
 ## Install
 
@@ -18,7 +26,7 @@ gemini mcp add --transport http pensyve https://mcp.pensyve.com/mcp
 
 ### Connect to Pensyve
 
-The extension needs a Pensyve API key. Choose one method:
+The extension needs a Pensyve API key.
 
 **Option A** — environment variable (recommended):
 
@@ -36,16 +44,66 @@ gemini extensions configure pensyve
 
 Get an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
 
-## Authentication
+### MCP config via settings.json
 
-1. Sign up at [pensyve.com](https://pensyve.com)
-2. Create an API key at [Settings → API Keys](https://pensyve.com/settings/api-keys)
-3. Set the environment variable:
-   ```bash
-   export PENSYVE_API_KEY="psy_your_key_here"
-   ```
+Copy `.gemini/settings.json.example` to `~/.gemini/settings.json` or your project's `.gemini/settings.json`:
 
-Then configure MCP with headers (see setup instructions above).
+**Cloud (recommended):**
+
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "httpUrl": "https://mcp.pensyve.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${PENSYVE_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+**Local (offline):**
+
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "command": "pensyve-mcp",
+      "args": ["--stdio"],
+      "env": {
+        "PENSYVE_PATH": "~/.pensyve/",
+        "PENSYVE_NAMESPACE": "default"
+      }
+    }
+  }
+}
+```
+
+Build the binary: `cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
+
+## Context File
+
+The `GEMINI.md` context file is automatically loaded by Gemini CLI and delivers the working-memory substrate — all 8 behavioral rules consolidated into one file as sections:
+
+| Section | When it activates |
+|---|---|
+| **Part 1: Memory Reflex** | Always (establishes the reasoning discipline) |
+| **Part 2: Entity Detection** | Always (canonicalization reference) |
+| **Part 3: Memory-Informed Debug** | When diagnosing bugs, errors, failing tests, crashes |
+| **Part 4: Memory-Informed Design** | When making architecture, API, or design decisions |
+| **Part 5: Memory-Informed Refactor** | Before substantive refactors |
+| **Part 6: Memory-Informed Longitudinal Work** | In research/benchmark/eval contexts |
+| **Part 7: Session Memory** | At conversation wrap-up or explicit end-of-session |
+| **Part 8: Context Loader** | When starting a new substantive conversation or switching contexts |
+
+## How It Works
+
+Gemini CLI has no hook/event surface, so the entire substrate is delivered through the single `GEMINI.md` context file the model interprets during reasoning. Part 1 (Memory Reflex) establishes the discipline: *before substantive answers, recall by entity; when a lesson lands, observe immediately with a one-line surface*. Flow sections (debug/design/refactor/longitudinal-work) activate when relevant and guide the model through consult-memory + capture-lesson steps.
+
+**Episode lifecycle:** Gemini CLI has no session-start/session-end hooks, so episodes open lazily on the first `pensyve_observe` call and are not explicitly closed under normal operation. Server-side consolidation handles aging.
+
+**Continuity primer:** Part 8 (Context Loader) runs a best-effort recall at the start of substantive conversations to surface prior relevant observations.
 
 ## Commands
 
@@ -56,16 +114,6 @@ Then configure MCP with headers (see setup instructions above).
 | `/forget <entity>`  | Delete all memories for an entity (with confirmation)   |
 | `/inspect [entity]` | View all memories grouped by type for an entity         |
 
-## Intelligent Memory Capture (v1.1.0)
-
-Pensyve uses a tiered classification system to identify what is worth remembering:
-
-- **Tier 1** (auto-store, confidence 0.9+): Explicit decisions, corrections, constraints -- high-signal items that should almost always be captured
-- **Tier 2** (batch review, confidence 0.7-0.89): Root causes, failed approaches, performance findings -- medium-signal items that benefit from user confirmation
-- **Discard**: Formatting, typos, boilerplate -- noise that should never be stored
-
-The `GEMINI.md` context file teaches the agent to buffer signals during a session and classify them at task boundaries, reducing MCP call overhead and producing higher-quality memories.
-
 ## Skills
 
 | Skill                      | When to Use                                                                       |
@@ -75,9 +123,15 @@ The `GEMINI.md` context file teaches the agent to buffer signals during a sessio
 | `context-loader`           | Session start or context switch -- loads historical context for continuity        |
 | `memory-review`            | Periodic -- finds stale facts, contradictions, and cleanup opportunities          |
 
-## MCP Tools
+## Memory Types
 
-The extension connects to the Pensyve remote MCP server, which exposes 7 tools:
+| Type | Definition | MCP call | Example |
+|---|---|---|---|
+| **Semantic** | Durable truths, decisions, preferences | `pensyve_remember` | "We chose RS256 over HS256 for JWT signing" |
+| **Episodic** | Temporal events, session-scoped observations | `pensyve_observe` (with lazy-opened `episode_id`) | "Phase-3 regression root cause: hybrid-router threshold" |
+| **Procedural** | Reusable workflows, sequences, recipes | `pensyve_observe` with `[procedural]` content prefix | "To calibrate V7r: freeze Haiku config, run suite, diff baseline" |
+
+## MCP Tools
 
 | Tool                    | Parameters                                                                | Returns                              |
 | ----------------------- | ------------------------------------------------------------------------- | ------------------------------------ |
@@ -89,22 +143,20 @@ The extension connects to the Pensyve remote MCP server, which exposes 7 tools:
 | `pensyve_forget`        | `entity`, `hard_delete?`                                                  | `forgotten_count`                    |
 | `pensyve_inspect`       | `entity`, `memory_type?`, `limit?`                                        | Array of memories with stats         |
 
-## Context File
+## Opt-Out
 
-The `GEMINI.md` context file is automatically loaded by Gemini CLI and teaches the agent when and how to use memory. It covers:
-
-- When to store, search, and delete memories
-- Entity naming conventions (lowercase, hyphenated)
-- Confidence levels for different memory types
-- Session workflow (start, during, end)
-- Rules for safety (no secrets, no auto-store, deduplication)
+- **Full opt-out** — remove the `GEMINI.md` file from your workspace
+- **Partial opt-out** — delete individual sections from `GEMINI.md`
+- **Silent mode** — remove the "one-line surface" guidance from Part 1; captures stay silent
+- **Recall-only mode** — remove the `Capture lesson` steps from flow sections while keeping `Consult memory`
 
 ## Design Philosophy
 
-- **GEMINI.md owns agent behavior** -- how and when the agent uses memory
-- **Pensyve owns dynamic memory** -- decisions, outcomes, patterns, context
-- **Always asks** -- no memory is stored without user confirmation
-- **Cloud-native** -- memories stored via the Pensyve managed service
+- **`GEMINI.md` owns agent behavior** — how and when the agent uses memory
+- **Memory as substrate** — not a feature the user invokes; always there, continuous, carried across sessions
+- **Pensyve owns dynamic memory** — decisions, outcomes, patterns, context
+- **Always asks** — no memory is stored without user confirmation
+- **Cloud-native** — memories stored via the Pensyve managed service
 
 ## Links
 
@@ -112,6 +164,7 @@ The `GEMINI.md` context file is automatically loaded by Gemini CLI and teaches t
 - **Docs:** [pensyve.com/docs](https://pensyve.com/docs)
 - **GitHub:** [github.com/major7apps/pensyve](https://github.com/major7apps/pensyve)
 - **API Keys:** [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys)
+- **Playbook:** [Working-memory substrate design](https://github.com/major7apps/pensyve-docs/blob/main/specs/2026-04-18-pensyve-working-memory-substrate-design.md)
 
 ## License
 
