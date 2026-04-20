@@ -34,18 +34,18 @@ echo ""
 echo "Check 1: no unsupported 'related_entities' on pensyve_recall"
 FOUND_RELATED=0
 for f in "$RULES_FILE" "$EXAMPLE_FILE"; do
-  awk '/pensyve_recall\(/{capture=1; buf=""}
-       capture {buf = buf "\n" $0}
-       capture && /\)/{
-         if(buf ~ /related_entities/ && buf !~ /\*\*no\*\*/ && buf !~ /no `related_entities`/)
-           print FILENAME ": related_entities found in pensyve_recall block: " buf;
-         capture=0
-       }' "$f" | while read -r line; do
+  while read -r line; do
     if [ -n "$line" ]; then
       echo "  FAIL: $line"
       FOUND_RELATED=1
     fi
-  done
+  done < <(awk '/pensyve_recall\(/{capture=1; buf=""}
+       capture {buf = buf "\n" $0}
+       capture && /\)/{
+       if(buf ~ /related_entities/ && buf !~ /\*\*no\*\*/ && buf !~ /no `related_entities`/)
+       print FILENAME ": related_entities found in pensyve_recall block: " buf;
+       capture=0
+       }' "$f")
 done
 if [ "$FOUND_RELATED" = "0" ]; then
   echo "  PASS"
@@ -58,18 +58,18 @@ echo ""
 echo "Check 2: no unsupported 'continuation_of' on pensyve_episode_start"
 FOUND_CONT=0
 for f in "$RULES_FILE" "$EXAMPLE_FILE"; do
-  awk '/pensyve_episode_start\(/{capture=1; buf=""}
-       capture {buf = buf "\n" $0}
-       capture && /\)/{
-         if(buf ~ /continuation_of/ && buf !~ /\*\*no\*\*/ && buf !~ /no `continuation_of`/)
-           print FILENAME ": continuation_of found in pensyve_episode_start block: " buf;
-         capture=0
-       }' "$f" | while read -r line; do
+  while read -r line; do
     if [ -n "$line" ]; then
       echo "  FAIL: $line"
       FOUND_CONT=1
     fi
-  done
+  done < <(awk '/pensyve_episode_start\(/{capture=1; buf=""}
+       capture {buf = buf "\n" $0}
+       capture && /\)/{
+       if(buf ~ /continuation_of/ && buf !~ /\*\*no\*\*/ && buf !~ /no `continuation_of`/)
+       print FILENAME ": continuation_of found in pensyve_episode_start block: " buf;
+       capture=0
+       }' "$f")
 done
 if [ "$FOUND_CONT" = "0" ]; then
   echo "  PASS"
@@ -82,23 +82,23 @@ echo ""
 echo "Check 3: every pensyve_observe example has source_entity and about_entity"
 MISSING_FIELDS=0
 for f in "$RULES_FILE" "$EXAMPLE_FILE"; do
-  awk '/pensyve_observe\(/{capture=1; buf=""; depth=0}
-       capture {buf = buf "\n" $0;
-                for(i=1; i<=length($0); i++){
-                  c=substr($0,i,1);
-                  if(c=="(") depth++;
-                  if(c==")") depth--;
-                };
-                if(depth==0 && buf ~ /pensyve_observe\(/){
-                  if(buf !~ /source_entity/) print FILENAME ": missing source_entity near: " buf;
-                  if(buf !~ /about_entity/) print FILENAME ": missing about_entity near: " buf;
-                  capture=0;
-                }}' "$f" | while read -r line; do
+  while read -r line; do
     if [ -n "$line" ]; then
       echo "  FAIL: $line"
       MISSING_FIELDS=1
     fi
-  done
+  done < <(awk '/pensyve_observe\(/{capture=1; buf=""; depth=0}
+       capture {buf = buf "\n" $0;
+       for(i=1; i<=length($0); i++){
+       c=substr($0,i,1);
+       if(c=="(") depth++;
+       if(c==")") depth--;
+       };
+       if(depth==0 && buf ~ /pensyve_observe\(/){
+       if(buf !~ /source_entity/) print FILENAME ": missing source_entity near: " buf;
+       if(buf !~ /about_entity/) print FILENAME ": missing about_entity near: " buf;
+       capture=0;
+       }}' "$f")
 done
 if [ "$MISSING_FIELDS" = "0" ]; then
   echo "  PASS"
