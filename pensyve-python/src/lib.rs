@@ -10,6 +10,7 @@ use uuid::Uuid;
 use pensyve_core::config::{PensyveConfig, RetrievalConfig};
 use pensyve_core::consolidation::ConsolidationEngine;
 use pensyve_core::embedding::OnnxEmbedder;
+use pensyve_core::graph::MemoryGraph;
 use pensyve_core::recall_grouped::{OrderBy, RecallGroupedConfig};
 use pensyve_core::retrieval::RecallEngine;
 use pensyve_core::storage::StorageTrait;
@@ -219,8 +220,44 @@ fn build_extractor(
                 .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
             Ok((Some(Arc::new(built)), Some(Arc::new(rt))))
         }
+        Some("local-vllm") | Some("local-llm") => {
+            // Offline-first Layer A path (v1.1 Step B). Config is env-driven
+            // so `Pensyve(extractor="local-vllm")` works with no additional
+            // Python surface change:
+            //   PENSYVE_LOCAL_LLM_URL    (default http://localhost:8888/v1)
+            //   PENSYVE_LOCAL_LLM_MODEL  (default "local")
+            //   PENSYVE_LOCAL_LLM_API_KEY (optional bearer token)
+            // `api_key` passed as a positional kwarg overrides the env var.
+            let built = pensyve_core::observation::LocalLLMExtractor::from_env()
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!(
+                        "Failed to build local-vllm extractor: {e}"
+                    ))
+                })?;
+            let built = match api_key {
+                Some(k) => pensyve_core::observation::LocalLLMExtractor::new(
+                    std::env::var("PENSYVE_LOCAL_LLM_URL")
+                        .unwrap_or_else(|_| "http://localhost:8888/v1".into()),
+                    std::env::var("PENSYVE_LOCAL_LLM_MODEL")
+                        .unwrap_or_else(|_| "local".into()),
+                    Some(k.to_string()),
+                )
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!(
+                        "Failed to build local-vllm extractor: {e}"
+                    ))
+                })?,
+                None => built,
+            };
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
+            Ok((Some(Arc::new(built)), Some(Arc::new(rt))))
+        }
         Some(other) => Err(PyValueError::new_err(format!(
-            "unknown extractor: {other:?}; supported: \"haiku\""
+            "unknown extractor: {other:?}; supported: \"haiku\", \"local-vllm\""
         ))),
     }
 }
@@ -239,6 +276,12 @@ struct PensyveInner {
     /// Shared tokio runtime used to drive the async extractor from the sync
     /// `PyO3` dispatch. Lazily created only when an extractor is configured.
     extractor_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    /// Cross-encoder reranker applied post-fusion in `recall` and
+    /// `recall_grouped`. Default is `BGERerankerBase` — on-by-default
+    /// because the Pensyve algorithm specifies it. Callers can opt out
+    /// with `Pensyve(reranker=None)` for embedded/offline contexts where
+    /// the ~150MB model download is unacceptable.
+    reranker: Option<Arc<pensyve_core::reranker::Reranker>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -265,13 +308,14 @@ impl PyPensyve {
     ///     `extractor_api_key`: Explicit API key for the haiku extractor.
     ///         Overrides `ANTHROPIC_API_KEY`.
     #[new]
-    #[pyo3(signature = (path=None, namespace=None, extractor=None, extractor_api_key=None))]
+    #[pyo3(signature = (path=None, namespace=None, extractor=None, extractor_api_key=None, reranker=Some("BGERerankerBase".to_string())))]
     #[allow(clippy::needless_pass_by_value)]
     fn new(
         path: Option<String>,
         namespace: Option<String>,
         extractor: Option<String>,
         extractor_api_key: Option<String>,
+        reranker: Option<String>,
     ) -> PyResult<Self> {
         let config = PensyveConfig::default();
 
@@ -366,6 +410,19 @@ impl PyPensyve {
         let (extractor_impl, extractor_runtime) =
             build_extractor(extractor.as_deref(), extractor_api_key.as_deref())?;
 
+        // Cross-encoder reranker is on-by-default per the Pensyve
+        // algorithm spec. `reranker=None` opts out for embedded/offline
+        // callers. On first construction fastembed downloads the model
+        // (~150MB for BGE; cached at ~/.fastembed_cache thereafter).
+        let reranker_impl = match reranker.as_deref() {
+            None => None,
+            Some(name) => Some(Arc::new(
+                pensyve_core::reranker::Reranker::new(name).map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to build reranker: {e}"))
+                })?,
+            )),
+        };
+
         Ok(Self {
             inner: Arc::new(PensyveInner {
                 namespace: ns,
@@ -376,6 +433,7 @@ impl PyPensyve {
                 consolidation_config: config.consolidation,
                 extractor: extractor_impl,
                 extractor_runtime,
+                reranker: reranker_impl,
             }),
         })
     }
@@ -463,12 +521,24 @@ impl PyPensyve {
         // NOTE: Lock held across recall (including embedding). RecallEngine borrows &VectorIndex.
         // Future: make RecallEngine lock internally per-operation to allow concurrent recalls.
         let vi = self.inner.vector_index.lock().unwrap();
-        let engine = RecallEngine::new(
+        // Build the graph fresh per-call from storage. Cheap (O(entities + edges)),
+        // always reflects the latest commits, and avoids lock juggling across
+        // concurrent recalls. This is a correctness-by-default feature: the
+        // Pensyve algorithm specifies graph traversal as part of recall fusion.
+        let graph = MemoryGraph::build_from_storage(
+            self.inner.storage.as_ref(),
+            self.inner.namespace.id,
+        );
+        let mut engine = RecallEngine::new(
             self.inner.storage.as_ref(),
             self.inner.embedder.as_ref(),
             &vi,
             &self.inner.retrieval_config,
         );
+        engine = engine.with_graph(&graph);
+        if let Some(reranker) = self.inner.reranker.as_deref() {
+            engine = engine.with_reranker(reranker);
+        }
 
         let result = engine
             .recall(query, self.inner.namespace.id, limit)
@@ -557,12 +627,23 @@ impl PyPensyve {
         // Lock held across recall, same as `recall()` — RecallEngine borrows
         // &VectorIndex for the duration of the call.
         let vi = self.inner.vector_index.lock().unwrap();
-        let engine = RecallEngine::new(
+        // Build the graph fresh per-call from storage — same rationale as
+        // `recall()` above. Keeps `recall_grouped` aligned with the same
+        // feature set (graph + reranker) as the single-entity path.
+        let graph = MemoryGraph::build_from_storage(
+            self.inner.storage.as_ref(),
+            self.inner.namespace.id,
+        );
+        let mut engine = RecallEngine::new(
             self.inner.storage.as_ref(),
             self.inner.embedder.as_ref(),
             &vi,
             &self.inner.retrieval_config,
         );
+        engine = engine.with_graph(&graph);
+        if let Some(reranker) = self.inner.reranker.as_deref() {
+            engine = engine.with_reranker(reranker);
+        }
 
         let groups = engine
             .recall_grouped(query, self.inner.namespace.id, &config)
@@ -856,6 +937,7 @@ impl PyEpisode {
     #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
     fn __exit__(
         &mut self,
+        py: Python<'_>,
         _exc_type: Option<&Bound<'_, PyAny>>,
         _exc_val: Option<&Bound<'_, PyAny>>,
         _exc_tb: Option<&Bound<'_, PyAny>>,
@@ -930,9 +1012,17 @@ impl PyEpisode {
             .update_episode(&episode)
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to update episode: {e}")))?;
 
-        // Observation extraction — runs only when a haiku extractor was
+        // Observation extraction — runs only when an extractor was
         // configured. All failures are logged + swallowed; episode stays
         // durable regardless.
+        //
+        // Concurrency note: we `py.detach()` for the blocking HTTP call so
+        // Python threads that fire __exit__ concurrently actually run in
+        // parallel. Without this, multiple threads would serialize on the
+        // GIL during the ~20s Qwen3.6 extraction, defeating vLLM's
+        // `--max-num-seqs=N` batching. The release is safe because we
+        // don't touch Python objects inside the closure — only Rust state
+        // (storage, embedder, extractor) guarded by their own Mutexes.
         if let (Some(extractor), Some(runtime)) = (
             self.inner.extractor.clone(),
             self.inner.extractor_runtime.clone(),
@@ -941,18 +1031,17 @@ impl PyEpisode {
             let embedder = self.inner.embedder.clone();
             let ns_id = self.namespace_id;
             let ep_id = self.episode_id;
-            // Block on the runtime here so callers see a consistent post-exit
-            // world (observations present before __exit__ returns). Run time
-            // is dominated by a single Haiku API call.
-            let persisted = runtime.block_on(async move {
-                pensyve_core::observation::commit_extraction_for_episode(
-                    storage.as_ref(),
-                    extractor.as_ref(),
-                    ns_id,
-                    ep_id,
-                    |text| embedder.embed(text),
-                )
-                .await
+            let persisted = py.detach(|| {
+                runtime.block_on(async move {
+                    pensyve_core::observation::commit_extraction_for_episode(
+                        storage.as_ref(),
+                        extractor.as_ref(),
+                        ns_id,
+                        ep_id,
+                        |text| embedder.embed(text),
+                    )
+                    .await
+                })
             });
             if persisted > 0 {
                 tracing::info!(
