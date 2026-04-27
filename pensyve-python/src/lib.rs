@@ -220,6 +220,49 @@ fn build_extractor(
                 .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
             Ok((Some(Arc::new(built)), Some(Arc::new(rt))))
         }
+        Some("haiku-batched") => {
+            // v1.3.x cost-opt Phase B path: batched Anthropic Messages
+            // Batches API for bulk re-ingestion workloads (50% per-token
+            // discount, async submit/poll/collect via the underlying
+            // sync `ObservationExtractor` trait). The inner per-call
+            // extractor still benefits from the prompt-caching default
+            // wired in Phase A.
+            let inner = match api_key {
+                Some(k) => pensyve_core::observation::AnthropicHaikuExtractor::new(k),
+                None => pensyve_core::observation::AnthropicHaikuExtractor::from_env(),
+            }
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("Failed to build haiku-batched extractor: {e}"))
+            })?;
+            let built = pensyve_core::observation::BatchedAnthropicHaikuExtractor::new(inner);
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
+            Ok((Some(Arc::new(built)), Some(Arc::new(rt))))
+        }
+        Some("haiku-nocache") => {
+            // Diagnostic path: identical to "haiku" but with prompt
+            // caching disabled. Used for parity benchmarks that need
+            // to isolate the caching cost-discount from extraction
+            // quality, and as an emergency rollback if a wire-shape
+            // regression surfaces in `cache_control` handling upstream.
+            let built = match api_key {
+                Some(k) => pensyve_core::observation::AnthropicHaikuExtractor::new(k),
+                None => pensyve_core::observation::AnthropicHaikuExtractor::from_env(),
+            }
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("Failed to build haiku-nocache extractor: {e}"))
+            })?
+            .without_prompt_caching();
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
+            Ok((Some(Arc::new(built)), Some(Arc::new(rt))))
+        }
         Some("local-vllm" | "local-llm") => {
             // Offline-first Layer A path (v1.1 Step B). Config is env-driven
             // so `Pensyve(extractor="local-vllm")` works with no additional
@@ -254,7 +297,7 @@ fn build_extractor(
             Ok((Some(Arc::new(built)), Some(Arc::new(rt))))
         }
         Some(other) => Err(PyValueError::new_err(format!(
-            "unknown extractor: {other:?}; supported: \"haiku\", \"local-vllm\""
+            "unknown extractor: {other:?}; supported: \"haiku\", \"haiku-batched\", \"haiku-nocache\", \"local-vllm\""
         ))),
     }
 }
@@ -298,12 +341,24 @@ impl PyPensyve {
     /// Args:
     ///     path: Directory for storage files (default: ~/.pensyve/default).
     ///     namespace: Namespace name (default: "default").
-    ///     extractor: Optional observation extractor. `"haiku"` wires the
-    ///         Anthropic Haiku 4.5 extractor (requires `ANTHROPIC_API_KEY`
-    ///         env var unless `extractor_api_key` is provided). `None` (default)
-    ///         skips extraction entirely — zero cost.
-    ///     `extractor_api_key`: Explicit API key for the haiku extractor.
-    ///         Overrides `ANTHROPIC_API_KEY`.
+    ///     extractor: Optional observation extractor. Supported values:
+    ///         - `"haiku"`: Anthropic Haiku 4.5 sync extractor with prompt
+    ///           caching ON (default cost-optimized path; ~57% discount on
+    ///           the static instruction prompt). Requires `ANTHROPIC_API_KEY`
+    ///           env var unless `extractor_api_key` is provided.
+    ///         - `"haiku-batched"`: same Haiku extractor wrapped in the
+    ///           Anthropic Messages Batches API for bulk re-ingestion
+    ///           workloads (50% per-token discount; async submit/poll/collect).
+    ///         - `"haiku-nocache"`: Haiku extractor with prompt caching
+    ///           disabled. Diagnostic-only — used for parity benchmarks and
+    ///           emergency rollback if a `cache_control` regression surfaces.
+    ///         - `"local-vllm"` / `"local-llm"`: OpenAI-compatible local LLM
+    ///           backend (offline-first; env-driven config via
+    ///           `PENSYVE_LOCAL_LLM_URL` / `PENSYVE_LOCAL_LLM_MODEL` /
+    ///           `PENSYVE_LOCAL_LLM_API_KEY`).
+    ///         `None` (default) skips extraction entirely — zero cost.
+    ///     `extractor_api_key`: Explicit API key for the haiku extractor
+    ///         variants. Overrides `ANTHROPIC_API_KEY`.
     #[new]
     #[pyo3(signature = (path=None, namespace=None, extractor=None, extractor_api_key=None, reranker=Some("BGERerankerBase".to_string())))]
     #[allow(clippy::needless_pass_by_value)]
