@@ -18,6 +18,11 @@ pub fn effective_stability(base_stability: f32, salience: f32, beta: f32) -> f32
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::float_cmp,
+    clippy::manual_range_contains,
+    reason = "test code: literal float comparisons and inline range checks are clearer"
+)]
 mod tests {
     use super::*;
 

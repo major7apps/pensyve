@@ -144,6 +144,10 @@ impl AccessRingBuffer {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::cast_lossless,
+    reason = "test code: `as f64` from small bounded loop counters is conventional in fixtures"
+)]
 mod tests {
     use super::*;
 

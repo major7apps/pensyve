@@ -557,6 +557,10 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
     // -------------------------------------------------------------------
 
     #[cfg(test)]
+    #[allow(
+        clippy::bind_instead_of_map,
+        reason = "test code: `.and_then(|e| Ok(e))` is intentional in `new_rejects_when_api_key_lookup_fails` — it documents the constructor's contract that key shape is not validated"
+    )]
     mod tests {
         use super::*;
         use wiremock::matchers::{body_partial_json, header, method, path};
@@ -1203,6 +1207,10 @@ mod localllm {
     // -----------------------------------------------------------------------
 
     #[cfg(test)]
+    #[allow(
+        clippy::err_expect,
+        reason = "test code: `.err().expect()` mirrors the structure of preceding ok-path asserts"
+    )]
     mod tests {
         use super::*;
         use chrono::{DateTime, Utc};
@@ -1450,6 +1458,10 @@ where
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "test code: `fake_embed` mirrors the embedder closure signature so test fixtures can be swapped in without changing callers"
+)]
 mod tests {
     use super::*;
 

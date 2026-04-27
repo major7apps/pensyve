@@ -158,6 +158,10 @@ impl Reranker {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(
+    clippy::ignore_without_reason,
+    reason = "test code: `#[ignore]` reasons are repeated in inline comments next to each attribute"
+)]
 mod tests {
     use super::*;
 

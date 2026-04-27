@@ -386,6 +386,12 @@ pub fn replay_priority(salience: f32, retrievability: f32, is_superseded: bool) 
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(
+    clippy::assign_op_pattern,
+    clippy::cast_lossless,
+    clippy::cast_possible_wrap,
+    reason = "test code: small fixture counters are bounded; explicit `as` casts and longhand assignment forms are clearer in test setup"
+)]
 mod tests {
     use std::path::PathBuf;
 

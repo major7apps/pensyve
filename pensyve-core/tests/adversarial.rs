@@ -1,3 +1,7 @@
+// Integration test fixtures may compare floats to exact literals (e.g. 0.0 from
+// zero-vector cosine similarity); the lint adds noise without value here.
+#![allow(clippy::float_cmp)]
+
 use pensyve_core::activation::base_level_activation;
 use pensyve_core::embedding::cosine_similarity;
 use pensyve_core::rrf::reciprocal_rank_fusion;

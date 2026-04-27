@@ -92,6 +92,10 @@ impl WeightLearner {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::uninlined_format_args,
+    reason = "test code: pedantic style — inlining adds no clarity to assertion messages"
+)]
 mod tests {
     use super::*;
 

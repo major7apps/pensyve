@@ -390,6 +390,11 @@ impl Default for MemoryGraph {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(
+    clippy::similar_names,
+    clippy::map_unwrap_or,
+    reason = "test code: edge_ab/edge_ac are intentional readable test fixture names; map().unwrap_or() reads more naturally than map_or() in test asserts"
+)]
 mod tests {
     use super::*;
 

@@ -1025,6 +1025,11 @@ fn apply_reranking(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(
+    clippy::doc_markdown,
+    clippy::map_unwrap_or,
+    reason = "test code: doc-comments on test helpers are informal; map().unwrap_or() reads more naturally than map_or() in test asserts"
+)]
 mod tests {
     use super::*;
     use crate::config::RetrievalConfig;

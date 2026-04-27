@@ -1,3 +1,8 @@
+// Bench fixtures use `as f64` from small loop indices and the criterion-bundled
+// `black_box` re-export; replacing them with `f64::from` / `std::hint::black_box`
+// would touch every benchmark site without changing what the benches measure.
+#![allow(deprecated, clippy::cast_lossless)]
+
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use uuid::Uuid;
 

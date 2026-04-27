@@ -519,6 +519,10 @@ impl Memory {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(
+    clippy::float_cmp,
+    reason = "test code: comparing literal float defaults is intentional"
+)]
 mod tests {
     use super::*;
 

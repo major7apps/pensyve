@@ -227,6 +227,12 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(
+    clippy::ignore_without_reason,
+    clippy::similar_names,
+    clippy::uninlined_format_args,
+    reason = "test code: pedantic style noise — `#[ignore]` reasons are repeated in inline comments, sim_ab/sim_ac are intentional readable test fixture names"
+)]
 mod tests {
     use super::*;
 

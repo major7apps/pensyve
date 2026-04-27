@@ -87,6 +87,10 @@ pub fn reciprocal_rank_fusion(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::cloned_ref_to_slice_refs,
+    reason = "test code: explicit `.clone()` is clearer than `from_ref` when the test inspects the same ranking under multiple call sites"
+)]
 mod tests {
     use super::*;
 
