@@ -220,7 +220,7 @@ fn build_extractor(
                 .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
             Ok((Some(Arc::new(built)), Some(Arc::new(rt))))
         }
-        Some("local-vllm") | Some("local-llm") => {
+        Some("local-vllm" | "local-llm") => {
             // Offline-first Layer A path (v1.1 Step B). Config is env-driven
             // so `Pensyve(extractor="local-vllm")` works with no additional
             // Python surface change:
