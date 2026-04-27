@@ -203,6 +203,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
         model: String,
         max_tokens: u32,
         base_url: String,
+        prompt_caching_enabled: bool,
     }
 
     impl AnthropicHaikuExtractor {
@@ -216,6 +217,12 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
         }
 
         /// Build an extractor with an explicit API key.
+        ///
+        /// Prompt caching is enabled by default — the static
+        /// `EXTRACTION_PROMPT_V1` ships in a cached `system` block so repeat
+        /// calls within Anthropic's 5-minute cache window bill cached input
+        /// tokens at 10% of the regular rate. Use [`Self::without_prompt_caching`]
+        /// to opt out for diagnostic comparisons.
         pub fn new(api_key: impl Into<String>) -> ExtractionResult<Self> {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
@@ -227,6 +234,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
                 model: DEFAULT_MODEL.into(),
                 max_tokens: DEFAULT_MAX_TOKENS,
                 base_url: "https://api.anthropic.com".into(),
+                prompt_caching_enabled: true,
             })
         }
 
@@ -245,9 +253,32 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
             self
         }
 
-        pub(super) fn build_prompt(messages: &[ExtractionMessage]) -> String {
+        /// Disable Anthropic prompt caching for this extractor.
+        ///
+        /// Production should leave caching on (the default) — switching off
+        /// loses the ~57% per-call discount on the static instruction prompt.
+        /// Intended for benchmarks that need to measure un-cached cost
+        /// directly, or for emergency rollback if a wire-shape regression
+        /// surfaces upstream.
+        #[must_use]
+        pub fn without_prompt_caching(mut self) -> Self {
+            self.prompt_caching_enabled = false;
+            self
+        }
+
+        /// The static instruction prompt used as the cached `system` block.
+        pub(super) fn system_prompt() -> &'static str {
+            EXTRACTION_PROMPT_V1
+        }
+
+        /// Render only the per-call recalled-memories body (no instruction
+        /// header). The result is sent as `messages[0].content`; the static
+        /// header travels separately via [`Self::system_prompt`] and gets
+        /// served from cache after the first call within Anthropic's 5-minute
+        /// window.
+        pub(super) fn user_message(messages: &[ExtractionMessage]) -> String {
             if messages.is_empty() {
-                return format!("{EXTRACTION_PROMPT_V1}\n\n[No conversation memories provided.]\n");
+                return "[No conversation memories provided.]".to_string();
             }
             let mut body = String::new();
             for m in messages {
@@ -266,8 +297,22 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
                     let _ = writeln!(body, "[{date}] {}: {}", m.role, m.content);
                 }
             }
+            format!("--- Recalled memories ---\n{body}--- End memories ---")
+        }
+
+        /// Render the combined instruction header plus recalled-memories body.
+        ///
+        /// Retained as a thin shim over [`Self::system_prompt`] +
+        /// [`Self::user_message`] so `LocalLLMExtractor`, which sends a
+        /// single user message to an OpenAI-compatible endpoint that has no
+        /// system-block / cache-control concept, gets identical prompt text
+        /// to the pre-caching Anthropic path. Any deviation here would
+        /// silently change benchmark numbers.
+        pub(super) fn build_prompt(messages: &[ExtractionMessage]) -> String {
             format!(
-                "{EXTRACTION_PROMPT_V1}\n\n--- Recalled memories ---\n{body}--- End memories ---"
+                "{}\n\n{}",
+                Self::system_prompt(),
+                Self::user_message(messages)
             )
         }
     }
@@ -291,6 +336,8 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
         model: &'a str,
         max_tokens: u32,
         temperature: f32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        system: Option<Vec<SystemBlock<'a>>>,
         messages: Vec<AnthropicMessage<'a>>,
     }
 
@@ -298,6 +345,25 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
     struct AnthropicMessage<'a> {
         role: &'a str,
         content: &'a str,
+    }
+
+    /// One block of the Anthropic Messages API `system` field. The
+    /// `cache_control` marker tells Anthropic to cache the prefix ending at
+    /// this block; subsequent calls within the cache window bill those
+    /// tokens at 10% of regular input price.
+    #[derive(Debug, Serialize)]
+    struct SystemBlock<'a> {
+        #[serde(rename = "type")]
+        block_type: &'static str,
+        text: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct CacheControl {
+        #[serde(rename = "type")]
+        cache_type: &'static str,
     }
 
     // Sibling extractor modules (see `localllm`) share this observation shape
@@ -417,16 +483,34 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
             episode_id: Uuid,
             messages: &[ExtractionMessage],
         ) -> ExtractionResult<Vec<ObservationMemory>> {
-            let prompt = Self::build_prompt(messages);
+            let user_msg = Self::user_message(messages);
             let last_event_time = messages.iter().filter_map(|m| m.event_time).max();
+
+            // Hoist the static instruction prompt into a `system` block.
+            // When prompt caching is enabled (default), Anthropic caches the
+            // block for ~5 minutes and bills the ~350 tokens at 10% on the
+            // next call — ~57% per-call savings on bulk workloads.
+            let cache_control = if self.prompt_caching_enabled {
+                Some(CacheControl {
+                    cache_type: "ephemeral",
+                })
+            } else {
+                None
+            };
+            let system_blocks = vec![SystemBlock {
+                block_type: "text",
+                text: Self::system_prompt(),
+                cache_control,
+            }];
 
             let req = AnthropicRequest {
                 model: &self.model,
                 max_tokens: self.max_tokens,
                 temperature: 0.0,
+                system: Some(system_blocks),
                 messages: vec![AnthropicMessage {
                     role: "user",
-                    content: &prompt,
+                    content: &user_msg,
                 }],
             };
 
@@ -475,7 +559,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
     #[cfg(test)]
     mod tests {
         use super::*;
-        use wiremock::matchers::{header, method, path};
+        use wiremock::matchers::{body_partial_json, header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         fn anthropic_response_body(text: &str) -> serde_json::Value {
@@ -729,6 +813,155 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
             let obs = raw_to_observation(raw, Uuid::new_v4(), Uuid::new_v4(), None);
             assert_eq!(obs.content, "will try out Todoist");
             assert!(obs.event_time.is_none());
+        }
+
+        #[tokio::test]
+        async fn extractor_sends_cached_system_block_by_default() {
+            // Wire-shape contract: prompt-caching-on (the default) routes the
+            // static EXTRACTION_PROMPT_V1 into the `system` block tagged
+            // `cache_control.type = "ephemeral"`, while the per-call
+            // recalled-memories body lives in `messages[0].content`.
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .and(body_partial_json(serde_json::json!({
+                    "system": [{
+                        "type": "text",
+                        "text": EXTRACTION_PROMPT_V1,
+                        "cache_control": {"type": "ephemeral"},
+                    }],
+                })))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(anthropic_response_body("[]")),
+                )
+                .mount(&server)
+                .await;
+
+            let extractor = AnthropicHaikuExtractor::new("test-key")
+                .unwrap()
+                .with_base_url(server.uri());
+            extractor
+                .extract(
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    &[ExtractionMessage {
+                        role: "user".into(),
+                        content: "I played AC Odyssey".into(),
+                        event_time: None,
+                    }],
+                )
+                .await
+                .unwrap();
+
+            let received = server.received_requests().await.expect("requests recorded");
+            assert_eq!(received.len(), 1);
+            let body: serde_json::Value = received[0].body_json().expect("json body");
+            let user_content = body["messages"][0]["content"]
+                .as_str()
+                .expect("user message content");
+            assert!(
+                user_content.contains("--- Recalled memories ---"),
+                "user message must carry the recalled-memories framing, got: {user_content}"
+            );
+            // The opening words of EXTRACTION_PROMPT_V1 must NOT appear in
+            // the user message — they belong only in the cached system
+            // block.
+            assert!(
+                !user_content.contains("structured-data extractor"),
+                "user message leaked instruction text: {user_content}"
+            );
+        }
+
+        #[tokio::test]
+        async fn extractor_omits_cache_control_when_caching_disabled() {
+            // Diagnostic path: callers who explicitly opt out (benchmarking
+            // un-cached cost) must produce a request whose system block has
+            // no `cache_control` key. We capture the actual JSON via
+            // `received_requests` and assert structurally — `body_partial_json`
+            // can match presence but not absence.
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(anthropic_response_body("[]")),
+                )
+                .mount(&server)
+                .await;
+
+            let extractor = AnthropicHaikuExtractor::new("test-key")
+                .unwrap()
+                .with_base_url(server.uri())
+                .without_prompt_caching();
+            extractor
+                .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
+                .await
+                .unwrap();
+
+            let received = server.received_requests().await.expect("requests recorded");
+            assert_eq!(received.len(), 1);
+            let body: serde_json::Value = received[0].body_json().expect("json body");
+            // System block still carries the prompt text (so the model still
+            // gets the instructions) but `cache_control` must be absent.
+            assert_eq!(body["system"][0]["type"], "text");
+            assert_eq!(body["system"][0]["text"], EXTRACTION_PROMPT_V1);
+            assert!(
+                body["system"][0].get("cache_control").is_none(),
+                "cache_control must be omitted when caching disabled, got: {}",
+                body["system"][0]
+            );
+        }
+
+        #[tokio::test]
+        async fn extractor_user_message_excludes_instruction_prompt() {
+            // The split between system_prompt() and user_message() is what
+            // makes prompt caching pay off — if the per-call user message
+            // still carried the full instruction header, the cache would
+            // never reduce token spend. Lock that invariant via a captured
+            // request body.
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(anthropic_response_body("[]")),
+                )
+                .mount(&server)
+                .await;
+
+            let extractor = AnthropicHaikuExtractor::new("test-key")
+                .unwrap()
+                .with_base_url(server.uri());
+            extractor
+                .extract(
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    &[ExtractionMessage {
+                        role: "user".into(),
+                        content: "I cooked dinner three times".into(),
+                        event_time: None,
+                    }],
+                )
+                .await
+                .unwrap();
+
+            let received = server.received_requests().await.expect("requests recorded");
+            let body: serde_json::Value = received[0].body_json().expect("json body");
+            let user_content = body["messages"][0]["content"]
+                .as_str()
+                .expect("user message content");
+            // 10-char marker pulled directly from EXTRACTION_PROMPT_V1's
+            // opening line ("structured-data extractor").
+            assert!(
+                !user_content.contains("structured"),
+                "user message must not embed the system prompt header: {user_content}"
+            );
+            assert!(
+                user_content.contains("--- Recalled memories ---"),
+                "user message must contain the memory framing: {user_content}"
+            );
+            assert!(
+                user_content.contains("I cooked dinner three times"),
+                "user message must contain the supplied turn: {user_content}"
+            );
         }
     }
 }
