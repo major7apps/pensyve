@@ -19,18 +19,32 @@ class Pensyve:
         namespace: str | None = None,
         extractor: str | None = None,
         extractor_api_key: str | None = None,
+        reranker: str | None = "BGERerankerBase",
     ) -> None:
         """Create or open a Pensyve instance.
 
         Args:
             path: Directory for storage files (default: ~/.pensyve/default).
             namespace: Namespace name (default: "default").
-            extractor: Optional observation extractor. `"haiku"` wires the
-                Anthropic Haiku 4.5 extractor (requires `ANTHROPIC_API_KEY`
-                env var unless `extractor_api_key` is provided). `None`
-                (default) skips extraction entirely.
-            extractor_api_key: Explicit API key for the haiku extractor.
-                Overrides `ANTHROPIC_API_KEY`.
+            extractor: Optional observation extractor.
+                - `"haiku"` wires the Anthropic Haiku 4.5 extractor
+                  (requires `ANTHROPIC_API_KEY` env var unless
+                  `extractor_api_key` is provided).
+                - `"local-vllm"` wires an OpenAI-compatible local-LLM
+                  extractor for offline-first deployments (reads
+                  `PENSYVE_LOCAL_LLM_URL`, `PENSYVE_LOCAL_LLM_MODEL`,
+                  `PENSYVE_LOCAL_LLM_API_KEY` from the environment; defaults
+                  to `http://localhost:8888/v1`, model `"local"`, no auth).
+                - `None` (default) skips extraction entirely.
+            extractor_api_key: Explicit API key for the configured extractor.
+                Overrides `ANTHROPIC_API_KEY` (haiku) or
+                `PENSYVE_LOCAL_LLM_API_KEY` (local-vllm).
+            reranker: Cross-encoder reranker applied post-fusion in `recall`
+                and `recall_grouped`. Default `"BGERerankerBase"` — the
+                algorithm-spec default. Pass `None` to disable (skips the
+                ~150MB fastembed model download, but this is a weaker
+                algorithm than the spec describes). `"JINARerankerV1TurboEn"`
+                is also supported as an English-only alternative.
         """
         ...
 
@@ -60,6 +74,12 @@ class Pensyve:
     ) -> list[Memory]:
         """Recall memories matching a query.
 
+        Applies the full Pensyve retrieval pipeline: vector search + RRF
+        fusion + graph traversal + cross-encoder reranking. Graph is built
+        fresh per-call from storage (O(entities + edges), sub-ms for
+        typical namespaces). Reranker is applied when configured in
+        ``__init__`` (default: ``BGERerankerBase``).
+
         Args:
             query: Search query string.
             entity: Optional entity to filter by.
@@ -78,11 +98,12 @@ class Pensyve:
     ) -> list[SessionGroup]:
         """Recall memories matching a query, clustered by source session.
 
-        Runs the normal RRF fusion pipeline and then groups the top-``limit``
-        results by ``episode_id``. Memories from the same session cluster
-        into a single :class:`SessionGroup` sorted by event time within the
-        group. Semantic and procedural memories (which have no episode)
-        appear as singleton groups with ``session_id=None``.
+        Runs the full Pensyve retrieval pipeline (vector + RRF + graph +
+        reranker) and then groups the top-``limit`` results by
+        ``episode_id``. Memories from the same session cluster into a
+        single :class:`SessionGroup` sorted by event time within the group.
+        Semantic and procedural memories (which have no episode) appear as
+        singleton groups with ``session_id=None``.
 
         Args:
             query: Search query string.
