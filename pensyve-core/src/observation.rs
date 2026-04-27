@@ -245,7 +245,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
             self
         }
 
-        fn build_prompt(messages: &[ExtractionMessage]) -> String {
+        pub(super) fn build_prompt(messages: &[ExtractionMessage]) -> String {
             if messages.is_empty() {
                 return format!("{EXTRACTION_PROMPT_V1}\n\n[No conversation memories provided.]\n");
             }
@@ -300,20 +300,24 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
         content: &'a str,
     }
 
+    // Sibling extractor modules (see `localllm`) share this observation shape
+    // + the date-prefix render logic + the tolerant JSON parser. Exposed with
+    // `pub(super)` so they're reachable from `observation::localllm` without
+    // leaking into the public pensyve-core surface.
     #[derive(Debug, Deserialize)]
-    struct RawObservation {
-        entity_type: String,
-        instance: String,
-        action: String,
+    pub(super) struct RawObservation {
+        pub(super) entity_type: String,
+        pub(super) instance: String,
+        pub(super) action: String,
         #[serde(default)]
-        quantity: Option<f64>,
+        pub(super) quantity: Option<f64>,
         #[serde(default)]
-        unit: Option<String>,
+        pub(super) unit: Option<String>,
         #[serde(default = "default_raw_confidence")]
-        confidence: f32,
+        pub(super) confidence: f32,
     }
 
-    fn default_raw_confidence() -> f32 {
+    pub(super) fn default_raw_confidence() -> f32 {
         0.8
     }
 
@@ -326,7 +330,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
     /// the language marker, and cutting at the closing fence. Bracket
     /// extraction below is a second line of defence when the response
     /// contains prose before/after the array.
-    fn parse_response(text: &str) -> Vec<RawObservation> {
+    pub(super) fn parse_response(text: &str) -> Vec<RawObservation> {
         let trimmed = text.trim();
         let no_fence = strip_markdown_fence(trimmed);
 
@@ -342,7 +346,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
 
     /// Remove ```` ``` ```` / ```` ```json ```` / ```` ```\n ```` wrappers
     /// from an LLM response. Handles the common shapes without regex.
-    fn strip_markdown_fence(s: &str) -> &str {
+    pub(super) fn strip_markdown_fence(s: &str) -> &str {
         let Some(start) = s.find("```") else {
             return s;
         };
@@ -361,13 +365,13 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
         after_lang[..close_rel].trim()
     }
 
-    fn raw_to_observation(
+    pub(super) fn raw_to_observation(
         raw: RawObservation,
         namespace_id: Uuid,
         episode_id: Uuid,
         event_time: Option<DateTime<Utc>>,
     ) -> ObservationMemory {
-        let content = format_observation_content(&raw);
+        let content = format_observation_content(&raw, event_time);
         let mut obs = ObservationMemory::new(
             namespace_id,
             episode_id,
@@ -384,14 +388,27 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
     }
 
     /// Render a human-readable sentence used as the embedding + display content.
-    /// Matches the format the Phase 0c reader prompt was trained against.
-    fn format_observation_content(raw: &RawObservation) -> String {
+    /// When `event_time` is known it is prefixed as `[YYYY-MM-DD] ` so the
+    /// observation is a self-contained date+fact string at recall time —
+    /// without the prefix, temporal-reasoning readers have to cross-reference
+    /// session-block headers to learn *when* a fact applies. Sprint doc 20's
+    /// pipeline relied on the outer reader prompt to attach dates; v1.1 moves
+    /// that responsibility into the observation itself so any reader that
+    /// simply concatenates content strings gets the date for free.
+    fn format_observation_content(
+        raw: &RawObservation,
+        event_time: Option<DateTime<Utc>>,
+    ) -> String {
         let base = format!("{} {}", raw.action, raw.instance);
-        match (raw.quantity, raw.unit.as_deref()) {
+        let body = match (raw.quantity, raw.unit.as_deref()) {
             (Some(q), Some(u)) => format!("{base} ({q} {u})"),
             (Some(q), None) => format!("{base} ({q})"),
             (None, Some(u)) => format!("{base} ({u})"),
             (None, None) => base,
+        };
+        match event_time {
+            Some(t) => format!("[{}] {}", t.format("%Y-%m-%d"), body),
+            None => body,
         }
     }
 
@@ -676,11 +693,443 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
             assert!(obs.confidence <= 1.0);
             assert!(obs.confidence >= 0.0);
         }
+
+        #[test]
+        fn content_prefixes_event_date_when_present() {
+            // v1.1: observations carry their date inline so temporal-reasoning
+            // readers don't have to cross-reference session-block headers.
+            let raw = RawObservation {
+                entity_type: "degree_earned".into(),
+                instance: "Business Administration".into(),
+                action: "graduated with".into(),
+                quantity: Some(1.0),
+                unit: None,
+                confidence: 0.9,
+            };
+            let event_time = Some(
+                DateTime::parse_from_rfc3339("2024-05-10T14:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            );
+            let obs = raw_to_observation(raw, Uuid::new_v4(), Uuid::new_v4(), event_time);
+            assert_eq!(obs.content, "[2024-05-10] graduated with Business Administration (1)");
+            assert_eq!(obs.event_time, event_time);
+        }
+
+        #[test]
+        fn content_omits_prefix_when_event_time_absent() {
+            // Keeps zero-cost fallback for callers without a date (unit tests,
+            // extractors that fail to resolve event_time). Matches the pre-v1.1
+            // format so ObservationMemory rows built without a date still embed
+            // cleanly against existing vector indexes.
+            let raw = RawObservation {
+                entity_type: "task_tried".into(),
+                instance: "Todoist".into(),
+                action: "will try out".into(),
+                quantity: None,
+                unit: None,
+                confidence: 0.8,
+            };
+            let obs = raw_to_observation(raw, Uuid::new_v4(), Uuid::new_v4(), None);
+            assert_eq!(obs.content, "will try out Todoist");
+            assert!(obs.event_time.is_none());
+        }
     }
 }
 
 #[cfg(feature = "observation-extraction")]
 pub use haiku::{AnthropicHaikuExtractor, EXTRACTION_PROMPT_V1};
+
+// ---------------------------------------------------------------------------
+// LocalLLMExtractor (feature-gated) — OpenAI-compatible local vLLM backend
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "observation-extraction")]
+mod localllm {
+    use super::haiku::{
+        EXTRACTION_PROMPT_V1, RawObservation, parse_response, raw_to_observation,
+    };
+    use super::{
+        ExtractionError, ExtractionMessage, ExtractionResult, ObservationExtractor,
+        ObservationMemory,
+    };
+    use async_trait::async_trait;
+    use serde::{Deserialize, Serialize};
+    use std::fmt::Write as _;
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    // Default wired to the DGX Spark local vLLM port the bench uses (see
+    // pensyve-docs/research/benchmark-sprint/20-observation-extractor-ingest-topk.md
+    // for the offline-first rationale). Any OpenAI-compatible chat-completions
+    // endpoint works — Qwen, Nemotron Nano, llama.cpp's server, etc.
+    const DEFAULT_BASE_URL: &str = "http://localhost:8888/v1";
+    const DEFAULT_MODEL: &str = "local";
+    const DEFAULT_MAX_TOKENS: u32 = 4096;
+    // Local reasoning models (Qwen 3.6, Nemotron 3 Nano in reasoning mode)
+    // emit hundreds of <think> tokens before the JSON output — a plain
+    // extraction prompt can easily hit 60-90s per episode on GB10. The
+    // 300s default covers the long tail; dense non-reasoning models (Qwen
+    // 3.5-27B dense, Qwen3-coder) finish in ~5-10s and aren't affected.
+    const DEFAULT_TIMEOUT_SECS: u64 = 300;
+
+    /// Extractor that hits an OpenAI-compatible `chat.completions` endpoint —
+    /// designed for local vLLM serving a small open-weight model (Qwen 3.5-27B
+    /// dense, Nemotron Nano 30B, etc.). Mirrors [`AnthropicHaikuExtractor`]
+    /// (same `EXTRACTION_PROMPT_V1`, same `RawObservation` shape, same
+    /// tolerant JSON parser) so switching extractors is a pure config flip
+    /// with no recall-time surface change.
+    ///
+    /// Wired via `Pensyve(extractor="local-vllm", ...)` on the Python side.
+    /// Offline-first: requires no API key and no network egress beyond the
+    /// configured `base_url`.
+    #[derive(Debug, Clone)]
+    pub struct LocalLLMExtractor {
+        client: reqwest::Client,
+        base_url: String,
+        model: String,
+        api_key: Option<String>,
+        max_tokens: u32,
+    }
+
+    impl LocalLLMExtractor {
+        /// Build with explicit endpoint + model id. `api_key` is optional —
+        /// local vLLM accepts any string (including none); cloud-gateway
+        /// drop-ins like vLLM-on-Modal may require it.
+        pub fn new(
+            base_url: impl Into<String>,
+            model: impl Into<String>,
+            api_key: Option<String>,
+        ) -> ExtractionResult<Self> {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+                .build()
+                .map_err(|e| ExtractionError::Config(format!("http client build: {e}")))?;
+            Ok(Self {
+                client,
+                base_url: base_url.into(),
+                model: model.into(),
+                api_key,
+                max_tokens: DEFAULT_MAX_TOKENS,
+            })
+        }
+
+        /// Build from environment variables:
+        ///   - `PENSYVE_LOCAL_LLM_URL`  (default `http://localhost:8888/v1`)
+        ///   - `PENSYVE_LOCAL_LLM_MODEL` (default `"local"` — vLLM accepts any
+        ///     model id for a single-model server; users override when the
+        ///     gateway multiplexes)
+        ///   - `PENSYVE_LOCAL_LLM_API_KEY` (optional)
+        pub fn from_env() -> ExtractionResult<Self> {
+            let base_url =
+                std::env::var("PENSYVE_LOCAL_LLM_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into());
+            let model = std::env::var("PENSYVE_LOCAL_LLM_MODEL")
+                .unwrap_or_else(|_| DEFAULT_MODEL.into());
+            let api_key = std::env::var("PENSYVE_LOCAL_LLM_API_KEY").ok();
+            Self::new(base_url, model, api_key)
+        }
+
+        #[must_use]
+        pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+            self.base_url = base_url.into();
+            self
+        }
+
+        #[must_use]
+        pub fn with_model(mut self, model: impl Into<String>) -> Self {
+            self.model = model.into();
+            self
+        }
+
+        #[must_use]
+        pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+            self.max_tokens = max_tokens;
+            self
+        }
+
+        /// Render the `[date] role: content` body + the V1 extraction prompt.
+        /// Duplicates the body-building shape from `AnthropicHaikuExtractor::
+        /// build_prompt` so the local backend sees identical prompt text —
+        /// any deviation would break the benchmark-pinned prompt.
+        fn build_prompt(messages: &[ExtractionMessage]) -> String {
+            if messages.is_empty() {
+                return format!("{EXTRACTION_PROMPT_V1}\n\n[No conversation memories provided.]\n");
+            }
+            let mut body = String::new();
+            for m in messages {
+                let date = m.event_time.map_or_else(
+                    || "unknown".to_string(),
+                    |t| t.format("%Y-%m-%d").to_string(),
+                );
+                if m.role.is_empty() {
+                    let _ = writeln!(body, "[{date}] {}", m.content);
+                } else {
+                    let _ = writeln!(body, "[{date}] {}: {}", m.role, m.content);
+                }
+            }
+            format!(
+                "{EXTRACTION_PROMPT_V1}\n\n--- Recalled memories ---\n{body}--- End memories ---"
+            )
+        }
+    }
+
+    #[derive(Debug, Serialize)]
+    struct OpenAIRequest<'a> {
+        model: &'a str,
+        messages: Vec<OpenAIMessage<'a>>,
+        max_tokens: u32,
+        temperature: f32,
+        // Qwen 3+ / Nemotron Nano are reasoning models: by default they emit
+        // 1-3k tokens of <think> output before producing the JSON, which at
+        // ~15 tok/s on GB10 blows a 300s budget. `enable_thinking: false`
+        // disables the reasoning pass — extraction runs in seconds instead
+        // of minutes. Non-reasoning models ignore the kwarg harmlessly.
+        chat_template_kwargs: ChatTemplateKwargs,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct ChatTemplateKwargs {
+        enable_thinking: bool,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct OpenAIMessage<'a> {
+        role: &'a str,
+        content: &'a str,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct OpenAIResponse {
+        #[serde(default)]
+        choices: Vec<OpenAIChoice>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct OpenAIChoice {
+        #[serde(default)]
+        message: OpenAIChoiceMessage,
+    }
+
+    #[derive(Debug, Deserialize, Default)]
+    struct OpenAIChoiceMessage {
+        #[serde(default)]
+        content: String,
+    }
+
+    #[async_trait]
+    impl ObservationExtractor for LocalLLMExtractor {
+        async fn extract(
+            &self,
+            namespace_id: Uuid,
+            episode_id: Uuid,
+            messages: &[ExtractionMessage],
+        ) -> ExtractionResult<Vec<ObservationMemory>> {
+            let prompt = Self::build_prompt(messages);
+            let last_event_time = messages.iter().filter_map(|m| m.event_time).max();
+
+            let req = OpenAIRequest {
+                model: &self.model,
+                messages: vec![OpenAIMessage {
+                    role: "user",
+                    content: &prompt,
+                }],
+                max_tokens: self.max_tokens,
+                temperature: 0.0,
+                chat_template_kwargs: ChatTemplateKwargs {
+                    enable_thinking: false,
+                },
+            };
+
+            // vLLM's chat endpoint lives at `/chat/completions` below
+            // `/v1`, so append both pieces regardless of whether the caller
+            // passed the trailing `/v1` themselves.
+            let base = self.base_url.trim_end_matches('/');
+            let base = if base.ends_with("/v1") {
+                base.to_string()
+            } else {
+                format!("{base}/v1")
+            };
+            let url = format!("{base}/chat/completions");
+
+            let mut builder = self.client.post(&url).json(&req);
+            if let Some(key) = self.api_key.as_deref() {
+                builder = builder.bearer_auth(key);
+            }
+            let response = builder
+                .send()
+                .await
+                .map_err(|e| ExtractionError::Transport(e.to_string()))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(ExtractionError::Transport(format!("HTTP {status}: {body}")));
+            }
+
+            let parsed: OpenAIResponse = response
+                .json()
+                .await
+                .map_err(|e| ExtractionError::Parse(e.to_string()))?;
+
+            let text = parsed
+                .choices
+                .into_iter()
+                .next()
+                .map(|c| c.message.content)
+                .unwrap_or_default();
+
+            let raws: Vec<RawObservation> = parse_response(&text);
+            Ok(raws
+                .into_iter()
+                .map(|r| raw_to_observation(r, namespace_id, episode_id, last_event_time))
+                .collect())
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests
+    // -----------------------------------------------------------------------
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use chrono::{DateTime, Utc};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn openai_response_body(text: &str) -> serde_json::Value {
+            serde_json::json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "model": "local",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            })
+        }
+
+        #[test]
+        fn from_env_uses_defaults_when_unset() {
+            // Best-effort: some env vars may be set in the test shell;
+            // only assert the call doesn't panic and returns a ready struct.
+            let e = LocalLLMExtractor::from_env().expect("from_env");
+            // Either default or env override; both are valid non-empty strings.
+            assert!(!e.base_url.is_empty());
+            assert!(!e.model.is_empty());
+        }
+
+        #[test]
+        fn build_prompt_date_anchors_turn_bodies() {
+            let msgs = [ExtractionMessage {
+                role: "user".into(),
+                content: "I picked up boots from Zara.".into(),
+                event_time: DateTime::parse_from_rfc3339("2024-02-05T10:00:00Z")
+                    .ok()
+                    .map(|d| d.with_timezone(&Utc)),
+            }];
+            let p = LocalLLMExtractor::build_prompt(&msgs);
+            assert!(p.contains("[2024-02-05] user: I picked up boots from Zara."));
+            assert!(p.contains("--- Recalled memories ---"));
+        }
+
+        #[tokio::test]
+        async fn extractor_parses_openai_shaped_response() {
+            let server = MockServer::start().await;
+            let raw_json = r#"[{"entity_type":"degree_earned","instance":"Business Administration","action":"graduated with","quantity":1,"confidence":0.9}]"#;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(openai_response_body(raw_json)))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let extractor = LocalLLMExtractor::new(server.uri(), "local", None).unwrap();
+            let event_time = DateTime::parse_from_rfc3339("2024-05-10T14:00:00Z")
+                .ok()
+                .map(|d| d.with_timezone(&Utc));
+            let msgs = [ExtractionMessage {
+                role: String::new(),
+                content: "I graduated with a BS in BA.".into(),
+                event_time,
+            }];
+            let out = extractor
+                .extract(Uuid::new_v4(), Uuid::new_v4(), &msgs)
+                .await
+                .expect("ok");
+            assert_eq!(out.len(), 1);
+            assert_eq!(
+                out[0].content,
+                "[2024-05-10] graduated with Business Administration (1)"
+            );
+        }
+
+        #[tokio::test]
+        async fn extractor_surfaces_http_errors_as_transport_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let extractor = LocalLLMExtractor::new(server.uri(), "local", None).unwrap();
+            let err = extractor
+                .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
+                .await
+                .err()
+                .expect("err");
+            match err {
+                ExtractionError::Transport(_) => {}
+                other => panic!("expected Transport, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn extractor_returns_empty_on_unparseable_response() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(openai_response_body("I'm sorry, I cannot comply.")),
+                )
+                .mount(&server)
+                .await;
+            let extractor = LocalLLMExtractor::new(server.uri(), "local", None).unwrap();
+            let out = extractor
+                .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
+                .await
+                .expect("ok");
+            assert!(out.is_empty());
+        }
+
+        #[tokio::test]
+        async fn base_url_without_v1_suffix_is_normalized() {
+            // Users may pass the raw host (e.g. reading a bare vLLM env var).
+            // The extractor should append `/v1/chat/completions` rather than
+            // double-nesting when `/v1` is already present.
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(openai_response_body("[]")))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let bare = server.uri(); // no trailing /v1
+            let extractor = LocalLLMExtractor::new(bare, "local", None).unwrap();
+            extractor
+                .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
+                .await
+                .expect("ok");
+        }
+    }
+}
+
+#[cfg(feature = "observation-extraction")]
+pub use localllm::LocalLLMExtractor;
 
 // ---------------------------------------------------------------------------
 // Ingest helper — canonical post-episode-close extraction flow
