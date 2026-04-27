@@ -371,7 +371,14 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
         episode_id: Uuid,
         event_time: Option<DateTime<Utc>>,
     ) -> ObservationMemory {
-        let content = format_observation_content(&raw, event_time);
+        // Embed the bare fact only — `event_time` lives in metadata. The
+        // earlier `[YYYY-MM-DD]` prefix would have stamped the *episode-max*
+        // timestamp into every observation (since extractors derive event_time
+        // as `messages.iter().filter_map(|m| m.event_time).max()`); for any
+        // backfilled or multi-day episode that misdates per-fact text and
+        // skews temporal recall. Leaving date attribution to readers/UI keeps
+        // the embedding text faithful to the underlying turn.
+        let content = format_observation_content(&raw);
         let mut obs = ObservationMemory::new(
             namespace_id,
             episode_id,
@@ -388,27 +395,17 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
     }
 
     /// Render a human-readable sentence used as the embedding + display content.
-    /// When `event_time` is known it is prefixed as `[YYYY-MM-DD] ` so the
-    /// observation is a self-contained date+fact string at recall time —
-    /// without the prefix, temporal-reasoning readers have to cross-reference
-    /// session-block headers to learn *when* a fact applies. Sprint doc 20's
-    /// pipeline relied on the outer reader prompt to attach dates; v1.1 moves
-    /// that responsibility into the observation itself so any reader that
-    /// simply concatenates content strings gets the date for free.
-    fn format_observation_content(
-        raw: &RawObservation,
-        event_time: Option<DateTime<Utc>>,
-    ) -> String {
+    /// Date attribution lives in `ObservationMemory::event_time` (metadata),
+    /// not in the embedded text — extractors only know the episode-max
+    /// timestamp, which would misdate per-fact content for any backfilled or
+    /// multi-day episode. Readers/UI that need a date can format from metadata.
+    fn format_observation_content(raw: &RawObservation) -> String {
         let base = format!("{} {}", raw.action, raw.instance);
-        let body = match (raw.quantity, raw.unit.as_deref()) {
+        match (raw.quantity, raw.unit.as_deref()) {
             (Some(q), Some(u)) => format!("{base} ({q} {u})"),
             (Some(q), None) => format!("{base} ({q})"),
             (None, Some(u)) => format!("{base} ({u})"),
             (None, None) => base,
-        };
-        match event_time {
-            Some(t) => format!("[{}] {}", t.format("%Y-%m-%d"), body),
-            None => body,
         }
     }
 
@@ -695,9 +692,12 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
         }
 
         #[test]
-        fn content_prefixes_event_date_when_present() {
-            // v1.1: observations carry their date inline so temporal-reasoning
-            // readers don't have to cross-reference session-block headers.
+        fn content_excludes_date_prefix_event_time_in_metadata_only() {
+            // Per PR #72 review (codex P1): observations must NOT embed
+            // `[YYYY-MM-DD]` into content because extractors only have access
+            // to episode-max event_time, which misdates every per-fact string
+            // in a backfilled / multi-day episode. Content stays plain;
+            // event_time lives only in ObservationMemory metadata.
             let raw = RawObservation {
                 entity_type: "degree_earned".into(),
                 instance: "Business Administration".into(),
@@ -712,16 +712,12 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
                     .with_timezone(&Utc),
             );
             let obs = raw_to_observation(raw, Uuid::new_v4(), Uuid::new_v4(), event_time);
-            assert_eq!(obs.content, "[2024-05-10] graduated with Business Administration (1)");
+            assert_eq!(obs.content, "graduated with Business Administration (1)");
             assert_eq!(obs.event_time, event_time);
         }
 
         #[test]
-        fn content_omits_prefix_when_event_time_absent() {
-            // Keeps zero-cost fallback for callers without a date (unit tests,
-            // extractors that fail to resolve event_time). Matches the pre-v1.1
-            // format so ObservationMemory rows built without a date still embed
-            // cleanly against existing vector indexes.
+        fn content_omits_date_when_event_time_absent() {
             let raw = RawObservation {
                 entity_type: "task_tried".into(),
                 instance: "Todoist".into(),
@@ -747,7 +743,7 @@ pub use haiku::{AnthropicHaikuExtractor, EXTRACTION_PROMPT_V1};
 #[cfg(feature = "observation-extraction")]
 mod localllm {
     use super::haiku::{
-        EXTRACTION_PROMPT_V1, RawObservation, parse_response, raw_to_observation,
+        AnthropicHaikuExtractor, RawObservation, parse_response, raw_to_observation,
     };
     use super::{
         ExtractionError, ExtractionMessage, ExtractionResult, ObservationExtractor,
@@ -755,7 +751,6 @@ mod localllm {
     };
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
-    use std::fmt::Write as _;
     use std::time::Duration;
     use uuid::Uuid;
 
@@ -823,8 +818,8 @@ mod localllm {
         pub fn from_env() -> ExtractionResult<Self> {
             let base_url =
                 std::env::var("PENSYVE_LOCAL_LLM_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into());
-            let model = std::env::var("PENSYVE_LOCAL_LLM_MODEL")
-                .unwrap_or_else(|_| DEFAULT_MODEL.into());
+            let model =
+                std::env::var("PENSYVE_LOCAL_LLM_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
             let api_key = std::env::var("PENSYVE_LOCAL_LLM_API_KEY").ok();
             Self::new(base_url, model, api_key)
         }
@@ -848,28 +843,12 @@ mod localllm {
         }
 
         /// Render the `[date] role: content` body + the V1 extraction prompt.
-        /// Duplicates the body-building shape from `AnthropicHaikuExtractor::
-        /// build_prompt` so the local backend sees identical prompt text —
-        /// any deviation would break the benchmark-pinned prompt.
+        /// Delegates to `AnthropicHaikuExtractor::build_prompt` (made
+        /// `pub(super)` in this PR) so the local backend sees identical
+        /// prompt text by construction — any deviation would break the
+        /// benchmark-pinned prompt.
         fn build_prompt(messages: &[ExtractionMessage]) -> String {
-            if messages.is_empty() {
-                return format!("{EXTRACTION_PROMPT_V1}\n\n[No conversation memories provided.]\n");
-            }
-            let mut body = String::new();
-            for m in messages {
-                let date = m.event_time.map_or_else(
-                    || "unknown".to_string(),
-                    |t| t.format("%Y-%m-%d").to_string(),
-                );
-                if m.role.is_empty() {
-                    let _ = writeln!(body, "[{date}] {}", m.content);
-                } else {
-                    let _ = writeln!(body, "[{date}] {}: {}", m.role, m.content);
-                }
-            }
-            format!(
-                "{EXTRACTION_PROMPT_V1}\n\n--- Recalled memories ---\n{body}--- End memories ---"
-            )
+            AnthropicHaikuExtractor::build_prompt(messages)
         }
     }
 
@@ -1041,7 +1020,9 @@ mod localllm {
             let raw_json = r#"[{"entity_type":"degree_earned","instance":"Business Administration","action":"graduated with","quantity":1,"confidence":0.9}]"#;
             Mock::given(method("POST"))
                 .and(path("/v1/chat/completions"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(openai_response_body(raw_json)))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(openai_response_body(raw_json)),
+                )
                 .expect(1)
                 .mount(&server)
                 .await;
@@ -1060,10 +1041,11 @@ mod localllm {
                 .await
                 .expect("ok");
             assert_eq!(out.len(), 1);
-            assert_eq!(
-                out[0].content,
-                "[2024-05-10] graduated with Business Administration (1)"
-            );
+            // Per PR #72 review (codex P1): content is the bare fact only;
+            // event_time lives in metadata to avoid stamping the episode-max
+            // timestamp into per-fact embedded text.
+            assert_eq!(out[0].content, "graduated with Business Administration (1)");
+            assert_eq!(out[0].event_time, event_time);
         }
 
         #[tokio::test]

@@ -228,26 +228,23 @@ fn build_extractor(
             //   PENSYVE_LOCAL_LLM_MODEL  (default "local")
             //   PENSYVE_LOCAL_LLM_API_KEY (optional bearer token)
             // `api_key` passed as a positional kwarg overrides the env var.
-            let built = pensyve_core::observation::LocalLLMExtractor::from_env()
-                .map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "Failed to build local-vllm extractor: {e}"
-                    ))
-                })?;
+            // Build directly per branch — when `api_key` is provided we want
+            // the explicit-config path; otherwise the env-only path. Avoids
+            // the wasted reqwest::Client allocation an unconditional
+            // `from_env()` followed by `new()` would incur.
             let built = match api_key {
                 Some(k) => pensyve_core::observation::LocalLLMExtractor::new(
                     std::env::var("PENSYVE_LOCAL_LLM_URL")
                         .unwrap_or_else(|_| "http://localhost:8888/v1".into()),
-                    std::env::var("PENSYVE_LOCAL_LLM_MODEL")
-                        .unwrap_or_else(|_| "local".into()),
+                    std::env::var("PENSYVE_LOCAL_LLM_MODEL").unwrap_or_else(|_| "local".into()),
                     Some(k.to_string()),
                 )
                 .map_err(|e| {
-                    PyRuntimeError::new_err(format!(
-                        "Failed to build local-vllm extractor: {e}"
-                    ))
+                    PyRuntimeError::new_err(format!("Failed to build local-vllm extractor: {e}"))
                 })?,
-                None => built,
+                None => pensyve_core::observation::LocalLLMExtractor::from_env().map_err(|e| {
+                    PyRuntimeError::new_err(format!("Failed to build local-vllm extractor: {e}"))
+                })?,
             };
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
@@ -521,31 +518,31 @@ impl PyPensyve {
         // NOTE: Lock held across recall (including embedding). RecallEngine borrows &VectorIndex.
         // Future: make RecallEngine lock internally per-operation to allow concurrent recalls.
         let vi = self.inner.vector_index.lock().unwrap();
-        // Build the graph fresh per-call from storage. Cheap (O(entities + edges)),
-        // always reflects the latest commits, and avoids lock juggling across
-        // concurrent recalls. This is a correctness-by-default feature: the
-        // Pensyve algorithm specifies graph traversal as part of recall fusion.
-        let graph = MemoryGraph::build_from_storage(
-            self.inner.storage.as_ref(),
-            self.inner.namespace.id,
-        );
+        // Per PR #72 review (codex P2): graph traversal in `RecallEngine`
+        // only kicks in when both a graph AND a target_entity are supplied
+        // (see `retrieval.rs:512` `match (self.graph, target_entity)`).
+        // Skip the O(entities + edges) graph build when no entity is provided —
+        // it would be wired into the engine but never consulted by ranking.
+        let entity_id = entity.map(|e| e.uuid);
+        let graph = entity_id.map(|_| {
+            MemoryGraph::build_from_storage(self.inner.storage.as_ref(), self.inner.namespace.id)
+        });
         let mut engine = RecallEngine::new(
             self.inner.storage.as_ref(),
             self.inner.embedder.as_ref(),
             &vi,
             &self.inner.retrieval_config,
         );
-        engine = engine.with_graph(&graph);
+        if let Some(g) = graph.as_ref() {
+            engine = engine.with_graph(g);
+        }
         if let Some(reranker) = self.inner.reranker.as_deref() {
             engine = engine.with_reranker(reranker);
         }
 
         let result = engine
-            .recall(query, self.inner.namespace.id, limit)
+            .recall_with_entity(query, self.inner.namespace.id, limit, entity_id)
             .map_err(|e| PyRuntimeError::new_err(format!("Recall failed: {e}")))?;
-
-        // Post-filter by entity if provided.
-        let entity_id = entity.map(|e| e.uuid);
 
         let mut memories: Vec<PyMemory> = result
             .memories
@@ -627,20 +624,17 @@ impl PyPensyve {
         // Lock held across recall, same as `recall()` — RecallEngine borrows
         // &VectorIndex for the duration of the call.
         let vi = self.inner.vector_index.lock().unwrap();
-        // Build the graph fresh per-call from storage — same rationale as
-        // `recall()` above. Keeps `recall_grouped` aligned with the same
-        // feature set (graph + reranker) as the single-entity path.
-        let graph = MemoryGraph::build_from_storage(
-            self.inner.storage.as_ref(),
-            self.inner.namespace.id,
-        );
+        // No graph here: `recall_grouped` accepts no target_entity, and graph
+        // traversal in `RecallEngine` only fires when both a graph and a
+        // target_entity are present (codex P2 on PR #72). Building it here
+        // would burn an O(entities + edges) storage scan with no ranking
+        // payoff. Reranker still wires in below.
         let mut engine = RecallEngine::new(
             self.inner.storage.as_ref(),
             self.inner.embedder.as_ref(),
             &vi,
             &self.inner.retrieval_config,
         );
-        engine = engine.with_graph(&graph);
         if let Some(reranker) = self.inner.reranker.as_deref() {
             engine = engine.with_reranker(reranker);
         }
