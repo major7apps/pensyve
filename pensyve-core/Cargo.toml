@@ -41,6 +41,11 @@ postgres = ["dep:sqlx-core", "dep:sqlx-postgres", "dep:tokio"]
 # Feature-gate the Anthropic-API-backed observation extractor so users
 # who don't need observations pay no HTTP-client compile cost.
 observation-extraction = ["dep:reqwest", "dep:tokio"]
+# Opt-in Anthropic Messages Batches API path — submits N episodes in one
+# request and stacks 50% off with prompt caching for ~80% per-call savings
+# on bulk workloads (benchmarks, nightly re-ingests). Reuses the
+# observation-extraction reqwest+tokio dependencies.
+batch-extractor = ["observation-extraction"]
 
 [dev-dependencies]
 tempfile = "3"

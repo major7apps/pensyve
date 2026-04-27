@@ -102,6 +102,32 @@ pub trait ObservationExtractor: Send + Sync + Debug {
         episode_id: Uuid,
         messages: &[ExtractionMessage],
     ) -> ExtractionResult<Vec<ObservationMemory>>;
+
+    /// Optional bulk extraction. Default implementation loops over `extract`.
+    ///
+    /// Implementations that support a batch API (e.g. Anthropic Messages
+    /// Batches) SHOULD override to amortize per-call overhead. The
+    /// `episode_ids` and `episodes` slices MUST have equal length; the
+    /// returned `Vec<Vec<ObservationMemory>>` is in input order.
+    async fn extract_batch(
+        &self,
+        namespace_id: Uuid,
+        episode_ids: &[Uuid],
+        episodes: Vec<&[ExtractionMessage]>,
+    ) -> ExtractionResult<Vec<Vec<ObservationMemory>>> {
+        if episode_ids.len() != episodes.len() {
+            return Err(ExtractionError::Other(format!(
+                "extract_batch: episode_ids ({}) and episodes ({}) length mismatch",
+                episode_ids.len(),
+                episodes.len(),
+            )));
+        }
+        let mut out = Vec::with_capacity(episodes.len());
+        for (eid, ep) in episode_ids.iter().zip(episodes) {
+            out.push(self.extract(namespace_id, *eid, ep).await?);
+        }
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +216,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
     const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
     const DEFAULT_MAX_TOKENS: u32 = 4096;
     const DEFAULT_TIMEOUT_SECS: u64 = 60;
-    const ANTHROPIC_VERSION: &str = "2023-06-01";
+    pub(super) const ANTHROPIC_VERSION: &str = "2023-06-01";
 
     /// Anthropic-Messages-API-backed observation extractor.
     ///
@@ -271,6 +297,43 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
             EXTRACTION_PROMPT_V1
         }
 
+        /// Borrow the underlying HTTP client. Sibling modules in
+        /// `pensyve-core::observation` (e.g. `batched_haiku`) reuse it to
+        /// avoid building a second connection pool.
+        ///
+        /// Gated to the `batch-extractor` feature because that's the only
+        /// in-tree caller; under `observation-extraction` alone these
+        /// accessors would dead-code-warn.
+        #[cfg(feature = "batch-extractor")]
+        pub(super) fn client(&self) -> &reqwest::Client {
+            &self.client
+        }
+
+        #[cfg(feature = "batch-extractor")]
+        pub(super) fn api_key(&self) -> &str {
+            &self.api_key
+        }
+
+        #[cfg(feature = "batch-extractor")]
+        pub(super) fn model(&self) -> &str {
+            &self.model
+        }
+
+        #[cfg(feature = "batch-extractor")]
+        pub(super) fn max_tokens(&self) -> u32 {
+            self.max_tokens
+        }
+
+        #[cfg(feature = "batch-extractor")]
+        pub(super) fn base_url(&self) -> &str {
+            &self.base_url
+        }
+
+        #[cfg(feature = "batch-extractor")]
+        pub(super) fn prompt_caching_enabled(&self) -> bool {
+            self.prompt_caching_enabled
+        }
+
         /// Render only the per-call recalled-memories body (no instruction
         /// header). The result is sent as `messages[0].content`; the static
         /// header travels separately via [`Self::system_prompt`] and gets
@@ -342,9 +405,9 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
     }
 
     #[derive(Debug, Serialize)]
-    struct AnthropicMessage<'a> {
-        role: &'a str,
-        content: &'a str,
+    pub(super) struct AnthropicMessage<'a> {
+        pub(super) role: &'a str,
+        pub(super) content: &'a str,
     }
 
     /// One block of the Anthropic Messages API `system` field. The
@@ -352,18 +415,18 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
     /// this block; subsequent calls within the cache window bill those
     /// tokens at 10% of regular input price.
     #[derive(Debug, Serialize)]
-    struct SystemBlock<'a> {
+    pub(super) struct SystemBlock<'a> {
         #[serde(rename = "type")]
-        block_type: &'static str,
-        text: &'a str,
+        pub(super) block_type: &'static str,
+        pub(super) text: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<CacheControl>,
+        pub(super) cache_control: Option<CacheControl>,
     }
 
     #[derive(Debug, Serialize)]
-    struct CacheControl {
+    pub(super) struct CacheControl {
         #[serde(rename = "type")]
-        cache_type: &'static str,
+        pub(super) cache_type: &'static str,
     }
 
     // Sibling extractor modules (see `localllm`) share this observation shape
@@ -974,6 +1037,811 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
 pub use haiku::{AnthropicHaikuExtractor, EXTRACTION_PROMPT_V1};
 
 // ---------------------------------------------------------------------------
+// BatchedAnthropicHaikuExtractor (feature-gated, opt-in) — Anthropic Messages
+// Batches API path. Stacks with prompt caching for ~80% per-call savings on
+// bulk workloads (benchmarks, nightly re-ingests). Submits N episodes in
+// one POST and polls `processing_status` until "ended", then collects
+// JSONL results routed by `custom_id`.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "batch-extractor")]
+mod batched_haiku {
+    use super::haiku::{
+        ANTHROPIC_VERSION, AnthropicHaikuExtractor, AnthropicMessage, CacheControl, SystemBlock,
+        parse_response, raw_to_observation,
+    };
+    use super::{
+        ExtractionError, ExtractionMessage, ExtractionResult, ObservationExtractor,
+        ObservationMemory,
+    };
+    use async_trait::async_trait;
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    /// Default poll cadence — Anthropic batches typically complete inside
+    /// minutes; 30s keeps GET volume reasonable across long batches without
+    /// adding noticeable latency for short ones.
+    const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(30);
+    /// Default ceiling — Anthropic's documented SLA is 24h, but 2h covers
+    /// every observed bench batch with margin. Callers running larger
+    /// workloads override via [`BatchedAnthropicHaikuExtractor::with_max_wait`].
+    const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(2 * 60 * 60);
+
+    /// Anthropic Messages Batches API extractor — opt-in bulk path.
+    ///
+    /// Wraps [`AnthropicHaikuExtractor`] and submits a single
+    /// `POST /v1/messages/batches` request carrying one entry per episode.
+    /// Single-episode `extract` calls fall through to the inner sync
+    /// extractor since batch overhead isn't worth it under those conditions.
+    #[derive(Debug, Clone)]
+    pub struct BatchedAnthropicHaikuExtractor {
+        inner: AnthropicHaikuExtractor,
+        poll_interval: Duration,
+        max_wait: Duration,
+    }
+
+    impl BatchedAnthropicHaikuExtractor {
+        /// Wrap an existing [`AnthropicHaikuExtractor`] with batch-mode
+        /// dispatch.
+        #[must_use]
+        pub fn new(inner: AnthropicHaikuExtractor) -> Self {
+            Self {
+                inner,
+                poll_interval: DEFAULT_POLL_INTERVAL,
+                max_wait: DEFAULT_MAX_WAIT,
+            }
+        }
+
+        /// Build the inner extractor from `ANTHROPIC_API_KEY` and wrap it.
+        pub fn from_env() -> ExtractionResult<Self> {
+            Ok(Self::new(AnthropicHaikuExtractor::from_env()?))
+        }
+
+        /// Override the poll cadence (default 30s).
+        #[must_use]
+        pub fn with_poll_interval(mut self, d: Duration) -> Self {
+            self.poll_interval = d;
+            self
+        }
+
+        /// Override the max-wait ceiling (default 2h). Anthropic's SLA is
+        /// 24h; raise for larger workloads.
+        #[must_use]
+        pub fn with_max_wait(mut self, d: Duration) -> Self {
+            self.max_wait = d;
+            self
+        }
+
+        async fn submit_batch(
+            &self,
+            episode_ids: &[Uuid],
+            episodes: &[&[ExtractionMessage]],
+        ) -> ExtractionResult<String> {
+            // Each batch entry mirrors the shape of `extract()`'s
+            // `AnthropicRequest` so caching/temperature/max_tokens stay
+            // identical across paths. The user message is built per-episode
+            // because `BatchEntry` owns its `BatchParams`.
+            let user_messages: Vec<String> = episodes
+                .iter()
+                .map(|ep| AnthropicHaikuExtractor::user_message(ep))
+                .collect();
+
+            let cache_control = if self.inner.prompt_caching_enabled() {
+                Some(CacheControl {
+                    cache_type: "ephemeral",
+                })
+            } else {
+                None
+            };
+
+            let entries: Vec<BatchEntry<'_>> = episode_ids
+                .iter()
+                .zip(user_messages.iter())
+                .map(|(eid, content)| BatchEntry {
+                    custom_id: eid.to_string(),
+                    params: BatchParams {
+                        model: self.inner.model(),
+                        max_tokens: self.inner.max_tokens(),
+                        temperature: 0.0,
+                        system: Some(vec![SystemBlock {
+                            block_type: "text",
+                            text: AnthropicHaikuExtractor::system_prompt(),
+                            cache_control: cache_control.as_ref().map(|_| CacheControl {
+                                cache_type: "ephemeral",
+                            }),
+                        }]),
+                        messages: vec![AnthropicMessage {
+                            role: "user",
+                            content,
+                        }],
+                    },
+                })
+                .collect();
+
+            let req = BatchSubmitRequest { requests: entries };
+
+            let url = format!(
+                "{}/v1/messages/batches",
+                self.inner.base_url().trim_end_matches('/')
+            );
+            let response = self
+                .inner
+                .client()
+                .post(&url)
+                .header("x-api-key", self.inner.api_key())
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .header("content-type", "application/json")
+                .json(&req)
+                .send()
+                .await
+                .map_err(|e| ExtractionError::Transport(e.to_string()))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(ExtractionError::Transport(format!("HTTP {status}: {body}")));
+            }
+
+            let parsed: BatchSubmitResponse = response
+                .json()
+                .await
+                .map_err(|e| ExtractionError::Parse(e.to_string()))?;
+            Ok(parsed.id)
+        }
+
+        async fn await_completion(&self, batch_id: &str) -> ExtractionResult<()> {
+            let start = Instant::now();
+            let url = format!(
+                "{}/v1/messages/batches/{batch_id}",
+                self.inner.base_url().trim_end_matches('/')
+            );
+            loop {
+                let response = self
+                    .inner
+                    .client()
+                    .get(&url)
+                    .header("x-api-key", self.inner.api_key())
+                    .header("anthropic-version", ANTHROPIC_VERSION)
+                    .send()
+                    .await
+                    .map_err(|e| ExtractionError::Transport(e.to_string()))?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(ExtractionError::Transport(format!("HTTP {status}: {body}")));
+                }
+                let status_body: BatchStatusResponse = response
+                    .json()
+                    .await
+                    .map_err(|e| ExtractionError::Parse(e.to_string()))?;
+                match status_body.processing_status.as_str() {
+                    "ended" => return Ok(()),
+                    "canceling" | "canceled" | "expired" | "failed" => {
+                        return Err(ExtractionError::Transport(format!(
+                            "batch {batch_id} terminated with status {}",
+                            status_body.processing_status
+                        )));
+                    }
+                    _ => {}
+                }
+                if Instant::now().duration_since(start) >= self.max_wait {
+                    return Err(ExtractionError::Other(format!(
+                        "batch {batch_id} exceeded max_wait of {:?}",
+                        self.max_wait
+                    )));
+                }
+                tokio::time::sleep(self.poll_interval).await;
+            }
+        }
+
+        async fn collect_results(
+            &self,
+            batch_id: &str,
+            namespace_id: Uuid,
+            episode_ids: &[Uuid],
+        ) -> ExtractionResult<Vec<Vec<ObservationMemory>>> {
+            let url = format!(
+                "{}/v1/messages/batches/{batch_id}/results",
+                self.inner.base_url().trim_end_matches('/')
+            );
+            let response = self
+                .inner
+                .client()
+                .get(&url)
+                .header("x-api-key", self.inner.api_key())
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .send()
+                .await
+                .map_err(|e| ExtractionError::Transport(e.to_string()))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(ExtractionError::Transport(format!("HTTP {status}: {body}")));
+            }
+            let body = response
+                .text()
+                .await
+                .map_err(|e| ExtractionError::Transport(e.to_string()))?;
+
+            // JSONL: one BatchResultLine per non-empty line.
+            let mut by_custom_id: HashMap<String, Vec<ObservationMemory>> =
+                HashMap::with_capacity(episode_ids.len());
+            for line in body.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let parsed: BatchResultLine = match serde_json::from_str(trimmed) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "pensyve::observation",
+                            error = %e,
+                            line = %trimmed,
+                            "skipping malformed batch result line",
+                        );
+                        continue;
+                    }
+                };
+
+                let Some(eid) = parse_episode_id(&parsed.custom_id, episode_ids) else {
+                    tracing::warn!(
+                        target: "pensyve::observation",
+                        custom_id = %parsed.custom_id,
+                        "batch result custom_id not in input set — dropping",
+                    );
+                    continue;
+                };
+
+                match parsed.result {
+                    BatchResultPayload::Succeeded { message } => {
+                        let text = message
+                            .content
+                            .into_iter()
+                            .find(|b| b.block_type == "text")
+                            .map(|b| b.text)
+                            .unwrap_or_default();
+                        // Per-episode event_time isn't available here (we
+                        // don't keep messages keyed for re-lookup). Leaving
+                        // it None matches the non-fatal-failure behavior:
+                        // observations land without a timestamp rather than
+                        // taking on a misleading episode-max date that
+                        // wasn't visible to the LLM at extract time.
+                        // Callers that need event_time should attach it
+                        // post-extraction (e.g. the ingest helper).
+                        let raws = parse_response(&text);
+                        let observations = raws
+                            .into_iter()
+                            .map(|r| raw_to_observation(r, namespace_id, eid, None))
+                            .collect();
+                        by_custom_id.insert(parsed.custom_id, observations);
+                    }
+                    BatchResultPayload::Errored { error }
+                    | BatchResultPayload::Canceled { error }
+                    | BatchResultPayload::Expired { error } => {
+                        tracing::warn!(
+                            target: "pensyve::observation",
+                            custom_id = %parsed.custom_id,
+                            error = ?error,
+                            "batch entry failed — emitting empty observations for this episode",
+                        );
+                        by_custom_id.insert(parsed.custom_id, Vec::new());
+                    }
+                }
+            }
+
+            // Re-order by input position. Missing entries (custom_id never
+            // appeared in the JSONL stream) are non-fatal and emit empty.
+            let out = episode_ids
+                .iter()
+                .map(|eid| {
+                    by_custom_id.remove(&eid.to_string()).unwrap_or_else(|| {
+                        tracing::warn!(
+                            target: "pensyve::observation",
+                            episode_id = %eid,
+                            "no batch result for episode — emitting empty observations",
+                        );
+                        Vec::new()
+                    })
+                })
+                .collect();
+            Ok(out)
+        }
+    }
+
+    /// Look up the input-order `Uuid` matching the textual `custom_id`.
+    /// Returns `None` if the id either fails to parse or isn't part of the
+    /// input set — both are non-fatal and surface as a warning + empty
+    /// observation list for the input slot.
+    fn parse_episode_id(custom_id: &str, episode_ids: &[Uuid]) -> Option<Uuid> {
+        let parsed = Uuid::parse_str(custom_id).ok()?;
+        episode_ids.iter().find(|eid| **eid == parsed).copied()
+    }
+
+    // -------------------------------------------------------------------
+    // Wire types — Anthropic Messages Batches API
+    // -------------------------------------------------------------------
+
+    #[derive(Debug, Serialize)]
+    struct BatchSubmitRequest<'a> {
+        requests: Vec<BatchEntry<'a>>,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct BatchEntry<'a> {
+        custom_id: String,
+        params: BatchParams<'a>,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct BatchParams<'a> {
+        model: &'a str,
+        max_tokens: u32,
+        temperature: f32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        system: Option<Vec<SystemBlock<'a>>>,
+        messages: Vec<AnthropicMessage<'a>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct BatchSubmitResponse {
+        id: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct BatchStatusResponse {
+        processing_status: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct BatchResultLine {
+        custom_id: String,
+        result: BatchResultPayload,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum BatchResultPayload {
+        Succeeded {
+            message: BatchResultMessage,
+        },
+        Errored {
+            #[serde(default)]
+            error: serde_json::Value,
+        },
+        Canceled {
+            #[serde(default)]
+            error: serde_json::Value,
+        },
+        Expired {
+            #[serde(default)]
+            error: serde_json::Value,
+        },
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct BatchResultMessage {
+        #[serde(default)]
+        content: Vec<BatchResultContentBlock>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct BatchResultContentBlock {
+        #[serde(rename = "type")]
+        block_type: String,
+        #[serde(default)]
+        text: String,
+    }
+
+    #[async_trait]
+    impl ObservationExtractor for BatchedAnthropicHaikuExtractor {
+        async fn extract(
+            &self,
+            namespace_id: Uuid,
+            episode_id: Uuid,
+            messages: &[ExtractionMessage],
+        ) -> ExtractionResult<Vec<ObservationMemory>> {
+            // Single-episode calls aren't worth the batch overhead — fall
+            // through to the inner sync extractor. Batch dispatch fires
+            // only when callers go through `extract_batch`.
+            self.inner.extract(namespace_id, episode_id, messages).await
+        }
+
+        async fn extract_batch(
+            &self,
+            namespace_id: Uuid,
+            episode_ids: &[Uuid],
+            episodes: Vec<&[ExtractionMessage]>,
+        ) -> ExtractionResult<Vec<Vec<ObservationMemory>>> {
+            if episode_ids.len() != episodes.len() {
+                return Err(ExtractionError::Other(format!(
+                    "extract_batch: length mismatch ({} ids vs {} episodes)",
+                    episode_ids.len(),
+                    episodes.len(),
+                )));
+            }
+            if episodes.is_empty() {
+                return Ok(Vec::new());
+            }
+            let batch_id = self.submit_batch(episode_ids, &episodes).await?;
+            self.await_completion(&batch_id).await?;
+            self.collect_results(&batch_id, namespace_id, episode_ids)
+                .await
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Tests
+    // -------------------------------------------------------------------
+
+    #[cfg(test)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "test code: each wiremock scenario sets up its own fixture inline for readability"
+    )]
+    mod tests {
+        use super::*;
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn batch_submit_response(id: &str) -> serde_json::Value {
+            serde_json::json!({
+                "id": id,
+                "type": "message_batch",
+                "processing_status": "in_progress",
+                "request_counts": {"processing": 0, "succeeded": 0, "errored": 0, "canceled": 0, "expired": 0},
+            })
+        }
+
+        fn status_response(processing_status: &str) -> serde_json::Value {
+            serde_json::json!({
+                "processing_status": processing_status,
+            })
+        }
+
+        fn jsonl_succeeded(custom_id: &str, text: &str) -> String {
+            let line = serde_json::json!({
+                "custom_id": custom_id,
+                "result": {
+                    "type": "succeeded",
+                    "message": {
+                        "id": "msg_test",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-haiku-4-5-20251001",
+                        "content": [{"type": "text", "text": text}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                    },
+                },
+            });
+            line.to_string()
+        }
+
+        fn jsonl_errored(custom_id: &str) -> String {
+            let line = serde_json::json!({
+                "custom_id": custom_id,
+                "result": {
+                    "type": "errored",
+                    "error": {"type": "overloaded_error", "message": "slow down"},
+                },
+            });
+            line.to_string()
+        }
+
+        fn make_extractor(server_uri: &str) -> BatchedAnthropicHaikuExtractor {
+            let inner = AnthropicHaikuExtractor::new("test-key")
+                .unwrap()
+                .with_base_url(server_uri.to_string());
+            BatchedAnthropicHaikuExtractor::new(inner)
+                .with_poll_interval(Duration::from_millis(10))
+                .with_max_wait(Duration::from_secs(5))
+        }
+
+        fn msg(text: &str) -> ExtractionMessage {
+            ExtractionMessage {
+                role: "user".into(),
+                content: text.into(),
+                event_time: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn batch_submit_posts_one_entry_per_episode() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages/batches"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(batch_submit_response("msgbatch_test123")),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            // Status endpoint says "ended" immediately so submit_batch's
+            // assertions are reached and no poll loop noise hits the
+            // request log we care about.
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/v1/messages/batches/msgbatch_[a-zA-Z0-9_]+$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(status_response("ended")))
+                .mount(&server)
+                .await;
+            // Empty results — we're checking submit shape, not collection.
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/v1/messages/batches/.+/results$"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(""))
+                .mount(&server)
+                .await;
+
+            let extractor = make_extractor(&server.uri());
+            let ns = Uuid::new_v4();
+            let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+            let ep0 = [msg("ep0 turn 0"), msg("ep0 turn 1")];
+            let ep1 = [msg("ep1 turn 0"), msg("ep1 turn 1")];
+            let ep2 = [msg("ep2 turn 0"), msg("ep2 turn 1")];
+            let episodes: Vec<&[ExtractionMessage]> = vec![&ep0, &ep1, &ep2];
+
+            extractor
+                .extract_batch(ns, &ids, episodes)
+                .await
+                .expect("extract_batch ok");
+
+            let received = server.received_requests().await.expect("requests recorded");
+            // Find the single POST to /v1/messages/batches.
+            let submit = received
+                .iter()
+                .find(|r| {
+                    r.method == wiremock::http::Method::POST
+                        && r.url.path() == "/v1/messages/batches"
+                })
+                .expect("submit POST captured");
+            let body: serde_json::Value = submit.body_json().expect("submit body json");
+            let requests = body["requests"].as_array().expect("requests array");
+            assert_eq!(requests.len(), 3);
+            for (i, entry) in requests.iter().enumerate() {
+                assert_eq!(entry["custom_id"].as_str().unwrap(), ids[i].to_string());
+                let params = &entry["params"];
+                assert_eq!(
+                    params["model"].as_str().unwrap(),
+                    "claude-haiku-4-5-20251001"
+                );
+                // Compare via raw JSON to avoid float-cmp lint — temperature
+                // is serialized as `0.0`, the canonical zero literal.
+                assert_eq!(params["temperature"], serde_json::json!(0.0));
+                let system = params["system"].as_array().expect("system array");
+                assert_eq!(system[0]["type"].as_str().unwrap(), "text");
+                assert_eq!(
+                    system[0]["cache_control"]["type"].as_str().unwrap(),
+                    "ephemeral",
+                    "cache_control must be ephemeral by default",
+                );
+                let user_content = params["messages"][0]["content"].as_str().unwrap();
+                assert!(
+                    user_content.contains("--- Recalled memories ---"),
+                    "user message must carry the recalled-memories framing, got: {user_content}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn batch_polls_until_ended() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages/batches"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(batch_submit_response("msgbatch_polltest")),
+                )
+                .mount(&server)
+                .await;
+            // wiremock matches mounts in LIFO order — the most recently
+            // mounted matcher wins. Mount the "in_progress" responder
+            // first, then add a higher-priority "ended" responder; both
+            // match the same path, so first call sees "in_progress" and
+            // we re-mount once that one is consumed. Simpler: mount the
+            // status endpoint with `up_to_n_times` so the first response
+            // is "in_progress" and subsequent calls are "ended".
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/v1/messages/batches/msgbatch_[a-zA-Z0-9_]+$"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(status_response("in_progress")),
+                )
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/v1/messages/batches/msgbatch_[a-zA-Z0-9_]+$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(status_response("ended")))
+                .mount(&server)
+                .await;
+
+            let ids = vec![Uuid::new_v4(), Uuid::new_v4()];
+            let body = format!(
+                "{}\n{}\n",
+                jsonl_succeeded(&ids[0].to_string(), "[]"),
+                jsonl_succeeded(&ids[1].to_string(), "[]"),
+            );
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/v1/messages/batches/.+/results$"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+
+            let extractor = make_extractor(&server.uri());
+            let ns = Uuid::new_v4();
+            let ep0 = [msg("ep0")];
+            let ep1 = [msg("ep1")];
+            let episodes: Vec<&[ExtractionMessage]> = vec![&ep0, &ep1];
+            let out = extractor
+                .extract_batch(ns, &ids, episodes)
+                .await
+                .expect("extract_batch should poll through in_progress to ended");
+            assert_eq!(out.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn batch_collects_results_routed_by_custom_id() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages/batches"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(batch_submit_response("msgbatch_routetest")),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/v1/messages/batches/msgbatch_[a-zA-Z0-9_]+$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(status_response("ended")))
+                .mount(&server)
+                .await;
+
+            let ids = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+            // JSONL has results in REVERSED input order — collect_results
+            // must re-order by input position.
+            let payload_2 = serde_json::to_string(&serde_json::json!([{
+                "entity_type": "game_played", "instance": "Tetris", "action": "played", "confidence": 0.9
+            }])).unwrap();
+            let payload_0 = serde_json::to_string(&serde_json::json!([{
+                "entity_type": "book_read", "instance": "Dune", "action": "read", "confidence": 0.9
+            }]))
+            .unwrap();
+            let body = format!(
+                "{}\n{}\n{}\n",
+                jsonl_succeeded(&ids[2].to_string(), &payload_2),
+                jsonl_succeeded(&ids[1].to_string(), "[]"),
+                jsonl_succeeded(&ids[0].to_string(), &payload_0),
+            );
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/v1/messages/batches/.+/results$"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+
+            let extractor = make_extractor(&server.uri());
+            let ns = Uuid::new_v4();
+            let ep0 = [msg("ep0")];
+            let ep1 = [msg("ep1")];
+            let ep2 = [msg("ep2")];
+            let episodes: Vec<&[ExtractionMessage]> = vec![&ep0, &ep1, &ep2];
+            let out = extractor
+                .extract_batch(ns, &ids, episodes)
+                .await
+                .expect("extract_batch ok");
+            assert_eq!(out.len(), 3);
+            // input pos 0 -> Dune
+            assert_eq!(out[0].len(), 1);
+            assert_eq!(out[0][0].instance, "Dune");
+            assert_eq!(out[0][0].episode_id, ids[0]);
+            // input pos 1 -> empty
+            assert!(out[1].is_empty());
+            // input pos 2 -> Tetris
+            assert_eq!(out[2].len(), 1);
+            assert_eq!(out[2][0].instance, "Tetris");
+            assert_eq!(out[2][0].episode_id, ids[2]);
+        }
+
+        #[tokio::test]
+        async fn batch_per_entry_error_emits_empty_observations() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages/batches"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(batch_submit_response("msgbatch_errortest")),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/v1/messages/batches/msgbatch_[a-zA-Z0-9_]+$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(status_response("ended")))
+                .mount(&server)
+                .await;
+
+            let ids = vec![Uuid::new_v4(), Uuid::new_v4()];
+            let payload = serde_json::to_string(&serde_json::json!([{
+                "entity_type": "game_played",
+                "instance": "Solitaire",
+                "action": "played",
+                "confidence": 0.9,
+            }]))
+            .unwrap();
+            let body = format!(
+                "{}\n{}\n",
+                jsonl_errored(&ids[0].to_string()),
+                jsonl_succeeded(&ids[1].to_string(), &payload),
+            );
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/v1/messages/batches/.+/results$"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+
+            let extractor = make_extractor(&server.uri());
+            let ns = Uuid::new_v4();
+            let ep0 = [msg("ep0")];
+            let ep1 = [msg("ep1")];
+            let episodes: Vec<&[ExtractionMessage]> = vec![&ep0, &ep1];
+            let out = extractor
+                .extract_batch(ns, &ids, episodes)
+                .await
+                .expect("per-entry errors must not fail the outer call");
+            assert_eq!(out.len(), 2);
+            assert!(
+                out[0].is_empty(),
+                "errored entry must yield empty observations"
+            );
+            assert_eq!(out[1].len(), 1);
+            assert_eq!(out[1][0].instance, "Solitaire");
+        }
+
+        #[tokio::test]
+        async fn batch_rejects_length_mismatch() {
+            let server = MockServer::start().await;
+            // No mocks needed — the early return fires before any HTTP.
+            let extractor = make_extractor(&server.uri());
+            let ns = Uuid::new_v4();
+            let ids = [Uuid::new_v4(), Uuid::new_v4()];
+            let a = [msg("a")];
+            let b = [msg("b")];
+            let c = [msg("c")];
+            let episodes: Vec<&[ExtractionMessage]> = vec![&a, &b, &c];
+            let err = extractor
+                .extract_batch(ns, &ids, episodes)
+                .await
+                .expect_err("length mismatch must error");
+            match err {
+                ExtractionError::Other(msg) => assert!(msg.contains("length mismatch")),
+                other => panic!("expected Other, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn batch_returns_empty_for_zero_episodes() {
+            let server = MockServer::start().await;
+            // Verify zero HTTP calls fire by mounting with `expect(0)`.
+            Mock::given(method("POST"))
+                .and(path("/v1/messages/batches"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let extractor = make_extractor(&server.uri());
+            let out = extractor
+                .extract_batch(Uuid::new_v4(), &[], Vec::new())
+                .await
+                .expect("zero-episode call must succeed");
+            assert!(out.is_empty());
+        }
+    }
+}
+
+#[cfg(feature = "batch-extractor")]
+pub use batched_haiku::BatchedAnthropicHaikuExtractor;
+
+// ---------------------------------------------------------------------------
 // LocalLLMExtractor (feature-gated) — OpenAI-compatible local vLLM backend
 // ---------------------------------------------------------------------------
 
@@ -1535,6 +2403,103 @@ mod tests {
         let out = extractor.extract(ns, ep, &[]).await.unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, fixed[0].id);
+    }
+
+    /// Recording extractor that captures every `extract` call's `episode_id`
+    /// so tests can assert the default `extract_batch` impl forwards each
+    /// episode through the per-call path in input order.
+    #[derive(Debug, Default)]
+    struct RecordingExtractor {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<Uuid>>>,
+    }
+
+    #[async_trait]
+    impl ObservationExtractor for RecordingExtractor {
+        async fn extract(
+            &self,
+            _namespace_id: Uuid,
+            episode_id: Uuid,
+            _messages: &[ExtractionMessage],
+        ) -> ExtractionResult<Vec<ObservationMemory>> {
+            self.calls.lock().unwrap().push(episode_id);
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn default_extract_batch_falls_through_to_per_episode_extract() {
+        // The trait's default `extract_batch` impl exists for backward
+        // compatibility — extractors that don't override it must still get
+        // one `extract` call per episode in input order.
+        let extractor = RecordingExtractor::default();
+        let ns = Uuid::new_v4();
+        let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let msgs = [
+            ExtractionMessage {
+                role: "user".into(),
+                content: "ep0".into(),
+                event_time: None,
+            },
+            ExtractionMessage {
+                role: "user".into(),
+                content: "ep1".into(),
+                event_time: None,
+            },
+            ExtractionMessage {
+                role: "user".into(),
+                content: "ep2".into(),
+                event_time: None,
+            },
+        ];
+        let episodes: Vec<&[ExtractionMessage]> = vec![
+            std::slice::from_ref(&msgs[0]),
+            std::slice::from_ref(&msgs[1]),
+            std::slice::from_ref(&msgs[2]),
+        ];
+
+        let out = extractor
+            .extract_batch(ns, &ids, episodes)
+            .await
+            .expect("default extract_batch ok");
+
+        assert_eq!(out.len(), 3, "one Vec per input episode");
+        let recorded = extractor.calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded.as_slice(),
+            ids.as_slice(),
+            "extract called per episode in input order"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_extract_batch_rejects_length_mismatch() {
+        // Length mismatch is a programmer error — fail fast with a clear
+        // message rather than silently truncating.
+        let extractor = RecordingExtractor::default();
+        let ns = Uuid::new_v4();
+        let ids = [Uuid::new_v4(), Uuid::new_v4()];
+        let msg = ExtractionMessage {
+            role: "user".into(),
+            content: "x".into(),
+            event_time: None,
+        };
+        let slice = std::slice::from_ref(&msg);
+        let episodes: Vec<&[ExtractionMessage]> = vec![slice, slice, slice];
+
+        let err = extractor
+            .extract_batch(ns, &ids, episodes)
+            .await
+            .expect_err("expected length-mismatch error");
+        match err {
+            ExtractionError::Other(msg) => {
+                assert!(msg.contains("length mismatch"), "unexpected msg: {msg}");
+            }
+            other => panic!("expected ExtractionError::Other, got {other:?}"),
+        }
+        assert!(
+            extractor.calls.lock().unwrap().is_empty(),
+            "no per-episode calls should have happened on rejection"
+        );
     }
 
     /// An extractor that always fails, used to exercise the non-fatal
