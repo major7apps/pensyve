@@ -1,6 +1,8 @@
 // Package pensyve provides a Go HTTP client for the Pensyve memory runtime API.
 package pensyve
 
+import "time"
+
 // Entity represents a named entity in the Pensyve memory system.
 type Entity struct {
 	ID   string `json:"id"`
@@ -16,6 +18,15 @@ type Memory struct {
 	Confidence float64 `json:"confidence"`
 	Stability  float64 `json:"stability"`
 	Score      float64 `json:"score,omitempty"`
+
+	// v1.2 W6: observation-typed memory fields (additive — null-friendly so
+	// existing memory_type=episodic|semantic|procedural rows decode cleanly).
+	EntityType string     `json:"entity_type,omitempty"`
+	Instance   string     `json:"instance,omitempty"`
+	Action     string     `json:"action,omitempty"`
+	Quantity   *float64   `json:"quantity,omitempty"`
+	Unit       *string    `json:"unit,omitempty"`
+	EventTime  *time.Time `json:"event_time,omitempty"`
 }
 
 // RecallOptions configures a recall query.

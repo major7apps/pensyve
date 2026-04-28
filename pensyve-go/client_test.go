@@ -925,3 +925,41 @@ func TestA2ATask(t *testing.T) {
 		t.Errorf("unexpected output count: %v", resp.Output["count"])
 	}
 }
+
+func TestMemoryStructHasObservationFields(t *testing.T) {
+	// W6 spec: Go Memory struct must include observation fields for parity
+	// with Python/TypeScript SDKs.
+	body := []byte(`{
+        "id": "mem_1",
+        "content": "subscribed to The New Yorker",
+        "memory_type": "observation",
+        "confidence": 0.9,
+        "stability": 0.5,
+        "score": 0.8,
+        "entity_type": "magazine",
+        "instance": "The New Yorker",
+        "action": "subscribed",
+        "quantity": null,
+        "unit": null,
+        "event_time": "2023-04-01T00:00:00Z"
+    }`)
+	var m Memory
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if m.EntityType != "magazine" {
+		t.Errorf("EntityType=%q, want 'magazine'", m.EntityType)
+	}
+	if m.Instance != "The New Yorker" {
+		t.Errorf("Instance=%q, want 'The New Yorker'", m.Instance)
+	}
+	if m.Action != "subscribed" {
+		t.Errorf("Action=%q, want 'subscribed'", m.Action)
+	}
+	if m.Quantity != nil {
+		t.Errorf("Quantity=%v, want nil", m.Quantity)
+	}
+	if m.EventTime == nil || m.EventTime.Year() != 2023 {
+		t.Errorf("EventTime=%v, want 2023-04-01", m.EventTime)
+	}
+}
