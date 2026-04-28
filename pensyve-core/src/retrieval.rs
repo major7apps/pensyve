@@ -391,11 +391,17 @@ impl<'a> RecallEngine<'a> {
         config: &crate::recall_grouped::RecallGroupedConfig,
     ) -> Result<Vec<crate::recall_grouped::SessionGroup>, RecallError> {
         let result = self.recall(query, namespace_id, config.limit)?;
-        let groups = crate::recall_grouped::group_by_session(
+        // Apply optional memory-type filter on the flat candidate pool *before*
+        // grouping. Mirrors the SDK-level `types` filter on the flat recall
+        // path; doing it pre-grouping means a group whose only matching member
+        // was filtered out collapses cleanly instead of becoming an empty
+        // bucket.
+        let memories = crate::recall_grouped::filter_candidates_by_types(
             result.memories,
-            config.order,
-            config.max_groups,
+            config.types.as_deref(),
         );
+        let groups =
+            crate::recall_grouped::group_by_session(memories, config.order, config.max_groups);
         // Observations attach post-grouping — they don't participate in RRF
         // candidate selection, only enrich the sessions that already won.
         Ok(crate::recall_grouped::attach_observations_to_groups(

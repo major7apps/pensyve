@@ -60,6 +60,16 @@ pub struct RecallGroupedConfig {
     /// Optional cap on the number of groups returned. `None` means unbounded:
     /// every group produced from the candidate pool is kept.
     pub max_groups: Option<usize>,
+    /// Optional memory-type filter applied to the candidate pool *before*
+    /// grouping. Each entry is matched against [`Memory::type_name`] —
+    /// accepted values are `"episodic"`, `"semantic"`, `"procedural"`, and
+    /// `"observation"`. `None` means no filter (all types kept). Mirrors the
+    /// equivalent SDK-level `types` filter on the flat recall path so
+    /// callers asking for "give me episodic-only sessions" don't have to
+    /// post-filter every group themselves.
+    ///
+    /// Default: `None`.
+    pub types: Option<Vec<String>>,
 }
 
 impl Default for RecallGroupedConfig {
@@ -68,6 +78,7 @@ impl Default for RecallGroupedConfig {
             limit: 50,
             order: OrderBy::Chronological,
             max_groups: None,
+            types: None,
         }
     }
 }
@@ -120,6 +131,31 @@ pub struct SessionGroup {
     /// `final_score` across the group's memories. Used when ordering by
     /// [`OrderBy::Relevance`].
     pub group_score: f32,
+}
+
+// ---------------------------------------------------------------------------
+// Pre-grouping filters
+// ---------------------------------------------------------------------------
+
+/// Filter a candidate pool to only memories whose [`Memory::type_name`]
+/// matches one of the entries in `types`.
+///
+/// `None` is the no-op identity (returns the input untouched). Implements the
+/// `RecallGroupedConfig.types` filter without leaking the `MemoryType`
+/// discriminator into the engine wiring — kept here so it's straightforward
+/// to unit-test alongside the other recall-grouped helpers.
+#[must_use]
+pub fn filter_candidates_by_types(
+    candidates: Vec<ScoredCandidate>,
+    types: Option<&[String]>,
+) -> Vec<ScoredCandidate> {
+    match types {
+        None => candidates,
+        Some(filter) => candidates
+            .into_iter()
+            .filter(|c| filter.iter().any(|t| t == c.memory.type_name()))
+            .collect(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -539,6 +575,57 @@ mod tests {
     }
 
     #[test]
+    fn filter_candidates_by_types_none_is_identity() {
+        // W6: no filter passed → input is returned unchanged (cheap path).
+        let ep = Uuid::new_v4();
+        let subj = Uuid::new_v4();
+        let candidates = vec![
+            scored(ep_at(ep, t(2026, 1, 1), "a"), 0.5),
+            scored(sem(subj, "is", "cool"), 0.3),
+        ];
+        let filtered = filter_candidates_by_types(candidates, None);
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn filter_candidates_by_types_drops_unmatched() {
+        // W6: types=["episodic"] filter drops semantic + procedural candidates
+        // before grouping. Mirrors the SDK-level `types` filter on flat recall.
+        let ep = Uuid::new_v4();
+        let subj = Uuid::new_v4();
+        let candidates = vec![
+            scored(ep_at(ep, t(2026, 1, 1), "ep1"), 0.9),
+            scored(sem(subj, "knows", "Rust"), 0.7),
+            scored(proc("on_error", "retry"), 0.5),
+            scored(ep_at(ep, t(2026, 1, 2), "ep2"), 0.8),
+        ];
+        let only_episodic = filter_candidates_by_types(candidates, Some(&["episodic".to_string()]));
+        assert_eq!(only_episodic.len(), 2);
+        for c in &only_episodic {
+            assert_eq!(c.memory.type_name(), "episodic");
+        }
+    }
+
+    #[test]
+    fn filter_candidates_by_types_accepts_multiple_types() {
+        // W6: types=["episodic","semantic"] keeps both kinds, drops procedural.
+        let ep = Uuid::new_v4();
+        let subj = Uuid::new_v4();
+        let candidates = vec![
+            scored(ep_at(ep, t(2026, 1, 1), "ep1"), 0.9),
+            scored(sem(subj, "knows", "Rust"), 0.7),
+            scored(proc("on_error", "retry"), 0.5),
+        ];
+        let kinds = ["episodic".to_string(), "semantic".to_string()];
+        let filtered = filter_candidates_by_types(candidates, Some(&kinds));
+        assert_eq!(filtered.len(), 2);
+        let names: Vec<_> = filtered.iter().map(|c| c.memory.type_name()).collect();
+        assert!(names.contains(&"episodic"));
+        assert!(names.contains(&"semantic"));
+        assert!(!names.contains(&"procedural"));
+    }
+
+    #[test]
     fn mixed_episodic_and_semantic_clusters_episodes_and_keeps_semantics_singleton() {
         let ep = Uuid::new_v4();
         let subj = Uuid::new_v4();
@@ -598,6 +685,7 @@ mod tests {
         assert_eq!(cfg.limit, 50);
         assert_eq!(cfg.order, OrderBy::Chronological);
         assert_eq!(cfg.max_groups, None);
+        assert!(cfg.types.is_none());
     }
 
     fn memory_content(memory: &Memory) -> String {
