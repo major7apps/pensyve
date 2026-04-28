@@ -1835,11 +1835,433 @@ mod batched_haiku {
                 .expect("zero-episode call must succeed");
             assert!(out.is_empty());
         }
+
+        // ---------------------------------------------------------------
+        // Cost-savings verification — `CachedBulkExtractor` integration
+        //
+        // The whole point of Phase C.2: a 500-question rebuild should make
+        // exactly ONE `POST /v1/messages/batches` (plus polls + results
+        // GETs), then serve every per-episode `extract` from the prewarmed
+        // cache without any further HTTP traffic. This test plays that
+        // dance against wiremock and asserts the wire shape.
+        // ---------------------------------------------------------------
+
+        #[tokio::test]
+        async fn prewarm_then_cached_extract_makes_exactly_one_batch_post() {
+            use crate::observation::NoopExtractor;
+            use crate::observation::cached_bulk::{CachedBulkExtractor, fingerprint_messages};
+            use std::collections::HashMap;
+            use std::sync::Arc;
+
+            let server = MockServer::start().await;
+            // Submit endpoint: must fire exactly once for the entire wave.
+            Mock::given(method("POST"))
+                .and(path("/v1/messages/batches"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(batch_submit_response("msgbatch_phaseCtwo")),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            // Status endpoint resolves immediately so the test is fast.
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/v1/messages/batches/msgbatch_[a-zA-Z0-9_]+$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(status_response("ended")))
+                .mount(&server)
+                .await;
+            // Three episodes, three results — JSONL response routed by
+            // custom_id back to the input position.
+            let ns = Uuid::new_v4();
+            let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+            let ep0 = [msg("user: I played AC Odyssey")];
+            let ep1 = [msg("user: I read Dune")];
+            let ep2 = [msg("user: I cooked tacos")];
+            let episodes: Vec<&[ExtractionMessage]> = vec![&ep0, &ep1, &ep2];
+
+            let result_body = format!(
+                "{}\n{}\n{}",
+                jsonl_succeeded(
+                    &ids[0].to_string(),
+                    r#"[{"entity_type":"game_played","instance":"AC Odyssey","action":"played","quantity":null,"unit":null,"confidence":0.95}]"#,
+                ),
+                jsonl_succeeded(
+                    &ids[1].to_string(),
+                    r#"[{"entity_type":"book_read","instance":"Dune","action":"read","quantity":null,"unit":null,"confidence":0.9}]"#,
+                ),
+                jsonl_succeeded(
+                    &ids[2].to_string(),
+                    r#"[{"entity_type":"meal_cooked","instance":"tacos","action":"cooked","quantity":null,"unit":null,"confidence":0.85}]"#,
+                ),
+            );
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/v1/messages/batches/.+/results$"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(result_body))
+                .mount(&server)
+                .await;
+
+            // Step 1: prewarm via extract_batch (one POST + polls + results
+            // GET).
+            let batch_extractor = make_extractor(&server.uri());
+            let batched_results = batch_extractor
+                .extract_batch(ns, &ids, episodes.clone())
+                .await
+                .expect("prewarm extract_batch ok");
+            assert_eq!(batched_results.len(), 3);
+
+            // Step 2: re-key by content fingerprint so the cache matches
+            // whatever Pensyve will hand to extract() at live ingest time.
+            let mut cache: HashMap<u64, Vec<ObservationMemory>> = HashMap::new();
+            for (msgs_slice, observations) in episodes.iter().zip(batched_results.into_iter()) {
+                let fp = fingerprint_messages(msgs_slice);
+                cache.insert(fp, observations);
+            }
+
+            // Step 3: drive the per-episode commit hook through the
+            // CachedBulkExtractor against fresh (live) episode_ids — the
+            // ones Pensyve would assign during real ingest. ZERO additional
+            // HTTP calls must fire.
+            let cached = CachedBulkExtractor::new(cache, Arc::new(NoopExtractor));
+            for msgs_slice in &episodes {
+                let live_ep = Uuid::new_v4();
+                let live_ns = Uuid::new_v4();
+                let out = cached
+                    .extract(live_ns, live_ep, msgs_slice)
+                    .await
+                    .expect("cache hit ok");
+                assert_eq!(out.len(), 1);
+                assert_eq!(out[0].namespace_id, live_ns);
+                assert_eq!(out[0].episode_id, live_ep);
+            }
+
+            // Assert wire-level: exactly one POST to /v1/messages/batches.
+            let received = server.received_requests().await.expect("requests recorded");
+            let post_count = received
+                .iter()
+                .filter(|r| {
+                    r.method == wiremock::http::Method::POST
+                        && r.url.path() == "/v1/messages/batches"
+                })
+                .count();
+            assert_eq!(
+                post_count, 1,
+                "must POST exactly once for the entire wave (got {post_count}); cache served the per-episode extracts",
+            );
+        }
     }
 }
 
 #[cfg(feature = "batch-extractor")]
 pub use batched_haiku::BatchedAnthropicHaikuExtractor;
+
+// ---------------------------------------------------------------------------
+// CachedBulkExtractor (feature-gated, opt-in) — replays a prewarmed cache
+// across the per-episode commit hook so bulk re-extraction workloads
+// realise Phase B's Anthropic Messages Batches discount without skipping
+// Pensyve's `commit_extraction_for_episode` consolidation pipeline.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "batch-extractor")]
+mod cached_bulk {
+    use super::{ExtractionMessage, ExtractionResult, ObservationExtractor, ObservationMemory};
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    /// Stable fingerprint for an episode's `ExtractionMessage` slice.
+    ///
+    /// The fingerprint must be deterministic so the harness can prewarm a
+    /// `CachedBulkExtractor` cache against the same per-session message
+    /// payload Pensyve will later hand to `extract`. Pensyve assigns
+    /// `episode_id`s internally during `episode().__exit__`, so we cannot
+    /// key the cache by episode id — content fingerprints fill the gap.
+    ///
+    /// The exact hash function is an implementation detail (today
+    /// `std::collections::hash_map::DefaultHasher`, matching the rest of
+    /// `pensyve-core`). It is process-local; both prewarm and live paths
+    /// run in the same process under the harness wave runner.
+    #[must_use]
+    pub fn fingerprint_messages(messages: &[ExtractionMessage]) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        // Length first, so the empty-slice case fingerprints uniquely and
+        // can't collide with a single empty-content message.
+        messages.len().hash(&mut hasher);
+        for m in messages {
+            m.role.hash(&mut hasher);
+            m.content.hash(&mut hasher);
+            // event_time is part of the wire payload sent to the extractor
+            // (renders into `[YYYY-MM-DD]` prefixes via `build_prompt`), so
+            // it must participate in the fingerprint.
+            match m.event_time {
+                Some(t) => {
+                    1_u8.hash(&mut hasher);
+                    t.timestamp_nanos_opt().unwrap_or(0).hash(&mut hasher);
+                }
+                None => {
+                    0_u8.hash(&mut hasher);
+                }
+            }
+        }
+        hasher.finish()
+    }
+
+    /// `ObservationExtractor` adapter that serves observations from a
+    /// pre-populated cache and falls through to an inner extractor on miss.
+    ///
+    /// Designed for bulk re-extraction workloads where the harness:
+    ///
+    /// 1. Pre-collects every episode's `ExtractionMessage` slice across
+    ///    every question.
+    /// 2. Submits them in one [`BatchedAnthropicHaikuExtractor::extract_batch`]
+    ///    call, paying the per-token Batches discount once.
+    /// 3. Builds a `HashMap<u64, Vec<ObservationMemory>>` keyed by
+    ///    [`fingerprint_messages`].
+    /// 4. Wraps the cache in `CachedBulkExtractor::new(cache, fallback)` and
+    ///    drives Pensyve through its normal per-question ingest path.
+    ///
+    /// At `extract` time the cached observations are cloned and rebound to
+    /// the call-site `(namespace_id, episode_id)` so Pensyve's storage layer
+    /// sees identifiers consistent with the live episode. On cache miss
+    /// (any episode the prewarm pass didn't see, e.g. mid-wave dataset edit)
+    /// the wrapper falls through to `fallback`, preserving correctness.
+    ///
+    /// `extract_batch` delegates to the trait default, which loops
+    /// `extract` per-episode — which still hits the cache. We deliberately
+    /// don't override `extract_batch` to call the inner batch path: this
+    /// adapter exists precisely because the per-call commit hook is the
+    /// only callable surface from Pensyve's `episode().__exit__`.
+    #[derive(Debug, Clone)]
+    pub struct CachedBulkExtractor {
+        cache: Arc<HashMap<u64, Vec<ObservationMemory>>>,
+        fallback: Arc<dyn ObservationExtractor>,
+    }
+
+    impl CachedBulkExtractor {
+        /// Build a new cached-bulk extractor. `cache` is shared via `Arc`
+        /// because cloned `Pensyve` instances (one per question in the
+        /// rebuild wave) share the same prewarmed state.
+        #[must_use]
+        pub fn new(
+            cache: HashMap<u64, Vec<ObservationMemory>>,
+            fallback: Arc<dyn ObservationExtractor>,
+        ) -> Self {
+            Self {
+                cache: Arc::new(cache),
+                fallback,
+            }
+        }
+
+        /// Number of cached entries.
+        #[must_use]
+        pub fn len(&self) -> usize {
+            self.cache.len()
+        }
+
+        /// `true` iff no entries are cached. The wrapper still functions —
+        /// every call falls through to the fallback — but a wave runner
+        /// receiving an empty cache should treat it as a configuration bug.
+        #[must_use]
+        pub fn is_empty(&self) -> bool {
+            self.cache.is_empty()
+        }
+
+        /// Diagnostic: did `extract` for this fingerprint hit the cache?
+        /// Used by the harness post-run audit to confirm every episode was
+        /// served from the prewarmed payload (no silent fall-throughs).
+        #[must_use]
+        pub fn contains(&self, fingerprint: u64) -> bool {
+            self.cache.contains_key(&fingerprint)
+        }
+    }
+
+    #[async_trait]
+    impl ObservationExtractor for CachedBulkExtractor {
+        async fn extract(
+            &self,
+            namespace_id: Uuid,
+            episode_id: Uuid,
+            messages: &[ExtractionMessage],
+        ) -> ExtractionResult<Vec<ObservationMemory>> {
+            let fp = fingerprint_messages(messages);
+            if let Some(cached) = self.cache.get(&fp) {
+                let rebound: Vec<ObservationMemory> = cached
+                    .iter()
+                    .map(|obs| {
+                        let mut clone = obs.clone();
+                        clone.namespace_id = namespace_id;
+                        clone.episode_id = episode_id;
+                        clone
+                    })
+                    .collect();
+                return Ok(rebound);
+            }
+            tracing::warn!(
+                target: "pensyve::observation",
+                episode_id = %episode_id,
+                fingerprint = fp,
+                "CachedBulkExtractor cache miss — falling through to inner extractor",
+            );
+            self.fallback
+                .extract(namespace_id, episode_id, messages)
+                .await
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Tests
+    // -------------------------------------------------------------------
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::observation::{ExtractionError, NoopExtractor};
+        use chrono::{TimeZone, Utc};
+        use std::sync::Mutex;
+
+        fn make_msgs(content: &str) -> Vec<ExtractionMessage> {
+            vec![ExtractionMessage {
+                role: "user".into(),
+                content: content.into(),
+                event_time: Some(Utc.with_ymd_and_hms(2026, 4, 27, 12, 0, 0).unwrap()),
+            }]
+        }
+
+        fn make_obs(ns: Uuid, ep: Uuid, instance: &str) -> ObservationMemory {
+            ObservationMemory::new(ns, ep, "game_played", instance, "played", instance)
+        }
+
+        #[tokio::test]
+        async fn cache_hit_serves_from_prewarmed_payload_and_rebinds_ids() {
+            let prewarm_ns = Uuid::new_v4();
+            let prewarm_ep = Uuid::new_v4();
+            let live_ns = Uuid::new_v4();
+            let live_ep = Uuid::new_v4();
+            let msgs = make_msgs("I played AC Odyssey for 70 hours");
+            let fp = fingerprint_messages(&msgs);
+
+            let mut cache = HashMap::new();
+            cache.insert(fp, vec![make_obs(prewarm_ns, prewarm_ep, "AC Odyssey")]);
+
+            // Use a tracking fallback that records every dispatch — we MUST
+            // see zero on a cache hit.
+            let fallback = Arc::new(TrackingFallback::default());
+            let extractor = CachedBulkExtractor::new(cache, fallback.clone());
+
+            let out = extractor
+                .extract(live_ns, live_ep, &msgs)
+                .await
+                .expect("cache hit returns ok");
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].instance, "AC Odyssey");
+            // ids rebound to the live call site.
+            assert_eq!(out[0].namespace_id, live_ns);
+            assert_eq!(out[0].episode_id, live_ep);
+            assert_eq!(
+                fallback.calls(),
+                0,
+                "fallback must NOT fire on a cache hit (otherwise the bulk discount is wasted)",
+            );
+        }
+
+        #[tokio::test]
+        async fn cache_miss_falls_through_to_inner_extractor() {
+            let cache: HashMap<u64, Vec<ObservationMemory>> = HashMap::new();
+            let fallback = Arc::new(TrackingFallback::default());
+            let extractor = CachedBulkExtractor::new(cache, fallback.clone());
+
+            let msgs = make_msgs("never seen by the prewarm pass");
+            let ns = Uuid::new_v4();
+            let ep = Uuid::new_v4();
+            let out = extractor.extract(ns, ep, &msgs).await.expect("ok");
+            assert!(out.is_empty(), "TrackingFallback returns empty");
+            assert_eq!(
+                fallback.calls(),
+                1,
+                "fallback must fire exactly once on a miss"
+            );
+        }
+
+        #[tokio::test]
+        async fn fingerprint_collisions_not_observed_for_distinct_content() {
+            // Cheap regression guard: two payloads with different content
+            // must not collide. `DefaultHasher` is not collision-resistant
+            // in the cryptographic sense, but for distinct ASCII strings
+            // we expect distinct outputs in practice.
+            let a = make_msgs("user: I played AC Odyssey");
+            let b = make_msgs("user: I played Dune");
+            assert_ne!(fingerprint_messages(&a), fingerprint_messages(&b));
+        }
+
+        #[tokio::test]
+        async fn fingerprint_stable_across_calls() {
+            let msgs = make_msgs("hello");
+            let fp1 = fingerprint_messages(&msgs);
+            let fp2 = fingerprint_messages(&msgs);
+            assert_eq!(fp1, fp2);
+        }
+
+        #[tokio::test]
+        async fn empty_cache_is_diagnostic_only_not_an_error() {
+            // An empty cache means every extract() falls through to the
+            // fallback — that's correctness-preserving but a config bug.
+            // We surface it via `is_empty()` so wave runners can audit.
+            let extractor = CachedBulkExtractor::new(HashMap::new(), Arc::new(NoopExtractor));
+            assert!(extractor.is_empty());
+            assert_eq!(extractor.len(), 0);
+            assert!(!extractor.contains(0));
+        }
+
+        // -------------------------------------------------------------------
+        // Test fixtures
+        // -------------------------------------------------------------------
+
+        /// Fallback that records call count without doing real work.
+        #[derive(Debug, Default)]
+        struct TrackingFallback {
+            calls: Mutex<usize>,
+        }
+
+        impl TrackingFallback {
+            fn calls(&self) -> usize {
+                *self.calls.lock().unwrap()
+            }
+        }
+
+        #[async_trait]
+        impl ObservationExtractor for TrackingFallback {
+            async fn extract(
+                &self,
+                _namespace_id: Uuid,
+                _episode_id: Uuid,
+                _messages: &[ExtractionMessage],
+            ) -> ExtractionResult<Vec<ObservationMemory>> {
+                *self.calls.lock().unwrap() += 1;
+                Ok(Vec::new())
+            }
+        }
+
+        /// Compile-time assertion: the wrapper is dyn-compatible.
+        #[allow(dead_code)]
+        fn cached_bulk_is_object_safe() {
+            fn takes_dyn(_: &dyn ObservationExtractor) {}
+            let cb = CachedBulkExtractor::new(HashMap::new(), Arc::new(NoopExtractor));
+            takes_dyn(&cb);
+        }
+
+        /// `ExtractionError` referenced via the use line so unused-import
+        /// lint stays quiet even though our happy-path tests don't need it.
+        #[allow(dead_code)]
+        fn _error_in_scope() -> Option<ExtractionError> {
+            None
+        }
+    }
+}
+
+#[cfg(feature = "batch-extractor")]
+pub use cached_bulk::{CachedBulkExtractor, fingerprint_messages};
 
 // ---------------------------------------------------------------------------
 // LocalLLMExtractor (feature-gated) — OpenAI-compatible local vLLM backend
