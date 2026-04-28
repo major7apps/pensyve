@@ -648,13 +648,16 @@ impl PyPensyve {
     ///     order: "chronological" (default, oldest session first) or
     ///         "relevance" (highest group score first).
     ///     `max_groups`: Optional cap on the number of groups returned.
-    #[pyo3(signature = (query, *, limit=50, order="chronological", max_groups=None))]
+    ///     types: Optional list of memory type strings to filter by, e.g.
+    ///         `["episodic"]`. Mirrors the equivalent kwarg on `recall`.
+    #[pyo3(signature = (query, *, limit=50, order="chronological", max_groups=None, types=None))]
     fn recall_grouped(
         &self,
         query: &str,
         limit: usize,
         order: &str,
         max_groups: Option<usize>,
+        types: Option<Vec<String>>,
     ) -> PyResult<Vec<PySessionGroup>> {
         if query.is_empty() {
             return Err(PyRuntimeError::new_err("query must not be empty"));
@@ -674,6 +677,7 @@ impl PyPensyve {
             limit,
             order: order_by,
             max_groups,
+            types,
         };
 
         // Lock held across recall, same as `recall()` — RecallEngine borrows

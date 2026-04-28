@@ -95,6 +95,7 @@ class Pensyve:
         limit: int = 50,
         order: Literal["chronological", "relevance"] = "chronological",
         max_groups: int | None = None,
+        types: list[str] | None = None,
     ) -> list[SessionGroup]:
         """Recall memories matching a query, clustered by source session.
 
@@ -112,6 +113,9 @@ class Pensyve:
             order: "chronological" (default, oldest session first) or
                 "relevance" (highest-scoring session first).
             max_groups: Optional cap on the number of groups returned.
+            types: Optional list of memory type strings to filter the
+                candidate pool *before* grouping. Mirrors the equivalent
+                kwarg on :meth:`recall`. Default ``None`` (no filter).
 
         Raises:
             ValueError: If ``order`` is not one of the supported values.
