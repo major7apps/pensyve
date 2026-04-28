@@ -54,6 +54,13 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         limit: usize,
 
+        /// Memory type filter: episodic, semantic, procedural, or observation.
+        /// Pass once per type to keep multiple kinds (e.g.
+        /// `--memory-type episodic --memory-type semantic`). Mirrors the
+        /// `--type` flag on `inspect`.
+        #[arg(long = "memory-type")]
+        memory_type: Vec<String>,
+
         /// Namespace to search in
         #[arg(long, default_value = "default")]
         namespace: String,
@@ -255,6 +262,7 @@ fn cmd_recall(
     query: &str,
     entity_filter: Option<&str>,
     limit: usize,
+    memory_type_filter: &[String],
     namespace_name: &str,
     format: OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -313,6 +321,17 @@ fn cmd_recall(
                 }
             } else {
                 true
+            }
+        })
+        .filter(|c| {
+            // W6: --memory-type filter mirrors the `inspect --type` flag and
+            // the SDK-level `types=` kwarg. Empty Vec means "no filter".
+            if memory_type_filter.is_empty() {
+                true
+            } else {
+                memory_type_filter
+                    .iter()
+                    .any(|t| t.eq_ignore_ascii_case(c.memory.type_name()))
             }
         })
         .collect();
@@ -717,8 +736,16 @@ fn main() {
             query,
             entity,
             limit,
+            memory_type,
             namespace,
-        } => cmd_recall(query, entity.as_deref(), *limit, namespace, format),
+        } => cmd_recall(
+            query,
+            entity.as_deref(),
+            *limit,
+            memory_type,
+            namespace,
+            format,
+        ),
 
         Command::Stats { namespace } => cmd_stats(namespace, format),
 
