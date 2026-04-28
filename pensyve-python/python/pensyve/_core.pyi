@@ -2,12 +2,49 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 __version__: str
 
 def embedding_info() -> tuple[str, int]:
     """Return (model_name, dimensions) for the active embedding model."""
+    ...
+
+class HaikuExtractionCache:
+    """Opaque prewarmed observation cache for `extractor="haiku-cached"`.
+
+    Built by `prewarm_haiku_extraction_cache(...)`. Carries one cache entry
+    per unique episode-message fingerprint submitted to the prewarm pass.
+    """
+
+    def __len__(self) -> int: ...
+    def size(self) -> int:
+        """Number of cached entries (alias for `__len__`)."""
+        ...
+
+def prewarm_haiku_extraction_cache(
+    messages_groups: list[list[dict[str, Any]]],
+    api_key: str | None = None,
+    poll_interval_secs: int = 30,
+    max_wait_secs: int = 7200,
+) -> HaikuExtractionCache:
+    """Submit every episode in one Anthropic Messages Batches call.
+
+    Returns a populated `HaikuExtractionCache` keyed by content fingerprint.
+    Pass the result as `Pensyve(extractor="haiku-cached", extractor_cache=...)`
+    to drive Pensyve's per-question ingest path off the cache without
+    further per-episode HTTP traffic.
+
+    Args:
+        messages_groups: One list per episode. Each inner list contains
+            dicts with `role` (str), `content` (str), and optional
+            `event_time` (RFC3339 string). The same shape Pensyve will
+            hand to the extractor at live ingest time, so both sides
+            agree on the fingerprint.
+        api_key: Overrides `ANTHROPIC_API_KEY` env var when provided.
+        poll_interval_secs: Status-poll cadence (default 30s).
+        max_wait_secs: Ceiling for the batch to settle (default 7200 = 2h).
+    """
     ...
 
 class Pensyve:
@@ -20,6 +57,7 @@ class Pensyve:
         extractor: str | None = None,
         extractor_api_key: str | None = None,
         reranker: str | None = "BGERerankerBase",
+        extractor_cache: HaikuExtractionCache | None = None,
     ) -> None:
         """Create or open a Pensyve instance.
 
@@ -30,6 +68,14 @@ class Pensyve:
                 - `"haiku"` wires the Anthropic Haiku 4.5 extractor
                   (requires `ANTHROPIC_API_KEY` env var unless
                   `extractor_api_key` is provided).
+                - `"haiku-batched"` wraps Haiku in the Anthropic Messages
+                  Batches API for bulk re-ingestion (50% per-token discount).
+                - `"haiku-cached"` serves per-episode extraction from a
+                  prewarmed cache built via
+                  `prewarm_haiku_extraction_cache(...)` — the canonical
+                  bulk path. Requires `extractor_cache=...`.
+                - `"haiku-nocache"` is the diagnostic path with prompt
+                  caching disabled.
                 - `"local-vllm"` wires an OpenAI-compatible local-LLM
                   extractor for offline-first deployments (reads
                   `PENSYVE_LOCAL_LLM_URL`, `PENSYVE_LOCAL_LLM_MODEL`,
@@ -45,6 +91,9 @@ class Pensyve:
                 ~150MB fastembed model download, but this is a weaker
                 algorithm than the spec describes). `"JINARerankerV1TurboEn"`
                 is also supported as an English-only alternative.
+            extractor_cache: Required when `extractor="haiku-cached"`. Build
+                via `prewarm_haiku_extraction_cache(messages_groups, ...)`.
+                Ignored for all other extractor values.
         """
         ...
 

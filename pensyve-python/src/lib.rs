@@ -61,7 +61,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEpisode>()?;
     m.add_class::<PyMemory>()?;
     m.add_class::<PySessionGroup>()?;
+    m.add_class::<PyHaikuExtractionCache>()?;
     m.add_function(wrap_pyfunction!(embedding_info, m)?)?;
+    m.add_function(wrap_pyfunction!(prewarm_haiku_extraction_cache, m)?)?;
     Ok(())
 }
 
@@ -190,15 +192,189 @@ fn observation_fields(
 }
 
 // ---------------------------------------------------------------------------
+// Haiku extraction cache (Phase C.2 — Anthropic Messages Batches API
+// prewarm + per-episode replay). The cache is opaque on the Python side;
+// it carries a `HashMap<u64, Vec<ObservationMemory>>` keyed by
+// `pensyve_core::observation::fingerprint_messages` so the wave runner
+// can submit the entire 500Q corpus in one batch and then drive Pensyve's
+// per-question ingest path off the cache without further HTTP traffic.
+// ---------------------------------------------------------------------------
+
+/// Opaque handle around a prewarmed observation cache.
+///
+/// Built by [`prewarm_haiku_extraction_cache`] and consumed by
+/// `Pensyve(extractor="haiku-cached", extractor_cache=...)`. Cloning is
+/// cheap — the underlying `HashMap` is shared via `Arc`.
+#[pyclass(name = "HaikuExtractionCache", frozen, from_py_object)]
+#[derive(Clone)]
+pub struct PyHaikuExtractionCache {
+    cache: Arc<std::collections::HashMap<u64, Vec<pensyve_core::types::ObservationMemory>>>,
+}
+
+#[pymethods]
+impl PyHaikuExtractionCache {
+    /// Number of cached entries (one per unique episode-message
+    /// fingerprint submitted to the prewarm pass).
+    fn __len__(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Diagnostic accessor used by tests / wave runners. Returns the count
+    /// of cached entries — same value as `len()` but explicit.
+    fn size(&self) -> usize {
+        self.cache.len()
+    }
+}
+
+/// Submit every episode's messages in a single
+/// `BatchedAnthropicHaikuExtractor::extract_batch` call and return the
+/// populated [`PyHaikuExtractionCache`].
+///
+/// `messages_groups` is `[[{"role": str, "content": str, "event_time":
+/// Optional[str]}, ...], ...]` — one inner list per episode. Inner dicts
+/// match the wire shape `Pensyve.episode().__exit__` will hand to the
+/// extractor at live ingest time, so the same fingerprint key applies on
+/// both sides.
+///
+/// `api_key` overrides `ANTHROPIC_API_KEY` env when provided.
+/// `poll_interval_secs` and `max_wait_secs` are forwarded to the inner
+/// `BatchedAnthropicHaikuExtractor` for waves that need different cadence
+/// from the 30s / 2h defaults.
+///
+/// Returns a `HaikuExtractionCache` whose entries cover every input
+/// `messages_groups[i]` whose batch result was `succeeded`. Errored,
+/// expired, or canceled entries are silently dropped — the
+/// `CachedBulkExtractor` wrapper falls through to the inner sync extractor
+/// on miss, which preserves correctness without forcing the wave runner to
+/// retry.
+#[pyfunction]
+#[pyo3(signature = (messages_groups, api_key=None, poll_interval_secs=30, max_wait_secs=7200))]
+#[allow(clippy::needless_pass_by_value)]
+fn prewarm_haiku_extraction_cache(
+    py: Python<'_>,
+    messages_groups: Vec<Vec<Bound<'_, PyDict>>>,
+    api_key: Option<String>,
+    poll_interval_secs: u64,
+    max_wait_secs: u64,
+) -> PyResult<PyHaikuExtractionCache> {
+    use pensyve_core::observation::{
+        AnthropicHaikuExtractor, BatchedAnthropicHaikuExtractor, ExtractionMessage,
+        ObservationExtractor, fingerprint_messages,
+    };
+    use std::time::Duration;
+
+    if messages_groups.is_empty() {
+        return Ok(PyHaikuExtractionCache {
+            cache: Arc::new(std::collections::HashMap::new()),
+        });
+    }
+
+    // Translate each inner list of dicts into a Vec<ExtractionMessage>.
+    // We materialise the messages eagerly so the extract_batch() future
+    // can borrow them without holding the GIL across `await`.
+    let mut episodes: Vec<Vec<ExtractionMessage>> = Vec::with_capacity(messages_groups.len());
+    for (i, group) in messages_groups.iter().enumerate() {
+        let mut episode_msgs: Vec<ExtractionMessage> = Vec::with_capacity(group.len());
+        for (j, item) in group.iter().enumerate() {
+            let role: String = match item.get_item("role")? {
+                Some(v) => v.extract()?,
+                None => String::new(),
+            };
+            let content: String = match item.get_item("content")? {
+                Some(v) => v.extract()?,
+                None => {
+                    return Err(PyValueError::new_err(format!(
+                        "messages_groups[{i}][{j}] missing required 'content' field"
+                    )));
+                }
+            };
+            let event_time = match item.get_item("event_time")? {
+                Some(v) if !v.is_none() => {
+                    let s: String = v.extract()?;
+                    Some(parse_rfc3339(&s).map_err(|e| {
+                        PyValueError::new_err(format!("messages_groups[{i}][{j}].event_time: {e}"))
+                    })?)
+                }
+                _ => None,
+            };
+            episode_msgs.push(ExtractionMessage {
+                role,
+                content,
+                event_time,
+            });
+        }
+        episodes.push(episode_msgs);
+    }
+
+    // Build the batch extractor with the requested cadence.
+    let inner = match api_key.as_deref() {
+        Some(k) => AnthropicHaikuExtractor::new(k),
+        None => AnthropicHaikuExtractor::from_env(),
+    }
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to build haiku extractor: {e}")))?;
+    let batched = BatchedAnthropicHaikuExtractor::new(inner)
+        .with_poll_interval(Duration::from_secs(poll_interval_secs))
+        .with_max_wait(Duration::from_secs(max_wait_secs));
+
+    // Synthetic per-episode UUIDs for Anthropic `custom_id` plumbing.
+    // We immediately re-key the results by content fingerprint so the
+    // cache is decoupled from these UUIDs (Pensyve assigns its own
+    // episode_ids at live ingest).
+    let synthetic_ids: Vec<Uuid> = (0..episodes.len()).map(|_| Uuid::new_v4()).collect();
+    let synthetic_ns = Uuid::new_v4();
+
+    // Drive the async submit/poll/collect on a dedicated tokio runtime.
+    // Releasing the GIL via `py.detach` matches the pattern used by
+    // `PyEpisode::__exit__` for the per-episode commit hook — it lets a
+    // host application keep other Python threads running while the bulk
+    // batch settles (which can take minutes for large waves).
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
+
+    let episode_slices: Vec<&[ExtractionMessage]> = episodes.iter().map(Vec::as_slice).collect();
+
+    let batched_results = py
+        .detach(|| rt.block_on(batched.extract_batch(synthetic_ns, &synthetic_ids, episode_slices)))
+        .map_err(|e| PyRuntimeError::new_err(format!("haiku batch extraction failed: {e}")))?;
+
+    // Re-key by content fingerprint. `extract_batch` returns one Vec per
+    // input position, so the fingerprint comes from the same input slice.
+    let mut cache: std::collections::HashMap<u64, Vec<pensyve_core::types::ObservationMemory>> =
+        std::collections::HashMap::with_capacity(episodes.len());
+    for (msgs, observations) in episodes.iter().zip(batched_results) {
+        let fp = fingerprint_messages(msgs);
+        cache.insert(fp, observations);
+    }
+
+    Ok(PyHaikuExtractionCache {
+        cache: Arc::new(cache),
+    })
+}
+
+/// Parse an RFC3339 timestamp string into a `DateTime<Utc>`. The harness
+/// passes `event_time` strings in the same shape `PyEpisode::message`
+/// accepts for `when=...` so prewarm and live ingest agree on the value
+/// that participates in the fingerprint.
+fn parse_rfc3339(s: &str) -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(s)
+        .map(|t| t.with_timezone(&Utc))
+        .map_err(|e| format!("not a valid RFC3339 timestamp: {e}"))
+}
+
+// ---------------------------------------------------------------------------
 // Shared inner state for Pensyve
 // ---------------------------------------------------------------------------
 
 /// Build the optional observation extractor and its backing runtime from
 /// constructor kwargs. Returns `(None, None)` when no extractor is requested.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_lines)]
 fn build_extractor(
     kind: Option<&str>,
     api_key: Option<&str>,
+    cache: Option<&PyHaikuExtractionCache>,
 ) -> PyResult<(
     Option<Arc<dyn pensyve_core::observation::ObservationExtractor>>,
     Option<Arc<tokio::runtime::Runtime>>,
@@ -296,8 +472,49 @@ fn build_extractor(
                 .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
             Ok((Some(Arc::new(built)), Some(Arc::new(rt))))
         }
+        Some("haiku-cached") => {
+            // v1.3.x cost-opt Phase C.2 path: serve per-episode extraction
+            // from a cache prewarmed via a single Anthropic Messages
+            // Batches submission. Bulk re-extraction workloads
+            // (`scripts/rebuild_v11_stores_batched.py`, nightly re-ingests)
+            // construct the cache via `prewarm_haiku_extraction_cache(...)`,
+            // then drive Pensyve's normal per-question ingest path with
+            // `extractor="haiku-cached"` + `extractor_cache=<cache>`.
+            //
+            // The fallback extractor (real Haiku-with-caching call) catches
+            // any episode the prewarm pass missed — preserves correctness
+            // without forcing wave runners to retry partial batches.
+            let cache_obj = cache.ok_or_else(|| {
+                PyValueError::new_err(
+                    "extractor=\"haiku-cached\" requires extractor_cache=<HaikuExtractionCache>; \
+                     build the cache via prewarm_haiku_extraction_cache(...) first",
+                )
+            })?;
+            let fallback_inner = match api_key {
+                Some(k) => pensyve_core::observation::AnthropicHaikuExtractor::new(k),
+                None => pensyve_core::observation::AnthropicHaikuExtractor::from_env(),
+            }
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "Failed to build fallback haiku extractor for haiku-cached: {e}"
+                ))
+            })?;
+            let fallback: Arc<dyn pensyve_core::observation::ObservationExtractor> =
+                Arc::new(fallback_inner);
+            // The Arc cache held by `PyHaikuExtractionCache` is shared,
+            // not cloned by value — both the Python handle and the Rust
+            // CachedBulkExtractor see the same prewarmed payload.
+            let cache_map = (*cache_obj.cache).clone();
+            let built = pensyve_core::observation::CachedBulkExtractor::new(cache_map, fallback);
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
+            Ok((Some(Arc::new(built)), Some(Arc::new(rt))))
+        }
         Some(other) => Err(PyValueError::new_err(format!(
-            "unknown extractor: {other:?}; supported: \"haiku\", \"haiku-batched\", \"haiku-nocache\", \"local-vllm\""
+            "unknown extractor: {other:?}; supported: \"haiku\", \"haiku-batched\", \"haiku-cached\", \"haiku-nocache\", \"local-vllm\""
         ))),
     }
 }
@@ -356,11 +573,20 @@ impl PyPensyve {
     ///           backend (offline-first; env-driven config via
     ///           `PENSYVE_LOCAL_LLM_URL` / `PENSYVE_LOCAL_LLM_MODEL` /
     ///           `PENSYVE_LOCAL_LLM_API_KEY`).
+    ///         - `"haiku-cached"`: serves per-episode extraction from a
+    ///           prewarmed cache built via [`prewarm_haiku_extraction_cache`]
+    ///           — the canonical bulk re-extraction path. Stacks Phase A
+    ///           caching with Phase B Batches (one POST for the entire wave)
+    ///           and falls through to a real Haiku call on cache miss to
+    ///           preserve correctness. Requires `extractor_cache=...`.
     ///         `None` (default) skips extraction entirely — zero cost.
     ///     `extractor_api_key`: Explicit API key for the haiku extractor
     ///         variants. Overrides `ANTHROPIC_API_KEY`.
+    ///     `extractor_cache`: Required when `extractor="haiku-cached"`. Build
+    ///         via `prewarm_haiku_extraction_cache(messages_groups, ...)`.
+    ///         Ignored for all other extractor values.
     #[new]
-    #[pyo3(signature = (path=None, namespace=None, extractor=None, extractor_api_key=None, reranker=Some("BGERerankerBase".to_string())))]
+    #[pyo3(signature = (path=None, namespace=None, extractor=None, extractor_api_key=None, reranker=Some("BGERerankerBase".to_string()), extractor_cache=None))]
     #[allow(clippy::needless_pass_by_value)]
     fn new(
         path: Option<String>,
@@ -368,6 +594,7 @@ impl PyPensyve {
         extractor: Option<String>,
         extractor_api_key: Option<String>,
         reranker: Option<String>,
+        extractor_cache: Option<PyHaikuExtractionCache>,
     ) -> PyResult<Self> {
         let config = PensyveConfig::default();
 
@@ -459,8 +686,11 @@ impl PyPensyve {
             }
         }
 
-        let (extractor_impl, extractor_runtime) =
-            build_extractor(extractor.as_deref(), extractor_api_key.as_deref())?;
+        let (extractor_impl, extractor_runtime) = build_extractor(
+            extractor.as_deref(),
+            extractor_api_key.as_deref(),
+            extractor_cache.as_ref(),
+        )?;
 
         // Cross-encoder reranker is on-by-default per the Pensyve
         // algorithm spec. `reranker=None` opts out for embedded/offline
