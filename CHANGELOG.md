@@ -5,6 +5,16 @@ All notable changes to Pensyve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2] - 2026-05-03
+
+### Changed
+
+- **Dependency bumps**: `fastembed` 5.13.3 → 5.13.4, `huggingface-hub` 1.12.0 → 1.13.0, `llama-cpp-python` 0.3.20 → 0.3.22, `eslint` 10.2.x → 10.3.0, `typescript-eslint` minor bump. All 11 version-bearing files moved to 1.3.2 in lockstep.
+
+### Notes
+
+- No code changes — patch release exists solely to roll up dependency updates accumulated since 1.3.1.
+
 ## [1.3.1] - 2026-04-20
 
 ### Fixed
