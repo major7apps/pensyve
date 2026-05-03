@@ -47,8 +47,10 @@ pub struct AppState {
     pub admin_key: Option<String>,
     pub ct: CancellationToken,
     pub redis: Option<redis::aio::ConnectionManager>,
-    /// Process-wide observation extractor. `None` when `ANTHROPIC_API_KEY`
-    /// is unset — ingest still works, observations are simply not produced.
+    /// Process-wide observation extractor. `None` when the local LLM
+    /// endpoint cannot be configured (typically a missing
+    /// `PENSYVE_EXTRACTOR_URL` / network egress restriction) — ingest
+    /// still works, observations are simply not produced.
     pub extractor: Option<Arc<dyn pensyve_core::observation::ObservationExtractor>>,
 }
 
@@ -250,17 +252,25 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
 
     let auth_required = !config.api_keys.is_empty();
 
-    // Observation extractor — initialized only when ANTHROPIC_API_KEY is set.
-    // Ingest still works without it; observations are simply not produced.
+    // Observation extractor — initialized from `LocalLLMExtractor::from_env()`
+    // which reads PENSYVE_EXTRACTOR_URL / PENSYVE_EXTRACTOR_MODEL /
+    // PENSYVE_EXTRACTOR_API_KEY. Defaults to qwen3.6-35b-a3b on
+    // http://localhost:8888/v1. Ingest still works if construction fails
+    // (e.g. no reqwest client buildable in the runtime env); observations
+    // are simply not produced.
     let extractor: Option<Arc<dyn pensyve_core::observation::ObservationExtractor>> =
-        match pensyve_core::observation::AnthropicHaikuExtractor::from_env() {
+        match pensyve_core::observation::LocalLLMExtractor::from_env() {
             Ok(e) => {
-                tracing::info!("Observation extractor: AnthropicHaikuExtractor (Haiku 4.5)");
+                tracing::info!(
+                    extractor = "LocalLLMExtractor",
+                    default_model = "qwen3.6-35b-a3b",
+                    "Observation extractor: local OpenAI-compatible vLLM backend"
+                );
                 Some(Arc::new(e))
             }
             Err(e) => {
                 tracing::info!(
-                    "Observation extractor disabled: {e}. Set ANTHROPIC_API_KEY to enable."
+                    "Observation extractor disabled: {e}. Set PENSYVE_EXTRACTOR_URL to enable."
                 );
                 None
             }

@@ -15,7 +15,7 @@ name = "pensyve_python"
 crate-type = ["cdylib"]
 
 [dependencies]
-pensyve-core = { path = "../pensyve-core", features = ["observation-extraction", "batch-extractor"] }
+pensyve-core = { path = "../pensyve-core", features = ["observation-extraction"] }
 pyo3 = { version = "^0.28.3", features = ["extension-module"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
@@ -23,6 +23,17 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[features]
+default = []
+# Opt-in archaeology gate that re-enables the retired Anthropic Haiku
+# extractor surface (`Pensyve(extractor="haiku" | "haiku-batched" |
+# "haiku-cached" | "haiku-nocache")`, `prewarm_haiku_extraction_cache`,
+# and the `HaikuExtractionCache` Python class). Forwards to the
+# `pensyve-core` feature of the same name. Default OFF — production
+# wheels ship without cloud-extraction paths; the canonical
+# extraction path is `Pensyve(extractor="local-llm")` against vLLM.
+legacy-anthropic-extractor = ["pensyve-core/legacy-anthropic-extractor"]
 
 [lints]
 workspace = true

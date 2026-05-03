@@ -6,10 +6,15 @@
 //! scanning raw turns. `recall_grouped` joins observations on the top-k
 //! episodes; they do **not** enter the RRF candidate pool.
 //!
-//! [`NoopExtractor`] is the default and costs nothing. [`AnthropicHaikuExtractor`]
-//! (behind the `observation-extraction` feature) reproduces the R7 benchmark
-//! pipeline — see `research/benchmark-sprint/19-observation-extractor-v1.md`
-//! and `20-observation-extractor-ingest-topk.md`.
+//! [`NoopExtractor`] is the default and costs nothing. The default extraction
+//! path runs entirely locally via vLLM ([`LocalLLMExtractor`], behind the
+//! `observation-extraction` feature) — no cloud LLM is reached on the
+//! supported public path. The retired Anthropic legacy path
+//! (`LegacyAnthropicExtractor`) remains gated behind the opt-in
+//! `legacy-anthropic-extractor` feature for historical reference and is
+//! not part of the supported public API; see
+//! `specs/2026-05-02-pensyve-eval-methodology-v2.md` §11 for the v2
+//! pivot away from cloud extraction.
 
 use std::fmt::Debug;
 
@@ -105,10 +110,10 @@ pub trait ObservationExtractor: Send + Sync + Debug {
 
     /// Optional bulk extraction. Default implementation loops over `extract`.
     ///
-    /// Implementations that support a batch API (e.g. Anthropic Messages
-    /// Batches) SHOULD override to amortize per-call overhead. The
-    /// `episode_ids` and `episodes` slices MUST have equal length; the
-    /// returned `Vec<Vec<ObservationMemory>>` is in input order.
+    /// Implementations that support a batch API SHOULD override to amortize
+    /// per-call overhead. The `episode_ids` and `episodes` slices MUST have
+    /// equal length; the returned `Vec<Vec<ObservationMemory>>` is in input
+    /// order.
     async fn extract_batch(
         &self,
         namespace_id: Uuid,
@@ -155,20 +160,18 @@ impl ObservationExtractor for NoopExtractor {
 }
 
 // ---------------------------------------------------------------------------
-// AnthropicHaikuExtractor (feature-gated)
+// Shared prompt + parse helpers (feature-gated to `observation-extraction`).
+// These are LLM-agnostic — no Anthropic / cloud references — and are reused
+// by `LocalLLMExtractor` (default path) and the opt-in
+// `LegacyAnthropicExtractor` archaeology module alike.
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "observation-extraction")]
-mod haiku {
-    use super::{
-        ExtractionError, ExtractionMessage, ExtractionResult, ObservationExtractor,
-        ObservationMemory,
-    };
-    use async_trait::async_trait;
+mod prompt_v1 {
+    use super::{ExtractionMessage, ObservationMemory};
     use chrono::{DateTime, Utc};
-    use serde::{Deserialize, Serialize};
+    use serde::Deserialize;
     use std::fmt::Write as _;
-    use std::time::Duration;
     use uuid::Uuid;
 
     /// Exact prompt the R7 benchmark used to score 89.0% on `LongMemEval_S`.
@@ -213,226 +216,56 @@ assistant without user confirmation = do NOT extract.
 
 Output ONLY a JSON array of objects. No prose, no explanation, no markdown fences.";
 
-    const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
-    const DEFAULT_MAX_TOKENS: u32 = 4096;
-    const DEFAULT_TIMEOUT_SECS: u64 = 60;
-    pub(super) const ANTHROPIC_VERSION: &str = "2023-06-01";
+    /// Render only the per-call recalled-memories body (no instruction
+    /// header). The result is intended to flow into a chat-completion-style
+    /// user message; callers that build a separate system block can prepend
+    /// [`system_prompt`] before this body, while callers that prefer a
+    /// single-message shape can use [`build_prompt`].
+    pub(super) fn user_message(messages: &[ExtractionMessage]) -> String {
+        if messages.is_empty() {
+            return "[No conversation memories provided.]".to_string();
+        }
+        let mut body = String::new();
+        for m in messages {
+            let date = m.event_time.map_or_else(
+                || "unknown".to_string(),
+                |t| t.format("%Y-%m-%d").to_string(),
+            );
+            // Skip the role prefix when empty — engine ingest paths don't
+            // store role on `EpisodicMemory` (it lives in `source_entity`
+            // + `about_entity` UUIDs instead). Harness callers that DO
+            // know the role can still set it and get the
+            // `[date] role: content` format.
+            if m.role.is_empty() {
+                let _ = writeln!(body, "[{date}] {}", m.content);
+            } else {
+                let _ = writeln!(body, "[{date}] {}: {}", m.role, m.content);
+            }
+        }
+        format!("--- Recalled memories ---\n{body}--- End memories ---")
+    }
 
-    /// Anthropic-Messages-API-backed observation extractor.
+    /// The static instruction prompt suitable for use as a cached
+    /// system-block (legacy path) or as a header concatenated into a single
+    /// user message (default local path).
+    pub(super) fn system_prompt() -> &'static str {
+        EXTRACTION_PROMPT_V1
+    }
+
+    /// Render the combined instruction header plus recalled-memories body.
     ///
-    /// Pinned to Haiku 4.5 by default — the model that reproduces the
-    /// benchmark headline. The API base URL is overridable for testing.
-    #[derive(Debug, Clone)]
-    pub struct AnthropicHaikuExtractor {
-        client: reqwest::Client,
-        api_key: String,
-        model: String,
-        max_tokens: u32,
-        base_url: String,
-        prompt_caching_enabled: bool,
+    /// Used by `LocalLLMExtractor` (the default path), which sends a single
+    /// user message to an OpenAI-compatible endpoint with no system-block /
+    /// cache-control concept. Any deviation in this rendering vs. the
+    /// legacy system+user split would silently change benchmark numbers.
+    pub(super) fn build_prompt(messages: &[ExtractionMessage]) -> String {
+        format!("{}\n\n{}", system_prompt(), user_message(messages))
     }
 
-    impl AnthropicHaikuExtractor {
-        /// Build an extractor using the `ANTHROPIC_API_KEY` env var.
-        ///
-        /// Returns `ExtractionError::Config` if the env var is missing.
-        pub fn from_env() -> ExtractionResult<Self> {
-            let api_key = std::env::var("ANTHROPIC_API_KEY")
-                .map_err(|_| ExtractionError::Config("ANTHROPIC_API_KEY env var not set".into()))?;
-            Self::new(api_key)
-        }
-
-        /// Build an extractor with an explicit API key.
-        ///
-        /// Prompt caching is enabled by default — the static
-        /// `EXTRACTION_PROMPT_V1` ships in a cached `system` block so repeat
-        /// calls within Anthropic's 5-minute cache window bill cached input
-        /// tokens at 10% of the regular rate. Use [`Self::without_prompt_caching`]
-        /// to opt out for diagnostic comparisons.
-        pub fn new(api_key: impl Into<String>) -> ExtractionResult<Self> {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
-                .build()
-                .map_err(|e| ExtractionError::Config(format!("http client build: {e}")))?;
-            Ok(Self {
-                client,
-                api_key: api_key.into(),
-                model: DEFAULT_MODEL.into(),
-                max_tokens: DEFAULT_MAX_TOKENS,
-                base_url: "https://api.anthropic.com".into(),
-                prompt_caching_enabled: true,
-            })
-        }
-
-        /// Override the model ID. Defaults to `claude-haiku-4-5-20251001`.
-        /// Changing the model invalidates any benchmark-reproducibility claim.
-        #[must_use]
-        pub fn with_model(mut self, model: impl Into<String>) -> Self {
-            self.model = model.into();
-            self
-        }
-
-        /// Override the base URL (primarily for test mocks).
-        #[must_use]
-        pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-            self.base_url = base_url.into();
-            self
-        }
-
-        /// Disable Anthropic prompt caching for this extractor.
-        ///
-        /// Production should leave caching on (the default) — switching off
-        /// loses the ~57% per-call discount on the static instruction prompt.
-        /// Intended for benchmarks that need to measure un-cached cost
-        /// directly, or for emergency rollback if a wire-shape regression
-        /// surfaces upstream.
-        #[must_use]
-        pub fn without_prompt_caching(mut self) -> Self {
-            self.prompt_caching_enabled = false;
-            self
-        }
-
-        /// The static instruction prompt used as the cached `system` block.
-        pub(super) fn system_prompt() -> &'static str {
-            EXTRACTION_PROMPT_V1
-        }
-
-        /// Borrow the underlying HTTP client. Sibling modules in
-        /// `pensyve-core::observation` (e.g. `batched_haiku`) reuse it to
-        /// avoid building a second connection pool.
-        ///
-        /// Gated to the `batch-extractor` feature because that's the only
-        /// in-tree caller; under `observation-extraction` alone these
-        /// accessors would dead-code-warn.
-        #[cfg(feature = "batch-extractor")]
-        pub(super) fn client(&self) -> &reqwest::Client {
-            &self.client
-        }
-
-        #[cfg(feature = "batch-extractor")]
-        pub(super) fn api_key(&self) -> &str {
-            &self.api_key
-        }
-
-        #[cfg(feature = "batch-extractor")]
-        pub(super) fn model(&self) -> &str {
-            &self.model
-        }
-
-        #[cfg(feature = "batch-extractor")]
-        pub(super) fn max_tokens(&self) -> u32 {
-            self.max_tokens
-        }
-
-        #[cfg(feature = "batch-extractor")]
-        pub(super) fn base_url(&self) -> &str {
-            &self.base_url
-        }
-
-        #[cfg(feature = "batch-extractor")]
-        pub(super) fn prompt_caching_enabled(&self) -> bool {
-            self.prompt_caching_enabled
-        }
-
-        /// Render only the per-call recalled-memories body (no instruction
-        /// header). The result is sent as `messages[0].content`; the static
-        /// header travels separately via [`Self::system_prompt`] and gets
-        /// served from cache after the first call within Anthropic's 5-minute
-        /// window.
-        pub(super) fn user_message(messages: &[ExtractionMessage]) -> String {
-            if messages.is_empty() {
-                return "[No conversation memories provided.]".to_string();
-            }
-            let mut body = String::new();
-            for m in messages {
-                let date = m.event_time.map_or_else(
-                    || "unknown".to_string(),
-                    |t| t.format("%Y-%m-%d").to_string(),
-                );
-                // Skip the role prefix when empty — engine ingest paths don't
-                // store role on `EpisodicMemory` (it lives in `source_entity`
-                // + `about_entity` UUIDs instead). Harness callers that DO
-                // know the role can still set it and get the
-                // `[date] role: content` format.
-                if m.role.is_empty() {
-                    let _ = writeln!(body, "[{date}] {}", m.content);
-                } else {
-                    let _ = writeln!(body, "[{date}] {}: {}", m.role, m.content);
-                }
-            }
-            format!("--- Recalled memories ---\n{body}--- End memories ---")
-        }
-
-        /// Render the combined instruction header plus recalled-memories body.
-        ///
-        /// Retained as a thin shim over [`Self::system_prompt`] +
-        /// [`Self::user_message`] so `LocalLLMExtractor`, which sends a
-        /// single user message to an OpenAI-compatible endpoint that has no
-        /// system-block / cache-control concept, gets identical prompt text
-        /// to the pre-caching Anthropic path. Any deviation here would
-        /// silently change benchmark numbers.
-        pub(super) fn build_prompt(messages: &[ExtractionMessage]) -> String {
-            format!(
-                "{}\n\n{}",
-                Self::system_prompt(),
-                Self::user_message(messages)
-            )
-        }
-    }
-
-    /// Raw response body from Anthropic Messages API.
-    #[derive(Debug, Deserialize)]
-    struct AnthropicResponse {
-        content: Vec<AnthropicContentBlock>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct AnthropicContentBlock {
-        #[serde(rename = "type")]
-        block_type: String,
-        #[serde(default)]
-        text: String,
-    }
-
-    #[derive(Debug, Serialize)]
-    struct AnthropicRequest<'a> {
-        model: &'a str,
-        max_tokens: u32,
-        temperature: f32,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        system: Option<Vec<SystemBlock<'a>>>,
-        messages: Vec<AnthropicMessage<'a>>,
-    }
-
-    #[derive(Debug, Serialize)]
-    pub(super) struct AnthropicMessage<'a> {
-        pub(super) role: &'a str,
-        pub(super) content: &'a str,
-    }
-
-    /// One block of the Anthropic Messages API `system` field. The
-    /// `cache_control` marker tells Anthropic to cache the prefix ending at
-    /// this block; subsequent calls within the cache window bill those
-    /// tokens at 10% of regular input price.
-    #[derive(Debug, Serialize)]
-    pub(super) struct SystemBlock<'a> {
-        #[serde(rename = "type")]
-        pub(super) block_type: &'static str,
-        pub(super) text: &'a str,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub(super) cache_control: Option<CacheControl>,
-    }
-
-    #[derive(Debug, Serialize)]
-    pub(super) struct CacheControl {
-        #[serde(rename = "type")]
-        pub(super) cache_type: &'static str,
-    }
-
-    // Sibling extractor modules (see `localllm`) share this observation shape
-    // + the date-prefix render logic + the tolerant JSON parser. Exposed with
-    // `pub(super)` so they're reachable from `observation::localllm` without
-    // leaking into the public pensyve-core surface.
+    // Sibling extractor modules (see `localllm` and the gated
+    // `legacy_anthropic`) share this observation shape + the tolerant JSON
+    // parser. Exposed with `pub(super)` so they're reachable without leaking
+    // into the public pensyve-core surface.
     #[derive(Debug, Deserialize)]
     pub(super) struct RawObservation {
         pub(super) entity_type: String,
@@ -537,22 +370,195 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
             (None, None) => base,
         }
     }
+}
+
+#[cfg(feature = "observation-extraction")]
+pub use prompt_v1::EXTRACTION_PROMPT_V1;
+
+// ---------------------------------------------------------------------------
+// LegacyAnthropicExtractor (gated by `legacy-anthropic-extractor`).
+//
+// OPT-IN ARCHAEOLOGY ONLY. Default builds (`--no-default-features` and
+// `--features observation-extraction`) do NOT compile this module. The v2
+// methodology pivot (specs/2026-05-02-pensyve-eval-methodology-v2.md §11)
+// retired the cloud extraction path; the type and its Messages-Batches
+// sibling are preserved here for git-blame archaeology and are not part of
+// the supported public API.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "legacy-anthropic-extractor")]
+mod legacy_anthropic {
+    use super::prompt_v1::{parse_response, raw_to_observation, system_prompt, user_message};
+    use super::{
+        ExtractionError, ExtractionMessage, ExtractionResult, ObservationExtractor,
+        ObservationMemory,
+    };
+    use async_trait::async_trait;
+    use serde::{Deserialize, Serialize};
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
+    const DEFAULT_MAX_TOKENS: u32 = 4096;
+    const DEFAULT_TIMEOUT_SECS: u64 = 60;
+    pub(super) const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+    /// Retired Anthropic-Messages-API-backed observation extractor.
+    ///
+    /// Originally pinned to Haiku 4.5 to reproduce the R7 benchmark headline.
+    /// Superseded by [`super::LocalLLMExtractor`] under
+    /// `specs/2026-05-02-pensyve-eval-methodology-v2.md` §11. Retained behind
+    /// the opt-in `legacy-anthropic-extractor` feature for git-blame
+    /// archaeology only — not part of the supported public API.
+    #[derive(Debug, Clone)]
+    pub struct LegacyAnthropicExtractor {
+        client: reqwest::Client,
+        api_key: String,
+        model: String,
+        max_tokens: u32,
+        base_url: String,
+        prompt_caching_enabled: bool,
+    }
+
+    impl LegacyAnthropicExtractor {
+        /// Build an extractor using the `ANTHROPIC_API_KEY` env var.
+        ///
+        /// Returns `ExtractionError::Config` if the env var is missing.
+        pub fn from_env() -> ExtractionResult<Self> {
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .map_err(|_| ExtractionError::Config("ANTHROPIC_API_KEY env var not set".into()))?;
+            Self::new(api_key)
+        }
+
+        /// Build an extractor with an explicit API key.
+        pub fn new(api_key: impl Into<String>) -> ExtractionResult<Self> {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+                .build()
+                .map_err(|e| ExtractionError::Config(format!("http client build: {e}")))?;
+            Ok(Self {
+                client,
+                api_key: api_key.into(),
+                model: DEFAULT_MODEL.into(),
+                max_tokens: DEFAULT_MAX_TOKENS,
+                base_url: "https://api.anthropic.com".into(),
+                prompt_caching_enabled: true,
+            })
+        }
+
+        /// Override the model ID. Defaults to `claude-haiku-4-5-20251001`.
+        #[must_use]
+        pub fn with_model(mut self, model: impl Into<String>) -> Self {
+            self.model = model.into();
+            self
+        }
+
+        /// Override the base URL (primarily for test mocks).
+        #[must_use]
+        pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+            self.base_url = base_url.into();
+            self
+        }
+
+        /// Disable Anthropic prompt caching for this extractor.
+        #[must_use]
+        pub fn without_prompt_caching(mut self) -> Self {
+            self.prompt_caching_enabled = false;
+            self
+        }
+
+        /// Borrow the underlying HTTP client. The legacy batched sibling
+        /// reuses it to avoid building a second connection pool.
+        pub(super) fn client(&self) -> &reqwest::Client {
+            &self.client
+        }
+
+        pub(super) fn api_key(&self) -> &str {
+            &self.api_key
+        }
+
+        pub(super) fn model(&self) -> &str {
+            &self.model
+        }
+
+        pub(super) fn max_tokens(&self) -> u32 {
+            self.max_tokens
+        }
+
+        pub(super) fn base_url(&self) -> &str {
+            &self.base_url
+        }
+
+        pub(super) fn prompt_caching_enabled(&self) -> bool {
+            self.prompt_caching_enabled
+        }
+
+        /// Combined instruction header + recalled-memories body (parity with
+        /// the local path; tests pin the rendering invariant).
+        #[cfg(test)]
+        pub(super) fn build_prompt(messages: &[ExtractionMessage]) -> String {
+            super::prompt_v1::build_prompt(messages)
+        }
+    }
+
+    /// Raw response body from Anthropic Messages API.
+    #[derive(Debug, Deserialize)]
+    struct AnthropicResponse {
+        content: Vec<AnthropicContentBlock>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct AnthropicContentBlock {
+        #[serde(rename = "type")]
+        block_type: String,
+        #[serde(default)]
+        text: String,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct AnthropicRequest<'a> {
+        model: &'a str,
+        max_tokens: u32,
+        temperature: f32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        system: Option<Vec<SystemBlock<'a>>>,
+        messages: Vec<AnthropicMessage<'a>>,
+    }
+
+    #[derive(Debug, Serialize)]
+    pub(super) struct AnthropicMessage<'a> {
+        pub(super) role: &'a str,
+        pub(super) content: &'a str,
+    }
+
+    /// One block of the Anthropic Messages API `system` field.
+    #[derive(Debug, Serialize)]
+    pub(super) struct SystemBlock<'a> {
+        #[serde(rename = "type")]
+        pub(super) block_type: &'static str,
+        pub(super) text: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub(super) cache_control: Option<CacheControl>,
+    }
+
+    #[derive(Debug, Serialize)]
+    pub(super) struct CacheControl {
+        #[serde(rename = "type")]
+        pub(super) cache_type: &'static str,
+    }
 
     #[async_trait]
-    impl ObservationExtractor for AnthropicHaikuExtractor {
+    impl ObservationExtractor for LegacyAnthropicExtractor {
         async fn extract(
             &self,
             namespace_id: Uuid,
             episode_id: Uuid,
             messages: &[ExtractionMessage],
         ) -> ExtractionResult<Vec<ObservationMemory>> {
-            let user_msg = Self::user_message(messages);
+            let user_msg = user_message(messages);
             let last_event_time = messages.iter().filter_map(|m| m.event_time).max();
 
             // Hoist the static instruction prompt into a `system` block.
-            // When prompt caching is enabled (default), Anthropic caches the
-            // block for ~5 minutes and bills the ~350 tokens at 10% on the
-            // next call — ~57% per-call savings on bulk workloads.
             let cache_control = if self.prompt_caching_enabled {
                 Some(CacheControl {
                     cache_type: "ephemeral",
@@ -562,7 +568,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
             };
             let system_blocks = vec![SystemBlock {
                 block_type: "text",
-                text: Self::system_prompt(),
+                text: system_prompt(),
                 cache_control,
             }];
 
@@ -616,7 +622,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
     }
 
     // -------------------------------------------------------------------
-    // Tests
+    // Tests (compile only when the legacy archaeology gate is on).
     // -------------------------------------------------------------------
 
     #[cfg(test)]
@@ -626,6 +632,8 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
     )]
     mod tests {
         use super::*;
+        use super::super::prompt_v1::{EXTRACTION_PROMPT_V1, RawObservation};
+        use chrono::{DateTime, Utc};
         use wiremock::matchers::{body_partial_json, header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -674,7 +682,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
                 .mount(&server)
                 .await;
 
-            let extractor = AnthropicHaikuExtractor::new("test-key")
+            let extractor = LegacyAnthropicExtractor::new("test-key")
                 .unwrap()
                 .with_base_url(server.uri());
             let ns = Uuid::new_v4();
@@ -713,7 +721,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
                 .mount(&server)
                 .await;
 
-            let extractor = AnthropicHaikuExtractor::new("k")
+            let extractor = LegacyAnthropicExtractor::new("k")
                 .unwrap()
                 .with_base_url(server.uri());
             let out = extractor
@@ -736,7 +744,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
                 .mount(&server)
                 .await;
 
-            let extractor = AnthropicHaikuExtractor::new("k")
+            let extractor = LegacyAnthropicExtractor::new("k")
                 .unwrap()
                 .with_base_url(server.uri());
             let out = extractor
@@ -755,7 +763,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
                 .mount(&server)
                 .await;
 
-            let extractor = AnthropicHaikuExtractor::new("k")
+            let extractor = LegacyAnthropicExtractor::new("k")
                 .unwrap()
                 .with_base_url(server.uri());
             let err = extractor
@@ -772,7 +780,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
             // An empty key is accepted by `new()` but callers should not
             // rely on that; the Config error variant is what `from_env`
             // returns when the var is missing.
-            let err = AnthropicHaikuExtractor::new("")
+            let err = LegacyAnthropicExtractor::new("")
                 .and_then(|e| {
                     // Confirm construction doesn't validate key shape.
                     // If the constructor starts validating, update this test.
@@ -798,7 +806,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
                 content: "I played AC Odyssey".into(),
                 event_time: None,
             }];
-            let prompt = AnthropicHaikuExtractor::build_prompt(&msgs);
+            let prompt = LegacyAnthropicExtractor::build_prompt(&msgs);
             assert!(prompt.contains("countable entity"));
             assert!(prompt.contains("user: I played AC Odyssey"));
             assert!(prompt.contains("--- Recalled memories ---"));
@@ -806,7 +814,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
 
         #[test]
         fn prompt_handles_empty_messages() {
-            let prompt = AnthropicHaikuExtractor::build_prompt(&[]);
+            let prompt = LegacyAnthropicExtractor::build_prompt(&[]);
             assert!(prompt.contains("No conversation memories provided"));
         }
 
@@ -821,7 +829,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
                 content: "Check http://example.com at 10:30".to_string(),
                 event_time: None,
             }];
-            let prompt = AnthropicHaikuExtractor::build_prompt(&msgs);
+            let prompt = LegacyAnthropicExtractor::build_prompt(&msgs);
             assert!(prompt.contains("[unknown] Check http://example.com at 10:30"));
             // And NO "10:" or "http:" being (mis)interpreted as a role marker.
             assert!(!prompt.contains("10: 30"));
@@ -904,7 +912,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
                 .mount(&server)
                 .await;
 
-            let extractor = AnthropicHaikuExtractor::new("test-key")
+            let extractor = LegacyAnthropicExtractor::new("test-key")
                 .unwrap()
                 .with_base_url(server.uri());
             extractor
@@ -955,7 +963,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
                 .mount(&server)
                 .await;
 
-            let extractor = AnthropicHaikuExtractor::new("test-key")
+            let extractor = LegacyAnthropicExtractor::new("test-key")
                 .unwrap()
                 .with_base_url(server.uri())
                 .without_prompt_caching();
@@ -994,7 +1002,7 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
                 .mount(&server)
                 .await;
 
-            let extractor = AnthropicHaikuExtractor::new("test-key")
+            let extractor = LegacyAnthropicExtractor::new("test-key")
                 .unwrap()
                 .with_base_url(server.uri());
             extractor
@@ -1033,23 +1041,23 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
     }
 }
 
-#[cfg(feature = "observation-extraction")]
-pub use haiku::{AnthropicHaikuExtractor, EXTRACTION_PROMPT_V1};
+#[cfg(feature = "legacy-anthropic-extractor")]
+pub use legacy_anthropic::LegacyAnthropicExtractor;
 
 // ---------------------------------------------------------------------------
-// BatchedAnthropicHaikuExtractor (feature-gated, opt-in) — Anthropic Messages
-// Batches API path. Stacks with prompt caching for ~80% per-call savings on
-// bulk workloads (benchmarks, nightly re-ingests). Submits N episodes in
-// one POST and polls `processing_status` until "ended", then collects
-// JSONL results routed by `custom_id`.
+// LegacyBatchedAnthropicExtractor (gated by `legacy-anthropic-extractor`).
+// Anthropic Messages Batches API path. Retired alongside
+// `LegacyAnthropicExtractor` under the v2 methodology pivot
+// (specs/2026-05-02-pensyve-eval-methodology-v2.md §11). Preserved here for
+// archaeology only — not part of the supported public API.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "batch-extractor")]
-mod batched_haiku {
-    use super::haiku::{
-        ANTHROPIC_VERSION, AnthropicHaikuExtractor, AnthropicMessage, CacheControl, SystemBlock,
-        parse_response, raw_to_observation,
+#[cfg(feature = "legacy-anthropic-extractor")]
+mod legacy_batched_anthropic {
+    use super::legacy_anthropic::{
+        ANTHROPIC_VERSION, AnthropicMessage, CacheControl, LegacyAnthropicExtractor, SystemBlock,
     };
+    use super::prompt_v1::{parse_response, raw_to_observation, system_prompt, user_message};
     use super::{
         ExtractionError, ExtractionMessage, ExtractionResult, ObservationExtractor,
         ObservationMemory,
@@ -1066,27 +1074,27 @@ mod batched_haiku {
     const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(30);
     /// Default ceiling — Anthropic's documented SLA is 24h, but 2h covers
     /// every observed bench batch with margin. Callers running larger
-    /// workloads override via [`BatchedAnthropicHaikuExtractor::with_max_wait`].
+    /// workloads override via [`LegacyBatchedAnthropicExtractor::with_max_wait`].
     const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(2 * 60 * 60);
 
     /// Anthropic Messages Batches API extractor — opt-in bulk path.
     ///
-    /// Wraps [`AnthropicHaikuExtractor`] and submits a single
+    /// Wraps [`LegacyAnthropicExtractor`] and submits a single
     /// `POST /v1/messages/batches` request carrying one entry per episode.
     /// Single-episode `extract` calls fall through to the inner sync
     /// extractor since batch overhead isn't worth it under those conditions.
     #[derive(Debug, Clone)]
-    pub struct BatchedAnthropicHaikuExtractor {
-        inner: AnthropicHaikuExtractor,
+    pub struct LegacyBatchedAnthropicExtractor {
+        inner: LegacyAnthropicExtractor,
         poll_interval: Duration,
         max_wait: Duration,
     }
 
-    impl BatchedAnthropicHaikuExtractor {
-        /// Wrap an existing [`AnthropicHaikuExtractor`] with batch-mode
+    impl LegacyBatchedAnthropicExtractor {
+        /// Wrap an existing [`LegacyAnthropicExtractor`] with batch-mode
         /// dispatch.
         #[must_use]
-        pub fn new(inner: AnthropicHaikuExtractor) -> Self {
+        pub fn new(inner: LegacyAnthropicExtractor) -> Self {
             Self {
                 inner,
                 poll_interval: DEFAULT_POLL_INTERVAL,
@@ -1096,7 +1104,7 @@ mod batched_haiku {
 
         /// Build the inner extractor from `ANTHROPIC_API_KEY` and wrap it.
         pub fn from_env() -> ExtractionResult<Self> {
-            Ok(Self::new(AnthropicHaikuExtractor::from_env()?))
+            Ok(Self::new(LegacyAnthropicExtractor::from_env()?))
         }
 
         /// Override the poll cadence (default 30s).
@@ -1123,10 +1131,7 @@ mod batched_haiku {
             // `AnthropicRequest` so caching/temperature/max_tokens stay
             // identical across paths. The user message is built per-episode
             // because `BatchEntry` owns its `BatchParams`.
-            let user_messages: Vec<String> = episodes
-                .iter()
-                .map(|ep| AnthropicHaikuExtractor::user_message(ep))
-                .collect();
+            let user_messages: Vec<String> = episodes.iter().map(|ep| user_message(ep)).collect();
 
             let cache_control = if self.inner.prompt_caching_enabled() {
                 Some(CacheControl {
@@ -1147,7 +1152,7 @@ mod batched_haiku {
                         temperature: 0.0,
                         system: Some(vec![SystemBlock {
                             block_type: "text",
-                            text: AnthropicHaikuExtractor::system_prompt(),
+                            text: system_prompt(),
                             cache_control: cache_control.as_ref().map(|_| CacheControl {
                                 cache_type: "ephemeral",
                             }),
@@ -1436,7 +1441,7 @@ mod batched_haiku {
     }
 
     #[async_trait]
-    impl ObservationExtractor for BatchedAnthropicHaikuExtractor {
+    impl ObservationExtractor for LegacyBatchedAnthropicExtractor {
         async fn extract(
             &self,
             namespace_id: Uuid,
@@ -1531,11 +1536,11 @@ mod batched_haiku {
             line.to_string()
         }
 
-        fn make_extractor(server_uri: &str) -> BatchedAnthropicHaikuExtractor {
-            let inner = AnthropicHaikuExtractor::new("test-key")
+        fn make_extractor(server_uri: &str) -> LegacyBatchedAnthropicExtractor {
+            let inner = LegacyAnthropicExtractor::new("test-key")
                 .unwrap()
                 .with_base_url(server_uri.to_string());
-            BatchedAnthropicHaikuExtractor::new(inner)
+            LegacyBatchedAnthropicExtractor::new(inner)
                 .with_poll_interval(Duration::from_millis(10))
                 .with_max_wait(Duration::from_secs(5))
         }
@@ -1951,17 +1956,19 @@ mod batched_haiku {
     }
 }
 
-#[cfg(feature = "batch-extractor")]
-pub use batched_haiku::BatchedAnthropicHaikuExtractor;
+#[cfg(feature = "legacy-anthropic-extractor")]
+pub use legacy_batched_anthropic::LegacyBatchedAnthropicExtractor;
 
 // ---------------------------------------------------------------------------
 // CachedBulkExtractor (feature-gated, opt-in) — replays a prewarmed cache
 // across the per-episode commit hook so bulk re-extraction workloads
-// realise Phase B's Anthropic Messages Batches discount without skipping
-// Pensyve's `commit_extraction_for_episode` consolidation pipeline.
+// reuse a single batched extraction pass without skipping Pensyve's
+// `commit_extraction_for_episode` consolidation pipeline. The cache is
+// extractor-agnostic; bulk passes can be powered by `LocalLLMExtractor`
+// (default) or, on the opt-in archaeology gate, the legacy batched path.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "batch-extractor")]
+#[cfg(feature = "observation-extraction")]
 mod cached_bulk {
     use super::{ExtractionMessage, ExtractionResult, ObservationExtractor, ObservationMemory};
     use async_trait::async_trait;
@@ -2015,8 +2022,9 @@ mod cached_bulk {
     ///
     /// 1. Pre-collects every episode's `ExtractionMessage` slice across
     ///    every question.
-    /// 2. Submits them in one [`BatchedAnthropicHaikuExtractor::extract_batch`]
-    ///    call, paying the per-token Batches discount once.
+    /// 2. Submits them in a single batched extraction pass against the
+    ///    chosen extractor (the local default, or the legacy archaeology
+    ///    path when explicitly opted in).
     /// 3. Builds a `HashMap<u64, Vec<ObservationMemory>>` keyed by
     ///    [`fingerprint_messages`].
     /// 4. Wraps the cache in `CachedBulkExtractor::new(cache, fallback)` and
@@ -2260,17 +2268,20 @@ mod cached_bulk {
     }
 }
 
-#[cfg(feature = "batch-extractor")]
+#[cfg(feature = "observation-extraction")]
 pub use cached_bulk::{CachedBulkExtractor, fingerprint_messages};
 
 // ---------------------------------------------------------------------------
-// LocalLLMExtractor (feature-gated) — OpenAI-compatible local vLLM backend
+// LocalLLMExtractor (feature-gated) — OpenAI-compatible local vLLM backend.
+// This is the supported default extraction path (see
+// specs/2026-05-02-pensyve-eval-methodology-v2.md §11). No cloud LLM is
+// reached on this path.
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "observation-extraction")]
 mod localllm {
-    use super::haiku::{
-        AnthropicHaikuExtractor, RawObservation, parse_response, raw_to_observation,
+    use super::prompt_v1::{
+        self, RawObservation, parse_response, raw_to_observation,
     };
     use super::{
         ExtractionError, ExtractionMessage, ExtractionResult, ObservationExtractor,
@@ -2284,9 +2295,13 @@ mod localllm {
     // Default wired to the DGX Spark local vLLM port the bench uses (see
     // pensyve-docs/research/benchmark-sprint/20-observation-extractor-ingest-topk.md
     // for the offline-first rationale). Any OpenAI-compatible chat-completions
-    // endpoint works — Qwen, Nemotron Nano, llama.cpp's server, etc.
+    // endpoint works — Qwen, Nemotron Nano, llama.cpp's server, etc. The
+    // `qwen3.6-35b-a3b` default tracks the v2-methodology pivot
+    // (specs/2026-05-02-pensyve-eval-methodology-v2.md §8) — single canonical
+    // model id keeps env-driven configs reproducible across the benchmark
+    // harness and the production engine.
     const DEFAULT_BASE_URL: &str = "http://localhost:8888/v1";
-    const DEFAULT_MODEL: &str = "local";
+    const DEFAULT_MODEL: &str = "qwen3.6-35b-a3b";
     const DEFAULT_MAX_TOKENS: u32 = 4096;
     // Local reasoning models (Qwen 3.6, Nemotron 3 Nano in reasoning mode)
     // emit hundreds of <think> tokens before the JSON output — a plain
@@ -2296,11 +2311,13 @@ mod localllm {
     const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
     /// Extractor that hits an OpenAI-compatible `chat.completions` endpoint —
-    /// designed for local vLLM serving a small open-weight model (Qwen 3.5-27B
-    /// dense, Nemotron Nano 30B, etc.). Mirrors [`AnthropicHaikuExtractor`]
-    /// (same `EXTRACTION_PROMPT_V1`, same `RawObservation` shape, same
-    /// tolerant JSON parser) so switching extractors is a pure config flip
-    /// with no recall-time surface change.
+    /// designed for local vLLM serving a small open-weight model (Qwen 3.6-35B
+    /// `MoE`, Nemotron Nano, etc.). Default extraction path under the v2
+    /// methodology pivot (specs/2026-05-02-pensyve-eval-methodology-v2.md
+    /// §11): runs entirely locally, no cloud LLM is reached. Uses the same
+    /// `EXTRACTION_PROMPT_V1`, `RawObservation` shape, and tolerant JSON
+    /// parser as the legacy archaeology path so prompt and parsing
+    /// invariants stay byte-identical across the two implementations.
     ///
     /// Wired via `Pensyve(extractor="local-vllm", ...)` on the Python side.
     /// Offline-first: requires no API key and no network egress beyond the
@@ -2336,18 +2353,18 @@ mod localllm {
             })
         }
 
-        /// Build from environment variables:
-        ///   - `PENSYVE_LOCAL_LLM_URL`  (default `http://localhost:8888/v1`)
-        ///   - `PENSYVE_LOCAL_LLM_MODEL` (default `"local"` — vLLM accepts any
-        ///     model id for a single-model server; users override when the
-        ///     gateway multiplexes)
-        ///   - `PENSYVE_LOCAL_LLM_API_KEY` (optional)
+        /// Build from environment variables — names match the canonical
+        /// spec table in `pensyve-eval-methodology-v2.md` §8:
+        ///   - `PENSYVE_EXTRACTOR_URL`   (default `http://localhost:8888/v1`)
+        ///   - `PENSYVE_EXTRACTOR_MODEL` (default `qwen3.6-35b-a3b`)
+        ///   - `PENSYVE_EXTRACTOR_API_KEY` (optional; vLLM ignores it but
+        ///     gateway-style drop-ins like vLLM-on-Modal may require it)
         pub fn from_env() -> ExtractionResult<Self> {
             let base_url =
-                std::env::var("PENSYVE_LOCAL_LLM_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into());
-            let model =
-                std::env::var("PENSYVE_LOCAL_LLM_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
-            let api_key = std::env::var("PENSYVE_LOCAL_LLM_API_KEY").ok();
+                std::env::var("PENSYVE_EXTRACTOR_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into());
+            let model = std::env::var("PENSYVE_EXTRACTOR_MODEL")
+                .unwrap_or_else(|_| DEFAULT_MODEL.into());
+            let api_key = std::env::var("PENSYVE_EXTRACTOR_API_KEY").ok();
             Self::new(base_url, model, api_key)
         }
 
@@ -2370,12 +2387,11 @@ mod localllm {
         }
 
         /// Render the `[date] role: content` body + the V1 extraction prompt.
-        /// Delegates to `AnthropicHaikuExtractor::build_prompt` (made
-        /// `pub(super)` in this PR) so the local backend sees identical
-        /// prompt text by construction — any deviation would break the
-        /// benchmark-pinned prompt.
+        /// Delegates to `prompt_v1::build_prompt` so the local backend sees
+        /// identical prompt text to the legacy archaeology path — any
+        /// deviation would break the benchmark-pinned prompt.
         fn build_prompt(messages: &[ExtractionMessage]) -> String {
-            AnthropicHaikuExtractor::build_prompt(messages)
+            prompt_v1::build_prompt(messages)
         }
     }
 
@@ -2638,11 +2654,651 @@ mod localllm {
                 .await
                 .expect("ok");
         }
+
+        #[test]
+        fn default_config_matches_spec_table() {
+            // Spec §8 (specs/2026-05-02-pensyve-eval-methodology-v2.md):
+            //   PENSYVE_EXTRACTOR_URL   default http://localhost:8888/v1
+            //   PENSYVE_EXTRACTOR_MODEL default qwen3.6-35b-a3b
+            // The harness, the engine, and downstream env-var docs all
+            // assume the same defaults — pin them here so a stray edit to
+            // the constants forces a test failure.
+            assert_eq!(DEFAULT_BASE_URL, "http://localhost:8888/v1");
+            assert_eq!(DEFAULT_MODEL, "qwen3.6-35b-a3b");
+            assert_eq!(DEFAULT_MAX_TOKENS, 4096);
+        }
+
+        #[test]
+        fn builders_chain_and_override_defaults() {
+            // The `with_*` builders must return `Self` (taking `self` by
+            // value) so they chain. They also must overwrite the field
+            // they target — easy to break by accident if someone mutates
+            // a clone instead of the moved value.
+            let extractor =
+                LocalLLMExtractor::new("http://example.com/v1", "default-model", None)
+                    .expect("new")
+                    .with_base_url("http://override.test/v1")
+                    .with_model("qwen3.6-35b-a3b")
+                    .with_max_tokens(2048);
+            assert_eq!(extractor.base_url, "http://override.test/v1");
+            assert_eq!(extractor.model, "qwen3.6-35b-a3b");
+            assert_eq!(extractor.max_tokens, 2048);
+            assert!(extractor.api_key.is_none());
+        }
+
+        #[tokio::test]
+        async fn request_body_matches_openai_chat_completions_shape() {
+            // Wire-shape contract: vLLM's OpenAI-compat endpoint expects
+            //   { model, messages: [{role, content}], temperature, max_tokens,
+            //     chat_template_kwargs: { enable_thinking } }
+            // with `chat_template_kwargs` at the TOP LEVEL (the Python
+            // OpenAI SDK accepts it under `extra_body=` then flattens it
+            // into the JSON body — raw HTTP must mirror that flattened
+            // shape, not nest it back under `extra_body`).
+            let server = MockServer::start().await;
+            let expected_body = serde_json::json!({
+                "model": "qwen3.6-35b-a3b",
+                "temperature": 0.0,
+                "max_tokens": 4096,
+                "chat_template_kwargs": {"enable_thinking": false},
+            });
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .and(wiremock::matchers::body_partial_json(expected_body))
+                .respond_with(ResponseTemplate::new(200).set_body_json(openai_response_body("[]")))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let extractor = LocalLLMExtractor::new(server.uri(), "qwen3.6-35b-a3b", None).unwrap();
+            let msgs = [ExtractionMessage {
+                role: String::new(),
+                content: "I bought 2 books today.".into(),
+                event_time: None,
+            }];
+            extractor
+                .extract(Uuid::new_v4(), Uuid::new_v4(), &msgs)
+                .await
+                .expect("ok");
+        }
+
+        #[tokio::test]
+        async fn request_user_message_carries_extraction_prompt_v1() {
+            // The user-message body must include the EXTRACTION_PROMPT_V1
+            // header (so the local model gets the same instructions Haiku
+            // does) AND the recalled-memories block. Body assertion is
+            // structural — we look for distinctive text from each piece.
+            let server = MockServer::start().await;
+            let captured: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(None));
+            let cap = captured.clone();
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(move |req: &wiremock::Request| {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&req.body)
+                        && let Ok(mut g) = cap.lock()
+                    {
+                        *g = Some(v);
+                    }
+                    ResponseTemplate::new(200).set_body_json(openai_response_body("[]"))
+                })
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let extractor = LocalLLMExtractor::new(server.uri(), "qwen3.6-35b-a3b", None).unwrap();
+            let msgs = [ExtractionMessage {
+                role: String::new(),
+                content: "I bought 2 books today.".into(),
+                event_time: None,
+            }];
+            extractor
+                .extract(Uuid::new_v4(), Uuid::new_v4(), &msgs)
+                .await
+                .expect("ok");
+            let body = captured
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .expect("captured body");
+            let content = body["messages"][0]["content"]
+                .as_str()
+                .expect("user message content");
+            // 10-char marker pulled from EXTRACTION_PROMPT_V1's opening
+            // line, identical to the haiku-side wire-shape test.
+            assert!(content.contains("structured-data extractor"));
+            assert!(content.contains("--- Recalled memories ---"));
+            assert!(content.contains("I bought 2 books today."));
+            // role is "user" in OpenAI chat shape.
+            assert_eq!(body["messages"][0]["role"].as_str(), Some("user"));
+        }
+
+        #[tokio::test]
+        async fn extractor_with_short_timeout_surfaces_transport_error() {
+            // Slow server: respond after a delay longer than the configured
+            // client timeout. reqwest converts the timeout into a transport
+            // error (not a panic), and the extractor must propagate that as
+            // ExtractionError::Transport so callers can retry / backoff.
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(openai_response_body("[]"))
+                        .set_delay(Duration::from_millis(500)),
+                )
+                .mount(&server)
+                .await;
+
+            // Build the extractor with an inner client that has a 50ms
+            // timeout — well below the 500ms server delay.
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_millis(50))
+                .build()
+                .expect("client");
+            let extractor = LocalLLMExtractor {
+                client,
+                base_url: server.uri(),
+                model: "qwen3.6-35b-a3b".into(),
+                api_key: None,
+                max_tokens: DEFAULT_MAX_TOKENS,
+            };
+            let err = extractor
+                .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
+                .await
+                .err()
+                .expect("err");
+            match err {
+                ExtractionError::Transport(_) => {}
+                other => panic!("expected Transport, got {other:?}"),
+            }
+        }
     }
 }
 
 #[cfg(feature = "observation-extraction")]
 pub use localllm::LocalLLMExtractor;
+
+// ---------------------------------------------------------------------------
+// BatchedLocalLLMExtractor (feature-gated) — concurrent fan-out wrapper.
+//
+// Within-question extraction uses `extract_batch` to dispatch up to N
+// `LocalLLMExtractor::extract` calls concurrently against the same
+// OpenAI-compatible vLLM endpoint. vLLM's `--max-num-seqs` knob gates how
+// many requests it will service in parallel; staying well under that ceiling
+// (and accounting for cross-question harness workers + ensemble overhead)
+// is the operator's responsibility — see the rationale on
+// `BatchedLocalLLMExtractor::DEFAULT_MAX_CONCURRENCY` below.
+//
+// Single-episode `extract` calls fall through to the inner extractor
+// unchanged so existing call sites (and the trait's object-safe `dyn`
+// dispatch) keep working without modification.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "observation-extraction")]
+mod batched_localllm {
+    use super::localllm::LocalLLMExtractor;
+    use super::{
+        ExtractionError, ExtractionMessage, ExtractionResult, ObservationExtractor,
+        ObservationMemory,
+    };
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+    use uuid::Uuid;
+
+    /// Concurrent fan-out wrapper around [`LocalLLMExtractor`].
+    ///
+    /// Wraps a single `LocalLLMExtractor` (and reuses its `reqwest::Client`
+    /// connection pool) and exposes the same trait surface. The
+    /// per-episode `extract` method delegates straight through; the
+    /// difference is in `extract_batch`, which fans out one `extract`
+    /// future per episode and gates them with a `tokio::sync::Semaphore`
+    /// so at most `max_concurrency` requests are in flight against the
+    /// vLLM server at any time.
+    ///
+    /// This is the default within-question concurrency strategy under the
+    /// v2 methodology pivot — across-question concurrency lives in the
+    /// harness layer (Python `concurrent.futures` workers); this struct
+    /// owns the within-question speedup.
+    #[derive(Debug, Clone)]
+    pub struct BatchedLocalLLMExtractor {
+        inner: LocalLLMExtractor,
+        max_concurrency: usize,
+    }
+
+    impl BatchedLocalLLMExtractor {
+        /// Default in-flight request ceiling.
+        ///
+        /// vLLM serving Qwen 3.6-35B-A3B on the bench host runs with
+        /// `--max-num-seqs=20`. The benchmark harness runs up to 4
+        /// across-question workers (Python layer), so each worker gets
+        /// roughly `20 / 4 = 5` concurrent server slots before contention
+        /// kicks in. The remaining headroom (5 → 8) covers ensemble
+        /// extraction overhead and short-lived bursts where a worker is
+        /// transiently below its share. Operators tuning a different
+        /// model or different worker count should override via
+        /// [`Self::with_max_concurrency`].
+        ///
+        /// Lowered 2026-05-02 from 8 → 4 after empirical OOM on 128 GB UMA:
+        /// `PENSYVE_WORKERS=4` × `max_concurrency=8` = 32 concurrent in-flight
+        /// extractions exhausted MemAvailable to 0.7 GB before kernel reclaim
+        /// (vLLM Qwen ~107 GB co-resident). Default of 4 keeps worst case at
+        /// 16 in-flight; operators on dedicated hardware override upward.
+        pub const DEFAULT_MAX_CONCURRENCY: usize = 4;
+
+        /// Wrap an existing [`LocalLLMExtractor`] with batch fan-out.
+        ///
+        /// The wrapped extractor's `reqwest::Client` (and its connection
+        /// pool, timeout, and authentication) is reused as-is — no
+        /// additional HTTP client is built.
+        #[must_use]
+        pub fn new(inner: LocalLLMExtractor) -> Self {
+            Self {
+                inner,
+                max_concurrency: Self::DEFAULT_MAX_CONCURRENCY,
+            }
+        }
+
+        /// Override the in-flight request ceiling. Values below 1 are
+        /// clamped to 1 — a zero-permit semaphore would deadlock.
+        #[must_use]
+        pub fn with_max_concurrency(mut self, n: usize) -> Self {
+            self.max_concurrency = n.max(1);
+            self
+        }
+
+        /// Borrow the wrapped extractor — useful for tests that need to
+        /// reach through to the inner config without unwrapping.
+        #[must_use]
+        pub fn inner(&self) -> &LocalLLMExtractor {
+            &self.inner
+        }
+
+        /// Current concurrency ceiling.
+        #[must_use]
+        pub fn max_concurrency(&self) -> usize {
+            self.max_concurrency
+        }
+    }
+
+    #[async_trait]
+    impl ObservationExtractor for BatchedLocalLLMExtractor {
+        async fn extract(
+            &self,
+            namespace_id: Uuid,
+            episode_id: Uuid,
+            messages: &[ExtractionMessage],
+        ) -> ExtractionResult<Vec<ObservationMemory>> {
+            // Single-episode calls don't benefit from the semaphore —
+            // dispatch straight to the inner extractor. This also keeps
+            // existing call sites that go through the trait's per-episode
+            // path working unchanged when they swap a `LocalLLMExtractor`
+            // for a `BatchedLocalLLMExtractor`.
+            self.inner.extract(namespace_id, episode_id, messages).await
+        }
+
+        async fn extract_batch(
+            &self,
+            namespace_id: Uuid,
+            episode_ids: &[Uuid],
+            episodes: Vec<&[ExtractionMessage]>,
+        ) -> ExtractionResult<Vec<Vec<ObservationMemory>>> {
+            // Length-mismatch handling mirrors the trait's default impl
+            // (and `LegacyBatchedAnthropicExtractor`) — fail fast with a
+            // clear message rather than silently truncating.
+            if episode_ids.len() != episodes.len() {
+                return Err(ExtractionError::Other(format!(
+                    "extract_batch: episode_ids ({}) and episodes ({}) length mismatch",
+                    episode_ids.len(),
+                    episodes.len(),
+                )));
+            }
+            if episodes.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let sem = Arc::new(Semaphore::new(self.max_concurrency));
+            let inner = &self.inner;
+
+            // Spawn one future per episode, each acquiring a permit before
+            // hitting the inner extractor. `join_all` preserves input
+            // order (it materializes a Vec<Output> indexed by spawn
+            // order), so result[i] corresponds to episode_ids[i] / episodes[i].
+            let futures = episode_ids
+                .iter()
+                .copied()
+                .zip(episodes)
+                .map(|(eid, msgs)| {
+                    let sem = sem.clone();
+                    async move {
+                        let _permit = sem
+                            .acquire()
+                            .await
+                            .map_err(|e| {
+                                ExtractionError::Other(format!(
+                                    "semaphore unexpectedly closed: {e}"
+                                ))
+                            })?;
+                        inner.extract(namespace_id, eid, msgs).await
+                    }
+                });
+
+            // First error wins via `collect::<Result<_, _>>()` — no
+            // partial-success aggregation. Callers that need
+            // per-episode error tolerance should call `extract` per
+            // episode and handle errors themselves; the batch contract
+            // here matches `LegacyBatchedAnthropicExtractor`'s
+            // all-or-nothing semantics.
+            let results = futures::future::join_all(futures).await;
+            results.into_iter().collect()
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests
+    // -----------------------------------------------------------------------
+
+    #[cfg(test)]
+    #[allow(
+        clippy::err_expect,
+        reason = "test code: `.err().expect()` mirrors the structure of preceding ok-path asserts"
+    )]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn openai_response_body(text: &str) -> serde_json::Value {
+            serde_json::json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "model": "local",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            })
+        }
+
+        fn msg(text: &str) -> ExtractionMessage {
+            ExtractionMessage {
+                role: "user".into(),
+                content: text.into(),
+                event_time: None,
+            }
+        }
+
+        #[test]
+        fn batched_default_concurrency_is_eight() {
+            // Pin the default concurrency. The rationale on the const
+            // ties it to vLLM's `--max-num-seqs=20` divided by 4 harness
+            // workers (with headroom for ensemble overhead). Any change
+            // to the const should be a deliberate, traceable bump.
+            let inner =
+                LocalLLMExtractor::new("http://example.com/v1", "qwen3.6-35b-a3b", None).unwrap();
+            let batched = BatchedLocalLLMExtractor::new(inner);
+            assert_eq!(batched.max_concurrency(), 4);
+            assert_eq!(BatchedLocalLLMExtractor::DEFAULT_MAX_CONCURRENCY, 4);
+        }
+
+        #[test]
+        fn batched_with_max_concurrency_clamps_zero_to_one() {
+            // A zero-permit semaphore deadlocks (no permits to acquire);
+            // clamp to 1 so misconfigured callers degrade to sequential
+            // dispatch rather than hanging forever.
+            let inner =
+                LocalLLMExtractor::new("http://example.com/v1", "qwen3.6-35b-a3b", None).unwrap();
+            let batched = BatchedLocalLLMExtractor::new(inner).with_max_concurrency(0);
+            assert_eq!(batched.max_concurrency(), 1);
+        }
+
+        #[test]
+        fn batched_with_max_concurrency_overrides_default() {
+            let inner =
+                LocalLLMExtractor::new("http://example.com/v1", "qwen3.6-35b-a3b", None).unwrap();
+            let batched = BatchedLocalLLMExtractor::new(inner).with_max_concurrency(16);
+            assert_eq!(batched.max_concurrency(), 16);
+        }
+
+        #[tokio::test]
+        async fn batched_delegates_single_extract_to_inner() {
+            // Calling the trait's per-episode `extract` method should hit
+            // the inner extractor exactly once. This is the contract that
+            // lets existing single-episode call sites swap
+            // `LocalLLMExtractor` for `BatchedLocalLLMExtractor` without
+            // any other change.
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(openai_response_body("[]")))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let inner = LocalLLMExtractor::new(server.uri(), "local", None).unwrap();
+            let batched = BatchedLocalLLMExtractor::new(inner);
+            let out = batched
+                .extract(Uuid::new_v4(), Uuid::new_v4(), &[msg("hello")])
+                .await
+                .expect("ok");
+            assert!(out.is_empty());
+        }
+
+        #[tokio::test]
+        async fn batched_returns_results_in_input_order() {
+            // Distinguish episodes by the entity_type echoed back in the
+            // mock response. The mock keys off the request body, so each
+            // episode round-trips a unique payload and we can confirm
+            // result[i] aligns with input[i] regardless of completion
+            // order.
+            let server = MockServer::start().await;
+            for tag in ["alpha", "beta", "gamma", "delta"] {
+                let body = format!(
+                    r#"[{{"entity_type":"tag_{tag}","instance":"x","action":"saw","quantity":1,"confidence":0.9}}]"#,
+                );
+                Mock::given(method("POST"))
+                    .and(path("/v1/chat/completions"))
+                    .and(wiremock::matchers::body_string_contains(tag))
+                    .respond_with(
+                        ResponseTemplate::new(200).set_body_json(openai_response_body(&body)),
+                    )
+                    .mount(&server)
+                    .await;
+            }
+
+            let inner = LocalLLMExtractor::new(server.uri(), "local", None).unwrap();
+            let batched = BatchedLocalLLMExtractor::new(inner).with_max_concurrency(4);
+
+            let messages = ["alpha", "beta", "gamma", "delta"]
+                .iter()
+                .map(|t| [msg(t)])
+                .collect::<Vec<_>>();
+            let ids: Vec<Uuid> = messages.iter().map(|_| Uuid::new_v4()).collect();
+            let episodes: Vec<&[ExtractionMessage]> =
+                messages.iter().map(<[ExtractionMessage; 1]>::as_slice).collect();
+
+            let out = batched
+                .extract_batch(Uuid::new_v4(), &ids, episodes)
+                .await
+                .expect("ok");
+
+            assert_eq!(out.len(), 4);
+            // Each result vec has exactly one observation; its
+            // entity_type encodes the originating tag, so we can check
+            // input-order alignment directly.
+            for (i, tag) in ["alpha", "beta", "gamma", "delta"].iter().enumerate() {
+                assert_eq!(out[i].len(), 1, "episode {i} should have one observation");
+                assert_eq!(
+                    out[i][0].entity_type,
+                    format!("tag_{tag}"),
+                    "episode {i} (input tag={tag}) returned wrong entity_type"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn batched_fans_out_concurrent_calls() {
+            // Observe peak in-flight concurrency by holding each request
+            // open for ~150ms while counting active calls. The semaphore
+            // caps the number of futures that can call `inner.extract`
+            // concurrently — with max_concurrency=4 and 8 episodes,
+            // wiremock should see at least 2 in-flight requests at peak
+            // (lower bound is loose to tolerate scheduler/runtime
+            // variance — what we're really asserting is "more than one
+            // request is in flight", proving fan-out happened).
+            //
+            // Mechanism: a background tokio task per request increments
+            // on arrival and decrements AFTER the response delay has
+            // elapsed. wiremock's `respond_with` closure is synchronous
+            // (it must return a `ResponseTemplate`), so the decrement
+            // can't live inside it directly without firing before the
+            // delayed response goes out the wire. Spawning a fire-and-
+            // forget task that sleeps the same duration as the response
+            // delay gives a faithful picture of concurrent request
+            // lifetimes.
+            let server = MockServer::start().await;
+            let in_flight = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let delay = Duration::from_millis(150);
+            let in_flight_resp = in_flight.clone();
+            let peak_resp = peak.clone();
+
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(move |_req: &wiremock::Request| {
+                    let cur = in_flight_resp.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak_resp.fetch_max(cur, Ordering::SeqCst);
+                    let in_flight_task = in_flight_resp.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        in_flight_task.fetch_sub(1, Ordering::SeqCst);
+                    });
+                    ResponseTemplate::new(200)
+                        .set_body_json(openai_response_body("[]"))
+                        .set_delay(delay)
+                })
+                .mount(&server)
+                .await;
+
+            let inner = LocalLLMExtractor::new(server.uri(), "local", None).unwrap();
+            let batched = BatchedLocalLLMExtractor::new(inner).with_max_concurrency(4);
+
+            // 8 episodes against a 4-permit semaphore — at the peak we
+            // expect roughly 4 in-flight, but assert >= 2 to keep the
+            // test robust against single-thread current-thread runtimes
+            // and CI scheduler noise.
+            let owned: Vec<[ExtractionMessage; 1]> = (0..8).map(|i| [msg(&format!("ep{i}"))]).collect();
+            let ids: Vec<Uuid> = (0..8).map(|_| Uuid::new_v4()).collect();
+            let episodes: Vec<&[ExtractionMessage]> =
+                owned.iter().map(<[ExtractionMessage; 1]>::as_slice).collect();
+
+            let out = batched
+                .extract_batch(Uuid::new_v4(), &ids, episodes)
+                .await
+                .expect("ok");
+            assert_eq!(out.len(), 8);
+
+            let observed_peak = peak.load(Ordering::SeqCst);
+            assert!(
+                (2..=4).contains(&observed_peak),
+                "observed peak concurrency {observed_peak} should be in [2, 4] \
+                 with max_concurrency=4 and 8 episodes (lower bound is loose to \
+                 tolerate scheduler non-determinism; upper bound enforces the \
+                 semaphore is actually clamping fan-out)"
+            );
+        }
+
+        #[tokio::test]
+        async fn batched_propagates_first_error() {
+            // Mock returns 500 for every call; the first error to land
+            // wins the join_all collect. Whichever future errors first,
+            // the overall result must be Err::Transport(...) — not a
+            // partial success and not a panic.
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(500).set_body_string("server kaput"))
+                .mount(&server)
+                .await;
+
+            let inner = LocalLLMExtractor::new(server.uri(), "local", None).unwrap();
+            let batched = BatchedLocalLLMExtractor::new(inner).with_max_concurrency(2);
+
+            let owned: Vec<[ExtractionMessage; 1]> = (0..3).map(|i| [msg(&format!("e{i}"))]).collect();
+            let ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+            let episodes: Vec<&[ExtractionMessage]> =
+                owned.iter().map(<[ExtractionMessage; 1]>::as_slice).collect();
+
+            let err = batched
+                .extract_batch(Uuid::new_v4(), &ids, episodes)
+                .await
+                .err()
+                .expect("expected an error");
+            match err {
+                ExtractionError::Transport(_) => {}
+                other => panic!("expected Transport, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn batched_empty_input_returns_empty() {
+            // No episodes → no fan-out, no HTTP calls. The mock has no
+            // expectations attached so any stray request would surface
+            // as a 404 (wiremock default) and trip the assertion.
+            let server = MockServer::start().await;
+            let inner = LocalLLMExtractor::new(server.uri(), "local", None).unwrap();
+            let batched = BatchedLocalLLMExtractor::new(inner);
+
+            let out = batched
+                .extract_batch(Uuid::new_v4(), &[], Vec::new())
+                .await
+                .expect("ok");
+            assert!(out.is_empty());
+        }
+
+        #[tokio::test]
+        async fn batched_rejects_length_mismatch() {
+            // Length-mismatch handling matches the trait default — fail
+            // with `ExtractionError::Other` carrying a "length mismatch"
+            // diagnostic so `cargo test` output points at the bug.
+            let inner =
+                LocalLLMExtractor::new("http://example.com/v1", "local", None).unwrap();
+            let batched = BatchedLocalLLMExtractor::new(inner);
+            let m = msg("x");
+            let slice = std::slice::from_ref(&m);
+
+            let err = batched
+                .extract_batch(Uuid::new_v4(), &[Uuid::new_v4(), Uuid::new_v4()], vec![slice])
+                .await
+                .err()
+                .expect("expected length-mismatch error");
+            match err {
+                ExtractionError::Other(msg) => {
+                    assert!(msg.contains("length mismatch"), "unexpected msg: {msg}");
+                }
+                other => panic!("expected ExtractionError::Other, got {other:?}"),
+            }
+        }
+
+        #[allow(dead_code)]
+        fn batched_is_object_safe() {
+            // Compile-time guard — adding a generic method to
+            // `BatchedLocalLLMExtractor`'s impl that breaks `dyn`
+            // dispatch would surface here at compile time.
+            fn takes_dyn(_: &dyn ObservationExtractor) {}
+            let inner = LocalLLMExtractor::new("http://x/v1", "local", None).unwrap();
+            takes_dyn(&BatchedLocalLLMExtractor::new(inner));
+        }
+    }
+}
+
+#[cfg(feature = "observation-extraction")]
+pub use batched_localllm::BatchedLocalLLMExtractor;
 
 // ---------------------------------------------------------------------------
 // Ingest helper — canonical post-episode-close extraction flow
@@ -2741,6 +3397,156 @@ where
         persisted += 1;
     }
     persisted
+}
+
+/// Bulk variant of [`commit_extraction_for_episode`].
+///
+/// Loads each episode's stored messages, dispatches a SINGLE
+/// [`ObservationExtractor::extract_batch`] call across every episode, then
+/// persists per-episode observations sequentially. Extractors that override
+/// `extract_batch` (e.g. [`BatchedLocalLLMExtractor`]) get to fan out the
+/// per-episode HTTP calls concurrently — that is the within-question
+/// throughput win this helper exists for. Extractors that DON'T override get
+/// the trait's default sequential loop, preserving the legacy semantics.
+///
+/// Per-episode error semantics mirror the single-episode helper:
+/// * Storage failures (load or save) are logged with `tracing::warn!` and the
+///   affected episode contributes 0 to the returned count; sibling episodes
+///   are unaffected.
+/// * Embedding failures are logged per-observation; surviving observations
+///   for the same episode still persist.
+/// * If the batch call itself fails (e.g. transport error to vLLM) the helper
+///   logs once and returns 0 — no observations land for any episode in the
+///   batch. Callers that need partial-success across episodes should chunk
+///   their input or use `commit_extraction_for_episode` per episode.
+///
+/// `episode_ids` is a slice (not consumed) so callers can also use it for
+/// post-call logging without cloning. Empty input is a no-op (returns 0).
+///
+/// Returns the total number of observations successfully persisted across
+/// every episode in the batch.
+pub async fn commit_extractions_for_episodes<F, E>(
+    storage: &(dyn crate::storage::StorageTrait + Send + Sync),
+    extractor: &dyn ObservationExtractor,
+    namespace_id: Uuid,
+    episode_ids: &[Uuid],
+    mut embed: F,
+) -> usize
+where
+    F: FnMut(&str) -> Result<Vec<f32>, E>,
+    E: std::fmt::Display,
+{
+    if episode_ids.is_empty() {
+        return 0;
+    }
+
+    // Load each episode's stored turns. Episodes whose load fails (or whose
+    // turn list is empty) are dropped from the batch so a single bad episode
+    // doesn't poison the entire run; we keep an index map back to the surviving
+    // episode_ids so per-episode persistence can match results to UUIDs.
+    let mut surviving_ids: Vec<Uuid> = Vec::with_capacity(episode_ids.len());
+    let mut surviving_messages: Vec<Vec<ExtractionMessage>> =
+        Vec::with_capacity(episode_ids.len());
+
+    for eid in episode_ids {
+        let raw_messages = match storage.list_episodic_by_episode(namespace_id, *eid) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    target: "pensyve::observation",
+                    error = %e,
+                    episode_id = %eid,
+                    "failed to load episode messages for extraction (batch)"
+                );
+                continue;
+            }
+        };
+        if raw_messages.is_empty() {
+            continue;
+        }
+        let extraction_messages: Vec<ExtractionMessage> = raw_messages
+            .iter()
+            .map(|m| ExtractionMessage {
+                role: String::new(),
+                content: m.content.clone(),
+                event_time: m.event_time,
+            })
+            .collect();
+        surviving_ids.push(*eid);
+        surviving_messages.push(extraction_messages);
+    }
+
+    if surviving_ids.is_empty() {
+        return 0;
+    }
+
+    // Borrow-shape gymnastics: `extract_batch` wants `Vec<&[ExtractionMessage]>`,
+    // but the owning `surviving_messages` Vec must outlive the borrow. Build the
+    // slice view in a tight scope right before the await.
+    let episode_slices: Vec<&[ExtractionMessage]> =
+        surviving_messages.iter().map(Vec::as_slice).collect();
+
+    let batch_results = match extractor
+        .extract_batch(namespace_id, &surviving_ids, episode_slices)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                target: "pensyve::observation",
+                error = %e,
+                batch_size = surviving_ids.len(),
+                "batched extractor failed — no observations persisted for this batch"
+            );
+            return 0;
+        }
+    };
+
+    if batch_results.len() != surviving_ids.len() {
+        // Defensive: a well-behaved extractor returns one result vec per
+        // input. If it doesn't, drop the batch rather than mis-attributing
+        // observations to wrong episodes.
+        tracing::warn!(
+            target: "pensyve::observation",
+            expected = surviving_ids.len(),
+            got = batch_results.len(),
+            "batched extractor returned wrong-length result — dropping batch"
+        );
+        return 0;
+    }
+
+    let mut total_persisted = 0usize;
+    for (eid, observations) in surviving_ids.iter().zip(batch_results) {
+        let mut episode_persisted = 0usize;
+        for mut obs in observations {
+            match embed(&obs.content) {
+                Ok(v) => obs.embedding = v,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "pensyve::observation",
+                        error = %e,
+                        observation_id = %obs.id,
+                        episode_id = %eid,
+                        "failed to embed observation content (batch)"
+                    );
+                    continue;
+                }
+            }
+            if let Err(e) = storage.save_observation(&obs) {
+                tracing::warn!(
+                    target: "pensyve::observation",
+                    error = %e,
+                    observation_id = %obs.id,
+                    episode_id = %eid,
+                    "failed to persist observation (batch)"
+                );
+                continue;
+            }
+            episode_persisted += 1;
+        }
+        total_persisted += episode_persisted;
+    }
+    total_persisted
 }
 
 // ---------------------------------------------------------------------------
@@ -3065,5 +3871,154 @@ mod tests {
         };
         let persisted = commit_extraction_for_episode(&db, &extractor, ns.id, ep, fake_embed).await;
         assert_eq!(persisted, 0);
+    }
+
+    /// Helper that builds a 2-episode test fixture: each episode has 2
+    /// turns with distinct content so per-episode persistence can be
+    /// verified by instance name.
+    fn setup_two_episodes() -> (TempDir, SqliteBackend, Namespace, Uuid, Uuid) {
+        let dir = TempDir::new().unwrap();
+        let db = SqliteBackend::open(dir.path()).unwrap();
+        let ns = Namespace::new("test-batch-ingest");
+        db.save_namespace(&ns).unwrap();
+        let ep_a = Uuid::new_v4();
+        let ep_b = Uuid::new_v4();
+        let src = Uuid::new_v4();
+        let about = Uuid::new_v4();
+        for content in ["user: I played AC Odyssey", "user: I finished Dune"] {
+            let mut mem = EpisodicMemory::new(ns.id, ep_a, src, about, content);
+            mem.event_time = Some(Utc::now());
+            db.save_episodic(&mem).unwrap();
+        }
+        for content in ["user: I baked sourdough", "user: I read Foundation"] {
+            let mut mem = EpisodicMemory::new(ns.id, ep_b, src, about, content);
+            mem.event_time = Some(Utc::now());
+            db.save_episodic(&mem).unwrap();
+        }
+        (dir, db, ns, ep_a, ep_b)
+    }
+
+    /// Per-episode-keyed mock extractor: returns a different observation
+    /// vector per `episode_id`, used to verify `commit_extractions_for_episodes`
+    /// keeps the input ordering aligned with persistence.
+    #[derive(Debug, Clone)]
+    struct PerEpisodeMockExtractor {
+        by_episode: std::collections::HashMap<Uuid, Vec<ObservationMemory>>,
+    }
+
+    #[async_trait]
+    impl ObservationExtractor for PerEpisodeMockExtractor {
+        async fn extract(
+            &self,
+            _namespace_id: Uuid,
+            episode_id: Uuid,
+            _messages: &[ExtractionMessage],
+        ) -> ExtractionResult<Vec<ObservationMemory>> {
+            Ok(self
+                .by_episode
+                .get(&episode_id)
+                .cloned()
+                .unwrap_or_default())
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_extractions_batch_persists_per_episode_observations() {
+        let (_dir, db, ns, ep_a, ep_b) = setup_two_episodes();
+        let mut by_episode = std::collections::HashMap::new();
+        by_episode.insert(
+            ep_a,
+            vec![ObservationMemory::new(
+                ns.id, ep_a, "game_played", "AC Odyssey", "played", "played AC Odyssey",
+            )],
+        );
+        by_episode.insert(
+            ep_b,
+            vec![ObservationMemory::new(
+                ns.id,
+                ep_b,
+                "food_made",
+                "sourdough",
+                "baked",
+                "baked sourdough",
+            )],
+        );
+        let extractor = PerEpisodeMockExtractor { by_episode };
+        let persisted = commit_extractions_for_episodes(
+            &db,
+            &extractor,
+            ns.id,
+            &[ep_a, ep_b],
+            fake_embed,
+        )
+        .await;
+        assert_eq!(persisted, 2);
+
+        // Episode A got the AC Odyssey observation; B got sourdough.
+        let stored_a = db.list_observations_by_episode_ids(&[ep_a], 100).unwrap();
+        assert_eq!(stored_a.len(), 1);
+        assert_eq!(stored_a[0].instance, "AC Odyssey");
+
+        let stored_b = db.list_observations_by_episode_ids(&[ep_b], 100).unwrap();
+        assert_eq!(stored_b.len(), 1);
+        assert_eq!(stored_b[0].instance, "sourdough");
+    }
+
+    #[tokio::test]
+    async fn commit_extractions_batch_empty_input_is_noop() {
+        let (_dir, db, ns, _ep_a, _ep_b) = setup_two_episodes();
+        let extractor = NoopExtractor;
+        let persisted =
+            commit_extractions_for_episodes(&db, &extractor, ns.id, &[], fake_embed).await;
+        assert_eq!(persisted, 0);
+    }
+
+    #[tokio::test]
+    async fn commit_extractions_batch_swallows_extractor_failure() {
+        let (_dir, db, ns, ep_a, ep_b) = setup_two_episodes();
+        let persisted = commit_extractions_for_episodes(
+            &db,
+            &FailingExtractor,
+            ns.id,
+            &[ep_a, ep_b],
+            fake_embed,
+        )
+        .await;
+        assert_eq!(persisted, 0);
+
+        // No observations landed for either episode.
+        let stored_a = db.list_observations_by_episode_ids(&[ep_a], 100).unwrap();
+        let stored_b = db.list_observations_by_episode_ids(&[ep_b], 100).unwrap();
+        assert!(stored_a.is_empty());
+        assert!(stored_b.is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_extractions_batch_drops_episodes_with_no_messages() {
+        // Mix one populated episode with one empty episode_id. The empty one
+        // is filtered out before the extract_batch call so it doesn't pollute
+        // the input ordering or the result count.
+        let (_dir, db, ns, ep_a, _ep_b) = setup_two_episodes();
+        let phantom_ep = Uuid::new_v4(); // never had any episodic memories saved.
+        let mut by_episode = std::collections::HashMap::new();
+        by_episode.insert(
+            ep_a,
+            vec![ObservationMemory::new(
+                ns.id, ep_a, "x", "y", "z", "z y",
+            )],
+        );
+        let extractor = PerEpisodeMockExtractor { by_episode };
+        let persisted = commit_extractions_for_episodes(
+            &db,
+            &extractor,
+            ns.id,
+            &[ep_a, phantom_ep],
+            fake_embed,
+        )
+        .await;
+        assert_eq!(persisted, 1);
+
+        let stored = db.list_observations_by_episode_ids(&[ep_a], 100).unwrap();
+        assert_eq!(stored.len(), 1);
     }
 }

@@ -33,19 +33,33 @@ async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 sqlx-core = { version = "0.8.6", features = ["_rt-tokio", "_tls-rustls-aws-lc-rs", "json", "chrono", "uuid"], optional = true }
 sqlx-postgres = { version = "0.8.6", features = ["json", "chrono", "uuid"], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true }
+# `BatchedLocalLLMExtractor` fans out N concurrent vLLM calls via
+# `futures::future::join_all`. Only the default-features set is needed
+# (`futures-util` for `join_all`); we don't pull in executors or I/O.
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"], optional = true }
 
 [features]
 default = []
 postgres = ["dep:sqlx-core", "dep:sqlx-postgres", "dep:tokio"]
-# Feature-gate the Anthropic-API-backed observation extractor so users
-# who don't need observations pay no HTTP-client compile cost.
-observation-extraction = ["dep:reqwest", "dep:tokio"]
-# Opt-in Anthropic Messages Batches API path — submits N episodes in one
-# request and stacks 50% off with prompt caching for ~80% per-call savings
-# on bulk workloads (benchmarks, nightly re-ingests). Reuses the
-# observation-extraction reqwest+tokio dependencies.
-batch-extractor = ["observation-extraction"]
+# Feature-gate the local-LLM-backed observation extractor + its tolerant
+# JSON parser + cached-bulk replay wrapper. The default (production) path
+# is `LocalLLMExtractor` against an OpenAI-compatible vLLM endpoint — no
+# cloud LLM is reached on this gate.
+observation-extraction = ["dep:reqwest", "dep:tokio", "dep:futures"]
+# Opt-in archaeology gate for the retired Anthropic Messages API extractor
+# (`LegacyAnthropicExtractor`) and its Messages-Batches sibling
+# (`LegacyBatchedAnthropicExtractor`). Default OFF and intentionally
+# undocumented in the public API: the v2 methodology pivot
+# (specs/2026-05-02-pensyve-eval-methodology-v2.md §11) replaced the
+# cloud extraction path with the local one. The code is preserved for
+# git-blame archaeology only — it cannot be reached on a default build.
+legacy-anthropic-extractor = ["observation-extraction"]
+# Deprecated alias for the legacy archaeology gate. Retained so existing
+# downstream callers (pensyve-python, pensyve-mcp-gateway) that reference
+# `batch-extractor` keep resolving until those crates' rename follow-ups
+# land. New code should depend on `legacy-anthropic-extractor` directly.
+batch-extractor = ["legacy-anthropic-extractor"]
 
 [dev-dependencies]
 tempfile = "3"
