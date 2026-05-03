@@ -376,6 +376,119 @@ Output ONLY a JSON array of objects. No prose, no explanation, no markdown fence
 pub use prompt_v1::EXTRACTION_PROMPT_V1;
 
 // ---------------------------------------------------------------------------
+// prompt_v2_pref — preference-extending extraction prompt (Phase F-A).
+//
+// V1 extracts only countable entities, which produces strong KU/TR/SS-User
+// numbers but cannot ground SS-Preference questions because stated
+// preferences ("I prefer hotels with great views") have no schema slot. V2
+// keeps the V1 countable-entity shape verbatim and adds an additional
+// preference shape that reuses the same `RawObservation` fields:
+//   - `entity_type`: "preference_<category>" (lodging, food, travel,
+//     services, dietary, style, communication, entertainment, owned_item, ...)
+//   - `action`:      "prefers" | "dislikes" | "avoids" | "always" | "never"
+//   - `instance`:    short preference statement, self-contained
+//   - `quantity` / `unit`: null (preferences are not counted)
+//   - `confidence`:  0.0-1.0
+//
+// Selection is env-gated: `PENSYVE_EXTRACTION_PROMPT_VERSION=v2` switches the
+// `LocalLLMExtractor` to this prompt; default (unset / "v1") keeps v1
+// byte-for-byte for reproducibility of the locked phase_e_full.jsonl
+// baseline. See pensyve-docs/research/benchmark-sprint/2026-05-04-ss-pref-
+// regression-research.md §4 Step 2.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "observation-extraction")]
+mod prompt_v2_pref {
+    use super::ExtractionMessage;
+
+    pub const EXTRACTION_PROMPT_V2_PREF: &str = "You are a structured-data extractor. \
+Given recalled conversation memories between a user and an assistant, \
+extract two kinds of facts about the USER (not the assistant's suggestions \
+unless the user confirmed them):
+
+(1) **Countable entity instances** — anything that could answer a \"how \
+many\", \"how often\", or \"list every\" question: items purchased, hours \
+spent on activities, places visited, books read, projects worked on, meals \
+cooked, clothing items, pets, tanks, plants, games played, rooms booked, etc.
+
+(2) **Stated preferences** — anything the user explicitly states they \
+prefer, like, dislike, want, avoid, always do, or never do. Categories \
+include but are not limited to:
+  - lodging (hotel features: views, balcony, pool, fireplace, room type)
+  - travel (transit modes, trip pace, destinations, accommodation style)
+  - food and dining (cuisines, restaurants, dietary restrictions, drinks)
+  - services (delivery, communication style, vendor preferences)
+  - dietary and wellness (allergies, restrictions, fitness routines)
+  - style and aesthetics (design, fashion, art, decoration tastes)
+  - communication (response format, tone, length, language)
+  - entertainment (genres, artists, shows, hobbies)
+  - already-owned items (gear, equipment, brands the user already has)
+  - standing instructions (\"always include cultural context\", \"never \
+    suggest budget options\")
+
+For each fact, output a JSON object with these fields:
+
+For COUNTABLE ENTITIES (kind 1):
+{
+  \"entity_type\": \"<category, e.g. 'game_played', 'book_read', 'place_visited'>\",
+  \"instance\": \"<specific name, e.g. 'Assassin's Creed Odyssey'>\",
+  \"action\": \"<what the user did, e.g. 'played', 'read', 'visited'>\",
+  \"quantity\": <numeric value if stated, else null>,
+  \"unit\": \"<unit if applicable, e.g. 'hours', 'pages', else null>\",
+  \"confidence\": <0.0-1.0>
+}
+
+For STATED PREFERENCES (kind 2):
+{
+  \"entity_type\": \"preference_<category>\",
+  \"instance\": \"<self-contained preference statement, e.g. 'hotels with great city views', 'spicy food', 'gluten-free baked goods', 'detail-oriented assistant responses'>\",
+  \"action\": \"prefers\" | \"dislikes\" | \"avoids\" | \"always\" | \"never\" | \"likes\",
+  \"quantity\": null,
+  \"unit\": null,
+  \"confidence\": <0.0-1.0>
+}
+
+Rules:
+- Only extract facts about what the USER actually said, did, owns, or \
+experienced. Exclude assistant suggestions the user did not confirm.
+- For preferences, prefer the user's exact phrasing in `instance`. Make \
+each preference self-contained — \"hotels with great views and a hot tub \
+on the balcony\" not just \"great views\".
+- If the user states a preference about a topic mid-conversation (e.g. \
+\"I also like hotels with rooftop pools\" while planning a trip), extract \
+it as a preference EVEN IF they don't repeat the topic name explicitly — \
+the conversation context makes the topic clear.
+- A single user turn can yield multiple preferences (one per stated \
+attribute). Extract each as a separate object.
+- Set confidence < 0.5 for hedged preferences (\"I think I might prefer\", \
+\"sometimes I like\") or aspirational ones not yet acted on.
+- If the user reverses a preference (\"actually I'd rather not\"), still \
+extract the new direction with full confidence — temporal ordering is \
+preserved by event-time metadata.
+- Pay attention to whether something was ACTUALLY done vs merely MENTIONED \
+or SUGGESTED. \"I bought boots\" = extract. \"You could try boots\" from \
+the assistant without user confirmation = do NOT extract.
+- If no facts are found, return an empty array: []
+
+Output ONLY a JSON array of objects. No prose, no explanation, no markdown fences.";
+
+    /// V2 prompt + recalled-memories body, single-message shape suitable for
+    /// the local OpenAI-compatible endpoint. Body rendering reuses
+    /// `prompt_v1::user_message` so per-message formatting stays identical
+    /// to v1 — only the system instruction differs.
+    pub(super) fn build_prompt(messages: &[ExtractionMessage]) -> String {
+        format!(
+            "{}\n\n{}",
+            EXTRACTION_PROMPT_V2_PREF,
+            super::prompt_v1::user_message(messages)
+        )
+    }
+}
+
+#[cfg(feature = "observation-extraction")]
+pub use prompt_v2_pref::EXTRACTION_PROMPT_V2_PREF;
+
+// ---------------------------------------------------------------------------
 // LegacyAnthropicExtractor (gated by `legacy-anthropic-extractor`).
 //
 // OPT-IN ARCHAEOLOGY ONLY. Default builds (`--no-default-features` and
@@ -2384,12 +2497,22 @@ mod localllm {
             self
         }
 
-        /// Render the `[date] role: content` body + the V1 extraction prompt.
-        /// Delegates to `prompt_v1::build_prompt` so the local backend sees
-        /// identical prompt text to the legacy archaeology path — any
-        /// deviation would break the benchmark-pinned prompt.
+        /// Render the `[date] role: content` body + the extraction prompt.
+        /// Default delegates to `prompt_v1::build_prompt` so the local backend
+        /// sees identical prompt text to the legacy archaeology path —
+        /// preserving the byte-pinned baseline behind `phase_e_full.jsonl`.
+        ///
+        /// `PENSYVE_EXTRACTION_PROMPT_VERSION=v2` switches to the
+        /// preference-extending V2 prompt; see
+        /// `pensyve-docs/research/benchmark-sprint/2026-05-04-ss-pref-regression-research.md`.
         fn build_prompt(messages: &[ExtractionMessage]) -> String {
-            prompt_v1::build_prompt(messages)
+            match std::env::var("PENSYVE_EXTRACTION_PROMPT_VERSION")
+                .as_deref()
+                .unwrap_or("v1")
+            {
+                "v2" | "v2_pref" => super::prompt_v2_pref::build_prompt(messages),
+                _ => prompt_v1::build_prompt(messages),
+            }
         }
     }
 
