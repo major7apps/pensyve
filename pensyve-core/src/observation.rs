@@ -2879,7 +2879,7 @@ mod batched_localllm {
         ///
         /// Lowered 2026-05-02 from 8 → 4 after empirical OOM on 128 GB UMA:
         /// `PENSYVE_WORKERS=4` × `max_concurrency=8` = 32 concurrent in-flight
-        /// extractions exhausted MemAvailable to 0.7 GB before kernel reclaim
+        /// extractions exhausted `MemAvailable` to 0.7 GB before kernel reclaim
         /// (vLLM Qwen ~107 GB co-resident). Default of 4 keeps worst case at
         /// 16 in-flight; operators on dedicated hardware override upward.
         pub const DEFAULT_MAX_CONCURRENCY: usize = 4;

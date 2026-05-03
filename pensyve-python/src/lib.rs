@@ -771,7 +771,7 @@ impl PyPensyve {
     ///         unset. Values below 1 are clamped to 1 by the underlying
     ///         semaphore. Ignored for every other extractor value.
     ///         Total in-flight = harness workers × this — keep
-    ///         workers × max_concurrency ≤ 16 on a 128 GB UMA box where
+    ///         `workers × max_concurrency` ≤ 16 on a 128 GB UMA box where
     ///         vLLM is co-resident; OOM-killer fires above ~24.
     #[new]
     #[pyo3(signature = (path=None, namespace=None, extractor=None, extractor_api_key=None, reranker=Some("BGERerankerBase".to_string()), extractor_cache=None, extractor_base_url=None, extractor_model=None, extractor_max_concurrency=None))]
