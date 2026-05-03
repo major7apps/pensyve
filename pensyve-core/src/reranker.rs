@@ -1,6 +1,25 @@
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use fastembed::{RerankInitOptions, RerankerModel, TextRerank};
+
+// ---------------------------------------------------------------------------
+// Process-wide reranker cache
+// ---------------------------------------------------------------------------
+//
+// Mirrors the embedder cache in `embedding.rs`. Each `Reranker::new` call
+// constructs a fresh `TextRerank` (~250 MB ONNX session for BGE-base) and
+// drops it on `Pensyve` teardown. ONNX Runtime does not return arena/bfc
+// pool memory to the OS allocator on session drop, so repeated
+// construct→drop cycles in eval harnesses leak monotonically.
+//
+// Sharing via `Arc` is safe: the inner state is already gated by `Mutex`
+// for the real variant and is read-only for the mock.
+static RERANKER_CACHE: OnceLock<Mutex<HashMap<String, Arc<Reranker>>>> = OnceLock::new();
+
+fn reranker_cache() -> &'static Mutex<HashMap<String, Arc<Reranker>>> {
+    RERANKER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -76,6 +95,20 @@ impl Reranker {
         Ok(Self {
             inner: RerankerInner::Real(Box::new(Mutex::new(text_rerank))),
         })
+    }
+
+    /// Cached variant of [`Self::new`]. Returns an `Arc<Reranker>` shared
+    /// across the process for the same `model_name`. Use in long-running
+    /// contexts to avoid repeated ONNX session allocation; see the embedder
+    /// cache rationale in `embedding.rs`.
+    pub fn new_cached(model_name: &str) -> Result<Arc<Self>, RerankerError> {
+        let mut guard = reranker_cache().lock().expect("reranker cache poisoned");
+        if let Some(existing) = guard.get(model_name) {
+            return Ok(Arc::clone(existing));
+        }
+        let fresh = Arc::new(Self::new(model_name)?);
+        guard.insert(model_name.to_string(), Arc::clone(&fresh));
+        Ok(fresh)
     }
 
     /// Create a mock reranker for testing.

@@ -1,9 +1,39 @@
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+
+// ---------------------------------------------------------------------------
+// Process-wide embedder cache
+// ---------------------------------------------------------------------------
+//
+// Every `Pensyve(...)` constructor in pensyve-python previously built a fresh
+// `OnnxEmbedder` (4-slot pool ≈ 1.3 GB of ONNX session state for GTE-base) and
+// dropped it at end-of-Pensyve. ONNX Runtime's CPU allocator uses arena/bfc
+// pools that are not returned to the OS allocator on `Drop`, producing a
+// monotonic ~250 MB-per-construction RSS leak in long-running eval harnesses
+// (see pensyve-docs/research/benchmark-sprint/_leak_diagnosis.md).
+//
+// The fix: a process-wide cache keyed by `(model_name, pool_size)`. Sessions
+// are immutable post-load; sharing across `Pensyve` instances is safe because
+// embedder calls already serialize through internal `Mutex<TextEmbedding>`s.
+static EMBEDDER_CACHE: OnceLock<Mutex<HashMap<(String, usize), Arc<OnnxEmbedder>>>> =
+    OnceLock::new();
+
+fn embedder_cache() -> &'static Mutex<HashMap<(String, usize), Arc<OnnxEmbedder>>> {
+    EMBEDDER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn resolve_pool_size() -> usize {
+    std::env::var("PENSYVE_EMBEDDING_POOL_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get().min(4)))
+}
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -82,11 +112,7 @@ impl OnnxEmbedder {
             }
         };
 
-        let pool_size = std::env::var("PENSYVE_EMBEDDING_POOL_SIZE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get().min(4)));
+        let pool_size = resolve_pool_size();
 
         let mut pool = Vec::with_capacity(pool_size);
         for i in 0..pool_size {
@@ -105,6 +131,24 @@ impl OnnxEmbedder {
                 next: AtomicUsize::new(0),
             },
         })
+    }
+
+    /// Cached variant of [`Self::new`]. Returns an `Arc<OnnxEmbedder>` shared
+    /// across the process for the same `(model_name, pool_size)` pair.
+    ///
+    /// Use this in long-running contexts (eval harnesses, servers) where
+    /// repeated `Pensyve(...)` construction would otherwise leak ONNX session
+    /// memory. See `pensyve-docs/research/benchmark-sprint/_leak_diagnosis.md`.
+    pub fn new_cached(model_name: &str) -> EmbeddingResult<Arc<Self>> {
+        let pool_size = resolve_pool_size();
+        let key = (model_name.to_string(), pool_size);
+        let mut guard = embedder_cache().lock().expect("embedder cache poisoned");
+        if let Some(existing) = guard.get(&key) {
+            return Ok(Arc::clone(existing));
+        }
+        let fresh = Arc::new(Self::new(model_name)?);
+        guard.insert(key, Arc::clone(&fresh));
+        Ok(fresh)
     }
 
     /// Create a mock embedder for testing. Produces deterministic, normalized

@@ -822,22 +822,25 @@ impl PyPensyve {
             }
         };
 
-        // Try GTE (768d) first, then MiniLM (384d) fallback.
-        let (embedder, model_name) = match OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5") {
+        // Try GTE (768d) first, then MiniLM (384d) fallback. `new_cached`
+        // returns a process-shared `Arc` so repeated `Pensyve(...)`
+        // construction does not leak ONNX session memory.
+        let (embedder, model_name) = match OnnxEmbedder::new_cached("Alibaba-NLP/gte-base-en-v1.5")
+        {
             Ok(e) => {
                 tracing::info!(embedding_model = "gte-base-en-v1.5", dimensions = 768);
-                (Arc::new(e), "gte-base-en-v1.5")
+                (e, "gte-base-en-v1.5")
             }
             Err(e1) => {
                 tracing::warn!(error = %e1, "Primary embedding model failed, trying fallback");
-                match OnnxEmbedder::new("all-MiniLM-L6-v2") {
+                match OnnxEmbedder::new_cached("all-MiniLM-L6-v2") {
                     Ok(e) => {
                         tracing::warn!(
                             embedding_model = "all-MiniLM-L6-v2",
                             dimensions = 384,
                             reason = "primary model unavailable"
                         );
-                        (Arc::new(e), "all-MiniLM-L6-v2")
+                        (e, "all-MiniLM-L6-v2")
                     }
                     Err(e2) => {
                         let allow_mock = std::env::var("PENSYVE_ALLOW_MOCK_EMBEDDER")
@@ -905,11 +908,11 @@ impl PyPensyve {
         // (~150MB for BGE; cached at ~/.fastembed_cache thereafter).
         let reranker_impl = match reranker.as_deref() {
             None => None,
-            Some(name) => Some(Arc::new(
-                pensyve_core::reranker::Reranker::new(name).map_err(|e| {
+            Some(name) => Some(
+                pensyve_core::reranker::Reranker::new_cached(name).map_err(|e| {
                     PyRuntimeError::new_err(format!("Failed to build reranker: {e}"))
                 })?,
-            )),
+            ),
         };
 
         Ok(Self {
