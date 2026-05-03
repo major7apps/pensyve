@@ -631,8 +631,8 @@ mod legacy_anthropic {
         reason = "test code: `.and_then(|e| Ok(e))` is intentional in `new_rejects_when_api_key_lookup_fails` — it documents the constructor's contract that key shape is not validated"
     )]
     mod tests {
-        use super::*;
         use super::super::prompt_v1::{EXTRACTION_PROMPT_V1, RawObservation};
+        use super::*;
         use chrono::{DateTime, Utc};
         use wiremock::matchers::{body_partial_json, header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2280,9 +2280,7 @@ pub use cached_bulk::{CachedBulkExtractor, fingerprint_messages};
 
 #[cfg(feature = "observation-extraction")]
 mod localllm {
-    use super::prompt_v1::{
-        self, RawObservation, parse_response, raw_to_observation,
-    };
+    use super::prompt_v1::{self, RawObservation, parse_response, raw_to_observation};
     use super::{
         ExtractionError, ExtractionMessage, ExtractionResult, ObservationExtractor,
         ObservationMemory,
@@ -2362,8 +2360,8 @@ mod localllm {
         pub fn from_env() -> ExtractionResult<Self> {
             let base_url =
                 std::env::var("PENSYVE_EXTRACTOR_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into());
-            let model = std::env::var("PENSYVE_EXTRACTOR_MODEL")
-                .unwrap_or_else(|_| DEFAULT_MODEL.into());
+            let model =
+                std::env::var("PENSYVE_EXTRACTOR_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
             let api_key = std::env::var("PENSYVE_EXTRACTOR_API_KEY").ok();
             Self::new(base_url, model, api_key)
         }
@@ -2674,12 +2672,11 @@ mod localllm {
             // value) so they chain. They also must overwrite the field
             // they target — easy to break by accident if someone mutates
             // a clone instead of the moved value.
-            let extractor =
-                LocalLLMExtractor::new("http://example.com/v1", "default-model", None)
-                    .expect("new")
-                    .with_base_url("http://override.test/v1")
-                    .with_model("qwen3.6-35b-a3b")
-                    .with_max_tokens(2048);
+            let extractor = LocalLLMExtractor::new("http://example.com/v1", "default-model", None)
+                .expect("new")
+                .with_base_url("http://override.test/v1")
+                .with_model("qwen3.6-35b-a3b")
+                .with_max_tokens(2048);
             assert_eq!(extractor.base_url, "http://override.test/v1");
             assert_eq!(extractor.model, "qwen3.6-35b-a3b");
             assert_eq!(extractor.max_tokens, 2048);
@@ -2972,14 +2969,9 @@ mod batched_localllm {
                 .map(|(eid, msgs)| {
                     let sem = sem.clone();
                     async move {
-                        let _permit = sem
-                            .acquire()
-                            .await
-                            .map_err(|e| {
-                                ExtractionError::Other(format!(
-                                    "semaphore unexpectedly closed: {e}"
-                                ))
-                            })?;
+                        let _permit = sem.acquire().await.map_err(|e| {
+                            ExtractionError::Other(format!("semaphore unexpectedly closed: {e}"))
+                        })?;
                         inner.extract(namespace_id, eid, msgs).await
                     }
                 });
@@ -3119,8 +3111,10 @@ mod batched_localllm {
                 .map(|t| [msg(t)])
                 .collect::<Vec<_>>();
             let ids: Vec<Uuid> = messages.iter().map(|_| Uuid::new_v4()).collect();
-            let episodes: Vec<&[ExtractionMessage]> =
-                messages.iter().map(<[ExtractionMessage; 1]>::as_slice).collect();
+            let episodes: Vec<&[ExtractionMessage]> = messages
+                .iter()
+                .map(<[ExtractionMessage; 1]>::as_slice)
+                .collect();
 
             let out = batched
                 .extract_batch(Uuid::new_v4(), &ids, episodes)
@@ -3192,10 +3186,13 @@ mod batched_localllm {
             // expect roughly 4 in-flight, but assert >= 2 to keep the
             // test robust against single-thread current-thread runtimes
             // and CI scheduler noise.
-            let owned: Vec<[ExtractionMessage; 1]> = (0..8).map(|i| [msg(&format!("ep{i}"))]).collect();
+            let owned: Vec<[ExtractionMessage; 1]> =
+                (0..8).map(|i| [msg(&format!("ep{i}"))]).collect();
             let ids: Vec<Uuid> = (0..8).map(|_| Uuid::new_v4()).collect();
-            let episodes: Vec<&[ExtractionMessage]> =
-                owned.iter().map(<[ExtractionMessage; 1]>::as_slice).collect();
+            let episodes: Vec<&[ExtractionMessage]> = owned
+                .iter()
+                .map(<[ExtractionMessage; 1]>::as_slice)
+                .collect();
 
             let out = batched
                 .extract_batch(Uuid::new_v4(), &ids, episodes)
@@ -3229,10 +3226,13 @@ mod batched_localllm {
             let inner = LocalLLMExtractor::new(server.uri(), "local", None).unwrap();
             let batched = BatchedLocalLLMExtractor::new(inner).with_max_concurrency(2);
 
-            let owned: Vec<[ExtractionMessage; 1]> = (0..3).map(|i| [msg(&format!("e{i}"))]).collect();
+            let owned: Vec<[ExtractionMessage; 1]> =
+                (0..3).map(|i| [msg(&format!("e{i}"))]).collect();
             let ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
-            let episodes: Vec<&[ExtractionMessage]> =
-                owned.iter().map(<[ExtractionMessage; 1]>::as_slice).collect();
+            let episodes: Vec<&[ExtractionMessage]> = owned
+                .iter()
+                .map(<[ExtractionMessage; 1]>::as_slice)
+                .collect();
 
             let err = batched
                 .extract_batch(Uuid::new_v4(), &ids, episodes)
@@ -3266,14 +3266,17 @@ mod batched_localllm {
             // Length-mismatch handling matches the trait default — fail
             // with `ExtractionError::Other` carrying a "length mismatch"
             // diagnostic so `cargo test` output points at the bug.
-            let inner =
-                LocalLLMExtractor::new("http://example.com/v1", "local", None).unwrap();
+            let inner = LocalLLMExtractor::new("http://example.com/v1", "local", None).unwrap();
             let batched = BatchedLocalLLMExtractor::new(inner);
             let m = msg("x");
             let slice = std::slice::from_ref(&m);
 
             let err = batched
-                .extract_batch(Uuid::new_v4(), &[Uuid::new_v4(), Uuid::new_v4()], vec![slice])
+                .extract_batch(
+                    Uuid::new_v4(),
+                    &[Uuid::new_v4(), Uuid::new_v4()],
+                    vec![slice],
+                )
                 .await
                 .err()
                 .expect("expected length-mismatch error");
@@ -3445,8 +3448,7 @@ where
     // doesn't poison the entire run; we keep an index map back to the surviving
     // episode_ids so per-episode persistence can match results to UUIDs.
     let mut surviving_ids: Vec<Uuid> = Vec::with_capacity(episode_ids.len());
-    let mut surviving_messages: Vec<Vec<ExtractionMessage>> =
-        Vec::with_capacity(episode_ids.len());
+    let mut surviving_messages: Vec<Vec<ExtractionMessage>> = Vec::with_capacity(episode_ids.len());
 
     for eid in episode_ids {
         let raw_messages = match storage.list_episodic_by_episode(namespace_id, *eid) {
@@ -3929,7 +3931,12 @@ mod tests {
         by_episode.insert(
             ep_a,
             vec![ObservationMemory::new(
-                ns.id, ep_a, "game_played", "AC Odyssey", "played", "played AC Odyssey",
+                ns.id,
+                ep_a,
+                "game_played",
+                "AC Odyssey",
+                "played",
+                "played AC Odyssey",
             )],
         );
         by_episode.insert(
@@ -3944,14 +3951,9 @@ mod tests {
             )],
         );
         let extractor = PerEpisodeMockExtractor { by_episode };
-        let persisted = commit_extractions_for_episodes(
-            &db,
-            &extractor,
-            ns.id,
-            &[ep_a, ep_b],
-            fake_embed,
-        )
-        .await;
+        let persisted =
+            commit_extractions_for_episodes(&db, &extractor, ns.id, &[ep_a, ep_b], fake_embed)
+                .await;
         assert_eq!(persisted, 2);
 
         // Episode A got the AC Odyssey observation; B got sourdough.
@@ -4003,9 +4005,7 @@ mod tests {
         let mut by_episode = std::collections::HashMap::new();
         by_episode.insert(
             ep_a,
-            vec![ObservationMemory::new(
-                ns.id, ep_a, "x", "y", "z", "z y",
-            )],
+            vec![ObservationMemory::new(ns.id, ep_a, "x", "y", "z", "z y")],
         );
         let extractor = PerEpisodeMockExtractor { by_episode };
         let persisted = commit_extractions_for_episodes(

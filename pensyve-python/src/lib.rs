@@ -456,8 +456,9 @@ fn build_local_llm_inner(
         )
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to build local-llm extractor: {e}")))
     } else {
-        pensyve_core::observation::LocalLLMExtractor::from_env()
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to build local-llm extractor: {e}")))
+        pensyve_core::observation::LocalLLMExtractor::from_env().map_err(|e| {
+            PyRuntimeError::new_err(format!("Failed to build local-llm extractor: {e}"))
+        })
     }
 }
 
@@ -490,7 +491,11 @@ fn new_extractor_runtime() -> PyResult<Arc<tokio::runtime::Runtime>> {
 /// compile when the opt-in `legacy-anthropic-extractor` feature is enabled —
 /// without that feature each haiku branch returns a clear error pointing
 /// the caller at the local path.
-#[allow(clippy::type_complexity, clippy::too_many_lines, clippy::too_many_arguments)]
+#[allow(
+    clippy::type_complexity,
+    clippy::too_many_lines,
+    clippy::too_many_arguments
+)]
 fn build_extractor(
     kind: Option<&str>,
     api_key: Option<&str>,
@@ -1312,7 +1317,8 @@ impl PyPensyve {
         // Batch by namespace_id. Cross-namespace flushes are rare (one
         // Pensyve handle = one namespace today) but bucketing is cheap
         // and keeps the API monomorphic if multi-namespace handles land.
-        let mut by_ns: std::collections::HashMap<Uuid, Vec<Uuid>> = std::collections::HashMap::new();
+        let mut by_ns: std::collections::HashMap<Uuid, Vec<Uuid>> =
+            std::collections::HashMap::new();
         for (ns_id, ep_id) in pending {
             by_ns.entry(ns_id).or_default().push(ep_id);
         }
