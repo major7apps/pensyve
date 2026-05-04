@@ -8,7 +8,7 @@ description = "Shared MCP tool definitions for Pensyve servers"
 name = "pensyve_mcp_tools"
 
 [dependencies]
-pensyve-core = { path = "../pensyve-core" }
+pensyve-core = { path = "../pensyve-core", version = "2.1.0" }
 rmcp = { version = "1.5", features = ["server", "macros"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

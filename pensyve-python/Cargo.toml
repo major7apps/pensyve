@@ -15,7 +15,7 @@ name = "pensyve_python"
 crate-type = ["cdylib"]
 
 [dependencies]
-pensyve-core = { path = "../pensyve-core", features = ["observation-extraction"] }
+pensyve-core = { path = "../pensyve-core", version = "2.1.0", features = ["observation-extraction"] }
 pyo3 = { version = "^0.28.3", features = ["extension-module"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
