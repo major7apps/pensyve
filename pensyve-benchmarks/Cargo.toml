@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 description = "Evaluation framework for Pensyve memory engine"
+publish = false
 
 [dependencies]
 pensyve-core = { path = "../pensyve-core", version = "2.1.0" }
