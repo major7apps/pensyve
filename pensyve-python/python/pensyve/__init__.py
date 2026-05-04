@@ -1,13 +1,11 @@
 from pensyve._core import (
     Entity,
     Episode,
-    HaikuExtractionCache,
     Memory,
     Pensyve,
     SessionGroup,
     __version__,
     embedding_info,
-    prewarm_haiku_extraction_cache,
 )
 from pensyve.reader import (
     V7_OBSERVATION_WRAPPER_PREFIX,
@@ -20,7 +18,6 @@ from pensyve.reader import (
 __all__ = [
     "Entity",
     "Episode",
-    "HaikuExtractionCache",
     "Memory",
     "Pensyve",
     "SessionGroup",
@@ -31,5 +28,4 @@ __all__ = [
     "embedding_info",
     "format_observations_block",
     "format_session_history",
-    "prewarm_haiku_extraction_cache",
 ]

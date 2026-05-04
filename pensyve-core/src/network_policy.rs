@@ -182,7 +182,7 @@ mod tests {
     fn disabled_rejects_every_url() {
         let p = NetworkPolicy::Disabled;
         assert!(p.check("http://localhost:8888/v1/chat/completions").is_err());
-        assert!(p.check("https://api.anthropic.com/v1/messages").is_err());
+        assert!(p.check("https://cloud.example.com/v1/messages").is_err());
         assert!(p.check("http://example.com/").is_err());
     }
 
@@ -190,7 +190,7 @@ mod tests {
     fn permissive_allows_every_url() {
         let p = NetworkPolicy::Permissive;
         assert!(p.check("http://localhost:8888/v1/chat/completions").is_ok());
-        assert!(p.check("https://api.anthropic.com/v1/messages").is_ok());
+        assert!(p.check("https://cloud.example.com/v1/messages").is_ok());
         assert!(p.check("http://example.com/").is_ok());
     }
 
@@ -217,7 +217,7 @@ mod tests {
         // Different scheme.
         assert!(p.check("https://localhost:8888/v1/chat/completions").is_err());
         // Cloud endpoint.
-        assert!(p.check("https://api.anthropic.com/v1/messages").is_err());
+        assert!(p.check("https://cloud.example.com/v1/messages").is_err());
     }
 
     #[test]
@@ -259,7 +259,7 @@ mod tests {
         let p = NetworkPolicy::LocalOnly {
             url: "http://localhost:8888".into(),
         };
-        let err = p.check("https://api.anthropic.com").unwrap_err();
+        let err = p.check("https://cloud.example.com").unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("LocalOnly"), "missing policy variant: {msg}");
         assert!(msg.contains("localhost"), "missing allowed url: {msg}");

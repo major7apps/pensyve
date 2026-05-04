@@ -22,6 +22,10 @@ The first formal v2-line release. v2.0 was the locked benchmark substrate (`pens
 - **`LocalLLMExtractor::network_policy()`** — accessor returning `&NetworkPolicy`.
 - **Integration test** `pensyve-core/tests/network_policy_fail_closed.rs` — five wiremock-backed cases proving Disabled / LocalOnly mismatch / LocalOnly match / Permissive / runtime override behave as specified.
 
+### Removed (BREAKING)
+
+- **All cloud-extraction code paths.** `LegacyAnthropicExtractor`, `LegacyBatchedAnthropicExtractor`, `HaikuQueryClassifier`, `HaikuExtractionCache`, `prewarm_haiku_extraction_cache`, the `extractor="haiku" | "haiku-batched" | "haiku-cached" | "haiku-nocache"` PyO3 strings, and the `legacy-anthropic-extractor` + `batch-extractor` Cargo features have been deleted. Pensyve no longer compiles or links against any cloud LLM SDK. The supported extraction path is `LocalLLMExtractor` (and its `BatchedLocalLLMExtractor` fan-out wrapper) against an OpenAI-compatible local endpoint such as vLLM. Cloud judges (`JudgeConfig::claude`, `JudgeConfig::gemini_flash_openrouter`) in `pensyve-benchmarks` were also removed; the only remaining judge is `JudgeConfig::qwen_local`. Migration: replace `extractor="haiku-*"` callers with `extractor="local-llm"` (or `"batched-local-llm"`) and run a local Qwen-class model under vLLM at `http://localhost:8888/v1`.
+
 ### Changed (BREAKING)
 
 - **`LocalLLMExtractor::new()`** now takes a fourth required parameter `policy: NetworkPolicy`. Migration:

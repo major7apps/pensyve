@@ -1,17 +1,8 @@
 # Pensyve Benchmarks
 
-## LongMemEval_S — public results
-
-Pensyve's LongMemEval_S results (91.0% Sonnet 4.6, 86.8% Haiku 4.5,
-91.4% Opus 4.6) and the full reader-ablation methodology are documented
-in the technical report:
-
-[`../docs/benchmarks/longmemeval-reader-ablation.pdf`](../docs/benchmarks/longmemeval-reader-ablation.pdf)
-
-The reproduction harness for those numbers lives in a private research
-repo until findings are formally released. The public repo intentionally
-does not ship the reader/judge pipeline so the methodology stays
-single-source-of-truth in the PDF.
+The reproduction harness for Pensyve's evaluation pipeline (LongMemEval-S
+and related runs) lives in a private research repo. The public repo
+intentionally does not ship the reader/judge pipeline.
 
 ## Synthetic Benchmark
 
