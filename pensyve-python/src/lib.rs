@@ -540,14 +540,13 @@ impl PyPensyve {
         // algorithm spec. `reranker=None` opts out for embedded/offline
         // callers. On first construction fastembed downloads the model
         // (~150MB for BGE; cached at ~/.fastembed_cache thereafter).
-        let reranker_impl = match reranker.as_deref() {
-            None => None,
-            Some(name) => Some(
-                pensyve_core::reranker::Reranker::new_cached(name).map_err(|e| {
-                    PyRuntimeError::new_err(format!("Failed to build reranker: {e}"))
-                })?,
-            ),
-        };
+        let reranker_impl =
+            match reranker.as_deref() {
+                None => None,
+                Some(name) => Some(pensyve_core::reranker::Reranker::new_cached(name).map_err(
+                    |e| PyRuntimeError::new_err(format!("Failed to build reranker: {e}")),
+                )?),
+            };
 
         Ok(Self {
             inner: Arc::new(PensyveInner {

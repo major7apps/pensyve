@@ -131,9 +131,7 @@ pub struct NetworkRequiredError {
 
 /// Error from parsing a `NetworkPolicy` string (env var, CLI flag, etc.).
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
-#[error(
-    "unrecognized NetworkPolicy {0:?}; expected one of: disabled, local-only, permissive"
-)]
+#[error("unrecognized NetworkPolicy {0:?}; expected one of: disabled, local-only, permissive")]
 pub struct NetworkPolicyParseError(pub String);
 
 /// Compare the scheme+authority of `target_url` against the prefix of
@@ -159,14 +157,16 @@ fn scheme_authority(url: &str) -> Option<String> {
         return None;
     }
     // host[:port] ends at the first '/', '?', or '#'
-    let end = rest
-        .find(['/', '?', '#'])
-        .unwrap_or(rest.len());
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..end];
     if authority.is_empty() {
         return None;
     }
-    Some(format!("{}://{}", scheme.to_ascii_lowercase(), authority.to_ascii_lowercase()))
+    Some(format!(
+        "{}://{}",
+        scheme.to_ascii_lowercase(),
+        authority.to_ascii_lowercase()
+    ))
 }
 
 #[cfg(test)]
@@ -181,7 +181,10 @@ mod tests {
     #[test]
     fn disabled_rejects_every_url() {
         let p = NetworkPolicy::Disabled;
-        assert!(p.check("http://localhost:8888/v1/chat/completions").is_err());
+        assert!(
+            p.check("http://localhost:8888/v1/chat/completions")
+                .is_err()
+        );
         assert!(p.check("https://cloud.example.com/v1/messages").is_err());
         assert!(p.check("http://example.com/").is_err());
     }
@@ -211,11 +214,20 @@ mod tests {
             url: "http://localhost:8888/v1".into(),
         };
         // Different host.
-        assert!(p.check("http://127.0.0.1:8888/v1/chat/completions").is_err());
+        assert!(
+            p.check("http://127.0.0.1:8888/v1/chat/completions")
+                .is_err()
+        );
         // Different port.
-        assert!(p.check("http://localhost:9999/v1/chat/completions").is_err());
+        assert!(
+            p.check("http://localhost:9999/v1/chat/completions")
+                .is_err()
+        );
         // Different scheme.
-        assert!(p.check("https://localhost:8888/v1/chat/completions").is_err());
+        assert!(
+            p.check("https://localhost:8888/v1/chat/completions")
+                .is_err()
+        );
         // Cloud endpoint.
         assert!(p.check("https://cloud.example.com/v1/messages").is_err());
     }
@@ -253,7 +265,10 @@ mod tests {
         let p = NetworkPolicy::Disabled;
         let err = p.check("http://example.com/x").unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("http://example.com/x"), "missing target: {msg}");
+        assert!(
+            msg.contains("http://example.com/x"),
+            "missing target: {msg}"
+        );
         assert!(msg.contains("Disabled"), "missing policy: {msg}");
 
         let p = NetworkPolicy::LocalOnly {
@@ -292,7 +307,9 @@ mod tests {
         assert_eq!(NetworkPolicy::parse("off", ""), Ok(NetworkPolicy::Disabled));
         assert_eq!(
             NetworkPolicy::parse("LocalOnly", "http://x:1"),
-            Ok(NetworkPolicy::LocalOnly { url: "http://x:1".into() })
+            Ok(NetworkPolicy::LocalOnly {
+                url: "http://x:1".into()
+            })
         );
         assert_eq!(
             NetworkPolicy::parse("any", ""),

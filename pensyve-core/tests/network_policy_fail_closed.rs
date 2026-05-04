@@ -44,13 +44,8 @@ async fn disabled_blocks_every_call() {
     // We still use a wiremock URL so the URL passed to .check() is a real
     // shape; the assertion is that the error names the policy.
     let server = MockServer::start().await;
-    let extractor = LocalLLMExtractor::new(
-        server.uri(),
-        TEST_MODEL,
-        None,
-        NetworkPolicy::Disabled,
-    )
-    .expect("build");
+    let extractor = LocalLLMExtractor::new(server.uri(), TEST_MODEL, None, NetworkPolicy::Disabled)
+        .expect("build");
 
     let err = extractor
         .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
@@ -131,7 +126,9 @@ async fn local_only_rejects_mismatched_authority() {
         server.uri(),
         TEST_MODEL,
         None,
-        NetworkPolicy::LocalOnly { url: allowed.into() },
+        NetworkPolicy::LocalOnly {
+            url: allowed.into(),
+        },
     )
     .expect("build");
 
@@ -175,13 +172,9 @@ async fn permissive_allows_any_url() {
         .mount(&server)
         .await;
 
-    let extractor = LocalLLMExtractor::new(
-        server.uri(),
-        TEST_MODEL,
-        None,
-        NetworkPolicy::Permissive,
-    )
-    .expect("build");
+    let extractor =
+        LocalLLMExtractor::new(server.uri(), TEST_MODEL, None, NetworkPolicy::Permissive)
+            .expect("build");
 
     let observations = extractor
         .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
@@ -199,14 +192,10 @@ async fn with_network_policy_overrides_construction_value() {
     // it to fail-closed can do so via the builder. Verifies the toggle
     // takes effect on the very next call.
     let server = MockServer::start().await;
-    let extractor = LocalLLMExtractor::new(
-        server.uri(),
-        TEST_MODEL,
-        None,
-        NetworkPolicy::Permissive,
-    )
-    .expect("build")
-    .with_network_policy(NetworkPolicy::Disabled);
+    let extractor =
+        LocalLLMExtractor::new(server.uri(), TEST_MODEL, None, NetworkPolicy::Permissive)
+            .expect("build")
+            .with_network_policy(NetworkPolicy::Disabled);
 
     let err = extractor
         .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
