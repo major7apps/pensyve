@@ -1,6 +1,6 @@
 [package]
 name = "pensyve-mcp-tools"
-version = "1.3.2"
+version = "2.1.0"
 edition = "2024"
 description = "Shared MCP tool definitions for Pensyve servers"
 

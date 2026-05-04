@@ -2398,6 +2398,7 @@ mod localllm {
         ExtractionError, ExtractionMessage, ExtractionResult, ObservationExtractor,
         ObservationMemory,
     };
+    use crate::network_policy::NetworkPolicy;
     use async_trait::async_trait;
     use serde::{Deserialize, Serialize};
     use std::time::Duration;
@@ -2440,16 +2441,26 @@ mod localllm {
         model: String,
         api_key: Option<String>,
         max_tokens: u32,
+        policy: NetworkPolicy,
     }
 
     impl LocalLLMExtractor {
         /// Build with explicit endpoint + model id. `api_key` is optional —
         /// local vLLM accepts any string (including none); cloud-gateway
         /// drop-ins like vLLM-on-Modal may require it.
+        ///
+        /// `policy` gates outbound traffic. v2.1+: this is a required
+        /// parameter — pass [`NetworkPolicy::LocalOnly`] with the same
+        /// `base_url` for the standard local-vLLM setup, or
+        /// [`NetworkPolicy::Permissive`] for managed-service deployments.
+        /// [`NetworkPolicy::Disabled`] makes every `extract` call fail
+        /// immediately with `ExtractionError::Transport` (used by the
+        /// "memory works on a plane" guarantee — see Rev B §5.8).
         pub fn new(
             base_url: impl Into<String>,
             model: impl Into<String>,
             api_key: Option<String>,
+            policy: NetworkPolicy,
         ) -> ExtractionResult<Self> {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
@@ -2461,6 +2472,7 @@ mod localllm {
                 model: model.into(),
                 api_key,
                 max_tokens: DEFAULT_MAX_TOKENS,
+                policy,
             })
         }
 
@@ -2470,13 +2482,19 @@ mod localllm {
         ///   - `PENSYVE_EXTRACTOR_MODEL` (default `qwen3.6-35b-a3b`)
         ///   - `PENSYVE_EXTRACTOR_API_KEY` (optional; vLLM ignores it but
         ///     gateway-style drop-ins like vLLM-on-Modal may require it)
+        ///   - `PENSYVE_NETWORK_POLICY`   (`disabled` | `local-only` |
+        ///     `permissive`; defaults to `LocalOnly { url: <base_url> }`
+        ///     when unset — the v2.1 fail-closed default for the local
+        ///     extractor configured for a known endpoint).
         pub fn from_env() -> ExtractionResult<Self> {
             let base_url =
                 std::env::var("PENSYVE_EXTRACTOR_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into());
             let model =
                 std::env::var("PENSYVE_EXTRACTOR_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
             let api_key = std::env::var("PENSYVE_EXTRACTOR_API_KEY").ok();
-            Self::new(base_url, model, api_key)
+            let policy = NetworkPolicy::from_env(&base_url)
+                .unwrap_or_else(|| NetworkPolicy::LocalOnly { url: base_url.clone() });
+            Self::new(base_url, model, api_key, policy)
         }
 
         #[must_use]
@@ -2495,6 +2513,24 @@ mod localllm {
         pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
             self.max_tokens = max_tokens;
             self
+        }
+
+        /// Override the active network policy. `with_base_url` does NOT
+        /// auto-update the policy — if you change the base URL away from
+        /// what was passed at construction, you must also update the
+        /// policy or every subsequent `extract` call will fail closed.
+        #[must_use]
+        pub fn with_network_policy(mut self, policy: NetworkPolicy) -> Self {
+            self.policy = policy;
+            self
+        }
+
+        /// Inspect the current network policy. Useful in tests and in
+        /// downstream wrappers (`BatchedLocalLLMExtractor`) that want to
+        /// reuse the inner extractor's policy decisions.
+        #[must_use]
+        pub fn network_policy(&self) -> &NetworkPolicy {
+            &self.policy
         }
 
         /// Render the `[date] role: content` body + the extraction prompt.
@@ -2593,6 +2629,10 @@ mod localllm {
                 format!("{base}/v1")
             };
             let url = format!("{base}/chat/completions");
+
+            self.policy
+                .check(&url)
+                .map_err(|e| ExtractionError::Transport(e.to_string()))?;
 
             let mut builder = self.client.post(&url).json(&req);
             if let Some(key) = self.api_key.as_deref() {
@@ -2695,7 +2735,7 @@ mod localllm {
                 .mount(&server)
                 .await;
 
-            let extractor = LocalLLMExtractor::new(server.uri(), "local", None).unwrap();
+            let extractor = LocalLLMExtractor::new(server.uri(), "local", None, NetworkPolicy::Permissive).unwrap();
             let event_time = DateTime::parse_from_rfc3339("2024-05-10T14:00:00Z")
                 .ok()
                 .map(|d| d.with_timezone(&Utc));
@@ -2725,7 +2765,7 @@ mod localllm {
                 .expect(1)
                 .mount(&server)
                 .await;
-            let extractor = LocalLLMExtractor::new(server.uri(), "local", None).unwrap();
+            let extractor = LocalLLMExtractor::new(server.uri(), "local", None, NetworkPolicy::Permissive).unwrap();
             let err = extractor
                 .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
                 .await
@@ -2748,7 +2788,7 @@ mod localllm {
                 )
                 .mount(&server)
                 .await;
-            let extractor = LocalLLMExtractor::new(server.uri(), "local", None).unwrap();
+            let extractor = LocalLLMExtractor::new(server.uri(), "local", None, NetworkPolicy::Permissive).unwrap();
             let out = extractor
                 .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
                 .await
@@ -2769,7 +2809,7 @@ mod localllm {
                 .mount(&server)
                 .await;
             let bare = server.uri(); // no trailing /v1
-            let extractor = LocalLLMExtractor::new(bare, "local", None).unwrap();
+            let extractor = LocalLLMExtractor::new(bare, "local", None, NetworkPolicy::Permissive).unwrap();
             extractor
                 .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
                 .await
@@ -2795,7 +2835,12 @@ mod localllm {
             // value) so they chain. They also must overwrite the field
             // they target — easy to break by accident if someone mutates
             // a clone instead of the moved value.
-            let extractor = LocalLLMExtractor::new("http://example.com/v1", "default-model", None)
+            let extractor = LocalLLMExtractor::new(
+                "http://example.com/v1",
+                "default-model",
+                None,
+                NetworkPolicy::Permissive,
+            )
                 .expect("new")
                 .with_base_url("http://override.test/v1")
                 .with_model("qwen3.6-35b-a3b")
@@ -2830,7 +2875,7 @@ mod localllm {
                 .mount(&server)
                 .await;
 
-            let extractor = LocalLLMExtractor::new(server.uri(), "qwen3.6-35b-a3b", None).unwrap();
+            let extractor = LocalLLMExtractor::new(server.uri(), "qwen3.6-35b-a3b", None, NetworkPolicy::Permissive).unwrap();
             let msgs = [ExtractionMessage {
                 role: String::new(),
                 content: "I bought 2 books today.".into(),
@@ -2866,7 +2911,7 @@ mod localllm {
                 .mount(&server)
                 .await;
 
-            let extractor = LocalLLMExtractor::new(server.uri(), "qwen3.6-35b-a3b", None).unwrap();
+            let extractor = LocalLLMExtractor::new(server.uri(), "qwen3.6-35b-a3b", None, NetworkPolicy::Permissive).unwrap();
             let msgs = [ExtractionMessage {
                 role: String::new(),
                 content: "I bought 2 books today.".into(),
@@ -2922,6 +2967,7 @@ mod localllm {
                 model: "qwen3.6-35b-a3b".into(),
                 api_key: None,
                 max_tokens: DEFAULT_MAX_TOKENS,
+                policy: NetworkPolicy::Permissive,
             };
             let err = extractor
                 .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
@@ -3121,6 +3167,7 @@ mod batched_localllm {
     )]
     mod tests {
         use super::*;
+        use crate::network_policy::NetworkPolicy;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
         use wiremock::matchers::{method, path};
@@ -3155,7 +3202,7 @@ mod batched_localllm {
             // workers (with headroom for ensemble overhead). Any change
             // to the const should be a deliberate, traceable bump.
             let inner =
-                LocalLLMExtractor::new("http://example.com/v1", "qwen3.6-35b-a3b", None).unwrap();
+                LocalLLMExtractor::new("http://example.com/v1", "qwen3.6-35b-a3b", None, NetworkPolicy::Permissive).unwrap();
             let batched = BatchedLocalLLMExtractor::new(inner);
             assert_eq!(batched.max_concurrency(), 4);
             assert_eq!(BatchedLocalLLMExtractor::DEFAULT_MAX_CONCURRENCY, 4);
@@ -3167,7 +3214,7 @@ mod batched_localllm {
             // clamp to 1 so misconfigured callers degrade to sequential
             // dispatch rather than hanging forever.
             let inner =
-                LocalLLMExtractor::new("http://example.com/v1", "qwen3.6-35b-a3b", None).unwrap();
+                LocalLLMExtractor::new("http://example.com/v1", "qwen3.6-35b-a3b", None, NetworkPolicy::Permissive).unwrap();
             let batched = BatchedLocalLLMExtractor::new(inner).with_max_concurrency(0);
             assert_eq!(batched.max_concurrency(), 1);
         }
@@ -3175,7 +3222,7 @@ mod batched_localllm {
         #[test]
         fn batched_with_max_concurrency_overrides_default() {
             let inner =
-                LocalLLMExtractor::new("http://example.com/v1", "qwen3.6-35b-a3b", None).unwrap();
+                LocalLLMExtractor::new("http://example.com/v1", "qwen3.6-35b-a3b", None, NetworkPolicy::Permissive).unwrap();
             let batched = BatchedLocalLLMExtractor::new(inner).with_max_concurrency(16);
             assert_eq!(batched.max_concurrency(), 16);
         }
@@ -3195,7 +3242,7 @@ mod batched_localllm {
                 .mount(&server)
                 .await;
 
-            let inner = LocalLLMExtractor::new(server.uri(), "local", None).unwrap();
+            let inner = LocalLLMExtractor::new(server.uri(), "local", None, NetworkPolicy::Permissive).unwrap();
             let batched = BatchedLocalLLMExtractor::new(inner);
             let out = batched
                 .extract(Uuid::new_v4(), Uuid::new_v4(), &[msg("hello")])
@@ -3226,7 +3273,7 @@ mod batched_localllm {
                     .await;
             }
 
-            let inner = LocalLLMExtractor::new(server.uri(), "local", None).unwrap();
+            let inner = LocalLLMExtractor::new(server.uri(), "local", None, NetworkPolicy::Permissive).unwrap();
             let batched = BatchedLocalLLMExtractor::new(inner).with_max_concurrency(4);
 
             let messages = ["alpha", "beta", "gamma", "delta"]
@@ -3302,7 +3349,7 @@ mod batched_localllm {
                 .mount(&server)
                 .await;
 
-            let inner = LocalLLMExtractor::new(server.uri(), "local", None).unwrap();
+            let inner = LocalLLMExtractor::new(server.uri(), "local", None, NetworkPolicy::Permissive).unwrap();
             let batched = BatchedLocalLLMExtractor::new(inner).with_max_concurrency(4);
 
             // 8 episodes against a 4-permit semaphore — at the peak we
@@ -3346,7 +3393,7 @@ mod batched_localllm {
                 .mount(&server)
                 .await;
 
-            let inner = LocalLLMExtractor::new(server.uri(), "local", None).unwrap();
+            let inner = LocalLLMExtractor::new(server.uri(), "local", None, NetworkPolicy::Permissive).unwrap();
             let batched = BatchedLocalLLMExtractor::new(inner).with_max_concurrency(2);
 
             let owned: Vec<[ExtractionMessage; 1]> =
@@ -3374,7 +3421,7 @@ mod batched_localllm {
             // expectations attached so any stray request would surface
             // as a 404 (wiremock default) and trip the assertion.
             let server = MockServer::start().await;
-            let inner = LocalLLMExtractor::new(server.uri(), "local", None).unwrap();
+            let inner = LocalLLMExtractor::new(server.uri(), "local", None, NetworkPolicy::Permissive).unwrap();
             let batched = BatchedLocalLLMExtractor::new(inner);
 
             let out = batched
@@ -3389,7 +3436,7 @@ mod batched_localllm {
             // Length-mismatch handling matches the trait default — fail
             // with `ExtractionError::Other` carrying a "length mismatch"
             // diagnostic so `cargo test` output points at the bug.
-            let inner = LocalLLMExtractor::new("http://example.com/v1", "local", None).unwrap();
+            let inner = LocalLLMExtractor::new("http://example.com/v1", "local", None, NetworkPolicy::Permissive).unwrap();
             let batched = BatchedLocalLLMExtractor::new(inner);
             let m = msg("x");
             let slice = std::slice::from_ref(&m);
@@ -3417,7 +3464,7 @@ mod batched_localllm {
             // `BatchedLocalLLMExtractor`'s impl that breaks `dyn`
             // dispatch would surface here at compile time.
             fn takes_dyn(_: &dyn ObservationExtractor) {}
-            let inner = LocalLLMExtractor::new("http://x/v1", "local", None).unwrap();
+            let inner = LocalLLMExtractor::new("http://x/v1", "local", None, NetworkPolicy::Permissive).unwrap();
             takes_dyn(&BatchedLocalLLMExtractor::new(inner));
         }
     }

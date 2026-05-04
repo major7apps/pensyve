@@ -5,6 +5,58 @@ All notable changes to Pensyve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-05-04
+
+The first formal v2-line release. v2.0 was the locked benchmark substrate (`pensyve@4afede9` / `020defd`) used through Phase F-A and Phase G0; the matching Cargo tag never cut. v2.1 ships v2.0 baseline + peer-card recall-time injection + the `NetworkPolicy` fail-closed contract specified in `pensyve-docs/specs/2026-05-04-pensyve-v3-revision-b.md` §5.8 and `pensyve-docs/specs/2026-05-04-pensyve-v2.1-ship.md`.
+
+**Empirical anchor:** Phase G0 (locked pre-reg `pensyve-docs@a863cb5`, results `97bf3a1`) falsified consolidator-tier architectures across 1T/2T/3T/5T arms (strict monotonic decline below v2.0 SS-Pref baseline). Pre-reg §4.4 fall-back triggered → ship v2.1, kill tier-consolidation as a v3 direction, pivot v3 to retrieval-side gains (`pensyve-docs/specs/2026-05-04-pensyve-v3-revision-c.md`).
+
+**v2.1 is NOT an accuracy improvement over v2.0.** Peer-card tied baseline at 7/30 on the F-A 30-Q SS-Pref probe; v2.1 ships it because the consolidator-tier alternative falsified harder. Value to operators: peer-card available across all SDK surfaces (Python/MCP/CLI/gateway) instead of harness-only, and a binding fail-closed network policy that makes "memory that works on a plane" testable.
+
+### Added
+
+- **`pensyve-core::network_policy::NetworkPolicy`** — fail-closed gate for outbound LLM/extractor traffic. Variants: `Disabled` (default), `LocalOnly { url }`, `Permissive`. `NetworkRequiredError` returned on policy violation; wrapped into `ExtractionError::Transport` at the call site.
+- **`pensyve-core::network_policy::NetworkRequiredError`** — error type for blocked network calls.
+- **`PENSYVE_NETWORK_POLICY` environment variable** — `disabled` / `local-only` / `permissive` (case-insensitive). Read by `LocalLLMExtractor::from_env()`; defaults to `LocalOnly { url: <base_url> }` when unset.
+- **`LocalLLMExtractor::with_network_policy(policy)`** — builder method to override the policy after construction.
+- **`LocalLLMExtractor::network_policy()`** — accessor returning `&NetworkPolicy`.
+- **Integration test** `pensyve-core/tests/network_policy_fail_closed.rs` — five wiremock-backed cases proving Disabled / LocalOnly mismatch / LocalOnly match / Permissive / runtime override behave as specified.
+
+### Changed (BREAKING)
+
+- **`LocalLLMExtractor::new()`** now takes a fourth required parameter `policy: NetworkPolicy`. Migration:
+
+  ```rust
+  // v1.3.x
+  let extractor = LocalLLMExtractor::new(base_url, model, api_key)?;
+
+  // v2.1.0 — equivalent behavior (allow only the configured base URL)
+  use pensyve_core::network_policy::NetworkPolicy;
+  let extractor = LocalLLMExtractor::new(
+      base_url.clone(),
+      model,
+      api_key,
+      NetworkPolicy::LocalOnly { url: base_url },
+  )?;
+
+  // v2.1.0 — strictest default
+  let extractor = LocalLLMExtractor::new(base_url, model, api_key, NetworkPolicy::Disabled)?;
+  // → every extract() call returns ExtractionError::Transport with
+  //   "NetworkPolicy::Disabled" in the message until you call
+  //   `.with_network_policy(...)` to relax it.
+  ```
+
+  `LocalLLMExtractor::from_env()` is unchanged surface: it now wires the policy automatically from `PENSYVE_NETWORK_POLICY` (or defaults to `LocalOnly { url: <base_url> }`). Existing callers using `from_env()` (notably `pensyve-mcp-gateway`) continue to work without modification.
+
+- **Cargo workspace version bumped `1.3.2 → 2.1.0`** across 9 manifests (7 workspace members + `pensyve-wasm` + `loadtest` minor bump 0.1.0 → 0.1.1) plus 2 pyproject.toml files (`./pyproject.toml`, `pensyve-python/pyproject.toml`) and `pensyve-ts/package.json`. Skipping 2.0.0 directly to 2.1.0 aligns Cargo crate versioning with the v2 eval-methodology line (`pensyve-docs/specs/2026-05-02-pensyve-eval-methodology-v2.md`); the v2.0 baseline never had a Cargo artifact distinct from 1.3.2. The major-version bump is also independently required by Cargo semver because of the `LocalLLMExtractor::new` signature change above.
+
+### Notes
+
+- **MSRV unchanged** at 1.88.
+- **Carve-out (CRITICAL).** `NetworkPolicy` gates pensyve-core LLM/extractor traffic only — it does NOT gate `pensyve-mcp-gateway`'s infrastructure HTTP (OAuth, Stripe metering, auth provider). Without this carve-out the gateway would be forced to `Permissive` purely to keep OAuth working, defeating the LLM-path safety property. See `pensyve-docs/specs/2026-05-04-pensyve-v2.1-ship.md` §5.3.
+- **Default-on peer-card and peer-card port to `pensyve-core/src/peer_card.rs`** are part of this v2.1 line — see the next changelog entry once those land.
+- **Deferred to v2.1 release gate**: the offline-proxy iptables-REJECT validation per v2.1 spec §8 G1 — `out/offline.json verdict:PASS` must be committed alongside the v2.1.0 release tag. Recipe at `pensyve-docs/research/benchmark-sprint/v3/g0-tier-ablation/out/offline_proxy.PENDING_SUDO`.
+
 ## [1.3.2] - 2026-05-03
 
 ### Changed

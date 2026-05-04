@@ -449,10 +449,19 @@ fn build_local_llm_inner(
         let resolved_key = api_key
             .map(str::to_string)
             .or_else(|| std::env::var("PENSYVE_EXTRACTOR_API_KEY").ok());
+        // Match `LocalLLMExtractor::from_env()`'s policy resolution: honour
+        // `PENSYVE_NETWORK_POLICY` when set, else fall back to a fail-closed
+        // `LocalOnly` pinned to the same `resolved_url` the extractor will
+        // actually call (v2.1 §5.5).
+        let policy = pensyve_core::network_policy::NetworkPolicy::from_env(&resolved_url)
+            .unwrap_or_else(|| pensyve_core::network_policy::NetworkPolicy::LocalOnly {
+                url: resolved_url.clone(),
+            });
         pensyve_core::observation::LocalLLMExtractor::new(
             resolved_url,
             resolved_model,
             resolved_key,
+            policy,
         )
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to build local-llm extractor: {e}")))
     } else {
