@@ -115,12 +115,9 @@ def format_session_history(groups: Iterable[Any]) -> str:
 # Query routing classifier — naive regex path
 # ---------------------------------------------------------------------------
 #
-# Mirror of `pensyve_core::classifier::classify_naive` (Rust). Keep these two
-# trigger lists in lockstep — any drift invalidates the cross-language parity
-# guarantee claimed in the v1.3.0 release notes. The Haiku-backed classifier
-# is not ported to Python here; callers that want Haiku routing should proxy
-# through the Pensyve gateway's classifier path (Phase 5+) or call the
-# Anthropic SDK directly.
+# Mirror of `pensyve_core::classifier::classify_naive` (Rust). Keep the two
+# trigger lists in lockstep — any drift invalidates the cross-language
+# parity guarantee.
 
 COUNTING_TRIGGERS: tuple[str, ...] = (
     "how many",

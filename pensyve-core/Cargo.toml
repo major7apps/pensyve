@@ -1,6 +1,6 @@
 [package]
 name = "pensyve-core"
-version = "1.3.2"
+version = "2.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -42,24 +42,10 @@ futures = { version = "0.3", default-features = false, features = ["std", "async
 [features]
 default = []
 postgres = ["dep:sqlx-core", "dep:sqlx-postgres", "dep:tokio"]
-# Feature-gate the local-LLM-backed observation extractor + its tolerant
-# JSON parser + cached-bulk replay wrapper. The default (production) path
-# is `LocalLLMExtractor` against an OpenAI-compatible vLLM endpoint — no
-# cloud LLM is reached on this gate.
+# Local-LLM-backed observation extractor (`LocalLLMExtractor`,
+# `BatchedLocalLLMExtractor`) + the tolerant JSON parser + cached-bulk
+# replay wrapper. Targets an OpenAI-compatible vLLM endpoint.
 observation-extraction = ["dep:reqwest", "dep:tokio", "dep:futures"]
-# Opt-in archaeology gate for the retired Anthropic Messages API extractor
-# (`LegacyAnthropicExtractor`) and its Messages-Batches sibling
-# (`LegacyBatchedAnthropicExtractor`). Default OFF and intentionally
-# undocumented in the public API: the v2 methodology pivot
-# (specs/2026-05-02-pensyve-eval-methodology-v2.md §11) replaced the
-# cloud extraction path with the local one. The code is preserved for
-# git-blame archaeology only — it cannot be reached on a default build.
-legacy-anthropic-extractor = ["observation-extraction"]
-# Deprecated alias for the legacy archaeology gate. Retained so existing
-# downstream callers (pensyve-python, pensyve-mcp-gateway) that reference
-# `batch-extractor` keep resolving until those crates' rename follow-ups
-# land. New code should depend on `legacy-anthropic-extractor` directly.
-batch-extractor = ["legacy-anthropic-extractor"]
 
 [dev-dependencies]
 tempfile = "3"

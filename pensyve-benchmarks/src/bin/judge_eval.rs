@@ -1,13 +1,15 @@
 //! LLM judge evaluation runner for Pensyve retrieval strategies.
 //!
 //! Generates a small synthetic corpus (100 memories, 20 queries, 32 dims),
-//! compares two retrieval strategies pairwise using three LLM judges (Claude,
-//! Gemini Flash, Qwen local), collects win rates, runs Bradley-Terry, and
-//! prints JSON results.
+//! compares two retrieval strategies pairwise using a local Qwen judge,
+//! collects win rates, runs Bradley-Terry, and prints JSON results.
 //!
 //! Usage:
 //!   cargo build -p pensyve-benchmarks --bin `judge_eval`
-//!   `OPENROUTER_API_KEY=$OPENROUTER_API_KEY` cargo run -p pensyve-benchmarks --bin `judge_eval`
+//!   cargo run -p pensyve-benchmarks --bin `judge_eval`
+//!
+//! Requires a local vLLM server at `http://localhost:8888/v1` serving
+//! `qwen3.6-35b-a3b` (or override via `JudgeConfig::qwen_local`).
 
 use pensyve_benchmarks::{
     corpus::{CorpusConfig, generate_corpus},
@@ -217,11 +219,7 @@ fn main() {
     let top_k = 5;
 
     // --- Judges ---
-    let judges = vec![
-        JudgeConfig::claude(),
-        JudgeConfig::gemini_flash_openrouter(),
-        JudgeConfig::qwen_local(),
-    ];
+    let judges = vec![JudgeConfig::qwen_local()];
 
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(60))

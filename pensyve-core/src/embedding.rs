@@ -20,10 +20,11 @@ use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 // The fix: a process-wide cache keyed by `(model_name, pool_size)`. Sessions
 // are immutable post-load; sharing across `Pensyve` instances is safe because
 // embedder calls already serialize through internal `Mutex<TextEmbedding>`s.
-static EMBEDDER_CACHE: OnceLock<Mutex<HashMap<(String, usize), Arc<OnnxEmbedder>>>> =
-    OnceLock::new();
+type EmbedderCache = Mutex<HashMap<(String, usize), Arc<OnnxEmbedder>>>;
 
-fn embedder_cache() -> &'static Mutex<HashMap<(String, usize), Arc<OnnxEmbedder>>> {
+static EMBEDDER_CACHE: OnceLock<EmbedderCache> = OnceLock::new();
+
+fn embedder_cache() -> &'static EmbedderCache {
     EMBEDDER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 

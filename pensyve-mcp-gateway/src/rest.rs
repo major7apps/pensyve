@@ -1600,8 +1600,8 @@ async fn episode_end(
     }
 
     // Trigger async observation extraction. Non-fatal: if the extractor isn't
-    // configured (ANTHROPIC_API_KEY unset) or the call fails, the episode
-    // still persists — observations are opportunistic enrichment.
+    // configured or the call fails, the episode still persists —
+    // observations are opportunistic enrichment.
     if let Some(extractor) = state.extractor.clone() {
         let storage = ps.storage.clone();
         let embedder = ps.embedder.clone();

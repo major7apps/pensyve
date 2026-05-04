@@ -1,8 +1,8 @@
 //! LLM-as-judge evaluation framework.
 //!
-//! Supports pairwise comparison of retrieval results using multiple LLM judges
-//! (Claude, Qwen local, Gemini via `OpenRouter`). Aggregates win rates into
-//! strength parameters via the Bradley-Terry MM algorithm.
+//! Supports pairwise comparison of retrieval results using a local Qwen
+//! judge. Aggregates win rates into strength parameters via the
+//! Bradley-Terry MM algorithm.
 
 use serde::{Deserialize, Serialize};
 
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Configuration for an LLM judge endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JudgeConfig {
-    /// Human-readable name for this judge (e.g. "claude", "`qwen_local`").
+    /// Human-readable name for this judge (e.g. "`qwen_local`").
     pub name: String,
     /// Full URL of the completions/messages endpoint.
     pub endpoint: String,
@@ -31,20 +31,7 @@ pub struct JudgeConfig {
 }
 
 impl JudgeConfig {
-    /// Claude Sonnet 4.6 via `OpenRouter` (avoids separate Anthropic API key).
-    pub fn claude() -> Self {
-        Self {
-            name: "claude".to_string(),
-            endpoint: "https://openrouter.ai/api/v1/chat/completions".to_string(),
-            model: "anthropic/claude-sonnet-4.6".to_string(),
-            api_key_env: Some("OPENROUTER_API_KEY".to_string()),
-            temperature: 0.0,
-            max_tokens: 512,
-            extra_body: None,
-        }
-    }
-
-    /// Qwen 3.5 35B running on a local inference server (no API key required).
+    /// Qwen running on a local inference server (no API key required).
     ///
     /// Thinking mode is explicitly disabled via `chat_template_kwargs` so that
     /// the judge returns plain JSON without a `<think>` preamble.
@@ -52,7 +39,7 @@ impl JudgeConfig {
         Self {
             name: "qwen_local".to_string(),
             endpoint: "http://localhost:8888/v1/chat/completions".to_string(),
-            model: "qwen3.5-35b".to_string(),
+            model: "qwen3.6-35b-a3b".to_string(),
             api_key_env: None,
             temperature: 0.0,
             max_tokens: 512,
@@ -61,19 +48,6 @@ impl JudgeConfig {
                     "enable_thinking": false
                 }
             })),
-        }
-    }
-
-    /// Google Gemini 2.5 Flash Lite via the `OpenRouter` gateway.
-    pub fn gemini_flash_openrouter() -> Self {
-        Self {
-            name: "gemini_flash_openrouter".to_string(),
-            endpoint: "https://openrouter.ai/api/v1/chat/completions".to_string(),
-            model: "google/gemini-2.5-flash-lite".to_string(),
-            api_key_env: Some("OPENROUTER_API_KEY".to_string()),
-            temperature: 0.0,
-            max_tokens: 512,
-            extra_body: None,
         }
     }
 }
