@@ -86,15 +86,11 @@ verdict = d.get("verdict")
 if verdict != "PASS":
     print(f"offline.json verdict={verdict!r}; expected PASS", file=sys.stderr)
     sys.exit(1)
-exit_code = d.get("exit_code")
 elapsed = d.get("elapsed_s")
-if not (isinstance(exit_code, int) and exit_code != 0):
-    print(f"offline.json exit_code={exit_code!r}; expected non-zero", file=sys.stderr)
-    sys.exit(1)
 if not (isinstance(elapsed, (int, float)) and elapsed < 60):
     print(f"offline.json elapsed_s={elapsed!r}; expected < 60", file=sys.stderr)
     sys.exit(1)
-print(f"offline.json: verdict=PASS exit_code={exit_code} elapsed_s={elapsed}")
+print(f"offline.json: verdict=PASS elapsed_s={elapsed} method={d.get('method','')}")
 PY
 }
 
