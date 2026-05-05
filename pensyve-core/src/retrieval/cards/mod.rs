@@ -48,9 +48,15 @@ use uuid::Uuid;
 use crate::storage::StorageTrait;
 use crate::types::{AgentId, UserId};
 
+pub mod composite;
+pub mod multi_session;
 pub mod peer_card_adapter;
+pub mod single_session_user;
 
+pub use composite::CompositeCard;
+pub use multi_session::MultiSessionCard;
 pub use peer_card_adapter::PeerCardAdapter;
+pub use single_session_user::SingleSessionUserCard;
 
 /// Retrieval-time card builder.
 ///
