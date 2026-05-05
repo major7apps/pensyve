@@ -11,6 +11,23 @@ members = [
 ]
 exclude = ["loadtest"]
 
+# Workspace-shared dependencies. Crates opt in via `dep = { workspace = true }`.
+# Currently only `tokio_util` lives here (added in G1 for `CancellationToken`
+# plumbing into long-running operators in P3/P4); other deps remain declared
+# per-crate to avoid disturbing the v2.1 build matrix unnecessarily.
+[workspace.dependencies]
+# Crate name on crates.io is `tokio-util` (hyphen); the Rust import path is
+# `tokio_util` (underscore). Both forms appear in the pre-reg text — the
+# manifest must use the hyphen form.
+#
+# NOTE on features: the G1 pre-reg lists `features = ["sync"]`, but
+# `tokio-util` 0.7.x does not expose a `sync` cargo feature — the
+# `tokio_util::sync::CancellationToken` type lives in an unconditionally-
+# compiled module backed by `tokio/sync` (a hard dependency of `tokio-util`
+# itself). Specifying `features = ["sync"]` therefore fails to resolve. We
+# pull in the crate with no extra features; `CancellationToken` is available.
+tokio-util = { version = "0.7" }
+
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }

@@ -60,6 +60,94 @@ impl SqliteBackend {
         let conn = lock_conn!(self);
         conn.execute_batch(SCHEMA)?;
         Self::run_migrations(&conn)?;
+        Self::run_versioned_migrations(&conn)?;
+        Ok(())
+    }
+
+    /// Run versioned schema migrations registered in `schema_versions`.
+    ///
+    /// Each migration declares a `version` (monotonic integer) and a closure
+    /// that performs the structural change. The runner is idempotent:
+    /// re-running it on a store where every migration is already applied
+    /// produces no schema mutations and no new `schema_versions` rows.
+    ///
+    /// Idempotency is enforced two ways:
+    /// 1. The runner reads `MAX(version)` from `schema_versions` and skips
+    ///    any migration whose version is `<= max_applied`.
+    /// 2. Inside the migration closures, `ALTER TABLE ADD COLUMN` is gated on
+    ///    `PRAGMA table_info` checks (via `column_exists`) and `CREATE INDEX`
+    ///    statements use `IF NOT EXISTS`. This guards against a half-applied
+    ///    state where the structural change landed but the `schema_versions`
+    ///    row insert failed (e.g., process killed between the two).
+    ///
+    /// Net effect: this method is safe to call on
+    ///   * a fresh store (creates `schema_versions`, applies all migrations)
+    ///   * a v2.1 store with no `schema_versions` table (creates it, applies
+    ///     all migrations against the legacy projection tables; existing rows
+    ///     get NULL for the new columns per the locked NULL-default design)
+    ///   * a store where this runner already ran (no-op)
+    fn run_versioned_migrations(conn: &Connection) -> StorageResult<()> {
+        // Bootstrap: ensure the registry table exists before we read from it.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_versions (
+                version     INTEGER PRIMARY KEY,
+                applied_at  TEXT NOT NULL,
+                description TEXT NOT NULL
+            );",
+        )?;
+
+        let max_applied: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_versions",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+
+        // ----- Migration v1: G1 multi-tenant scoping columns + indexes. -----
+        //
+        // Adds `agent_id TEXT NULL` and `user_id TEXT NULL` to each of the
+        // four projection tables (`episodic_memories`, `semantic_memories`,
+        // `procedural_memories`, `observation_memories`). Existing rows get
+        // NULL (legacy unscoped behavior). Composite index
+        // `(namespace_id, agent_id, user_id)` makes scoped recall a covering
+        // lookup instead of a post-filter.
+        //
+        // See `research/benchmark-sprint/v3/g1/preregistration.md` §3.0 items
+        // 2-4 and Appendix B (line anchors verified at draft time).
+        if max_applied < 1 {
+            const V1_TABLES: &[&str] = &[
+                "episodic_memories",
+                "semantic_memories",
+                "procedural_memories",
+                "observation_memories",
+            ];
+
+            for table in V1_TABLES {
+                if !Self::column_exists(conn, table, "agent_id")? {
+                    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN agent_id TEXT;"))?;
+                }
+                if !Self::column_exists(conn, table, "user_id")? {
+                    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN user_id TEXT;"))?;
+                }
+                conn.execute_batch(&format!(
+                    "CREATE INDEX IF NOT EXISTS idx_{table}_namespace_agent_user
+                     ON {table}(namespace_id, agent_id, user_id);"
+                ))?;
+            }
+
+            conn.execute(
+                "INSERT INTO schema_versions (version, applied_at, description)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    1_i64,
+                    Utc::now().to_rfc3339(),
+                    "G1: add agent_id + user_id to projection tables; composite (namespace, agent, user) indexes",
+                ],
+            )?;
+        }
+
         Ok(())
     }
 

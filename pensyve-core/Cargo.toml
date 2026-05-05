@@ -34,6 +34,12 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 sqlx-core = { version = "0.8.6", features = ["_rt-tokio", "_tls-rustls-aws-lc-rs", "json", "chrono", "uuid"], optional = true }
 sqlx-postgres = { version = "0.8.6", features = ["json", "chrono", "uuid"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"], optional = true }
+# `CancellationToken` for cooperative cancellation of long-running operators.
+# Plumbed through `ConsolidationEngine::run` and the LocalLLM extractors in
+# G1/P3-P4. Landed unconditionally (rather than feature-gated) so the same
+# signature works for `default` builds that only construct cancel tokens to
+# pass through to no-op call sites.
+tokio-util = { workspace = true }
 # `BatchedLocalLLMExtractor` fans out N concurrent vLLM calls via
 # `futures::future::join_all`. Only the default-features set is needed
 # (`futures-util` for `join_all`); we don't pull in executors or I/O.
