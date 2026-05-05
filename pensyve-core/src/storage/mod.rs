@@ -168,6 +168,64 @@ pub trait StorageTrait: Send + Sync {
         limit: usize,
     ) -> StorageResult<Vec<Memory>>;
 
+    /// G1: scope-aware FTS variant.
+    ///
+    /// Filters returned memories by `(agent_id, user_id)` according to the
+    /// locked NULL-default semantics (operator-confirmed 2026-05-05):
+    /// - `(None, None)` is the **unscoped handle** — apply NO scope filter.
+    ///   Returns every row in the namespace regardless of the row's
+    ///   `agent_id`/`user_id` column values. This preserves v2.1 behavior
+    ///   on unscoped handles and matches pre-reg §2 invariant I3 sub-case
+    ///   (b): "unscoped sees both legacy NULL and new (A, U) rows".
+    /// - `(Some(A), Some(U))` is a **strict scoped match**: returns rows
+    ///   whose `agent_id = A AND user_id = U` exactly. No NULL fallback
+    ///   for scoped handles — scoped means scoped.
+    /// - mixed `(Some, None)` / `(None, Some)` returns rows matching the
+    ///   provided side AND NULL on the unspecified side (operator-flagged
+    ///   edge case; the unset side stays strict-bucket because the
+    ///   operator did not constrain it and stricter is safer for the rare
+    ///   half-tenant-id situation).
+    /// - `agent_only`: when `Some`, returns every row whose `agent_id`
+    ///   equals it regardless of `user_id` (drives `recall_across_users`).
+    ///
+    /// Default impl delegates to [`search_fts`] then post-filters in
+    /// memory — backends that can express the predicate at the SQL layer
+    /// override for performance (the `SQLite` backend uses the
+    /// `(namespace_id, agent_id, user_id)` composite index added in G1
+    /// P1 to make this a covering-index lookup).
+    fn search_fts_scoped_by_pair(
+        &self,
+        query: &str,
+        namespace_id: Uuid,
+        agent_id: Option<Uuid>,
+        user_id: Option<Uuid>,
+        agent_only: Option<Uuid>,
+        limit: usize,
+    ) -> StorageResult<Vec<Memory>> {
+        let raw = self.search_fts(query, namespace_id, limit.saturating_mul(4))?;
+        Ok(raw
+            .into_iter()
+            .filter(|m| memory_matches_scope(m, agent_id, user_id, agent_only))
+            .take(limit)
+            .collect())
+    }
+
+    /// G1: scope-aware bulk-by-namespace variant. Same semantics as
+    /// [`search_fts_scoped_by_pair`].
+    fn get_all_memories_by_namespace_scoped_pair(
+        &self,
+        namespace_id: Uuid,
+        agent_id: Option<Uuid>,
+        user_id: Option<Uuid>,
+        agent_only: Option<Uuid>,
+    ) -> StorageResult<Vec<Memory>> {
+        let raw = self.get_all_memories_by_namespace(namespace_id)?;
+        Ok(raw
+            .into_iter()
+            .filter(|m| memory_matches_scope(m, agent_id, user_id, agent_only))
+            .collect())
+    }
+
     /// Entity-scoped full-text search.
     ///
     /// Like `search_fts`, but only returns semantic memories whose `subject`
@@ -277,4 +335,62 @@ pub struct ActivityAggregate {
     pub remembers: usize,
     pub observes: usize,
     pub forgets: usize,
+}
+
+// ---------------------------------------------------------------------------
+// G1 scope helpers (in-memory filter for default trait impls)
+// ---------------------------------------------------------------------------
+
+/// Read the `(agent_id, user_id)` scope tuple off a `Memory` value. Returns
+/// `(None, None)` for legacy v2.1 rows that pre-date the G1 columns.
+fn memory_scope(mem: &Memory) -> (Option<Uuid>, Option<Uuid>) {
+    match mem {
+        Memory::Episodic(m) => (m.agent_id, m.user_id),
+        Memory::Semantic(m) => (m.agent_id, m.user_id),
+        Memory::Procedural(m) => (m.agent_id, m.user_id),
+        Memory::Observation(m) => (m.agent_id, m.user_id),
+    }
+}
+
+/// Decide whether a memory matches the requested scope predicate, mirroring
+/// the SQL clause in the `SqliteBackend` overrides (operator-confirmed
+/// 2026-05-05):
+///
+/// ```text
+/// IF agent_only IS Some(A):
+///     row.agent_id == A
+/// ELSE IF agent_id IS None AND user_id IS None:
+///     true   // unscoped handle — no scope filter at all
+/// ELSE:
+///     (row.agent_id == agent_id  OR (agent_id IS None AND row.agent_id IS None))
+///   AND
+///     (row.user_id  == user_id   OR (user_id  IS None AND row.user_id  IS None))
+/// ```
+///
+/// `agent_only` is the `recall_across_users` path: it pins the agent and
+/// ignores the user dimension entirely. The fully-unscoped `(None, None)`
+/// case preserves v2.1 behavior — every row in the namespace is visible.
+pub fn memory_matches_scope(
+    mem: &Memory,
+    agent_id: Option<Uuid>,
+    user_id: Option<Uuid>,
+    agent_only: Option<Uuid>,
+) -> bool {
+    let (row_agent, row_user) = memory_scope(mem);
+    if let Some(a) = agent_only {
+        return row_agent == Some(a);
+    }
+    // Fully-unscoped handle: no scope filter — see all rows in the namespace.
+    if agent_id.is_none() && user_id.is_none() {
+        return true;
+    }
+    let agent_match = match agent_id {
+        Some(a) => row_agent == Some(a),
+        None => row_agent.is_none(),
+    };
+    let user_match = match user_id {
+        Some(u) => row_user == Some(u),
+        None => row_user.is_none(),
+    };
+    agent_match && user_match
 }

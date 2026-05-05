@@ -337,6 +337,20 @@ struct PensyveInner {
     vector_index: Arc<Mutex<VectorIndex>>,
     retrieval_config: RetrievalConfig,
     consolidation_config: pensyve_core::config::ConsolidationConfig,
+    /// G1 multi-tenant scope. `None` on both = legacy unscoped recall on
+    /// rows whose `(agent_id, user_id)` is `(NULL, NULL)`.
+    agent_id: Option<Uuid>,
+    user_id: Option<Uuid>,
+    /// G1 `recall_across_users` opt-in. Latched at construction time per
+    /// the operator-locked design (preregistration §3.0 item 7, §3.2(b)
+    /// resolved to construction-time gating). True iff the
+    /// `PENSYVE_NETWORK_POLICY` env var resolves to `Permissive` at
+    /// `Pensyve(...)` construction. Method calls re-check this flag
+    /// synchronously and raise `NetworkRequiredError` before any storage
+    /// access if false. We intentionally do NOT re-read the env var on
+    /// each call — a runtime mutation of `PENSYVE_NETWORK_POLICY` after
+    /// construction must NOT relax the gate.
+    recall_across_users_allowed: bool,
     /// Optional extractor wired at construction time. When `Some`,
     /// `PyEpisode::__exit__` runs extraction + persistence after saving raw
     /// memories. `None` is the zero-cost default.
@@ -410,7 +424,7 @@ impl PyPensyve {
     ///         `workers × max_concurrency` ≤ 16 on a 128 GB UMA box where
     ///         vLLM is co-resident; OOM-killer fires above ~24.
     #[new]
-    #[pyo3(signature = (path=None, namespace=None, extractor=None, extractor_api_key=None, reranker=Some("BGERerankerBase".to_string()), extractor_base_url=None, extractor_model=None, extractor_max_concurrency=None))]
+    #[pyo3(signature = (path=None, namespace=None, extractor=None, extractor_api_key=None, reranker=Some("BGERerankerBase".to_string()), extractor_base_url=None, extractor_model=None, extractor_max_concurrency=None, agent_id=None, user_id=None))]
     #[allow(
         clippy::needless_pass_by_value,
         clippy::too_many_arguments,
@@ -425,7 +439,33 @@ impl PyPensyve {
         extractor_base_url: Option<String>,
         extractor_model: Option<String>,
         extractor_max_concurrency: Option<usize>,
+        // G1: multi-tenant scoping. UUID-shaped strings parsed at the
+        // binding boundary; pre-reg §3.0 item 6 (8 → 10 params).
+        agent_id: Option<String>,
+        user_id: Option<String>,
     ) -> PyResult<Self> {
+        // G1: parse the scope strings at the binding boundary and surface
+        // a Python `ValueError` on parse failure (matches PyO3 idiom).
+        let agent_id_uuid: Option<Uuid> = match agent_id.as_deref() {
+            Some(s) => Some(Uuid::parse_str(s).map_err(|e| {
+                PyValueError::new_err(format!("agent_id must be a valid UUID: {e}"))
+            })?),
+            None => None,
+        };
+        let user_id_uuid: Option<Uuid> = match user_id.as_deref() {
+            Some(s) => Some(Uuid::parse_str(s).map_err(|e| {
+                PyValueError::new_err(format!("user_id must be a valid UUID: {e}"))
+            })?),
+            None => None,
+        };
+
+        // G1: latch the construction-time policy decision for
+        // `recall_across_users` gating. Operator-locked (§3.2(b)):
+        // construction-time, not call-site.
+        let recall_across_users_allowed = matches!(
+            pensyve_core::network_policy::NetworkPolicy::from_env(""),
+            Some(pensyve_core::network_policy::NetworkPolicy::Permissive)
+        );
         let config = PensyveConfig::default();
 
         let storage_path = match path {
@@ -561,6 +601,9 @@ impl PyPensyve {
                 defer_extraction,
                 pending_extractions: Mutex::new(Vec::new()),
                 reranker: reranker_impl,
+                agent_id: agent_id_uuid,
+                user_id: user_id_uuid,
+                recall_across_users_allowed,
             }),
         })
     }
@@ -669,6 +712,10 @@ impl PyPensyve {
         if let Some(reranker) = self.inner.reranker.as_deref() {
             engine = engine.with_reranker(reranker);
         }
+        // G1: thread `(agent_id, user_id)` scope into the recall engine.
+        // Default `(None, None)` triggers the locked NULL-default filter
+        // (legacy v2.1 unscoped data only).
+        engine = engine.with_scope(self.inner.agent_id, self.inner.user_id);
 
         let result = engine
             .recall_with_entity(query, self.inner.namespace.id, limit, entity_id)
@@ -702,6 +749,77 @@ impl PyPensyve {
         }
 
         Ok(memories)
+    }
+
+    /// G1 cross-tenant opt-in recall (`recall_across_users`).
+    ///
+    /// Returns rows whose `agent_id` matches the handle's configured
+    /// `agent_id`, regardless of `user_id` — i.e., every `(A, *)` pair.
+    /// The handle's `user_id` is intentionally ignored for this call.
+    ///
+    /// Gating: latched at CONSTRUCTION TIME per the operator-locked
+    /// design (preregistration §3.2(b) resolved). The handle reads the
+    /// `PENSYVE_NETWORK_POLICY` env var once during `Pensyve(...)`
+    /// construction; only `Permissive` enables this method. Under
+    /// `Disabled` (default) or `LocalOnly` the method synchronously
+    /// raises `RuntimeError("network call ... not permitted by
+    /// NetworkPolicy::...")` BEFORE any storage access. Mutating the
+    /// env var after construction does NOT relax the gate.
+    ///
+    /// Requires `agent_id` to have been set on the constructor —
+    /// otherwise the method returns `ValueError` (cross-user recall is
+    /// undefined without a pinned agent).
+    ///
+    /// Args:
+    ///     query: Search query string.
+    ///     limit: Maximum number of results (default: 5).
+    #[pyo3(signature = (query, limit=5))]
+    fn recall_across_users(&self, query: &str, limit: usize) -> PyResult<Vec<PyMemory>> {
+        if query.is_empty() {
+            return Err(PyRuntimeError::new_err("query must not be empty"));
+        }
+
+        // Gate FIRST — before namespace lookup, before embedding, before
+        // any I/O. The error matches `NetworkRequiredError`'s shape so
+        // callers (and the test harness) can pattern-match on the
+        // message prefix.
+        if !self.inner.recall_across_users_allowed {
+            return Err(PyRuntimeError::new_err(
+                "network call to recall_across_users not permitted by NetworkPolicy::Disabled \
+                 (or LocalOnly): set PENSYVE_NETWORK_POLICY=permissive at process start to \
+                 opt in to cross-tenant recall on the managed-service path",
+            ));
+        }
+
+        let Some(agent_id_self) = self.inner.agent_id else {
+            return Err(PyValueError::new_err(
+                "recall_across_users requires `agent_id` on the Pensyve(...) constructor — \
+                 cross-user recall is undefined without a pinned agent",
+            ));
+        };
+
+        let vi = self.inner.vector_index.lock().unwrap();
+        let mut engine = RecallEngine::new(
+            self.inner.storage.as_ref(),
+            self.inner.embedder.as_ref(),
+            &vi,
+            &self.inner.retrieval_config,
+        );
+        if let Some(reranker) = self.inner.reranker.as_deref() {
+            engine = engine.with_reranker(reranker);
+        }
+        // Pin recall to `(agent_id_self, *)` — user_id is ignored.
+        engine = engine.with_agent_only(agent_id_self);
+
+        let result = engine
+            .recall(query, self.inner.namespace.id, limit)
+            .map_err(|e| PyRuntimeError::new_err(format!("Recall failed: {e}")))?;
+
+        Ok(result
+            .memories
+            .into_iter()
+            .map(|c| py_memory_from(&c.memory, c.final_score))
+            .collect())
     }
 
     /// Recall memories matching a query, clustered by source session.
@@ -772,6 +890,8 @@ impl PyPensyve {
         if let Some(reranker) = self.inner.reranker.as_deref() {
             engine = engine.with_reranker(reranker);
         }
+        // G1: scope-by-default — same as `recall`.
+        engine = engine.with_scope(self.inner.agent_id, self.inner.user_id);
 
         let groups = engine
             .recall_grouped(query, self.inner.namespace.id, &config)
@@ -825,6 +945,9 @@ impl PyPensyve {
         let (predicate, object) = parse_fact(fact);
 
         let mut mem = SemanticMemory::new(ns_id, entity.uuid, &predicate, &object, confidence);
+        // G1: tag the row with the handle's `(agent_id, user_id)` scope.
+        mem.agent_id = self.inner.agent_id;
+        mem.user_id = self.inner.user_id;
 
         // Embed the fact.
         let embedding = self
@@ -1179,6 +1302,10 @@ impl PyEpisode {
             // matching real-time conversational ingest semantics.
             // `Option<DateTime<Utc>>` is Copy so `*when` works.
             mem.event_time = Some((*when).unwrap_or_else(Utc::now));
+            // G1: tag the row with the handle's `(agent_id, user_id)`
+            // scope. Default `(None, None)` keeps legacy v2.1 NULL rows.
+            mem.agent_id = self.inner.agent_id;
+            mem.user_id = self.inner.user_id;
 
             // Embed the content.
             let embedding = self

@@ -11,7 +11,7 @@ use crate::embedding::OnnxEmbedder;
 use crate::graph::MemoryGraph;
 use crate::reranker::Reranker;
 use crate::rrf;
-use crate::storage::StorageTrait;
+use crate::storage::{StorageTrait, memory_matches_scope as pensyve_core_scope_match};
 use crate::types::Memory;
 use crate::vector::VectorIndex;
 
@@ -301,6 +301,13 @@ pub struct RecallEngine<'a> {
     graph: Option<&'a MemoryGraph>,
     /// Optional cross-encoder reranker applied after fusion scoring.
     reranker: Option<&'a Reranker>,
+    /// G1 multi-tenant scope. `(agent_id, user_id)` defaults to `(None, None)`
+    /// which preserves v2.1 behavior (filter only by namespace).
+    /// `agent_only=Some(A)` switches recall to the cross-user opt-in path
+    /// (`recall_across_users`) and causes `agent_id`/`user_id` to be ignored.
+    agent_id: Option<Uuid>,
+    user_id: Option<Uuid>,
+    agent_only: Option<Uuid>,
 }
 
 /// Maximum number of candidates to pass into the cross-encoder for reranking.
@@ -321,6 +328,9 @@ impl<'a> RecallEngine<'a> {
             config,
             graph: None,
             reranker: None,
+            agent_id: None,
+            user_id: None,
+            agent_only: None,
         }
     }
 
@@ -339,6 +349,30 @@ impl<'a> RecallEngine<'a> {
     #[must_use]
     pub fn with_reranker(mut self, reranker: &'a Reranker) -> Self {
         self.reranker = Some(reranker);
+        self
+    }
+
+    /// Attach G1 multi-tenant scope. Defaults are `(None, None)` (legacy
+    /// unscoped recall — applies NO scope filter, returning every row in
+    /// the namespace; preserves v2.1 behavior). When both are `Some`,
+    /// recall returns only rows whose `(agent_id, user_id)` matches exactly
+    /// (no NULL fallback). When one side is `None` and the other is `Some`,
+    /// the unspecified side matches NULL only (operator-flagged edge case).
+    #[must_use]
+    pub fn with_scope(mut self, agent_id: Option<Uuid>, user_id: Option<Uuid>) -> Self {
+        self.agent_id = agent_id;
+        self.user_id = user_id;
+        self.agent_only = None;
+        self
+    }
+
+    /// Configure the engine for the `recall_across_users` opt-in path.
+    /// Returns rows whose `agent_id` matches `agent_id_self` regardless
+    /// of `user_id`. The `(agent_id, user_id)` fields set via
+    /// `with_scope` are ignored while `agent_only` is set.
+    #[must_use]
+    pub fn with_agent_only(mut self, agent_id_self: Uuid) -> Self {
+        self.agent_only = Some(agent_id_self);
         self
     }
 
@@ -735,9 +769,18 @@ impl<'a> RecallEngine<'a> {
         let vector_hits = self.vector_index.search(query_embedding, max_candidates)?;
         let vector_map: HashMap<Uuid, f32> = vector_hits.iter().copied().collect();
 
-        let fts_memories = self
-            .storage
-            .search_fts(query, namespace_id, max_candidates)?;
+        // G1: when scope is configured, prefer the scope-aware FTS variant
+        // (the SqliteBackend override applies the (namespace, agent, user)
+        // composite-index predicate). Default args `(None, None, None)`
+        // route through the unscoped path → byte-for-byte v2.1 behavior.
+        let fts_memories = self.storage.search_fts_scoped_by_pair(
+            query,
+            namespace_id,
+            self.agent_id,
+            self.user_id,
+            self.agent_only,
+            max_candidates,
+        )?;
 
         let mut candidates: HashMap<Uuid, Memory> = HashMap::new();
         for mem in fts_memories {
@@ -753,6 +796,24 @@ impl<'a> RecallEngine<'a> {
                     candidates.insert(*id, Memory::Procedural(m));
                 }
             }
+        }
+
+        // G1: post-filter the vector-derived candidates by scope. FTS-derived
+        // candidates already came through the scope-aware variant above; this
+        // step is what enforces scope on rows that only the vector index hit.
+        //
+        // Unscoped handle (`agent_id=None, user_id=None, agent_only=None`):
+        // operator-locked semantics (2026-05-05) — apply NO scope filter,
+        // preserving v2.1 behavior. So we only retain when at least one
+        // scope dimension is set; otherwise every namespace row is allowed
+        // through.
+        if self.agent_id.is_some()
+            || self.user_id.is_some()
+            || self.agent_only.is_some()
+        {
+            candidates.retain(|_, m| {
+                pensyve_core_scope_match(m, self.agent_id, self.user_id, self.agent_only)
+            });
         }
 
         Ok((candidates, vector_map))
@@ -816,7 +877,15 @@ impl<'a> RecallEngine<'a> {
             vector_map.entry(id).or_insert(score);
         }
 
-        let broad_fts = self.storage.search_fts(query, namespace_id, broad_limit)?;
+        // G1: scope-aware broad FTS step.
+        let broad_fts = self.storage.search_fts_scoped_by_pair(
+            query,
+            namespace_id,
+            self.agent_id,
+            self.user_id,
+            self.agent_only,
+            broad_limit,
+        )?;
         for mem in broad_fts {
             candidates.entry(mem.id()).or_insert(mem);
         }
@@ -834,6 +903,20 @@ impl<'a> RecallEngine<'a> {
             }
         }
 
+        // G1: post-filter so the entity-scoped path obeys multi-tenant
+        // scope too. Without this, an entity-traversal query could surface
+        // rows from another `(agent_id, user_id)` tenant via the dual-path
+        // branch. Unscoped handles skip the retain (operator-locked
+        // semantics 2026-05-05: no scope filter).
+        if self.agent_id.is_some()
+            || self.user_id.is_some()
+            || self.agent_only.is_some()
+        {
+            candidates.retain(|_, m| {
+                pensyve_core_scope_match(m, self.agent_id, self.user_id, self.agent_only)
+            });
+        }
+
         Ok((candidates, vector_map))
     }
 
@@ -844,9 +927,17 @@ impl<'a> RecallEngine<'a> {
         namespace_id: Uuid,
         max_candidates: usize,
     ) -> Result<HashMap<Uuid, f32>, RecallError> {
-        let ordered = self
-            .storage
-            .search_fts(query, namespace_id, max_candidates)?;
+        // G1: route through the scope-aware FTS variant so the BM25 map
+        // doesn't leak rows from another tenant. Default args restore the
+        // unscoped v2.1 path.
+        let ordered = self.storage.search_fts_scoped_by_pair(
+            query,
+            namespace_id,
+            self.agent_id,
+            self.user_id,
+            self.agent_only,
+            max_candidates,
+        )?;
         let fts_count = ordered.len();
         let map = ordered
             .iter()

@@ -780,8 +780,8 @@ impl StorageTrait for SqliteBackend {
             r"INSERT OR REPLACE INTO episodic_memories
                (id, namespace_id, episode_id, source_entity, about_entity, content, content_type,
                 summary, embedding, context_intent, timestamp, stability, retrievability,
-                access_count, last_accessed, event_time)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                access_count, last_accessed, event_time, agent_id, user_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 mem.id.to_string(),
                 mem.namespace_id.to_string(),
@@ -799,6 +799,8 @@ impl StorageTrait for SqliteBackend {
                 mem.access_count,
                 last_accessed,
                 opt_dt_to_str(mem.event_time),
+                mem.agent_id.map(|u| u.to_string()),
+                mem.user_id.map(|u| u.to_string()),
             ],
         )?;
 
@@ -822,7 +824,8 @@ impl StorageTrait for SqliteBackend {
             .query_row(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           content_type, summary, embedding, context_intent, timestamp,
-                          stability, retrievability, access_count, last_accessed, event_time
+                          stability, retrievability, access_count, last_accessed, event_time,
+                          agent_id, user_id
                    FROM episodic_memories WHERE id = ?1",
                 params![id.to_string()],
                 row_to_episodic,
@@ -840,7 +843,8 @@ impl StorageTrait for SqliteBackend {
         let mut stmt = conn.prepare(
             r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                       content_type, summary, embedding, context_intent, timestamp,
-                      stability, retrievability, access_count, last_accessed, event_time
+                      stability, retrievability, access_count, last_accessed, event_time,
+                      agent_id, user_id
                FROM episodic_memories WHERE about_entity = ?1
                ORDER BY timestamp DESC LIMIT ?2",
         )?;
@@ -904,8 +908,8 @@ impl StorageTrait for SqliteBackend {
                 r"INSERT OR REPLACE INTO semantic_memories
                    (id, namespace_id, subject, predicate, object, content_type, object_entity,
                     confidence, valid_at, invalid_at, source_episodes, embedding, stability,
-                    retrievability)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    retrievability, agent_id, user_id)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     mem.id.to_string(),
                     mem.namespace_id.to_string(),
@@ -921,6 +925,8 @@ impl StorageTrait for SqliteBackend {
                     embedding_blob,
                     f64::from(mem.stability),
                     f64::from(mem.retrievability),
+                    mem.agent_id.map(|u| u.to_string()),
+                    mem.user_id.map(|u| u.to_string()),
                 ],
             )?;
 
@@ -956,7 +962,8 @@ impl StorageTrait for SqliteBackend {
             .query_row(
                 r"SELECT id, namespace_id, subject, predicate, object, content_type,
                           object_entity, confidence, valid_at, invalid_at,
-                          source_episodes, embedding, stability, retrievability
+                          source_episodes, embedding, stability, retrievability,
+                          agent_id, user_id
                    FROM semantic_memories WHERE id = ?1",
                 params![id.to_string()],
                 row_to_semantic,
@@ -974,7 +981,8 @@ impl StorageTrait for SqliteBackend {
         let mut stmt = conn.prepare(
             r"SELECT id, namespace_id, subject, predicate, object, content_type,
                       object_entity, confidence, valid_at, invalid_at,
-                      source_episodes, embedding, stability, retrievability
+                      source_episodes, embedding, stability, retrievability,
+                      agent_id, user_id
                FROM semantic_memories WHERE subject = ?1
                ORDER BY valid_at DESC LIMIT ?2",
         )?;
@@ -1001,7 +1009,8 @@ impl StorageTrait for SqliteBackend {
         let mut stmt = conn.prepare(
             r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                       content_type, summary, embedding, context_intent, timestamp,
-                      stability, retrievability, access_count, last_accessed, event_time
+                      stability, retrievability, access_count, last_accessed, event_time,
+                      agent_id, user_id
                FROM episodic_memories
                WHERE namespace_id = ?1 AND episode_id = ?2
                ORDER BY COALESCE(event_time, timestamp) ASC",
@@ -1045,8 +1054,9 @@ impl StorageTrait for SqliteBackend {
         conn.execute(
             r"INSERT OR REPLACE INTO procedural_memories
                (id, namespace_id, trigger_text, action, outcome, context, reliability,
-                trial_count, success_count, source_episodes, embedding, created_at, last_used)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                trial_count, success_count, source_episodes, embedding, created_at, last_used,
+                agent_id, user_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 mem.id.to_string(),
                 mem.namespace_id.to_string(),
@@ -1061,6 +1071,8 @@ impl StorageTrait for SqliteBackend {
                 embedding_blob,
                 mem.created_at.to_rfc3339(),
                 last_used,
+                mem.agent_id.map(|u| u.to_string()),
+                mem.user_id.map(|u| u.to_string()),
             ],
         )?;
 
@@ -1084,7 +1096,8 @@ impl StorageTrait for SqliteBackend {
         let result = conn
             .query_row(
                 r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
-                          trial_count, success_count, source_episodes, embedding, created_at, last_used
+                          trial_count, success_count, source_episodes, embedding, created_at, last_used,
+                          agent_id, user_id
                    FROM procedural_memories WHERE id = ?1",
                 params![id.to_string()],
                 row_to_procedural,
@@ -1138,8 +1151,9 @@ impl StorageTrait for SqliteBackend {
             conn.execute(
                 r"INSERT OR REPLACE INTO observation_memories
                    (id, namespace_id, episode_id, entity_type, instance, action, quantity, unit,
-                    content, embedding, confidence, event_time, created_at, stability, retrievability)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    content, embedding, confidence, event_time, created_at, stability, retrievability,
+                    agent_id, user_id)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     mem.id.to_string(),
                     mem.namespace_id.to_string(),
@@ -1156,6 +1170,8 @@ impl StorageTrait for SqliteBackend {
                     mem.created_at.to_rfc3339(),
                     f64::from(mem.stability),
                     f64::from(mem.retrievability),
+                    mem.agent_id.map(|u| u.to_string()),
+                    mem.user_id.map(|u| u.to_string()),
                 ],
             )?;
             conn.execute(
@@ -1188,7 +1204,7 @@ impl StorageTrait for SqliteBackend {
             .query_row(
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
                           unit, content, embedding, confidence, event_time, created_at,
-                          stability, retrievability
+                          stability, retrievability, agent_id, user_id
                    FROM observation_memories WHERE id = ?1",
                 params![id.to_string()],
                 row_to_observation,
@@ -1210,7 +1226,7 @@ impl StorageTrait for SqliteBackend {
         let sql = format!(
             "SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity, \
               unit, content, embedding, confidence, event_time, created_at, \
-              stability, retrievability \
+              stability, retrievability, agent_id, user_id \
              FROM observation_memories \
              WHERE episode_id IN ({placeholders}) \
              ORDER BY created_at ASC \
@@ -1358,7 +1374,8 @@ impl StorageTrait for SqliteBackend {
                         .query_row(
                             r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                                       content_type, summary, embedding, context_intent, timestamp,
-                                      stability, retrievability, access_count, last_accessed, event_time
+                                      stability, retrievability, access_count, last_accessed, event_time,
+                                      agent_id, user_id
                                FROM episodic_memories WHERE id = ?1",
                             params![id.to_string()],
                             row_to_episodic,
@@ -1373,7 +1390,8 @@ impl StorageTrait for SqliteBackend {
                         .query_row(
                             r"SELECT id, namespace_id, subject, predicate, object, content_type,
                                       object_entity, confidence, valid_at, invalid_at,
-                                      source_episodes, embedding, stability, retrievability
+                                      source_episodes, embedding, stability, retrievability,
+                                      agent_id, user_id
                                FROM semantic_memories WHERE id = ?1",
                             params![id.to_string()],
                             row_to_semantic,
@@ -1387,7 +1405,8 @@ impl StorageTrait for SqliteBackend {
                     let result = conn
                         .query_row(
                             r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
-                                      trial_count, success_count, source_episodes, embedding, created_at, last_used
+                                      trial_count, success_count, source_episodes, embedding, created_at, last_used,
+                                      agent_id, user_id
                                FROM procedural_memories WHERE id = ?1",
                             params![id.to_string()],
                             row_to_procedural,
@@ -1453,7 +1472,8 @@ impl StorageTrait for SqliteBackend {
                     .query_row(
                         r"SELECT id, namespace_id, subject, predicate, object, content_type,
                                   object_entity, confidence, valid_at, invalid_at,
-                                  source_episodes, embedding, stability, retrievability
+                                  source_episodes, embedding, stability, retrievability,
+                                  agent_id, user_id
                            FROM semantic_memories WHERE id = ?1",
                         params![id.to_string()],
                         row_to_semantic,
@@ -1493,7 +1513,8 @@ impl StorageTrait for SqliteBackend {
                     .query_row(
                         r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                                   content_type, summary, embedding, context_intent, timestamp,
-                                  stability, retrievability, access_count, last_accessed, event_time
+                                  stability, retrievability, access_count, last_accessed, event_time,
+                                  agent_id, user_id
                            FROM episodic_memories WHERE id = ?1",
                         params![id.to_string()],
                         row_to_episodic,
@@ -1523,7 +1544,8 @@ impl StorageTrait for SqliteBackend {
             let mut stmt = conn.prepare(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           content_type, summary, embedding, context_intent, timestamp,
-                          stability, retrievability, access_count, last_accessed, event_time
+                          stability, retrievability, access_count, last_accessed, event_time,
+                          agent_id, user_id
                    FROM episodic_memories WHERE namespace_id = ?1",
             )?;
             let rows = stmt.query_map(params![&ns_str], row_to_episodic)?;
@@ -1537,7 +1559,8 @@ impl StorageTrait for SqliteBackend {
             let mut stmt = conn.prepare(
                 r"SELECT id, namespace_id, subject, predicate, object, content_type,
                           object_entity, confidence, valid_at, invalid_at,
-                          source_episodes, embedding, stability, retrievability
+                          source_episodes, embedding, stability, retrievability,
+                          agent_id, user_id
                    FROM semantic_memories WHERE namespace_id = ?1",
             )?;
             let rows = stmt.query_map(params![&ns_str], row_to_semantic)?;
@@ -1550,7 +1573,8 @@ impl StorageTrait for SqliteBackend {
         {
             let mut stmt = conn.prepare(
                 r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
-                          trial_count, success_count, source_episodes, embedding, created_at, last_used
+                          trial_count, success_count, source_episodes, embedding, created_at, last_used,
+                          agent_id, user_id
                    FROM procedural_memories WHERE namespace_id = ?1",
             )?;
             let rows = stmt.query_map(params![&ns_str], row_to_procedural)?;
@@ -1564,7 +1588,7 @@ impl StorageTrait for SqliteBackend {
             let mut stmt = conn.prepare(
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
                           unit, content, embedding, confidence, event_time, created_at,
-                          stability, retrievability
+                          stability, retrievability, agent_id, user_id
                    FROM observation_memories WHERE namespace_id = ?1",
             )?;
             let rows = stmt.query_map(params![&ns_str], row_to_observation)?;
@@ -1572,6 +1596,193 @@ impl StorageTrait for SqliteBackend {
                 memories.push(Memory::Observation(row??));
             }
         }
+
+        Ok(memories)
+    }
+
+    // -----------------------------------------------------------------------
+    // G1: scope-aware variants (SQL-layer override of the default trait
+    // impls in `storage::mod`). These are the multi-tenant read paths.
+    //
+    // SQL clause matches the design locked in
+    // `pensyve-docs/research/benchmark-sprint/v3/g1/preregistration.md`
+    // §1.4 item 2 (scope-by-default) and §3.0 item 7 (`recall_across_users`),
+    // with the (None, None) semantic clarified by the operator on 2026-05-05:
+    //
+    //   IF agent_only IS NOT NULL:
+    //       namespace_id = ? AND agent_id = ?
+    //   ELSE IF agent_id IS NONE AND user_id IS NONE:
+    //       namespace_id = ?                      -- unscoped: NO scope filter
+    //   ELSE IF agent_id IS SOME AND user_id IS SOME:
+    //       namespace_id = ? AND agent_id = ? AND user_id = ?
+    //   ELSE IF agent_id IS SOME AND user_id IS NONE:
+    //       namespace_id = ? AND agent_id = ? AND user_id IS NULL
+    //   ELSE (agent_id IS NONE AND user_id IS SOME):
+    //       namespace_id = ? AND agent_id IS NULL AND user_id = ?
+    //
+    // The composite index `(namespace_id, agent_id, user_id)` from G1 P1
+    // makes the scoped paths covering-index lookups; the unscoped path
+    // is the v2.1 hot path (namespace-only).
+    // -----------------------------------------------------------------------
+
+    fn search_fts_scoped_by_pair(
+        &self,
+        query: &str,
+        namespace_id: Uuid,
+        agent_id: Option<Uuid>,
+        user_id: Option<Uuid>,
+        agent_only: Option<Uuid>,
+        limit: usize,
+    ) -> StorageResult<Vec<Memory>> {
+        // FTS doesn't carry the scope columns (per the v2.1 `memory_fts`
+        // virtual-table schema); run the regular FTS to get a candidate
+        // pool, then drop rows that don't match the scope predicate. The
+        // pool is widened by 4x to absorb the post-filter loss without
+        // starving the recall pipeline. The actual SQL-layer scope
+        // filter lives on `get_all_memories_by_namespace_scoped_pair`
+        // (covering-index lookup); recall paths that need pure scope
+        // semantics use that variant instead of FTS.
+        let raw = self.search_fts(query, namespace_id, limit.saturating_mul(4))?;
+        Ok(raw
+            .into_iter()
+            .filter(|m| super::memory_matches_scope(m, agent_id, user_id, agent_only))
+            .take(limit)
+            .collect())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn get_all_memories_by_namespace_scoped_pair(
+        &self,
+        namespace_id: Uuid,
+        agent_id: Option<Uuid>,
+        user_id: Option<Uuid>,
+        agent_only: Option<Uuid>,
+    ) -> StorageResult<Vec<Memory>> {
+        // Build the WHERE-suffix and the parameter shape once, then per-table
+        // dispatch to the matching `query_map` arm. The five cases mirror the
+        // dispatch table in the section header above.
+        enum ScopeBind<'a> {
+            /// `WHERE namespace_id = ?1` — unscoped handle (None, None) or
+            /// internally for the no-filter pass. Single param: namespace.
+            NsOnly,
+            /// `WHERE namespace_id = ?1 AND agent_id = ?2` — `agent_only`
+            /// (`recall_across_users`) path.
+            AgentOnly(&'a String),
+            /// `WHERE namespace_id = ?1 AND agent_id = ?2 AND user_id = ?3`
+            /// — strict scoped match.
+            Both(&'a String, &'a String),
+            /// `WHERE namespace_id = ?1 AND agent_id = ?2 AND user_id IS NULL`
+            /// — agent set, user unset (operator-flagged edge case).
+            AgentSetUserNull(&'a String),
+            /// `WHERE namespace_id = ?1 AND agent_id IS NULL AND user_id = ?2`
+            /// — user set, agent unset (operator-flagged edge case).
+            UserSetAgentNull(&'a String),
+        }
+
+        // We rebuild each projection-table SELECT with a scope-aware WHERE.
+        // The leading `namespace_id` keeps the v2.1 hot path; the trailing
+        // `(agent_id, user_id)` is index-covered by `idx_<table>_namespace_agent_user`.
+        let conn = lock_conn!(self);
+        let ns_str = namespace_id.to_string();
+        let mut memories = Vec::new();
+
+        let agent_str = agent_id.map(|u| u.to_string());
+        let user_str = user_id.map(|u| u.to_string());
+        let agent_only_str = agent_only.map(|u| u.to_string());
+
+        let bind = if let Some(a) = agent_only_str.as_ref() {
+            ScopeBind::AgentOnly(a)
+        } else {
+            match (agent_str.as_ref(), user_str.as_ref()) {
+                (None, None) => ScopeBind::NsOnly,
+                (Some(a), Some(u)) => ScopeBind::Both(a, u),
+                (Some(a), None) => ScopeBind::AgentSetUserNull(a),
+                (None, Some(u)) => ScopeBind::UserSetAgentNull(u),
+            }
+        };
+
+        let where_sql: &'static str = match bind {
+            ScopeBind::NsOnly => "namespace_id = ?1",
+            ScopeBind::AgentOnly(_) => "namespace_id = ?1 AND agent_id = ?2",
+            ScopeBind::Both(_, _) => "namespace_id = ?1 AND agent_id = ?2 AND user_id = ?3",
+            ScopeBind::AgentSetUserNull(_) => {
+                "namespace_id = ?1 AND agent_id = ?2 AND user_id IS NULL"
+            }
+            ScopeBind::UserSetAgentNull(_) => {
+                "namespace_id = ?1 AND agent_id IS NULL AND user_id = ?2"
+            }
+        };
+
+        // Helper macro: given a SELECT prefix and a row mapper, run the query
+        // with the bind shape determined above and push converted rows into
+        // `memories`.
+        macro_rules! run_scoped {
+            ($select_sql:expr, $row_to:expr, $variant:expr) => {{
+                let sql = format!("{} WHERE {}", $select_sql, where_sql);
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = match &bind {
+                    ScopeBind::NsOnly => stmt
+                        .query_map(params![&ns_str], $row_to)?
+                        .collect::<Result<Vec<_>, _>>()?,
+                    ScopeBind::AgentOnly(a) => stmt
+                        .query_map(params![&ns_str, a], $row_to)?
+                        .collect::<Result<Vec<_>, _>>()?,
+                    ScopeBind::Both(a, u) => stmt
+                        .query_map(params![&ns_str, a, u], $row_to)?
+                        .collect::<Result<Vec<_>, _>>()?,
+                    ScopeBind::AgentSetUserNull(a) => stmt
+                        .query_map(params![&ns_str, a], $row_to)?
+                        .collect::<Result<Vec<_>, _>>()?,
+                    ScopeBind::UserSetAgentNull(u) => stmt
+                        .query_map(params![&ns_str, u], $row_to)?
+                        .collect::<Result<Vec<_>, _>>()?,
+                };
+                for r in rows {
+                    memories.push($variant(r?));
+                }
+            }};
+        }
+
+        // Episodic
+        run_scoped!(
+            "SELECT id, namespace_id, episode_id, source_entity, about_entity, content, \
+              content_type, summary, embedding, context_intent, timestamp, \
+              stability, retrievability, access_count, last_accessed, event_time, \
+              agent_id, user_id \
+             FROM episodic_memories",
+            row_to_episodic,
+            Memory::Episodic
+        );
+
+        // Semantic
+        run_scoped!(
+            "SELECT id, namespace_id, subject, predicate, object, content_type, \
+              object_entity, confidence, valid_at, invalid_at, \
+              source_episodes, embedding, stability, retrievability, agent_id, user_id \
+             FROM semantic_memories",
+            row_to_semantic,
+            Memory::Semantic
+        );
+
+        // Procedural
+        run_scoped!(
+            "SELECT id, namespace_id, trigger_text, action, outcome, context, reliability, \
+              trial_count, success_count, source_episodes, embedding, created_at, last_used, \
+              agent_id, user_id \
+             FROM procedural_memories",
+            row_to_procedural,
+            Memory::Procedural
+        );
+
+        // Observation
+        run_scoped!(
+            "SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity, \
+              unit, content, embedding, confidence, event_time, created_at, \
+              stability, retrievability, agent_id, user_id \
+             FROM observation_memories",
+            row_to_observation,
+            Memory::Observation
+        );
 
         Ok(memories)
     }
@@ -2093,6 +2304,9 @@ fn row_to_episodic(
     let access_count: u32 = row.get(13)?;
     let last_accessed_str: Option<String> = row.get(14)?;
     let event_time_str: Option<String> = row.get(15)?;
+    // G1: scope columns are nullable. Legacy v2.1 rows return NULL.
+    let agent_id_str: Option<String> = row.get(16)?;
+    let user_id_str: Option<String> = row.get(17)?;
 
     let id = match parse_uuid(&id_str) {
         Ok(v) => v,
@@ -2113,6 +2327,17 @@ fn row_to_episodic(
     let about_entity = match parse_uuid(&about_str) {
         Ok(v) => v,
         Err(e) => return Ok(Err(e)),
+    };
+
+    let agent_id = match agent_id_str.as_deref().map(parse_uuid) {
+        Some(Ok(v)) => Some(v),
+        Some(Err(e)) => return Ok(Err(e)),
+        None => None,
+    };
+    let user_id = match user_id_str.as_deref().map(parse_uuid) {
+        Some(Ok(v)) => Some(v),
+        Some(Err(e)) => return Ok(Err(e)),
+        None => None,
     };
 
     Ok(Ok(EpisodicMemory {
@@ -2142,6 +2367,8 @@ fn row_to_episodic(
         // pensyve-docs/research/benchmark-sprint/06-phase-v-verification.md.
         event_time: str_to_opt_dt(event_time_str.as_deref()),
         superseded_by: None,
+        agent_id,
+        user_id,
     }))
 }
 
@@ -2162,6 +2389,9 @@ fn row_to_semantic(
     let embedding_bytes: Option<Vec<u8>> = row.get(11)?;
     let stability: f64 = row.get(12)?;
     let retrievability: f64 = row.get(13)?;
+    // G1: scope columns are nullable. Legacy v2.1 rows return NULL.
+    let agent_id_str: Option<String> = row.get(14)?;
+    let user_id_str: Option<String> = row.get(15)?;
 
     let id = match parse_uuid(&id_str) {
         Ok(v) => v,
@@ -2174,6 +2404,17 @@ fn row_to_semantic(
     let subject = match parse_uuid(&subject_str) {
         Ok(v) => v,
         Err(e) => return Ok(Err(e)),
+    };
+
+    let agent_id = match agent_id_str.as_deref().map(parse_uuid) {
+        Some(Ok(v)) => Some(v),
+        Some(Err(e)) => return Ok(Err(e)),
+        None => None,
+    };
+    let user_id = match user_id_str.as_deref().map(parse_uuid) {
+        Some(Ok(v)) => Some(v),
+        Some(Err(e)) => return Ok(Err(e)),
+        None => None,
     };
 
     Ok(Ok(SemanticMemory {
@@ -2198,6 +2439,8 @@ fn row_to_semantic(
             .unwrap_or_default(),
         stability: stability as f32,
         retrievability: retrievability as f32,
+        agent_id,
+        user_id,
     }))
 }
 
@@ -2217,6 +2460,9 @@ fn row_to_procedural(
     let embedding_bytes: Option<Vec<u8>> = row.get(10)?;
     let created_at_str: String = row.get(11)?;
     let last_used_str: Option<String> = row.get(12)?;
+    // G1: scope columns are nullable. Legacy v2.1 rows return NULL.
+    let agent_id_str: Option<String> = row.get(13)?;
+    let user_id_str: Option<String> = row.get(14)?;
 
     let context: HashMap<String, serde_json::Value> = match serde_json::from_str(&context_str) {
         Ok(v) => v,
@@ -2230,6 +2476,17 @@ fn row_to_procedural(
     let namespace_id = match parse_uuid(&ns_str) {
         Ok(v) => v,
         Err(e) => return Ok(Err(e)),
+    };
+
+    let agent_id = match agent_id_str.as_deref().map(parse_uuid) {
+        Some(Ok(v)) => Some(v),
+        Some(Err(e)) => return Ok(Err(e)),
+        None => None,
+    };
+    let user_id = match user_id_str.as_deref().map(parse_uuid) {
+        Some(Ok(v)) => Some(v),
+        Some(Err(e)) => return Ok(Err(e)),
+        None => None,
     };
 
     Ok(Ok(ProceduralMemory {
@@ -2249,6 +2506,8 @@ fn row_to_procedural(
             .unwrap_or_default(),
         created_at: str_to_dt(&created_at_str),
         last_used: str_to_opt_dt(last_used_str.as_deref()),
+        agent_id,
+        user_id,
     }))
 }
 
@@ -2270,6 +2529,9 @@ fn row_to_observation(
     let created_at_str: String = row.get(12)?;
     let stability: f64 = row.get(13)?;
     let retrievability: f64 = row.get(14)?;
+    // G1: scope columns are nullable. Legacy v2.1 rows return NULL.
+    let agent_id_str: Option<String> = row.get(15)?;
+    let user_id_str: Option<String> = row.get(16)?;
 
     let id = match parse_uuid(&id_str) {
         Ok(v) => v,
@@ -2282,6 +2544,16 @@ fn row_to_observation(
     let episode_id = match parse_uuid(&episode_id_str) {
         Ok(v) => v,
         Err(e) => return Ok(Err(e)),
+    };
+    let agent_id = match agent_id_str.as_deref().map(parse_uuid) {
+        Some(Ok(v)) => Some(v),
+        Some(Err(e)) => return Ok(Err(e)),
+        None => None,
+    };
+    let user_id = match user_id_str.as_deref().map(parse_uuid) {
+        Some(Ok(v)) => Some(v),
+        Some(Err(e)) => return Ok(Err(e)),
+        None => None,
     };
 
     Ok(Ok(ObservationMemory {
@@ -2303,6 +2575,8 @@ fn row_to_observation(
         created_at: str_to_dt(&created_at_str),
         stability: stability as f32,
         retrievability: retrievability as f32,
+        agent_id,
+        user_id,
     }))
 }
 

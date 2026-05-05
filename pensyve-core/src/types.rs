@@ -5,6 +5,98 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
+// Multi-tenant scoping newtypes (G1 / Phase G1 P2)
+// ---------------------------------------------------------------------------
+//
+// `AgentId` and `UserId` are typesafe wrappers around `Uuid` used to scope
+// memory rows by `(agent_id, user_id)` pair. They exist so that a `Uuid`
+// parameter cannot be silently swapped between the agent and user roles —
+// callers must pass the right newtype and the type system catches the swap.
+//
+// CRITICAL: these newtypes have NO relationship to the `EntityKind::Agent` /
+// `EntityKind::User` enum variants below. `EntityKind` describes graph-node
+// roles in the entity-relation layer; `AgentId`/`UserId` describe row-level
+// multi-tenant scoping at the projection-table level. The two abstractions
+// are deliberately decoupled (an `EntityKind::Agent` row and an `AgentId`
+// scope can refer to entirely different UUIDs).
+
+/// Agent UUID used for row-level multi-tenant scoping on memory projections.
+///
+/// Stored as `agent_id TEXT NULL` on the four projection tables. Recall on a
+/// `Pensyve` handle constructed with `agent_id=Some(...)` filters by this
+/// value; `None` selects the legacy unscoped (NULL) bucket per the locked
+/// G1 design (`pensyve-docs/research/benchmark-sprint/v3/g1/preregistration.md`
+/// §1.4 item 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AgentId(pub Uuid);
+
+impl AgentId {
+    /// Construct from a string-shaped UUID. Returns the underlying parse
+    /// error if the input is not a valid UUID.
+    pub fn parse_str(s: &str) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(s).map(Self)
+    }
+
+    /// Borrow the inner UUID.
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl From<Uuid> for AgentId {
+    fn from(u: Uuid) -> Self {
+        Self(u)
+    }
+}
+
+impl From<AgentId> for Uuid {
+    fn from(a: AgentId) -> Self {
+        a.0
+    }
+}
+
+impl std::fmt::Display for AgentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// User UUID used for row-level multi-tenant scoping on memory projections.
+/// See [`AgentId`] for the design rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UserId(pub Uuid);
+
+impl UserId {
+    pub fn parse_str(s: &str) -> Result<Self, uuid::Error> {
+        Uuid::parse_str(s).map(Self)
+    }
+
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl From<Uuid> for UserId {
+    fn from(u: Uuid) -> Self {
+        Self(u)
+    }
+}
+
+impl From<UserId> for Uuid {
+    fn from(u: UserId) -> Self {
+        u.0
+    }
+}
+
+impl std::fmt::Display for UserId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Enums
 // ---------------------------------------------------------------------------
 
@@ -177,6 +269,12 @@ pub struct EpisodicMemory {
     /// If this memory was superseded by a newer one, its ID.
     #[serde(default)]
     pub superseded_by: Option<Uuid>,
+    /// Multi-tenant agent scope (G1). NULL = legacy unscoped row.
+    #[serde(default)]
+    pub agent_id: Option<Uuid>,
+    /// Multi-tenant user scope (G1). NULL = legacy unscoped row.
+    #[serde(default)]
+    pub user_id: Option<Uuid>,
 }
 
 fn default_salience() -> f32 {
@@ -211,6 +309,8 @@ impl EpisodicMemory {
             storage_strength: 0.0,
             event_time: None,
             superseded_by: None,
+            agent_id: None,
+            user_id: None,
         }
     }
 }
@@ -238,6 +338,12 @@ pub struct SemanticMemory {
     pub embedding: Vec<f32>,
     pub stability: f32,
     pub retrievability: f32,
+    /// Multi-tenant agent scope (G1). NULL = legacy unscoped row.
+    #[serde(default)]
+    pub agent_id: Option<Uuid>,
+    /// Multi-tenant user scope (G1). NULL = legacy unscoped row.
+    #[serde(default)]
+    pub user_id: Option<Uuid>,
 }
 
 impl SemanticMemory {
@@ -263,6 +369,8 @@ impl SemanticMemory {
             embedding: Vec::new(),
             stability: 1.0,
             retrievability: 1.0,
+            agent_id: None,
+            user_id: None,
         }
     }
 }
@@ -287,6 +395,12 @@ pub struct ProceduralMemory {
     pub embedding: Vec<f32>,
     pub created_at: DateTime<Utc>,
     pub last_used: Option<DateTime<Utc>>,
+    /// Multi-tenant agent scope (G1). NULL = legacy unscoped row.
+    #[serde(default)]
+    pub agent_id: Option<Uuid>,
+    /// Multi-tenant user scope (G1). NULL = legacy unscoped row.
+    #[serde(default)]
+    pub user_id: Option<Uuid>,
 }
 
 impl ProceduralMemory {
@@ -316,6 +430,8 @@ impl ProceduralMemory {
             embedding: Vec::new(),
             created_at: Utc::now(),
             last_used: None,
+            agent_id: None,
+            user_id: None,
         }
     }
 }
@@ -384,6 +500,14 @@ pub struct ObservationMemory {
 
     /// Retrievability in [0, 1]; starts at 1.0 and decays with disuse.
     pub retrievability: f32,
+
+    /// Multi-tenant agent scope (G1). NULL = legacy unscoped row.
+    #[serde(default)]
+    pub agent_id: Option<Uuid>,
+
+    /// Multi-tenant user scope (G1). NULL = legacy unscoped row.
+    #[serde(default)]
+    pub user_id: Option<Uuid>,
 }
 
 impl ObservationMemory {
@@ -411,6 +535,8 @@ impl ObservationMemory {
             created_at: Utc::now(),
             stability: 1.0,
             retrievability: 1.0,
+            agent_id: None,
+            user_id: None,
         }
     }
 }

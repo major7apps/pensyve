@@ -1708,6 +1708,12 @@ fn row_to_episodic(row: EpisodicRow) -> EpisodicMemory {
         storage_strength: 0.0,
         event_time,
         superseded_by: None,
+        // G1: postgres backend does not yet carry the multi-tenant scope
+        // columns. The struct fields exist for trait/serde compatibility
+        // but are always None on this backend until the postgres schema
+        // adds matching columns in a follow-up.
+        agent_id: None,
+        user_id: None,
     }
 }
 
@@ -1744,6 +1750,9 @@ fn row_to_semantic(row: SemanticRow) -> SemanticMemory {
         embedding: pgtext_to_embedding(embedding_text.as_deref()),
         stability,
         retrievability,
+        // G1: postgres backend does not yet carry the multi-tenant scope columns.
+        agent_id: None,
+        user_id: None,
     }
 }
 
@@ -1781,6 +1790,9 @@ fn row_to_procedural(row: ProceduralRow) -> ProceduralMemory {
         embedding: pgtext_to_embedding(embedding_text.as_deref()),
         created_at,
         last_used,
+        // G1: postgres backend does not yet carry the multi-tenant scope columns.
+        agent_id: None,
+        user_id: None,
     }
 }
 
@@ -1818,5 +1830,8 @@ fn row_to_observation(row: ObservationRow) -> ObservationMemory {
         created_at,
         stability,
         retrievability,
+        // G1: postgres backend does not yet carry the multi-tenant scope columns.
+        agent_id: None,
+        user_id: None,
     }
 }
