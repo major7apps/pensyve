@@ -466,6 +466,22 @@ impl PyPensyve {
             pensyve_core::network_policy::NetworkPolicy::from_env(""),
             Some(pensyve_core::network_policy::NetworkPolicy::Permissive)
         );
+
+        // G1 fix: resolve the embedder's load-time `NetworkPolicy` at handle
+        // construction so `NetworkPolicy::Disabled` propagates from the
+        // Pensyve handle into `OnnxEmbedder` per pre-reg §2 invariant I4 +
+        // §3.0 item 10. When `PENSYVE_NETWORK_POLICY=disabled` is set
+        // explicitly, the embedder MUST refuse load-time HF downloads.
+        // When the env var is unset we keep the prior `Permissive` behaviour
+        // so existing deployments that already populate the fastembed cache
+        // on first run do not regress. The embedder targets
+        // `https://huggingface.co/...`; under `LocalOnly` the policy will
+        // (correctly) deny that URL, so passing `""` as the LocalOnly
+        // fallback is intentional — there is no local fallback for HF
+        // downloads.
+        let embedder_policy = pensyve_core::network_policy::NetworkPolicy::from_env("")
+            .unwrap_or(pensyve_core::network_policy::NetworkPolicy::Permissive);
+
         let config = PensyveConfig::default();
 
         let storage_path = match path {
@@ -499,16 +515,25 @@ impl PyPensyve {
 
         // Try GTE (768d) first, then MiniLM (384d) fallback. `new_cached`
         // returns a process-shared `Arc` so repeated `Pensyve(...)`
-        // construction does not leak ONNX session memory.
-        let (embedder, model_name) = match OnnxEmbedder::new_cached("Alibaba-NLP/gte-base-en-v1.5")
-        {
+        // construction does not leak ONNX session memory. The
+        // `_with_policy` variant gates load-time HF downloads through
+        // `embedder_policy` so `NetworkPolicy::Disabled` set on the
+        // Pensyve handle propagates to the embedder (pre-reg I4 + §3.0
+        // item 10).
+        let (embedder, model_name) = match OnnxEmbedder::new_cached_with_policy(
+            "Alibaba-NLP/gte-base-en-v1.5",
+            &embedder_policy,
+        ) {
             Ok(e) => {
                 tracing::info!(embedding_model = "gte-base-en-v1.5", dimensions = 768);
                 (e, "gte-base-en-v1.5")
             }
             Err(e1) => {
                 tracing::warn!(error = %e1, "Primary embedding model failed, trying fallback");
-                match OnnxEmbedder::new_cached("all-MiniLM-L6-v2") {
+                match OnnxEmbedder::new_cached_with_policy(
+                    "all-MiniLM-L6-v2",
+                    &embedder_policy,
+                ) {
                     Ok(e) => {
                         tracing::warn!(
                             embedding_model = "all-MiniLM-L6-v2",
@@ -987,11 +1012,18 @@ impl PyPensyve {
     ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
         let _ = entity; // namespace-wide for now
         let ns_id = self.inner.namespace.id;
+        // G1/P3a: ConsolidationEngine::run gained `policy` + `cancel`.
+        // Engine performs no network calls today; Disabled (fail-closed)
+        // mirrors the Pensyve handle's fail-closed default. The PyO3
+        // binding is synchronous and exposes no cancellation primitive
+        // to Python today, so a fresh never-cancelled token is correct.
         let stats = ConsolidationEngine::run(
             self.inner.storage.as_ref(),
             self.inner.embedder.as_ref(),
             &self.inner.consolidation_config,
             ns_id,
+            &pensyve_core::network_policy::NetworkPolicy::Disabled,
+            &tokio_util::sync::CancellationToken::new(),
         )
         .map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Consolidation failed: {e}"))
@@ -1088,11 +1120,16 @@ impl PyPensyve {
             runtime.block_on(async move {
                 let mut grand_total = 0usize;
                 for (ns_id, ep_ids) in by_ns {
+                    // G1/P3b: helper gained `cancel`. The PyO3 binding is
+                    // synchronous and exposes no cancel primitive to Python
+                    // today, so a fresh never-cancelled token is correct;
+                    // future async-Python work can wire a real token here.
                     let n = pensyve_core::observation::commit_extractions_for_episodes(
                         storage.as_ref(),
                         extractor.as_ref(),
                         ns_id,
                         &ep_ids,
+                        tokio_util::sync::CancellationToken::new(),
                         |text| embedder.embed(text),
                     )
                     .await;
@@ -1386,11 +1423,15 @@ impl PyEpisode {
             let ep_id = self.episode_id;
             let persisted = py.detach(|| {
                 runtime.block_on(async move {
+                    // G1/P3b: helper gained `cancel`. The PyO3 binding is
+                    // synchronous and exposes no cancel primitive to Python
+                    // today, so a fresh never-cancelled token is correct.
                     pensyve_core::observation::commit_extraction_for_episode(
                         storage.as_ref(),
                         extractor.as_ref(),
                         ns_id,
                         ep_id,
+                        tokio_util::sync::CancellationToken::new(),
                         |text| embedder.embed(text),
                     )
                     .await

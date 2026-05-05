@@ -1,13 +1,3 @@
-mod auth;
-mod cache;
-mod config;
-mod oauth;
-mod rate_limit;
-mod rest;
-mod tenant;
-mod usage;
-mod usage_counter;
-
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -29,30 +19,16 @@ use pensyve_core::vector::VectorIndex;
 
 use pensyve_mcp_tools::PensyveMcpServer;
 
-use crate::auth::{AuthContext, AuthLayer};
-use crate::config::GatewayConfig;
-use crate::rate_limit::RateLimitLayer;
-use crate::tenant::TenantStateManager;
-use crate::usage::UsageReporter;
-use crate::usage_counter::UsageCounter;
-
-/// Application state shared across all requests.
-pub struct AppState {
-    pub auth: auth::AuthValidator,
-    pub rate_limiter: rate_limit::RateLimiter,
-    pub usage_reporter: UsageReporter,
-    pub usage_counter: UsageCounter,
-    pub tenant_mgr: TenantStateManager,
-    pub auth_required: bool,
-    pub admin_key: Option<String>,
-    pub ct: CancellationToken,
-    pub redis: Option<redis::aio::ConnectionManager>,
-    /// Process-wide observation extractor. `None` when the local LLM
-    /// endpoint cannot be configured (typically a missing
-    /// `PENSYVE_EXTRACTOR_URL` / network egress restriction) — ingest
-    /// still works, observations are simply not produced.
-    pub extractor: Option<Arc<dyn pensyve_core::observation::ObservationExtractor>>,
-}
+use pensyve_mcp_gateway::auth::{self, AuthContext, AuthLayer};
+use pensyve_mcp_gateway::cache;
+use pensyve_mcp_gateway::config::GatewayConfig;
+use pensyve_mcp_gateway::oauth;
+use pensyve_mcp_gateway::rate_limit::{self, RateLimitLayer};
+use pensyve_mcp_gateway::rest;
+use pensyve_mcp_gateway::tenant::TenantStateManager;
+use pensyve_mcp_gateway::usage::{self, UsageReporter};
+use pensyve_mcp_gateway::usage_counter::{self, UsageCounter};
+use pensyve_mcp_gateway::{AppState, build_tenant_key, parse_agent_id_header};
 
 struct InitResources {
     storage: Arc<dyn StorageTrait>,
@@ -387,11 +363,17 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                 for ns_id in state.tenant_mgr.active_namespace_ids() {
                     if let Some(ps) = state.tenant_mgr.get_state_by_namespace_id(ns_id) {
                         let config = pensyve_core::config::ConsolidationConfig::default();
+                        // G1/P3a: ConsolidationEngine::run gained `policy`
+                        // + `cancel`. The engine performs no network calls
+                        // today; pass Disabled (fail-closed) and a fresh
+                        // never-cancelled token for this background loop.
                         match pensyve_core::consolidation::ConsolidationEngine::run(
                             ps.storage.as_ref(),
                             &ps.embedder,
                             &config,
                             ns_id,
+                            &pensyve_core::network_policy::NetworkPolicy::Disabled,
+                            &tokio_util::sync::CancellationToken::new(),
                         ) {
                             Ok(cs) => {
                                 if cs.promoted > 0 || cs.archived > 0 {
@@ -517,7 +499,9 @@ tokio::task_local! {
 }
 
 /// Axum middleware that:
-/// 1. Sets the tenant ID task-local from the auth context (for rmcp service factory)
+/// 1. Sets the tenant ID task-local from the auth context (for rmcp service factory),
+///    folding in any `X-Pensyve-Agent-Id` header so per-tenant agents get
+///    isolated namespaces (G1/P3d).
 /// 2. Records usage for successful billable requests — both to the local
 ///    in-memory counter (for the dashboard's "Usage This Period") and to the
 ///    Stripe meter pipeline (for invoicing paying customers).
@@ -527,11 +511,18 @@ async fn tenant_and_usage_middleware(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let auth_ctx = req.extensions().get::<AuthContext>().cloned();
+    // Per-tenant agent_id header (G1/P3d). Malformed UUID → ignored, no error
+    // returned to the client (backward compatibility with v2.1.0 callers).
+    let agent_id = parse_agent_id_header(req.headers());
+
     // Prefer user_id for tenant resolution so that OAuth (MCP plugin) and
     // API key (dashboard) access the same namespace for the same user.
-    let tenant_id = auth_ctx
-        .as_ref()
-        .map(|ctx| ctx.user_id.as_deref().unwrap_or(&ctx.key_id).to_string());
+    // When an agent_id is supplied, fold it in so the same credential can
+    // host multiple isolated agents.
+    let tenant_id = auth_ctx.as_ref().map(|ctx| {
+        let auth_tenant = ctx.user_id.as_deref().unwrap_or(&ctx.key_id);
+        build_tenant_key(auth_tenant, agent_id.as_ref())
+    });
     let scope = auth_ctx
         .as_ref()
         .map_or_else(|| "mcp".to_string(), |ctx| ctx.scope.clone());
@@ -576,3 +567,4 @@ async fn tenant_and_usage_middleware(
 
     response
 }
+

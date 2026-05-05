@@ -379,11 +379,18 @@ impl PensyveMcpServer {
             let ns_id = state.namespace.id;
             tokio::spawn(async move {
                 let config = pensyve_core::config::ConsolidationConfig::default();
+                // G1/P3a: ConsolidationEngine::run gained `policy` + `cancel`.
+                // Engine performs no network calls today, so Disabled is the
+                // safest default; this background spawn is fire-and-forget
+                // (no external cancel signal) so a fresh CancellationToken
+                // (never cancelled) is appropriate.
                 match pensyve_core::consolidation::ConsolidationEngine::run(
                     storage.as_ref(),
                     &embedder,
                     &config,
                     ns_id,
+                    &pensyve_core::network_policy::NetworkPolicy::Disabled,
+                    &tokio_util::sync::CancellationToken::new(),
                 ) {
                     Ok(stats) => {
                         if stats.promoted > 0 {

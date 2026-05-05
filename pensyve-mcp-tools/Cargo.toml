@@ -16,6 +16,9 @@ name = "pensyve_mcp_tools"
 pensyve-core = { path = "../pensyve-core", version = "2.1.0" }
 rmcp = { version = "1.5", features = ["server", "macros"] }
 tokio = { version = "1", features = ["full"] }
+# G1/P3a: needed for `CancellationToken::new()` passed to
+# `ConsolidationEngine::run` from the post-`episode_end` background spawn.
+tokio-util = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1"

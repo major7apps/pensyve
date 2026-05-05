@@ -17,6 +17,7 @@
 
 use pensyve_core::network_policy::NetworkPolicy;
 use pensyve_core::observation::{ExtractionError, LocalLLMExtractor, ObservationExtractor};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -48,7 +49,7 @@ async fn disabled_blocks_every_call() {
         .expect("build");
 
     let err = extractor
-        .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
+        .extract(Uuid::new_v4(), Uuid::new_v4(), &[], CancellationToken::new())
         .await
         .err()
         .expect("Disabled must reject");
@@ -99,7 +100,7 @@ async fn local_only_allows_matching_authority() {
     .expect("build");
 
     let observations = extractor
-        .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
+        .extract(Uuid::new_v4(), Uuid::new_v4(), &[], CancellationToken::new())
         .await
         .expect("LocalOnly must allow matching URL");
     assert!(observations.is_empty());
@@ -133,7 +134,7 @@ async fn local_only_rejects_mismatched_authority() {
     .expect("build");
 
     let err = extractor
-        .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
+        .extract(Uuid::new_v4(), Uuid::new_v4(), &[], CancellationToken::new())
         .await
         .err()
         .expect("LocalOnly mismatch must reject");
@@ -177,7 +178,7 @@ async fn permissive_allows_any_url() {
             .expect("build");
 
     let observations = extractor
-        .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
+        .extract(Uuid::new_v4(), Uuid::new_v4(), &[], CancellationToken::new())
         .await
         .expect("Permissive must allow");
     assert!(observations.is_empty());
@@ -198,7 +199,7 @@ async fn with_network_policy_overrides_construction_value() {
             .with_network_policy(NetworkPolicy::Disabled);
 
     let err = extractor
-        .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
+        .extract(Uuid::new_v4(), Uuid::new_v4(), &[], CancellationToken::new())
         .await
         .err()
         .expect("Disabled override must reject");

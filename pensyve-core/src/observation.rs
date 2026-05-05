@@ -16,6 +16,7 @@ use std::fmt::Debug;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::types::ObservationMemory;
@@ -46,6 +47,26 @@ pub enum ExtractionError {
     /// or wall-clock timeout.
     #[error("extractor budget exceeded: {0}")]
     BudgetExceeded(String),
+
+    /// The operation was cancelled cooperatively via a
+    /// [`tokio_util::sync::CancellationToken`]. G1/P3-P4 contract: long-running
+    /// extractor calls (single-episode HTTP and per-item fan-out batch) MUST
+    /// honor cancel within ≤500 ms (pre-reg §5.5 / I5). The cancel can fire
+    /// (a) before the HTTP request leaves the client, or (b) mid-flight, in
+    /// which case the in-flight `reqwest` future is dropped and the error
+    /// surfaces here. The accompanying `String` carries a short site marker
+    /// (e.g. `"cancelled before HTTP call"`, `"cancelled during HTTP call"`,
+    /// `"cancelled mid-batch at item N"`) so post-hoc logs can reconstruct
+    /// where the cancel was observed.
+    ///
+    /// Note for the SQLite-transactional invariant in pre-reg I5: the
+    /// extractor itself does not write to the store — the calling helper
+    /// (`commit_extraction_for_episode` /
+    /// `commit_extractions_for_episodes`) is responsible for transactional
+    /// boundaries. When a cancelled future is dropped between transactions,
+    /// no partial-write corruption is possible by construction.
+    #[error("extraction cancelled: {0}")]
+    Cancelled(String),
 
     /// Unclassified runtime error.
     #[error("extraction failed: {0}")]
@@ -93,6 +114,16 @@ pub trait ObservationExtractor: Send + Sync + Debug {
     ///   this as its `episode_id` (verified by callers).
     /// * `messages` — ordered turns in the episode. May be empty (in which
     ///   case return an empty vec).
+    /// * `cancel` — cooperative-cancellation token. Long-running extractors
+    ///   (e.g. [`LocalLLMExtractor`] which makes a blocking HTTP POST against
+    ///   a local vLLM endpoint) MUST check this before issuing the call and
+    ///   race it against the in-flight HTTP future via `tokio::select!`. On
+    ///   cancel, return [`ExtractionError::Cancelled`] within ≤500 ms (G1
+    ///   pre-reg §5.5 / I5). Implementations that have no `await` boundary
+    ///   where cancellation could meaningfully interpose (e.g.
+    ///   [`NoopExtractor`]) MAY ignore the token. Callers that don't care
+    ///   about cancellation pass `CancellationToken::new()` (a fresh token
+    ///   that is never cancelled).
     ///
     /// Returns an owned `Vec` of observations. The caller is responsible for
     /// computing embeddings and persisting to storage.
@@ -101,6 +132,7 @@ pub trait ObservationExtractor: Send + Sync + Debug {
         namespace_id: Uuid,
         episode_id: Uuid,
         messages: &[ExtractionMessage],
+        cancel: CancellationToken,
     ) -> ExtractionResult<Vec<ObservationMemory>>;
 
     /// Optional bulk extraction. Default implementation loops over `extract`.
@@ -109,11 +141,21 @@ pub trait ObservationExtractor: Send + Sync + Debug {
     /// per-call overhead. The `episode_ids` and `episodes` slices MUST have
     /// equal length; the returned `Vec<Vec<ObservationMemory>>` is in input
     /// order.
+    ///
+    /// Cancellation: at the top of each per-item iteration the default loop
+    /// checks `cancel.is_cancelled()` and short-circuits with
+    /// [`ExtractionError::Cancelled`] (carrying `"cancelled mid-batch at
+    /// item N"`) if so. The same `cancel` token is forwarded into every
+    /// per-item `extract` call so mid-HTTP cancellation also propagates.
+    /// Concrete implementations that override `extract_batch` (e.g.
+    /// [`BatchedLocalLLMExtractor`]) MUST honor the same contract — pre-reg
+    /// I5 binds them, not the trait default.
     async fn extract_batch(
         &self,
         namespace_id: Uuid,
         episode_ids: &[Uuid],
         episodes: Vec<&[ExtractionMessage]>,
+        cancel: CancellationToken,
     ) -> ExtractionResult<Vec<Vec<ObservationMemory>>> {
         if episode_ids.len() != episodes.len() {
             return Err(ExtractionError::Other(format!(
@@ -123,8 +165,13 @@ pub trait ObservationExtractor: Send + Sync + Debug {
             )));
         }
         let mut out = Vec::with_capacity(episodes.len());
-        for (eid, ep) in episode_ids.iter().zip(episodes) {
-            out.push(self.extract(namespace_id, *eid, ep).await?);
+        for (idx, (eid, ep)) in episode_ids.iter().zip(episodes).enumerate() {
+            if cancel.is_cancelled() {
+                return Err(ExtractionError::Cancelled(format!(
+                    "cancelled mid-batch at item {idx}"
+                )));
+            }
+            out.push(self.extract(namespace_id, *eid, ep, cancel.clone()).await?);
         }
         Ok(out)
     }
@@ -149,7 +196,12 @@ impl ObservationExtractor for NoopExtractor {
         _namespace_id: Uuid,
         _episode_id: Uuid,
         _messages: &[ExtractionMessage],
+        _cancel: CancellationToken,
     ) -> ExtractionResult<Vec<ObservationMemory>> {
+        // No `await` on real work — cancellation is structurally a no-op
+        // here (the Ok(Vec::new()) returns synchronously). The token is
+        // accepted to satisfy the trait contract; callers that signal
+        // cancel will simply observe the empty success.
         Ok(Vec::new())
     }
 }
@@ -492,7 +544,10 @@ pub use prompt_v2_pref::EXTRACTION_PROMPT_V2_PREF;
 
 #[cfg(feature = "observation-extraction")]
 mod cached_bulk {
-    use super::{ExtractionMessage, ExtractionResult, ObservationExtractor, ObservationMemory};
+    use super::{
+        CancellationToken, ExtractionMessage, ExtractionResult, ObservationExtractor,
+        ObservationMemory,
+    };
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::collections::hash_map::DefaultHasher;
@@ -614,7 +669,11 @@ mod cached_bulk {
             namespace_id: Uuid,
             episode_id: Uuid,
             messages: &[ExtractionMessage],
+            cancel: CancellationToken,
         ) -> ExtractionResult<Vec<ObservationMemory>> {
+            // Cache lookup is in-memory and non-cancellable; the cancel
+            // token is forwarded to the fallback path so a miss that ends
+            // up calling LocalLLMExtractor still respects the token.
             let fp = fingerprint_messages(messages);
             if let Some(cached) = self.cache.get(&fp) {
                 let rebound: Vec<ObservationMemory> = cached
@@ -635,7 +694,7 @@ mod cached_bulk {
                 "CachedBulkExtractor cache miss — falling through to inner extractor",
             );
             self.fallback
-                .extract(namespace_id, episode_id, messages)
+                .extract(namespace_id, episode_id, messages, cancel)
                 .await
         }
     }
@@ -681,7 +740,7 @@ mod cached_bulk {
             let extractor = CachedBulkExtractor::new(cache, fallback.clone());
 
             let out = extractor
-                .extract(live_ns, live_ep, &msgs)
+                .extract(live_ns, live_ep, &msgs, CancellationToken::new())
                 .await
                 .expect("cache hit returns ok");
             assert_eq!(out.len(), 1);
@@ -705,7 +764,10 @@ mod cached_bulk {
             let msgs = make_msgs("never seen by the prewarm pass");
             let ns = Uuid::new_v4();
             let ep = Uuid::new_v4();
-            let out = extractor.extract(ns, ep, &msgs).await.expect("ok");
+            let out = extractor
+                .extract(ns, ep, &msgs, CancellationToken::new())
+                .await
+                .expect("ok");
             assert!(out.is_empty(), "TrackingFallback returns empty");
             assert_eq!(
                 fallback.calls(),
@@ -767,6 +829,7 @@ mod cached_bulk {
                 _namespace_id: Uuid,
                 _episode_id: Uuid,
                 _messages: &[ExtractionMessage],
+                _cancel: CancellationToken,
             ) -> ExtractionResult<Vec<ObservationMemory>> {
                 *self.calls.lock().unwrap() += 1;
                 Ok(Vec::new())
@@ -804,8 +867,8 @@ pub use cached_bulk::{CachedBulkExtractor, fingerprint_messages};
 mod localllm {
     use super::prompt_v1::{self, RawObservation, parse_response, raw_to_observation};
     use super::{
-        ExtractionError, ExtractionMessage, ExtractionResult, ObservationExtractor,
-        ObservationMemory,
+        CancellationToken, ExtractionError, ExtractionMessage, ExtractionResult,
+        ObservationExtractor, ObservationMemory,
     };
     use crate::network_policy::NetworkPolicy;
     use async_trait::async_trait;
@@ -1013,7 +1076,18 @@ mod localllm {
             namespace_id: Uuid,
             episode_id: Uuid,
             messages: &[ExtractionMessage],
+            cancel: CancellationToken,
         ) -> ExtractionResult<Vec<ObservationMemory>> {
+            // Pre-flight cancel check. Cheap, deterministic, and short-circuits
+            // the prompt build + URL normalization + policy check below when
+            // the caller has already given up (e.g. consolidation engine
+            // tearing down a batch). Pre-reg §5.5 / I5 binds the contract.
+            if cancel.is_cancelled() {
+                return Err(ExtractionError::Cancelled(
+                    "cancelled before HTTP call".into(),
+                ));
+            }
+
             let prompt = Self::build_prompt(messages);
             let last_event_time = messages.iter().filter_map(|m| m.event_time).max();
 
@@ -1049,21 +1123,43 @@ mod localllm {
             if let Some(key) = self.api_key.as_deref() {
                 builder = builder.bearer_auth(key);
             }
-            let response = builder
-                .send()
-                .await
-                .map_err(|e| ExtractionError::Transport(e.to_string()))?;
 
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                return Err(ExtractionError::Transport(format!("HTTP {status}: {body}")));
-            }
+            // Mid-flight cancellation: race the HTTP send/recv against the
+            // cancel token. The reqwest future is dropped on cancel —
+            // reqwest::Client uses connection pooling and will tear down
+            // the in-flight request cleanly when its future is cancelled.
+            // No partial-write corruption can result here because the
+            // extractor itself never touches storage; the caller's helper
+            // (`commit_extraction_for_episode`) owns the SQLite transactional
+            // boundary, and the helper only writes AFTER this future
+            // returns Ok.
+            let http_future = async {
+                let response = builder
+                    .send()
+                    .await
+                    .map_err(|e| ExtractionError::Transport(e.to_string()))?;
 
-            let parsed: OpenAIResponse = response
-                .json()
-                .await
-                .map_err(|e| ExtractionError::Parse(e.to_string()))?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(ExtractionError::Transport(format!("HTTP {status}: {body}")));
+                }
+
+                let parsed: OpenAIResponse = response
+                    .json()
+                    .await
+                    .map_err(|e| ExtractionError::Parse(e.to_string()))?;
+                Ok::<OpenAIResponse, ExtractionError>(parsed)
+            };
+
+            let parsed = tokio::select! {
+                result = http_future => result?,
+                () = cancel.cancelled() => {
+                    return Err(ExtractionError::Cancelled(
+                        "cancelled during HTTP call".into(),
+                    ));
+                }
+            };
 
             let text = parsed
                 .choices
@@ -1158,7 +1254,7 @@ mod localllm {
                 event_time,
             }];
             let out = extractor
-                .extract(Uuid::new_v4(), Uuid::new_v4(), &msgs)
+                .extract(Uuid::new_v4(), Uuid::new_v4(), &msgs, CancellationToken::new())
                 .await
                 .expect("ok");
             assert_eq!(out.len(), 1);
@@ -1182,7 +1278,7 @@ mod localllm {
                 LocalLLMExtractor::new(server.uri(), "local", None, NetworkPolicy::Permissive)
                     .unwrap();
             let err = extractor
-                .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
+                .extract(Uuid::new_v4(), Uuid::new_v4(), &[], CancellationToken::new())
                 .await
                 .err()
                 .expect("err");
@@ -1207,7 +1303,7 @@ mod localllm {
                 LocalLLMExtractor::new(server.uri(), "local", None, NetworkPolicy::Permissive)
                     .unwrap();
             let out = extractor
-                .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
+                .extract(Uuid::new_v4(), Uuid::new_v4(), &[], CancellationToken::new())
                 .await
                 .expect("ok");
             assert!(out.is_empty());
@@ -1229,7 +1325,7 @@ mod localllm {
             let extractor =
                 LocalLLMExtractor::new(bare, "local", None, NetworkPolicy::Permissive).unwrap();
             extractor
-                .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
+                .extract(Uuid::new_v4(), Uuid::new_v4(), &[], CancellationToken::new())
                 .await
                 .expect("ok");
         }
@@ -1306,7 +1402,7 @@ mod localllm {
                 event_time: None,
             }];
             extractor
-                .extract(Uuid::new_v4(), Uuid::new_v4(), &msgs)
+                .extract(Uuid::new_v4(), Uuid::new_v4(), &msgs, CancellationToken::new())
                 .await
                 .expect("ok");
         }
@@ -1347,7 +1443,7 @@ mod localllm {
                 event_time: None,
             }];
             extractor
-                .extract(Uuid::new_v4(), Uuid::new_v4(), &msgs)
+                .extract(Uuid::new_v4(), Uuid::new_v4(), &msgs, CancellationToken::new())
                 .await
                 .expect("ok");
             let body = captured
@@ -1398,7 +1494,7 @@ mod localllm {
                 policy: NetworkPolicy::Permissive,
             };
             let err = extractor
-                .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
+                .extract(Uuid::new_v4(), Uuid::new_v4(), &[], CancellationToken::new())
                 .await
                 .err()
                 .expect("err");
@@ -1433,8 +1529,8 @@ pub use localllm::LocalLLMExtractor;
 mod batched_localllm {
     use super::localllm::LocalLLMExtractor;
     use super::{
-        ExtractionError, ExtractionMessage, ExtractionResult, ObservationExtractor,
-        ObservationMemory,
+        CancellationToken, ExtractionError, ExtractionMessage, ExtractionResult,
+        ObservationExtractor, ObservationMemory,
     };
     use async_trait::async_trait;
     use std::sync::Arc;
@@ -1523,13 +1619,18 @@ mod batched_localllm {
             namespace_id: Uuid,
             episode_id: Uuid,
             messages: &[ExtractionMessage],
+            cancel: CancellationToken,
         ) -> ExtractionResult<Vec<ObservationMemory>> {
             // Single-episode calls don't benefit from the semaphore —
             // dispatch straight to the inner extractor. This also keeps
             // existing call sites that go through the trait's per-episode
             // path working unchanged when they swap a `LocalLLMExtractor`
-            // for a `BatchedLocalLLMExtractor`.
-            self.inner.extract(namespace_id, episode_id, messages).await
+            // for a `BatchedLocalLLMExtractor`. The cancel token is
+            // forwarded so mid-HTTP cancellation in the inner extractor
+            // honors the batch-wide signal.
+            self.inner
+                .extract(namespace_id, episode_id, messages, cancel)
+                .await
         }
 
         async fn extract_batch(
@@ -1537,6 +1638,7 @@ mod batched_localllm {
             namespace_id: Uuid,
             episode_ids: &[Uuid],
             episodes: Vec<&[ExtractionMessage]>,
+            cancel: CancellationToken,
         ) -> ExtractionResult<Vec<Vec<ObservationMemory>>> {
             // Length-mismatch handling mirrors the trait's default impl —
             // fail fast with a clear message rather than silently truncating.
@@ -1551,6 +1653,14 @@ mod batched_localllm {
                 return Ok(Vec::new());
             }
 
+            // Pre-flight cancel check — if the caller already gave up,
+            // don't even spin up the semaphore + per-item futures.
+            if cancel.is_cancelled() {
+                return Err(ExtractionError::Cancelled(
+                    "cancelled before batch fan-out".into(),
+                ));
+            }
+
             let sem = Arc::new(Semaphore::new(self.max_concurrency));
             let inner = &self.inner;
 
@@ -1558,19 +1668,50 @@ mod batched_localllm {
             // hitting the inner extractor. `join_all` preserves input
             // order (it materializes a Vec<Output> indexed by spawn
             // order), so result[i] corresponds to episode_ids[i] / episodes[i].
-            let futures = episode_ids
-                .iter()
-                .copied()
-                .zip(episodes)
-                .map(|(eid, msgs)| {
-                    let sem = sem.clone();
-                    async move {
-                        let _permit = sem.acquire().await.map_err(|e| {
-                            ExtractionError::Other(format!("semaphore unexpectedly closed: {e}"))
-                        })?;
-                        inner.extract(namespace_id, eid, msgs).await
-                    }
-                });
+            //
+            // Cancellation strategy:
+            //   1. Each per-item future checks cancel.is_cancelled() at the
+            //      top of its body BEFORE acquiring the semaphore permit.
+            //      Items that wake up after cancel was signalled
+            //      short-circuit with Cancelled and never even hold a
+            //      permit, freeing it for any item already past the check
+            //      (which races to completion via the inner extractor's
+            //      own select! — see localllm::extract).
+            //   2. The inner extractor's `extract` honors the same token,
+            //      so any in-flight HTTP call drops cleanly.
+            // Result shape on cancel: at least one Cancelled wins via
+            // `collect::<Result<_, _>>()`. Pre-reg §5.5 says "no
+            // partial-write corruption" — that's about the SQLite store,
+            // not in-memory results. Implementation choice: return
+            // Err(Cancelled) only; do NOT return a half-populated
+            // Vec<Vec<...>>. The all-or-nothing batch contract that
+            // existed pre-G1 is preserved on cancel, and any caller
+            // helper that wanted partial persistence has to call
+            // `extract` per item itself.
+            let cancel_for_loop = cancel.clone();
+            let futures =
+                episode_ids
+                    .iter()
+                    .copied()
+                    .zip(episodes)
+                    .enumerate()
+                    .map(|(idx, (eid, msgs))| {
+                        let sem = sem.clone();
+                        let cancel = cancel_for_loop.clone();
+                        async move {
+                            if cancel.is_cancelled() {
+                                return Err(ExtractionError::Cancelled(format!(
+                                    "cancelled mid-batch at item {idx}"
+                                )));
+                            }
+                            let _permit = sem.acquire().await.map_err(|e| {
+                                ExtractionError::Other(format!(
+                                    "semaphore unexpectedly closed: {e}"
+                                ))
+                            })?;
+                            inner.extract(namespace_id, eid, msgs, cancel.clone()).await
+                        }
+                    });
 
             // First error wins via `collect::<Result<_, _>>()` — no
             // partial-success aggregation. Callers that need
@@ -1688,7 +1829,12 @@ mod batched_localllm {
                     .unwrap();
             let batched = BatchedLocalLLMExtractor::new(inner);
             let out = batched
-                .extract(Uuid::new_v4(), Uuid::new_v4(), &[msg("hello")])
+                .extract(
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    &[msg("hello")],
+                    CancellationToken::new(),
+                )
                 .await
                 .expect("ok");
             assert!(out.is_empty());
@@ -1732,7 +1878,7 @@ mod batched_localllm {
                 .collect();
 
             let out = batched
-                .extract_batch(Uuid::new_v4(), &ids, episodes)
+                .extract_batch(Uuid::new_v4(), &ids, episodes, CancellationToken::new())
                 .await
                 .expect("ok");
 
@@ -1812,7 +1958,7 @@ mod batched_localllm {
                 .collect();
 
             let out = batched
-                .extract_batch(Uuid::new_v4(), &ids, episodes)
+                .extract_batch(Uuid::new_v4(), &ids, episodes, CancellationToken::new())
                 .await
                 .expect("ok");
             assert_eq!(out.len(), 8);
@@ -1854,7 +2000,7 @@ mod batched_localllm {
                 .collect();
 
             let err = batched
-                .extract_batch(Uuid::new_v4(), &ids, episodes)
+                .extract_batch(Uuid::new_v4(), &ids, episodes, CancellationToken::new())
                 .await
                 .err()
                 .expect("expected an error");
@@ -1876,7 +2022,7 @@ mod batched_localllm {
             let batched = BatchedLocalLLMExtractor::new(inner);
 
             let out = batched
-                .extract_batch(Uuid::new_v4(), &[], Vec::new())
+                .extract_batch(Uuid::new_v4(), &[], Vec::new(), CancellationToken::new())
                 .await
                 .expect("ok");
             assert!(out.is_empty());
@@ -1903,6 +2049,7 @@ mod batched_localllm {
                     Uuid::new_v4(),
                     &[Uuid::new_v4(), Uuid::new_v4()],
                     vec![slice],
+                    CancellationToken::new(),
                 )
                 .await
                 .err()
@@ -1943,12 +2090,22 @@ pub use batched_localllm::BatchedLocalLLMExtractor;
 /// embedding vector (or a boxed error). Taking a closure keeps `pensyve-core`
 /// independent of the concrete embedder implementation.
 ///
+/// `cancel` is propagated into the extractor's `extract` call so a long-
+/// running HTTP round-trip honors the cancel within ≤500 ms (G1 pre-reg
+/// I5). The helper does not check `cancel` between persistence steps —
+/// once the extractor returns Ok, persistence is best-effort and the
+/// caller already swallowed any partial cancel through an `Err(Cancelled)`
+/// from the extractor. Callers that don't care about cancellation pass
+/// `tokio_util::sync::CancellationToken::new()` (a fresh, never-cancelled
+/// token).
+///
 /// Returns the number of observations successfully persisted.
 pub async fn commit_extraction_for_episode<F, E>(
     storage: &(dyn crate::storage::StorageTrait + Send + Sync),
     extractor: &dyn ObservationExtractor,
     namespace_id: Uuid,
     episode_id: Uuid,
+    cancel: CancellationToken,
     mut embed: F,
 ) -> usize
 where
@@ -1988,7 +2145,7 @@ where
         .collect();
 
     let observations = match extractor
-        .extract(namespace_id, episode_id, &extraction_messages)
+        .extract(namespace_id, episode_id, &extraction_messages, cancel)
         .await
     {
         Ok(v) => v,
@@ -2055,6 +2212,12 @@ where
 /// `episode_ids` is a slice (not consumed) so callers can also use it for
 /// post-call logging without cloning. Empty input is a no-op (returns 0).
 ///
+/// `cancel` is forwarded into [`ObservationExtractor::extract_batch`] so
+/// long-running fan-outs honor cooperative cancellation per G1 pre-reg
+/// I5. On `Err(Cancelled)` from the extractor the helper returns 0 (same
+/// shape as any batch failure — no partial persistence). Callers that
+/// don't care about cancellation pass `CancellationToken::new()`.
+///
 /// Returns the total number of observations successfully persisted across
 /// every episode in the batch.
 pub async fn commit_extractions_for_episodes<F, E>(
@@ -2062,6 +2225,7 @@ pub async fn commit_extractions_for_episodes<F, E>(
     extractor: &dyn ObservationExtractor,
     namespace_id: Uuid,
     episode_ids: &[Uuid],
+    cancel: CancellationToken,
     mut embed: F,
 ) -> usize
 where
@@ -2118,7 +2282,7 @@ where
         surviving_messages.iter().map(Vec::as_slice).collect();
 
     let batch_results = match extractor
-        .extract_batch(namespace_id, &surviving_ids, episode_slices)
+        .extract_batch(namespace_id, &surviving_ids, episode_slices, cancel)
         .await
     {
         Ok(v) => v,
@@ -2202,7 +2366,10 @@ mod tests {
             content: "I played Assassin's Creed Odyssey for 70 hours".into(),
             event_time: None,
         }];
-        let out = extractor.extract(ns, ep, &msgs).await.unwrap();
+        let out = extractor
+            .extract(ns, ep, &msgs, CancellationToken::new())
+            .await
+            .unwrap();
         assert!(out.is_empty());
     }
 
@@ -2210,7 +2377,7 @@ mod tests {
     async fn noop_accepts_empty_messages() {
         let extractor = NoopExtractor;
         let out = extractor
-            .extract(Uuid::new_v4(), Uuid::new_v4(), &[])
+            .extract(Uuid::new_v4(), Uuid::new_v4(), &[], CancellationToken::new())
             .await
             .unwrap();
         assert!(out.is_empty());
@@ -2239,6 +2406,7 @@ mod tests {
             _namespace_id: Uuid,
             _episode_id: Uuid,
             _messages: &[ExtractionMessage],
+            _cancel: CancellationToken,
         ) -> ExtractionResult<Vec<ObservationMemory>> {
             Ok(self.fixed.clone())
         }
@@ -2259,7 +2427,10 @@ mod tests {
         let extractor = MockExtractor {
             fixed: fixed.clone(),
         };
-        let out = extractor.extract(ns, ep, &[]).await.unwrap();
+        let out = extractor
+            .extract(ns, ep, &[], CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, fixed[0].id);
     }
@@ -2279,6 +2450,7 @@ mod tests {
             _namespace_id: Uuid,
             episode_id: Uuid,
             _messages: &[ExtractionMessage],
+            _cancel: CancellationToken,
         ) -> ExtractionResult<Vec<ObservationMemory>> {
             self.calls.lock().unwrap().push(episode_id);
             Ok(Vec::new())
@@ -2317,7 +2489,7 @@ mod tests {
         ];
 
         let out = extractor
-            .extract_batch(ns, &ids, episodes)
+            .extract_batch(ns, &ids, episodes, CancellationToken::new())
             .await
             .expect("default extract_batch ok");
 
@@ -2346,7 +2518,7 @@ mod tests {
         let episodes: Vec<&[ExtractionMessage]> = vec![slice, slice, slice];
 
         let err = extractor
-            .extract_batch(ns, &ids, episodes)
+            .extract_batch(ns, &ids, episodes, CancellationToken::new())
             .await
             .expect_err("expected length-mismatch error");
         match err {
@@ -2373,6 +2545,7 @@ mod tests {
             _: Uuid,
             _: Uuid,
             _: &[ExtractionMessage],
+            _: CancellationToken,
         ) -> ExtractionResult<Vec<ObservationMemory>> {
             Err(ExtractionError::Transport("boom".into()))
         }
@@ -2381,7 +2554,9 @@ mod tests {
     #[tokio::test]
     async fn failing_extractor_returns_error() {
         let extractor = FailingExtractor;
-        let result = extractor.extract(Uuid::new_v4(), Uuid::new_v4(), &[]).await;
+        let result = extractor
+            .extract(Uuid::new_v4(), Uuid::new_v4(), &[], CancellationToken::new())
+            .await;
         assert!(matches!(result, Err(ExtractionError::Transport(_))));
     }
 
@@ -2422,8 +2597,15 @@ mod tests {
     #[tokio::test]
     async fn commit_extraction_noop_persists_nothing() {
         let (_dir, db, ns, ep) = setup_storage();
-        let persisted =
-            commit_extraction_for_episode(&db, &NoopExtractor, ns.id, ep, fake_embed).await;
+        let persisted = commit_extraction_for_episode(
+            &db,
+            &NoopExtractor,
+            ns.id,
+            ep,
+            CancellationToken::new(),
+            fake_embed,
+        )
+        .await;
         assert_eq!(persisted, 0);
     }
 
@@ -2442,7 +2624,15 @@ mod tests {
             ObservationMemory::new(ns.id, ep, "book_read", "Dune", "read", "read Dune"),
         ];
         let extractor = MockExtractor { fixed };
-        let persisted = commit_extraction_for_episode(&db, &extractor, ns.id, ep, fake_embed).await;
+        let persisted = commit_extraction_for_episode(
+            &db,
+            &extractor,
+            ns.id,
+            ep,
+            CancellationToken::new(),
+            fake_embed,
+        )
+        .await;
         assert_eq!(persisted, 2);
 
         // Verify the observations landed with embeddings attached.
@@ -2462,8 +2652,15 @@ mod tests {
     #[tokio::test]
     async fn commit_extraction_swallows_extractor_failure() {
         let (_dir, db, ns, ep) = setup_storage();
-        let persisted =
-            commit_extraction_for_episode(&db, &FailingExtractor, ns.id, ep, fake_embed).await;
+        let persisted = commit_extraction_for_episode(
+            &db,
+            &FailingExtractor,
+            ns.id,
+            ep,
+            CancellationToken::new(),
+            fake_embed,
+        )
+        .await;
         assert_eq!(persisted, 0);
 
         // Episode's raw memories are untouched — ingest is non-fatal.
@@ -2480,7 +2677,15 @@ mod tests {
         let fail_embed = |_: &str| -> Result<Vec<f32>, std::io::Error> {
             Err(std::io::Error::other("embedder down"))
         };
-        let persisted = commit_extraction_for_episode(&db, &extractor, ns.id, ep, fail_embed).await;
+        let persisted = commit_extraction_for_episode(
+            &db,
+            &extractor,
+            ns.id,
+            ep,
+            CancellationToken::new(),
+            fail_embed,
+        )
+        .await;
         assert_eq!(persisted, 0);
 
         let stored = db.list_observations_by_episode_ids(&[ep], 100).unwrap();
@@ -2500,7 +2705,15 @@ mod tests {
                 ns.id, ep, "should", "not", "persist", "",
             )],
         };
-        let persisted = commit_extraction_for_episode(&db, &extractor, ns.id, ep, fake_embed).await;
+        let persisted = commit_extraction_for_episode(
+            &db,
+            &extractor,
+            ns.id,
+            ep,
+            CancellationToken::new(),
+            fake_embed,
+        )
+        .await;
         assert_eq!(persisted, 0);
     }
 
@@ -2544,6 +2757,7 @@ mod tests {
             _namespace_id: Uuid,
             episode_id: Uuid,
             _messages: &[ExtractionMessage],
+            _cancel: CancellationToken,
         ) -> ExtractionResult<Vec<ObservationMemory>> {
             Ok(self
                 .by_episode
@@ -2580,9 +2794,15 @@ mod tests {
             )],
         );
         let extractor = PerEpisodeMockExtractor { by_episode };
-        let persisted =
-            commit_extractions_for_episodes(&db, &extractor, ns.id, &[ep_a, ep_b], fake_embed)
-                .await;
+        let persisted = commit_extractions_for_episodes(
+            &db,
+            &extractor,
+            ns.id,
+            &[ep_a, ep_b],
+            CancellationToken::new(),
+            fake_embed,
+        )
+        .await;
         assert_eq!(persisted, 2);
 
         // Episode A got the AC Odyssey observation; B got sourdough.
@@ -2599,8 +2819,15 @@ mod tests {
     async fn commit_extractions_batch_empty_input_is_noop() {
         let (_dir, db, ns, _ep_a, _ep_b) = setup_two_episodes();
         let extractor = NoopExtractor;
-        let persisted =
-            commit_extractions_for_episodes(&db, &extractor, ns.id, &[], fake_embed).await;
+        let persisted = commit_extractions_for_episodes(
+            &db,
+            &extractor,
+            ns.id,
+            &[],
+            CancellationToken::new(),
+            fake_embed,
+        )
+        .await;
         assert_eq!(persisted, 0);
     }
 
@@ -2612,6 +2839,7 @@ mod tests {
             &FailingExtractor,
             ns.id,
             &[ep_a, ep_b],
+            CancellationToken::new(),
             fake_embed,
         )
         .await;
@@ -2642,6 +2870,7 @@ mod tests {
             &extractor,
             ns.id,
             &[ep_a, phantom_ep],
+            CancellationToken::new(),
             fake_embed,
         )
         .await;

@@ -23,6 +23,10 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
+# G1/P3a: needed for `CancellationToken::new()` passed to
+# `ConsolidationEngine::run` from the synchronous `consolidate(...)` PyO3
+# binding.
+tokio-util = { workspace = true }
 
 [lints]
 workspace = true

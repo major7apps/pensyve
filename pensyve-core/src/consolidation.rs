@@ -2,11 +2,13 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::ConsolidationConfig;
 use crate::decay;
 use crate::embedding::{OnnxEmbedder, cosine_similarity};
+use crate::network_policy::{NetworkPolicy, NetworkRequiredError};
 use crate::storage::{StorageError, StorageTrait};
 use crate::types::{EpisodicMemory, Memory, SemanticMemory};
 
@@ -20,6 +22,31 @@ pub enum ConsolidationError {
     Storage(#[from] StorageError),
     #[error("Embedding error: {0}")]
     Embedding(#[from] crate::embedding::EmbeddingError),
+    /// Operation was cancelled via the [`CancellationToken`] supplied to
+    /// [`ConsolidationEngine::run`]. The string carries a human-readable
+    /// breadcrumb (e.g., `"cancelled before decay pass"`) describing the
+    /// last reached cancel-check before the future returned. See pre-reg
+    /// §3.0 item 11 + §5.5 (I5 invariant) for the contract.
+    #[error("Consolidation cancelled: {0}")]
+    Cancelled(String),
+    /// An outbound network call required by the engine was rejected by the
+    /// active [`NetworkPolicy`]. Today the consolidation engine performs no
+    /// network calls itself (per-call ONNX inference is local; the HF
+    /// model download is gated at `OnnxEmbedder::new`, not here), so this
+    /// variant is plumbed for future operator surfaces (e.g., the G3
+    /// supersession-chain summarizer fired from per-event consolidation,
+    /// per pre-reg §1.2). It is constructed only from
+    /// [`NetworkRequiredError`] via the `From` impl below. Pre-reg §5.4
+    /// (I4 invariant) names this variant explicitly as the propagation
+    /// shape for `ConsolidationEngine::run` policy violations.
+    #[error("Network call denied by policy: {0}")]
+    Network(String),
+}
+
+impl From<NetworkRequiredError> for ConsolidationError {
+    fn from(err: NetworkRequiredError) -> Self {
+        Self::Network(err.to_string())
+    }
 }
 
 pub type ConsolidationResult = Result<ConsolidationStats, ConsolidationError>;
@@ -51,25 +78,68 @@ impl ConsolidationEngine {
     ///
     /// Job 1: Episodic -> Semantic promotion (repeated facts)
     /// Job 3: FSRS decay pass
+    ///
+    /// `policy` gates any outbound network call the engine (or its future
+    /// G3 summarizer surface) might issue. Today the engine performs no
+    /// network calls — per-call ONNX inference is local and the HF model
+    /// download is gated at `OnnxEmbedder::new`, not here — so the
+    /// parameter is plumbed but enforcement is a no-op until a network
+    /// surface is added (e.g., the G3 per-event chain summarizer noted in
+    /// pre-reg §1.2). Callers that want fail-closed defaults pass
+    /// `NetworkPolicy::Disabled`.
+    ///
+    /// `cancel` lets the caller interrupt a long-running consolidation at
+    /// SQLite-transactional boundaries. Per pre-reg §5.5 (I5 invariant)
+    /// the cancel checks are placed BETWEEN transactions, never inside
+    /// one — `SQLite` rolls back the in-flight transaction automatically
+    /// when the future is dropped, but checking inside an open transaction
+    /// would risk committing a partial state. Cancel response time target
+    /// is ≤500 ms (pre-reg §2 I5).
     #[tracing::instrument(skip_all, fields(namespace_id = %namespace_id))]
     pub fn run(
         storage: &dyn StorageTrait,
         embedder: &OnnxEmbedder,
         config: &ConsolidationConfig,
         namespace_id: Uuid,
+        policy: &NetworkPolicy,
+        cancel: &CancellationToken,
     ) -> ConsolidationResult {
         let start = Instant::now();
         let max_dur = Duration::from_secs(config.max_duration_secs);
 
+        // Cancel-check at engine entry — before the first storage read.
+        if cancel.is_cancelled() {
+            return Err(ConsolidationError::Cancelled(
+                "cancelled before promotion pass".into(),
+            ));
+        }
+
         let mut stats = ConsolidationStats::default();
-        stats.promoted +=
-            Self::promote_episodic_to_semantic(storage, embedder, namespace_id, start, max_dur)?;
+        stats.promoted += Self::promote_episodic_to_semantic(
+            storage,
+            embedder,
+            namespace_id,
+            start,
+            max_dur,
+            policy,
+            cancel,
+        )?;
 
         if start.elapsed() > max_dur {
             return Ok(stats);
         }
 
-        let (decayed, archived) = Self::decay_pass(storage, config, namespace_id, start, max_dur)?;
+        // Cancel-check between the two passes (each pass = a sequence of
+        // single-row SQLite transactions; this check sits between passes
+        // so neither pass observes a half-committed boundary).
+        if cancel.is_cancelled() {
+            return Err(ConsolidationError::Cancelled(
+                "cancelled before decay pass".into(),
+            ));
+        }
+
+        let (decayed, archived) =
+            Self::decay_pass(storage, config, namespace_id, start, max_dur, cancel)?;
         stats.decayed += decayed;
         stats.archived += archived;
         Ok(stats)
@@ -82,12 +152,23 @@ impl ConsolidationEngine {
     /// Scan episodic memories for repeated facts about the same entity.
     /// When 2+ episodic memories for the same `about_entity` have cosine similarity
     /// > 0.8, promote them to a single `SemanticMemory`.
+    ///
+    /// `_policy` is accepted for forward compatibility (G3 will fire a
+    /// network-capable summarizer here, per pre-reg §1.2). Today the body
+    /// performs only local ONNX inference and `SQLite` writes, so the
+    /// policy is unused at the call sites.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "G1 plumbing: policy + cancel parameters threaded through the engine surface; refactoring into a struct is deferred to G3 when the summarizer attaches"
+    )]
     fn promote_episodic_to_semantic(
         storage: &dyn StorageTrait,
         embedder: &OnnxEmbedder,
         namespace_id: Uuid,
         start: Instant,
         max_duration: Duration,
+        _policy: &NetworkPolicy,
+        cancel: &CancellationToken,
     ) -> Result<usize, ConsolidationError> {
         // Fetch all memories for this namespace to identify episodic ones.
         let all_memories = storage.get_all_memories_by_namespace(namespace_id)?;
@@ -108,6 +189,16 @@ impl ConsolidationEngine {
         for memories in episodic_by_entity.values() {
             if start.elapsed() > max_duration {
                 break;
+            }
+            // Per-entity cancel check — sits between save_semantic
+            // transactions of the previous entity and the next entity's
+            // cluster work. SQLite rolls back any in-flight transaction
+            // when the future is dropped; this check guarantees we do not
+            // begin a new save_semantic after cancel was signalled.
+            if cancel.is_cancelled() {
+                return Err(ConsolidationError::Cancelled(format!(
+                    "cancelled mid-promotion after {promoted} promotions"
+                )));
             }
 
             // Skip groups with only one memory — nothing to cluster.
@@ -208,6 +299,7 @@ impl ConsolidationEngine {
         namespace_id: Uuid,
         start: Instant,
         max_duration: Duration,
+        cancel: &CancellationToken,
     ) -> Result<(usize, usize), ConsolidationError> {
         let all_memories = storage.get_all_memories_by_namespace(namespace_id)?;
         let now = Utc::now();
@@ -219,6 +311,16 @@ impl ConsolidationEngine {
         for mem in all_memories {
             if start.elapsed() > max_duration {
                 break;
+            }
+            // Per-row cancel check — sits between the previous row's
+            // `update_episodic_access` / `update_procedural_reliability`
+            // (each a single-statement SQLite transaction) and the next
+            // row. Per pre-reg §5.5 (I5), partial-write corruption is
+            // prevented by checking BETWEEN transactions, not within.
+            if cancel.is_cancelled() {
+                return Err(ConsolidationError::Cancelled(format!(
+                    "cancelled mid-decay after {decayed} rows processed"
+                )));
             }
             match mem {
                 Memory::Episodic(em) => {
@@ -469,7 +571,7 @@ mod tests {
         }
 
         let config = make_config();
-        let stats = ConsolidationEngine::run(&storage, &embedder, &config, ns.id).unwrap();
+        let stats = ConsolidationEngine::run(&storage, &embedder, &config, ns.id, &NetworkPolicy::Disabled, &CancellationToken::new()).unwrap();
 
         assert!(
             stats.promoted >= 1,
@@ -522,7 +624,7 @@ mod tests {
         }
 
         let config = make_config();
-        let stats = ConsolidationEngine::run(&storage, &embedder, &config, ns.id).unwrap();
+        let stats = ConsolidationEngine::run(&storage, &embedder, &config, ns.id, &NetworkPolicy::Disabled, &CancellationToken::new()).unwrap();
 
         // With unique (dissimilar) content, no promotions should occur.
         assert_eq!(
@@ -560,7 +662,7 @@ mod tests {
         );
 
         let config = make_config();
-        let stats = ConsolidationEngine::run(&storage, &embedder, &config, ns.id).unwrap();
+        let stats = ConsolidationEngine::run(&storage, &embedder, &config, ns.id, &NetworkPolicy::Disabled, &CancellationToken::new()).unwrap();
 
         // The decay pass should have processed at least the one memory we inserted.
         assert!(
@@ -608,7 +710,7 @@ mod tests {
             ..PensyveConfig::default().consolidation
         };
 
-        let stats = ConsolidationEngine::run(&storage, &embedder, &config, ns.id).unwrap();
+        let stats = ConsolidationEngine::run(&storage, &embedder, &config, ns.id, &NetworkPolicy::Disabled, &CancellationToken::new()).unwrap();
 
         assert!(
             stats.archived >= 1,
@@ -708,7 +810,7 @@ mod tests {
         storage.save_namespace(&ns).unwrap();
 
         let config = make_config();
-        let stats = ConsolidationEngine::run(&storage, &embedder, &config, ns.id).unwrap();
+        let stats = ConsolidationEngine::run(&storage, &embedder, &config, ns.id, &NetworkPolicy::Disabled, &CancellationToken::new()).unwrap();
 
         assert_eq!(stats.promoted, 0);
         assert_eq!(stats.decayed, 0);

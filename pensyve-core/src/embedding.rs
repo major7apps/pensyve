@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
+use crate::network_policy::{NetworkPolicy, NetworkRequiredError};
+
 // ---------------------------------------------------------------------------
 // Process-wide embedder cache
 // ---------------------------------------------------------------------------
@@ -36,6 +38,26 @@ fn resolve_pool_size() -> usize {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get().min(4)))
 }
 
+/// Resolve the fastembed cache directory the same way
+/// `fastembed::common::get_cache_dir` does: `FASTEMBED_CACHE_DIR` env
+/// var, defaulting to `.fastembed_cache` under the current working
+/// directory. Used to detect whether a load-time HF download is needed.
+fn fastembed_cache_dir() -> std::path::PathBuf {
+    std::env::var("FASTEMBED_CACHE_DIR")
+        .map_or_else(|_| std::path::PathBuf::from(".fastembed_cache"), Into::into)
+}
+
+/// Check whether a `HuggingFace` model is already present in the
+/// fastembed cache. fastembed lays models down at
+/// `<cache>/models--<org>--<name>/`. If this directory exists,
+/// fastembed's `pull_from_hf` will short-circuit without any network
+/// I/O. Used by [`OnnxEmbedder::new_with_policy`] to decide whether the
+/// `NetworkPolicy` gate must fire.
+fn is_model_cached(hf_model_code: &str) -> bool {
+    let cache_subdir = format!("models--{}", hf_model_code.replace('/', "--"));
+    fastembed_cache_dir().join(cache_subdir).is_dir()
+}
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -46,6 +68,20 @@ pub enum EmbeddingError {
     ModelLoad(String),
     #[error("Inference error: {0}")]
     Inference(String),
+    /// A load-time `HuggingFace` model download was required but the
+    /// active [`NetworkPolicy`] denied it. Constructed from
+    /// [`NetworkRequiredError`] via the `From` impl below. Per pre-reg
+    /// §2 invariant I4: "`OnnxEmbedder`: load-time HF download denied
+    /// under Disabled at constructor; per-call no-op." See
+    /// [`OnnxEmbedder::new_with_policy`] for the gating site.
+    #[error("Network call denied by policy: {0}")]
+    Network(String),
+}
+
+impl From<NetworkRequiredError> for EmbeddingError {
+    fn from(err: NetworkRequiredError) -> Self {
+        Self::Network(err.to_string())
+    }
 }
 
 pub type EmbeddingResult<T> = Result<T, EmbeddingError>;
@@ -94,16 +130,47 @@ impl OnnxEmbedder {
     /// Create a real ONNX-backed embedder using fastembed.
     /// Downloads the model to the `HuggingFace` cache on first use.
     ///
+    /// Equivalent to `new_with_policy(model_name, &NetworkPolicy::Permissive)`.
+    /// Existing v2.1 callers preserve their previous behavior; opt into
+    /// fail-closed semantics via [`Self::new_with_policy`].
+    ///
     /// Supported model names:
     ///   - `"Alibaba-NLP/gte-base-en-v1.5"` → 768 dimensions (default)
     ///   - `"all-MiniLM-L6-v2"` → 384 dimensions
     ///   - `"sentence-transformers/all-MiniLM-L6-v2"` → 384 dimensions
     pub fn new(model_name: &str) -> EmbeddingResult<Self> {
-        let (model_enum, dims) = match model_name {
-            "Alibaba-NLP/gte-base-en-v1.5" => (EmbeddingModel::GTEBaseENV15, 768),
-            "all-MiniLM-L6-v2" | "sentence-transformers/all-MiniLM-L6-v2" => {
-                (EmbeddingModel::AllMiniLML6V2, 384)
-            }
+        Self::new_with_policy(model_name, &NetworkPolicy::Permissive)
+    }
+
+    /// Create a real ONNX-backed embedder, gating any load-time
+    /// `HuggingFace` download through the supplied [`NetworkPolicy`].
+    ///
+    /// Per pre-reg §2 invariant I4 + §3.0 item 10: under
+    /// [`NetworkPolicy::Disabled`], constructing an embedder for a model
+    /// that is NOT already cached MUST surface
+    /// [`EmbeddingError::Network`]. If the model IS already cached
+    /// (resolved via the fastembed cache directory layout
+    /// `models--<org>--<name>` under `FASTEMBED_CACHE_DIR` or
+    /// `.fastembed_cache`), the policy check is a no-op because no
+    /// network request is needed.
+    ///
+    /// This is the fail-closed-friendly entry point. Callers that want
+    /// the v2.1 always-permissive behavior keep using [`Self::new`].
+    pub fn new_with_policy(
+        model_name: &str,
+        policy: &NetworkPolicy,
+    ) -> EmbeddingResult<Self> {
+        let (model_enum, dims, hf_model_code) = match model_name {
+            "Alibaba-NLP/gte-base-en-v1.5" => (
+                EmbeddingModel::GTEBaseENV15,
+                768,
+                "Alibaba-NLP/gte-base-en-v1.5",
+            ),
+            "all-MiniLM-L6-v2" | "sentence-transformers/all-MiniLM-L6-v2" => (
+                EmbeddingModel::AllMiniLML6V2,
+                384,
+                "Qdrant/all-MiniLM-L6-v2-onnx",
+            ),
             other => {
                 let supported: Vec<&str> = SUPPORTED_MODELS.iter().map(|(name, _)| *name).collect();
                 return Err(EmbeddingError::ModelLoad(format!(
@@ -112,6 +179,20 @@ impl OnnxEmbedder {
                 )));
             }
         };
+
+        // Cache pre-check: if the model directory already exists in the
+        // fastembed cache, fastembed's `pull_from_hf` short-circuits and
+        // performs zero network I/O. In that case the policy check is a
+        // no-op (no network call is attempted) and we can proceed
+        // regardless of `Disabled`. If the cache is absent, we MUST gate
+        // the would-be download through the policy.
+        if !is_model_cached(hf_model_code) {
+            // Build the canonical HF URL for this model so the policy
+            // gets a real target string (used in the error message and
+            // any future `LocalOnly` URL-prefix checks).
+            let hf_url = format!("https://huggingface.co/{hf_model_code}");
+            policy.check(&hf_url)?;
+        }
 
         let pool_size = resolve_pool_size();
 
@@ -141,13 +222,34 @@ impl OnnxEmbedder {
     /// repeated `Pensyve(...)` construction would otherwise leak ONNX session
     /// memory. See `pensyve-docs/research/benchmark-sprint/_leak_diagnosis.md`.
     pub fn new_cached(model_name: &str) -> EmbeddingResult<Arc<Self>> {
+        Self::new_cached_with_policy(model_name, &NetworkPolicy::Permissive)
+    }
+
+    /// Policy-aware cached variant of [`Self::new_with_policy`]. Mirrors
+    /// [`Self::new_cached`] but routes the underlying construction through
+    /// [`Self::new_with_policy`] so the active [`NetworkPolicy`] gates any
+    /// load-time `HuggingFace` download.
+    ///
+    /// Per pre-reg §2 invariant I4 + §3.0 item 10: this is the entry point
+    /// the Pensyve handle constructor MUST use so that
+    /// [`NetworkPolicy::Disabled`] propagates from the handle down to the
+    /// embedder. A cache hit on the process-shared `Arc` short-circuits
+    /// without re-checking the policy — by construction, an entry only
+    /// exists in the cache because a previous successful construction
+    /// (under whatever policy was active then) populated the on-disk
+    /// fastembed cache, and `new_with_policy` itself treats an already-cached
+    /// model as a no-op (no network request is needed).
+    pub fn new_cached_with_policy(
+        model_name: &str,
+        policy: &NetworkPolicy,
+    ) -> EmbeddingResult<Arc<Self>> {
         let pool_size = resolve_pool_size();
         let key = (model_name.to_string(), pool_size);
         let mut guard = embedder_cache().lock().expect("embedder cache poisoned");
         if let Some(existing) = guard.get(&key) {
             return Ok(Arc::clone(existing));
         }
-        let fresh = Arc::new(Self::new(model_name)?);
+        let fresh = Arc::new(Self::new_with_policy(model_name, policy)?);
         guard.insert(key, Arc::clone(&fresh));
         Ok(fresh)
     }

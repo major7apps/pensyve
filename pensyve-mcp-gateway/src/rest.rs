@@ -1570,11 +1570,16 @@ async fn episode_end(
         let ns_id = ps.namespace.id;
         tokio::spawn(async move {
             let config = pensyve_core::config::ConsolidationConfig::default();
+            // G1/P3a: pass Disabled + fresh CancellationToken; this is a
+            // fire-and-forget background spawn after episode_end with no
+            // external cancel signal source.
             match pensyve_core::consolidation::ConsolidationEngine::run(
                 storage.as_ref(),
                 &embedder,
                 &config,
                 ns_id,
+                &pensyve_core::network_policy::NetworkPolicy::Disabled,
+                &tokio_util::sync::CancellationToken::new(),
             ) {
                 Ok(consolidation_stats) => {
                     if consolidation_stats.promoted > 0 {
@@ -1607,11 +1612,16 @@ async fn episode_end(
         let embedder = ps.embedder.clone();
         let ns_id = ps.namespace.id;
         tokio::spawn(async move {
+            // G1/P3b: commit_extraction_for_episode gained a `cancel` arg;
+            // background spawn has no external cancel signal, so pass a
+            // fresh never-cancelled token (same pattern as the
+            // ConsolidationEngine call sites above).
             let persisted = pensyve_core::observation::commit_extraction_for_episode(
                 storage.as_ref(),
                 extractor.as_ref(),
                 ns_id,
                 episode_id,
+                tokio_util::sync::CancellationToken::new(),
                 |text| embedder.embed(text),
             )
             .await;
@@ -1652,11 +1662,15 @@ async fn consolidate(
     let ps = get_pensyve_state(&state, &auth_ctx)?;
 
     let config = pensyve_core::config::ConsolidationConfig::default();
+    // G1/P3a: pass Disabled + fresh CancellationToken. Synchronous REST
+    // path — no external cancel signal source today.
     let consolidation_result = pensyve_core::consolidation::ConsolidationEngine::run(
         ps.storage.as_ref(),
         &ps.embedder,
         &config,
         ps.namespace.id,
+        &pensyve_core::network_policy::NetworkPolicy::Disabled,
+        &tokio_util::sync::CancellationToken::new(),
     )
     .map_err(|e| {
         RestError(
