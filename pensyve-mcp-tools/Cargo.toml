@@ -1,6 +1,6 @@
 [package]
 name = "pensyve-mcp-tools"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2024"
 description = "Shared MCP tool definitions for Pensyve servers"
 rust-version = "1.88"
@@ -13,7 +13,7 @@ documentation = "https://pensyve.com/docs"
 name = "pensyve_mcp_tools"
 
 [dependencies]
-pensyve-core = { path = "../pensyve-core", version = "2.1.0" }
+pensyve-core = { path = "../pensyve-core", version = "2.2.0" }
 rmcp = { version = "1.5", features = ["server", "macros"] }
 tokio = { version = "1", features = ["full"] }
 # G1/P3a: needed for `CancellationToken::new()` passed to
