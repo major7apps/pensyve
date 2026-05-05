@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
@@ -34,6 +34,12 @@ macro_rules! lock_conn {
 
 pub struct SqliteBackend {
     conn: Mutex<Connection>,
+    /// Filesystem path of the underlying `SQLite` file (`<dir>/memories.db`).
+    /// Recorded at construction so `StorageTrait::db_path` can hand it to
+    /// read-only auxiliaries (G2 retrieval cards) that open their own
+    /// `rusqlite::Connection` instead of borrowing this backend's
+    /// mutex-guarded one.
+    db_path: PathBuf,
 }
 
 impl SqliteBackend {
@@ -42,7 +48,7 @@ impl SqliteBackend {
     pub fn open(dir: &Path) -> StorageResult<Self> {
         std::fs::create_dir_all(dir)?;
         let db_path = dir.join("memories.db");
-        let conn = Connection::open(db_path)?;
+        let conn = Connection::open(&db_path)?;
 
         // Enable WAL mode for concurrent reads.
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
@@ -51,6 +57,7 @@ impl SqliteBackend {
 
         let backend = Self {
             conn: Mutex::new(conn),
+            db_path,
         };
         backend.run_schema()?;
         Ok(backend)
@@ -507,6 +514,14 @@ fn str_to_dt(s: &str) -> DateTime<Utc> {
 // ---------------------------------------------------------------------------
 
 impl StorageTrait for SqliteBackend {
+    // -----------------------------------------------------------------------
+    // Disk path (G2)
+    // -----------------------------------------------------------------------
+
+    fn db_path(&self) -> Option<&Path> {
+        Some(&self.db_path)
+    }
+
     // -----------------------------------------------------------------------
     // Namespaces
     // -----------------------------------------------------------------------

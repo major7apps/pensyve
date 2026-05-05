@@ -41,6 +41,21 @@ pub type StorageResult<T> = Result<T, StorageError>;
 // ---------------------------------------------------------------------------
 
 pub trait StorageTrait: Send + Sync {
+    /// Filesystem path of the underlying `SQLite` file, when the backend is
+    /// disk-backed. Returns `None` for in-memory backends, the (future)
+    /// Postgres backend, or any backend that has no single-file location.
+    ///
+    /// Introduced in G2 (v3 retrieval-card composition phase) so retrieval
+    /// cards (`pensyve-core/src/retrieval/cards/`) can open their own
+    /// short-lived read-only `rusqlite::Connection` instead of borrowing
+    /// the backend's mutex-guarded primary connection — keeps card-build
+    /// off the write path's critical section. Default impl is `None`; the
+    /// `SqliteBackend` overrides to return the path it was constructed
+    /// with.
+    fn db_path(&self) -> Option<&std::path::Path> {
+        None
+    }
+
     // Namespaces
     fn save_namespace(&self, ns: &Namespace) -> StorageResult<()>;
     fn get_namespace(&self, id: Uuid) -> StorageResult<Option<Namespace>>;
