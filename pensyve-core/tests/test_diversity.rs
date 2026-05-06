@@ -8,6 +8,11 @@
 //! so the only fixture work is constructing `ScoredCandidate` values
 //! with hand-crafted vectors.
 
+// 0.7071 literals below are intentional 4-decimal-precision fixture values
+// for the rounding shown in the inline test math; not approximations of
+// `std::f32::consts::FRAC_1_SQRT_2`.
+#![allow(clippy::approx_constant)]
+
 use uuid::Uuid;
 
 use pensyve_core::retrieval::ScoredCandidate;
@@ -175,7 +180,7 @@ fn test_lambda_05_balanced() {
     );
 }
 
-/// k > input.len() — return all items reordered (no padding).
+/// `k > input.len()` — return all items reordered (no padding).
 #[test]
 fn test_k_larger_than_input() {
     let query = vec![1.0_f32, 0.0, 0.0, 0.0];
