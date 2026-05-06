@@ -108,6 +108,72 @@ pub enum EntityKind {
     Tool,
 }
 
+/// Typed-slot kind for per-event observation enrichment (Pensyve v3 G3).
+///
+/// Per `LaceMem` (`arXiv:2604.27695`) `Synthius` typology — a fixed
+/// 5-slot family that the per-event consolidation gate's typed-slot
+/// extractor populates on `observation_memories` write events. The
+/// values land in the corresponding NULLABLE columns added by the
+/// `schema_versions` v=2 migration (`biography_slot`, `preference_slot`,
+/// `experience_slot`, `social_slot`, `work_slot`).
+///
+/// Operator-locked decision (c) on 2026-05-06: typed-slot enrichment is
+/// implemented as new NULLABLE columns on `observation_memories` rather
+/// than a separate `typed_slots` table. The enum here is the typed
+/// dispatch surface used by `consolidation::typed_slots::extract_slots`
+/// when populating the columns; legacy v=1 rows return NULL and are
+/// skipped by recall-time card consumers.
+///
+/// Operator-locked decision (c') on 2026-05-06: extraction is FIXED-SHAPE
+/// — a single LLM call extracts all 5 slots; non-matching slots return
+/// NULL in the JSON response. The enum exists so call sites can refer to
+/// individual slot kinds by type-safe variant rather than by string
+/// constant when wiring the recall-time card SQL extensions.
+///
+/// Pre-reg §3.4 item 9 + §7 item 10 + Appendix B.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotKind {
+    Biography,
+    Preference,
+    Experience,
+    Social,
+    Work,
+}
+
+impl SlotKind {
+    /// Stable lowercase string used for the SQL column-name suffix
+    /// (`{kind}_slot`) and for the JSON field name in the typed-slot
+    /// extractor's response shape. Single source of truth so the SQL
+    /// migration in `storage::sqlite::run_versioned_migrations` and the
+    /// extractor's response parser cannot drift.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Biography => "biography",
+            Self::Preference => "preference",
+            Self::Experience => "experience",
+            Self::Social => "social",
+            Self::Work => "work",
+        }
+    }
+
+    /// Iterator over all slot kinds in canonical extraction order. The
+    /// order matches the JSON-key order in the extractor prompt and the
+    /// column-creation order in the v=2 migration so log diff and
+    /// schema-replay tools can read both sides without reordering.
+    #[must_use]
+    pub fn all() -> &'static [SlotKind] {
+        &[
+            Self::Biography,
+            Self::Preference,
+            Self::Experience,
+            Self::Social,
+            Self::Work,
+        ]
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Outcome {
     Success,

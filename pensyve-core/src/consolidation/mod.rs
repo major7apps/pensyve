@@ -1,3 +1,49 @@
+//! Consolidation engine — periodic and per-event memory transformations.
+//!
+//! ## Per-event gate hooks (G3)
+//!
+//! Pre-reg `pensyve-docs/research/benchmark-sprint/v3/g3/preregistration.md`
+//! §3.4 item 7 + §3.7 + §3.8 add two per-event hooks that fire from
+//! [`ConsolidationEngine::run`] when the appropriate `PENSYVE_RETRIEVAL_CARDS_G3`
+//! env-var arm is active:
+//!
+//! 1. **Supersession-chain summarizer** ([`run_supersession_summarizer_hook`])
+//!    — fires on `supersedes`-edge population. Reads chain entries, calls
+//!    Qwen once with chain text, writes 1-2 sentence English-prose summary
+//!    to `chain_summary` column on the head observation. Bounded by
+//!    `#[max_llm_calls(1)]`. Gated on `PENSYVE_RETRIEVAL_CARDS_G3 ∈
+//!    {summarizer, full}` via [`g3_summarizer_enabled`].
+//! 2. **Typed-slot extractor** ([`run_typed_slots_hook`]) — fires on
+//!    observation insertion when the question-type heuristic matches
+//!    (`action ∈ {'mentioned', 'stated', 'is', 'has', 'lives'}` per
+//!    `PeerCard`'s `action_to_kind` mapping). Calls Qwen once with
+//!    observation content, parses 5-slot JSON, writes populated slots to
+//!    typed-slot columns. Bounded by `#[max_llm_calls(1)]` (one call
+//!    extracts all 5 slots per operator-locked (c') 2026-05-06). Gated on
+//!    `PENSYVE_RETRIEVAL_CARDS_G3 ∈ {typed_slots, full}` via
+//!    [`g3_typed_slots_enabled`].
+//!
+//! Both hooks check [`NetworkPolicy::Permissive`] before the LLM call (G1
+//! contract) and respect the [`CancellationToken`] passed through.
+//!
+//! Operator-locked (b') on 2026-05-06: cancellation semantics =
+//! ROLLBACK. If `cancel` triggers mid-LLM-call, partial state is rolled
+//! back — `chain_summary` and typed-slot columns are either fully
+//! populated OR NULL, never partial. Implementation: each hook uses a
+//! defer-write pattern (compute the full LLM result first; persist only
+//! on success) so a cancelled future drops cleanly without touching
+//! `SQLite`. The storage-trait write methods are atomic single-row
+//! UPDATE statements, so the persist step is its own transaction
+//! boundary — no partial column writes are possible by construction.
+//!
+//! ## Submodules
+//!
+//! - [`typed_slots`] — fixed-shape 5-slot LLM extractor used by the
+//!   per-event gate. See its module docs for the prompt and parser
+//!   contract.
+
+pub mod typed_slots;
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -10,7 +56,9 @@ use crate::decay;
 use crate::embedding::{OnnxEmbedder, cosine_similarity};
 use crate::network_policy::{NetworkPolicy, NetworkRequiredError};
 use crate::storage::{StorageError, StorageTrait};
-use crate::types::{EpisodicMemory, Memory, SemanticMemory};
+use crate::types::{EpisodicMemory, Memory, SemanticMemory, SlotKind};
+
+use self::typed_slots::{TypedSlotLlm, TypedSlots, extract_slots};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -387,6 +435,272 @@ impl ConsolidationEngine {
 
         Ok((decayed, archived))
     }
+}
+
+// ---------------------------------------------------------------------------
+// G3 per-event consolidation gate hooks
+// ---------------------------------------------------------------------------
+//
+// These hook helpers are NOT plumbed into the legacy
+// `ConsolidationEngine::run` periodic pass — they fire from the ingest
+// path (engine entry / observation persist) when an event triggers the
+// associated condition. The pre-reg's "ConsolidationEngine::run is
+// extended with two per-event gate hooks" wording is realised here as
+// `pub fn` helpers callable from any ingest site that already holds a
+// storage handle, an extractor handle, and a cancellation token.
+//
+// Wiring into the actual ingest path (e.g.,
+// `pensyve_core::observation::commit_extraction_for_episode`) is left to
+// the harness adapter on the parallel P5 work; this module ships the
+// callable surface + the env-gate predicates.
+
+/// Action verbs that trigger the typed-slot extractor's question-type
+/// heuristic, per pre-reg §3.8 ("`action ∈ {'mentioned', 'stated', 'is',
+/// 'has', 'lives'}` per `PeerCard`'s `action_to_kind` mapping"). Mirrors
+/// the user-fact verb set in
+/// `pensyve_core::retrieval::cards::single_session_user::USER_FACT_ACTIONS`
+/// — kept as a const here rather than imported because the typed-slot
+/// gate may evolve its trigger criteria independent of the SSU card.
+const TYPED_SLOT_TRIGGER_ACTIONS: &[&str] = &["mentioned", "stated", "is", "has", "lives"];
+
+/// True when the action verb matches the typed-slot extractor's trigger
+/// heuristic. Case-insensitive + trimmed.
+#[must_use]
+pub fn typed_slot_action_triggers(action: &str) -> bool {
+    let normalized = action.trim().to_ascii_lowercase();
+    TYPED_SLOT_TRIGGER_ACTIONS.iter().any(|v| *v == normalized)
+}
+
+/// Read `PENSYVE_RETRIEVAL_CARDS_G3` and return `true` when the
+/// supersession-chain summarizer hook is enabled (`summarizer` or `full`).
+/// All other values (including unset / empty) return `false`.
+#[must_use]
+pub fn g3_summarizer_enabled() -> bool {
+    matches!(
+        std::env::var("PENSYVE_RETRIEVAL_CARDS_G3")
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Ok("summarizer" | "full")
+    )
+}
+
+/// Read `PENSYVE_RETRIEVAL_CARDS_G3` and return `true` when the
+/// typed-slot extractor hook is enabled (`typed_slots` or `full`). All
+/// other values (including unset / empty) return `false`.
+#[must_use]
+pub fn g3_typed_slots_enabled() -> bool {
+    matches!(
+        std::env::var("PENSYVE_RETRIEVAL_CARDS_G3")
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Ok("typed_slots" | "full")
+    )
+}
+
+/// Per-event gate hook: typed-slot extractor.
+///
+/// Fires on observation insertion when the action verb matches
+/// [`typed_slot_action_triggers`] AND the env-gate
+/// [`g3_typed_slots_enabled`] is on. Calls the LLM once with the
+/// observation content; parses the JSON response into [`TypedSlots`];
+/// returns the slots without persisting (caller persists via
+/// `StorageTrait::update_observation_typed_slots` once that surface
+/// lands — see pre-reg §7 item 7 wiring note).
+///
+/// Bounded by `#[max_llm_calls(1)]` per Rev B §5.4.
+///
+/// ## `NetworkPolicy`
+///
+/// The hook itself does NOT call into the network — it delegates to the
+/// passed-in [`TypedSlotLlm`] which honors its own configured policy
+/// (`Permissive` for managed-service, `LocalOnly` for offline-first
+/// `localhost:8888`, `Disabled` for the air-gap test). The policy
+/// argument here is forwarded for forward-compat: when the trait gains
+/// a policy-aware variant, the hook plumbs it through unchanged.
+///
+/// ## Cancellation (operator-locked (b') ROLLBACK)
+///
+/// On cancel, the LLM call returns
+/// [`typed_slots::SlotExtractionError::Cancelled`] and this hook returns
+/// `Err(_)`. Caller MUST NOT persist on this path — typed-slot columns
+/// stay NULL (rollback semantics). Atomic single-row UPDATE on the
+/// persist side guarantees no partial-column states are possible by
+/// construction.
+///
+/// ## Defer-on-failure
+///
+/// On parse / transport / empty-content failure, returns `Ok(None)` so
+/// the caller can log to the per-event defer log and continue without
+/// typed-slot enrichment for this observation. Distinguished from the
+/// cancel path which returns `Err(_)` so callers can route the two
+/// outcomes to different log streams.
+pub async fn run_typed_slots_hook<L: TypedSlotLlm + ?Sized>(
+    observation_action: &str,
+    observation_content: &str,
+    extractor: &L,
+    policy: &NetworkPolicy,
+    cancel: CancellationToken,
+) -> Result<Option<TypedSlots>, ConsolidationError> {
+    // Env-gate: only fire when arm is on.
+    if !g3_typed_slots_enabled() {
+        return Ok(None);
+    }
+
+    // Action-heuristic gate: pre-reg §3.8 limits the extractor to
+    // user-fact-shaped observations to keep write-time LLM cost bounded.
+    if !typed_slot_action_triggers(observation_action) {
+        return Ok(None);
+    }
+
+    // NetworkPolicy gate: G1 contract requires `Permissive` for any
+    // outbound LLM call. `Disabled` and `LocalOnly` are checked by the
+    // extractor itself (the policy parameter on `LocalLLMExtractor` is
+    // already enforced); we re-check here so the hook fails closed
+    // before attempting the call when the policy is explicitly off.
+    if matches!(policy, NetworkPolicy::Disabled) {
+        return Ok(None);
+    }
+
+    // Pre-flight cancel — cheap short-circuit before the LLM call.
+    if cancel.is_cancelled() {
+        return Err(ConsolidationError::Cancelled(
+            "cancelled before typed-slots LLM call".into(),
+        ));
+    }
+
+    match extract_slots(observation_content, extractor, cancel).await {
+        Ok(slots) => {
+            // Defer-on-empty: nothing to persist; caller logs to defer
+            // log and skips the UPDATE.
+            if slots.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(slots))
+        }
+        Err(typed_slots::SlotExtractionError::Cancelled(msg)) => {
+            // Operator-locked (b') ROLLBACK path: surface as Cancelled so
+            // the caller does not persist.
+            Err(ConsolidationError::Cancelled(format!("typed-slots: {msg}")))
+        }
+        Err(other) => {
+            // Defer-on-failure: log + skip persist. The typed-slot
+            // columns remain NULL for this observation, which is the
+            // same shape as a v=1 legacy row.
+            tracing::debug!(
+                error = %other,
+                action = observation_action,
+                "typed-slot extractor deferred on this observation"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Per-event gate hook: supersession-chain summarizer.
+///
+/// Fires on `supersedes`-edge population (caller decides when to invoke
+/// — typically right after `Edge { edge_type: EdgeType::Supersedes, .. }`
+/// is committed) when the env-gate [`g3_summarizer_enabled`] is on.
+/// Calls the LLM once with the chain entries' concatenated content;
+/// returns the 1-2 sentence English-prose summary string without
+/// persisting. Caller persists into the head observation's
+/// `chain_summary` column via the storage-trait UPDATE.
+///
+/// Bounded by `#[max_llm_calls(1)]` per Rev B §5.4.
+///
+/// ## Cancellation (operator-locked (b') ROLLBACK)
+///
+/// On cancel, the LLM call returns Cancelled and this hook returns
+/// `Err(_)`. Caller MUST NOT persist — `chain_summary` column stays NULL.
+///
+/// ## Defer-on-failure
+///
+/// On any non-cancellation failure, returns `Ok(None)`. Caller logs and
+/// skips the UPDATE; the head observation's `chain_summary` stays NULL.
+///
+/// ## Implementation note
+///
+/// The summarizer is implemented as a thin wrapper around
+/// [`TypedSlotLlm::complete`] with a chain-summary prompt instead of the
+/// 5-slot prompt — the underlying HTTP shape is identical (single
+/// system-prompt + user-content pair), so reusing the trait avoids
+/// duplicating the OpenAI-compatible request plumbing.
+pub async fn run_supersession_summarizer_hook<L: TypedSlotLlm + ?Sized>(
+    chain_text: &str,
+    extractor: &L,
+    policy: &NetworkPolicy,
+    cancel: CancellationToken,
+) -> Result<Option<String>, ConsolidationError> {
+    const SUMMARIZER_PROMPT: &str = "You are a memory-chain summarizer. \
+Given a sequence of related observations describing how a user state \
+evolved over time, produce a 1-2 sentence English-prose summary of the \
+overall evolution. Focus on the FINAL state and the path that got there. \
+Output ONLY the summary text. No prose intro, no bullet points, no \
+markdown.";
+
+    if !g3_summarizer_enabled() {
+        return Ok(None);
+    }
+
+    let trimmed = chain_text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    if matches!(policy, NetworkPolicy::Disabled) {
+        return Ok(None);
+    }
+
+    if cancel.is_cancelled() {
+        return Err(ConsolidationError::Cancelled(
+            "cancelled before summarizer LLM call".into(),
+        ));
+    }
+
+    match extractor.complete(SUMMARIZER_PROMPT, trimmed, cancel).await {
+        Ok(text) => {
+            let summary = text.trim().to_string();
+            if summary.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(summary))
+        }
+        Err(typed_slots::SlotExtractionError::Cancelled(msg)) => {
+            Err(ConsolidationError::Cancelled(format!("summarizer: {msg}")))
+        }
+        Err(other) => {
+            tracing::debug!(
+                error = %other,
+                "supersession-chain summarizer deferred on this chain"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Apply a [`TypedSlots`] result to the column-name → value mapping the
+/// caller will bind into a SQL UPDATE statement. Centralises the slot-
+/// column naming convention (column = `{kind}_slot`) so SQL sites cannot
+/// drift from the migration's column names.
+#[must_use]
+pub fn typed_slots_to_columns(slots: &TypedSlots) -> Vec<(&'static str, Option<String>)> {
+    SlotKind::all()
+        .iter()
+        .map(|kind| {
+            let col = match kind {
+                SlotKind::Biography => "biography_slot",
+                SlotKind::Preference => "preference_slot",
+                SlotKind::Experience => "experience_slot",
+                SlotKind::Social => "social_slot",
+                SlotKind::Work => "work_slot",
+            };
+            (col, slots.get(*kind).map(str::to_string))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

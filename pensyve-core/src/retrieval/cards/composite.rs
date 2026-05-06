@@ -115,6 +115,9 @@ pub const G2_PEER_CARD_CAP: usize = 40;
 pub const G2_MULTI_SESSION_CARD_CAP: usize = 8;
 /// `SingleSessionUserCard` per-card cap (operator §3.X(a) lock 2026-05-05).
 pub const G2_SINGLE_SESSION_USER_CARD_CAP: usize = 12;
+/// `SupersessionCard` per-card cap (G3 pre-reg §3.4 item 1; matches MS
+/// card budget). 80-entry composite hard cap holds: 40 + 8 + 12 + 8 = 68.
+pub const G3_SUPERSESSION_CARD_CAP: usize = 8;
 
 /// Separator inserted between adjacent surviving card sections. Matches
 /// pre-reg §3.8 ("joined with `\n\n`") and gives the reader prompt a
@@ -183,6 +186,34 @@ impl CompositeCard {
             (peer, G2_PEER_CARD_CAP),
             (multi_session, G2_MULTI_SESSION_CARD_CAP),
             (single_session_user, G2_SINGLE_SESSION_USER_CARD_CAP),
+        ])
+    }
+
+    /// G3 default composite per pre-reg §3.4 item 2 + operator-locked
+    /// (b) on 2026-05-06: extends the G2 chain with a 4th card —
+    /// [`crate::retrieval::cards::SupersessionCard`] — at the end of
+    /// the priority chain. Per-card caps inherited from G2; supersession
+    /// cap (= 8) added per [`G3_SUPERSESSION_CARD_CAP`]. The 80-entry
+    /// composite hard cap holds: 40 + 8 + 12 + 8 = 68.
+    ///
+    /// As with [`g2_default`], concrete card types are passed as
+    /// `Box<dyn RetrievalCard>` so the constructor stays decoupled from
+    /// the sibling card module imports — useful for the harness adapter
+    /// that mixes-and-matches per arm.
+    ///
+    /// [`g2_default`]: CompositeCard::g2_default
+    #[must_use]
+    pub fn g3_default(
+        peer: Box<dyn RetrievalCard>,
+        multi_session: Box<dyn RetrievalCard>,
+        single_session_user: Box<dyn RetrievalCard>,
+        supersession: Box<dyn RetrievalCard>,
+    ) -> Self {
+        Self::new(vec![
+            (peer, G2_PEER_CARD_CAP),
+            (multi_session, G2_MULTI_SESSION_CARD_CAP),
+            (single_session_user, G2_SINGLE_SESSION_USER_CARD_CAP),
+            (supersession, G3_SUPERSESSION_CARD_CAP),
         ])
     }
 }
