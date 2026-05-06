@@ -221,7 +221,7 @@ impl AuthValidator {
                 hash.to_string(),
                 (
                     ctx.clone(),
-                    std::time::Instant::now() + std::time::Duration::from_hours(1),
+                    std::time::Instant::now() + std::time::Duration::from_secs(3600),
                 ),
             );
 
@@ -438,7 +438,7 @@ mod tests {
         scope: Option<String>,
     }
 
-    /// Helper: build an AuthValidator with JWT support using the test key pair.
+    /// Helper: build an `AuthValidator` with JWT support using the test key pair.
     fn validator_with_jwt(api_keys: Vec<String>) -> AuthValidator {
         let config = test_config(api_keys);
         let mut validator = AuthValidator::new(&config);

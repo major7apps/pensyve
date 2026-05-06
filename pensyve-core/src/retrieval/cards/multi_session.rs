@@ -337,7 +337,8 @@ where
         if let Some(d) = day {
             agg.days.insert(d);
         }
-        if agg.most_recent_snippet.is_none() {
+        if !agg.seen_first_row {
+            agg.seen_first_row = true;
             agg.most_recent_snippet = content
                 .as_deref()
                 .map(str::trim)
@@ -365,14 +366,11 @@ fn day_bucket(event_time: Option<&str>) -> Option<String> {
 /// Per-entity aggregate built during the SQL scan.
 #[derive(Debug, Default)]
 struct EntityAggregate {
-    /// Set of distinct YYYY-MM-DD day strings on which this entity was
-    /// observed. NULL `event_time` rows do not contribute a day.
     days: std::collections::BTreeSet<String>,
-    /// Most recent observation's content snippet, truncated. None when
-    /// no row carried non-empty content.
+    // Pins snippet + event_time to the first (newest) row even when
+    // that row's content is empty — prevents silent backfill from older rows.
+    seen_first_row: bool,
     most_recent_snippet: Option<String>,
-    /// Raw `event_time` string of the most recent observation. Used
-    /// only as a sort key. None when only NULL-time rows exist.
     most_recent_event_time: Option<String>,
 }
 

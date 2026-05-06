@@ -136,6 +136,7 @@ async fn start_test_server(mgr: Arc<TenantStateManager>) -> (String, Cancellatio
     (url, ct)
 }
 
+#[allow(clippy::needless_pass_by_value)] // params is moved into the json! macro
 fn rpc(method: &str, params: serde_json::Value, id: u32) -> String {
     serde_json::json!({
         "jsonrpc": "2.0",

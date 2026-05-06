@@ -339,7 +339,7 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
     tokio::spawn({
         let state = app_state.clone();
         async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_mins(1));
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
                 state.rate_limiter.evict_stale();

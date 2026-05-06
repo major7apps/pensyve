@@ -81,6 +81,7 @@ async fn start_test_server(state: Arc<PensyveState>) -> (String, CancellationTok
     (url, ct)
 }
 
+#[allow(clippy::needless_pass_by_value)] // params is moved into the json! macro
 fn json_rpc(method: &str, params: serde_json::Value, id: u32) -> String {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -405,6 +406,7 @@ async fn test_mcp_invalid_method_returns_error() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_mcp_forget_and_inspect() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = create_test_state(&dir);

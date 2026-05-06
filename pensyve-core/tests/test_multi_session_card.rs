@@ -88,6 +88,77 @@ fn insert_obs(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Snippet pin: when the newest row's `content` is empty, the snippet
+/// must NOT silently backfill from an older row. Earlier code used
+/// `most_recent_snippet.is_none()` as the first-row guard, so an empty
+/// newest row left the snippet unset and the older row's content
+/// captured it (PR #78 codex review). The fix uses a `seen_first_row`
+/// flag so snippet + `event_time` pin to the same (newest) row.
+#[test]
+fn snippet_does_not_backfill_when_newest_row_content_is_empty() {
+    let (_dir, db_path, backend) = open_backend();
+    let ns = Uuid::new_v4().to_string();
+    let conn = Connection::open(&db_path).unwrap();
+    // Older row with non-empty content.
+    insert_obs(
+        &conn,
+        &ns,
+        "person",
+        "marie-curie",
+        "stated",
+        "older row has actual content",
+        Some("2024-01-01T10:00:00Z"),
+        None,
+        None,
+    );
+    // Newer row with EMPTY content (whitespace only).
+    insert_obs(
+        &conn,
+        &ns,
+        "person",
+        "marie-curie",
+        "mentioned",
+        "   ",
+        Some("2024-02-01T10:00:00Z"),
+        None,
+        None,
+    );
+    // Add a third date-day so the entity qualifies for cross-session output.
+    insert_obs(
+        &conn,
+        &ns,
+        "person",
+        "marie-curie",
+        "mentioned",
+        "third row content",
+        Some("2024-03-01T10:00:00Z"),
+        None,
+        None,
+    );
+    drop(conn);
+
+    let card = MultiSessionCard::new()
+        .build(
+            "q",
+            backend.as_ref(),
+            Uuid::parse_str(&ns).unwrap(),
+            None,
+            None,
+            None,
+        )
+        .expect("card should surface marie-curie");
+    // The newest row is 2024-03-01 with "third row content" — that's the
+    // expected snippet. The older 2024-01-01 row's content must NOT appear.
+    assert!(
+        card.contains("third row content"),
+        "newest row's content must be the snippet; was: {card}"
+    );
+    assert!(
+        !card.contains("older row has actual content"),
+        "must not backfill snippet from older row; was: {card}"
+    );
+}
+
 /// **Cross-session entity surfacing.** Entity mentioned across 3
 /// distinct date-day buckets surfaces with N=3, snippet from the most
 /// recent observation.

@@ -114,6 +114,30 @@ fn fake_ns() -> Uuid {
 
 /// Empty composite (no cards) returns `None`. The harness adapter uses
 /// this to skip the prepend cleanly when no cards are configured.
+/// Footer-marker preservation on bullet-style cards. A card emitting
+/// `header\n- bullets...\n--- END ---` must keep `--- END ---` after
+/// clipping; earlier code stripped all non-bullet lines after the
+/// header (PR #78 codex review).
+#[test]
+fn bullet_card_with_trailing_marker_preserves_footer() {
+    let (_dir, store) = make_store();
+    let card_output =
+        "User standing facts:\n- alpha\n- beta\n- gamma\n- delta\n--- END USER FACTS ---";
+    let composite = CompositeCard::new(vec![(
+        Box::new(MockCard::new("ssu", Some(card_output.to_string()))),
+        2, // cap drops gamma + delta but must keep the footer
+    )]);
+    let out = composite
+        .build("q", store.as_ref(), fake_ns(), None, None, None)
+        .expect("composite should produce output");
+    assert!(
+        out.contains("--- END USER FACTS ---"),
+        "footer marker must be preserved after bullet clipping; was: {out}"
+    );
+    assert!(out.contains("- alpha") && out.contains("- beta"));
+    assert!(!out.contains("- gamma") && !out.contains("- delta"));
+}
+
 #[test]
 fn empty_composite_returns_none() {
     let (_dir, store) = make_store();

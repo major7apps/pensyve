@@ -252,55 +252,62 @@ impl RetrievalCard for CompositeCard {
 /// start with `"- "`, it is returned verbatim. This preserves the v2.1
 /// `PeerCard` surface (`PREFERENCE: ...` / `INSTRUCTION: ...` body
 /// lines wrapped in `--- USER PEER CARD ... ---` markers) byte-for-byte
-/// — which is the binding parity contract for ARM-1-CTRL per pre-reg
-/// §3.5. See module docs "`PeerCard` pass-through" for the rationale.
+/// — the binding parity contract for ARM-1-CTRL per pre-reg §3.5.
 ///
 /// **Bullet-style clipping.** If the output contains at least one
 /// `"- "` line:
-/// - Line 0 is treated as a header (e.g., `"User standing facts:"`).
-/// - Bullet lines are collected in document order; non-bullet lines
-///   that follow the header are skipped (preserves only header + first
-///   N bullets).
-/// - The first `n` bullets are joined with `"\n"` after the header.
-/// - If `n == 0` or there are zero bullets after filtering, the empty
-///   string is returned (composite treats this as a defer).
+/// - Line 0 is treated as a header.
+/// - The first `n` bullet lines are kept.
+/// - Any non-bullet lines AFTER the last kept bullet are preserved
+///   verbatim as a footer (e.g., `--- END USER FACTS ---` markers).
+///   Non-bullet lines BETWEEN bullets are dropped.
+/// - If `n == 0` or there are zero bullets, the empty string is
+///   returned (composite treats this as a defer).
 fn clip_bullet_entries_or_passthrough(card_output: &str, n: usize) -> String {
-    // Detect surface shape first. We scan all lines (not just lines
-    // after the header) because a markered card like PeerCard has its
-    // bullets-or-not signal anywhere in the body.
     let has_bullets = card_output.lines().any(|l| l.starts_with("- "));
     if !has_bullets {
-        // Non-bullet surface (e.g., v2.1 PeerCard markers + PREFERENCE:
-        // body). Pass through verbatim — its own internal cap already
-        // applied at the card layer.
         return card_output.to_string();
     }
-
-    // Bullet-shaped card. Apply the header + N-bullets clipper.
     if n == 0 {
-        // Cap = 0 explicitly omits the card section. The outer composite
-        // also short-circuits cap == 0 before calling us, but the
-        // function-level guard makes the helper safe to call standalone.
         return String::new();
     }
 
-    let mut lines = card_output.lines();
-    let header = lines.next().unwrap_or("");
-    let bullets: Vec<&str> = lines.filter(|l| l.starts_with("- ")).take(n).collect();
-
-    if bullets.is_empty() {
-        // Header without any bullets is treated as no content. Composite
-        // will elide this slot entirely.
-        return String::new();
-    }
-
-    if header.is_empty() {
-        // Defensive: card output started with a `- ` line directly (no
-        // header). Emit just the bullets.
-        bullets.join("\n")
+    let lines: Vec<&str> = card_output.lines().collect();
+    let (header_idx, header): (usize, &str) = if lines[0].starts_with("- ") {
+        (usize::MAX, "")
     } else {
-        format!("{}\n{}", header, bullets.join("\n"))
+        (0, lines[0])
+    };
+
+    // Find bullet line indices in document order; keep the first n.
+    let bullet_indices: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(i, l)| *i != header_idx && l.starts_with("- "))
+        .map(|(i, _)| i)
+        .take(n)
+        .collect();
+
+    if bullet_indices.is_empty() {
+        return String::new();
     }
+
+    // Footer = any non-bullet lines after the last kept bullet.
+    let last_bullet = *bullet_indices.last().unwrap();
+    let footer: Vec<&str> = lines[last_bullet + 1..]
+        .iter()
+        .filter(|l| !l.starts_with("- "))
+        .copied()
+        .collect();
+
+    let bullets: Vec<&str> = bullet_indices.iter().map(|&i| lines[i]).collect();
+    let mut out = Vec::with_capacity(1 + bullets.len() + footer.len());
+    if !header.is_empty() {
+        out.push(header);
+    }
+    out.extend(&bullets);
+    out.extend(&footer);
+    out.join("\n")
 }
 
 #[cfg(test)]
