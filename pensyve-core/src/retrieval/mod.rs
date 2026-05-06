@@ -25,6 +25,7 @@
 
 pub mod cards;
 pub mod engine;
+pub mod intent_router;
 
 // Flat re-export keeps the v2.x API surface intact after the
 // retrieval.rs -> retrieval/engine.rs refactor. New code introduced by G2

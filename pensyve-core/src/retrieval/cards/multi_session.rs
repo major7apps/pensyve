@@ -74,6 +74,7 @@ use std::path::PathBuf;
 use rusqlite::{Connection, OpenFlags, ToSql};
 use uuid::Uuid;
 
+use crate::retrieval::intent_router;
 use crate::storage::StorageTrait;
 use crate::types::{AgentId, UserId};
 
@@ -101,25 +102,78 @@ pub const MULTI_SESSION_CARD_FOOTER: &str = "--- END CROSS-SESSION ENTITIES ---"
 /// pins this at "~80 chars".
 const SNIPPET_MAX_CHARS: usize = 80;
 
+/// Env-var controlling G3 retrieval-card layering. Recognized values:
+/// `router` (router gate + SQL scope-tighten on; other G3 mechanisms off)
+/// and `full` (all G3 mechanisms on). Any other value (or unset) preserves
+/// G2 baseline behavior. Per pre-reg §3.4 + §3.6 + operator decision (a)
+/// 2026-05-06.
+pub const RETRIEVAL_CARDS_G3_ENV: &str = "PENSYVE_RETRIEVAL_CARDS_G3";
+
+/// G2 baseline cross-session threshold: an entity must surface in ≥2
+/// distinct date-day buckets to count as cross-session.
+const MS_CARD_CROSS_SESSION_THRESHOLD_G2: usize = 2;
+
+/// G3 router-mode cross-session threshold: raise the bar to ≥3 distinct
+/// date-day buckets to suppress marginal cross-session entities that
+/// drove the G2 H4 SSU partial-fail. Per pre-reg §3.6 SQL scope-tighten.
+const MS_CARD_CROSS_SESSION_THRESHOLD_G3: usize = 3;
+
 /// Cross-session entity-link card builder.
 ///
 /// Construct with [`MultiSessionCard::new`] for the default cap of
 /// [`MULTI_SESSION_CARD_MAX_ENTRIES`] (= 40), or
 /// [`MultiSessionCard::with_cap`] when a test or composite-cap override
 /// needs a different limit.
+///
+/// The G3 layering knob (`PENSYVE_RETRIEVAL_CARDS_G3`) is read once at
+/// construction time and cached as `g3_mode`. This avoids a per-`build()`
+/// `std::env::var` syscall on the hot recall path; callers that need to
+/// switch G3 modes mid-process should construct a fresh card.
 #[derive(Debug, Clone)]
 pub struct MultiSessionCard {
     /// Maximum number of entries the card emits before truncating.
     /// Defaults to [`MULTI_SESSION_CARD_MAX_ENTRIES`].
     max_entries: usize,
+    /// G3 layering mode resolved at construction. `Some(_)` enables the
+    /// router gate + SQL scope-tighten; `None` preserves G2 baseline
+    /// behavior. Per pre-reg §3.4 item 5 + §3.6 + operator decision (a)
+    /// 2026-05-06.
+    g3_mode: Option<G3Mode>,
+}
+
+/// G3 layering mode resolved from `PENSYVE_RETRIEVAL_CARDS_G3` at card
+/// construction. Both `Router` and `Full` enable the same MS-card-side
+/// gates; `Full` additionally implies all other G3 mechanisms (handled
+/// by sibling cards / engine, not here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum G3Mode {
+    /// Router gate + MS SQL scope-tighten on; per-event consolidation,
+    /// MMR diversity, typed-slot extractor, `SupersessionCard` all off.
+    Router,
+    /// All G3 mechanisms on. From `MultiSessionCard`'s perspective this
+    /// is identical to `Router` — the additional G3 mechanisms are
+    /// activated by sibling cards / the recall engine.
+    Full,
+}
+
+/// Resolve the G3 layering mode from the process environment. Returns
+/// `None` for unset / unrecognized values, preserving G2 baseline.
+fn resolve_g3_mode() -> Option<G3Mode> {
+    match std::env::var(RETRIEVAL_CARDS_G3_ENV).ok().as_deref() {
+        Some("router") => Some(G3Mode::Router),
+        Some("full") => Some(G3Mode::Full),
+        _ => None,
+    }
 }
 
 impl MultiSessionCard {
-    /// Construct a card with the default cap (= 40).
+    /// Construct a card with the default cap (= 40). Reads
+    /// `PENSYVE_RETRIEVAL_CARDS_G3` once and caches the resolved mode.
     #[must_use]
     pub fn new() -> Self {
         Self {
             max_entries: MULTI_SESSION_CARD_MAX_ENTRIES,
+            g3_mode: resolve_g3_mode(),
         }
     }
 
@@ -127,9 +181,15 @@ impl MultiSessionCard {
     /// or for a composite dispatcher that wants to allocate a smaller
     /// share of the 80-entry composite budget; production callers
     /// should prefer [`MultiSessionCard::new`].
+    ///
+    /// As with [`MultiSessionCard::new`], the G3 layering mode is read
+    /// from the environment at this point and cached.
     #[must_use]
     pub fn with_cap(max_entries: usize) -> Self {
-        Self { max_entries }
+        Self {
+            max_entries,
+            g3_mode: resolve_g3_mode(),
+        }
     }
 }
 
@@ -147,8 +207,21 @@ impl RetrievalCard for MultiSessionCard {
         namespace_id: Uuid,
         agent_id: Option<AgentId>,
         user_id: Option<UserId>,
-        _question_type: Option<&str>,
+        question_type: Option<&str>,
     ) -> Option<String> {
+        // G3 router gate (pre-reg §3.4 item 5 + §3.6, operator decision
+        // (a) 2026-05-06). Active only when `g3_mode` was resolved at
+        // construction (i.e., `PENSYVE_RETRIEVAL_CARDS_G3 ∈ {router,
+        // full}`) AND a `question_type` was supplied. Baseline (G2)
+        // callers without `question_type` skip the gate so they remain
+        // byte-for-byte compatible with the G2 ARM-1-G3-BASELINE floor.
+        if let (Some(_), Some(qt)) = (self.g3_mode, question_type) {
+            let decision = intent_router::route(qt);
+            if !decision.enable_ms_card {
+                return None;
+            }
+        }
+
         // Defer-on-failure path 1: backend has no on-disk SQLite file
         // (in-memory store, future Postgres backend). Card opens its
         // own short-lived read-only connection, so we need the path.
@@ -167,7 +240,25 @@ impl RetrievalCard for MultiSessionCard {
         )
         .ok()?;
 
-        build_from_conn(&conn, namespace_id, agent_id, user_id, self.max_entries)
+        // G3 SQL scope-tighten (pre-reg §3.6): raise cross-session
+        // threshold from G2's ≥2 to ≥3 distinct date-day buckets when
+        // `g3_mode` is set. The filter is enforced in `build_from_conn`'s
+        // post-aggregation pass (the SQL itself returns all rows; the
+        // session-count check happens against the in-memory aggregate).
+        let cross_session_threshold = if self.g3_mode.is_some() {
+            MS_CARD_CROSS_SESSION_THRESHOLD_G3
+        } else {
+            MS_CARD_CROSS_SESSION_THRESHOLD_G2
+        };
+
+        build_from_conn(
+            &conn,
+            namespace_id,
+            agent_id,
+            user_id,
+            self.max_entries,
+            cross_session_threshold,
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -179,12 +270,18 @@ impl RetrievalCard for MultiSessionCard {
 /// connection. Exposed `pub(super)` rather than `pub` — the public
 /// surface is the trait `build()`. Tests in this crate exercise it
 /// directly to avoid the temp-file-and-backend ceremony.
+///
+/// `cross_session_threshold` is the minimum number of distinct
+/// date-day buckets an entity must surface in to count as cross-
+/// session. G2 baseline = 2; G3 router/full = 3 (§3.6 SQL scope-
+/// tighten).
 pub(crate) fn build_from_conn(
     conn: &Connection,
     namespace_id: Uuid,
     agent_id: Option<AgentId>,
     user_id: Option<UserId>,
     max_entries: usize,
+    cross_session_threshold: usize,
 ) -> Option<String> {
     if max_entries == 0 {
         // A zero cap is a degenerate caller bug; prefer defer-on-failure
@@ -221,8 +318,10 @@ pub(crate) fn build_from_conn(
     let mut entries: Vec<RenderedEntity> = groups
         .into_iter()
         .filter_map(|((etype, instance), agg)| {
-            // The cross-session signal: ≥2 distinct date-day buckets.
-            if agg.days.len() < 2 {
+            // The cross-session signal: ≥`cross_session_threshold`
+            // distinct date-day buckets. G2 baseline = 2; G3
+            // router/full = 3 per pre-reg §3.6 SQL scope-tighten.
+            if agg.days.len() < cross_session_threshold {
                 return None;
             }
             Some(RenderedEntity {
