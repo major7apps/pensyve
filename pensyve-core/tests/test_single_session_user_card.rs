@@ -31,11 +31,11 @@ use std::sync::{Mutex, OnceLock};
 
 use uuid::Uuid;
 
+use pensyve_core::retrieval::cards::RetrievalCard;
 use pensyve_core::retrieval::cards::single_session_user::{
     DEFAULT_SSU_N, MAX_SSU_N, SSU_CARD_FOOTER, SSU_CARD_HEADER, SSU_CARD_MAX_ENTRIES,
     SSU_CARD_NAME, SingleSessionUserCard,
 };
-use pensyve_core::retrieval::cards::RetrievalCard;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::{AgentId, UserId};
@@ -233,8 +233,14 @@ fn default_n_3_windows_to_most_recent_three_sessions() {
     assert!(card.contains("session-3 standing fact"), "card was: {card}");
     assert!(card.contains("session-4 standing fact"), "card was: {card}");
     assert!(card.contains("session-5 standing fact"), "card was: {card}");
-    assert!(!card.contains("session-1 standing fact"), "card was: {card}");
-    assert!(!card.contains("session-2 standing fact"), "card was: {card}");
+    assert!(
+        !card.contains("session-1 standing fact"),
+        "card was: {card}"
+    );
+    assert!(
+        !card.contains("session-2 standing fact"),
+        "card was: {card}"
+    );
 }
 
 /// `PENSYVE_SSU_N=5` override: all 5 session-days surface.
@@ -385,6 +391,96 @@ fn scope_filter_isolates_user_facts() {
     assert!(
         unscoped.contains("user-2 has a sourdough starter"),
         "unscoped card should contain U2's fact; was: {unscoped}"
+    );
+}
+
+/// Half-set scope (Some, None) and (None, Some) — the strict-IS-NULL
+/// contract for the unspecified dimension per `addendum_02` +
+/// `MultiSessionCard::build_scope_clause` parity. Earlier code
+/// matched-any on the unspecified side (latent multi-tenant
+/// isolation bug; PR #78 review). This test pins the corrected
+/// behavior.
+///
+/// Setup: rows seeded under three (`agent_id`, `user_id`) combinations:
+/// - `(A1, NULL)` — agent set, user absent (legacy half-tenant pattern)
+/// - `(A1, U1)`   — fully specified
+/// - `(NULL, U1)` — user set, agent absent (legacy half-tenant pattern)
+///
+/// Assertions:
+/// - Build with `(Some(A1), None)` → returns ONLY the `(A1, NULL)` row,
+///   NOT the `(A1, U1)` row (would leak across the unspecified user
+///   dimension if the IS-NULL constraint were missing).
+/// - Build with `(None, Some(U1))` → returns ONLY the `(NULL, U1)` row,
+///   NOT the `(A1, U1)` row (symmetric leak prevention on agent side).
+#[test]
+fn half_set_scope_strict_is_null_on_unspecified_dimension() {
+    let _guard = SsuEnvGuard::unset();
+    let (_dir, db_path, backend) = make_backend();
+    let ns = Uuid::new_v4();
+    let a1 = AgentId::from(Uuid::new_v4());
+    let u1 = UserId::from(Uuid::new_v4());
+
+    // (A1, NULL): agent set, user absent — should match (Some(A1), None)
+    seed_row(
+        &db_path,
+        &ns.to_string(),
+        Some(&a1.as_uuid().to_string()),
+        None,
+        "stated",
+        "instance-a1-null",
+        "fact under (A1, NULL)",
+        "2024-04-01T10:00:00Z",
+    );
+    // (A1, U1): fully specified — must NOT match (Some(A1), None) under
+    // the corrected IS-NULL contract.
+    seed_row(
+        &db_path,
+        &ns.to_string(),
+        Some(&a1.as_uuid().to_string()),
+        Some(&u1.as_uuid().to_string()),
+        "stated",
+        "instance-a1-u1",
+        "fact under (A1, U1)",
+        "2024-04-02T10:00:00Z",
+    );
+    // (NULL, U1): user set, agent absent — should match (None, Some(U1))
+    seed_row(
+        &db_path,
+        &ns.to_string(),
+        None,
+        Some(&u1.as_uuid().to_string()),
+        "stated",
+        "instance-null-u1",
+        "fact under (NULL, U1)",
+        "2024-04-03T10:00:00Z",
+    );
+
+    // (Some(A1), None) → strict (A1, NULL), NOT (A1, U1).
+    let agent_only = SingleSessionUserCard::new()
+        .build("q", backend.as_ref(), ns, Some(a1), None, None)
+        .expect("(Some, None) scope should yield the (A1, NULL) fact");
+    assert!(
+        agent_only.contains("fact under (A1, NULL)"),
+        "(Some(A1), None) must surface (A1, NULL) row; was: {agent_only}"
+    );
+    assert!(
+        !agent_only.contains("fact under (A1, U1)"),
+        "(Some(A1), None) MUST NOT leak (A1, U1) row across the \
+         unspecified user dimension; was: {agent_only}"
+    );
+
+    // (None, Some(U1)) → strict (NULL, U1), NOT (A1, U1).
+    let user_only = SingleSessionUserCard::new()
+        .build("q", backend.as_ref(), ns, None, Some(u1), None)
+        .expect("(None, Some) scope should yield the (NULL, U1) fact");
+    assert!(
+        user_only.contains("fact under (NULL, U1)"),
+        "(None, Some(U1)) must surface (NULL, U1) row; was: {user_only}"
+    );
+    assert!(
+        !user_only.contains("fact under (A1, U1)"),
+        "(None, Some(U1)) MUST NOT leak (A1, U1) row across the \
+         unspecified agent dimension; was: {user_only}"
     );
 }
 

@@ -214,7 +214,8 @@ impl RetrievalCard for CompositeCard {
                 continue;
             }
 
-            let Some(raw) = card.build(query, store, namespace_id, agent_id, user_id, question_type)
+            let Some(raw) =
+                card.build(query, store, namespace_id, agent_id, user_id, question_type)
             else {
                 // Defer-on-failure path: card chose to contribute
                 // nothing for this question. Elide silently.
@@ -315,7 +316,8 @@ mod tests {
     #[test]
     fn clipper_passes_through_non_bullet_surface() {
         // Mimics the v2.1 PeerCard surface — markers + PREFERENCE: / INSTRUCTION: lines.
-        let peer_like = "--- USER PEER CARD ---\nPREFERENCE: x\nINSTRUCTION: y\n--- END PEER CARD ---";
+        let peer_like =
+            "--- USER PEER CARD ---\nPREFERENCE: x\nINSTRUCTION: y\n--- END PEER CARD ---";
         let out = clip_bullet_entries_or_passthrough(peer_like, 2);
         assert_eq!(
             out, peer_like,

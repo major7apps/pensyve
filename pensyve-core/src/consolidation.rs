@@ -571,7 +571,15 @@ mod tests {
         }
 
         let config = make_config();
-        let stats = ConsolidationEngine::run(&storage, &embedder, &config, ns.id, &NetworkPolicy::Disabled, &CancellationToken::new()).unwrap();
+        let stats = ConsolidationEngine::run(
+            &storage,
+            &embedder,
+            &config,
+            ns.id,
+            &NetworkPolicy::Disabled,
+            &CancellationToken::new(),
+        )
+        .unwrap();
 
         assert!(
             stats.promoted >= 1,
@@ -624,7 +632,15 @@ mod tests {
         }
 
         let config = make_config();
-        let stats = ConsolidationEngine::run(&storage, &embedder, &config, ns.id, &NetworkPolicy::Disabled, &CancellationToken::new()).unwrap();
+        let stats = ConsolidationEngine::run(
+            &storage,
+            &embedder,
+            &config,
+            ns.id,
+            &NetworkPolicy::Disabled,
+            &CancellationToken::new(),
+        )
+        .unwrap();
 
         // With unique (dissimilar) content, no promotions should occur.
         assert_eq!(
@@ -662,7 +678,15 @@ mod tests {
         );
 
         let config = make_config();
-        let stats = ConsolidationEngine::run(&storage, &embedder, &config, ns.id, &NetworkPolicy::Disabled, &CancellationToken::new()).unwrap();
+        let stats = ConsolidationEngine::run(
+            &storage,
+            &embedder,
+            &config,
+            ns.id,
+            &NetworkPolicy::Disabled,
+            &CancellationToken::new(),
+        )
+        .unwrap();
 
         // The decay pass should have processed at least the one memory we inserted.
         assert!(
@@ -710,7 +734,15 @@ mod tests {
             ..PensyveConfig::default().consolidation
         };
 
-        let stats = ConsolidationEngine::run(&storage, &embedder, &config, ns.id, &NetworkPolicy::Disabled, &CancellationToken::new()).unwrap();
+        let stats = ConsolidationEngine::run(
+            &storage,
+            &embedder,
+            &config,
+            ns.id,
+            &NetworkPolicy::Disabled,
+            &CancellationToken::new(),
+        )
+        .unwrap();
 
         assert!(
             stats.archived >= 1,
@@ -810,7 +842,15 @@ mod tests {
         storage.save_namespace(&ns).unwrap();
 
         let config = make_config();
-        let stats = ConsolidationEngine::run(&storage, &embedder, &config, ns.id, &NetworkPolicy::Disabled, &CancellationToken::new()).unwrap();
+        let stats = ConsolidationEngine::run(
+            &storage,
+            &embedder,
+            &config,
+            ns.id,
+            &NetworkPolicy::Disabled,
+            &CancellationToken::new(),
+        )
+        .unwrap();
 
         assert_eq!(stats.promoted, 0);
         assert_eq!(stats.decayed, 0);

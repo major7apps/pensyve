@@ -219,13 +219,8 @@ async fn i5_long_running_consolidation_cancels_within_budget() {
     const N_ROWS: usize = 5_000;
     let row_count_before = {
         for i in 0..N_ROWS {
-            let mut mem = EpisodicMemory::new(
-                ns.id,
-                episode.id,
-                source_id,
-                entity_id,
-                "prefers dark mode",
-            );
+            let mut mem =
+                EpisodicMemory::new(ns.id, episode.id, source_id, entity_id, "prefers dark mode");
             mem.embedding = embedder.embed(&mem.content).unwrap();
             // Stagger timestamps so the cluster's "most recent" pick is
             // deterministic; the value itself doesn't matter for cancel.

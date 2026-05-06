@@ -567,4 +567,3 @@ async fn tenant_and_usage_middleware(
 
     response
 }
-

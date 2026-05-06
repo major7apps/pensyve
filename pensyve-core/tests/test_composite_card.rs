@@ -22,14 +22,14 @@
 //! - `name()` is the stable `"CompositeCard"` identifier.
 //! - Object-safety: `Box<dyn RetrievalCard>` over mock impls compiles.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use uuid::Uuid;
 
 use pensyve_core::retrieval::cards::{CompositeCard, RetrievalCard};
-use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::storage::StorageTrait;
+use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::{AgentId, UserId};
 
 use tempfile::TempDir;
@@ -255,7 +255,10 @@ fn cap_zero_omits_section_entirely() {
     let other = "Other card:\n- x";
     let composite = CompositeCard::new(vec![
         // First slot capped at 0 → must be omitted.
-        (Box::new(MockCard::new("zero", Some(bullets.to_string()))), 0),
+        (
+            Box::new(MockCard::new("zero", Some(bullets.to_string()))),
+            0,
+        ),
         // Second slot survives.
         (Box::new(MockCard::new("other", Some(other.to_string()))), 5),
     ]);

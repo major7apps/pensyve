@@ -101,8 +101,8 @@ fn cache_env_lock() -> &'static Mutex<()> {
 fn real_cache_dir() -> &'static Path {
     static REAL: OnceLock<PathBuf> = OnceLock::new();
     REAL.get_or_init(|| {
-        let raw = std::env::var("FASTEMBED_CACHE_DIR")
-            .unwrap_or_else(|_| ".fastembed_cache".into());
+        let raw =
+            std::env::var("FASTEMBED_CACHE_DIR").unwrap_or_else(|_| ".fastembed_cache".into());
         let p = PathBuf::from(raw);
         // Canonicalize if possible so the snapshot is robust against
         // later cwd changes; fall back to the lexical path otherwise.
@@ -128,7 +128,8 @@ const MINILM_CACHE_DIR: &str = "models--Qdrant--all-MiniLM-L6-v2-onnx";
 /// fail — the cache is a developer-environment precondition, not a
 /// production-code invariant.
 fn fastembed_cache_has(model_subdir: &str) -> bool {
-    let cache_dir = std::env::var("FASTEMBED_CACHE_DIR").unwrap_or_else(|_| ".fastembed_cache".into());
+    let cache_dir =
+        std::env::var("FASTEMBED_CACHE_DIR").unwrap_or_else(|_| ".fastembed_cache".into());
     Path::new(&cache_dir).join(model_subdir).is_dir()
 }
 
@@ -169,7 +170,8 @@ fn reranker_does_not_make_network_calls() {
         return;
     }
 
-    let reranker = Reranker::new("BGERerankerBase").expect("BGE reranker should construct from cache");
+    let reranker =
+        Reranker::new("BGERerankerBase").expect("BGE reranker should construct from cache");
     let query = "What is the capital of France?";
     let docs = [
         "Paris is the capital of France.",
@@ -181,7 +183,11 @@ fn reranker_does_not_make_network_calls() {
         .expect("rerank against cached model should succeed without network");
 
     // Sanity: the call returned the requested top_k entries.
-    assert_eq!(results.len(), 3, "rerank should return all 3 docs at top_k=3");
+    assert_eq!(
+        results.len(),
+        3,
+        "rerank should return all 3 docs at top_k=3"
+    );
     // Scores are well-defined; the most-relevant doc (Paris-as-capital)
     // should outrank the Berlin doc. We don't assert a specific ordering
     // (cross-encoder scores vary across builds); we only assert the call
@@ -226,8 +232,8 @@ fn onnx_embedder_per_call_inference_makes_no_network_calls() {
         return;
     }
 
-    let embedder = OnnxEmbedder::new("all-MiniLM-L6-v2")
-        .expect("MiniLM embedder should construct from cache");
+    let embedder =
+        OnnxEmbedder::new("all-MiniLM-L6-v2").expect("MiniLM embedder should construct from cache");
 
     // Several `embed` calls in sequence — the per-call surface is what
     // we're attesting has no network awareness. Each call exercises the
@@ -241,7 +247,9 @@ fn onnx_embedder_per_call_inference_makes_no_network_calls() {
         "fastembed wraps ONNX Runtime for sentence embeddings",
     ];
     for text in &inputs {
-        let embedding = embedder.embed(text).expect("embed should succeed without network");
+        let embedding = embedder
+            .embed(text)
+            .expect("embed should succeed without network");
         assert_eq!(
             embedding.len(),
             384,
@@ -298,10 +306,8 @@ fn onnx_embedder_constructor_under_disabled_with_uncached_model_returns_error() 
     let cache_tempdir = TempDir::new().expect("tempdir for empty fastembed cache");
     let _guard = FastembedCacheGuard::set(cache_tempdir.path());
 
-    let result = OnnxEmbedder::new_with_policy(
-        "Alibaba-NLP/gte-base-en-v1.5",
-        &NetworkPolicy::Disabled,
-    );
+    let result =
+        OnnxEmbedder::new_with_policy("Alibaba-NLP/gte-base-en-v1.5", &NetworkPolicy::Disabled);
 
     match result {
         Err(EmbeddingError::Network(msg)) => {
@@ -327,11 +333,7 @@ fn onnx_embedder_constructor_under_disabled_with_uncached_model_returns_error() 
     let entries: Vec<_> = std::fs::read_dir(cache_tempdir.path())
         .expect("read tempdir")
         .filter_map(Result::ok)
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("models--")
-        })
+        .filter(|e| e.file_name().to_string_lossy().starts_with("models--"))
         .collect();
     assert!(
         entries.is_empty(),
@@ -377,11 +379,8 @@ fn onnx_embedder_constructor_under_disabled_with_cached_model_succeeds() {
     let _serial = cache_env_lock().lock().expect("env lock poisoned");
     let _guard = FastembedCacheGuard::set(&real);
 
-    let embedder = OnnxEmbedder::new_with_policy(
-        "all-MiniLM-L6-v2",
-        &NetworkPolicy::Disabled,
-    )
-    .expect("cached model should construct under Disabled");
+    let embedder = OnnxEmbedder::new_with_policy("all-MiniLM-L6-v2", &NetworkPolicy::Disabled)
+        .expect("cached model should construct under Disabled");
 
     let embedding = embedder.embed("hello").expect("embed should succeed");
     assert_eq!(
@@ -507,7 +506,10 @@ fn peer_card_uses_only_readonly_sqlite_no_network() {
     // connection), this call site is the one most likely to surface
     // the regression because it's exercised on every recall.
     let card = build_peer_card(&db_path).expect("peer card should build from seeded store");
-    assert!(card.starts_with(PEER_CARD_HEADER), "card should have header");
+    assert!(
+        card.starts_with(PEER_CARD_HEADER),
+        "card should have header"
+    );
     assert!(card.ends_with(PEER_CARD_FOOTER), "card should have footer");
     assert!(
         card.contains("PREFERENCE: no-network coffee shops"),
@@ -533,7 +535,9 @@ fn peer_card_uses_only_readonly_sqlite_no_network() {
     );
     let err_msg = write_attempt.unwrap_err().to_string().to_lowercase();
     assert!(
-        err_msg.contains("readonly") || err_msg.contains("read-only") || err_msg.contains("read only"),
+        err_msg.contains("readonly")
+            || err_msg.contains("read-only")
+            || err_msg.contains("read only"),
         "expected a readonly-database error, got: {err_msg}"
     );
 
@@ -541,7 +545,9 @@ fn peer_card_uses_only_readonly_sqlite_no_network() {
     // store. Row count after = row count before = 1.
     let count: i64 = Connection::open(&db_path)
         .expect("reopen writable to count")
-        .query_row("SELECT COUNT(*) FROM observation_memories", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM observation_memories", [], |row| {
+            row.get(0)
+        })
         .expect("count rows");
     assert_eq!(count, 1, "build_peer_card must not insert/delete rows");
 }

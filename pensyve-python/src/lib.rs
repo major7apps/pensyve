@@ -530,10 +530,7 @@ impl PyPensyve {
             }
             Err(e1) => {
                 tracing::warn!(error = %e1, "Primary embedding model failed, trying fallback");
-                match OnnxEmbedder::new_cached_with_policy(
-                    "all-MiniLM-L6-v2",
-                    &embedder_policy,
-                ) {
+                match OnnxEmbedder::new_cached_with_policy("all-MiniLM-L6-v2", &embedder_policy) {
                     Ok(e) => {
                         tracing::warn!(
                             embedding_model = "all-MiniLM-L6-v2",

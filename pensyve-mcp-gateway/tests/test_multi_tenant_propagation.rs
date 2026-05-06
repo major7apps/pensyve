@@ -248,15 +248,7 @@ async fn two_tenants_with_distinct_agent_ids_are_isolated() {
     remember(&client, &url, Some(&agent_a), "alice", "prefers tea", 10).await;
 
     // Tenant B writes one fact about "alice" (same entity name, different scope).
-    remember(
-        &client,
-        &url,
-        Some(&agent_b),
-        "alice",
-        "prefers coffee",
-        11,
-    )
-    .await;
+    remember(&client, &url, Some(&agent_b), "alice", "prefers coffee", 11).await;
 
     // Tenant A inspects: must see exactly its own write.
     let a_view = inspect(&client, &url, Some(&agent_a), "alice", 20).await;

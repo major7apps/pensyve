@@ -167,13 +167,7 @@ impl RetrievalCard for MultiSessionCard {
         )
         .ok()?;
 
-        build_from_conn(
-            &conn,
-            namespace_id,
-            agent_id,
-            user_id,
-            self.max_entries,
-        )
+        build_from_conn(&conn, namespace_id, agent_id, user_id, self.max_entries)
     }
 
     fn name(&self) -> &'static str {
@@ -320,12 +314,19 @@ fn build_scope_clause(
 fn aggregate_rows<I>(rows: I) -> BTreeMap<(String, String), EntityAggregate>
 where
     I: IntoIterator<
-        Item = (Option<String>, Option<String>, Option<String>, Option<String>),
+        Item = (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
     >,
 {
     let mut groups: BTreeMap<(String, String), EntityAggregate> = BTreeMap::new();
     for (entity_type, instance, content, event_time) in rows {
-        let entity_type = entity_type.map(|s| s.trim().to_string()).unwrap_or_default();
+        let entity_type = entity_type
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
         let instance = instance.map(|s| s.trim().to_string()).unwrap_or_default();
         if entity_type.is_empty() || instance.is_empty() {
             // No grouping key — skip; signals a malformed observation row.
@@ -397,12 +398,18 @@ fn render_line(e: RenderedEntity) -> String {
         snippet,
         ..
     } = e;
-    let session_word = if n_sessions == 1 { "session" } else { "sessions" };
+    let session_word = if n_sessions == 1 {
+        "session"
+    } else {
+        "sessions"
+    };
     match snippet {
         Some(s) => format!(
             "- {entity_type}: {instance} (mentioned across {n_sessions} {session_word}; latest: '{s}')"
         ),
-        None => format!("- {entity_type}: {instance} (mentioned across {n_sessions} {session_word})"),
+        None => {
+            format!("- {entity_type}: {instance} (mentioned across {n_sessions} {session_word})")
+        }
     }
 }
 
@@ -415,7 +422,10 @@ fn truncate_snippet(s: &str) -> String {
     if char_count <= SNIPPET_MAX_CHARS {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(SNIPPET_MAX_CHARS.saturating_sub(1)).collect();
+    let mut out: String = s
+        .chars()
+        .take(SNIPPET_MAX_CHARS.saturating_sub(1))
+        .collect();
     out.push('…');
     out
 }

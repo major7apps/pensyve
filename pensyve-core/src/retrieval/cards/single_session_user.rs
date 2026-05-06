@@ -270,7 +270,8 @@ fn build_card_from_conn(
     // once; reused by both queries below. We use the same pattern as
     // the recall-path scope filter (G1 substrate): NULL-equivalence
     // when scope is absent, exact-match when present.
-    let (scope_clause, scope_binds) = build_scope_clause(&ns, agent_str.as_deref(), user_str.as_deref());
+    let (scope_clause, scope_binds) =
+        build_scope_clause(&ns, agent_str.as_deref(), user_str.as_deref());
 
     // ----- Query 1: identify the N most-recent session-days -----
     // SQLite's `DATE(event_time)` parses ISO-8601 timestamps and
@@ -288,10 +289,8 @@ fn build_card_from_conn(
     );
 
     let mut day_stmt = conn.prepare(&day_sql).ok()?;
-    let mut day_params: Vec<Box<dyn ToSql>> = scope_binds
-        .iter()
-        .map(|v| boxed_sql(v.clone()))
-        .collect();
+    let mut day_params: Vec<Box<dyn ToSql>> =
+        scope_binds.iter().map(|v| boxed_sql(v.clone())).collect();
     // SAFETY: `n` is bounded above by `MAX_SSU_N` (= 100); the cast to
     // i64 cannot wrap. Suppress the pedantic lint with a scoped allow.
     #[allow(clippy::cast_possible_wrap)]
@@ -334,18 +333,18 @@ fn build_card_from_conn(
     );
 
     let mut fact_stmt = conn.prepare(&fact_sql).ok()?;
-    let mut fact_params: Vec<Box<dyn ToSql>> = scope_binds
-        .iter()
-        .map(|v| boxed_sql(v.clone()))
-        .collect();
+    let mut fact_params: Vec<Box<dyn ToSql>> =
+        scope_binds.iter().map(|v| boxed_sql(v.clone())).collect();
     for d in &days {
         fact_params.push(Box::new(d.clone()));
     }
     for a in USER_FACT_ACTIONS {
         fact_params.push(Box::new((*a).to_string()));
     }
-    let fact_param_refs: Vec<&dyn ToSql> =
-        fact_params.iter().map(std::convert::AsRef::as_ref).collect();
+    let fact_param_refs: Vec<&dyn ToSql> = fact_params
+        .iter()
+        .map(std::convert::AsRef::as_ref)
+        .collect();
 
     let rows = fact_stmt
         .query_map(fact_param_refs.as_slice(), |row| {
@@ -390,9 +389,21 @@ fn build_card_from_conn(
 /// Build the WHERE-clause fragment and bind values for the
 /// `(namespace_id, agent_id, user_id)` scope filter.
 ///
-/// - `namespace_id` is always present (positional bind 1).
-/// - `agent_id` / `user_id` absent → match any value (including NULL).
-/// - `agent_id` / `user_id` present → exact match required.
+/// Locked scope semantics per pensyve-docs G2 pre-reg + `addendum_02`
+/// (matches `MultiSessionCard::build_scope_clause` byte-for-byte):
+/// - `(None, None)` → `namespace_id = ?1` (legacy unscoped read; sees
+///   all rows in namespace per `addendum_02` Option 2).
+/// - `(Some, Some)` → strict `agent_id = ? AND user_id = ?`.
+/// - `(Some, None)` → strict `agent_id = ? AND user_id IS NULL`.
+/// - `(None, Some)` → strict `agent_id IS NULL AND user_id = ?`.
+///
+/// The strict-IS-NULL on the unspecified dimension prevents
+/// cross-tenant leakage when a caller supplies a partial tenant
+/// identifier; this is the multi-tenant safety contract `addendum_02`
+/// locked. Earlier code matched any value (including non-NULL) on
+/// the unspecified side — a latent isolation bug for managed-service
+/// callers (harmless under the G2 benchmark which always uses
+/// `(None, None)`, but binding for future multi-tenant deployments).
 ///
 /// Returns `(clause, binds)` where `clause` references positional
 /// placeholders `?1`, `?2`, ... in order matching `binds`.
@@ -401,16 +412,40 @@ fn build_scope_clause(
     agent_id: Option<&str>,
     user_id: Option<&str>,
 ) -> (String, Vec<SqlValue>) {
+    // Special case: both dimensions absent collapses to namespace-only
+    // (the legacy v2.1 unscoped path). `addendum_02` Option 2 locks this
+    // as "no scope filter; sees all rows in namespace" rather than the
+    // stricter `agent_id IS NULL AND user_id IS NULL` reading. The
+    // strict-IS-NULL form would behave identically on legacy v2.1
+    // NULL-defaulted stores but would silently exclude
+    // future-written-with-tenant-id rows on mixed stores.
+    if agent_id.is_none() && user_id.is_none() {
+        return (
+            "namespace_id = ?1".to_string(),
+            vec![SqlValue::Text(namespace_id.to_string())],
+        );
+    }
+
     let mut clauses = vec!["namespace_id = ?1".to_string()];
     let mut binds: Vec<SqlValue> = vec![SqlValue::Text(namespace_id.to_string())];
 
-    if let Some(a) = agent_id {
-        binds.push(SqlValue::Text(a.to_string()));
-        clauses.push(format!("agent_id = ?{}", binds.len()));
+    match agent_id {
+        Some(a) => {
+            binds.push(SqlValue::Text(a.to_string()));
+            clauses.push(format!("agent_id = ?{}", binds.len()));
+        }
+        None => {
+            clauses.push("agent_id IS NULL".to_string());
+        }
     }
-    if let Some(u) = user_id {
-        binds.push(SqlValue::Text(u.to_string()));
-        clauses.push(format!("user_id = ?{}", binds.len()));
+    match user_id {
+        Some(u) => {
+            binds.push(SqlValue::Text(u.to_string()));
+            clauses.push(format!("user_id = ?{}", binds.len()));
+        }
+        None => {
+            clauses.push("user_id IS NULL".to_string());
+        }
     }
 
     (clauses.join(" AND "), binds)
@@ -427,11 +462,7 @@ fn boxed_sql(v: SqlValue) -> Box<dyn ToSql> {
 /// falls back to `"User <action> <instance>"` when content is empty.
 /// Trims to [`SSU_CARD_MAX_ENTRY_CHARS`] with a trailing ellipsis on
 /// overflow.
-fn render_fact_line(
-    action: Option<&str>,
-    instance: Option<&str>,
-    content: Option<&str>,
-) -> String {
+fn render_fact_line(action: Option<&str>, instance: Option<&str>, content: Option<&str>) -> String {
     let content_trimmed = content.unwrap_or("").trim();
     let raw = if content_trimmed.is_empty() {
         let a = action.unwrap_or("").trim();
@@ -574,7 +605,11 @@ mod tests {
 
     #[test]
     fn render_fact_line_uses_content_when_present() {
-        let line = render_fact_line(Some("stated"), Some("budget"), Some("plans a trip to Iceland"));
+        let line = render_fact_line(
+            Some("stated"),
+            Some("budget"),
+            Some("plans a trip to Iceland"),
+        );
         assert_eq!(line, "User plans a trip to Iceland");
     }
 
@@ -586,7 +621,11 @@ mod tests {
 
     #[test]
     fn render_fact_line_does_not_double_prefix() {
-        let line = render_fact_line(Some("stated"), None, Some("User completed sourdough baking"));
+        let line = render_fact_line(
+            Some("stated"),
+            None,
+            Some("User completed sourdough baking"),
+        );
         assert_eq!(line, "User completed sourdough baking");
     }
 
@@ -602,17 +641,38 @@ mod tests {
         let conn = make_test_conn();
         let ns = Uuid::new_v4().to_string();
         // 3 sessions on 3 distinct days.
-        insert(&conn, &ns, None, None, Some("stated"), None, Some("plans a trip to Iceland"), Some("2024-01-01T10:00:00Z"));
-        insert(&conn, &ns, None, None, Some("has"), None, Some("a sourdough starter"), Some("2024-01-02T10:00:00Z"));
-        insert(&conn, &ns, None, None, Some("lives"), None, Some("in Seattle"), Some("2024-01-03T10:00:00Z"));
-        let card = build_card_from_conn(
+        insert(
             &conn,
-            3,
-            Uuid::parse_str(&ns).unwrap(),
+            &ns,
             None,
             None,
-        )
-        .expect("non-empty card");
+            Some("stated"),
+            None,
+            Some("plans a trip to Iceland"),
+            Some("2024-01-01T10:00:00Z"),
+        );
+        insert(
+            &conn,
+            &ns,
+            None,
+            None,
+            Some("has"),
+            None,
+            Some("a sourdough starter"),
+            Some("2024-01-02T10:00:00Z"),
+        );
+        insert(
+            &conn,
+            &ns,
+            None,
+            None,
+            Some("lives"),
+            None,
+            Some("in Seattle"),
+            Some("2024-01-03T10:00:00Z"),
+        );
+        let card = build_card_from_conn(&conn, 3, Uuid::parse_str(&ns).unwrap(), None, None)
+            .expect("non-empty card");
         assert!(card.contains(SSU_CARD_HEADER));
         assert!(card.contains(SSU_CARD_FOOTER));
         assert!(card.contains("plans a trip to Iceland"));

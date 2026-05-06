@@ -191,14 +191,7 @@ fn returns_none_when_no_entity_crosses_sessions() {
         None,
     );
 
-    let out = MultiSessionCard::new().build(
-        "any query",
-        backend.as_ref(),
-        ns,
-        None,
-        None,
-        None,
-    );
+    let out = MultiSessionCard::new().build("any query", backend.as_ref(), ns, None, None, None);
     assert!(
         out.is_none(),
         "single-session-only entities must yield None (defer-on-failure), got: {out:?}"
@@ -216,17 +209,38 @@ fn single_session_entities_are_filtered_out() {
     let seed = Connection::open(&db_path).unwrap();
     // Cross-session: Bob across 2 days.
     insert_obs(
-        &seed, &ns_str, "person", "Bob", "discussed", "intro",
-        Some("2023-03-01"), None, None,
+        &seed,
+        &ns_str,
+        "person",
+        "Bob",
+        "discussed",
+        "intro",
+        Some("2023-03-01"),
+        None,
+        None,
     );
     insert_obs(
-        &seed, &ns_str, "person", "Bob", "discussed", "followup",
-        Some("2023-03-15"), None, None,
+        &seed,
+        &ns_str,
+        "person",
+        "Bob",
+        "discussed",
+        "followup",
+        Some("2023-03-15"),
+        None,
+        None,
     );
     // Single-session: Carol on one day only.
     insert_obs(
-        &seed, &ns_str, "person", "Carol", "mentioned", "one-off",
-        Some("2023-03-20"), None, None,
+        &seed,
+        &ns_str,
+        "person",
+        "Carol",
+        "mentioned",
+        "one-off",
+        Some("2023-03-20"),
+        None,
+        None,
     );
 
     let out = MultiSessionCard::new()
@@ -256,16 +270,26 @@ fn cap_truncates_to_requested_size() {
         let inst = format!("entity_{i:02}");
         // Two distinct date-day buckets per entity → cross-session.
         insert_obs(
-            &seed, &ns_str, "topic", &inst, "discussed",
+            &seed,
+            &ns_str,
+            "topic",
+            &inst,
+            "discussed",
             "first mention",
             Some(&format!("2023-04-{:02}T00:00:00Z", i + 1)),
-            None, None,
+            None,
+            None,
         );
         insert_obs(
-            &seed, &ns_str, "topic", &inst, "discussed",
+            &seed,
+            &ns_str,
+            "topic",
+            &inst,
+            "discussed",
             "second mention",
             Some(&format!("2023-05-{:02}T00:00:00Z", i + 1)),
-            None, None,
+            None,
+            None,
         );
     }
 
@@ -295,21 +319,49 @@ fn scope_filter_partitions_by_agent_user_pair() {
     let seed = Connection::open(&db_path).unwrap();
     // U1 entity — cross-session.
     insert_obs(
-        &seed, &ns_str, "person", "U1Alice", "discussed", "u1 first",
-        Some("2023-06-01"), Some(&agent.to_string()), Some(&user1.to_string()),
+        &seed,
+        &ns_str,
+        "person",
+        "U1Alice",
+        "discussed",
+        "u1 first",
+        Some("2023-06-01"),
+        Some(&agent.to_string()),
+        Some(&user1.to_string()),
     );
     insert_obs(
-        &seed, &ns_str, "person", "U1Alice", "discussed", "u1 second",
-        Some("2023-06-15"), Some(&agent.to_string()), Some(&user1.to_string()),
+        &seed,
+        &ns_str,
+        "person",
+        "U1Alice",
+        "discussed",
+        "u1 second",
+        Some("2023-06-15"),
+        Some(&agent.to_string()),
+        Some(&user1.to_string()),
     );
     // U2 entity — also cross-session, but under a different user.
     insert_obs(
-        &seed, &ns_str, "person", "U2Bob", "discussed", "u2 first",
-        Some("2023-06-02"), Some(&agent.to_string()), Some(&user2.to_string()),
+        &seed,
+        &ns_str,
+        "person",
+        "U2Bob",
+        "discussed",
+        "u2 first",
+        Some("2023-06-02"),
+        Some(&agent.to_string()),
+        Some(&user2.to_string()),
     );
     insert_obs(
-        &seed, &ns_str, "person", "U2Bob", "discussed", "u2 second",
-        Some("2023-06-16"), Some(&agent.to_string()), Some(&user2.to_string()),
+        &seed,
+        &ns_str,
+        "person",
+        "U2Bob",
+        "discussed",
+        "u2 second",
+        Some("2023-06-16"),
+        Some(&agent.to_string()),
+        Some(&user2.to_string()),
     );
 
     let card = MultiSessionCard::new();
