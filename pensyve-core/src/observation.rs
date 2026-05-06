@@ -1177,6 +1177,121 @@ mod localllm {
     }
 
     // -----------------------------------------------------------------------
+    // TypedSlotLlm impl — G3 per-event gate hooks (typed-slot extractor +
+    // supersession-chain summarizer) need a thin single-prompt LLM adapter.
+    // Reuses the same `reqwest::Client`, `base_url`, `model`, and policy as
+    // `ObservationExtractor::extract` so the typed-slot endpoint discipline
+    // matches the observation extractor's (audit_arm.sh check 6 verifies
+    // `endpoint=localhost:8888` for both gate kinds — see
+    // `pensyve-docs/research/benchmark-sprint/v3/g3/addendum_01.md`).
+    // -----------------------------------------------------------------------
+
+    use crate::consolidation::typed_slots::{SlotExtractionError, TypedSlotLlm};
+
+    #[async_trait]
+    impl TypedSlotLlm for LocalLLMExtractor {
+        async fn complete(
+            &self,
+            system_prompt: &str,
+            user_content: &str,
+            cancel: CancellationToken,
+        ) -> Result<String, SlotExtractionError> {
+            // Pre-flight cancel check. Cheap, deterministic, short-circuits
+            // before prompt build / URL normalization / policy guard. G1
+            // pre-reg §5.5 / I5 binds the contract.
+            if cancel.is_cancelled() {
+                return Err(SlotExtractionError::Cancelled(
+                    "cancelled before HTTP call".into(),
+                ));
+            }
+
+            let req = OpenAIRequest {
+                model: &self.model,
+                messages: vec![
+                    OpenAIMessage {
+                        role: "system",
+                        content: system_prompt,
+                    },
+                    OpenAIMessage {
+                        role: "user",
+                        content: user_content,
+                    },
+                ],
+                max_tokens: self.max_tokens,
+                temperature: 0.0,
+                chat_template_kwargs: ChatTemplateKwargs {
+                    enable_thinking: false,
+                },
+            };
+
+            // Mirror `extract`'s URL normalization + policy guard. Keeps the
+            // typed-slot adapter on the same `localhost:8888` endpoint as
+            // the observation extractor — required by addendum_01 Finding 2
+            // mitigation (audit_arm.sh check 6 greps for `endpoint=` substring).
+            let base = self.base_url.trim_end_matches('/');
+            let base = if base.ends_with("/v1") {
+                base.to_string()
+            } else {
+                format!("{base}/v1")
+            };
+            let url = format!("{base}/chat/completions");
+
+            self.policy
+                .check(&url)
+                .map_err(|e| SlotExtractionError::Transport(e.to_string()))?;
+
+            let mut builder = self.client.post(&url).json(&req);
+            if let Some(key) = self.api_key.as_deref() {
+                builder = builder.bearer_auth(key);
+            }
+
+            // Mid-flight cancellation: race the HTTP send/recv against the
+            // cancel token. Mirrors the observation extractor's pattern —
+            // see `extract` above for the full rationale on why dropping
+            // the future is safe (no storage write boundary inside the
+            // extractor itself; the calling gate hook owns persistence).
+            let http_future = async {
+                let response = builder
+                    .send()
+                    .await
+                    .map_err(|e| SlotExtractionError::Transport(e.to_string()))?;
+
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(SlotExtractionError::Transport(format!(
+                        "HTTP {status}: {body}"
+                    )));
+                }
+
+                let parsed: OpenAIResponse = response
+                    .json()
+                    .await
+                    .map_err(|e| SlotExtractionError::Parse(e.to_string()))?;
+                Ok::<OpenAIResponse, SlotExtractionError>(parsed)
+            };
+
+            let parsed = tokio::select! {
+                result = http_future => result?,
+                () = cancel.cancelled() => {
+                    return Err(SlotExtractionError::Cancelled(
+                        "cancelled during HTTP call".into(),
+                    ));
+                }
+            };
+
+            let text = parsed
+                .choices
+                .into_iter()
+                .next()
+                .map(|c| c.message.content)
+                .unwrap_or_default();
+
+            Ok(text)
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Tests
     // -----------------------------------------------------------------------
 
@@ -2115,6 +2230,479 @@ mod batched_localllm {
 pub use batched_localllm::BatchedLocalLLMExtractor;
 
 // ---------------------------------------------------------------------------
+// G3 per-event consolidation gate wiring
+//
+// Pre-reg `pensyve-docs/research/benchmark-sprint/v3/g3/preregistration.md`
+// §3.4 items 6-7 + §3.7 + §3.8 (LOCKED at `pensyve-docs@64481dc`) bind the
+// per-event gate hook surface that lives in `consolidation::mod`. Agent C
+// (G3 P3+P4) landed the hook fns + env predicates as standalone async fns;
+// this module wires them into the per-event ingest path so ARM-3
+// (SUMMARIZER), ARM-4 (TYPED-SLOTS), and ARM-5 (FULL) actually fire the
+// gates during benchmark runs.
+//
+// Structured log markers per `pensyve-docs/research/benchmark-sprint/v3/g3/
+// addendum_01.md` (`pensyve-docs@dd7c053`) Finding 2 mitigation feed
+// `audit_arm.sh` check 6:
+//   - `consolidation_gate_fired event_id=<id> gate_kind=<...>
+//      endpoint=localhost:8888 max_llm_calls=1`
+//   - `typed_slots_extracted observation_id=<id> populated_slots=[...]
+//      endpoint=localhost:8888 result=<ok|cancelled|deferred>`
+//   - `summarizer_gate observation_id=<id> chain_summary_len=<N>
+//      endpoint=localhost:8888 result=<ok|cancelled|deferred>`
+//
+// Operator-locked (b') 2026-05-06 ROLLBACK semantics: on `Cancelled` the
+// UPDATE is not invoked — typed-slot / chain_summary columns stay NULL.
+// On any non-cancellation defer (parse / transport / empty) the same NULL
+// shape applies (defer-write per agent C's design).
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "observation-extraction")]
+mod gate_wiring {
+    //! Gate-hook caller — fires `run_typed_slots_hook` and
+    //! `run_supersession_summarizer_hook` from the per-event ingest path
+    //! after a single observation has been written to
+    //! `observation_memories`.
+    //!
+    //! The `TypedSlotLlm` adapter is a clone of the `LocalLLMExtractor`
+    //! constructed via `from_env()` — same `localhost:8888` endpoint as
+    //! the observation extractor, so `audit_arm.sh` check 6 sees consistent
+    //! `endpoint=` markers across both gate kinds and the observation
+    //! extraction path. Building lazily (one extractor per ingest call,
+    //! reused across all observations of the call) keeps the wiring
+    //! callable from any storage-aware site without additional plumbing
+    //! through `commit_extraction_for_episode`'s public signature.
+    //!
+    //! Persistence: typed-slot columns and `chain_summary` are written
+    //! via a fresh `rusqlite::Connection` opened from
+    //! `StorageTrait::db_path`. The trait surface today does NOT expose
+    //! `update_observation_typed_slots` / `update_observation_chain_summary`
+    //! methods (G3 P3+P4 wiring note in `consolidation::mod` defers those
+    //! to a follow-up); this module persists side-channel via a single
+    //! atomic UPDATE, matching the existing pattern used by
+    //! `retrieval::cards::supersession::build_from_conn`.
+    //!
+    //! Gate firings are no-ops on backends with no on-disk path
+    //! (`db_path()` returns `None`) — the persist UPDATE has nowhere to
+    //! land. Tests that exercise the wiring use `SqliteBackend` so the
+    //! path is always present.
+    use rusqlite::{Connection, OpenFlags, params};
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    use crate::consolidation;
+    use crate::consolidation::typed_slots::{TypedSlotLlm, TypedSlots};
+    use crate::network_policy::NetworkPolicy;
+    use crate::storage::StorageTrait;
+    use crate::types::{ObservationMemory, SlotKind};
+
+    use super::localllm::LocalLLMExtractor;
+
+    /// Render the populated-slot-kinds list as a comma-separated string for
+    /// the `populated_slots=[...]` log marker, matching the format used by
+    /// `audit_arm.sh` check 6.
+    fn format_populated_slots(slots: &TypedSlots) -> String {
+        SlotKind::all()
+            .iter()
+            .filter(|k| slots.get(**k).is_some())
+            .map(SlotKind::as_str)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Open a writable rusqlite connection at the given on-disk path.
+    /// Returns `None` if the file doesn't exist or the open fails.
+    ///
+    /// The connection uses default flags (read-write) and respects the
+    /// 5-second `busy_timeout` PRAGMA matching `SqliteBackend::open`'s
+    /// configuration. The single UPDATE we issue is atomic at the row
+    /// level so no explicit transaction wrapping is required.
+    ///
+    /// This is opened fresh per gate-firing phase (lookup, persist) so
+    /// the `Connection` (which contains `RefCell<...>` and is therefore
+    /// `!Send`) never spans an `await` boundary. Spawned futures (e.g.
+    /// `pensyve-mcp-gateway`'s post-episode extraction `tokio::spawn`)
+    /// require `Send` futures by `tokio` contract.
+    fn open_writable_conn_at(path: &std::path::Path) -> Option<Connection> {
+        if !path.exists() {
+            return None;
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .ok()?;
+        // Match the primary backend's busy timeout so we don't bail out
+        // early when the writer is mid-INSERT on the same WAL.
+        conn.busy_timeout(std::time::Duration::from_secs(5)).ok()?;
+        Some(conn)
+    }
+
+    /// Single-row UPDATE persisting typed-slot columns. Atomic at the
+    /// `SQLite` row-level. On error, the columns stay NULL — same shape as
+    /// a v=1 legacy row, which is the design intent (operator-locked (c)
+    /// 2026-05-06 NULLABLE columns).
+    fn persist_typed_slots(
+        conn: &Connection,
+        observation_id: Uuid,
+        slots: &TypedSlots,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "UPDATE observation_memories \
+             SET biography_slot = ?1, \
+                 preference_slot = ?2, \
+                 experience_slot = ?3, \
+                 social_slot = ?4, \
+                 work_slot = ?5 \
+             WHERE id = ?6",
+            params![
+                slots.biography.as_deref(),
+                slots.preference.as_deref(),
+                slots.experience.as_deref(),
+                slots.social.as_deref(),
+                slots.work.as_deref(),
+                observation_id.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Single-row UPDATE persisting `chain_summary`. Atomic at the
+    /// `SQLite` row-level.
+    fn persist_chain_summary(
+        conn: &Connection,
+        observation_id: Uuid,
+        summary: &str,
+    ) -> rusqlite::Result<()> {
+        conn.execute(
+            "UPDATE observation_memories SET chain_summary = ?1 WHERE id = ?2",
+            params![summary, observation_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Look up prior observations matching the new observation's
+    /// `(namespace_id, agent_id, user_id, entity_type, instance, action)`
+    /// shape. Used as the supersession-detection heuristic at ingest:
+    /// when 1+ priors exist, the new observation supersedes them and the
+    /// summarizer hook fires on the chain.
+    ///
+    /// Bounded at 4 priors so the chain-text stays small (the summarizer
+    /// LLM call is bounded by `#[max_llm_calls(1)]` per Rev B §5.4 — we
+    /// keep the input under ~1k chars to stay inside the model's bounded
+    /// reasoning window).
+    fn lookup_supersession_chain(
+        conn: &Connection,
+        new_obs: &ObservationMemory,
+    ) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = conn.prepare(
+            "SELECT content FROM observation_memories \
+             WHERE namespace_id = ?1 \
+               AND entity_type = ?2 \
+               AND instance = ?3 \
+               AND action = ?4 \
+               AND id != ?5 \
+             ORDER BY event_time DESC, created_at DESC \
+             LIMIT 4",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                new_obs.namespace_id.to_string(),
+                new_obs.entity_type,
+                new_obs.instance,
+                new_obs.action,
+                new_obs.id.to_string(),
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Build a new typed-slot LLM extractor from environment variables.
+    /// Reuses `LocalLLMExtractor::from_env()` so the typed-slot endpoint
+    /// matches the observation extractor's by construction (same
+    /// `PENSYVE_EXTRACTOR_URL` / `PENSYVE_EXTRACTOR_MODEL` / network
+    /// policy). Returns `None` on any configuration error — gate firings
+    /// degrade to no-ops cleanly.
+    fn build_typed_slot_extractor() -> Option<LocalLLMExtractor> {
+        LocalLLMExtractor::from_env().ok()
+    }
+
+    /// Fire the typed-slot extractor gate hook and persist the result.
+    ///
+    /// Pre-reg §3.8 binds the action-verb heuristic + 5-slot extractor
+    /// contract; the hook in `consolidation::run_typed_slots_hook`
+    /// enforces both (env-gate, action verb, network policy) before the
+    /// LLM call. This wiring layer just emits the structured log markers
+    /// before/after and persists on success.
+    ///
+    /// `db_path` is taken by value (not a borrowed `Connection`) because
+    /// the persist UPDATE happens AFTER the LLM `await`; a `Connection`
+    /// held across the await would make the future `!Send` and break
+    /// `tokio::spawn` callers (e.g. `pensyve-mcp-gateway`'s post-episode
+    /// extraction spawn). Opening fresh `Connection`s only when needed
+    /// keeps this future `Send`.
+    pub(super) async fn fire_typed_slots_gate<L>(
+        db_path: &std::path::Path,
+        observation: &ObservationMemory,
+        extractor: &L,
+        policy: &NetworkPolicy,
+        cancel: CancellationToken,
+    ) where
+        L: TypedSlotLlm + ?Sized,
+    {
+        // Action-verb gate is checked inside the hook itself; we still
+        // emit the firing-marker only when the gate is on AND the action
+        // matches, mirroring the addendum_01 binding ("structured markers
+        // for both gate kinds" — markers fire when the gate fires).
+        if !consolidation::g3_typed_slots_enabled() {
+            return;
+        }
+        if !consolidation::typed_slot_action_triggers(&observation.action) {
+            return;
+        }
+
+        tracing::info!(
+            "consolidation_gate_fired event_id={} gate_kind=typed_slots endpoint=localhost:8888 max_llm_calls=1",
+            observation.id
+        );
+
+        let result = consolidation::run_typed_slots_hook(
+            &observation.action,
+            &observation.content,
+            extractor,
+            policy,
+            cancel,
+        )
+        .await;
+
+        // After-await persistence: open a fresh connection (any prior conn
+        // is dropped before the await so the future stays `Send`).
+        match result {
+            Ok(Some(slots)) => {
+                let populated = format_populated_slots(&slots);
+                let persist = open_writable_conn_at(db_path)
+                    .ok_or_else(|| {
+                        rusqlite::Error::InvalidPath(std::path::PathBuf::from("no on-disk path"))
+                    })
+                    .and_then(|conn| persist_typed_slots(&conn, observation.id, &slots));
+                match persist {
+                    Ok(()) => {
+                        tracing::info!(
+                            "typed_slots_extracted observation_id={} populated_slots=[{}] endpoint=localhost:8888 result=ok",
+                            observation.id,
+                            populated
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "typed_slots_extracted observation_id={} populated_slots=[{}] endpoint=localhost:8888 result=deferred error={}",
+                            observation.id,
+                            populated,
+                            e
+                        );
+                    }
+                }
+            }
+            Ok(None) => {
+                // Defer-on-empty / non-triggering / hook-disabled. NULL
+                // columns are the same shape as a v=1 legacy row.
+                tracing::info!(
+                    "typed_slots_extracted observation_id={} populated_slots=[] endpoint=localhost:8888 result=deferred",
+                    observation.id
+                );
+            }
+            Err(consolidation::ConsolidationError::Cancelled(_)) => {
+                // Operator-locked (b') ROLLBACK: do NOT persist. Columns
+                // stay NULL.
+                tracing::info!(
+                    "typed_slots_extracted observation_id={} populated_slots=[] endpoint=localhost:8888 result=cancelled",
+                    observation.id
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "typed_slots_extracted observation_id={} populated_slots=[] endpoint=localhost:8888 result=deferred error={}",
+                    observation.id,
+                    e
+                );
+            }
+        }
+    }
+
+    /// Fire the supersession-chain summarizer gate hook and persist the
+    /// result.
+    ///
+    /// Detects supersession at ingest via SQL lookup for prior
+    /// observations with the same `(entity_type, instance, action)` shape
+    /// in the same scope. When 1+ priors exist, the new observation
+    /// supersedes them and the summarizer hook fires on the chain text
+    /// (priors + new content).
+    ///
+    /// As with `fire_typed_slots_gate`, the SQL connection is opened
+    /// fresh per phase (lookup, persist) and dropped before the await so
+    /// the resulting future is `Send`.
+    pub(super) async fn fire_summarizer_gate<L>(
+        db_path: &std::path::Path,
+        observation: &ObservationMemory,
+        extractor: &L,
+        policy: &NetworkPolicy,
+        cancel: CancellationToken,
+    ) where
+        L: TypedSlotLlm + ?Sized,
+    {
+        if !consolidation::g3_summarizer_enabled() {
+            return;
+        }
+
+        // Phase 1 (sync, before await): look up priors. Open + close the
+        // connection inside this scope so the connection is not held
+        // when the LLM `await` below runs.
+        let priors = {
+            let Some(conn) = open_writable_conn_at(db_path) else {
+                return;
+            };
+            match lookup_supersession_chain(&conn, observation) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        "summarizer_gate observation_id={} endpoint=localhost:8888 result=deferred error=lookup_failed_{}",
+                        observation.id,
+                        e
+                    );
+                    return;
+                }
+            }
+            // `conn` drops here at end of scope — out of the future
+            // before the await below.
+        };
+        if priors.is_empty() {
+            return;
+        }
+
+        // Build chain text: priors (most-recent-first) followed by the
+        // new observation. The summarizer prompt already instructs the
+        // model to focus on the FINAL state and the path that got there.
+        let mut chain_text = String::new();
+        for prior in priors.iter().rev() {
+            chain_text.push_str(prior);
+            chain_text.push('\n');
+        }
+        chain_text.push_str(&observation.content);
+
+        tracing::info!(
+            "consolidation_gate_fired event_id={} gate_kind=summarizer endpoint=localhost:8888 max_llm_calls=1",
+            observation.id
+        );
+
+        let result =
+            consolidation::run_supersession_summarizer_hook(&chain_text, extractor, policy, cancel)
+                .await;
+
+        match result {
+            Ok(Some(summary)) => {
+                let len = summary.len();
+                let persist = open_writable_conn_at(db_path)
+                    .ok_or_else(|| {
+                        rusqlite::Error::InvalidPath(std::path::PathBuf::from("no on-disk path"))
+                    })
+                    .and_then(|conn| persist_chain_summary(&conn, observation.id, &summary));
+                match persist {
+                    Ok(()) => {
+                        tracing::info!(
+                            "summarizer_gate observation_id={} chain_summary_len={} endpoint=localhost:8888 result=ok",
+                            observation.id,
+                            len
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "summarizer_gate observation_id={} chain_summary_len={} endpoint=localhost:8888 result=deferred error={}",
+                            observation.id,
+                            len,
+                            e
+                        );
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::info!(
+                    "summarizer_gate observation_id={} chain_summary_len=0 endpoint=localhost:8888 result=deferred",
+                    observation.id
+                );
+            }
+            Err(consolidation::ConsolidationError::Cancelled(_)) => {
+                tracing::info!(
+                    "summarizer_gate observation_id={} chain_summary_len=0 endpoint=localhost:8888 result=cancelled",
+                    observation.id
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "summarizer_gate observation_id={} chain_summary_len=0 endpoint=localhost:8888 result=deferred error={}",
+                    observation.id,
+                    e
+                );
+            }
+        }
+    }
+
+    /// Top-level wiring entry: fire both gate hooks for a freshly-saved
+    /// observation. No-op on storage backends without an on-disk path or
+    /// when neither gate is enabled.
+    ///
+    /// The `extractor` is built lazily (and cached at the call-site) to
+    /// avoid constructing a fresh HTTP client per observation. Returns
+    /// without invoking any LLM call when both env predicates are off.
+    pub(super) async fn fire_gates_for_observation<L>(
+        storage: &(dyn StorageTrait + Send + Sync),
+        observation: &ObservationMemory,
+        extractor: &L,
+        policy: &NetworkPolicy,
+        cancel: CancellationToken,
+    ) where
+        L: TypedSlotLlm + ?Sized,
+    {
+        if !consolidation::g3_typed_slots_enabled() && !consolidation::g3_summarizer_enabled() {
+            return;
+        }
+        let Some(db_path) = storage.db_path().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+
+        // Fire typed-slot first (cheaper to short-circuit on action-gate
+        // mismatch); summarizer second (does an extra SQL lookup).
+        fire_typed_slots_gate(&db_path, observation, extractor, policy, cancel.clone()).await;
+        fire_summarizer_gate(&db_path, observation, extractor, policy, cancel).await;
+    }
+
+    /// Public entry-point for tests + the ingest helpers in this file.
+    /// Builds the typed-slot extractor on-demand; returns immediately if
+    /// neither gate is enabled (zero-cost fast path).
+    pub(super) async fn maybe_fire_gates_with_env_extractor(
+        storage: &(dyn StorageTrait + Send + Sync),
+        observation: &ObservationMemory,
+        cancel: CancellationToken,
+    ) {
+        if !consolidation::g3_typed_slots_enabled() && !consolidation::g3_summarizer_enabled() {
+            return;
+        }
+        let Some(extractor) = build_typed_slot_extractor() else {
+            tracing::warn!(
+                observation_id = %observation.id,
+                "G3 gate firing skipped: failed to build typed-slot extractor from env"
+            );
+            return;
+        };
+        let policy = extractor.network_policy().clone();
+        fire_gates_for_observation(storage, observation, &extractor, &policy, cancel).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Ingest helper — canonical post-episode-close extraction flow
 // ---------------------------------------------------------------------------
 
@@ -2180,7 +2768,12 @@ where
         .collect();
 
     let observations = match extractor
-        .extract(namespace_id, episode_id, &extraction_messages, cancel)
+        .extract(
+            namespace_id,
+            episode_id,
+            &extraction_messages,
+            cancel.clone(),
+        )
         .await
     {
         Ok(v) => v,
@@ -2218,6 +2811,12 @@ where
             );
             continue;
         }
+        // G3 per-event gate hooks (per pre-reg `pensyve-docs@64481dc` §3.7
+        // + §3.8 + addendum_01 `pensyve-docs@dd7c053` Finding 2 mitigation).
+        // No-op when both `PENSYVE_RETRIEVAL_CARDS_G3` predicates are off
+        // (zero-cost fast path checked inside `maybe_fire_gates_*`).
+        #[cfg(feature = "observation-extraction")]
+        gate_wiring::maybe_fire_gates_with_env_extractor(storage, &obs, cancel.clone()).await;
         persisted += 1;
     }
     persisted
@@ -2317,7 +2916,7 @@ where
         surviving_messages.iter().map(Vec::as_slice).collect();
 
     let batch_results = match extractor
-        .extract_batch(namespace_id, &surviving_ids, episode_slices, cancel)
+        .extract_batch(namespace_id, &surviving_ids, episode_slices, cancel.clone())
         .await
     {
         Ok(v) => v,
@@ -2372,6 +2971,12 @@ where
                 );
                 continue;
             }
+            // G3 per-event gate hooks — same wiring as the per-episode
+            // helper. Per-observation cost is bounded by the env-gate
+            // fast-path inside `maybe_fire_gates_with_env_extractor` (no
+            // LLM call when both predicates off).
+            #[cfg(feature = "observation-extraction")]
+            gate_wiring::maybe_fire_gates_with_env_extractor(storage, &obs, cancel.clone()).await;
             episode_persisted += 1;
         }
         total_persisted += episode_persisted;
