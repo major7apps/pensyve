@@ -24,6 +24,7 @@
 //! continue to work unchanged after the directory split.
 
 pub mod cards;
+pub mod diversity;
 pub mod engine;
 pub mod intent_router;
 

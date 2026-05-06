@@ -470,8 +470,25 @@ impl<'a> RecallEngine<'a> {
         let timeout = std::time::Duration::from_secs(self.config.recall_timeout_secs);
         let max_candidates = self.config.max_candidates;
 
-        // Steps 1–4: embed, search, merge candidates.
+        // G3-P5: read MMR lambda once up front so we know whether to retain
+        // the query embedding for diversity reranking. When unset/<=0.0 the
+        // recall path is byte-for-byte identical to G2 (default-OFF).
+        let mmr_lambda: Option<f32> = std::env::var("PENSYVE_MMR_LAMBDA")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .map(|v| v.clamp(0.0, 1.0))
+            .filter(|&v| v > 0.0);
+
+        // Steps 1–4: embed, search, merge candidates. We capture the query
+        // embedding into `query_embedding_owned` only when MMR is active so
+        // the optional rerank at the tail can reuse it without re-embedding.
+        // Capture is gated on `mmr_lambda.is_some()` so default-OFF stays
+        // zero-overhead.
+        let mut query_embedding_owned: Option<Vec<f32>> = None;
         let (candidates, vector_map) = if let Some(emb) = pre_embedding {
+            if mmr_lambda.is_some() {
+                query_embedding_owned = Some(emb.to_vec());
+            }
             if target_entity.is_some() {
                 self.gather_candidates_dual_path(
                     emb,
@@ -483,19 +500,36 @@ impl<'a> RecallEngine<'a> {
             } else {
                 self.gather_candidates_with_embedding(emb, query, namespace_id, max_candidates)?
             }
-        } else {
-            if target_entity.is_some() {
-                let query_embedding = self.embedder.embed(query)?;
-                self.gather_candidates_dual_path(
-                    &query_embedding,
-                    query,
-                    namespace_id,
-                    max_candidates,
-                    target_entity,
-                )?
-            } else {
-                self.gather_candidates(query, namespace_id, max_candidates)?
+        } else if target_entity.is_some() {
+            let query_embedding = self.embedder.embed(query)?;
+            let result = self.gather_candidates_dual_path(
+                &query_embedding,
+                query,
+                namespace_id,
+                max_candidates,
+                target_entity,
+            )?;
+            if mmr_lambda.is_some() {
+                query_embedding_owned = Some(query_embedding);
             }
+            result
+        } else if mmr_lambda.is_some() {
+            // Same as gather_candidates(...), inlined here so we can keep
+            // the query embedding around for MMR without changing the
+            // gather_candidates signature. Only taken on the MMR-active
+            // path; default-OFF still routes through gather_candidates and
+            // pays the original cost.
+            let query_embedding = self.embedder.embed(query)?;
+            let result = self.gather_candidates_with_embedding(
+                &query_embedding,
+                query,
+                namespace_id,
+                max_candidates,
+            )?;
+            query_embedding_owned = Some(query_embedding);
+            result
+        } else {
+            self.gather_candidates(query, namespace_id, max_candidates)?
         };
 
         if candidates.is_empty() {
@@ -729,6 +763,16 @@ impl<'a> RecallEngine<'a> {
         }
 
         scored.truncate(limit);
+
+        // G3-P5: optional MMR diversity rerank, BEFORE card prepend.
+        // Operator-locked decision (a') 2026-05-06: cards see the
+        // diversity-reordered observations, so MMR runs here at the recall
+        // tail. Default-OFF: only fires when PENSYVE_MMR_LAMBDA is set
+        // and > 0.0, preserving G2 byte-for-byte parity for ARM-1-G3-BASELINE
+        // through ARM-4-TYPED-SLOTS. ARM-5-G3-FULL sets λ=0.5.
+        if let (Some(lambda), Some(qvec)) = (mmr_lambda, query_embedding_owned.as_deref()) {
+            scored = crate::retrieval::diversity::rerank_mmr(scored, qvec, lambda, limit);
+        }
 
         // Step 9: Retrieval-induced reinforcement.
         self.apply_reinforcement(&scored);
