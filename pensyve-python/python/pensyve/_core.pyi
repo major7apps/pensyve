@@ -186,6 +186,66 @@ class Pensyve:
         """
         ...
 
+    def build_retrieval_card_g3(
+        self,
+        db_path: str,
+        question_type: str,
+        g2_cards: list[str],
+        g3_features: list[str],
+    ) -> str | None:
+        """G3 retrieval-card composition (binding pre-reg
+        ``pensyve-docs@64481dc`` §3.4 item 11 + §7 item 11).
+
+        Builds the G3 ``CompositeCard`` against an external SQLite store
+        and returns the synthesized card text (English prose, possibly
+        multi-section joined with ``\\n\\n``), or ``None`` when every
+        selected card defers.
+
+        Args:
+            db_path: Path to a Pensyve SQLite store. May be the directory
+                containing ``memories.db`` OR the file itself; both shapes
+                are normalized to the directory before opening.
+            question_type: LongMemEval question_type string (e.g.
+                ``"single-session-preference"``, ``"multi-session"``).
+                Threaded into each card's ``build()`` call.
+            g2_cards: G2 base composition; subset of
+                ``["peer", "ms", "ssu"]``. Order does not matter (the G2
+                priority order is fixed).
+            g3_features: G3 layering knobs; subset of
+                ``["router", "summarizer", "typed_slots", "diversity"]``.
+                Translated to the ``PENSYVE_RETRIEVAL_CARDS_G3`` env-var
+                value: ``[]`` → unset (G2-equivalent baseline), single
+                feature → that feature's name, all four → ``"full"``.
+                ``"summarizer"`` additionally pulls ``SupersessionCard``
+                into the composite chain.
+        """
+        ...
+
+    def recall_with_diversity(
+        self,
+        query: str,
+        k: int = 22,
+        lambda_: float = 0.5,
+    ) -> list[Memory]:
+        """Recall with MMR diversity reorder (binding pre-reg
+        ``pensyve-docs@64481dc`` §3.4 item 11 + §7 item 11).
+
+        Sets ``PENSYVE_MMR_LAMBDA`` for the duration of this call so the
+        existing diversity reorder in ``RecallEngine`` activates, then
+        restores the prior env-var value on return (including panic /
+        exception unwind). Behaviorally identical to :meth:`recall` when
+        ``lambda_ <= 0.0``; reorders by ``lambda_·sim − (1−lambda_)·max_j sim``
+        otherwise.
+
+        Args:
+            query: Search query string.
+            k: Maximum number of results (default: 22).
+            lambda_: MMR balance, clamped to ``[0.0, 1.0]`` by the engine.
+                The Python kwarg uses a trailing underscore because
+                ``lambda`` is a reserved word.
+        """
+        ...
+
     def forget(
         self,
         entity: Entity,

@@ -13,6 +13,14 @@ use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::graph::MemoryGraph;
 use pensyve_core::recall_grouped::{OrderBy, RecallGroupedConfig};
 use pensyve_core::retrieval::RecallEngine;
+use pensyve_core::retrieval::cards::composite::{
+    G2_MULTI_SESSION_CARD_CAP, G2_PEER_CARD_CAP, G2_SINGLE_SESSION_USER_CARD_CAP,
+    G3_SUPERSESSION_CARD_CAP,
+};
+use pensyve_core::retrieval::cards::{
+    CompositeCard, MultiSessionCard, PeerCardAdapter, RetrievalCard, SingleSessionUserCard,
+    SupersessionCard,
+};
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::{self, EntityKind, EpisodicMemory, Namespace, Outcome, SemanticMemory};
@@ -63,6 +71,93 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySessionGroup>()?;
     m.add_function(wrap_pyfunction!(embedding_info, m)?)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// G3 env-var guards
+// ---------------------------------------------------------------------------
+
+/// Process-wide mutex serializing writes to `PENSYVE_RETRIEVAL_CARDS_G3` and
+/// `PENSYVE_MMR_LAMBDA`. Both env vars are read by retrieval-card and recall
+/// engine code at call time; the G3 `PyO3` bindings (`build_retrieval_card_g3`,
+/// `recall_with_diversity`) mutate them transiently for the duration of one
+/// call. Mirrors the `RouterEnvGuard` / `SsuEnvGuard` patterns already used in
+/// `pensyve-core/tests/test_intent_router.rs` + `tests/test_single_session_user_card.rs`.
+fn g3_env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// RAII guard that holds [`g3_env_lock`] for its lifetime, mutates a single
+/// env var to a target value (or removes it), and restores the prior value
+/// on drop — including on Rust panic / Python exception unwind paths.
+///
+/// `# Safety`: `std::env::set_var` / `remove_var` are flagged unsafe in
+/// modern Rust because env mutation is process-global and not thread-safe.
+/// This guard serializes all writers/readers behind [`g3_env_lock`] for the
+/// `pensyve-python` cdylib lifetime; concurrent G3 `PyO3` calls cannot race.
+struct G3EnvGuard {
+    _serial: std::sync::MutexGuard<'static, ()>,
+    key: &'static str,
+    previous: Option<String>,
+}
+
+#[allow(
+    unsafe_code,
+    reason = "G3 PyO3 binding scoped env-var guard; std::env::set_var / remove_var require unsafe in modern Rust because env mutation is process-global. The struct holds the process-wide g3_env_lock for its lifetime so concurrent calls cannot race."
+)]
+impl G3EnvGuard {
+    /// Acquire the lock, capture the previous value of `key`, set it to
+    /// `value`. The guard restores `previous` on drop.
+    fn set(key: &'static str, value: &str) -> Self {
+        let serial = g3_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var(key).ok();
+        // SAFETY: see struct doc; serialized via the mutex in `serial`.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self {
+            _serial: serial,
+            key,
+            previous,
+        }
+    }
+
+    /// Acquire the lock, capture the previous value of `key`, remove it.
+    /// The guard restores `previous` on drop.
+    fn unset(key: &'static str) -> Self {
+        let serial = g3_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var(key).ok();
+        // SAFETY: see struct doc.
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self {
+            _serial: serial,
+            key,
+            previous,
+        }
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "G3 PyO3 binding scoped env-var guard; see G3EnvGuard::set for justification"
+)]
+impl Drop for G3EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: drop runs while we still hold the serialization lock.
+        unsafe {
+            match &self.previous {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -934,6 +1029,278 @@ impl PyPensyve {
                     .collect(),
                 group_score: g.group_score,
             })
+            .collect())
+    }
+
+    /// G3 retrieval-card composition (binding pre-reg `pensyve-docs@64481dc`
+    /// §3.4 item 11 + §7 item 11).
+    ///
+    /// Builds the G3 [`CompositeCard`] against an external `SQLite` store
+    /// (the harness's per-question DB lives in a `TemporaryDirectory`).
+    /// `g3_features` is translated to the
+    /// [`pensyve_core::retrieval::cards::multi_session::RETRIEVAL_CARDS_G3_ENV`]
+    /// env-var value for the duration of this call; the env-var is restored
+    /// to its prior value on return (including panic / exception unwind).
+    ///
+    /// Args:
+    ///     `db_path`: Path to a Pensyve `SQLite` store. May be the directory
+    ///         containing `memories.db` OR the file itself; both shapes are
+    ///         normalized to the directory before opening
+    ///         [`SqliteBackend`].
+    ///     `question_type`: `LongMemEval` `question_type` string (e.g.
+    ///         `"single-session-preference"`, `"multi-session"`). Threaded
+    ///         to each card's `build()` call so the intent router and any
+    ///         future per-question-type cards can dispatch on it.
+    ///     `g2_cards`: G2 base composition. Subset of
+    ///         `["peer", "ms", "ssu"]`; the order does not matter (G2
+    ///         priority order is fixed). An empty list disables every G2
+    ///         card; the result is supersession-only (or `None` when the
+    ///         supersession card defers).
+    ///     `g3_features`: G3 layering knobs. Subset of
+    ///         `["router", "summarizer", "typed_slots", "diversity"]`.
+    ///         Translated to the env-var value:
+    ///         - `[]` → unset (G2-equivalent baseline; engine sees no env var)
+    ///         - `["router"]` → `"router"`
+    ///         - `["summarizer"]` → `"summarizer"`
+    ///         - `["typed_slots"]` → `"typed_slots"`
+    ///         - any superset of `{router, summarizer, typed_slots, diversity}`
+    ///           covering all four → `"full"` (operator-locked single-string
+    ///           encoding per §3.1).
+    ///         The `summarizer` feature additionally pulls
+    ///         [`SupersessionCard`] into the composite chain
+    ///         (otherwise it is omitted).
+    ///
+    /// Returns:
+    ///     The synthesized card text (English prose, possibly multi-section
+    ///     joined with `\n\n`), or `None` when every selected card defers.
+    #[pyo3(signature = (db_path, question_type, g2_cards, g3_features))]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+    fn build_retrieval_card_g3(
+        &self,
+        db_path: String,
+        question_type: String,
+        g2_cards: Vec<String>,
+        g3_features: Vec<String>,
+    ) -> PyResult<Option<String>> {
+        // Validate g2_cards membership.
+        for card in &g2_cards {
+            match card.as_str() {
+                "peer" | "ms" | "ssu" => {}
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "g2_cards element {other:?} is not recognized; expected subset of \
+                         [\"peer\", \"ms\", \"ssu\"]"
+                    )));
+                }
+            }
+        }
+        // Validate g3_features membership.
+        for feat in &g3_features {
+            match feat.as_str() {
+                "router" | "summarizer" | "typed_slots" | "diversity" => {}
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "g3_features element {other:?} is not recognized; expected subset of \
+                         [\"router\", \"summarizer\", \"typed_slots\", \"diversity\"]"
+                    )));
+                }
+            }
+        }
+
+        // Translate g3_features to PENSYVE_RETRIEVAL_CARDS_G3 env-var value
+        // per pre-reg §3.1 (single-string encoding). Any subset covering all
+        // four flags collapses to "full"; otherwise we emit the singleton
+        // value when exactly one feature is requested. Empty → unset.
+        let env_var_key = pensyve_core::retrieval::cards::multi_session::RETRIEVAL_CARDS_G3_ENV;
+        let env_value: Option<&str> = if g3_features.is_empty() {
+            None
+        } else {
+            let has_router = g3_features.iter().any(|f| f == "router");
+            let has_summ = g3_features.iter().any(|f| f == "summarizer");
+            let has_typed = g3_features.iter().any(|f| f == "typed_slots");
+            let has_div = g3_features.iter().any(|f| f == "diversity");
+            if has_router && has_summ && has_typed && has_div {
+                Some("full")
+            } else if has_router && !has_summ && !has_typed && !has_div {
+                Some("router")
+            } else if has_summ && !has_router && !has_typed && !has_div {
+                Some("summarizer")
+            } else if has_typed && !has_router && !has_summ && !has_div {
+                Some("typed_slots")
+            } else if has_div && !has_router && !has_summ && !has_typed {
+                // `diversity` alone has no card-side env-gate (MMR is wired
+                // via PENSYVE_MMR_LAMBDA in `recall_with_diversity`), so we
+                // leave the cards env-var unset for this combo. Caller
+                // typically pairs `diversity` with `recall_with_diversity`.
+                None
+            } else {
+                return Err(PyValueError::new_err(format!(
+                    "g3_features={g3_features:?} is not a recognized G3 layer combination; \
+                     expected one of: [], [\"router\"], [\"summarizer\"], [\"typed_slots\"], \
+                     [\"diversity\"], or [\"router\", \"summarizer\", \"typed_slots\", \"diversity\"] (full)"
+                )));
+            }
+        };
+
+        // Acquire the env-var guard. `_guard` keeps the env var set + the
+        // process-wide lock held for the full card-build call; `Drop`
+        // restores the prior value on every exit path.
+        let _guard = match env_value {
+            Some(v) => G3EnvGuard::set(env_var_key, v),
+            None => G3EnvGuard::unset(env_var_key),
+        };
+
+        // Normalize `db_path` into the directory expected by
+        // `SqliteBackend::open`. The harness sometimes passes the file path
+        // (`{tmp}/memories.db`); other callers pass the parent directory
+        // directly. Both shapes work.
+        let raw = PathBuf::from(&db_path);
+        let dir = if raw.is_file() || raw.extension().and_then(|s| s.to_str()) == Some("db") {
+            raw.parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or(raw)
+        } else {
+            raw
+        };
+
+        let backend = SqliteBackend::open(&dir).map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "Failed to open SQLite backend at {}: {e}",
+                dir.display()
+            ))
+        })?;
+
+        // Resolve the namespace. Prefer the same namespace the harness
+        // adapter uses ("longmemeval"); fall back to the handle's own
+        // namespace name; ultimately scan storage and use the first hit.
+        // Defer-on-failure: when no namespace exists we simply return None
+        // (every card would have nothing to scope by).
+        let ns_id_opt: Option<Uuid> = backend
+            .get_namespace_by_name("longmemeval")
+            .ok()
+            .flatten()
+            .map(|ns| ns.id)
+            .or_else(|| {
+                let handle_name = self.inner.namespace.name.clone();
+                backend
+                    .get_namespace_by_name(&handle_name)
+                    .ok()
+                    .flatten()
+                    .map(|ns| ns.id)
+            });
+
+        let Some(ns_id) = ns_id_opt else {
+            return Ok(None);
+        };
+
+        // Build the composite card chain. `g2_cards` chooses which G2 cards
+        // are present; `g3_features` containing "summarizer" pulls in the
+        // SupersessionCard. The G2 priority order (Peer → MS → SSU) is
+        // preserved regardless of the input list ordering — matches Rev C
+        // §3.1 + the operator §3.X(a) per-card cap layout.
+        let want_peer = g2_cards.iter().any(|c| c == "peer");
+        let want_ms = g2_cards.iter().any(|c| c == "ms");
+        let want_ssu = g2_cards.iter().any(|c| c == "ssu");
+        let want_supersession = g3_features.iter().any(|f| f == "summarizer");
+
+        let mut cards: Vec<(Box<dyn RetrievalCard>, usize)> = Vec::with_capacity(4);
+        if want_peer {
+            cards.push((Box::new(PeerCardAdapter::new()), G2_PEER_CARD_CAP));
+        }
+        if want_ms {
+            cards.push((Box::new(MultiSessionCard::new()), G2_MULTI_SESSION_CARD_CAP));
+        }
+        if want_ssu {
+            cards.push((
+                Box::new(SingleSessionUserCard::new()),
+                G2_SINGLE_SESSION_USER_CARD_CAP,
+            ));
+        }
+        if want_supersession {
+            cards.push((Box::new(SupersessionCard::new()), G3_SUPERSESSION_CARD_CAP));
+        }
+
+        if cards.is_empty() {
+            // No cards selected → no composition to build. Defer cleanly.
+            return Ok(None);
+        }
+
+        let composite = CompositeCard::new(cards);
+        // `query` is reserved for future per-card relevance scoring; G2/G3
+        // cards ignore it (see `RetrievalCard` trait docs). Empty string is
+        // explicitly allowed and matches the harness adapter's call
+        // pattern.
+        let qt: Option<&str> = if question_type.is_empty() {
+            None
+        } else {
+            Some(question_type.as_str())
+        };
+        Ok(composite.build(
+            "",
+            &backend as &dyn StorageTrait,
+            ns_id,
+            self.inner.agent_id.map(pensyve_core::types::AgentId::from),
+            self.inner.user_id.map(pensyve_core::types::UserId::from),
+            qt,
+        ))
+    }
+
+    /// Recall with MMR diversity reorder (binding pre-reg
+    /// `pensyve-docs@64481dc` §3.4 item 11 + §7 item 11).
+    ///
+    /// Sets `PENSYVE_MMR_LAMBDA` for the duration of this call so the
+    /// existing diversity reorder in `RecallEngine::recall_inner` activates,
+    /// then restores the prior env-var value on return (including panic /
+    /// exception unwind). Behaviorally identical to [`recall`] when
+    /// `lambda_ == 0.0` (engine treats `lambda <= 0.0` as MMR-OFF) and
+    /// reorders the result by `λ·sim − (1−λ)·max_j sim` when `lambda_ > 0.0`.
+    ///
+    /// Args:
+    ///     query: Search query string.
+    ///     k: Maximum number of results (default: 22).
+    ///     `lambda_`: MMR balance. Clamped to `[0.0, 1.0]` by the engine.
+    ///         `1.0` is pure relevance (output ≈ unreordered recall).
+    ///         `0.0` (or unset) is MMR-OFF. The pre-reg §3.9 fixes
+    ///         ARM-5-G3-FULL at `0.5`. The Python kwarg uses a trailing
+    ///         underscore because `lambda` is a reserved word.
+    #[pyo3(signature = (query, k=22, lambda_=0.5))]
+    fn recall_with_diversity(
+        &self,
+        query: &str,
+        k: usize,
+        lambda_: f32,
+    ) -> PyResult<Vec<PyMemory>> {
+        if query.is_empty() {
+            return Err(PyRuntimeError::new_err("query must not be empty"));
+        }
+
+        // Acquire the env-var guard. The engine reads PENSYVE_MMR_LAMBDA
+        // once at the top of `recall_inner`, so we just need it set when
+        // `engine.recall(...)` runs. Drop restores on every exit path
+        // (including the embedding-failure / SQL-failure unwind paths).
+        let clamped = lambda_.clamp(0.0, 1.0);
+        let _guard = G3EnvGuard::set("PENSYVE_MMR_LAMBDA", &format!("{clamped}"));
+
+        let vi = self.inner.vector_index.lock().unwrap();
+        let mut engine = RecallEngine::new(
+            self.inner.storage.as_ref(),
+            self.inner.embedder.as_ref(),
+            &vi,
+            &self.inner.retrieval_config,
+        );
+        if let Some(reranker) = self.inner.reranker.as_deref() {
+            engine = engine.with_reranker(reranker);
+        }
+        engine = engine.with_scope(self.inner.agent_id, self.inner.user_id);
+
+        let result = engine
+            .recall(query, self.inner.namespace.id, k)
+            .map_err(|e| PyRuntimeError::new_err(format!("Recall failed: {e}")))?;
+
+        Ok(result
+            .memories
+            .into_iter()
+            .map(|c| py_memory_from(&c.memory, c.final_score))
             .collect())
     }
 
