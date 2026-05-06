@@ -24,6 +24,7 @@
 //! continue to work unchanged after the directory split.
 
 pub mod cards;
+pub mod diversity;
 pub mod engine;
 
 // Flat re-export keeps the v2.x API surface intact after the
