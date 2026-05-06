@@ -136,6 +136,7 @@ async fn start_test_server(mgr: Arc<TenantStateManager>) -> (String, Cancellatio
     (url, ct)
 }
 
+#[allow(clippy::needless_pass_by_value)] // params is moved into the json! macro
 fn rpc(method: &str, params: serde_json::Value, id: u32) -> String {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -248,15 +249,7 @@ async fn two_tenants_with_distinct_agent_ids_are_isolated() {
     remember(&client, &url, Some(&agent_a), "alice", "prefers tea", 10).await;
 
     // Tenant B writes one fact about "alice" (same entity name, different scope).
-    remember(
-        &client,
-        &url,
-        Some(&agent_b),
-        "alice",
-        "prefers coffee",
-        11,
-    )
-    .await;
+    remember(&client, &url, Some(&agent_b), "alice", "prefers coffee", 11).await;
 
     // Tenant A inspects: must see exactly its own write.
     let a_view = inspect(&client, &url, Some(&agent_a), "alice", 20).await;

@@ -84,11 +84,7 @@ fn pensyve_handle_with_disabled_policy_denies_uncached_embedder_construction() {
     let entries: Vec<_> = std::fs::read_dir(cache_tempdir.path())
         .expect("read tempdir")
         .filter_map(Result::ok)
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("models--")
-        })
+        .filter(|e| e.file_name().to_string_lossy().starts_with("models--"))
         .collect();
     assert!(
         entries.is_empty(),

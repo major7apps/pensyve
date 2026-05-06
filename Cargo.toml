@@ -39,6 +39,8 @@ missing_panics_doc = { level = "allow" }
 cast_possible_truncation = { level = "allow" }
 cast_precision_loss = { level = "allow" }
 cast_sign_loss = { level = "allow" }
+cast_lossless = { level = "allow" }
+float_cmp = { level = "allow" }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

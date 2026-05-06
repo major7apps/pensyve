@@ -45,7 +45,8 @@ fn column_names(conn: &Connection, table: &str) -> Vec<String> {
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(1))
         .expect("query table_info");
-    rows.collect::<Result<Vec<_>, _>>().expect("collect column names")
+    rows.collect::<Result<Vec<_>, _>>()
+        .expect("collect column names")
 }
 
 fn index_names(conn: &Connection, table: &str) -> Vec<String> {
@@ -55,7 +56,8 @@ fn index_names(conn: &Connection, table: &str) -> Vec<String> {
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(1))
         .expect("query index_list");
-    rows.collect::<Result<Vec<_>, _>>().expect("collect index names")
+    rows.collect::<Result<Vec<_>, _>>()
+        .expect("collect index names")
 }
 
 fn schema_version_rows(conn: &Connection) -> Vec<(i64, String)> {
@@ -63,9 +65,12 @@ fn schema_version_rows(conn: &Connection) -> Vec<(i64, String)> {
         .prepare("SELECT version, description FROM schema_versions ORDER BY version")
         .expect("prepare schema_versions select");
     let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
         .expect("query schema_versions");
-    rows.collect::<Result<Vec<_>, _>>().expect("collect schema_versions")
+    rows.collect::<Result<Vec<_>, _>>()
+        .expect("collect schema_versions")
 }
 
 fn assert_migration_v1_landed(conn: &Connection) {
@@ -99,7 +104,11 @@ fn fresh_store_migration_is_idempotent() {
         let conn = open_raw(tmp.path());
 
         let rows = schema_version_rows(&conn);
-        assert_eq!(rows.len(), 1, "expected exactly one migration row, got {rows:?}");
+        assert_eq!(
+            rows.len(),
+            1,
+            "expected exactly one migration row, got {rows:?}"
+        );
         assert_eq!(rows[0].0, 1, "expected version=1");
 
         assert_migration_v1_landed(&conn);
@@ -138,11 +147,18 @@ fn fresh_store_migration_is_idempotent() {
             rows, versions_first,
             "schema_versions changed on re-open: {rows:?} vs {versions_first:?}"
         );
-        assert_eq!(rows.len(), 1, "duplicate schema_versions row inserted on re-run");
+        assert_eq!(
+            rows.len(),
+            1,
+            "duplicate schema_versions row inserted on re-run"
+        );
 
         for (i, table) in PROJECTION_TABLES.iter().enumerate() {
             let cols_now = column_names(&conn, table);
-            assert_eq!(cols_now, cols_first[i], "{table} columns drifted across re-open");
+            assert_eq!(
+                cols_now, cols_first[i],
+                "{table} columns drifted across re-open"
+            );
 
             let indexes_now = index_names(&conn, table);
             assert_eq!(
@@ -285,7 +301,8 @@ fn seed_v2_1_store(dir: &Path) -> LegacyRowIds {
     let conn = Connection::open(dir.join("memories.db")).expect("open seed db");
     conn.execute_batch("PRAGMA journal_mode=WAL;").expect("WAL");
     conn.execute_batch("PRAGMA foreign_keys=ON;").expect("FK");
-    conn.execute_batch(V2_1_SCHEMA).expect("create v2.1 projection tables");
+    conn.execute_batch(V2_1_SCHEMA)
+        .expect("create v2.1 projection tables");
 
     let ids = LegacyRowIds {
         episodic: Uuid::new_v4(),
@@ -312,7 +329,11 @@ fn v2_1_fixture_upgrade_lands_alters_and_preserves_rows() {
 
     // schema_versions registered exactly one row at version=1.
     let rows = schema_version_rows(&conn);
-    assert_eq!(rows.len(), 1, "expected one schema_versions row, got {rows:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected one schema_versions row, got {rows:?}"
+    );
     assert_eq!(rows[0].0, 1);
 
     // Existing rows preserved with NULL agent_id + user_id (the locked
@@ -346,5 +367,9 @@ fn v2_1_fixture_upgrade_lands_alters_and_preserves_rows() {
     let _backend = SqliteBackend::open(tmp.path()).expect("second upgrade open");
     let conn = open_raw(tmp.path());
     let rows = schema_version_rows(&conn);
-    assert_eq!(rows.len(), 1, "duplicate schema_versions row on re-run against fixture");
+    assert_eq!(
+        rows.len(),
+        1,
+        "duplicate schema_versions row on re-run against fixture"
+    );
 }

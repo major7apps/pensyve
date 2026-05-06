@@ -4,7 +4,7 @@
 //! `PensyveState` or the generated tool-router types.  Instead we replicate
 //! the exact same pensyve-core operations that each tool handler performs,
 //! exercising the full storage / embedding / vector-index stack with a
-//! temporary SQLite database.
+//! temporary `SQLite` database.
 
 use std::sync::Arc;
 
@@ -71,18 +71,17 @@ impl TestState {
 
     /// Replicate the "get or create entity" logic used by `remember` and `episode_start`.
     fn get_or_create_entity(&self, name: &str) -> Entity {
-        match self
+        if let Some(e) = self
             .storage
             .get_entity_by_name(name, self.namespace.id)
             .expect("storage lookup")
         {
-            Some(e) => e,
-            None => {
-                let mut e = Entity::new(name, EntityKind::Agent);
-                e.namespace_id = self.namespace.id;
-                self.storage.save_entity(&e).expect("save entity");
-                e
-            }
+            e
+        } else {
+            let mut e = Entity::new(name, EntityKind::Agent);
+            e.namespace_id = self.namespace.id;
+            self.storage.save_entity(&e).expect("save entity");
+            e
         }
     }
 }

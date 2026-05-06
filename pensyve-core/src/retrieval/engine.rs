@@ -807,10 +807,7 @@ impl<'a> RecallEngine<'a> {
         // preserving v2.1 behavior. So we only retain when at least one
         // scope dimension is set; otherwise every namespace row is allowed
         // through.
-        if self.agent_id.is_some()
-            || self.user_id.is_some()
-            || self.agent_only.is_some()
-        {
+        if self.agent_id.is_some() || self.user_id.is_some() || self.agent_only.is_some() {
             candidates.retain(|_, m| {
                 pensyve_core_scope_match(m, self.agent_id, self.user_id, self.agent_only)
             });
@@ -908,10 +905,7 @@ impl<'a> RecallEngine<'a> {
         // rows from another `(agent_id, user_id)` tenant via the dual-path
         // branch. Unscoped handles skip the retain (operator-locked
         // semantics 2026-05-05: no scope filter).
-        if self.agent_id.is_some()
-            || self.user_id.is_some()
-            || self.agent_only.is_some()
-        {
+        if self.agent_id.is_some() || self.user_id.is_some() || self.agent_only.is_some() {
             candidates.retain(|_, m| {
                 pensyve_core_scope_match(m, self.agent_id, self.user_id, self.agent_only)
             });

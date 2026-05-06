@@ -1254,7 +1254,12 @@ mod localllm {
                 event_time,
             }];
             let out = extractor
-                .extract(Uuid::new_v4(), Uuid::new_v4(), &msgs, CancellationToken::new())
+                .extract(
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    &msgs,
+                    CancellationToken::new(),
+                )
                 .await
                 .expect("ok");
             assert_eq!(out.len(), 1);
@@ -1278,7 +1283,12 @@ mod localllm {
                 LocalLLMExtractor::new(server.uri(), "local", None, NetworkPolicy::Permissive)
                     .unwrap();
             let err = extractor
-                .extract(Uuid::new_v4(), Uuid::new_v4(), &[], CancellationToken::new())
+                .extract(
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    &[],
+                    CancellationToken::new(),
+                )
                 .await
                 .err()
                 .expect("err");
@@ -1303,7 +1313,12 @@ mod localllm {
                 LocalLLMExtractor::new(server.uri(), "local", None, NetworkPolicy::Permissive)
                     .unwrap();
             let out = extractor
-                .extract(Uuid::new_v4(), Uuid::new_v4(), &[], CancellationToken::new())
+                .extract(
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    &[],
+                    CancellationToken::new(),
+                )
                 .await
                 .expect("ok");
             assert!(out.is_empty());
@@ -1325,7 +1340,12 @@ mod localllm {
             let extractor =
                 LocalLLMExtractor::new(bare, "local", None, NetworkPolicy::Permissive).unwrap();
             extractor
-                .extract(Uuid::new_v4(), Uuid::new_v4(), &[], CancellationToken::new())
+                .extract(
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    &[],
+                    CancellationToken::new(),
+                )
                 .await
                 .expect("ok");
         }
@@ -1402,7 +1422,12 @@ mod localllm {
                 event_time: None,
             }];
             extractor
-                .extract(Uuid::new_v4(), Uuid::new_v4(), &msgs, CancellationToken::new())
+                .extract(
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    &msgs,
+                    CancellationToken::new(),
+                )
                 .await
                 .expect("ok");
         }
@@ -1443,7 +1468,12 @@ mod localllm {
                 event_time: None,
             }];
             extractor
-                .extract(Uuid::new_v4(), Uuid::new_v4(), &msgs, CancellationToken::new())
+                .extract(
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    &msgs,
+                    CancellationToken::new(),
+                )
                 .await
                 .expect("ok");
             let body = captured
@@ -1494,7 +1524,12 @@ mod localllm {
                 policy: NetworkPolicy::Permissive,
             };
             let err = extractor
-                .extract(Uuid::new_v4(), Uuid::new_v4(), &[], CancellationToken::new())
+                .extract(
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    &[],
+                    CancellationToken::new(),
+                )
                 .await
                 .err()
                 .expect("err");
@@ -2377,7 +2412,12 @@ mod tests {
     async fn noop_accepts_empty_messages() {
         let extractor = NoopExtractor;
         let out = extractor
-            .extract(Uuid::new_v4(), Uuid::new_v4(), &[], CancellationToken::new())
+            .extract(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                &[],
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert!(out.is_empty());
@@ -2555,7 +2595,12 @@ mod tests {
     async fn failing_extractor_returns_error() {
         let extractor = FailingExtractor;
         let result = extractor
-            .extract(Uuid::new_v4(), Uuid::new_v4(), &[], CancellationToken::new())
+            .extract(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                &[],
+                CancellationToken::new(),
+            )
             .await;
         assert!(matches!(result, Err(ExtractionError::Transport(_))));
     }

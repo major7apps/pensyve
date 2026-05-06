@@ -34,6 +34,7 @@ const CLOUD_REGISTER_URL: &str = "https://pensyve.com/api/oauth/register";
 /// Returns protected resource metadata per RFC 9728. MCP clients discover
 /// this first (via the `resource_metadata` WWW-Authenticate parameter),
 /// then follow `authorization_servers` to find the authorization server.
+#[allow(clippy::unused_async)] // axum handler signature requires async
 pub async fn oauth_protected_resource() -> impl IntoResponse {
     let metadata = serde_json::json!({
         "resource": GATEWAY_ISSUER,
@@ -55,6 +56,7 @@ pub async fn oauth_protected_resource() -> impl IntoResponse {
 ///
 /// Returns OAuth 2.1 metadata per RFC 8414. MCP clients use this to
 /// discover the authorization and token endpoints.
+#[allow(clippy::unused_async)] // axum handler signature requires async
 pub async fn oauth_metadata() -> impl IntoResponse {
     let metadata = serde_json::json!({
         "issuer": GATEWAY_ISSUER,
@@ -94,6 +96,7 @@ pub async fn oauth_register(req: Request<Body>) -> impl IntoResponse {
 }
 
 /// `OPTIONS` handler for CORS preflight on OAuth endpoints.
+#[allow(clippy::unused_async)] // axum handler signature requires async
 pub async fn oauth_cors_preflight() -> impl IntoResponse {
     Response::builder()
         .status(StatusCode::NO_CONTENT)

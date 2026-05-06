@@ -156,10 +156,7 @@ impl OnnxEmbedder {
     ///
     /// This is the fail-closed-friendly entry point. Callers that want
     /// the v2.1 always-permissive behavior keep using [`Self::new`].
-    pub fn new_with_policy(
-        model_name: &str,
-        policy: &NetworkPolicy,
-    ) -> EmbeddingResult<Self> {
+    pub fn new_with_policy(model_name: &str, policy: &NetworkPolicy) -> EmbeddingResult<Self> {
         let (model_enum, dims, hf_model_code) = match model_name {
             "Alibaba-NLP/gte-base-en-v1.5" => (
                 EmbeddingModel::GTEBaseENV15,
