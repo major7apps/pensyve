@@ -12,6 +12,7 @@ use tower::{Layer, Service};
 
 use crate::AppState;
 use crate::config::GatewayConfig;
+use crate::middleware::tracing::TraceContext;
 
 /// Validated API key context attached to the request extensions.
 #[derive(Clone, Debug)]
@@ -108,10 +109,15 @@ impl AuthValidator {
     }
 
     /// Validate a token. Checks API keys first, then JWT, then remote endpoint.
-    pub async fn validate(&self, key: &str) -> Option<AuthContext> {
+    ///
+    /// `trace` carries the W3C trace context for the inbound request and
+    /// is propagated as a `traceparent` header on outbound `validate_remote`
+    /// calls. `None` skips propagation (used by unit tests that bypass the
+    /// tracing middleware).
+    pub async fn validate(&self, key: &str, trace: Option<&TraceContext>) -> Option<AuthContext> {
         // 1. API key path (psy_ prefix)
         if key.starts_with("psy_") {
-            return self.validate_api_key(key).await;
+            return self.validate_api_key(key, trace).await;
         }
 
         // 2. JWT path (OAuth access tokens from pensyve.com)
@@ -140,7 +146,11 @@ impl AuthValidator {
         })
     }
 
-    async fn validate_api_key(&self, key: &str) -> Option<AuthContext> {
+    async fn validate_api_key(
+        &self,
+        key: &str,
+        trace: Option<&TraceContext>,
+    ) -> Option<AuthContext> {
         // Check local key list (from PENSYVE_API_KEYS env var)
         let hash = hash_key(key);
         if let Some(prefix) = self.valid_key_hashes.get(&hash) {
@@ -166,13 +176,19 @@ impl AuthValidator {
 
         // 3. Try remote validation
         if let Some(url) = &self.validation_url {
-            return self.validate_remote(url, key, &hash).await;
+            return self.validate_remote(url, key, &hash, trace).await;
         }
 
         None
     }
 
-    async fn validate_remote(&self, url: &str, key: &str, hash: &str) -> Option<AuthContext> {
+    async fn validate_remote(
+        &self,
+        url: &str,
+        key: &str,
+        hash: &str,
+        trace: Option<&TraceContext>,
+    ) -> Option<AuthContext> {
         let mut req = self
             .http_client
             .post(url)
@@ -181,6 +197,15 @@ impl AuthValidator {
 
         if let Some(secret) = &self.gateway_secret {
             req = req.header("x-gateway-secret", secret);
+        }
+
+        // Phase 23/A: propagate W3C trace context to pensyve.com so the
+        // validation endpoint can correlate its logs with the gateway's.
+        if let Some(t) = trace {
+            req = req.header(
+                crate::middleware::tracing::TRACEPARENT_HEADER,
+                t.to_header_value(),
+            );
         }
 
         let resp = req.send().await.ok()?;
@@ -344,7 +369,11 @@ where
                 },
             };
 
-            if let Some(ctx) = state.auth.validate(&token).await {
+            // Pull trace context off the request (set by TracingLayer
+            // upstream) so we can propagate it on the outbound
+            // `validate_remote` POST.
+            let trace = req.extensions().get::<TraceContext>().cloned();
+            if let Some(ctx) = state.auth.validate(&token, trace.as_ref()).await {
                 req.extensions_mut().insert(ctx);
                 inner.call(req).await
             } else {
@@ -396,25 +425,30 @@ mod tests {
     #[tokio::test]
     async fn test_auth_validator_accepts_valid_key() {
         let validator = AuthValidator::new(&test_config(vec!["psy_testkey12345".into()]));
-        assert!(validator.validate("psy_testkey12345").await.is_some());
+        assert!(
+            validator
+                .validate("psy_testkey12345", None)
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
     async fn test_auth_validator_rejects_invalid_key() {
         let validator = AuthValidator::new(&test_config(vec!["psy_testkey12345".into()]));
-        assert!(validator.validate("psy_wrong_key").await.is_none());
+        assert!(validator.validate("psy_wrong_key", None).await.is_none());
     }
 
     #[tokio::test]
     async fn test_auth_validator_rejects_non_psy_prefix() {
         let validator = AuthValidator::new(&test_config(vec!["psy_testkey12345".into()]));
-        assert!(validator.validate("sk_testkey12345").await.is_none());
+        assert!(validator.validate("sk_testkey12345", None).await.is_none());
     }
 
     #[tokio::test]
     async fn test_auth_validator_empty_config_rejects_all() {
         let validator = AuthValidator::new(&test_config(vec![]));
-        assert!(validator.validate("psy_anything").await.is_none());
+        assert!(validator.validate("psy_anything", None).await.is_none());
     }
 
     // Ed25519 test key pair generated for unit tests only — not a real secret.
@@ -480,7 +514,7 @@ mod tests {
         let token = sign_jwt(&valid_claims());
 
         let ctx = validator
-            .validate(&token)
+            .validate(&token, None)
             .await
             .expect("valid JWT should be accepted");
         assert_eq!(ctx.user_id.as_deref(), Some("user_abc123"));
@@ -496,7 +530,7 @@ mod tests {
         let token = sign_jwt(&claims);
 
         assert!(
-            validator.validate(&token).await.is_none(),
+            validator.validate(&token, None).await.is_none(),
             "expired JWT should be rejected"
         );
     }
@@ -509,7 +543,7 @@ mod tests {
         let token = sign_jwt(&claims);
 
         assert!(
-            validator.validate(&token).await.is_none(),
+            validator.validate(&token, None).await.is_none(),
             "JWT with wrong issuer should be rejected"
         );
     }
@@ -522,7 +556,7 @@ mod tests {
         let token = sign_jwt(&claims);
 
         assert!(
-            validator.validate(&token).await.is_none(),
+            validator.validate(&token, None).await.is_none(),
             "JWT with wrong audience should be rejected"
         );
     }
@@ -538,7 +572,7 @@ mod tests {
 
         let token = sign_jwt(&valid_claims());
         assert!(
-            validator.validate(&token).await.is_none(),
+            validator.validate(&token, None).await.is_none(),
             "JWT should not validate when no public key is configured"
         );
     }
@@ -550,7 +584,7 @@ mod tests {
 
         // A psy_ token should go through the API key path, not JWT.
         let ctx = validator
-            .validate("psy_testkey12345")
+            .validate("psy_testkey12345", None)
             .await
             .expect("psy_ key should be validated as API key");
         assert!(
@@ -565,7 +599,10 @@ mod tests {
         // And a psy_ token that is NOT in the valid list should be rejected via
         // the API key path, never falling through to JWT validation.
         assert!(
-            validator.validate("psy_not_a_real_key").await.is_none(),
+            validator
+                .validate("psy_not_a_real_key", None)
+                .await
+                .is_none(),
             "invalid psy_ key should be rejected even with JWT configured"
         );
     }
@@ -574,7 +611,7 @@ mod tests {
     async fn test_local_api_key_gets_default_mcp_scope() {
         let validator = AuthValidator::new(&test_config(vec!["psy_testkey12345".into()]));
         let ctx = validator
-            .validate("psy_testkey12345")
+            .validate("psy_testkey12345", None)
             .await
             .expect("valid key");
         assert_eq!(ctx.scope, "mcp");
@@ -584,7 +621,7 @@ mod tests {
     async fn test_jwt_extracts_scope() {
         let validator = validator_with_jwt(vec![]);
         let token = sign_jwt(&valid_claims());
-        let ctx = validator.validate(&token).await.expect("valid JWT");
+        let ctx = validator.validate(&token, None).await.expect("valid JWT");
         assert_eq!(ctx.scope, "mcp");
     }
 
@@ -594,7 +631,7 @@ mod tests {
         config.key_user_map = vec![("psy_testkey12345".to_string(), "user_abc".to_string())];
         let validator = AuthValidator::new(&config);
         let ctx = validator
-            .validate("psy_testkey12345")
+            .validate("psy_testkey12345", None)
             .await
             .expect("valid key");
         assert_eq!(ctx.user_id.as_deref(), Some("user_abc"));
@@ -605,7 +642,7 @@ mod tests {
         let config = test_config(vec!["psy_testkey12345".into()]);
         let validator = AuthValidator::new(&config);
         let ctx = validator
-            .validate("psy_testkey12345")
+            .validate("psy_testkey12345", None)
             .await
             .expect("valid key");
         assert!(ctx.user_id.is_none());
