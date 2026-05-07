@@ -463,6 +463,29 @@ impl ConsolidationEngine {
 /// gate may evolve its trigger criteria independent of the SSU card.
 const TYPED_SLOT_TRIGGER_ACTIONS: &[&str] = &["mentioned", "stated", "is", "has", "lives"];
 
+/// Hard cap on per-event LLM input size. Bounds context overflow + latency
+/// spikes + runaway cost on accidentally-large observations or deep
+/// supersession chains. Per coderabbit Major review on PR #86 +
+/// pre-reg §3.7 design intent (chain summary is bounded by chain depth ≤ 4
+/// and `LIMIT 4` in `lookup_supersession_chain`). Chosen conservatively at
+/// 12 KB to fit comfortably inside any production model's context window
+/// while still admitting realistic observation/chain sizes.
+const MAX_LLM_INPUT_BYTES: usize = 12_000;
+
+/// Truncate a string to at most `max_bytes` while preserving UTF-8
+/// boundaries. Walks back from the byte cap until landing on a char
+/// boundary so we never split a multi-byte codepoint mid-character.
+fn truncate_utf8_safe(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// True when the action verb matches the typed-slot extractor's trigger
 /// heuristic. Case-insensitive + trimmed.
 #[must_use]
@@ -572,7 +595,16 @@ pub async fn run_typed_slots_hook<L: TypedSlotLlm + ?Sized>(
         ));
     }
 
-    match extract_slots(observation_content, extractor, cancel).await {
+    // Bound LLM input size before the network call. Prevents context
+    // overflow + latency spikes + runaway cost on accidentally-large
+    // observations (e.g., a haystack message that includes a full
+    // conversation excerpt). Per coderabbit Major review on PR #86.
+    let bounded_content = truncate_utf8_safe(observation_content, MAX_LLM_INPUT_BYTES);
+    if bounded_content.is_empty() {
+        return Ok(None);
+    }
+
+    match extract_slots(bounded_content, extractor, cancel).await {
         Ok(slots) => {
             // Defer-on-empty: nothing to persist; caller logs to defer
             // log and skips the UPDATE.
@@ -646,7 +678,8 @@ markdown.";
         return Ok(None);
     }
 
-    let trimmed = chain_text.trim();
+    // Bound LLM input — chain text can grow with depth-of-supersession.
+    let trimmed = truncate_utf8_safe(chain_text.trim(), MAX_LLM_INPUT_BYTES);
     if trimmed.is_empty() {
         return Ok(None);
     }

@@ -103,18 +103,28 @@ pub fn rerank_mmr(
             let rel = relevance[cand_idx];
 
             // Redundancy term: max cosine sim against already-selected.
-            // Empty selected (first iteration) → redundancy = 0, so the
+            // First iteration (empty selected) → redundancy = 0, so the
             // first pick equals the highest-relevance candidate.
-            let mut max_redundancy = 0.0_f32;
-            for &sel_idx in &selected_indices {
-                let sim = cosine_similarity(
-                    items[cand_idx].memory.embedding(),
-                    items[sel_idx].memory.embedding(),
-                );
-                if sim > max_redundancy {
-                    max_redundancy = sim;
-                }
-            }
+            //
+            // Use the actual maximum (NEG_INFINITY init) instead of
+            // clamping at 0.0. Negative cosine values represent genuine
+            // dissimilarity and should *boost* the candidate's MMR score —
+            // the previous `0.0` floor flattened all-negative cases to
+            // pure-relevance ordering, defeating the diversity term.
+            // Per coderabbit Major review on PR #86.
+            let max_redundancy = if selected_indices.is_empty() {
+                0.0_f32
+            } else {
+                selected_indices
+                    .iter()
+                    .map(|&sel_idx| {
+                        cosine_similarity(
+                            items[cand_idx].memory.embedding(),
+                            items[sel_idx].memory.embedding(),
+                        )
+                    })
+                    .fold(f32::NEG_INFINITY, f32::max)
+            };
 
             let mmr = lambda * rel - (1.0 - lambda) * max_redundancy;
 

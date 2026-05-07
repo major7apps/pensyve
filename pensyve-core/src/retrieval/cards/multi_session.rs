@@ -241,15 +241,23 @@ impl RetrievalCard for MultiSessionCard {
         .ok()?;
 
         // G3 SQL scope-tighten (pre-reg §3.6): raise cross-session
-        // threshold from G2's ≥2 to ≥3 distinct date-day buckets when
-        // `g3_mode` is set. The filter is enforced in `build_from_conn`'s
-        // post-aggregation pass (the SQL itself returns all rows; the
-        // session-count check happens against the in-memory aggregate).
-        let cross_session_threshold = if self.g3_mode.is_some() {
-            MS_CARD_CROSS_SESSION_THRESHOLD_G3
-        } else {
-            MS_CARD_CROSS_SESSION_THRESHOLD_G2
-        };
+        // threshold from G2's ≥2 to ≥3 distinct date-day buckets ONLY when
+        // BOTH (a) `g3_mode` is set AND (b) `question_type` matches a
+        // routed cross-session type (multi-session / temporal-reasoning /
+        // knowledge-update). Coderabbit Major review on PR #86 caught a
+        // regression: the original guard raised the threshold on any
+        // `g3_mode`, which silently dropped 2-session entities for callers
+        // that pass no question_type or non-routed types — contradicting
+        // the baseline-compatible fallback intent of the router gate above.
+        let cross_session_threshold = matches!(
+            (self.g3_mode, question_type),
+            (
+                Some(_),
+                Some("multi-session" | "temporal-reasoning" | "knowledge-update")
+            )
+        )
+        .then_some(MS_CARD_CROSS_SESSION_THRESHOLD_G3)
+        .unwrap_or(MS_CARD_CROSS_SESSION_THRESHOLD_G2);
 
         build_from_conn(
             &conn,

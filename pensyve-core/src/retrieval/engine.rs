@@ -762,17 +762,24 @@ impl<'a> RecallEngine<'a> {
             scored = apply_reranking(scored, reranker, query)?;
         }
 
-        scored.truncate(limit);
-
-        // G3-P5: optional MMR diversity rerank, BEFORE card prepend.
+        // G3-P5: optional MMR diversity rerank, BEFORE card prepend AND
+        // BEFORE limit-truncation. MMR needs the full pool to pick diverse
+        // alternatives from lower-ranked candidates — truncating first
+        // would constrain it to reordering the top-N relevance set, which
+        // defeats the diversity term. Per coderabbit Major review on PR
+        // #86 (engine.rs:775). MMR's internal `target = k.min(items.len())`
+        // ensures the output is bounded to `limit` regardless.
+        //
         // Operator-locked decision (a') 2026-05-06: cards see the
-        // diversity-reordered observations, so MMR runs here at the recall
-        // tail. Default-OFF: only fires when PENSYVE_MMR_LAMBDA is set
-        // and > 0.0, preserving G2 byte-for-byte parity for ARM-1-G3-BASELINE
-        // through ARM-4-TYPED-SLOTS. ARM-5-G3-FULL sets λ=0.5.
+        // diversity-reordered observations. Default-OFF: only fires when
+        // PENSYVE_MMR_LAMBDA is set and > 0.0, preserving G2 byte-for-byte
+        // parity for ARM-1-G3-BASELINE through ARM-4-TYPED-SLOTS.
+        // ARM-5-G3-FULL sets λ=0.5.
         if let (Some(lambda), Some(qvec)) = (mmr_lambda, query_embedding_owned.as_deref()) {
             scored = crate::retrieval::diversity::rerank_mmr(scored, qvec, lambda, limit);
         }
+
+        scored.truncate(limit);
 
         // Step 9: Retrieval-induced reinforcement.
         self.apply_reinforcement(&scored);

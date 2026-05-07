@@ -2394,6 +2394,14 @@ mod gate_wiring {
         conn: &Connection,
         new_obs: &ObservationMemory,
     ) -> rusqlite::Result<Vec<String>> {
+        // Multi-tenant scope: filter by (namespace_id, agent_id, user_id) to
+        // prevent cross-tenant leakage into the chain text. NULL-safe `IS`
+        // matches the v2.2.0 scoping convention used by the retrieval cards
+        // (peer_card.rs / multi_session.rs / single_session_user.rs). Without
+        // these predicates, two tenants sharing a namespace would see each
+        // other's prior observations summarized into chain_summary — a
+        // correctness + privacy regression flagged in PR #86 (codex P1 +
+        // claude bot + coderabbit Major).
         let mut stmt = conn.prepare(
             "SELECT content FROM observation_memories \
              WHERE namespace_id = ?1 \
@@ -2401,6 +2409,8 @@ mod gate_wiring {
                AND instance = ?3 \
                AND action = ?4 \
                AND id != ?5 \
+               AND agent_id IS ?6 \
+               AND user_id IS ?7 \
              ORDER BY event_time DESC, created_at DESC \
              LIMIT 4",
         )?;
@@ -2411,6 +2421,8 @@ mod gate_wiring {
                 new_obs.instance,
                 new_obs.action,
                 new_obs.id.to_string(),
+                new_obs.agent_id.as_ref().map(ToString::to_string),
+                new_obs.user_id.as_ref().map(ToString::to_string),
             ],
             |row| row.get::<_, String>(0),
         )?;
