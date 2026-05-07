@@ -254,7 +254,12 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
 
     let app_state = Arc::new(AppState {
         auth: auth::AuthValidator::new(&config),
-        rate_limiter: rate_limit::RateLimiter::new(config.rate_limit_per_minute),
+        // Phase 23 Track B: rate limiter is now Redis-backed (when REDIS_URL
+        // is set) with plan-aware daily quotas. Falls back to an in-memory
+        // sliding window when Redis is unavailable. The legacy
+        // `rate_limit_per_minute` config is intentionally no longer wired
+        // through here — limits are sourced from the caller's plan tier.
+        rate_limiter: rate_limit::RateLimiter::new(redis.clone()),
         usage_reporter: UsageReporter::new(config.stripe_api_key.clone()),
         usage_counter,
         tenant_mgr,
@@ -335,17 +340,9 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         .layer(AuthLayer::new(app_state.clone()))
         .with_state(app_state.clone());
 
-    // Periodic eviction of stale rate-limit entries.
-    tokio::spawn({
-        let state = app_state.clone();
-        async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                state.rate_limiter.evict_stale();
-            }
-        }
-    });
+    // Phase 23 Track B: the periodic `evict_stale()` task is gone — Redis
+    // TTLs handle window expiry on the primary path, and the in-memory
+    // fallback prunes entries on read inside `RateLimiter::check_fallback`.
 
     // Background consolidation — runs every PENSYVE_CONSOLIDATION_INTERVAL_SECS (default 6h).
     tokio::spawn({
