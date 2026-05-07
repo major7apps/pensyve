@@ -175,6 +175,24 @@ pub trait ObservationExtractor: Send + Sync + Debug {
         }
         Ok(out)
     }
+
+    /// If this extractor is (or wraps) a [`LocalLLMExtractor`], return a
+    /// reference to it so the G3 per-event gate hooks can reuse the same
+    /// endpoint / network policy / auth credentials as the observation
+    /// extractor itself. Default returns `None` — callers fall back to
+    /// `LocalLLMExtractor::from_env()`.
+    ///
+    /// Per coderabbit PR #86 round-4 review on observation.rs:2754:
+    /// without this, an explicitly-configured extractor (e.g. one
+    /// built via `LocalLLMExtractor::new(custom_url, ...)` rather than
+    /// the env path) would silently split the ingest pipeline — the
+    /// observation extractor would call one endpoint and the gate
+    /// extractor a different env-derived one. Implementations that
+    /// don't speak the typed-slot protocol leave this at the default.
+    #[cfg(feature = "observation-extraction")]
+    fn typed_slot_extractor(&self) -> Option<&LocalLLMExtractor> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1187,6 +1205,16 @@ mod localllm {
                 .map(|r| raw_to_observation(r, namespace_id, episode_id, last_event_time))
                 .collect())
         }
+
+        fn typed_slot_extractor(&self) -> Option<&LocalLLMExtractor> {
+            // The observation extractor IS the typed-slot LLM — same
+            // endpoint, same auth, same network policy. Per coderabbit
+            // PR #86 round-4 review on observation.rs:2754, returning
+            // `Some(self)` here lets the gate path reuse the caller's
+            // configured handle instead of building a separate
+            // env-derived one.
+            Some(self)
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1884,6 +1912,14 @@ mod batched_localllm {
             let results = futures::future::join_all(futures).await;
             results.into_iter().collect()
         }
+
+        fn typed_slot_extractor(&self) -> Option<&LocalLLMExtractor> {
+            // Forward to the wrapped inner extractor. Per coderabbit
+            // PR #86 round-4 review on observation.rs:2754 — the
+            // `BatchedLocalLLMExtractor` is just a fan-out wrapper, so
+            // the gate path can reuse `self.inner` directly.
+            Some(&self.inner)
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2302,6 +2338,7 @@ mod gate_wiring {
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
+    use super::ObservationExtractor;
     use crate::consolidation;
     use crate::consolidation::typed_slots::{TypedSlotLlm, TypedSlots};
     use crate::network_policy::NetworkPolicy;
@@ -2359,7 +2396,7 @@ mod gate_wiring {
         observation_id: Uuid,
         slots: &TypedSlots,
     ) -> rusqlite::Result<()> {
-        conn.execute(
+        let updated = conn.execute(
             "UPDATE observation_memories \
              SET biography_slot = ?1, \
                  preference_slot = ?2, \
@@ -2376,6 +2413,15 @@ mod gate_wiring {
                 observation_id.to_string(),
             ],
         )?;
+        // Per coderabbit PR #86 round-4 review on observation.rs:2392 —
+        // a zero-row UPDATE means the observation row vanished between
+        // `save_observation` and the gate fire (e.g., concurrent delete
+        // or DB scope mismatch); the audit trail must NOT log
+        // `result=ok` in that case. Surface as a query error so the
+        // calling gate logs `result=deferred` with a real reason.
+        if updated != 1 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
         Ok(())
     }
 
@@ -2386,10 +2432,15 @@ mod gate_wiring {
         observation_id: Uuid,
         summary: &str,
     ) -> rusqlite::Result<()> {
-        conn.execute(
+        let updated = conn.execute(
             "UPDATE observation_memories SET chain_summary = ?1 WHERE id = ?2",
             params![summary, observation_id.to_string()],
         )?;
+        // Same zero-row guard as `persist_typed_slots` — see comment there
+        // (coderabbit PR #86 round-4 review).
+        if updated != 1 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
         Ok(())
     }
 
@@ -2733,13 +2784,30 @@ mod gate_wiring {
     /// across every observation in the call — see
     /// [`maybe_fire_gates_with_extractor`]. Returns `None` when both
     /// gates are off (zero-cost) OR when env-based extractor build
-    /// fails (warns once at construction). Per coderabbit PR #86
-    /// round-3 review on observation.rs:2713 — avoids per-observation
-    /// `reqwest::Client` reconstruction and repeated env parsing on
-    /// the hot path.
-    pub(super) fn build_gate_extractor_if_enabled() -> Option<LocalLLMExtractor> {
+    /// fails (warns once at construction).
+    ///
+    /// `caller` is the observation extractor configured by the ingest
+    /// caller. When it exposes a `LocalLLMExtractor` via
+    /// [`ObservationExtractor::typed_slot_extractor`] (which both the
+    /// `LocalLLMExtractor` itself and the `BatchedLocalLLMExtractor`
+    /// wrapper do), we clone-and-reuse it so the gate calls go to the
+    /// same endpoint / network policy / auth as the observation
+    /// extraction. Without this, an explicitly-configured caller would
+    /// silently split its ingest pipeline across two LLM endpoints —
+    /// the observation extractor running on the configured one and the
+    /// gate path on whatever the env vars happened to point at. Per
+    /// coderabbit PR #86 round-3 review on observation.rs:2713
+    /// (caching) and round-4 review on observation.rs:2754 (caller
+    /// reuse). `LocalLLMExtractor::clone()` is cheap because
+    /// `reqwest::Client` is `Arc`-internally.
+    pub(super) fn build_gate_extractor_if_enabled(
+        caller: Option<&dyn ObservationExtractor>,
+    ) -> Option<LocalLLMExtractor> {
         if !consolidation::g3_typed_slots_enabled() && !consolidation::g3_summarizer_enabled() {
             return None;
+        }
+        if let Some(local) = caller.and_then(ObservationExtractor::typed_slot_extractor) {
+            return Some(local.clone());
         }
         match LocalLLMExtractor::from_env() {
             Ok(ext) => Some(ext),
@@ -2866,9 +2934,11 @@ where
     // gates are off / env-build failed). Per coderabbit PR #86 round-3
     // review on observation.rs:2713 — connection pool + env parsing now
     // reused across every observation in this episode rather than rebuilt
-    // per `save_observation` call.
+    // per `save_observation` call. Round-4 review (observation.rs:2754):
+    // we forward the caller's extractor so the gate reuses its endpoint /
+    // network policy / auth instead of a separate env-derived one.
     #[cfg(feature = "observation-extraction")]
-    let gate_extractor = gate_wiring::build_gate_extractor_if_enabled();
+    let gate_extractor = gate_wiring::build_gate_extractor_if_enabled(Some(extractor));
 
     let mut persisted = 0usize;
     for mut obs in observations {
@@ -3035,9 +3105,11 @@ where
 
     // Hoist gate-extractor construction once for the whole bulk call —
     // shared across every episode + every observation. Per coderabbit
-    // PR #86 round-3 review on observation.rs:2986 (and 2826).
+    // PR #86 round-3 review on observation.rs:2986 (and 2826). Round-4
+    // review (observation.rs:2754): forward the caller's extractor so
+    // the gate reuses its endpoint / network policy / auth.
     #[cfg(feature = "observation-extraction")]
-    let gate_extractor = gate_wiring::build_gate_extractor_if_enabled();
+    let gate_extractor = gate_wiring::build_gate_extractor_if_enabled(Some(extractor));
 
     let mut total_persisted = 0usize;
     for (eid, observations) in surviving_ids.iter().zip(batch_results) {

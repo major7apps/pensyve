@@ -76,91 +76,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // ---------------------------------------------------------------------------
 // G3 env-var guards
 // ---------------------------------------------------------------------------
-
-/// Process-wide mutex serializing writes to `PENSYVE_RETRIEVAL_CARDS_G3` and
-/// `PENSYVE_MMR_LAMBDA`. Both env vars are read by retrieval-card and recall
-/// engine code at call time; the G3 `PyO3` bindings (`build_retrieval_card_g3`,
-/// `recall_with_diversity`) mutate them transiently for the duration of one
-/// call. Mirrors the `RouterEnvGuard` / `SsuEnvGuard` patterns already used in
-/// `pensyve-core/tests/test_intent_router.rs` + `tests/test_single_session_user_card.rs`.
-fn g3_env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-}
-
-/// RAII guard that holds [`g3_env_lock`] for its lifetime, mutates a single
-/// env var to a target value (or removes it), and restores the prior value
-/// on drop — including on Rust panic / Python exception unwind paths.
-///
-/// `# Safety`: `std::env::set_var` / `remove_var` are flagged unsafe in
-/// modern Rust because env mutation is process-global and not thread-safe.
-/// This guard serializes all writers/readers behind [`g3_env_lock`] for the
-/// `pensyve-python` cdylib lifetime; concurrent G3 `PyO3` calls cannot race.
-struct G3EnvGuard {
-    _serial: std::sync::MutexGuard<'static, ()>,
-    key: &'static str,
-    previous: Option<String>,
-}
-
-#[allow(
-    unsafe_code,
-    reason = "G3 PyO3 binding scoped env-var guard; std::env::set_var / remove_var require unsafe in modern Rust because env mutation is process-global. The struct holds the process-wide g3_env_lock for its lifetime so concurrent calls cannot race."
-)]
-impl G3EnvGuard {
-    /// Acquire the lock, capture the previous value of `key`, set it to
-    /// `value`. The guard restores `previous` on drop.
-    fn set(key: &'static str, value: &str) -> Self {
-        let serial = g3_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::env::var(key).ok();
-        // SAFETY: see struct doc; serialized via the mutex in `serial`.
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self {
-            _serial: serial,
-            key,
-            previous,
-        }
-    }
-
-    /// Acquire the lock, capture the previous value of `key`, remove it.
-    /// The guard restores `previous` on drop.
-    fn unset(key: &'static str) -> Self {
-        let serial = g3_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::env::var(key).ok();
-        // SAFETY: see struct doc.
-        unsafe {
-            std::env::remove_var(key);
-        }
-        Self {
-            _serial: serial,
-            key,
-            previous,
-        }
-    }
-}
-
-#[allow(
-    unsafe_code,
-    reason = "G3 PyO3 binding scoped env-var guard; see G3EnvGuard::set for justification"
-)]
-impl Drop for G3EnvGuard {
-    fn drop(&mut self) {
-        // SAFETY: drop runs while we still hold the serialization lock.
-        unsafe {
-            match &self.previous {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1107,12 +1022,14 @@ impl PyPensyve {
             }
         }
 
-        // Translate g3_features to PENSYVE_RETRIEVAL_CARDS_G3 env-var value
-        // per pre-reg §3.1 (single-string encoding). Any subset covering all
-        // four flags collapses to "full"; otherwise we emit the singleton
-        // value when exactly one feature is requested. Empty → unset.
-        let env_var_key = pensyve_core::retrieval::cards::multi_session::RETRIEVAL_CARDS_G3_ENV;
-        let env_value: Option<&str> = if g3_features.is_empty() {
+        // Translate g3_features into the G3 layering mode value passed
+        // to `MultiSessionCard::with_g3_mode(...)`. The vocabulary
+        // matches `PENSYVE_RETRIEVAL_CARDS_G3` (`"router"`, `"full"`,
+        // or unset / unrecognized → G2 baseline). Per coderabbit PR #86
+        // round-4 review on pensyve-python/src/lib.rs:160 — passing the
+        // mode explicitly here instead of mutating env eliminates the
+        // race window with parallel unguarded `recall()` callers.
+        let g3_mode_value: Option<&str> = if g3_features.is_empty() {
             None
         } else {
             let has_router = g3_features.iter().any(|f| f == "router");
@@ -1128,10 +1045,11 @@ impl PyPensyve {
             } else if has_typed && !has_router && !has_summ && !has_div {
                 Some("typed_slots")
             } else if has_div && !has_router && !has_summ && !has_typed {
-                // `diversity` alone has no card-side env-gate (MMR is wired
-                // via PENSYVE_MMR_LAMBDA in `recall_with_diversity`), so we
-                // leave the cards env-var unset for this combo. Caller
-                // typically pairs `diversity` with `recall_with_diversity`.
+                // `diversity` alone has no card-side mode (MMR is wired
+                // via `engine.with_mmr_lambda(...)` in
+                // `recall_with_diversity`), so we leave the card mode
+                // unset for this combo. Caller typically pairs
+                // `diversity` with `recall_with_diversity`.
                 None
             } else {
                 return Err(PyValueError::new_err(format!(
@@ -1140,14 +1058,6 @@ impl PyPensyve {
                      [\"diversity\"], or [\"router\", \"summarizer\", \"typed_slots\", \"diversity\"] (full)"
                 )));
             }
-        };
-
-        // Acquire the env-var guard. `_guard` keeps the env var set + the
-        // process-wide lock held for the full card-build call; `Drop`
-        // restores the prior value on every exit path.
-        let _guard = match env_value {
-            Some(v) => G3EnvGuard::set(env_var_key, v),
-            None => G3EnvGuard::unset(env_var_key),
         };
 
         // Normalize `db_path` into the directory expected by
@@ -1212,7 +1122,14 @@ impl PyPensyve {
             cards.push((Box::new(PeerCardAdapter::new()), G2_PEER_CARD_CAP));
         }
         if want_ms {
-            cards.push((Box::new(MultiSessionCard::new()), G2_MULTI_SESSION_CARD_CAP));
+            // Pass `g3_mode_value` explicitly so the card sees the
+            // intended mode without relying on a process-env mutation
+            // (round-4 fix; see comment block above the
+            // `g3_mode_value` computation).
+            cards.push((
+                Box::new(MultiSessionCard::new().with_g3_mode(g3_mode_value)),
+                G2_MULTI_SESSION_CARD_CAP,
+            ));
         }
         if want_ssu {
             cards.push((
@@ -1278,12 +1195,13 @@ impl PyPensyve {
             return Err(PyRuntimeError::new_err("query must not be empty"));
         }
 
-        // Acquire the env-var guard. The engine reads PENSYVE_MMR_LAMBDA
-        // once at the top of `recall_inner`, so we just need it set when
-        // `engine.recall(...)` runs. Drop restores on every exit path
-        // (including the embedding-failure / SQL-failure unwind paths).
+        // Per coderabbit PR #86 round-4 review on
+        // pensyve-python/src/lib.rs:160 — thread the MMR lambda through
+        // the engine boundary explicitly via `with_mmr_lambda` instead
+        // of mutating `PENSYVE_MMR_LAMBDA` via `G3EnvGuard`. Closes the
+        // race where a parallel unguarded `recall()` could read the env
+        // var while another caller had it transiently set.
         let clamped = lambda_.clamp(0.0, 1.0);
-        let _guard = G3EnvGuard::set("PENSYVE_MMR_LAMBDA", &format!("{clamped}"));
 
         let vi = self.inner.vector_index.lock().unwrap();
         let mut engine = RecallEngine::new(
@@ -1296,6 +1214,7 @@ impl PyPensyve {
             engine = engine.with_reranker(reranker);
         }
         engine = engine.with_scope(self.inner.agent_id, self.inner.user_id);
+        engine = engine.with_mmr_lambda(clamped);
 
         let result = engine
             .recall(query, self.inner.namespace.id, k)

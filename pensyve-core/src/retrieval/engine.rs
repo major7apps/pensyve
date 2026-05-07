@@ -308,6 +308,15 @@ pub struct RecallEngine<'a> {
     agent_id: Option<Uuid>,
     user_id: Option<Uuid>,
     agent_only: Option<Uuid>,
+    /// Optional explicit MMR balance parameter. When set, the recall
+    /// pipeline uses this value directly instead of reading
+    /// `PENSYVE_MMR_LAMBDA` from the process env. Per coderabbit PR #86
+    /// round-4 review on `pensyve-python/src/lib.rs:160` — eliminates
+    /// the race window between the `PyO3` boundary's `G3EnvGuard` and
+    /// concurrent unguarded readers. Falls through to the env-var read
+    /// when `None`, preserving the v2.2.0 default-OFF behavior for
+    /// callers that haven't migrated.
+    mmr_lambda: Option<f32>,
 }
 
 /// Maximum number of candidates to pass into the cross-encoder for reranking.
@@ -331,6 +340,7 @@ impl<'a> RecallEngine<'a> {
             agent_id: None,
             user_id: None,
             agent_only: None,
+            mmr_lambda: None,
         }
     }
 
@@ -373,6 +383,21 @@ impl<'a> RecallEngine<'a> {
     #[must_use]
     pub fn with_agent_only(mut self, agent_id_self: Uuid) -> Self {
         self.agent_only = Some(agent_id_self);
+        self
+    }
+
+    /// Override the MMR balance parameter explicitly. Per coderabbit
+    /// PR #86 round-4 review — passing this through the engine boundary
+    /// instead of mutating `PENSYVE_MMR_LAMBDA` eliminates the race
+    /// between concurrent recall callers (`recall_with_diversity` used
+    /// to set the env var transiently while a parallel `recall()` could
+    /// read it). When this setter is not called, the engine falls back
+    /// to reading `PENSYVE_MMR_LAMBDA` from the env (v2.2.0 default-OFF
+    /// behavior preserved for the harness adapter). Values outside
+    /// `[0.0, 1.0]` are clamped, matching the env-var path.
+    #[must_use]
+    pub fn with_mmr_lambda(mut self, lambda: f32) -> Self {
+        self.mmr_lambda = Some(lambda.clamp(0.0, 1.0));
         self
     }
 
@@ -470,13 +495,22 @@ impl<'a> RecallEngine<'a> {
         let timeout = std::time::Duration::from_secs(self.config.recall_timeout_secs);
         let max_candidates = self.config.max_candidates;
 
-        // G3-P5: read MMR lambda once up front so we know whether to retain
-        // the query embedding for diversity reranking. When unset/<=0.0 the
-        // recall path is byte-for-byte identical to G2 (default-OFF).
-        let mmr_lambda: Option<f32> = std::env::var("PENSYVE_MMR_LAMBDA")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .map(|v| v.clamp(0.0, 1.0))
+        // G3-P5: prefer the explicit `with_mmr_lambda(...)` override
+        // when the caller threaded it through (PyO3 binding's
+        // `recall_with_diversity` sets it directly — no env-var
+        // round-trip). Falls back to the `PENSYVE_MMR_LAMBDA` env var
+        // for callers that haven't migrated. Per coderabbit PR #86
+        // round-4 review on pensyve-python/src/lib.rs:160. When
+        // unset/<=0.0 the recall path is byte-for-byte identical to G2
+        // (default-OFF).
+        let mmr_lambda: Option<f32> = self
+            .mmr_lambda
+            .or_else(|| {
+                std::env::var("PENSYVE_MMR_LAMBDA")
+                    .ok()
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .map(|v| v.clamp(0.0, 1.0))
+            })
             .filter(|&v| v > 0.0);
 
         // Steps 1–4: embed, search, merge candidates. We capture the query

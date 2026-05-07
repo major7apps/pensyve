@@ -191,6 +191,30 @@ impl MultiSessionCard {
             g3_mode: resolve_g3_mode(),
         }
     }
+
+    /// Override the G3 layering mode explicitly, replacing whatever
+    /// value [`resolve_g3_mode`] picked up from the environment at
+    /// construction. The parameter accepts the same string vocabulary
+    /// as `PENSYVE_RETRIEVAL_CARDS_G3` (`"router"` or `"full"`); any
+    /// other value (including `None`) clears the mode back to G2
+    /// baseline.
+    ///
+    /// Per coderabbit PR #86 round-4 review on
+    /// `pensyve-python/src/lib.rs:160` — the `PyO3` boundary now passes
+    /// the resolved mode here directly instead of mutating
+    /// `PENSYVE_RETRIEVAL_CARDS_G3` for the duration of one call. This
+    /// closes the race window where a parallel unguarded `recall()`
+    /// could read the env var while another caller's `G3EnvGuard` had
+    /// it transiently set.
+    #[must_use]
+    pub fn with_g3_mode(mut self, mode: Option<&str>) -> Self {
+        self.g3_mode = match mode {
+            Some("router") => Some(G3Mode::Router),
+            Some("full") => Some(G3Mode::Full),
+            _ => None,
+        };
+        self
+    }
 }
 
 impl Default for MultiSessionCard {
