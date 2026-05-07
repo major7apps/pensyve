@@ -5,6 +5,44 @@ All notable changes to Pensyve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-05-07
+
+Bundles G2 + G3 + G4 retrieval-side mechanism + Phase 23 production hardening accumulated since the v2.2.0 milestone tag. The 2.2.0 → 2.4.0 jump (skipping 2.3.0) reflects the magnitude of the surface change. **The G3 and G4 retrieval mechanisms ship default-OFF behind env gates**; flipping them on is gated by the locked G4 ablation pre-registration (`pensyve-docs/research/benchmark-sprint/v3/g4/preregistration.md @ 8930c4a`) §3.6 / §4.3 decision tree, evaluated against the wave whose results land in `pensyve-docs/research/benchmark-sprint/v3/g4/results.md`.
+
+**Empirical anchor:** G2 (`pensyve@a85f089`, PR #78) shipped retrieval-side composition (`RetrievalCard` trait + 3 cards + 4-arm ablation harness). G3 (`pensyve@3519b73`, PR #86) added intent router + supersession summarizer + typed-slot enrichment + MMR diversity. G4 (`pensyve@799f172`, PR #88) added k-budget per question_type + MS-card-v2 + PyO3 kwargs. Phase 23 (`pensyve@db67b91`, PR #87) hardened the gateway: distributed tracing + Redis rate limits + circuit breakers.
+
+### Added
+
+- **G2 — retrieval-side composition** (`pensyve-core::retrieval`): `RetrievalCard` trait with three production cards — `PeerCard`, `MultiSessionCard`, `SingleSessionUserCard`. The 4-arm ablation harness lives in `pensyve-benchmarks` for research reproducibility; SDK consumers compose via `RecallEngine::recall_grouped(...)`.
+- **G3 — intent routing + diversity**:
+  - `pensyve-core::retrieval::intent_router::{IntentRouter, RouterDecision}` — per-question-type per-card enable flags (single-session-preference / multi-session / single-session-user / temporal-reasoning / knowledge-update / single-session-assistant).
+  - `pensyve-core::retrieval::supersession_summarizer` — output-level merge of supersession chains with `--- SUPERSESSION CHAIN (MS) ---` markers (Approach A).
+  - **MMR diversity** — `RecallEngine::with_mmr_lambda(λ)` builder; default λ=0.5 when enabled. Order: reranker → MMR → cards.
+  - Typed-slot enrichment — schema-aware extraction for known slot types.
+- **G4 — k-budget per question_type + MS-card-v2**:
+  - `pensyve-core::retrieval::intent_router::KBudget { ss_pref, ms, ssu }` — per-bucket recall caps. Defaults `{ss_pref:22, ms:50, ssu:12}` per locked pre-reg §3.7. Mapping: `single-session-preference → ss_pref`; `multi-session | temporal-reasoning | knowledge-update → ms`; `single-session-user | single-session-assistant → ssu`.
+  - `RecallEngine::recall_grouped_with_router(&router, query, ns_id, question_type, &config)` — additive; routes `config.limit` through `KBudget` per question_type.
+  - `MultiSessionCard::v2()` + `with_ms_days(days)` — opt-in stricter MS-card threshold (default=2 days when enabled).
+  - **PyO3 constructor kwargs** on `Pensyve.__init__`: `k_budget: dict[str,int]` (overrides env), `ms_card_days: int`. Resolution order: kwarg > env > default.
+  - **Env knobs** (default-OFF behind `PENSYVE_RETRIEVAL_CARDS=peer+ms+ssu` opt-in): `PENSYVE_K_BUDGET_SS_PREF`, `PENSYVE_K_BUDGET_MS`, `PENSYVE_K_BUDGET_SSU`, `PENSYVE_MS_CARD_DAYS`, `PENSYVE_MMR_LAMBDA`, `PENSYVE_PEER_CARD`, `PENSYVE_SSU_N`, `PENSYVE_RETRIEVAL_CARDS_G3`.
+- **Phase 23 — gateway production hardening** (`pensyve-mcp-gateway`):
+  - **W3C `traceparent` middleware** — extracts/propagates trace context across requests; structured logging includes `trace_id` / `span_id` for correlation.
+  - **Redis-backed plan-aware rate limits** — atomic Lua check-and-increment script in `pensyve-mcp-gateway::rate_limit::redis_atomic_increment`. Plan tiers: free 30 RPM / 1k daily, business 300 RPM / 50k daily, enterprise unlimited. RFC 7231 `Retry-After` header on 429 responses.
+  - **Circuit breakers** — auth (5 fail / 60s window / 30s cooldown) + Stripe (3 fail / 60s window / 60s cooldown) via `pensyve-mcp-gateway::circuit_breaker`. Env-configurable `PENSYVE_CB_AUTH_*` / `PENSYVE_CB_STRIPE_*`. Bounded buffer (`PENSYVE_STRIPE_BUFFER_SIZE`, default 5000, drop-oldest) for Stripe outage tolerance.
+  - **Zero new Cargo deps** — uses `std::sync::Mutex` + `VecDeque` only.
+
+### Changed
+
+- **Recall pipeline order** — reranker → MMR → cards (G3 invariant carried forward into G4).
+- **Cargo workspace version bumped `2.2.0 → 2.4.0`** across 8 manifests (workspace members + `pensyve-wasm`) plus 2 `pyproject.toml` files (`./pyproject.toml`, `pensyve-python/pyproject.toml`). The lagged `pensyve-benchmarks` and `pensyve-wasm` (previously at 2.1.0) join the lockstep at this cut. Inter-crate version pins updated correspondingly.
+
+### Notes
+
+- **G3/G4 retrieval mechanism defaults are OFF.** SDK consumers calling `Pensyve.recall(...)` without `PENSYVE_RETRIEVAL_CARDS` set get the v2.1 baseline behavior. The locked pre-reg §3.6 ship-strategy decision (`v2.4.0` defaults-on if H1 PASS) is **deferred to a post-wave point release** (`v2.4.x` or `v2.5.0`) to decouple publish from research validation.
+- **Issue #92** (`major7apps/pensyve#92`) — `IntentRouter` is constructed on `PensyveInner` but the public `Pensyve.recall(...)` and `Pensyve.recall_grouped(...)` SDK entry points do not yet thread it; `k_budget` resolution flows through the harness `compose_for_g4_grid` adapter only. **Tracked for v2.4.x** before any defaults-flip cycle.
+- **`pensyve-python` wheel: aarch64-linux only** for this release per locked pre-reg decision; broader wheel matrix returns when the cross-compile prebuilts story is resolved (see `pensyve-docs` memory `feedback_onnx_cross_compile.md`).
+- **MSRV unchanged** at 1.88.
+
 ## [2.1.0] - 2026-05-04
 
 The first formal v2-line release. v2.0 was the locked benchmark substrate (`pensyve@4afede9` / `020defd`) used through Phase F-A and Phase G0; the matching Cargo tag never cut. v2.1 ships v2.0 baseline + peer-card recall-time injection + the `NetworkPolicy` fail-closed contract specified in `pensyve-docs/specs/2026-05-04-pensyve-v3-revision-b.md` §5.8 and `pensyve-docs/specs/2026-05-04-pensyve-v2.1-ship.md`.
