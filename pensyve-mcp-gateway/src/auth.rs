@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use tower::{Layer, Service};
 
 use crate::AppState;
+use crate::circuit_breaker::CircuitBreaker;
 use crate::config::GatewayConfig;
 use crate::middleware::tracing::TraceContext;
 
@@ -56,6 +57,10 @@ pub struct AuthValidator {
     jwt_decoding_key: Option<DecodingKey>,
     /// Async HTTP client for remote key validation.
     http_client: reqwest::Client,
+    /// Phase 23/C: circuit breaker around `validate_remote`. `None` is
+    /// equivalent to "always closed" — used by unit tests that don't need
+    /// to exercise the breaker logic.
+    circuit_breaker: Option<Arc<CircuitBreaker>>,
 }
 
 impl AuthValidator {
@@ -105,7 +110,17 @@ impl AuthValidator {
             remote_cache: dashmap::DashMap::new(),
             jwt_decoding_key,
             http_client,
+            circuit_breaker: None,
         }
+    }
+
+    /// Attach a circuit breaker that wraps every `validate_remote` call.
+    /// Call this in `main.rs` after constructing the validator and the
+    /// shared breaker.
+    #[must_use]
+    pub fn with_circuit_breaker(mut self, cb: Arc<CircuitBreaker>) -> Self {
+        self.circuit_breaker = Some(cb);
+        self
     }
 
     /// Validate a token. Checks API keys first, then JWT, then remote endpoint.
@@ -164,7 +179,7 @@ impl AuthValidator {
             });
         }
 
-        // 2. Check remote validation cache
+        // 2. Check remote validation cache (fresh entries only).
         if let Some(entry) = self.remote_cache.get(&hash) {
             let (ctx, expires) = entry.value();
             if std::time::Instant::now() < *expires {
@@ -174,9 +189,53 @@ impl AuthValidator {
             self.remote_cache.remove(&hash);
         }
 
-        // 3. Try remote validation
+        // 3. Try remote validation, gated by the circuit breaker.
         if let Some(url) = &self.validation_url {
-            return self.validate_remote(url, key, &hash, trace).await;
+            // Phase 23/C: if the breaker is Open, skip the remote call
+            // entirely. Fall back to a *stale* cache hit if one exists
+            // (entries are kept in the dashmap with their expiry; we
+            // re-read here ignoring the expiry rather than mutating the
+            // remove-on-expiry logic above). Returning a stale-but-known
+            // AuthContext is safer than 403'ing every authenticated user
+            // when pensyve.com is down — cached entries were valid as of
+            // the last successful round-trip.
+            if let Some(cb) = &self.circuit_breaker
+                && let Err(open) = cb.check().await
+            {
+                tracing::warn!(
+                    circuit = open.name,
+                    failures = open.failures,
+                    "auth circuit open; attempting stale cache fallback"
+                );
+                if let Some(entry) = self.remote_cache.get(&hash) {
+                    let (ctx, _expires) = entry.value();
+                    return Some(ctx.clone());
+                }
+                // No cache entry at all → deny. The middleware turns
+                // None into 403 forbidden; we keep the existing API
+                // surface (Option<AuthContext>) rather than introducing
+                // a new AuthError::ServiceUnavailable variant that
+                // would cascade into Service / Tower / response-mapping
+                // changes.
+                return None;
+            }
+
+            let result = self.validate_remote(url, key, &hash, trace).await;
+            if let Some(cb) = &self.circuit_breaker {
+                // A None result here means the remote endpoint either
+                // returned 4xx (key invalid) or failed entirely. We can
+                // distinguish the two paths inside `validate_remote`,
+                // but for circuit-breaker purposes any non-success of
+                // the round-trip counts as a failure — a key being
+                // legitimately revoked still completes the HTTP call
+                // successfully. See validate_remote_with_outcome below.
+                if result.is_some() {
+                    cb.record_success().await;
+                }
+                // Failure recording happens inside validate_remote where
+                // we can distinguish "transport error" from "bad key".
+            }
+            return result;
         }
 
         None
@@ -208,12 +267,46 @@ impl AuthValidator {
             );
         }
 
-        let resp = req.send().await.ok()?;
-        if !resp.status().is_success() {
+        // Phase 23/C: distinguish transport-level failures (network
+        // partitions, 5xx, JSON decode) from auth-level failures (4xx,
+        // valid=false). Only the former trip the circuit; a steady stream
+        // of revoked keys MUST NOT take the validator offline for healthy
+        // tenants.
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(cb) = &self.circuit_breaker {
+                    cb.record_failure().await;
+                }
+                tracing::warn!(error = %e, "remote validation transport error");
+                return None;
+            }
+        };
+
+        if resp.status().is_server_error() {
+            if let Some(cb) = &self.circuit_breaker {
+                cb.record_failure().await;
+            }
+            tracing::warn!(status = %resp.status(), "remote validation 5xx");
             return None;
         }
 
-        let body: serde_json::Value = resp.json().await.ok()?;
+        if !resp.status().is_success() {
+            // 4xx — the auth endpoint responded but rejected the key.
+            // This is NOT a circuit-tripping event.
+            return None;
+        }
+
+        let body: serde_json::Value = match resp.json().await {
+            Ok(b) => b,
+            Err(e) => {
+                if let Some(cb) = &self.circuit_breaker {
+                    cb.record_failure().await;
+                }
+                tracing::warn!(error = %e, "remote validation JSON decode failed");
+                return None;
+            }
+        };
         if body.get("valid")?.as_bool()? {
             let ctx = AuthContext {
                 key_id: body

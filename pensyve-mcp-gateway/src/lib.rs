@@ -9,6 +9,7 @@
 
 pub mod auth;
 pub mod cache;
+pub mod circuit_breaker;
 pub mod config;
 pub mod middleware;
 pub mod oauth;
