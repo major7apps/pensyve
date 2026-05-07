@@ -51,12 +51,17 @@ use crate::retrieval::engine::ScoredCandidate;
 ///
 /// Inputs:
 /// - `items`: candidates as produced by `RecallEngine::recall` (already
-///   sorted by RRF score descending). Their order on input determines the
-///   relevance term: position 0 is treated as most relevant, position
-///   N-1 as least. The actual relevance score is computed via cosine
-///   similarity between the candidate's embedding and `query_vec`, NOT
-///   from the input position — so re-ranking results from the reranker
-///   stage are honored.
+///   sorted by `ScoredCandidate.final_score` descending — the RRF +
+///   cross-encoder fused score). MMR does NOT consume `final_score`
+///   directly; the relevance term is recomputed as cosine similarity
+///   between the candidate's embedding and `query_vec` so that relevance
+///   and the redundancy term share a single scale (cosine ∈ [-1, 1]) and
+///   the lambda balance remains well-calibrated. Side effect: with
+///   λ = 1.0 the output order is *not* guaranteed to equal the input
+///   order — MMR will resort by raw cosine, which can disagree with the
+///   reranker's `final_score`. Documented tradeoff per coderabbit/claude
+///   PR #86 review and pre-reg §3.X(a'); G4 may revisit using
+///   normalized `final_score` once a multi-cell λ ablation is run.
 /// - `query_vec`: the query embedding used for the relevance term. Same
 ///   vector the recall engine fed into the vector index.
 /// - `lambda`: balance parameter, clamped into `[0.0, 1.0]`. λ=1.0 is

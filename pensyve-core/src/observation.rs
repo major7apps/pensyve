@@ -1913,7 +1913,7 @@ mod batched_localllm {
         }
 
         #[test]
-        fn batched_default_concurrency_is_eight() {
+        fn batched_default_concurrency_is_four() {
             // Pin the default concurrency. The rationale on the const
             // ties it to vLLM's `--max-num-seqs=20` divided by 4 harness
             // workers (with headroom for ensemble overhead). Any change

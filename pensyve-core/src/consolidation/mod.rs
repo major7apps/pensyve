@@ -3,9 +3,12 @@
 //! ## Per-event gate hooks (G3)
 //!
 //! Pre-reg `pensyve-docs/research/benchmark-sprint/v3/g3/preregistration.md`
-//! §3.4 item 7 + §3.7 + §3.8 add two per-event hooks that fire from
-//! [`ConsolidationEngine::run`] when the appropriate `PENSYVE_RETRIEVAL_CARDS_G3`
-//! env-var arm is active:
+//! §3.4 item 7 + §3.7 + §3.8 add two per-event hooks. They fire from the
+//! ingest path (e.g., `pensyve_core::observation::commit_*` helpers) — NOT
+//! from the legacy [`ConsolidationEngine::run`] periodic pass — when the
+//! appropriate `PENSYVE_RETRIEVAL_CARDS_G3` env-var arm is active. See
+//! the comment block at the hook definitions below for the wiring
+//! rationale.
 //!
 //! 1. **Supersession-chain summarizer** ([`run_supersession_summarizer_hook`])
 //!    — fires on `supersedes`-edge population. Reads chain entries, calls
