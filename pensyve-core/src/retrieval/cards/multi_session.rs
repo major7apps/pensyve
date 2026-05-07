@@ -79,6 +79,7 @@ use crate::storage::StorageTrait;
 use crate::types::{AgentId, UserId};
 
 use super::RetrievalCard;
+use super::supersession::SupersessionCard;
 
 /// Per-card name string used by [`RetrievalCard::name`]. Stable
 /// identifier — log consumers (`out/g2_card_defer_log.jsonl`) match on
@@ -118,6 +119,23 @@ const MS_CARD_CROSS_SESSION_THRESHOLD_G2: usize = 2;
 /// drove the G2 H4 SSU partial-fail. Per pre-reg §3.6 SQL scope-tighten.
 const MS_CARD_CROSS_SESSION_THRESHOLD_G3: usize = 3;
 
+/// G4 MS-card-v2 cross-session threshold default: relaxed back to ≥2
+/// distinct date-day buckets (G4 pre-reg lock @ pensyve-docs@8930c4a).
+/// G3 raised the bar to 3 to suppress marginal cross-session entities
+/// at the cost of recall on legitimate 2-session cross-session entities.
+/// G4 trades recall back in. The threshold is env-toggleable via
+/// [`MS_CARD_DAYS_ENV`] (`PENSYVE_MS_CARD_DAYS`).
+pub const MS_CARD_CROSS_SESSION_THRESHOLD_G4: usize = 2;
+
+/// Env-var controlling the G4 MS-card-v2 cross-session day threshold.
+/// Recognized values: any unsigned integer string (e.g., `"2"`, `"3"`,
+/// `"4"`). Unset / unparseable values fall back to
+/// [`MS_CARD_CROSS_SESSION_THRESHOLD_G4`] (= 2) when the v2 path is
+/// active. Read once at construction (`MultiSessionCard::v2` /
+/// `MultiSessionCard::v2_with_cap`) and cached as `ms_days` so the
+/// recall hot path does not re-read the environment.
+pub const MS_CARD_DAYS_ENV: &str = "PENSYVE_MS_CARD_DAYS";
+
 /// Cross-session entity-link card builder.
 ///
 /// Construct with [`MultiSessionCard::new`] for the default cap of
@@ -139,6 +157,25 @@ pub struct MultiSessionCard {
     /// behavior. Per pre-reg §3.4 item 5 + §3.6 + operator decision (a)
     /// 2026-05-06.
     g3_mode: Option<G3Mode>,
+    /// G4 MS-card-v2 cross-session day threshold, resolved at
+    /// construction time. `Some(n)` activates the v2 path (≥`n` distinct
+    /// date-day buckets, env-toggleable via `PENSYVE_MS_CARD_DAYS`,
+    /// default = 2). `None` preserves the G2/G3 dispatch on `g3_mode` +
+    /// `question_type`. Per G4 pre-reg lock @ pensyve-docs@8930c4a.
+    ///
+    /// Cached at construction (mirrors `g3_mode`) so the recall hot path
+    /// does not re-read `PENSYVE_MS_CARD_DAYS` on every `build()`.
+    ms_days: Option<usize>,
+    /// Optional supersession-chain side-input. When `Some`, MS-card-v2
+    /// queries the supersession card's chain-only output at recall time
+    /// and prepends a chain-summary block onto its own output (G4
+    /// Approach A output-merge per pre-reg lock @ pensyve-docs@8930c4a).
+    /// When `None`, MS-card emits its standard output unchanged.
+    ///
+    /// The standalone [`SupersessionCard`] in the composite chain is
+    /// unaffected; this field carries a separate (typically
+    /// freshly-constructed) handle used solely for the merge path.
+    supersession_chain: Option<SupersessionCard>,
 }
 
 /// G3 layering mode resolved from `PENSYVE_RETRIEVAL_CARDS_G3` at card
@@ -166,14 +203,36 @@ fn resolve_g3_mode() -> Option<G3Mode> {
     }
 }
 
+/// Resolve the G4 MS-card-v2 cross-session day threshold from
+/// [`MS_CARD_DAYS_ENV`]. Returns the parsed value when set to a valid
+/// non-zero unsigned integer, otherwise the v2 default
+/// ([`MS_CARD_CROSS_SESSION_THRESHOLD_G4`] = 2).
+///
+/// Zero is treated as unparseable: a 0-day threshold would surface
+/// every entity (no cross-session signal at all), which is never useful.
+fn resolve_ms_days() -> usize {
+    std::env::var(MS_CARD_DAYS_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(MS_CARD_CROSS_SESSION_THRESHOLD_G4)
+}
+
 impl MultiSessionCard {
     /// Construct a card with the default cap (= 40). Reads
     /// `PENSYVE_RETRIEVAL_CARDS_G3` once and caches the resolved mode.
+    ///
+    /// This is the **G2/G3 entry path**: `ms_days` is `None`, so the
+    /// cross-session threshold is dispatched on `g3_mode` +
+    /// `question_type` (G2 baseline = 2, G3 routed-cross-session = 3).
+    /// The G4 MS-card-v2 path is reached via [`MultiSessionCard::v2`].
     #[must_use]
     pub fn new() -> Self {
         Self {
             max_entries: MULTI_SESSION_CARD_MAX_ENTRIES,
             g3_mode: resolve_g3_mode(),
+            ms_days: None,
+            supersession_chain: None,
         }
     }
 
@@ -183,13 +242,72 @@ impl MultiSessionCard {
     /// should prefer [`MultiSessionCard::new`].
     ///
     /// As with [`MultiSessionCard::new`], the G3 layering mode is read
-    /// from the environment at this point and cached.
+    /// from the environment at this point and cached. This is the
+    /// **G2/G3 entry path**; `ms_days` is `None`.
     #[must_use]
     pub fn with_cap(max_entries: usize) -> Self {
         Self {
             max_entries,
             g3_mode: resolve_g3_mode(),
+            ms_days: None,
+            supersession_chain: None,
         }
+    }
+
+    /// Construct a **G4 MS-card-v2** card with the default cap (= 40).
+    /// Reads both `PENSYVE_RETRIEVAL_CARDS_G3` and
+    /// [`MS_CARD_DAYS_ENV`] (`PENSYVE_MS_CARD_DAYS`) once at
+    /// construction and caches the resolved values.
+    ///
+    /// The v2 path takes precedence over the G2/G3 dispatch when
+    /// active: the cross-session threshold is **always**
+    /// `ms_days` regardless of `question_type`. The default v2
+    /// threshold is [`MS_CARD_CROSS_SESSION_THRESHOLD_G4`] (= 2),
+    /// relaxed back from G3's 3 to recover legitimate 2-session
+    /// cross-session entities suppressed by the G3 SQL scope-tighten.
+    ///
+    /// Use [`MultiSessionCard::v2_with_supersession`] / the builder
+    /// [`MultiSessionCard::with_supersession_chain`] to also wire in
+    /// the supersession-chain output-merge (G4 Approach A).
+    #[must_use]
+    pub fn v2() -> Self {
+        Self {
+            max_entries: MULTI_SESSION_CARD_MAX_ENTRIES,
+            g3_mode: resolve_g3_mode(),
+            ms_days: Some(resolve_ms_days()),
+            supersession_chain: None,
+        }
+    }
+
+    /// Construct a **G4 MS-card-v2** card with an explicit entry cap.
+    /// Reads both env vars once and caches the resolved values, as in
+    /// [`MultiSessionCard::v2`].
+    #[must_use]
+    pub fn v2_with_cap(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            g3_mode: resolve_g3_mode(),
+            ms_days: Some(resolve_ms_days()),
+            supersession_chain: None,
+        }
+    }
+
+    /// Builder method: attach a [`SupersessionCard`] handle for the G4
+    /// Approach A output-merge. When attached, MS-card builds its
+    /// standard output then prepends a chain-summary block produced by
+    /// [`SupersessionCard::build_chain_only`]. Pass any
+    /// `SupersessionCard` instance — it is consumed for its chain-only
+    /// query, never rendered with its own header/footer scaffolding by
+    /// this card.
+    ///
+    /// Standalone `SupersessionCard` consumers (including the separate
+    /// `SupersessionCard` slot in `CompositeCard::g3_default` /
+    /// `CompositeCard::g4_default`) are unaffected — the chain handle
+    /// here is independent and is never published as the SSC block.
+    #[must_use]
+    pub fn with_supersession_chain(mut self, chain: SupersessionCard) -> Self {
+        self.supersession_chain = Some(chain);
+        self
     }
 
     /// Override the G3 layering mode explicitly, replacing whatever
@@ -213,6 +331,24 @@ impl MultiSessionCard {
             Some("full") => Some(G3Mode::Full),
             _ => None,
         };
+        self
+    }
+
+    /// Override the G4 MS-card-v2 day threshold explicitly, replacing
+    /// whatever value [`resolve_ms_days`] picked up from
+    /// [`MS_CARD_DAYS_ENV`] at construction. `Some(n)` (with `n > 0`)
+    /// activates the v2 path with threshold `n`; `None` reverts to the
+    /// G2/G3 dispatch (`new()` / `with_cap()` semantics).
+    ///
+    /// Mirrors the pattern of [`with_g3_mode`] — gives the `PyO3`
+    /// boundary a way to pass a per-call threshold without mutating
+    /// `PENSYVE_MS_CARD_DAYS` (closes the same env-mutation race that
+    /// motivated `with_g3_mode`).
+    ///
+    /// [`with_g3_mode`]: MultiSessionCard::with_g3_mode
+    #[must_use]
+    pub fn with_ms_days(mut self, days: Option<usize>) -> Self {
+        self.ms_days = days.filter(|&n| n > 0);
         self
     }
 }
@@ -264,39 +400,119 @@ impl RetrievalCard for MultiSessionCard {
         )
         .ok()?;
 
-        // G3 SQL scope-tighten (pre-reg §3.6): raise cross-session
-        // threshold from G2's ≥2 to ≥3 distinct date-day buckets ONLY when
-        // BOTH (a) `g3_mode` is set AND (b) `question_type` matches a
-        // routed cross-session type (multi-session / temporal-reasoning /
-        // knowledge-update). Coderabbit Major review on PR #86 caught a
-        // regression: the original guard raised the threshold on any
-        // `g3_mode`, which silently dropped 2-session entities for callers
-        // that pass no question_type or non-routed types — contradicting
-        // the baseline-compatible fallback intent of the router gate above.
-        let cross_session_threshold = matches!(
+        // Cross-session threshold dispatch:
+        //
+        // - **G4 MS-card-v2 path** (`ms_days = Some(n)`): use `n`
+        //   directly. Default = 2 (relaxed back from G3's 3). The v2
+        //   threshold is question-type-agnostic — the router gate above
+        //   has already filtered out non-cross-session question types.
+        //
+        // - **G3 SQL scope-tighten** (`ms_days = None`,
+        //   `g3_mode = Some(_)`, `question_type` matches routed
+        //   cross-session): raise to G3's 3.
+        //
+        // - **G2 baseline** (everything else): use 2.
+        //
+        // Coderabbit Major review on PR #86 pinned the `g3_mode` +
+        // `question_type` AND-guard for the G3 path; the v2 short-circuit
+        // sits ahead of that guard so v2 callers do not need to pass a
+        // question_type to get the relaxed threshold.
+        let cross_session_threshold = if let Some(n) = self.ms_days {
+            n
+        } else if matches!(
             (self.g3_mode, question_type),
             (
                 Some(_),
                 Some("multi-session" | "temporal-reasoning" | "knowledge-update")
             )
-        )
-        .then_some(MS_CARD_CROSS_SESSION_THRESHOLD_G3)
-        .unwrap_or(MS_CARD_CROSS_SESSION_THRESHOLD_G2);
+        ) {
+            MS_CARD_CROSS_SESSION_THRESHOLD_G3
+        } else {
+            MS_CARD_CROSS_SESSION_THRESHOLD_G2
+        };
 
-        build_from_conn(
+        let base = build_from_conn(
             &conn,
             namespace_id,
             agent_id,
             user_id,
             self.max_entries,
             cross_session_threshold,
-        )
+        );
+
+        // G4 Approach A output-merge: prepend supersession-chain entries
+        // when the chain handle is attached. The merge runs only if
+        // either the base MS-card or the chain produced content; if both
+        // are empty the card defers (returns `None`) per the standard
+        // contract.
+        if self.supersession_chain.is_some() {
+            let chain_output = self.supersession_chain.as_ref().and_then(|sc| {
+                sc.build_chain_only(&conn, namespace_id, agent_id.as_ref(), user_id.as_ref())
+            });
+            self.merge_supersession_chain(chain_output.as_deref(), base)
+        } else {
+            base
+        }
     }
 
     fn name(&self) -> &'static str {
         MULTI_SESSION_CARD_NAME
     }
 }
+
+impl MultiSessionCard {
+    /// G4 Approach A output-merge helper. Combines a supersession-chain
+    /// summary block (typically produced by
+    /// [`SupersessionCard::build_chain_only`]) with the MS-card's own
+    /// base output, prepending the chain block under a stable
+    /// `--- SUPERSESSION CHAIN (MS) ---` / `--- END SUPERSESSION CHAIN
+    /// (MS) ---` marker pair. The marker pair is **distinct** from the
+    /// standalone `SupersessionCard` block markers so log-grep
+    /// consumers and the composite-level bullet clipper can tell the
+    /// two surfaces apart.
+    ///
+    /// Merge semantics (full truth table):
+    ///
+    /// | `chain_output`      | `base_output`     | result                          |
+    /// |---------------------|-------------------|---------------------------------|
+    /// | `Some(non-empty)`   | `Some(non-empty)` | chain block + `\n\n` + base     |
+    /// | `Some(non-empty)`   | `None`            | chain block alone               |
+    /// | `None` / empty      | `Some(non-empty)` | base alone                      |
+    /// | `None` / empty      | `None`            | `None` (defer-on-failure)       |
+    ///
+    /// `\n\n` matches `CompositeCard`'s section separator so the
+    /// composite-level join sees the merged output as one cohesive
+    /// section.
+    #[must_use]
+    pub fn merge_supersession_chain(
+        &self,
+        chain_output: Option<&str>,
+        base_output: Option<String>,
+    ) -> Option<String> {
+        let chain_clean = chain_output
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("{MS_CARD_SUPERSESSION_HEADER}\n{s}\n{MS_CARD_SUPERSESSION_FOOTER}"));
+
+        match (chain_clean, base_output) {
+            (Some(chain), Some(base)) => Some(format!("{chain}\n\n{base}")),
+            (Some(chain), None) => Some(chain),
+            (None, Some(base)) => Some(base),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Marker line opening the supersession-chain block prepended by
+/// MS-card-v2 (G4 Approach A output-merge). Distinct from the
+/// standalone `SupersessionCard`'s `--- SUPERSESSION CHAIN ---` so
+/// log-grep tools and the composite-level bullet clipper can
+/// distinguish the two surfaces.
+pub const MS_CARD_SUPERSESSION_HEADER: &str = "--- SUPERSESSION CHAIN (MS) ---";
+
+/// Marker line closing the MS-card supersession-chain block. See
+/// [`MS_CARD_SUPERSESSION_HEADER`].
+pub const MS_CARD_SUPERSESSION_FOOTER: &str = "--- END SUPERSESSION CHAIN (MS) ---";
 
 /// Lower-level entry point: build the card from an already-open
 /// connection. Exposed `pub(super)` rather than `pub` — the public

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use uuid::Uuid;
@@ -21,6 +21,7 @@ use pensyve_core::retrieval::cards::{
     CompositeCard, MultiSessionCard, PeerCardAdapter, RetrievalCard, SingleSessionUserCard,
     SupersessionCard,
 };
+use pensyve_core::retrieval::intent_router::{IntentRouter, KBudget};
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::{self, EntityKind, EpisodicMemory, Namespace, Outcome, SemanticMemory};
@@ -387,6 +388,117 @@ struct PensyveInner {
     /// with `Pensyve(reranker=None)` for embedded/offline contexts where
     /// the ~150MB model download is unacceptable.
     reranker: Option<Arc<pensyve_core::reranker::Reranker>>,
+    /// G4 P5: stateful intent router with the resolved per-`question_type`
+    /// k-budget cached at construction. Built from the `k_budget` kwarg /
+    /// `PENSYVE_K_BUDGET_*` env vars / locked defaults via
+    /// `IntentRouter::with_budget(...)`. Routed recall paths
+    /// (`recall_grouped_with_router`) consume this directly; the
+    /// Python-side `k_budget` getter inspects `IntentRouter::k_budget()`.
+    intent_router: IntentRouter,
+    /// G4 P5: resolved MS-card-v2 cross-session day threshold. Set at
+    /// construction via the `ms_card_days` kwarg / `PENSYVE_MS_CARD_DAYS`
+    /// env var / locked default of 2. Threaded into the
+    /// `MultiSessionCard::with_ms_days(Some(_))` builder at every card
+    /// construction site so the recall pipeline (composite-card path)
+    /// observes the resolved value.
+    ms_card_days: usize,
+}
+
+// ---------------------------------------------------------------------------
+// G4 P5: k-budget + ms_card_days resolution
+// ---------------------------------------------------------------------------
+//
+// G4 introduces two new construction-time configurations:
+//
+//   1. k-budget per `question_type` (G4 P2 — `IntentRouter::k_for_type`)
+//   2. MS-card-v2 cross-session day threshold (G4 P3)
+//
+// Both are env-driven by default but should also be reachable via PyO3
+// kwargs for SDK consumers. Pre-reg lock at `pensyve-docs@8930c4a`:
+//   - k-budget defaults: `{SS-Pref: 22, MS: 50, SSU: 12}`
+//   - MS-card-days default: `2`
+//   - Precedence: kwarg > env > default (matches v2.1's
+//     `Pensyve::with_peer_card(bool)` pattern).
+//
+// The upstream Rust API surface
+// (`pensyve_core::retrieval::intent_router::{KBudget, IntentRouter}` and
+// `MultiSessionCard::with_ms_days`) lands via G4 P2 / P3. The PyO3 layer
+// imports the upstream `KBudget` directly (single source of truth for
+// the locked default constants + env-var parsing), wraps it in an
+// `IntentRouter` for the routed-recall path, and threads
+// `ms_card_days` into the lone `MultiSessionCard::new()` site via
+// `MultiSessionCard::with_ms_days(Some(_))`.
+
+/// Default MS-card-v2 cross-session day threshold per pre-reg
+/// `pensyve-docs@8930c4a`. Mirrors the constant defined in
+/// `pensyve_core::retrieval::cards::multi_session` so the kwarg /
+/// env / default precedence resolver here matches the locked value
+/// without depending on a private constant on the core side.
+const G4_DEFAULT_MS_CARD_DAYS: usize = 2;
+
+/// Parse a `{"ss_pref": 22, "ms": 50, "ssu": 12}` dict from the kwarg.
+///
+/// Missing keys fall back to the locked defaults — callers can supply a
+/// partial dict (e.g. `{"ms": 60}`) without restating the other slots.
+/// Unknown keys are rejected with `ValueError` to catch typos early
+/// (e.g. `"ss_pref" -> "sspref"`).
+///
+/// Zero values are rejected with `ValueError`, mirroring the env-path
+/// guard in [`KBudget::from_env`]: a zero k-budget would short-circuit
+/// the entire recall pipeline, so we surface the misuse explicitly here
+/// rather than silently letting it through. Operators that genuinely
+/// want to suppress recall should use a dedicated kill-switch, not
+/// `k_budget={"...": 0}`.
+fn parse_k_budget_dict(dict: &Bound<'_, PyDict>) -> PyResult<KBudget> {
+    let mut budget = KBudget::default();
+    for (k, v) in dict.iter() {
+        let key: String = k.extract().map_err(|_| {
+            PyTypeError::new_err("k_budget keys must be strings: 'ss_pref' | 'ms' | 'ssu'")
+        })?;
+        let val: usize = v.extract().map_err(|_| {
+            PyTypeError::new_err(format!("k_budget['{key}'] must be a non-negative integer"))
+        })?;
+        if val == 0 {
+            return Err(PyValueError::new_err(format!(
+                "k_budget['{key}'] must be > 0; zero would short-circuit recall. \
+                 Omit the key to inherit the default, or use a dedicated kill-switch \
+                 to disable recall."
+            )));
+        }
+        match key.as_str() {
+            "ss_pref" => budget.ss_pref = val,
+            "ms" => budget.ms = val,
+            "ssu" => budget.ssu = val,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown k_budget key '{other}'. Expected one of: 'ss_pref', 'ms', 'ssu'"
+                )));
+            }
+        }
+    }
+    Ok(budget)
+}
+
+/// Resolve `ms_card_days` per pre-reg precedence: kwarg > env > default.
+///
+/// Env var: `PENSYVE_MS_CARD_DAYS` (parsed as `usize`; unparseable
+/// values fall back to the default). Default: `2`.
+///
+/// Zero is treated as unset on both the kwarg and env paths, mirroring
+/// the core-side guard in `multi_session::resolve_ms_days`: a 0-day
+/// threshold would surface every entity (no cross-session signal) and
+/// `MultiSessionCard::with_ms_days(Some(0))` already filters it to
+/// `None` internally — without this filter the `ms_card_days` getter
+/// would lie about the effective threshold.
+fn resolve_ms_card_days(kwarg: Option<usize>) -> usize {
+    if let Some(d) = kwarg.filter(|&n| n > 0) {
+        return d;
+    }
+    std::env::var("PENSYVE_MS_CARD_DAYS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(G4_DEFAULT_MS_CARD_DAYS)
 }
 
 // ---------------------------------------------------------------------------
@@ -433,8 +545,17 @@ impl PyPensyve {
     ///         Total in-flight = harness workers × this — keep
     ///         `workers × max_concurrency` ≤ 16 on a 128 GB UMA box where
     ///         vLLM is co-resident; OOM-killer fires above ~24.
+    ///     `k_budget`: G4 retrieval-side k-budget per `question_type`
+    ///         family. Dict shape: `{"ss_pref": int, "ms": int, "ssu": int}`.
+    ///         Missing keys fall back to the locked defaults
+    ///         `{ss_pref: 22, ms: 50, ssu: 12}`. Precedence:
+    ///         kwarg > `PENSYVE_K_BUDGET_*` env > default. Pre-reg lock
+    ///         at `pensyve-docs@8930c4a`.
+    ///     `ms_card_days`: G4 MS-card-v2 cross-session day threshold.
+    ///         Default 2. Precedence: kwarg > `PENSYVE_MS_CARD_DAYS` env >
+    ///         default. Pre-reg lock at `pensyve-docs@8930c4a`.
     #[new]
-    #[pyo3(signature = (path=None, namespace=None, extractor=None, extractor_api_key=None, reranker=Some("BGERerankerBase".to_string()), extractor_base_url=None, extractor_model=None, extractor_max_concurrency=None, agent_id=None, user_id=None))]
+    #[pyo3(signature = (path=None, namespace=None, extractor=None, extractor_api_key=None, reranker=Some("BGERerankerBase".to_string()), extractor_base_url=None, extractor_model=None, extractor_max_concurrency=None, agent_id=None, user_id=None, k_budget=None, ms_card_days=None))]
     #[allow(
         clippy::needless_pass_by_value,
         clippy::too_many_arguments,
@@ -453,6 +574,12 @@ impl PyPensyve {
         // binding boundary; pre-reg §3.0 item 6 (8 → 10 params).
         agent_id: Option<String>,
         user_id: Option<String>,
+        // G4 P5: retrieval-side k-budget + MS-card day threshold.
+        // Plumbed end-to-end into the upstream `IntentRouter` (G4 P2)
+        // and `MultiSessionCard::with_ms_days` (G4 P3) at construction.
+        // Pre-reg lock `pensyve-docs@8930c4a`.
+        k_budget: Option<Bound<'_, PyDict>>,
+        ms_card_days: Option<usize>,
     ) -> PyResult<Self> {
         // G1: parse the scope strings at the binding boundary and surface
         // a Python `ValueError` on parse failure (matches PyO3 idiom).
@@ -476,6 +603,25 @@ impl PyPensyve {
             pensyve_core::network_policy::NetworkPolicy::from_env(""),
             Some(pensyve_core::network_policy::NetworkPolicy::Permissive)
         );
+
+        // G4 P5: resolve k-budget + ms_card_days with precedence
+        // kwarg > env > default. The kwarg path takes the dict value as
+        // a partial override of the locked defaults; missing dict keys
+        // do NOT inherit from the env. This matches the v2.1
+        // `with_peer_card(bool)` precedence pattern.
+        //
+        // The resolved `KBudget` is wrapped in an `IntentRouter` so
+        // routed recall (`RecallEngine::recall_grouped_with_router`,
+        // G4 P2) consumes it directly without re-reading env vars on
+        // the per-call hot path. `resolved_ms_card_days` is threaded
+        // into every `MultiSessionCard::new()` site below via
+        // `MultiSessionCard::with_ms_days(Some(_))` (G4 P3).
+        let resolved_k_budget = match k_budget {
+            Some(dict) => parse_k_budget_dict(&dict)?,
+            None => KBudget::from_env(),
+        };
+        let resolved_intent_router = IntentRouter::with_budget(resolved_k_budget);
+        let resolved_ms_card_days = resolve_ms_card_days(ms_card_days);
 
         // G1 fix: resolve the embedder's load-time `NetworkPolicy` at handle
         // construction so `NetworkPolicy::Disabled` propagates from the
@@ -636,8 +782,42 @@ impl PyPensyve {
                 agent_id: agent_id_uuid,
                 user_id: user_id_uuid,
                 recall_across_users_allowed,
+                intent_router: resolved_intent_router,
+                ms_card_days: resolved_ms_card_days,
             }),
         })
+    }
+
+    // -----------------------------------------------------------------
+    // G4 P5: introspection getters for the resolved k-budget + MS-card
+    // day threshold. These exist primarily so Python tests can assert
+    // the kwarg > env > default precedence without round-tripping
+    // through the (still-being-built) recall pipeline. They are also
+    // useful for SDK consumers debugging unexpected retrieval shape.
+    // -----------------------------------------------------------------
+
+    /// Resolved k-budget per `question_type` family.
+    ///
+    /// Returns a dict with keys `ss_pref`, `ms`, `ssu`. The values
+    /// reflect the kwarg > env > default precedence locked at
+    /// `pensyve-docs@8930c4a`.
+    #[getter]
+    fn k_budget<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let kb = self.inner.intent_router.k_budget();
+        let d = PyDict::new(py);
+        d.set_item("ss_pref", kb.ss_pref)?;
+        d.set_item("ms", kb.ms)?;
+        d.set_item("ssu", kb.ssu)?;
+        Ok(d)
+    }
+
+    /// Resolved MS-card-v2 cross-session day threshold.
+    ///
+    /// Reflects the kwarg > env > default precedence locked at
+    /// `pensyve-docs@8930c4a` (default = 2).
+    #[getter]
+    fn ms_card_days(&self) -> usize {
+        self.inner.ms_card_days
     }
 
     /// Get or create an entity.
@@ -1118,8 +1298,18 @@ impl PyPensyve {
             // intended mode without relying on a process-env mutation
             // (round-4 fix; see comment block above the
             // `g3_mode_value` computation).
+            //
+            // G4 P5: thread the resolved `ms_card_days` through
+            // `MultiSessionCard::with_ms_days(Some(_))` (G4 P3) so the
+            // card observes the kwarg / env / locked-default value
+            // resolved at `Pensyve::new` time, byte-for-byte matching
+            // the precedence the introspection getter reports.
             cards.push((
-                Box::new(MultiSessionCard::new().with_g3_mode(g3_mode_value)),
+                Box::new(
+                    MultiSessionCard::new()
+                        .with_g3_mode(g3_mode_value)
+                        .with_ms_days(Some(self.inner.ms_card_days)),
+                ),
                 G2_MULTI_SESSION_CARD_CAP,
             ));
         }

@@ -216,6 +216,53 @@ impl CompositeCard {
             (supersession, G3_SUPERSESSION_CARD_CAP),
         ])
     }
+
+    /// G4 default composite per pre-reg lock @ pensyve-docs@8930c4a:
+    /// inherits the G3 four-card chain
+    /// (`Peer + MultiSession + SingleSessionUser + Supersession`) but
+    /// expects the `multi_session` slot to be a
+    /// [`crate::retrieval::cards::MultiSessionCard`] constructed via
+    /// `MultiSessionCard::v2()` /
+    /// `MultiSessionCard::v2_with_cap()` with an attached
+    /// `with_supersession_chain(...)` handle.
+    ///
+    /// Wiring rationale (Approach A output-merge):
+    ///
+    /// - The MS-card-v2 reads the supersession chain at recall time
+    ///   and **prepends** a chain block to its own output under the
+    ///   `--- SUPERSESSION CHAIN (MS) ---` markers (distinct from the
+    ///   standalone SSC markers).
+    /// - The 4th-slot standalone `SupersessionCard` continues to emit
+    ///   its own `--- SUPERSESSION CHAIN ---` block; both surfaces
+    ///   coexist in the composite output.
+    /// - The merge sits inside `MultiSessionCard::build()` (not in
+    ///   `CompositeCard::build()`) so the composite stays object-safe
+    ///   and `cards: Vec<(Box<dyn RetrievalCard>, usize)>` does not
+    ///   need card-specific dispatch logic. The output-level join here
+    ///   is composition-only.
+    ///
+    /// The caller is responsible for constructing the `multi_session`
+    /// arg via the v2 path with the supersession-chain handle attached;
+    /// this constructor's signature is identical to
+    /// [`g3_default`] so the harness adapter / Python bindings can swap
+    /// G3 → G4 by changing only the `multi_session` builder, not the
+    /// composite assembly.
+    ///
+    /// [`g3_default`]: CompositeCard::g3_default
+    #[must_use]
+    pub fn g4_default(
+        peer: Box<dyn RetrievalCard>,
+        multi_session: Box<dyn RetrievalCard>,
+        single_session_user: Box<dyn RetrievalCard>,
+        supersession: Box<dyn RetrievalCard>,
+    ) -> Self {
+        Self::new(vec![
+            (peer, G2_PEER_CARD_CAP),
+            (multi_session, G2_MULTI_SESSION_CARD_CAP),
+            (single_session_user, G2_SINGLE_SESSION_USER_CARD_CAP),
+            (supersession, G3_SUPERSESSION_CARD_CAP),
+        ])
+    }
 }
 
 impl RetrievalCard for CompositeCard {
@@ -291,7 +338,14 @@ impl RetrievalCard for CompositeCard {
 /// - The first `n` bullet lines are kept.
 /// - Any non-bullet lines AFTER the last kept bullet are preserved
 ///   verbatim as a footer (e.g., `--- END USER FACTS ---` markers).
-///   Non-bullet lines BETWEEN bullets are dropped.
+/// - **Marker-style** non-bullet lines BETWEEN bullets — lines that
+///   start with `"--- "` and end with `" ---"` — are preserved in
+///   document order. This supports the G4 MS-card-v2 + supersession
+///   output-merge surface, where the merged output may contain inner
+///   `--- SUPERSESSION CHAIN (MS) ---` / `--- END SUPERSESSION CHAIN
+///   (MS) ---` boundaries between the chain bullets and the
+///   cross-session bullets. Non-marker non-bullet lines between
+///   bullets are still dropped.
 /// - If `n == 0` or there are zero bullets, the empty string is
 ///   returned (composite treats this as a defer).
 fn clip_bullet_entries_or_passthrough(card_output: &str, n: usize) -> String {
@@ -323,22 +377,52 @@ fn clip_bullet_entries_or_passthrough(card_output: &str, n: usize) -> String {
         return String::new();
     }
 
-    // Footer = any non-bullet lines after the last kept bullet.
+    // Build the output in document order: header (if any), then walk
+    // from line 0..=last_bullet keeping bullets in `bullet_indices` and
+    // marker-style non-bullet lines (`--- ... ---`) between them, then
+    // append the footer (any non-bullet lines after the last kept bullet).
     let last_bullet = *bullet_indices.last().unwrap();
-    let footer: Vec<&str> = lines[last_bullet + 1..]
-        .iter()
-        .filter(|l| !l.starts_with("- "))
-        .copied()
-        .collect();
+    let bullet_set: std::collections::HashSet<usize> = bullet_indices.iter().copied().collect();
 
-    let bullets: Vec<&str> = bullet_indices.iter().map(|&i| lines[i]).collect();
-    let mut out = Vec::with_capacity(1 + bullets.len() + footer.len());
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
     if !header.is_empty() {
         out.push(header);
     }
-    out.extend(&bullets);
-    out.extend(&footer);
+    // Walk inclusive from the line after the header up to and including
+    // the last kept bullet.
+    let walk_start = usize::from(header_idx != usize::MAX);
+    for (i, l) in lines
+        .iter()
+        .enumerate()
+        .take(last_bullet + 1)
+        .skip(walk_start)
+    {
+        if bullet_set.contains(&i) {
+            out.push(l);
+        } else if !l.starts_with("- ") && is_section_marker(l) {
+            // Marker-style line between bullets — preserved.
+            out.push(l);
+        }
+        // Other non-bullet lines between bullets: dropped (preserves
+        // the original clipper contract for non-marker noise).
+    }
+    // Footer = any non-bullet lines after the last kept bullet (existing
+    // behavior; markers and prose alike pass through).
+    for l in &lines[last_bullet + 1..] {
+        if !l.starts_with("- ") {
+            out.push(l);
+        }
+    }
     out.join("\n")
+}
+
+/// Is `line` a section-marker line (starts with `"--- "` and ends with
+/// `" ---"`)? Used by `clip_bullet_entries_or_passthrough` to preserve
+/// inner section boundaries (e.g., the MS-card-v2 +
+/// supersession-chain merged surface) instead of dropping them as noise.
+fn is_section_marker(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with("--- ") && t.ends_with(" ---") && t.len() >= "--- X ---".len()
 }
 
 #[cfg(test)]
