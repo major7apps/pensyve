@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use uuid::Uuid;
@@ -387,6 +387,145 @@ struct PensyveInner {
     /// with `Pensyve(reranker=None)` for embedded/offline contexts where
     /// the ~150MB model download is unacceptable.
     reranker: Option<Arc<pensyve_core::reranker::Reranker>>,
+    /// G4 P5: resolved k-budget per `question_type` family. Set at
+    /// construction via the `k_budget` kwarg / `PENSYVE_K_BUDGET_*` env
+    /// vars / locked defaults. Currently stored for Python-side
+    /// observability + future wiring into `IntentRouter::k_for_type` (G4
+    /// P2). Recall pipeline does not yet consume this — see TODO(g4-p5).
+    k_budget: KBudget,
+    /// G4 P5: resolved MS-card-v2 cross-session day threshold. Set at
+    /// construction via the `ms_card_days` kwarg / `PENSYVE_MS_CARD_DAYS`
+    /// env var / locked default of 2. Currently stored for observability
+    /// and future wiring into `MultiSessionCard::with_days` (G4 P3).
+    /// Recall pipeline does not yet consume this — see TODO(g4-p5).
+    ms_card_days: usize,
+}
+
+// ---------------------------------------------------------------------------
+// G4 P5: k-budget + ms_card_days resolution
+// ---------------------------------------------------------------------------
+//
+// G4 introduces two new construction-time configurations:
+//
+//   1. k-budget per `question_type` (G4 P2 — `IntentRouter::k_for_type`)
+//   2. MS-card-v2 cross-session day threshold (G4 P3)
+//
+// Both are env-driven by default but should also be reachable via PyO3
+// kwargs for SDK consumers. Pre-reg lock at `pensyve-docs@8930c4a`:
+//   - k-budget defaults: `{SS-Pref: 22, MS: 50, SSU: 12}`
+//   - MS-card-days default: `2`
+//   - Precedence: kwarg > env > default (matches v2.1's
+//     `Pensyve::with_peer_card(bool)` pattern).
+//
+// NOTE: the upstream Rust API surface (`IntentRouter::k_for_type` +
+// `MultiSessionCard::with_days`) is being built in parallel by G4 P2 / P3.
+// Until those branches merge to `main`, this module **stubs the resolution
+// logic** and stores the values on `PensyveInner` for Python-side
+// observability, but does NOT yet plumb them through the recall engine.
+// The wiring point is marked with `TODO(g4-p5)`. See the report.
+
+/// Default k-budget per pre-reg `pensyve-docs@8930c4a`. Anchored as a
+/// const so that test fixtures and the resolver agree byte-for-byte on
+/// the locked numbers.
+const G4_DEFAULT_K_SS_PREF: usize = 22;
+const G4_DEFAULT_K_MS: usize = 50;
+const G4_DEFAULT_K_SSU: usize = 12;
+
+/// Default MS-card-v2 cross-session day threshold per pre-reg.
+const G4_DEFAULT_MS_CARD_DAYS: usize = 2;
+
+/// Resolved k-budget per `question_type` family.
+///
+/// The three slots correspond to the three card-archetype k caps under
+/// G4: `ss_pref` (single-session-preference), `ms` (multi-session +
+/// temporal-reasoning + knowledge-update), `ssu` (single-session-user
+/// and single-session-assistant). The `IntentRouter` (G4 P2) consumes
+/// this via a dispatch on `question_type` -> the appropriate slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KBudget {
+    pub ss_pref: usize,
+    pub ms: usize,
+    pub ssu: usize,
+}
+
+impl KBudget {
+    /// Pre-reg-locked defaults: `{SS-Pref: 22, MS: 50, SSU: 12}`.
+    pub(crate) const fn defaults() -> Self {
+        Self {
+            ss_pref: G4_DEFAULT_K_SS_PREF,
+            ms: G4_DEFAULT_K_MS,
+            ssu: G4_DEFAULT_K_SSU,
+        }
+    }
+
+    /// Read budget from `PENSYVE_K_BUDGET_*` env vars, falling back to
+    /// the locked defaults for any var that is unset or unparseable.
+    /// Mirrors the env-driven path that the `IntentRouter` (G4 P2) will
+    /// expose at the Rust-core level.
+    pub(crate) fn from_env() -> Self {
+        let mut b = Self::defaults();
+        if let Ok(s) = std::env::var("PENSYVE_K_BUDGET_SS_PREF")
+            && let Ok(n) = s.parse()
+        {
+            b.ss_pref = n;
+        }
+        if let Ok(s) = std::env::var("PENSYVE_K_BUDGET_MS")
+            && let Ok(n) = s.parse()
+        {
+            b.ms = n;
+        }
+        if let Ok(s) = std::env::var("PENSYVE_K_BUDGET_SSU")
+            && let Ok(n) = s.parse()
+        {
+            b.ssu = n;
+        }
+        b
+    }
+}
+
+/// Parse a `{"ss_pref": 22, "ms": 50, "ssu": 12}` dict from the kwarg.
+///
+/// Missing keys fall back to the locked defaults — callers can supply a
+/// partial dict (e.g. `{"ms": 60}`) without restating the other slots.
+/// Unknown keys are rejected with `ValueError` to catch typos early
+/// (e.g. `"ss_pref" -> "sspref"`).
+fn parse_k_budget_dict(dict: &Bound<'_, PyDict>) -> PyResult<KBudget> {
+    let mut budget = KBudget::defaults();
+    for (k, v) in dict.iter() {
+        let key: String = k.extract().map_err(|_| {
+            PyTypeError::new_err("k_budget keys must be strings: 'ss_pref' | 'ms' | 'ssu'")
+        })?;
+        let val: usize = v.extract().map_err(|_| {
+            PyTypeError::new_err(format!(
+                "k_budget['{key}'] must be a non-negative integer"
+            ))
+        })?;
+        match key.as_str() {
+            "ss_pref" => budget.ss_pref = val,
+            "ms" => budget.ms = val,
+            "ssu" => budget.ssu = val,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "Unknown k_budget key '{other}'. Expected one of: 'ss_pref', 'ms', 'ssu'"
+                )));
+            }
+        }
+    }
+    Ok(budget)
+}
+
+/// Resolve `ms_card_days` per pre-reg precedence: kwarg > env > default.
+///
+/// Env var: `PENSYVE_MS_CARD_DAYS` (parsed as `usize`; unparseable
+/// values fall back to the default). Default: `2`.
+fn resolve_ms_card_days(kwarg: Option<usize>) -> usize {
+    if let Some(d) = kwarg {
+        return d;
+    }
+    std::env::var("PENSYVE_MS_CARD_DAYS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(G4_DEFAULT_MS_CARD_DAYS)
 }
 
 // ---------------------------------------------------------------------------
@@ -433,8 +572,17 @@ impl PyPensyve {
     ///         Total in-flight = harness workers × this — keep
     ///         `workers × max_concurrency` ≤ 16 on a 128 GB UMA box where
     ///         vLLM is co-resident; OOM-killer fires above ~24.
+    ///     `k_budget`: G4 retrieval-side k-budget per `question_type`
+    ///         family. Dict shape: `{"ss_pref": int, "ms": int, "ssu": int}`.
+    ///         Missing keys fall back to the locked defaults
+    ///         `{ss_pref: 22, ms: 50, ssu: 12}`. Precedence:
+    ///         kwarg > `PENSYVE_K_BUDGET_*` env > default. Pre-reg lock
+    ///         at `pensyve-docs@8930c4a`.
+    ///     `ms_card_days`: G4 MS-card-v2 cross-session day threshold.
+    ///         Default 2. Precedence: kwarg > `PENSYVE_MS_CARD_DAYS` env >
+    ///         default. Pre-reg lock at `pensyve-docs@8930c4a`.
     #[new]
-    #[pyo3(signature = (path=None, namespace=None, extractor=None, extractor_api_key=None, reranker=Some("BGERerankerBase".to_string()), extractor_base_url=None, extractor_model=None, extractor_max_concurrency=None, agent_id=None, user_id=None))]
+    #[pyo3(signature = (path=None, namespace=None, extractor=None, extractor_api_key=None, reranker=Some("BGERerankerBase".to_string()), extractor_base_url=None, extractor_model=None, extractor_max_concurrency=None, agent_id=None, user_id=None, k_budget=None, ms_card_days=None))]
     #[allow(
         clippy::needless_pass_by_value,
         clippy::too_many_arguments,
@@ -453,6 +601,12 @@ impl PyPensyve {
         // binding boundary; pre-reg §3.0 item 6 (8 → 10 params).
         agent_id: Option<String>,
         user_id: Option<String>,
+        // G4 P5: retrieval-side k-budget + MS-card day threshold.
+        // Stub-stored on `PensyveInner` until G4 P2 / P3 land the
+        // upstream `IntentRouter::k_for_type` + `MultiSessionCard::with_days`
+        // wiring points. Pre-reg lock `pensyve-docs@8930c4a`.
+        k_budget: Option<Bound<'_, PyDict>>,
+        ms_card_days: Option<usize>,
     ) -> PyResult<Self> {
         // G1: parse the scope strings at the binding boundary and surface
         // a Python `ValueError` on parse failure (matches PyO3 idiom).
@@ -476,6 +630,25 @@ impl PyPensyve {
             pensyve_core::network_policy::NetworkPolicy::from_env(""),
             Some(pensyve_core::network_policy::NetworkPolicy::Permissive)
         );
+
+        // G4 P5: resolve k-budget + ms_card_days with precedence
+        // kwarg > env > default. The kwarg path takes the dict value as
+        // a partial override of the locked defaults; missing dict keys
+        // do NOT inherit from the env. This matches the v2.1
+        // `with_peer_card(bool)` precedence pattern.
+        //
+        // TODO(g4-p5): plumb `k_budget` into the IntentRouter once
+        // `pensyve_core::retrieval::intent_router::k_for_type(...)` lands
+        // (G4 P2). Plumb `ms_card_days` into MultiSessionCard once
+        // `MultiSessionCard::with_days(...)` lands (G4 P3). Both APIs are
+        // not yet on `main` — values are stored on `PensyveInner` so the
+        // Python kwargs are wired end-to-end at the binding boundary
+        // and downstream wiring is a single-edit follow-up.
+        let resolved_k_budget = match k_budget {
+            Some(dict) => parse_k_budget_dict(&dict)?,
+            None => KBudget::from_env(),
+        };
+        let resolved_ms_card_days = resolve_ms_card_days(ms_card_days);
 
         // G1 fix: resolve the embedder's load-time `NetworkPolicy` at handle
         // construction so `NetworkPolicy::Disabled` propagates from the
@@ -636,8 +809,41 @@ impl PyPensyve {
                 agent_id: agent_id_uuid,
                 user_id: user_id_uuid,
                 recall_across_users_allowed,
+                k_budget: resolved_k_budget,
+                ms_card_days: resolved_ms_card_days,
             }),
         })
+    }
+
+    // -----------------------------------------------------------------
+    // G4 P5: introspection getters for the resolved k-budget + MS-card
+    // day threshold. These exist primarily so Python tests can assert
+    // the kwarg > env > default precedence without round-tripping
+    // through the (still-being-built) recall pipeline. They are also
+    // useful for SDK consumers debugging unexpected retrieval shape.
+    // -----------------------------------------------------------------
+
+    /// Resolved k-budget per `question_type` family.
+    ///
+    /// Returns a dict with keys `ss_pref`, `ms`, `ssu`. The values
+    /// reflect the kwarg > env > default precedence locked at
+    /// `pensyve-docs@8930c4a`.
+    #[getter]
+    fn k_budget<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("ss_pref", self.inner.k_budget.ss_pref)?;
+        d.set_item("ms", self.inner.k_budget.ms)?;
+        d.set_item("ssu", self.inner.k_budget.ssu)?;
+        Ok(d)
+    }
+
+    /// Resolved MS-card-v2 cross-session day threshold.
+    ///
+    /// Reflects the kwarg > env > default precedence locked at
+    /// `pensyve-docs@8930c4a` (default = 2).
+    #[getter]
+    fn ms_card_days(&self) -> usize {
+        self.inner.ms_card_days
     }
 
     /// Get or create an entity.

@@ -57,43 +57,67 @@ class Pensyve:
         extractor: str | None = None,
         extractor_api_key: str | None = None,
         reranker: str | None = "BGERerankerBase",
-        extractor_cache: HaikuExtractionCache | None = None,
+        extractor_base_url: str | None = None,
+        extractor_model: str | None = None,
+        extractor_max_concurrency: int | None = None,
+        agent_id: str | None = None,
+        user_id: str | None = None,
+        k_budget: dict[str, int] | None = None,
+        ms_card_days: int | None = None,
     ) -> None:
         """Create or open a Pensyve instance.
 
         Args:
             path: Directory for storage files (default: ~/.pensyve/default).
             namespace: Namespace name (default: "default").
-            extractor: Optional observation extractor.
-                - `"haiku"` wires the Anthropic Haiku 4.5 extractor
-                  (requires `ANTHROPIC_API_KEY` env var unless
-                  `extractor_api_key` is provided).
-                - `"haiku-batched"` wraps Haiku in the Anthropic Messages
-                  Batches API for bulk re-ingestion (50% per-token discount).
-                - `"haiku-cached"` serves per-episode extraction from a
-                  prewarmed cache built via
-                  `prewarm_haiku_extraction_cache(...)` — the canonical
-                  bulk path. Requires `extractor_cache=...`.
-                - `"haiku-nocache"` is the diagnostic path with prompt
-                  caching disabled.
-                - `"local-vllm"` wires an OpenAI-compatible local-LLM
-                  extractor for offline-first deployments (reads
-                  `PENSYVE_LOCAL_LLM_URL`, `PENSYVE_LOCAL_LLM_MODEL`,
-                  `PENSYVE_LOCAL_LLM_API_KEY` from the environment; defaults
-                  to `http://localhost:8888/v1`, model `"local"`, no auth).
+            extractor: Optional observation extractor. Supported values:
+                - `"local-llm"` / `"local-vllm"`: OpenAI-compatible local
+                  backend; offline-first.
+                - `"batched-local-llm"`: deferred per-episode extraction
+                  drained by `flush_extractions()`.
+                - `"haiku"` / `"haiku-batched"` / `"haiku-cached"` /
+                  `"haiku-nocache"`: Anthropic Haiku 4.5 paths.
                 - `None` (default) skips extraction entirely.
             extractor_api_key: Explicit API key for the configured extractor.
-                Overrides `ANTHROPIC_API_KEY` (haiku) or
-                `PENSYVE_LOCAL_LLM_API_KEY` (local-vllm).
-            reranker: Cross-encoder reranker applied post-fusion in `recall`
-                and `recall_grouped`. Default `"BGERerankerBase"` — the
-                algorithm-spec default. Pass `None` to disable (skips the
-                ~150MB fastembed model download, but this is a weaker
-                algorithm than the spec describes). `"JINARerankerV1TurboEn"`
-                is also supported as an English-only alternative.
-            extractor_cache: Required when `extractor="haiku-cached"`. Build
-                via `prewarm_haiku_extraction_cache(messages_groups, ...)`.
-                Ignored for all other extractor values.
+            reranker: Cross-encoder reranker applied post-fusion. Default
+                `"BGERerankerBase"`. Pass `None` to disable.
+            extractor_base_url: Override for the local-LLM endpoint
+                (precedes `PENSYVE_EXTRACTOR_URL`).
+            extractor_model: Override for the local-LLM model id (precedes
+                `PENSYVE_EXTRACTOR_MODEL`).
+            extractor_max_concurrency: In-flight ceiling for
+                `extractor="batched-local-llm"`.
+            agent_id: G1 multi-tenant scope — UUID-shaped string.
+            user_id: G1 multi-tenant scope — UUID-shaped string.
+            k_budget: G4 retrieval-side k-budget per `question_type`
+                family. Dict shape:
+                `{"ss_pref": int, "ms": int, "ssu": int}`. Missing keys
+                fall back to the locked defaults
+                `{"ss_pref": 22, "ms": 50, "ssu": 12}`. Precedence:
+                kwarg > `PENSYVE_K_BUDGET_*` env > default. Pre-reg lock
+                at `pensyve-docs@8930c4a`.
+            ms_card_days: G4 MS-card-v2 cross-session day threshold.
+                Default `2`. Precedence: kwarg > `PENSYVE_MS_CARD_DAYS`
+                env > default. Pre-reg lock at `pensyve-docs@8930c4a`.
+        """
+        ...
+
+    @property
+    def k_budget(self) -> dict[str, int]:
+        """Resolved k-budget per `question_type` family.
+
+        Returns a dict with keys ``ss_pref``, ``ms``, ``ssu``. Reflects
+        the kwarg > env > default precedence locked at
+        ``pensyve-docs@8930c4a``.
+        """
+        ...
+
+    @property
+    def ms_card_days(self) -> int:
+        """Resolved MS-card-v2 cross-session day threshold.
+
+        Reflects the kwarg > env > default precedence locked at
+        ``pensyve-docs@8930c4a`` (default = 2).
         """
         ...
 
