@@ -449,9 +449,7 @@ fn parse_k_budget_dict(dict: &Bound<'_, PyDict>) -> PyResult<KBudget> {
             PyTypeError::new_err("k_budget keys must be strings: 'ss_pref' | 'ms' | 'ssu'")
         })?;
         let val: usize = v.extract().map_err(|_| {
-            PyTypeError::new_err(format!(
-                "k_budget['{key}'] must be a non-negative integer"
-            ))
+            PyTypeError::new_err(format!("k_budget['{key}'] must be a non-negative integer"))
         })?;
         match key.as_str() {
             "ss_pref" => budget.ss_pref = val,

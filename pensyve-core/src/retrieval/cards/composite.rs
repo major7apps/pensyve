@@ -391,7 +391,12 @@ fn clip_bullet_entries_or_passthrough(card_output: &str, n: usize) -> String {
     // Walk inclusive from the line after the header up to and including
     // the last kept bullet.
     let walk_start = usize::from(header_idx != usize::MAX);
-    for (i, l) in lines.iter().enumerate().take(last_bullet + 1).skip(walk_start) {
+    for (i, l) in lines
+        .iter()
+        .enumerate()
+        .take(last_bullet + 1)
+        .skip(walk_start)
+    {
         if bullet_set.contains(&i) {
             out.push(l);
         } else if !l.starts_with("- ") && is_section_marker(l) {

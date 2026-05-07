@@ -447,12 +447,7 @@ impl RetrievalCard for MultiSessionCard {
         // contract.
         if self.supersession_chain.is_some() {
             let chain_output = self.supersession_chain.as_ref().and_then(|sc| {
-                sc.build_chain_only(
-                    &conn,
-                    namespace_id,
-                    agent_id.as_ref(),
-                    user_id.as_ref(),
-                )
+                sc.build_chain_only(&conn, namespace_id, agent_id.as_ref(), user_id.as_ref())
             });
             self.merge_supersession_chain(chain_output.as_deref(), base)
         } else {
@@ -497,11 +492,7 @@ impl MultiSessionCard {
         let chain_clean = chain_output
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|s| {
-                format!(
-                    "{MS_CARD_SUPERSESSION_HEADER}\n{s}\n{MS_CARD_SUPERSESSION_FOOTER}"
-                )
-            });
+            .map(|s| format!("{MS_CARD_SUPERSESSION_HEADER}\n{s}\n{MS_CARD_SUPERSESSION_FOOTER}"));
 
         match (chain_clean, base_output) {
             (Some(chain), Some(base)) => Some(format!("{chain}\n\n{base}")),

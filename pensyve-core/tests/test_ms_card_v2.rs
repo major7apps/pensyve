@@ -314,11 +314,10 @@ fn ms_v1_new_constructor_ignores_ms_card_days_env() {
     let card = MultiSessionCard::new();
     let out = card
         .build("any", backend.as_ref(), ns, None, None, None)
-        .expect("G2/G3 entry-path `new()` must surface 2-day entity regardless of PENSYVE_MS_CARD_DAYS");
-    assert!(
-        out.contains("Carol"),
-        "expected entity Carol; got:\n{out}"
-    );
+        .expect(
+            "G2/G3 entry-path `new()` must surface 2-day entity regardless of PENSYVE_MS_CARD_DAYS",
+        );
+    assert!(out.contains("Carol"), "expected entity Carol; got:\n{out}");
 }
 
 // ---------------------------------------------------------------------------
