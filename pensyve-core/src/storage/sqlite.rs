@@ -322,6 +322,31 @@ impl SqliteBackend {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(times)
     }
+
+    /// Return the first namespace UUID stored in this backend, ordered by
+    /// `created_at` (oldest first) for a deterministic pick. Used as a
+    /// last-resort fallback by external callers (e.g., the `pensyve-python`
+    /// G3 binding) that accept arbitrary `db_path` arguments and need to
+    /// resolve *some* namespace when the well-known names miss. Returns
+    /// `Ok(None)` only when the store is genuinely empty.
+    pub fn first_namespace_id(&self) -> Result<Option<Uuid>, StorageError> {
+        let conn = lock_conn!(self);
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT id FROM namespaces ORDER BY created_at ASC, id ASC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match result {
+            None => Ok(None),
+            Some(id_str) => {
+                let id = Uuid::parse_str(&id_str)
+                    .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?;
+                Ok(Some(id))
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

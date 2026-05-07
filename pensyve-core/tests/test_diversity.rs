@@ -15,6 +15,7 @@
 
 use uuid::Uuid;
 
+use pensyve_core::embedding::cosine_similarity;
 use pensyve_core::retrieval::ScoredCandidate;
 use pensyve_core::retrieval::diversity::rerank_mmr;
 use pensyve_core::types::{EpisodicMemory, Memory};
@@ -220,7 +221,10 @@ fn test_empty_input_no_panic() {
 }
 
 /// Unnormalized vectors — cosine similarity normalizes internally, so
-/// magnitude doesn't matter and no NaN should leak into scoring.
+/// magnitude doesn't matter and no NaN should leak into scoring. Also
+/// covers the degenerate all-zero embedding: `cosine_similarity` returns
+/// 0.0 for zero-norm inputs (per the embedding module doc), so MMR must
+/// never propagate NaN from such candidates.
 #[test]
 fn test_unnormalized_vectors() {
     let query = vec![10.0_f32, 0.0, 0.0, 0.0];
@@ -229,16 +233,32 @@ fn test_unnormalized_vectors() {
     let c1 = make_candidate(vec![0.001, 0.001, 0.0, 0.0], 0.5);
     let c2 = make_candidate(vec![0.0, 0.0, 1e6, 0.0], 0.2);
     let c3 = make_candidate(vec![3.0, 4.0, 0.0, 0.0], 0.6); // magnitude 5
+    // Degenerate all-zero embedding — would produce NaN if normalization
+    // weren't handled (0 / 0). Sized 768 to mirror real embedder output.
+    let c4 = make_candidate(vec![0.0; 768], 0.4);
 
-    let out = rerank_mmr(vec![c0, c1, c2, c3], &query, 0.5, 4);
+    let out = rerank_mmr(vec![c0, c1, c2, c3, c4], &query, 0.5, 5);
 
-    assert_eq!(out.len(), 4);
+    assert_eq!(out.len(), 5);
     for cand in &out {
         // The MMR module only reorders existing candidates. We didn't
         // mutate `final_score` so it should still be the marker we set.
         assert!(
             !cand.final_score.is_nan(),
             "MMR rerank must not emit NaN scores even for wildly unnormalized vectors"
+        );
+
+        // coderabbit PR #86 review on test_diversity.rs:243 — assertion
+        // now exercises actual cosine math, not just the seeded fixture
+        // marker. `cosine_similarity` is the same function MMR uses
+        // internally; computing it on the returned candidate's embedding
+        // would surface any NaN regression in the normalization pipeline
+        // (e.g., regressing to dot/(|a|*|b|) without the zero-norm guard).
+        let sim = cosine_similarity(cand.memory.embedding(), &query);
+        assert!(
+            !sim.is_nan(),
+            "Cosine similarity against query must not be NaN for any returned candidate \
+             (degenerate inputs included)"
         );
     }
 }

@@ -971,6 +971,19 @@ mod localllm {
             Self::new(base_url, model, api_key, policy)
         }
 
+        /// Configured chat endpoint base URL (without the `/chat/completions`
+        /// suffix). Read by the G3 gate wiring layer so structured log
+        /// markers (`consolidation_gate_fired`, `typed_slots_extracted`,
+        /// `summarizer_gate`) record the actual URL the gate called rather
+        /// than a hardcoded literal — operators with `PENSYVE_EXTRACTOR_URL`
+        /// pointing somewhere other than `localhost:8888` get accurate
+        /// audit evidence. Per coderabbit PR #86 round-3 review on
+        /// observation.rs:2483.
+        #[must_use]
+        pub fn endpoint(&self) -> &str {
+            &self.base_url
+        }
+
         #[must_use]
         pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
             self.base_url = base_url.into();
@@ -2433,16 +2446,6 @@ mod gate_wiring {
         Ok(out)
     }
 
-    /// Build a new typed-slot LLM extractor from environment variables.
-    /// Reuses `LocalLLMExtractor::from_env()` so the typed-slot endpoint
-    /// matches the observation extractor's by construction (same
-    /// `PENSYVE_EXTRACTOR_URL` / `PENSYVE_EXTRACTOR_MODEL` / network
-    /// policy). Returns `None` on any configuration error — gate firings
-    /// degrade to no-ops cleanly.
-    fn build_typed_slot_extractor() -> Option<LocalLLMExtractor> {
-        LocalLLMExtractor::from_env().ok()
-    }
-
     /// Fire the typed-slot extractor gate hook and persist the result.
     ///
     /// Pre-reg §3.8 binds the action-verb heuristic + 5-slot extractor
@@ -2462,6 +2465,7 @@ mod gate_wiring {
         observation: &ObservationMemory,
         extractor: &L,
         policy: &NetworkPolicy,
+        endpoint: &str,
         cancel: CancellationToken,
     ) where
         L: TypedSlotLlm + ?Sized,
@@ -2478,8 +2482,9 @@ mod gate_wiring {
         }
 
         tracing::info!(
-            "consolidation_gate_fired event_id={} gate_kind=typed_slots endpoint=localhost:8888 max_llm_calls=1",
-            observation.id
+            "consolidation_gate_fired event_id={} gate_kind=typed_slots endpoint={} max_llm_calls=1",
+            observation.id,
+            endpoint
         );
 
         let result = consolidation::run_typed_slots_hook(
@@ -2504,16 +2509,18 @@ mod gate_wiring {
                 match persist {
                     Ok(()) => {
                         tracing::info!(
-                            "typed_slots_extracted observation_id={} populated_slots=[{}] endpoint=localhost:8888 result=ok",
+                            "typed_slots_extracted observation_id={} populated_slots=[{}] endpoint={} result=ok",
                             observation.id,
-                            populated
+                            populated,
+                            endpoint
                         );
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "typed_slots_extracted observation_id={} populated_slots=[{}] endpoint=localhost:8888 result=deferred error={}",
+                            "typed_slots_extracted observation_id={} populated_slots=[{}] endpoint={} result=deferred error={}",
                             observation.id,
                             populated,
+                            endpoint,
                             e
                         );
                     }
@@ -2523,22 +2530,25 @@ mod gate_wiring {
                 // Defer-on-empty / non-triggering / hook-disabled. NULL
                 // columns are the same shape as a v=1 legacy row.
                 tracing::info!(
-                    "typed_slots_extracted observation_id={} populated_slots=[] endpoint=localhost:8888 result=deferred",
-                    observation.id
+                    "typed_slots_extracted observation_id={} populated_slots=[] endpoint={} result=deferred",
+                    observation.id,
+                    endpoint
                 );
             }
             Err(consolidation::ConsolidationError::Cancelled(_)) => {
                 // Operator-locked (b') ROLLBACK: do NOT persist. Columns
                 // stay NULL.
                 tracing::info!(
-                    "typed_slots_extracted observation_id={} populated_slots=[] endpoint=localhost:8888 result=cancelled",
-                    observation.id
+                    "typed_slots_extracted observation_id={} populated_slots=[] endpoint={} result=cancelled",
+                    observation.id,
+                    endpoint
                 );
             }
             Err(e) => {
                 tracing::warn!(
-                    "typed_slots_extracted observation_id={} populated_slots=[] endpoint=localhost:8888 result=deferred error={}",
+                    "typed_slots_extracted observation_id={} populated_slots=[] endpoint={} result=deferred error={}",
                     observation.id,
+                    endpoint,
                     e
                 );
             }
@@ -2562,6 +2572,7 @@ mod gate_wiring {
         observation: &ObservationMemory,
         extractor: &L,
         policy: &NetworkPolicy,
+        endpoint: &str,
         cancel: CancellationToken,
     ) where
         L: TypedSlotLlm + ?Sized,
@@ -2581,8 +2592,9 @@ mod gate_wiring {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(
-                        "summarizer_gate observation_id={} endpoint=localhost:8888 result=deferred error=lookup_failed_{}",
+                        "summarizer_gate observation_id={} endpoint={} result=deferred error=lookup_failed_{}",
                         observation.id,
+                        endpoint,
                         e
                     );
                     return;
@@ -2606,8 +2618,9 @@ mod gate_wiring {
         chain_text.push_str(&observation.content);
 
         tracing::info!(
-            "consolidation_gate_fired event_id={} gate_kind=summarizer endpoint=localhost:8888 max_llm_calls=1",
-            observation.id
+            "consolidation_gate_fired event_id={} gate_kind=summarizer endpoint={} max_llm_calls=1",
+            observation.id,
+            endpoint
         );
 
         let result =
@@ -2625,16 +2638,18 @@ mod gate_wiring {
                 match persist {
                     Ok(()) => {
                         tracing::info!(
-                            "summarizer_gate observation_id={} chain_summary_len={} endpoint=localhost:8888 result=ok",
+                            "summarizer_gate observation_id={} chain_summary_len={} endpoint={} result=ok",
                             observation.id,
-                            len
+                            len,
+                            endpoint
                         );
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "summarizer_gate observation_id={} chain_summary_len={} endpoint=localhost:8888 result=deferred error={}",
+                            "summarizer_gate observation_id={} chain_summary_len={} endpoint={} result=deferred error={}",
                             observation.id,
                             len,
+                            endpoint,
                             e
                         );
                     }
@@ -2642,20 +2657,23 @@ mod gate_wiring {
             }
             Ok(None) => {
                 tracing::info!(
-                    "summarizer_gate observation_id={} chain_summary_len=0 endpoint=localhost:8888 result=deferred",
-                    observation.id
+                    "summarizer_gate observation_id={} chain_summary_len=0 endpoint={} result=deferred",
+                    observation.id,
+                    endpoint
                 );
             }
             Err(consolidation::ConsolidationError::Cancelled(_)) => {
                 tracing::info!(
-                    "summarizer_gate observation_id={} chain_summary_len=0 endpoint=localhost:8888 result=cancelled",
-                    observation.id
+                    "summarizer_gate observation_id={} chain_summary_len=0 endpoint={} result=cancelled",
+                    observation.id,
+                    endpoint
                 );
             }
             Err(e) => {
                 tracing::warn!(
-                    "summarizer_gate observation_id={} chain_summary_len=0 endpoint=localhost:8888 result=deferred error={}",
+                    "summarizer_gate observation_id={} chain_summary_len=0 endpoint={} result=deferred error={}",
                     observation.id,
+                    endpoint,
                     e
                 );
             }
@@ -2666,14 +2684,24 @@ mod gate_wiring {
     /// observation. No-op on storage backends without an on-disk path or
     /// when neither gate is enabled.
     ///
-    /// The `extractor` is built lazily (and cached at the call-site) to
-    /// avoid constructing a fresh HTTP client per observation. Returns
-    /// without invoking any LLM call when both env predicates are off.
+    /// `endpoint` is the configured LLM endpoint URL (e.g. read from
+    /// `LocalLLMExtractor::endpoint()`); it's threaded into the
+    /// structured log markers (`consolidation_gate_fired`,
+    /// `typed_slots_extracted`, `summarizer_gate`) so the audit trail
+    /// reflects the actual URL the gate called rather than a hardcoded
+    /// literal — operators with `PENSYVE_EXTRACTOR_URL` pointing
+    /// somewhere other than `localhost:8888` get accurate evidence.
+    ///
+    /// The caller hoists extractor construction once per ingest call
+    /// (see `commit_extraction_for_episode` and
+    /// `commit_extractions_for_episodes`), avoiding the per-observation
+    /// `reqwest::Client` rebuild.
     pub(super) async fn fire_gates_for_observation<L>(
         storage: &(dyn StorageTrait + Send + Sync),
         observation: &ObservationMemory,
         extractor: &L,
         policy: &NetworkPolicy,
+        endpoint: &str,
         cancel: CancellationToken,
     ) where
         L: TypedSlotLlm + ?Sized,
@@ -2687,30 +2715,64 @@ mod gate_wiring {
 
         // Fire typed-slot first (cheaper to short-circuit on action-gate
         // mismatch); summarizer second (does an extra SQL lookup).
-        fire_typed_slots_gate(&db_path, observation, extractor, policy, cancel.clone()).await;
-        fire_summarizer_gate(&db_path, observation, extractor, policy, cancel).await;
+        fire_typed_slots_gate(
+            &db_path,
+            observation,
+            extractor,
+            policy,
+            endpoint,
+            cancel.clone(),
+        )
+        .await;
+        fire_summarizer_gate(&db_path, observation, extractor, policy, endpoint, cancel).await;
     }
 
-    /// Public entry-point for tests + the ingest helpers in this file.
-    /// Builds the typed-slot extractor on-demand; returns immediately if
-    /// neither gate is enabled (zero-cost fast path).
-    pub(super) async fn maybe_fire_gates_with_env_extractor(
+    /// Build the gate extractor IF either G3 gate is enabled. Intended
+    /// to be called once per ingest scope (e.g.
+    /// `commit_extraction_for_episode`) and the resulting handle reused
+    /// across every observation in the call — see
+    /// [`maybe_fire_gates_with_extractor`]. Returns `None` when both
+    /// gates are off (zero-cost) OR when env-based extractor build
+    /// fails (warns once at construction). Per coderabbit PR #86
+    /// round-3 review on observation.rs:2713 — avoids per-observation
+    /// `reqwest::Client` reconstruction and repeated env parsing on
+    /// the hot path.
+    pub(super) fn build_gate_extractor_if_enabled() -> Option<LocalLLMExtractor> {
+        if !consolidation::g3_typed_slots_enabled() && !consolidation::g3_summarizer_enabled() {
+            return None;
+        }
+        match LocalLLMExtractor::from_env() {
+            Ok(ext) => Some(ext),
+            Err(e) => {
+                tracing::warn!(
+                    "G3 gate firing disabled: failed to build typed-slot extractor from env: {}",
+                    e
+                );
+                None
+            }
+        }
+    }
+
+    /// Fire both G3 gate hooks for a single observation using a
+    /// pre-built extractor. When `extractor` is `None` (gates off or
+    /// build failed), this is a zero-cost no-op. The extractor is
+    /// expected to have been hoisted once per ingest call via
+    /// [`build_gate_extractor_if_enabled`] so connection pooling and
+    /// env parsing are reused across every observation persisted in
+    /// the call.
+    pub(super) async fn maybe_fire_gates_with_extractor(
         storage: &(dyn StorageTrait + Send + Sync),
         observation: &ObservationMemory,
+        extractor: Option<&LocalLLMExtractor>,
         cancel: CancellationToken,
     ) {
-        if !consolidation::g3_typed_slots_enabled() && !consolidation::g3_summarizer_enabled() {
-            return;
-        }
-        let Some(extractor) = build_typed_slot_extractor() else {
-            tracing::warn!(
-                observation_id = %observation.id,
-                "G3 gate firing skipped: failed to build typed-slot extractor from env"
-            );
+        let Some(extractor) = extractor else {
             return;
         };
         let policy = extractor.network_policy().clone();
-        fire_gates_for_observation(storage, observation, &extractor, &policy, cancel).await;
+        let endpoint = extractor.endpoint();
+        fire_gates_for_observation(storage, observation, extractor, &policy, endpoint, cancel)
+            .await;
     }
 }
 
@@ -2800,6 +2862,14 @@ where
         }
     };
 
+    // Build the gate extractor ONCE per ingest call (or `None` if both
+    // gates are off / env-build failed). Per coderabbit PR #86 round-3
+    // review on observation.rs:2713 — connection pool + env parsing now
+    // reused across every observation in this episode rather than rebuilt
+    // per `save_observation` call.
+    #[cfg(feature = "observation-extraction")]
+    let gate_extractor = gate_wiring::build_gate_extractor_if_enabled();
+
     let mut persisted = 0usize;
     for mut obs in observations {
         match embed(&obs.content) {
@@ -2826,9 +2896,15 @@ where
         // G3 per-event gate hooks (per pre-reg `pensyve-docs@64481dc` §3.7
         // + §3.8 + addendum_01 `pensyve-docs@dd7c053` Finding 2 mitigation).
         // No-op when both `PENSYVE_RETRIEVAL_CARDS_G3` predicates are off
-        // (zero-cost fast path checked inside `maybe_fire_gates_*`).
+        // (zero-cost fast path: `gate_extractor` is `None`).
         #[cfg(feature = "observation-extraction")]
-        gate_wiring::maybe_fire_gates_with_env_extractor(storage, &obs, cancel.clone()).await;
+        gate_wiring::maybe_fire_gates_with_extractor(
+            storage,
+            &obs,
+            gate_extractor.as_ref(),
+            cancel.clone(),
+        )
+        .await;
         persisted += 1;
     }
     persisted
@@ -2866,6 +2942,7 @@ where
 ///
 /// Returns the total number of observations successfully persisted across
 /// every episode in the batch.
+#[allow(clippy::too_many_lines)]
 pub async fn commit_extractions_for_episodes<F, E>(
     storage: &(dyn crate::storage::StorageTrait + Send + Sync),
     extractor: &dyn ObservationExtractor,
@@ -2956,6 +3033,12 @@ where
         return 0;
     }
 
+    // Hoist gate-extractor construction once for the whole bulk call —
+    // shared across every episode + every observation. Per coderabbit
+    // PR #86 round-3 review on observation.rs:2986 (and 2826).
+    #[cfg(feature = "observation-extraction")]
+    let gate_extractor = gate_wiring::build_gate_extractor_if_enabled();
+
     let mut total_persisted = 0usize;
     for (eid, observations) in surviving_ids.iter().zip(batch_results) {
         let mut episode_persisted = 0usize;
@@ -2984,11 +3067,18 @@ where
                 continue;
             }
             // G3 per-event gate hooks — same wiring as the per-episode
-            // helper. Per-observation cost is bounded by the env-gate
-            // fast-path inside `maybe_fire_gates_with_env_extractor` (no
-            // LLM call when both predicates off).
+            // helper, sharing the hoisted extractor across every
+            // observation in the bulk call. Per-observation cost is
+            // bounded by the `gate_extractor.is_none()` fast-path inside
+            // `maybe_fire_gates_with_extractor` when both predicates off.
             #[cfg(feature = "observation-extraction")]
-            gate_wiring::maybe_fire_gates_with_env_extractor(storage, &obs, cancel.clone()).await;
+            gate_wiring::maybe_fire_gates_with_extractor(
+                storage,
+                &obs,
+                gate_extractor.as_ref(),
+                cancel.clone(),
+            )
+            .await;
             episode_persisted += 1;
         }
         total_persisted += episode_persisted;

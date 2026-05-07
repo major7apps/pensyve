@@ -1187,7 +1187,11 @@ impl PyPensyve {
                     .ok()
                     .flatten()
                     .map(|ns| ns.id)
-            });
+            })
+            // Fallback: pick the first existing namespace before giving up —
+            // handles external DBs created under arbitrary namespace names.
+            // Per coderabbit PR #86 review on lib.rs:1194.
+            .or_else(|| backend.first_namespace_id().ok().flatten());
 
         let Some(ns_id) = ns_id_opt else {
             return Ok(None);

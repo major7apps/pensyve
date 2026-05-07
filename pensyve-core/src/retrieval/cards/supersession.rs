@@ -229,13 +229,14 @@ pub(crate) fn build_from_conn(
     let mut stmt = conn.prepare(&sql).ok()?;
     let mut params: Vec<Box<dyn ToSql>> =
         scope_binds.iter().map(|v| boxed_sql(v.clone())).collect();
-    // SAFETY: max_entries is bounded by the per-card cap (= 8 by default,
-    // never exceeds usize range that fits in i64 on supported targets);
-    // the cast to i64 cannot wrap.
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        params.push(Box::new(max_entries as i64));
-    }
+    // coderabbit PR #86 review on supersession.rs:264 — over-fetch by 4×
+    // then cap after dedupe so duplicates/whitespace don't undercap the
+    // result (the SQL LIMIT runs before the Rust-side trim/dedupe below,
+    // so binding `max_entries` directly could yield fewer than the
+    // requested count even when older unique summaries exist).
+    let fetch_limit_usize = max_entries.saturating_mul(4).max(max_entries);
+    let fetch_limit = i64::try_from(fetch_limit_usize).unwrap_or(i64::MAX);
+    params.push(Box::new(fetch_limit));
     let param_refs: Vec<&dyn ToSql> = params.iter().map(std::convert::AsRef::as_ref).collect();
 
     let rows = stmt
