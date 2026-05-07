@@ -332,9 +332,15 @@ impl UsageReporter {
 
         let mut overall_success = true;
         for ((customer_id, tier), (count, traceparent)) in &aggregated {
-            let success =
-                Self::post_meter_event(client, api_key, customer_id, *tier, *count, traceparent.as_deref())
-                    .await;
+            let success = Self::post_meter_event(
+                client,
+                api_key,
+                customer_id,
+                *tier,
+                *count,
+                traceparent.as_deref(),
+            )
+            .await;
             if !success {
                 overall_success = false;
                 tracing::error!(
@@ -375,9 +381,15 @@ impl UsageReporter {
         );
 
         for ((customer_id, tier), (count, traceparent)) in &aggregated {
-            let success =
-                Self::post_meter_event(client, api_key, customer_id, *tier, *count, traceparent.as_deref())
-                    .await;
+            let success = Self::post_meter_event(
+                client,
+                api_key,
+                customer_id,
+                *tier,
+                *count,
+                traceparent.as_deref(),
+            )
+            .await;
             if !success {
                 tracing::error!(
                     customer = customer_id,
@@ -564,8 +576,7 @@ mod tests {
         // Trip the circuit.
         cb.record_failure().await;
 
-        let buffer: Arc<Mutex<VecDeque<UsageEvent>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
+        let buffer: Arc<Mutex<VecDeque<UsageEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
         let client = reqwest::Client::new();
         let mut batch = vec![
             UsageEvent {
@@ -584,15 +595,8 @@ mod tests {
             },
         ];
 
-        UsageReporter::flush_batch_with_buffer(
-            &mut batch,
-            None,
-            &client,
-            Some(&cb),
-            &buffer,
-            10,
-        )
-        .await;
+        UsageReporter::flush_batch_with_buffer(&mut batch, None, &client, Some(&cb), &buffer, 10)
+            .await;
 
         assert!(batch.is_empty(), "batch should be drained into buffer");
         let buf = buffer.lock().expect("lock");
@@ -620,8 +624,7 @@ mod tests {
         ));
         cb.record_failure().await;
 
-        let buffer: Arc<Mutex<VecDeque<UsageEvent>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
+        let buffer: Arc<Mutex<VecDeque<UsageEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
         let client = reqwest::Client::new();
 
         let mut batch: Vec<UsageEvent> = (0..5)
@@ -634,15 +637,8 @@ mod tests {
             })
             .collect();
 
-        UsageReporter::flush_batch_with_buffer(
-            &mut batch,
-            None,
-            &client,
-            Some(&cb),
-            &buffer,
-            3,
-        )
-        .await;
+        UsageReporter::flush_batch_with_buffer(&mut batch, None, &client, Some(&cb), &buffer, 3)
+            .await;
 
         let buf = buffer.lock().expect("lock");
         assert_eq!(buf.len(), 3, "buffer should be capped at 3");

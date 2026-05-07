@@ -518,12 +518,7 @@ mod tests {
     #[tokio::test]
     async fn test_auth_validator_accepts_valid_key() {
         let validator = AuthValidator::new(&test_config(vec!["psy_testkey12345".into()]));
-        assert!(
-            validator
-                .validate("psy_testkey12345", None)
-                .await
-                .is_some()
-        );
+        assert!(validator.validate("psy_testkey12345", None).await.is_some());
     }
 
     #[tokio::test]

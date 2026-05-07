@@ -338,7 +338,10 @@ mod tests {
     #[test]
     fn extract_or_generate_creates_new_when_malformed() {
         let mut headers = HeaderMap::new();
-        headers.insert(TRACEPARENT_HEADER, "not-a-valid-traceparent".parse().expect("valid"));
+        headers.insert(
+            TRACEPARENT_HEADER,
+            "not-a-valid-traceparent".parse().expect("valid"),
+        );
         let ctx = extract_or_generate(&headers);
         assert_ne!(ctx.to_header_value(), "not-a-valid-traceparent");
         assert!(parse_traceparent(&ctx.to_header_value()).is_some());

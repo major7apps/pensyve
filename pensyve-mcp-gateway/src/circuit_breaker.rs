@@ -67,8 +67,8 @@ impl CircuitBreakerConfig {
     #[must_use]
     pub fn from_env(name: &'static str, defaults: (u32, u32, u32)) -> Self {
         let prefix = env_prefix_for(name);
-        let failure_threshold = read_env_u32(&format!("PENSYVE_CB_{prefix}_FAILURE_THRESHOLD"))
-            .unwrap_or(defaults.0);
+        let failure_threshold =
+            read_env_u32(&format!("PENSYVE_CB_{prefix}_FAILURE_THRESHOLD")).unwrap_or(defaults.0);
         let window_secs =
             read_env_u32(&format!("PENSYVE_CB_{prefix}_WINDOW_SECS")).unwrap_or(defaults.1);
         let cooldown_secs =
@@ -263,8 +263,11 @@ impl CircuitBreaker {
         // because Redis is slow).
         if let Some(mut redis) = self.redis.clone() {
             let result = tokio::time::timeout(REDIS_TIMEOUT, async {
-                let state: Option<String> =
-                    redis.get(redis_state_key(self.config.name)).await.ok().flatten();
+                let state: Option<String> = redis
+                    .get(redis_state_key(self.config.name))
+                    .await
+                    .ok()
+                    .flatten();
                 state
             })
             .await;
@@ -272,7 +275,10 @@ impl CircuitBreaker {
                 && s == "open"
             {
                 // Mirror to in-memory so HalfOpen probe logic stays consistent.
-                let mut fb = self.fallback.lock().expect("circuit fallback mutex poisoned");
+                let mut fb = self
+                    .fallback
+                    .lock()
+                    .expect("circuit fallback mutex poisoned");
                 fb.state = CircuitState::Open;
                 if fb.opened_at.is_none() {
                     fb.opened_at = Some(Instant::now());
@@ -289,7 +295,10 @@ impl CircuitBreaker {
 
         let now = Instant::now();
         let cooldown = Duration::from_secs(u64::from(self.config.cooldown_secs));
-        let mut fb = self.fallback.lock().expect("circuit fallback mutex poisoned");
+        let mut fb = self
+            .fallback
+            .lock()
+            .expect("circuit fallback mutex poisoned");
         match fb.state {
             CircuitState::Closed | CircuitState::HalfOpen => Ok(()),
             CircuitState::Open => {
@@ -326,7 +335,10 @@ impl CircuitBreaker {
     /// **Closed** and clear all state.
     pub async fn record_success(&self) {
         {
-            let mut fb = self.fallback.lock().expect("circuit fallback mutex poisoned");
+            let mut fb = self
+                .fallback
+                .lock()
+                .expect("circuit fallback mutex poisoned");
             match fb.state {
                 CircuitState::Closed => {
                     fb.failures.clear();
@@ -355,10 +367,12 @@ impl CircuitBreaker {
             let _ = tokio::time::timeout(REDIS_TIMEOUT, async {
                 // Best-effort cleanup; failures here are non-fatal.
                 let _: Result<(), _> = redis.del::<_, ()>(redis_state_key(self.config.name)).await;
-                let _: Result<(), _> =
-                    redis.del::<_, ()>(redis_failures_key(self.config.name)).await;
-                let _: Result<(), _> =
-                    redis.del::<_, ()>(redis_opened_at_key(self.config.name)).await;
+                let _: Result<(), _> = redis
+                    .del::<_, ()>(redis_failures_key(self.config.name))
+                    .await;
+                let _: Result<(), _> = redis
+                    .del::<_, ()>(redis_opened_at_key(self.config.name))
+                    .await;
             })
             .await;
         }
@@ -376,7 +390,10 @@ impl CircuitBreaker {
         let window = Duration::from_secs(u64::from(self.config.window_secs));
         let opened_now: bool;
         {
-            let mut fb = self.fallback.lock().expect("circuit fallback mutex poisoned");
+            let mut fb = self
+                .fallback
+                .lock()
+                .expect("circuit fallback mutex poisoned");
             match fb.state {
                 CircuitState::Closed => {
                     fb.failures.push(now);
@@ -432,10 +449,7 @@ impl CircuitBreaker {
                 // transition by one request — acceptable. We refresh the
                 // TTL on every increment so a steady failure stream keeps
                 // the counter alive across the window.
-                if let Ok(count) = redis
-                    .incr::<_, _, i64>(redis_failures_key(name), 1)
-                    .await
-                {
+                if let Ok(count) = redis.incr::<_, _, i64>(redis_failures_key(name), 1).await {
                     let _: Result<(), _> = redis
                         .expire::<_, ()>(redis_failures_key(name), i64::from(window_secs))
                         .await;
@@ -446,11 +460,7 @@ impl CircuitBreaker {
                 }
                 if opened_now {
                     let _: Result<(), _> = redis
-                        .set_ex::<_, _, ()>(
-                            redis_state_key(name),
-                            "open",
-                            u64::from(cooldown_secs),
-                        )
+                        .set_ex::<_, _, ()>(redis_state_key(name), "open", u64::from(cooldown_secs))
                         .await;
                     let _: Result<(), _> = redis
                         .set_ex::<_, _, ()>(
@@ -471,7 +481,10 @@ impl CircuitBreaker {
     /// — Redis is only consulted on `check()` to decide whether to short-
     /// circuit the request.
     pub fn current_state(&self) -> CircuitState {
-        let fb = self.fallback.lock().expect("circuit fallback mutex poisoned");
+        let fb = self
+            .fallback
+            .lock()
+            .expect("circuit fallback mutex poisoned");
         fb.state
     }
 
@@ -480,7 +493,10 @@ impl CircuitBreaker {
     /// tests and debug logging only.
     #[cfg(test)]
     pub fn failure_count(&self) -> usize {
-        let fb = self.fallback.lock().expect("circuit fallback mutex poisoned");
+        let fb = self
+            .fallback
+            .lock()
+            .expect("circuit fallback mutex poisoned");
         fb.failures.len()
     }
 }
@@ -652,33 +668,42 @@ mod tests {
         // already exercised in production via the `from_env` constructor
         // chained from `auth_default`.
         let prefix = env_prefix_for("auth_validation");
-        assert_eq!(format!("PENSYVE_CB_{prefix}_FAILURE_THRESHOLD"),
-                   "PENSYVE_CB_AUTH_FAILURE_THRESHOLD");
-        assert_eq!(format!("PENSYVE_CB_{prefix}_WINDOW_SECS"),
-                   "PENSYVE_CB_AUTH_WINDOW_SECS");
-        assert_eq!(format!("PENSYVE_CB_{prefix}_COOLDOWN_SECS"),
-                   "PENSYVE_CB_AUTH_COOLDOWN_SECS");
+        assert_eq!(
+            format!("PENSYVE_CB_{prefix}_FAILURE_THRESHOLD"),
+            "PENSYVE_CB_AUTH_FAILURE_THRESHOLD"
+        );
+        assert_eq!(
+            format!("PENSYVE_CB_{prefix}_WINDOW_SECS"),
+            "PENSYVE_CB_AUTH_WINDOW_SECS"
+        );
+        assert_eq!(
+            format!("PENSYVE_CB_{prefix}_COOLDOWN_SECS"),
+            "PENSYVE_CB_AUTH_COOLDOWN_SECS"
+        );
     }
 
     #[test]
     fn stripe_default_env_var_names_match_locked_decision() {
         let prefix = env_prefix_for("stripe_usage");
-        assert_eq!(format!("PENSYVE_CB_{prefix}_FAILURE_THRESHOLD"),
-                   "PENSYVE_CB_STRIPE_FAILURE_THRESHOLD");
-        assert_eq!(format!("PENSYVE_CB_{prefix}_WINDOW_SECS"),
-                   "PENSYVE_CB_STRIPE_WINDOW_SECS");
-        assert_eq!(format!("PENSYVE_CB_{prefix}_COOLDOWN_SECS"),
-                   "PENSYVE_CB_STRIPE_COOLDOWN_SECS");
+        assert_eq!(
+            format!("PENSYVE_CB_{prefix}_FAILURE_THRESHOLD"),
+            "PENSYVE_CB_STRIPE_FAILURE_THRESHOLD"
+        );
+        assert_eq!(
+            format!("PENSYVE_CB_{prefix}_WINDOW_SECS"),
+            "PENSYVE_CB_STRIPE_WINDOW_SECS"
+        );
+        assert_eq!(
+            format!("PENSYVE_CB_{prefix}_COOLDOWN_SECS"),
+            "PENSYVE_CB_STRIPE_COOLDOWN_SECS"
+        );
     }
 
     #[test]
     fn from_env_returns_defaults_when_vars_unset() {
         // Use an obviously-unique name so it can't collide with anything
         // in the runtime environment of the test harness.
-        let cfg = CircuitBreakerConfig::from_env(
-            "phase23_test_circuit_unique_xyz",
-            (5, 60, 30),
-        );
+        let cfg = CircuitBreakerConfig::from_env("phase23_test_circuit_unique_xyz", (5, 60, 30));
         assert_eq!(cfg.failure_threshold, 5);
         assert_eq!(cfg.window_secs, 60);
         assert_eq!(cfg.cooldown_secs, 30);
