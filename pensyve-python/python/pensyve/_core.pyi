@@ -73,10 +73,9 @@ class Pensyve:
             extractor: Optional observation extractor. Supported values:
                 - `"local-llm"` / `"local-vllm"`: OpenAI-compatible local
                   backend; offline-first.
-                - `"batched-local-llm"`: deferred per-episode extraction
-                  drained by `flush_extractions()`.
-                - `"haiku"` / `"haiku-batched"` / `"haiku-cached"` /
-                  `"haiku-nocache"`: Anthropic Haiku 4.5 paths.
+                - `"batched-local-llm"`: same inner extractor wrapped in
+                  a semaphore-gated batch path; activates via
+                  `flush_extractions()`.
                 - `None` (default) skips extraction entirely.
             extractor_api_key: Explicit API key for the configured extractor.
             reranker: Cross-encoder reranker applied post-fusion. Default

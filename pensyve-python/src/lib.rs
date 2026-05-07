@@ -442,6 +442,13 @@ const G4_DEFAULT_MS_CARD_DAYS: usize = 2;
 /// partial dict (e.g. `{"ms": 60}`) without restating the other slots.
 /// Unknown keys are rejected with `ValueError` to catch typos early
 /// (e.g. `"ss_pref" -> "sspref"`).
+///
+/// Zero values are rejected with `ValueError`, mirroring the env-path
+/// guard in [`KBudget::from_env`]: a zero k-budget would short-circuit
+/// the entire recall pipeline, so we surface the misuse explicitly here
+/// rather than silently letting it through. Operators that genuinely
+/// want to suppress recall should use a dedicated kill-switch, not
+/// `k_budget={"...": 0}`.
 fn parse_k_budget_dict(dict: &Bound<'_, PyDict>) -> PyResult<KBudget> {
     let mut budget = KBudget::default();
     for (k, v) in dict.iter() {
@@ -451,6 +458,13 @@ fn parse_k_budget_dict(dict: &Bound<'_, PyDict>) -> PyResult<KBudget> {
         let val: usize = v.extract().map_err(|_| {
             PyTypeError::new_err(format!("k_budget['{key}'] must be a non-negative integer"))
         })?;
+        if val == 0 {
+            return Err(PyValueError::new_err(format!(
+                "k_budget['{key}'] must be > 0; zero would short-circuit recall. \
+                 Omit the key to inherit the default, or use a dedicated kill-switch \
+                 to disable recall."
+            )));
+        }
         match key.as_str() {
             "ss_pref" => budget.ss_pref = val,
             "ms" => budget.ms = val,
@@ -469,13 +483,21 @@ fn parse_k_budget_dict(dict: &Bound<'_, PyDict>) -> PyResult<KBudget> {
 ///
 /// Env var: `PENSYVE_MS_CARD_DAYS` (parsed as `usize`; unparseable
 /// values fall back to the default). Default: `2`.
+///
+/// Zero is treated as unset on both the kwarg and env paths, mirroring
+/// the core-side guard in `multi_session::resolve_ms_days`: a 0-day
+/// threshold would surface every entity (no cross-session signal) and
+/// `MultiSessionCard::with_ms_days(Some(0))` already filters it to
+/// `None` internally — without this filter the `ms_card_days` getter
+/// would lie about the effective threshold.
 fn resolve_ms_card_days(kwarg: Option<usize>) -> usize {
-    if let Some(d) = kwarg {
+    if let Some(d) = kwarg.filter(|&n| n > 0) {
         return d;
     }
     std::env::var("PENSYVE_MS_CARD_DAYS")
         .ok()
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
         .unwrap_or(G4_DEFAULT_MS_CARD_DAYS)
 }
 

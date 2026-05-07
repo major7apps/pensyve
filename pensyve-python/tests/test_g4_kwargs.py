@@ -145,6 +145,23 @@ def test_k_budget_non_int_value_raises_type_error(store_path):
         )
 
 
+def test_k_budget_zero_value_raises_value_error(store_path):
+    """A zero k-budget would short-circuit recall — reject explicitly.
+
+    Mirrors the env-path guard in ``KBudget::from_env`` (filters zero
+    silently). The kwarg path is louder: callers passing ``0`` almost
+    certainly mean a typo or misunderstanding, so we surface it with a
+    clear error message rather than silently inheriting the default.
+    """
+    for key in ("ss_pref", "ms", "ssu"):
+        with pytest.raises(ValueError, match=r"must be > 0"):
+            pensyve.Pensyve(
+                path=store_path,
+                reranker=None,
+                k_budget={key: 0},
+            )
+
+
 # ---------------------------------------------------------------------------
 # ms_card_days
 # ---------------------------------------------------------------------------
@@ -179,5 +196,32 @@ def test_ms_card_days_kwarg_overrides_env(monkeypatch, store_path):
 def test_ms_card_days_unparseable_env_falls_back_to_default(monkeypatch, store_path):
     """Garbage env value should not crash; default takes over."""
     monkeypatch.setenv("PENSYVE_MS_CARD_DAYS", "garbage")
+    p = pensyve.Pensyve(path=store_path, reranker=None)
+    assert p.ms_card_days == 2
+
+
+def test_ms_card_days_kwarg_zero_falls_back_to_env_then_default(
+    monkeypatch, store_path
+):
+    """Zero kwarg is treated as unset (parity with core's resolve_ms_days).
+
+    ``MultiSessionCard::with_ms_days(Some(0))`` already filters zero
+    internally, so accepting ``ms_card_days=0`` here would make the
+    getter lie about the effective threshold. Mirror the env-path guard:
+    fall through to env (also filtered for zero), then to the default.
+    """
+    # No env: kwarg=0 -> default 2
+    p = pensyve.Pensyve(path=store_path, reranker=None, ms_card_days=0)
+    assert p.ms_card_days == 2
+
+    # Env=5, kwarg=0 -> env wins (kwarg=0 is unset)
+    monkeypatch.setenv("PENSYVE_MS_CARD_DAYS", "5")
+    p2 = pensyve.Pensyve(path=store_path, reranker=None, ms_card_days=0)
+    assert p2.ms_card_days == 5
+
+
+def test_ms_card_days_env_zero_falls_back_to_default(monkeypatch, store_path):
+    """Zero env value is treated as unset (parity with core's resolve_ms_days)."""
+    monkeypatch.setenv("PENSYVE_MS_CARD_DAYS", "0")
     p = pensyve.Pensyve(path=store_path, reranker=None)
     assert p.ms_card_days == 2
