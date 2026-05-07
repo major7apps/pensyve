@@ -253,6 +253,14 @@ impl UsageReporter {
         // Circuit Closed (or HalfOpen probe): flush the current batch
         // through the existing retry loop. Record the outcome on the
         // breaker so HalfOpen → Closed transition is captured.
+        //
+        // Phase 23/C (PR #87 r2): `flush_batch_returning_success` drains
+        // `batch` via `aggregate_batch`. If the flush fails BEFORE the
+        // breaker has accumulated enough failures to trip Open, the batch
+        // contents would otherwise be silently lost. Take a defensive
+        // clone so we can requeue on failure into the same bounded
+        // buffer the Open path uses (drop-oldest semantics preserved).
+        let preserved = batch.clone();
         let success = Self::flush_batch_returning_success(batch, stripe_api_key, client).await;
         if success {
             cb.record_success().await;
@@ -263,6 +271,29 @@ impl UsageReporter {
             // again) doesn't strand the buffered tail.
             Self::drain_buffer(buffer, stripe_api_key, client, cb).await;
         } else {
+            // Requeue the in-flight batch into the bounded buffer so we
+            // don't under-bill on the failure runway before the breaker
+            // trips. Drop-oldest matches the locked Phase 23 decision.
+            let requeued_len;
+            let dropped_oldest;
+            {
+                let mut buf = buffer.lock().expect("usage buffer mutex poisoned");
+                let mut dropped = 0usize;
+                for event in preserved {
+                    if buf.len() >= buffer_capacity && buf.pop_front().is_some() {
+                        dropped += 1;
+                    }
+                    buf.push_back(event);
+                }
+                requeued_len = buf.len();
+                dropped_oldest = dropped;
+            }
+            tracing::warn!(
+                buffered = requeued_len,
+                dropped_oldest,
+                capacity = buffer_capacity,
+                "stripe flush failed; batch requeued into bounded buffer"
+            );
             cb.record_failure().await;
         }
     }

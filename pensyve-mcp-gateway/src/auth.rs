@@ -311,7 +311,23 @@ impl AuthValidator {
                 return None;
             }
         };
-        if body.get("valid")?.as_bool()? {
+        // Phase 23/C (PR #87 r2): a 2xx response with a missing or
+        // wrong-typed `valid` field is a contract regression on the
+        // validator side, not a revoked key. Treat it as a downstream
+        // failure so the auth circuit can trip on sustained validator
+        // misbehaviour rather than silently looking like a steady stream
+        // of rejections.
+        let Some(valid) = body.get("valid").and_then(serde_json::Value::as_bool) else {
+            if let Some(cb) = &self.circuit_breaker {
+                cb.record_failure().await;
+            }
+            tracing::warn!(
+                payload = %body,
+                "remote validation 2xx with missing or non-bool `valid` field"
+            );
+            return None;
+        };
+        if valid {
             let ctx = AuthContext {
                 key_id: body
                     .get("keyId")
