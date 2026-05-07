@@ -46,6 +46,11 @@ pub struct UsageEvent {
     pub stripe_customer_id: Option<String>,
     pub tier: OperationTier,
     pub count: u32,
+    /// W3C `traceparent` header value for the originating request, used
+    /// when this event is forwarded to Stripe's meter events endpoint.
+    /// `None` when no trace context was present (legacy callers, tests,
+    /// or fire-and-forget paths that bypass the tracing middleware).
+    pub traceparent: Option<String>,
 }
 
 /// Asynchronous Stripe usage reporter.
@@ -124,10 +129,20 @@ impl UsageReporter {
         };
 
         // Aggregate by (customer_id, tier) to minimize HTTP calls.
-        let mut aggregated: HashMap<(String, OperationTier), u32> = HashMap::new();
+        // Each bucket keeps a (count, last_traceparent) pair: with batching,
+        // many requests collapse into one Stripe POST, so we keep the most
+        // recent traceparent so at least one trace correlates to the call.
+        let mut aggregated: HashMap<(String, OperationTier), (u32, Option<String>)> =
+            HashMap::new();
         for event in batch.drain(..) {
             if let Some(customer_id) = event.stripe_customer_id {
-                *aggregated.entry((customer_id, event.tier)).or_default() += event.count;
+                let entry = aggregated
+                    .entry((customer_id, event.tier))
+                    .or_insert((0, None));
+                entry.0 += event.count;
+                if event.traceparent.is_some() {
+                    entry.1 = event.traceparent;
+                }
             }
         }
 
@@ -137,27 +152,32 @@ impl UsageReporter {
 
         tracing::info!(
             groups = aggregated.len(),
-            total_ops = aggregated.values().sum::<u32>(),
+            total_ops = aggregated.values().map(|(c, _)| c).sum::<u32>(),
             "Flushing usage to Stripe"
         );
 
-        for ((customer_id, tier), count) in &aggregated {
+        for ((customer_id, tier), (count, traceparent)) in &aggregated {
             let mut success = false;
             for attempt in 0..3 {
                 if attempt > 0 {
                     tokio::time::sleep(tokio::time::Duration::from_millis(500 * 2u64.pow(attempt)))
                         .await;
                 }
-                let result = client
+                let mut req = client
                     .post("https://api.stripe.com/v1/billing/meter_events")
                     .bearer_auth(api_key)
                     .form(&[
                         ("event_name", tier.event_name()),
                         ("payload[stripe_customer_id]", customer_id),
                         ("payload[value]", &count.to_string()),
-                    ])
-                    .send()
-                    .await;
+                    ]);
+                // Phase 23/A: propagate W3C trace context so Stripe's
+                // request logs (and our own egress logs) can be correlated
+                // back to the originating MCP request.
+                if let Some(tp) = traceparent {
+                    req = req.header(crate::middleware::tracing::TRACEPARENT_HEADER, tp);
+                }
+                let result = req.send().await;
 
                 match result {
                     Ok(resp) if resp.status().is_success() => {
@@ -207,6 +227,7 @@ mod tests {
             stripe_customer_id: None,
             tier: OperationTier::Standard,
             count: 1,
+            traceparent: None,
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -222,6 +243,7 @@ mod tests {
                 stripe_customer_id: None,
                 tier: OperationTier::Standard,
                 count: 1,
+                traceparent: None,
             });
         }
 
@@ -250,12 +272,14 @@ mod tests {
                 stripe_customer_id: Some("cus_1".into()),
                 tier: OperationTier::Standard,
                 count: 3,
+                traceparent: None,
             },
             UsageEvent {
                 key_id: "k1".into(),
                 stripe_customer_id: Some("cus_1".into()),
                 tier: OperationTier::Standard,
                 count: 7,
+                traceparent: None,
             },
         ];
         // Without a real Stripe key, this just discards.
