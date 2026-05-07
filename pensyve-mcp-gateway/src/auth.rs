@@ -225,21 +225,12 @@ impl AuthValidator {
                 return None;
             }
 
-            let result = self.validate_remote(url, key, &hash, trace).await;
-            if let Some(cb) = &self.circuit_breaker {
-                // A success here completes the round-trip cleanly — we
-                // record it. Failure recording happens *inside*
-                // `validate_remote` because only there can we distinguish
-                // a genuine transport / 5xx / decode error (which trips
-                // the breaker) from a legitimate 4xx revoked-key response
-                // (which does NOT trip the breaker — a steady stream of
-                // revoked keys must not take the validator offline for
-                // healthy tenants).
-                if result.is_some() {
-                    cb.record_success().await;
-                }
-            }
-            return result;
+            // All breaker bookkeeping (success on any healthy round-trip,
+            // failure on transport / 5xx / decode / contract-regression
+            // errors) lives inside `validate_remote` so HalfOpen recovers
+            // even when the validator returns a healthy 4xx or
+            // `{"valid": false}` rejection (PR #87 r3, CodeRabbit).
+            return self.validate_remote(url, key, &hash, trace).await;
         }
 
         None
@@ -297,7 +288,14 @@ impl AuthValidator {
 
         if !resp.status().is_success() {
             // 4xx — the auth endpoint responded but rejected the key.
-            // This is NOT a circuit-tripping event.
+            // This is NOT a circuit-tripping event; in fact a clean
+            // rejection is positive evidence that the validator is
+            // healthy, so record it as a breaker success (PR #87 r3,
+            // CodeRabbit) to let HalfOpen close on a stream of healthy
+            // rejections after a recovery.
+            if let Some(cb) = &self.circuit_breaker {
+                cb.record_success().await;
+            }
             return None;
         }
 
@@ -321,52 +319,110 @@ impl AuthValidator {
             if let Some(cb) = &self.circuit_breaker {
                 cb.record_failure().await;
             }
+            // PR #87 r3 (CodeRabbit): never log the raw validator payload
+            // at warn level — it can spill `userId`, `stripeCustomerId`
+            // or other unexpected fields into structured logs during a
+            // contract regression. Surface only top-level field names
+            // and JSON types so an operator can diagnose the schema
+            // drift without leaking PII.
             tracing::warn!(
-                payload = %body,
+                payload_shape = %describe_payload_shape(&body),
                 "remote validation 2xx with missing or non-bool `valid` field"
             );
             return None;
         };
-        if valid {
-            let ctx = AuthContext {
-                key_id: body
-                    .get("keyId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("remote")
-                    .to_string(),
-                user_id: body
-                    .get("userId")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                scope: body
-                    .get("scope")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("mcp")
-                    .to_string(),
-                stripe_customer_id: body
-                    .get("stripeCustomerId")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                plan: body
-                    .get("plan")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("free")
-                    .to_string(),
-            };
-
-            // Cache for 1 hour — remote validation is the #1 latency source.
-            self.remote_cache.insert(
-                hash.to_string(),
-                (
-                    ctx.clone(),
-                    std::time::Instant::now() + std::time::Duration::from_secs(3600),
-                ),
-            );
-
-            return Some(ctx);
+        if !valid {
+            // Healthy `{"valid": false}` rejection — same reasoning as the
+            // 4xx branch above: the validator answered cleanly, so the
+            // round-trip is positive evidence of liveness (PR #87 r3,
+            // CodeRabbit).
+            if let Some(cb) = &self.circuit_breaker {
+                cb.record_success().await;
+            }
+            return None;
         }
 
-        None
+        let ctx = parse_auth_context(&body);
+
+        // Cache for 1 hour — remote validation is the #1 latency source.
+        self.remote_cache.insert(
+            hash.to_string(),
+            (
+                ctx.clone(),
+                std::time::Instant::now() + std::time::Duration::from_secs(3600),
+            ),
+        );
+
+        // Healthy `{"valid": true}` round-trip — record breaker success
+        // here (rather than at the call site) so all healthy-response
+        // paths through `validate_remote` consistently feed the breaker
+        // (PR #87 r3, CodeRabbit).
+        if let Some(cb) = &self.circuit_breaker {
+            cb.record_success().await;
+        }
+
+        Some(ctx)
+    }
+}
+
+/// Build an `AuthContext` from a `{"valid": true, ...}` validator
+/// response. Extracted from `validate_remote` to keep that function
+/// under the clippy line-count cap.
+fn parse_auth_context(body: &serde_json::Value) -> AuthContext {
+    AuthContext {
+        key_id: body
+            .get("keyId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("remote")
+            .to_string(),
+        user_id: body
+            .get("userId")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        scope: body
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("mcp")
+            .to_string(),
+        stripe_customer_id: body
+            .get("stripeCustomerId")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        plan: body
+            .get("plan")
+            .and_then(|v| v.as_str())
+            .unwrap_or("free")
+            .to_string(),
+    }
+}
+
+/// Describe the top-level shape of a JSON payload as a comma-joined
+/// list of `field: type` entries. Used in place of `payload = %body` so
+/// validator contract regressions can be diagnosed without spilling
+/// values like `userId`, `stripeCustomerId`, or arbitrary extension
+/// fields into structured logs.
+fn describe_payload_shape(body: &serde_json::Value) -> String {
+    match body {
+        serde_json::Value::Object(map) => {
+            let mut parts: Vec<String> = map
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", json_type(v)))
+                .collect();
+            parts.sort();
+            format!("{{{}}}", parts.join(", "))
+        }
+        other => format!("<non-object: {}>", json_type(other)),
+    }
+}
+
+fn json_type(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }
 
