@@ -104,12 +104,16 @@ fn fresh_store_migration_is_idempotent() {
         let conn = open_raw(tmp.path());
 
         let rows = schema_version_rows(&conn);
+        // G3 added v=2 (typed-slot + chain_summary NULLABLE columns on
+        // observation_memories). Fresh-store open lands BOTH v=1 and
+        // v=2 in one pass.
         assert_eq!(
             rows.len(),
-            1,
-            "expected exactly one migration row, got {rows:?}"
+            2,
+            "expected v=1 AND v=2 migration rows after G3, got {rows:?}"
         );
         assert_eq!(rows[0].0, 1, "expected version=1");
+        assert_eq!(rows[1].0, 2, "expected version=2");
 
         assert_migration_v1_landed(&conn);
     }
@@ -147,10 +151,11 @@ fn fresh_store_migration_is_idempotent() {
             rows, versions_first,
             "schema_versions changed on re-open: {rows:?} vs {versions_first:?}"
         );
+        // G3: 2 rows (v=1 + v=2); both must remain stable across reopens.
         assert_eq!(
             rows.len(),
-            1,
-            "duplicate schema_versions row inserted on re-run"
+            2,
+            "duplicate schema_versions row inserted on re-run; expected 2 (v=1+v=2), got {rows:?}"
         );
 
         for (i, table) in PROJECTION_TABLES.iter().enumerate() {
@@ -327,14 +332,17 @@ fn v2_1_fixture_upgrade_lands_alters_and_preserves_rows() {
     // Schema landed.
     assert_migration_v1_landed(&conn);
 
-    // schema_versions registered exactly one row at version=1.
+    // schema_versions registered TWO rows: v=1 (G1) and v=2 (G3).
+    // The v2.1 fixture starts pre-G1, so the upgrade open lands BOTH
+    // migrations in one pass.
     let rows = schema_version_rows(&conn);
     assert_eq!(
         rows.len(),
-        1,
-        "expected one schema_versions row, got {rows:?}"
+        2,
+        "expected v=1 + v=2 schema_versions rows, got {rows:?}"
     );
     assert_eq!(rows[0].0, 1);
+    assert_eq!(rows[1].0, 2);
 
     // Existing rows preserved with NULL agent_id + user_id (the locked
     // NULL-default design).
@@ -369,7 +377,7 @@ fn v2_1_fixture_upgrade_lands_alters_and_preserves_rows() {
     let rows = schema_version_rows(&conn);
     assert_eq!(
         rows.len(),
-        1,
-        "duplicate schema_versions row on re-run against fixture"
+        2,
+        "duplicate schema_versions row on re-run against fixture; expected 2 (v=1+v=2), got {rows:?}"
     );
 }

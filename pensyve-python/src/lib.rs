@@ -13,6 +13,14 @@ use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::graph::MemoryGraph;
 use pensyve_core::recall_grouped::{OrderBy, RecallGroupedConfig};
 use pensyve_core::retrieval::RecallEngine;
+use pensyve_core::retrieval::cards::composite::{
+    G2_MULTI_SESSION_CARD_CAP, G2_PEER_CARD_CAP, G2_SINGLE_SESSION_USER_CARD_CAP,
+    G3_SUPERSESSION_CARD_CAP,
+};
+use pensyve_core::retrieval::cards::{
+    CompositeCard, MultiSessionCard, PeerCardAdapter, RetrievalCard, SingleSessionUserCard,
+    SupersessionCard,
+};
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::{self, EntityKind, EpisodicMemory, Namespace, Outcome, SemanticMemory};
@@ -65,6 +73,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// G3 env-var guards
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -934,6 +944,278 @@ impl PyPensyve {
                     .collect(),
                 group_score: g.group_score,
             })
+            .collect())
+    }
+
+    /// G3 retrieval-card composition (binding pre-reg `pensyve-docs@64481dc`
+    /// §3.4 item 11 + §7 item 11).
+    ///
+    /// Builds the G3 [`CompositeCard`] against an external `SQLite` store
+    /// (the harness's per-question DB lives in a `TemporaryDirectory`).
+    /// `g3_features` is translated to the
+    /// [`pensyve_core::retrieval::cards::multi_session::RETRIEVAL_CARDS_G3_ENV`]
+    /// env-var value for the duration of this call; the env-var is restored
+    /// to its prior value on return (including panic / exception unwind).
+    ///
+    /// Args:
+    ///     `db_path`: Path to a Pensyve `SQLite` store. May be the directory
+    ///         containing `memories.db` OR the file itself; both shapes are
+    ///         normalized to the directory before opening
+    ///         [`SqliteBackend`].
+    ///     `question_type`: `LongMemEval` `question_type` string (e.g.
+    ///         `"single-session-preference"`, `"multi-session"`). Threaded
+    ///         to each card's `build()` call so the intent router and any
+    ///         future per-question-type cards can dispatch on it.
+    ///     `g2_cards`: G2 base composition. Subset of
+    ///         `["peer", "ms", "ssu"]`; the order does not matter (G2
+    ///         priority order is fixed). An empty list disables every G2
+    ///         card; the result is supersession-only (or `None` when the
+    ///         supersession card defers).
+    ///     `g3_features`: G3 layering knobs. Subset of
+    ///         `["router", "summarizer", "typed_slots", "diversity"]`.
+    ///         Translated to the env-var value:
+    ///         - `[]` → unset (G2-equivalent baseline; engine sees no env var)
+    ///         - `["router"]` → `"router"`
+    ///         - `["summarizer"]` → `"summarizer"`
+    ///         - `["typed_slots"]` → `"typed_slots"`
+    ///         - any superset of `{router, summarizer, typed_slots, diversity}`
+    ///           covering all four → `"full"` (operator-locked single-string
+    ///           encoding per §3.1).
+    ///         The `summarizer` feature additionally pulls
+    ///         [`SupersessionCard`] into the composite chain
+    ///         (otherwise it is omitted).
+    ///
+    /// Returns:
+    ///     The synthesized card text (English prose, possibly multi-section
+    ///     joined with `\n\n`), or `None` when every selected card defers.
+    #[pyo3(signature = (db_path, question_type, g2_cards, g3_features))]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+    fn build_retrieval_card_g3(
+        &self,
+        db_path: String,
+        question_type: String,
+        g2_cards: Vec<String>,
+        g3_features: Vec<String>,
+    ) -> PyResult<Option<String>> {
+        // Validate g2_cards membership.
+        for card in &g2_cards {
+            match card.as_str() {
+                "peer" | "ms" | "ssu" => {}
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "g2_cards element {other:?} is not recognized; expected subset of \
+                         [\"peer\", \"ms\", \"ssu\"]"
+                    )));
+                }
+            }
+        }
+        // Validate g3_features membership.
+        for feat in &g3_features {
+            match feat.as_str() {
+                "router" | "summarizer" | "typed_slots" | "diversity" => {}
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "g3_features element {other:?} is not recognized; expected subset of \
+                         [\"router\", \"summarizer\", \"typed_slots\", \"diversity\"]"
+                    )));
+                }
+            }
+        }
+
+        // Translate g3_features into the G3 layering mode value passed
+        // to `MultiSessionCard::with_g3_mode(...)`. The vocabulary
+        // matches `PENSYVE_RETRIEVAL_CARDS_G3` (`"router"`, `"full"`,
+        // or unset / unrecognized → G2 baseline). Per coderabbit PR #86
+        // round-4 review on pensyve-python/src/lib.rs:160 — passing the
+        // mode explicitly here instead of mutating env eliminates the
+        // race window with parallel unguarded `recall()` callers.
+        //
+        // Per coderabbit PR #86 round-5 review on lib.rs:1060: the
+        // mode mapping accepts arbitrary subsets rather than rejecting
+        // mixed combinations. The `MultiSessionCard`'s G3 mode (the
+        // only thing this value influences) only distinguishes
+        // `Some("full")` (all four flags) from `Some("router")` (any
+        // subset that includes router) from `None` (everything else);
+        // the other features (`summarizer`, `typed_slots`, `diversity`)
+        // are wired through their own paths (`want_supersession` below
+        // for the `SupersessionCard`, `recall_with_diversity` for MMR)
+        // and don't need to be encoded into the card-side mode at all.
+        let has_router = g3_features.iter().any(|f| f == "router");
+        let has_summ = g3_features.iter().any(|f| f == "summarizer");
+        let has_typed = g3_features.iter().any(|f| f == "typed_slots");
+        let has_div = g3_features.iter().any(|f| f == "diversity");
+        let g3_mode_value: Option<&str> = if has_router && has_summ && has_typed && has_div {
+            Some("full")
+        } else if has_router {
+            Some("router")
+        } else {
+            None
+        };
+
+        // Normalize `db_path` into the directory expected by
+        // `SqliteBackend::open`. The harness sometimes passes the file path
+        // (`{tmp}/memories.db`); other callers pass the parent directory
+        // directly. Both shapes work.
+        let raw = PathBuf::from(&db_path);
+        let dir = if raw.is_file() || raw.extension().and_then(|s| s.to_str()) == Some("db") {
+            raw.parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or(raw)
+        } else {
+            raw
+        };
+
+        let backend = SqliteBackend::open(&dir).map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "Failed to open SQLite backend at {}: {e}",
+                dir.display()
+            ))
+        })?;
+
+        // Resolve the namespace. Prefer the same namespace the harness
+        // adapter uses ("longmemeval"); fall back to the handle's own
+        // namespace name; ultimately scan storage and use the first hit.
+        // Defer-on-failure: when no namespace exists we simply return None
+        // (every card would have nothing to scope by).
+        let ns_id_opt: Option<Uuid> = backend
+            .get_namespace_by_name("longmemeval")
+            .ok()
+            .flatten()
+            .map(|ns| ns.id)
+            .or_else(|| {
+                let handle_name = self.inner.namespace.name.clone();
+                backend
+                    .get_namespace_by_name(&handle_name)
+                    .ok()
+                    .flatten()
+                    .map(|ns| ns.id)
+            })
+            // Fallback: pick the first existing namespace before giving up —
+            // handles external DBs created under arbitrary namespace names.
+            // Per coderabbit PR #86 review on lib.rs:1194.
+            .or_else(|| backend.first_namespace_id().ok().flatten());
+
+        let Some(ns_id) = ns_id_opt else {
+            return Ok(None);
+        };
+
+        // Build the composite card chain. `g2_cards` chooses which G2 cards
+        // are present; `g3_features` containing "summarizer" pulls in the
+        // SupersessionCard. The G2 priority order (Peer → MS → SSU) is
+        // preserved regardless of the input list ordering — matches Rev C
+        // §3.1 + the operator §3.X(a) per-card cap layout.
+        let want_peer = g2_cards.iter().any(|c| c == "peer");
+        let want_ms = g2_cards.iter().any(|c| c == "ms");
+        let want_ssu = g2_cards.iter().any(|c| c == "ssu");
+        let want_supersession = g3_features.iter().any(|f| f == "summarizer");
+
+        let mut cards: Vec<(Box<dyn RetrievalCard>, usize)> = Vec::with_capacity(4);
+        if want_peer {
+            cards.push((Box::new(PeerCardAdapter::new()), G2_PEER_CARD_CAP));
+        }
+        if want_ms {
+            // Pass `g3_mode_value` explicitly so the card sees the
+            // intended mode without relying on a process-env mutation
+            // (round-4 fix; see comment block above the
+            // `g3_mode_value` computation).
+            cards.push((
+                Box::new(MultiSessionCard::new().with_g3_mode(g3_mode_value)),
+                G2_MULTI_SESSION_CARD_CAP,
+            ));
+        }
+        if want_ssu {
+            cards.push((
+                Box::new(SingleSessionUserCard::new()),
+                G2_SINGLE_SESSION_USER_CARD_CAP,
+            ));
+        }
+        if want_supersession {
+            cards.push((Box::new(SupersessionCard::new()), G3_SUPERSESSION_CARD_CAP));
+        }
+
+        if cards.is_empty() {
+            // No cards selected → no composition to build. Defer cleanly.
+            return Ok(None);
+        }
+
+        let composite = CompositeCard::new(cards);
+        // `query` is reserved for future per-card relevance scoring; G2/G3
+        // cards ignore it (see `RetrievalCard` trait docs). Empty string is
+        // explicitly allowed and matches the harness adapter's call
+        // pattern.
+        let qt: Option<&str> = if question_type.is_empty() {
+            None
+        } else {
+            Some(question_type.as_str())
+        };
+        Ok(composite.build(
+            "",
+            &backend as &dyn StorageTrait,
+            ns_id,
+            self.inner.agent_id.map(pensyve_core::types::AgentId::from),
+            self.inner.user_id.map(pensyve_core::types::UserId::from),
+            qt,
+        ))
+    }
+
+    /// Recall with MMR diversity reorder (binding pre-reg
+    /// `pensyve-docs@64481dc` §3.4 item 11 + §7 item 11).
+    ///
+    /// Passes `lambda_` directly to
+    /// [`RecallEngine::with_mmr_lambda`](pensyve_core::retrieval::engine::RecallEngine::with_mmr_lambda)
+    /// so the diversity reorder activates without process-env mutation
+    /// (round-4 fix). Behaviorally identical to [`recall`] when
+    /// `lambda_ <= 0.0` (engine treats those as MMR-OFF); reorders by
+    /// `λ·sim − (1−λ)·max_j sim` otherwise.
+    ///
+    /// Args:
+    ///     query: Search query string.
+    ///     k: Maximum number of results (default: 22).
+    ///     `lambda_`: MMR balance. Clamped to `[0.0, 1.0]` by the engine.
+    ///         `1.0` is pure relevance (output ≈ unreordered recall).
+    ///         `0.0` (or unset) is MMR-OFF. The pre-reg §3.9 fixes
+    ///         ARM-5-G3-FULL at `0.5`. The Python kwarg uses a trailing
+    ///         underscore because `lambda` is a reserved word.
+    #[pyo3(signature = (query, k=22, lambda_=0.5))]
+    fn recall_with_diversity(
+        &self,
+        query: &str,
+        k: usize,
+        lambda_: f32,
+    ) -> PyResult<Vec<PyMemory>> {
+        if query.is_empty() {
+            return Err(PyRuntimeError::new_err("query must not be empty"));
+        }
+
+        // Per coderabbit PR #86 round-4 review on
+        // pensyve-python/src/lib.rs:160 — thread the MMR lambda through
+        // the engine boundary explicitly via `with_mmr_lambda` instead
+        // of mutating `PENSYVE_MMR_LAMBDA` via `G3EnvGuard`. Closes the
+        // race where a parallel unguarded `recall()` could read the env
+        // var while another caller had it transiently set.
+        let clamped = lambda_.clamp(0.0, 1.0);
+
+        let vi = self.inner.vector_index.lock().unwrap();
+        let mut engine = RecallEngine::new(
+            self.inner.storage.as_ref(),
+            self.inner.embedder.as_ref(),
+            &vi,
+            &self.inner.retrieval_config,
+        );
+        if let Some(reranker) = self.inner.reranker.as_deref() {
+            engine = engine.with_reranker(reranker);
+        }
+        engine = engine.with_scope(self.inner.agent_id, self.inner.user_id);
+        engine = engine.with_mmr_lambda(clamped);
+
+        let result = engine
+            .recall(query, self.inner.namespace.id, k)
+            .map_err(|e| PyRuntimeError::new_err(format!("Recall failed: {e}")))?;
+
+        Ok(result
+            .memories
+            .into_iter()
+            .map(|c| py_memory_from(&c.memory, c.final_score))
             .collect())
     }
 

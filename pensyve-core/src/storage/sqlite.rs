@@ -155,6 +155,55 @@ impl SqliteBackend {
             )?;
         }
 
+        // ----- Migration v2: G3 typed-slot + supersession-chain columns. -----
+        //
+        // Adds 6 NULLABLE TEXT columns to `observation_memories` per the
+        // operator-locked decisions (b) + (c) on 2026-05-06:
+        //
+        //   biography_slot   — per-event typed-slot extractor output
+        //   preference_slot  — per-event typed-slot extractor output
+        //   experience_slot  — per-event typed-slot extractor output
+        //   social_slot      — per-event typed-slot extractor output
+        //   work_slot        — per-event typed-slot extractor output
+        //   chain_summary    — supersession-chain summarizer output
+        //
+        // NULLABLE preserves backward compat: legacy v=1 rows return NULL
+        // for the new columns and the recall-time `SupersessionCard` /
+        // typed-slot card SQL skip NULL values per pre-reg §3.7 / §3.8.
+        //
+        // See `research/benchmark-sprint/v3/g3/preregistration.md` §3.4
+        // items 8-9 + §7 items 8-10 + Appendix B (line anchors verified
+        // at draft time). Mirrors the v1 idempotency pattern: each ALTER
+        // is guarded by `column_exists` so re-runs are no-ops.
+        if max_applied < 2 {
+            const V2_OBSERVATION_COLUMNS: &[&str] = &[
+                "biography_slot",
+                "preference_slot",
+                "experience_slot",
+                "social_slot",
+                "work_slot",
+                "chain_summary",
+            ];
+
+            for column in V2_OBSERVATION_COLUMNS {
+                if !Self::column_exists(conn, "observation_memories", column)? {
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE observation_memories ADD COLUMN {column} TEXT;"
+                    ))?;
+                }
+            }
+
+            conn.execute(
+                "INSERT INTO schema_versions (version, applied_at, description)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    2_i64,
+                    Utc::now().to_rfc3339(),
+                    "G3: add typed-slot + chain_summary NULLABLE columns to observation_memories",
+                ],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -272,6 +321,31 @@ impl SqliteBackend {
             .query_map(rusqlite::params![memory_id, limit as i64], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(times)
+    }
+
+    /// Return the first namespace UUID stored in this backend, ordered by
+    /// `created_at` (oldest first) for a deterministic pick. Used as a
+    /// last-resort fallback by external callers (e.g., the `pensyve-python`
+    /// G3 binding) that accept arbitrary `db_path` arguments and need to
+    /// resolve *some* namespace when the well-known names miss. Returns
+    /// `Ok(None)` only when the store is genuinely empty.
+    pub fn first_namespace_id(&self) -> Result<Option<Uuid>, StorageError> {
+        let conn = lock_conn!(self);
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT id FROM namespaces ORDER BY created_at ASC, id ASC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match result {
+            None => Ok(None),
+            Some(id_str) => {
+                let id = Uuid::parse_str(&id_str)
+                    .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?;
+                Ok(Some(id))
+            }
+        }
     }
 }
 

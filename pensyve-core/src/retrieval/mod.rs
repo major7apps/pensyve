@@ -24,7 +24,9 @@
 //! continue to work unchanged after the directory split.
 
 pub mod cards;
+pub mod diversity;
 pub mod engine;
+pub mod intent_router;
 
 // Flat re-export keeps the v2.x API surface intact after the
 // retrieval.rs -> retrieval/engine.rs refactor. New code introduced by G2
