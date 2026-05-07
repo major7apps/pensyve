@@ -443,22 +443,30 @@ impl CircuitBreaker {
             let name = self.config.name;
             let window_secs = self.config.window_secs;
             let cooldown_secs = self.config.cooldown_secs;
+            let failure_threshold = self.config.failure_threshold;
             let _ = tokio::time::timeout(REDIS_TIMEOUT, async {
                 // INCR + EXPIRE without WATCH/Lua is racy across
                 // instances but the worst-case effect is a delayed
                 // transition by one request — acceptable. We refresh the
                 // TTL on every increment so a steady failure stream keeps
                 // the counter alive across the window.
+                let mut should_mark_open = opened_now;
                 if let Ok(count) = redis.incr::<_, _, i64>(redis_failures_key(name), 1).await {
                     let _: Result<(), _> = redis
                         .expire::<_, ()>(redis_failures_key(name), i64::from(window_secs))
                         .await;
-                    if opened_now || count >= i64::from(cooldown_secs) {
-                        // Mark Open in Redis with cooldown TTL so sibling
-                        // pods see the same state.
+                    // Trip the cluster-wide circuit when the *Redis*
+                    // counter crosses the threshold even if this pod's
+                    // local in-memory state hasn't tripped yet — that's
+                    // how sibling gateway instances pick up failures
+                    // distributed across the fleet.
+                    if count >= i64::from(failure_threshold) {
+                        should_mark_open = true;
                     }
                 }
-                if opened_now {
+                if should_mark_open {
+                    // Mark Open in Redis with cooldown TTL so sibling
+                    // pods see the same state.
                     let _: Result<(), _> = redis
                         .set_ex::<_, _, ()>(redis_state_key(name), "open", u64::from(cooldown_secs))
                         .await;

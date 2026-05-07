@@ -184,6 +184,20 @@ impl UsageReporter {
                             &buffer,
                             buffer_capacity,
                         ).await;
+                    } else if let Some(cb) = circuit_breaker.as_ref() {
+                        // Idle tick + empty batch: if the breaker has
+                        // recovered, drain any events that piled up while
+                        // the breaker was Open. Without this, low-traffic
+                        // tenants under-report billable usage indefinitely
+                        // after a Stripe outage (the buffer only drains
+                        // on the *next* successful flush of new events).
+                        let has_buffered = {
+                            let buf = buffer.lock().expect("usage buffer mutex poisoned");
+                            !buf.is_empty()
+                        };
+                        if has_buffered && cb.check().await.is_ok() {
+                            Self::drain_buffer(&buffer, stripe_api_key.as_deref(), &client, cb).await;
+                        }
                     }
                 }
             }
@@ -276,17 +290,24 @@ impl UsageReporter {
                 buf.drain(..take).collect()
             };
             let chunk_len = chunk.len();
-            let mut chunk_vec = chunk;
+            // Keep an untouched copy for the requeue path.
+            // `flush_batch_returning_success` calls `aggregate_batch` which
+            // *drains* its input vec, so by the time the !success branch
+            // runs there's nothing left in the borrowed copy to push back.
+            // Without this clone the failed events would be silently lost.
+            let mut working_copy = chunk.clone();
             let success =
-                Self::flush_batch_returning_success(&mut chunk_vec, stripe_api_key, client).await;
+                Self::flush_batch_returning_success(&mut working_copy, stripe_api_key, client)
+                    .await;
             if !success {
-                // Push the un-flushed chunk back to the front so order is
-                // preserved on the next drain attempt. Take care to drop
-                // the MutexGuard before .await — std Mutex guards are
-                // !Send and would un-Send the report_loop future.
+                // Push the original (un-drained) chunk back to the front
+                // so order is preserved on the next drain attempt. Take
+                // care to drop the MutexGuard before .await — std Mutex
+                // guards are !Send and would un-Send the report_loop
+                // future.
                 let remaining = {
                     let mut buf = buffer.lock().expect("usage buffer mutex poisoned");
-                    for event in chunk_vec.into_iter().rev() {
+                    for event in chunk.into_iter().rev() {
                         buf.push_front(event);
                     }
                     buf.len()

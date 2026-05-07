@@ -180,13 +180,18 @@ impl AuthValidator {
         }
 
         // 2. Check remote validation cache (fresh entries only).
+        //
+        // Note: expired entries are intentionally NOT removed here — they
+        // serve as the stale-cache fallback when the auth circuit breaker
+        // is Open (see step 3 below). They're overwritten on a successful
+        // re-validation. Without this, an outage longer than the 1h TTL
+        // would delete the only known-good context and reject every
+        // authenticated request.
         if let Some(entry) = self.remote_cache.get(&hash) {
             let (ctx, expires) = entry.value();
             if std::time::Instant::now() < *expires {
                 return Some(ctx.clone());
             }
-            drop(entry);
-            self.remote_cache.remove(&hash);
         }
 
         // 3. Try remote validation, gated by the circuit breaker.
@@ -222,18 +227,17 @@ impl AuthValidator {
 
             let result = self.validate_remote(url, key, &hash, trace).await;
             if let Some(cb) = &self.circuit_breaker {
-                // A None result here means the remote endpoint either
-                // returned 4xx (key invalid) or failed entirely. We can
-                // distinguish the two paths inside `validate_remote`,
-                // but for circuit-breaker purposes any non-success of
-                // the round-trip counts as a failure — a key being
-                // legitimately revoked still completes the HTTP call
-                // successfully. See validate_remote_with_outcome below.
+                // A success here completes the round-trip cleanly — we
+                // record it. Failure recording happens *inside*
+                // `validate_remote` because only there can we distinguish
+                // a genuine transport / 5xx / decode error (which trips
+                // the breaker) from a legitimate 4xx revoked-key response
+                // (which does NOT trip the breaker — a steady stream of
+                // revoked keys must not take the validator offline for
+                // healthy tenants).
                 if result.is_some() {
                     cb.record_success().await;
                 }
-                // Failure recording happens inside validate_remote where
-                // we can distinguish "transport error" from "bad key".
             }
             return result;
         }

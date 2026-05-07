@@ -174,13 +174,21 @@ impl RateLimiter {
                 Ok(outcome) => return outcome,
                 Err(e) => {
                     // Warn once per process, not once per request.
-                    if self.fallback_warned.swap(true, Ordering::Relaxed) {
-                        tracing::debug!(error = %e, "Rate limit Redis call failed; using fallback");
-                    } else {
+                    // `swap(true, _)` returns the *previous* value: false
+                    // on the very first failure (which is when we want
+                    // the loud warning), true thereafter (when we drop
+                    // to debug-level so we don't flood the logs).
+                    // Reading `if !swap(...)` matches that mental model
+                    // (negate "have we already warned?") even though
+                    // clippy::if_not_else prefers the inverted form.
+                    #[allow(clippy::if_not_else)]
+                    if !self.fallback_warned.swap(true, Ordering::Relaxed) {
                         tracing::warn!(
                             error = %e,
                             "Rate limiter falling back to in-memory; daily quota NOT enforced"
                         );
+                    } else {
+                        tracing::debug!(error = %e, "Rate limit Redis call failed; using fallback");
                     }
                     // Fall through to the in-memory path.
                 }
