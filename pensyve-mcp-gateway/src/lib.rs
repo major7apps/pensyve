@@ -9,7 +9,9 @@
 
 pub mod auth;
 pub mod cache;
+pub mod circuit_breaker;
 pub mod config;
+pub mod middleware;
 pub mod oauth;
 pub mod rate_limit;
 pub mod rest;

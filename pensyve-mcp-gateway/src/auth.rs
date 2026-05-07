@@ -11,7 +11,9 @@ use sha2::{Digest, Sha256};
 use tower::{Layer, Service};
 
 use crate::AppState;
+use crate::circuit_breaker::CircuitBreaker;
 use crate::config::GatewayConfig;
+use crate::middleware::tracing::TraceContext;
 
 /// Validated API key context attached to the request extensions.
 #[derive(Clone, Debug)]
@@ -55,6 +57,10 @@ pub struct AuthValidator {
     jwt_decoding_key: Option<DecodingKey>,
     /// Async HTTP client for remote key validation.
     http_client: reqwest::Client,
+    /// Phase 23/C: circuit breaker around `validate_remote`. `None` is
+    /// equivalent to "always closed" — used by unit tests that don't need
+    /// to exercise the breaker logic.
+    circuit_breaker: Option<Arc<CircuitBreaker>>,
 }
 
 impl AuthValidator {
@@ -104,14 +110,29 @@ impl AuthValidator {
             remote_cache: dashmap::DashMap::new(),
             jwt_decoding_key,
             http_client,
+            circuit_breaker: None,
         }
     }
 
+    /// Attach a circuit breaker that wraps every `validate_remote` call.
+    /// Call this in `main.rs` after constructing the validator and the
+    /// shared breaker.
+    #[must_use]
+    pub fn with_circuit_breaker(mut self, cb: Arc<CircuitBreaker>) -> Self {
+        self.circuit_breaker = Some(cb);
+        self
+    }
+
     /// Validate a token. Checks API keys first, then JWT, then remote endpoint.
-    pub async fn validate(&self, key: &str) -> Option<AuthContext> {
+    ///
+    /// `trace` carries the W3C trace context for the inbound request and
+    /// is propagated as a `traceparent` header on outbound `validate_remote`
+    /// calls. `None` skips propagation (used by unit tests that bypass the
+    /// tracing middleware).
+    pub async fn validate(&self, key: &str, trace: Option<&TraceContext>) -> Option<AuthContext> {
         // 1. API key path (psy_ prefix)
         if key.starts_with("psy_") {
-            return self.validate_api_key(key).await;
+            return self.validate_api_key(key, trace).await;
         }
 
         // 2. JWT path (OAuth access tokens from pensyve.com)
@@ -140,7 +161,11 @@ impl AuthValidator {
         })
     }
 
-    async fn validate_api_key(&self, key: &str) -> Option<AuthContext> {
+    async fn validate_api_key(
+        &self,
+        key: &str,
+        trace: Option<&TraceContext>,
+    ) -> Option<AuthContext> {
         // Check local key list (from PENSYVE_API_KEYS env var)
         let hash = hash_key(key);
         if let Some(prefix) = self.valid_key_hashes.get(&hash) {
@@ -154,25 +179,70 @@ impl AuthValidator {
             });
         }
 
-        // 2. Check remote validation cache
+        // 2. Check remote validation cache (fresh entries only).
+        //
+        // Note: expired entries are intentionally NOT removed here — they
+        // serve as the stale-cache fallback when the auth circuit breaker
+        // is Open (see step 3 below). They're overwritten on a successful
+        // re-validation. Without this, an outage longer than the 1h TTL
+        // would delete the only known-good context and reject every
+        // authenticated request.
         if let Some(entry) = self.remote_cache.get(&hash) {
             let (ctx, expires) = entry.value();
             if std::time::Instant::now() < *expires {
                 return Some(ctx.clone());
             }
-            drop(entry);
-            self.remote_cache.remove(&hash);
         }
 
-        // 3. Try remote validation
+        // 3. Try remote validation, gated by the circuit breaker.
         if let Some(url) = &self.validation_url {
-            return self.validate_remote(url, key, &hash).await;
+            // Phase 23/C: if the breaker is Open, skip the remote call
+            // entirely. Fall back to a *stale* cache hit if one exists
+            // (entries are kept in the dashmap with their expiry; we
+            // re-read here ignoring the expiry rather than mutating the
+            // remove-on-expiry logic above). Returning a stale-but-known
+            // AuthContext is safer than 403'ing every authenticated user
+            // when pensyve.com is down — cached entries were valid as of
+            // the last successful round-trip.
+            if let Some(cb) = &self.circuit_breaker
+                && let Err(open) = cb.check().await
+            {
+                tracing::warn!(
+                    circuit = open.name,
+                    failures = open.failures,
+                    "auth circuit open; attempting stale cache fallback"
+                );
+                if let Some(entry) = self.remote_cache.get(&hash) {
+                    let (ctx, _expires) = entry.value();
+                    return Some(ctx.clone());
+                }
+                // No cache entry at all → deny. The middleware turns
+                // None into 403 forbidden; we keep the existing API
+                // surface (Option<AuthContext>) rather than introducing
+                // a new AuthError::ServiceUnavailable variant that
+                // would cascade into Service / Tower / response-mapping
+                // changes.
+                return None;
+            }
+
+            // All breaker bookkeeping (success on any healthy round-trip,
+            // failure on transport / 5xx / decode / contract-regression
+            // errors) lives inside `validate_remote` so HalfOpen recovers
+            // even when the validator returns a healthy 4xx or
+            // `{"valid": false}` rejection (PR #87 r3, CodeRabbit).
+            return self.validate_remote(url, key, &hash, trace).await;
         }
 
         None
     }
 
-    async fn validate_remote(&self, url: &str, key: &str, hash: &str) -> Option<AuthContext> {
+    async fn validate_remote(
+        &self,
+        url: &str,
+        key: &str,
+        hash: &str,
+        trace: Option<&TraceContext>,
+    ) -> Option<AuthContext> {
         let mut req = self
             .http_client
             .post(url)
@@ -183,52 +253,176 @@ impl AuthValidator {
             req = req.header("x-gateway-secret", secret);
         }
 
-        let resp = req.send().await.ok()?;
-        if !resp.status().is_success() {
+        // Phase 23/A: propagate W3C trace context to pensyve.com so the
+        // validation endpoint can correlate its logs with the gateway's.
+        if let Some(t) = trace {
+            req = req.header(
+                crate::middleware::tracing::TRACEPARENT_HEADER,
+                t.to_header_value(),
+            );
+        }
+
+        // Phase 23/C: distinguish transport-level failures (network
+        // partitions, 5xx, JSON decode) from auth-level failures (4xx,
+        // valid=false). Only the former trip the circuit; a steady stream
+        // of revoked keys MUST NOT take the validator offline for healthy
+        // tenants.
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(cb) = &self.circuit_breaker {
+                    cb.record_failure().await;
+                }
+                tracing::warn!(error = %e, "remote validation transport error");
+                return None;
+            }
+        };
+
+        if resp.status().is_server_error() {
+            if let Some(cb) = &self.circuit_breaker {
+                cb.record_failure().await;
+            }
+            tracing::warn!(status = %resp.status(), "remote validation 5xx");
             return None;
         }
 
-        let body: serde_json::Value = resp.json().await.ok()?;
-        if body.get("valid")?.as_bool()? {
-            let ctx = AuthContext {
-                key_id: body
-                    .get("keyId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("remote")
-                    .to_string(),
-                user_id: body
-                    .get("userId")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                scope: body
-                    .get("scope")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("mcp")
-                    .to_string(),
-                stripe_customer_id: body
-                    .get("stripeCustomerId")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                plan: body
-                    .get("plan")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("free")
-                    .to_string(),
-            };
-
-            // Cache for 1 hour — remote validation is the #1 latency source.
-            self.remote_cache.insert(
-                hash.to_string(),
-                (
-                    ctx.clone(),
-                    std::time::Instant::now() + std::time::Duration::from_secs(3600),
-                ),
-            );
-
-            return Some(ctx);
+        if !resp.status().is_success() {
+            // 4xx — the auth endpoint responded but rejected the key.
+            // This is NOT a circuit-tripping event; in fact a clean
+            // rejection is positive evidence that the validator is
+            // healthy, so record it as a breaker success (PR #87 r3,
+            // CodeRabbit) to let HalfOpen close on a stream of healthy
+            // rejections after a recovery.
+            if let Some(cb) = &self.circuit_breaker {
+                cb.record_success().await;
+            }
+            return None;
         }
 
-        None
+        let body: serde_json::Value = match resp.json().await {
+            Ok(b) => b,
+            Err(e) => {
+                if let Some(cb) = &self.circuit_breaker {
+                    cb.record_failure().await;
+                }
+                tracing::warn!(error = %e, "remote validation JSON decode failed");
+                return None;
+            }
+        };
+        // Phase 23/C (PR #87 r2): a 2xx response with a missing or
+        // wrong-typed `valid` field is a contract regression on the
+        // validator side, not a revoked key. Treat it as a downstream
+        // failure so the auth circuit can trip on sustained validator
+        // misbehaviour rather than silently looking like a steady stream
+        // of rejections.
+        let Some(valid) = body.get("valid").and_then(serde_json::Value::as_bool) else {
+            if let Some(cb) = &self.circuit_breaker {
+                cb.record_failure().await;
+            }
+            // PR #87 r3 (CodeRabbit): never log the raw validator payload
+            // at warn level — it can spill `userId`, `stripeCustomerId`
+            // or other unexpected fields into structured logs during a
+            // contract regression. Surface only top-level field names
+            // and JSON types so an operator can diagnose the schema
+            // drift without leaking PII.
+            tracing::warn!(
+                payload_shape = %describe_payload_shape(&body),
+                "remote validation 2xx with missing or non-bool `valid` field"
+            );
+            return None;
+        };
+        if !valid {
+            // Healthy `{"valid": false}` rejection — same reasoning as the
+            // 4xx branch above: the validator answered cleanly, so the
+            // round-trip is positive evidence of liveness (PR #87 r3,
+            // CodeRabbit).
+            if let Some(cb) = &self.circuit_breaker {
+                cb.record_success().await;
+            }
+            return None;
+        }
+
+        let ctx = parse_auth_context(&body);
+
+        // Cache for 1 hour — remote validation is the #1 latency source.
+        self.remote_cache.insert(
+            hash.to_string(),
+            (
+                ctx.clone(),
+                std::time::Instant::now() + std::time::Duration::from_secs(3600),
+            ),
+        );
+
+        // Healthy `{"valid": true}` round-trip — record breaker success
+        // here (rather than at the call site) so all healthy-response
+        // paths through `validate_remote` consistently feed the breaker
+        // (PR #87 r3, CodeRabbit).
+        if let Some(cb) = &self.circuit_breaker {
+            cb.record_success().await;
+        }
+
+        Some(ctx)
+    }
+}
+
+/// Build an `AuthContext` from a `{"valid": true, ...}` validator
+/// response. Extracted from `validate_remote` to keep that function
+/// under the clippy line-count cap.
+fn parse_auth_context(body: &serde_json::Value) -> AuthContext {
+    AuthContext {
+        key_id: body
+            .get("keyId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("remote")
+            .to_string(),
+        user_id: body
+            .get("userId")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        scope: body
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("mcp")
+            .to_string(),
+        stripe_customer_id: body
+            .get("stripeCustomerId")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        plan: body
+            .get("plan")
+            .and_then(|v| v.as_str())
+            .unwrap_or("free")
+            .to_string(),
+    }
+}
+
+/// Describe the top-level shape of a JSON payload as a comma-joined
+/// list of `field: type` entries. Used in place of `payload = %body` so
+/// validator contract regressions can be diagnosed without spilling
+/// values like `userId`, `stripeCustomerId`, or arbitrary extension
+/// fields into structured logs.
+fn describe_payload_shape(body: &serde_json::Value) -> String {
+    match body {
+        serde_json::Value::Object(map) => {
+            let mut parts: Vec<String> = map
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", json_type(v)))
+                .collect();
+            parts.sort();
+            format!("{{{}}}", parts.join(", "))
+        }
+        other => format!("<non-object: {}>", json_type(other)),
+    }
+}
+
+fn json_type(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }
 
@@ -344,7 +538,11 @@ where
                 },
             };
 
-            if let Some(ctx) = state.auth.validate(&token).await {
+            // Pull trace context off the request (set by TracingLayer
+            // upstream) so we can propagate it on the outbound
+            // `validate_remote` POST.
+            let trace = req.extensions().get::<TraceContext>().cloned();
+            if let Some(ctx) = state.auth.validate(&token, trace.as_ref()).await {
                 req.extensions_mut().insert(ctx);
                 inner.call(req).await
             } else {
@@ -396,25 +594,25 @@ mod tests {
     #[tokio::test]
     async fn test_auth_validator_accepts_valid_key() {
         let validator = AuthValidator::new(&test_config(vec!["psy_testkey12345".into()]));
-        assert!(validator.validate("psy_testkey12345").await.is_some());
+        assert!(validator.validate("psy_testkey12345", None).await.is_some());
     }
 
     #[tokio::test]
     async fn test_auth_validator_rejects_invalid_key() {
         let validator = AuthValidator::new(&test_config(vec!["psy_testkey12345".into()]));
-        assert!(validator.validate("psy_wrong_key").await.is_none());
+        assert!(validator.validate("psy_wrong_key", None).await.is_none());
     }
 
     #[tokio::test]
     async fn test_auth_validator_rejects_non_psy_prefix() {
         let validator = AuthValidator::new(&test_config(vec!["psy_testkey12345".into()]));
-        assert!(validator.validate("sk_testkey12345").await.is_none());
+        assert!(validator.validate("sk_testkey12345", None).await.is_none());
     }
 
     #[tokio::test]
     async fn test_auth_validator_empty_config_rejects_all() {
         let validator = AuthValidator::new(&test_config(vec![]));
-        assert!(validator.validate("psy_anything").await.is_none());
+        assert!(validator.validate("psy_anything", None).await.is_none());
     }
 
     // Ed25519 test key pair generated for unit tests only — not a real secret.
@@ -480,7 +678,7 @@ mod tests {
         let token = sign_jwt(&valid_claims());
 
         let ctx = validator
-            .validate(&token)
+            .validate(&token, None)
             .await
             .expect("valid JWT should be accepted");
         assert_eq!(ctx.user_id.as_deref(), Some("user_abc123"));
@@ -496,7 +694,7 @@ mod tests {
         let token = sign_jwt(&claims);
 
         assert!(
-            validator.validate(&token).await.is_none(),
+            validator.validate(&token, None).await.is_none(),
             "expired JWT should be rejected"
         );
     }
@@ -509,7 +707,7 @@ mod tests {
         let token = sign_jwt(&claims);
 
         assert!(
-            validator.validate(&token).await.is_none(),
+            validator.validate(&token, None).await.is_none(),
             "JWT with wrong issuer should be rejected"
         );
     }
@@ -522,7 +720,7 @@ mod tests {
         let token = sign_jwt(&claims);
 
         assert!(
-            validator.validate(&token).await.is_none(),
+            validator.validate(&token, None).await.is_none(),
             "JWT with wrong audience should be rejected"
         );
     }
@@ -538,7 +736,7 @@ mod tests {
 
         let token = sign_jwt(&valid_claims());
         assert!(
-            validator.validate(&token).await.is_none(),
+            validator.validate(&token, None).await.is_none(),
             "JWT should not validate when no public key is configured"
         );
     }
@@ -550,7 +748,7 @@ mod tests {
 
         // A psy_ token should go through the API key path, not JWT.
         let ctx = validator
-            .validate("psy_testkey12345")
+            .validate("psy_testkey12345", None)
             .await
             .expect("psy_ key should be validated as API key");
         assert!(
@@ -565,7 +763,10 @@ mod tests {
         // And a psy_ token that is NOT in the valid list should be rejected via
         // the API key path, never falling through to JWT validation.
         assert!(
-            validator.validate("psy_not_a_real_key").await.is_none(),
+            validator
+                .validate("psy_not_a_real_key", None)
+                .await
+                .is_none(),
             "invalid psy_ key should be rejected even with JWT configured"
         );
     }
@@ -574,7 +775,7 @@ mod tests {
     async fn test_local_api_key_gets_default_mcp_scope() {
         let validator = AuthValidator::new(&test_config(vec!["psy_testkey12345".into()]));
         let ctx = validator
-            .validate("psy_testkey12345")
+            .validate("psy_testkey12345", None)
             .await
             .expect("valid key");
         assert_eq!(ctx.scope, "mcp");
@@ -584,7 +785,7 @@ mod tests {
     async fn test_jwt_extracts_scope() {
         let validator = validator_with_jwt(vec![]);
         let token = sign_jwt(&valid_claims());
-        let ctx = validator.validate(&token).await.expect("valid JWT");
+        let ctx = validator.validate(&token, None).await.expect("valid JWT");
         assert_eq!(ctx.scope, "mcp");
     }
 
@@ -594,7 +795,7 @@ mod tests {
         config.key_user_map = vec![("psy_testkey12345".to_string(), "user_abc".to_string())];
         let validator = AuthValidator::new(&config);
         let ctx = validator
-            .validate("psy_testkey12345")
+            .validate("psy_testkey12345", None)
             .await
             .expect("valid key");
         assert_eq!(ctx.user_id.as_deref(), Some("user_abc"));
@@ -605,7 +806,7 @@ mod tests {
         let config = test_config(vec!["psy_testkey12345".into()]);
         let validator = AuthValidator::new(&config);
         let ctx = validator
-            .validate("psy_testkey12345")
+            .validate("psy_testkey12345", None)
             .await
             .expect("valid key");
         assert!(ctx.user_id.is_none());

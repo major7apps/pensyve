@@ -21,7 +21,9 @@ use pensyve_mcp_tools::PensyveMcpServer;
 
 use pensyve_mcp_gateway::auth::{self, AuthContext, AuthLayer};
 use pensyve_mcp_gateway::cache;
+use pensyve_mcp_gateway::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use pensyve_mcp_gateway::config::GatewayConfig;
+use pensyve_mcp_gateway::middleware::tracing::TracingLayer;
 use pensyve_mcp_gateway::oauth;
 use pensyve_mcp_gateway::rate_limit::{self, RateLimitLayer};
 use pensyve_mcp_gateway::rest;
@@ -160,11 +162,22 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
 }
 
 fn main() -> Result<()> {
+    // JSON formatter with span attributes flattened into each event record
+    // (Phase 23/A): the TracingLayer middleware wraps every request handler
+    // in a span carrying `trace_id` + `span_id` fields, and
+    // `with_current_span(true)` emits those fields on every log line under
+    // the span — giving us `trace_id` / `span_id` columns in CloudWatch
+    // Insights without any per-call-site changes.
+    //
+    // `with_span_list(false)` suppresses the redundant `spans` array; the
+    // current span object alone is what downstream log queries key on.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .json()
+        .with_current_span(true)
+        .with_span_list(false)
         .init();
 
     let config = GatewayConfig::from_env();
@@ -228,6 +241,20 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
 
     let auth_required = !config.api_keys.is_empty();
 
+    // Phase 23/C: shared circuit breakers for the two known-flaky external
+    // dependencies. Both default to operator-locked thresholds:
+    //   auth:    5 failures / 60s / 30s cooldown
+    //   stripe:  3 failures / 60s / 60s cooldown
+    // Override via PENSYVE_CB_AUTH_*  / PENSYVE_CB_STRIPE_* env vars.
+    let auth_cb = Arc::new(CircuitBreaker::new(
+        CircuitBreakerConfig::auth_default(),
+        redis.clone(),
+    ));
+    let stripe_cb = Arc::new(CircuitBreaker::new(
+        CircuitBreakerConfig::stripe_default(),
+        redis.clone(),
+    ));
+
     // Observation extractor — initialized from `LocalLLMExtractor::from_env()`
     // which reads PENSYVE_EXTRACTOR_URL / PENSYVE_EXTRACTOR_MODEL /
     // PENSYVE_EXTRACTOR_API_KEY. Defaults to qwen3.6-35b-a3b on
@@ -253,9 +280,23 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         };
 
     let app_state = Arc::new(AppState {
-        auth: auth::AuthValidator::new(&config),
-        rate_limiter: rate_limit::RateLimiter::new(config.rate_limit_per_minute),
-        usage_reporter: UsageReporter::new(config.stripe_api_key.clone()),
+        // Phase 23/C: AuthValidator wired with the auth circuit breaker so
+        // validate_remote() trips on repeated upstream failures and falls back
+        // to remote_cache.
+        auth: auth::AuthValidator::new(&config).with_circuit_breaker(auth_cb.clone()),
+        // Phase 23/B: rate limiter is now Redis-backed (when REDIS_URL is set)
+        // with plan-aware daily quotas. Falls back to an in-memory sliding
+        // window when Redis is unavailable. The legacy `rate_limit_per_minute`
+        // config is intentionally no longer wired through here — limits are
+        // sourced from the caller's plan tier.
+        rate_limiter: rate_limit::RateLimiter::new(redis.clone()),
+        // Phase 23/C: UsageReporter wired with the stripe circuit breaker so
+        // failed Stripe meter events buffer (bounded VecDeque) and drain on
+        // half-open success.
+        usage_reporter: UsageReporter::new_with_circuit_breaker(
+            config.stripe_api_key.clone(),
+            stripe_cb.clone(),
+        ),
         usage_counter,
         tenant_mgr,
         auth_required,
@@ -333,19 +374,16 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         ))
         .layer(RateLimitLayer::new(app_state.clone()))
         .layer(AuthLayer::new(app_state.clone()))
+        // Tracing layer is added LAST so it sits outermost: it observes
+        // every request before auth/rate-limit, so the trace context is
+        // already in request extensions when auth.rs's `validate_remote`
+        // and the tenant_and_usage middleware run.
+        .layer(TracingLayer::new())
         .with_state(app_state.clone());
 
-    // Periodic eviction of stale rate-limit entries.
-    tokio::spawn({
-        let state = app_state.clone();
-        async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                state.rate_limiter.evict_stale();
-            }
-        }
-    });
+    // Phase 23 Track B: the periodic `evict_stale()` task is gone — Redis
+    // TTLs handle window expiry on the primary path, and the in-memory
+    // fallback prunes entries on read inside `RateLimiter::check_fallback`.
 
     // Background consolidation — runs every PENSYVE_CONSOLIDATION_INTERVAL_SECS (default 6h).
     tokio::spawn({
@@ -511,6 +549,11 @@ async fn tenant_and_usage_middleware(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let auth_ctx = req.extensions().get::<AuthContext>().cloned();
+    // W3C trace context (Phase 23/A) populated upstream by TracingLayer.
+    let trace_ctx = req
+        .extensions()
+        .get::<pensyve_mcp_gateway::middleware::tracing::TraceContext>()
+        .cloned();
     // Per-tenant agent_id header (G1/P3d). Malformed UUID → ignored, no error
     // returned to the client (backward compatibility with v2.1.0 callers).
     let agent_id = parse_agent_id_header(req.headers());
@@ -561,6 +604,9 @@ async fn tenant_and_usage_middleware(
                 stripe_customer_id: ctx.stripe_customer_id,
                 tier: usage::OperationTier::Standard,
                 count: 1,
+                traceparent: trace_ctx
+                    .as_ref()
+                    .map(pensyve_mcp_gateway::middleware::tracing::TraceContext::to_header_value),
             });
         }
     }
