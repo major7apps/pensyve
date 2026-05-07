@@ -21,6 +21,7 @@ use pensyve_mcp_tools::PensyveMcpServer;
 
 use pensyve_mcp_gateway::auth::{self, AuthContext, AuthLayer};
 use pensyve_mcp_gateway::cache;
+use pensyve_mcp_gateway::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use pensyve_mcp_gateway::config::GatewayConfig;
 use pensyve_mcp_gateway::middleware::tracing::TracingLayer;
 use pensyve_mcp_gateway::oauth;
@@ -240,6 +241,20 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
 
     let auth_required = !config.api_keys.is_empty();
 
+    // Phase 23/C: shared circuit breakers for the two known-flaky external
+    // dependencies. Both default to operator-locked thresholds:
+    //   auth:    5 failures / 60s / 30s cooldown
+    //   stripe:  3 failures / 60s / 60s cooldown
+    // Override via PENSYVE_CB_AUTH_*  / PENSYVE_CB_STRIPE_* env vars.
+    let auth_cb = Arc::new(CircuitBreaker::new(
+        CircuitBreakerConfig::auth_default(),
+        redis.clone(),
+    ));
+    let stripe_cb = Arc::new(CircuitBreaker::new(
+        CircuitBreakerConfig::stripe_default(),
+        redis.clone(),
+    ));
+
     // Observation extractor — initialized from `LocalLLMExtractor::from_env()`
     // which reads PENSYVE_EXTRACTOR_URL / PENSYVE_EXTRACTOR_MODEL /
     // PENSYVE_EXTRACTOR_API_KEY. Defaults to qwen3.6-35b-a3b on
@@ -265,9 +280,12 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         };
 
     let app_state = Arc::new(AppState {
-        auth: auth::AuthValidator::new(&config),
+        auth: auth::AuthValidator::new(&config).with_circuit_breaker(auth_cb.clone()),
         rate_limiter: rate_limit::RateLimiter::new(config.rate_limit_per_minute),
-        usage_reporter: UsageReporter::new(config.stripe_api_key.clone()),
+        usage_reporter: UsageReporter::new_with_circuit_breaker(
+            config.stripe_api_key.clone(),
+            stripe_cb.clone(),
+        ),
         usage_counter,
         tenant_mgr,
         auth_required,
