@@ -513,16 +513,12 @@ impl<'a> RecallEngine<'a> {
             })
             .filter(|&v| v > 0.0);
 
-        // Steps 1–4: embed, search, merge candidates. We capture the query
-        // embedding into `query_embedding_owned` only when MMR is active so
-        // the optional rerank at the tail can reuse it without re-embedding.
-        // Capture is gated on `mmr_lambda.is_some()` so default-OFF stays
-        // zero-overhead.
-        let mut query_embedding_owned: Option<Vec<f32>> = None;
+        // Steps 1–4: embed, search, merge candidates. The MMR rerank
+        // at the tail no longer needs the query embedding (it consumes
+        // the reranker's `final_score` for relevance per coderabbit
+        // round-5 review on diversity.rs:95), so the recall path
+        // doesn't have to retain it past the gather step.
         let (candidates, vector_map) = if let Some(emb) = pre_embedding {
-            if mmr_lambda.is_some() {
-                query_embedding_owned = Some(emb.to_vec());
-            }
             if target_entity.is_some() {
                 self.gather_candidates_dual_path(
                     emb,
@@ -536,32 +532,13 @@ impl<'a> RecallEngine<'a> {
             }
         } else if target_entity.is_some() {
             let query_embedding = self.embedder.embed(query)?;
-            let result = self.gather_candidates_dual_path(
+            self.gather_candidates_dual_path(
                 &query_embedding,
                 query,
                 namespace_id,
                 max_candidates,
                 target_entity,
-            )?;
-            if mmr_lambda.is_some() {
-                query_embedding_owned = Some(query_embedding);
-            }
-            result
-        } else if mmr_lambda.is_some() {
-            // Same as gather_candidates(...), inlined here so we can keep
-            // the query embedding around for MMR without changing the
-            // gather_candidates signature. Only taken on the MMR-active
-            // path; default-OFF still routes through gather_candidates and
-            // pays the original cost.
-            let query_embedding = self.embedder.embed(query)?;
-            let result = self.gather_candidates_with_embedding(
-                &query_embedding,
-                query,
-                namespace_id,
-                max_candidates,
-            )?;
-            query_embedding_owned = Some(query_embedding);
-            result
+            )?
         } else {
             self.gather_candidates(query, namespace_id, max_candidates)?
         };
@@ -809,8 +786,8 @@ impl<'a> RecallEngine<'a> {
         // PENSYVE_MMR_LAMBDA is set and > 0.0, preserving G2 byte-for-byte
         // parity for ARM-1-G3-BASELINE through ARM-4-TYPED-SLOTS.
         // ARM-5-G3-FULL sets λ=0.5.
-        if let (Some(lambda), Some(qvec)) = (mmr_lambda, query_embedding_owned.as_deref()) {
-            scored = crate::retrieval::diversity::rerank_mmr(scored, qvec, lambda, limit);
+        if let Some(lambda) = mmr_lambda {
+            scored = crate::retrieval::diversity::rerank_mmr(scored, lambda, limit);
         }
 
         scored.truncate(limit);

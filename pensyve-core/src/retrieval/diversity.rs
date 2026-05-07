@@ -11,30 +11,36 @@
 //! Standard MMR (Carbonell & Goldstein 1998), greedy selection:
 //!
 //! ```text
-//! score(item) = λ · sim(item, query)
-//!             − (1 − λ) · max_j sim(item, selected[j])
+//! score(item) = λ · rel(item)
+//!             − (1 − λ) · max_j cos(item, selected[j])
 //! ```
+//!
+//! `rel(item)` is the candidate's `ScoredCandidate.final_score` — the
+//! RRF + cross-encoder fused relevance the recall pipeline already
+//! computed. Final-scores are min-max normalized within the candidate
+//! pool to `[0, 1]` so they share a scale with the cosine redundancy
+//! term and the lambda balance stays well-defined. Per coderabbit
+//! PR #86 review on diversity.rs:95.
 //!
 //! Each iteration picks the candidate with the highest MMR score, appends
 //! it to the selected list, and removes it from the pool. Stops at `k`
 //! items or when the pool is empty.
 //!
-//! ## Similarity function
+//! ## Redundancy term
 //!
-//! Cosine similarity. Memory embeddings are L2-normalized at insert time
-//! by `pensyve_core::vector::VectorIndex`, but this module does not assume
-//! that — it calls [`crate::embedding::cosine_similarity`] which performs
-//! its own normalization, so unnormalized inputs are still scored
-//! correctly. A candidate with an empty (zero-length) embedding gets
-//! similarity 0.0 and is treated as orthogonal to everything.
+//! Cosine similarity between candidate embeddings. Memory embeddings are
+//! L2-normalized at insert time by `pensyve_core::vector::VectorIndex`,
+//! but this module does not assume that — it calls
+//! [`crate::embedding::cosine_similarity`] which performs its own
+//! normalization, so unnormalized inputs still score correctly. A
+//! candidate with an empty (zero-length) embedding gets similarity 0.0
+//! and is treated as orthogonal to everything.
 //!
-//! ## Embedding source
+//! ## λ=1.0 honors the reranker
 //!
-//! `ScoredCandidate.memory.embedding()` already exposes the embedding
-//! vector for every memory variant (Episodic, Semantic, Procedural,
-//! Observation). The MMR call site in `engine.rs` therefore passes the
-//! existing `Vec<ScoredCandidate>` directly — no signature extension
-//! required.
+//! Because relevance is the reranker's `final_score` (not a re-derived
+//! cosine-vs-query), `λ = 1.0` reproduces the input order EXACTLY —
+//! MMR adds no resorting, the reranker stage is fully respected.
 //!
 //! ## Default-OFF behavior
 //!
@@ -52,18 +58,12 @@ use crate::retrieval::engine::ScoredCandidate;
 /// Inputs:
 /// - `items`: candidates as produced by `RecallEngine::recall` (already
 ///   sorted by `ScoredCandidate.final_score` descending — the RRF +
-///   cross-encoder fused score). MMR does NOT consume `final_score`
-///   directly; the relevance term is recomputed as cosine similarity
-///   between the candidate's embedding and `query_vec` so that relevance
-///   and the redundancy term share a single scale (cosine ∈ [-1, 1]) and
-///   the lambda balance remains well-calibrated. Side effect: with
-///   λ = 1.0 the output order is *not* guaranteed to equal the input
-///   order — MMR will resort by raw cosine, which can disagree with the
-///   reranker's `final_score`. Documented tradeoff per coderabbit/claude
-///   PR #86 review and pre-reg §3.X(a'); G4 may revisit using
-///   normalized `final_score` once a multi-cell λ ablation is run.
-/// - `query_vec`: the query embedding used for the relevance term. Same
-///   vector the recall engine fed into the vector index.
+///   cross-encoder fused score). MMR uses `final_score` directly as the
+///   relevance term, min-max-normalized within the candidate pool to
+///   `[0, 1]` so it shares a scale with the cosine redundancy term.
+///   This honors the reranker stage: with λ=1.0 the output order
+///   reproduces the input order exactly. Per coderabbit PR #86 review on
+///   diversity.rs:95.
 /// - `lambda`: balance parameter, clamped into `[0.0, 1.0]`. λ=1.0 is
 ///   pure relevance (output ≈ input order); λ=0.0 is pure diversity. The
 ///   pre-reg §3.9 fixes ARM-5-G3-FULL at λ=0.5.
@@ -73,12 +73,7 @@ use crate::retrieval::engine::ScoredCandidate;
 ///
 /// Returns a new `Vec<ScoredCandidate>` in MMR-selected order. The input
 /// vector is consumed; preserved candidates are moved into the output.
-pub fn rerank_mmr(
-    items: Vec<ScoredCandidate>,
-    query_vec: &[f32],
-    lambda: f32,
-    k: usize,
-) -> Vec<ScoredCandidate> {
+pub fn rerank_mmr(items: Vec<ScoredCandidate>, lambda: f32, k: usize) -> Vec<ScoredCandidate> {
     if k == 0 || items.is_empty() {
         return Vec::new();
     }
@@ -86,13 +81,30 @@ pub fn rerank_mmr(
     let lambda = lambda.clamp(0.0, 1.0);
     let target = k.min(items.len());
 
-    // Pre-compute relevance (cosine vs. query) once per candidate.
-    // Using indexed access because we'll be removing items from the pool
-    // by index during selection.
-    let relevance: Vec<f32> = items
+    // Pre-compute relevance from the reranker's fused `final_score`,
+    // min-max normalized within this candidate pool so the magnitude
+    // sits on the same `[0, 1]` scale as the cosine redundancy term.
+    // Per coderabbit PR #86 review on diversity.rs:95 — using
+    // `final_score` here lets λ=1.0 reproduce the reranker's order
+    // exactly. When all scores are equal (`range == 0`) we fall back
+    // to a constant 0.5 so ordering is decided by the diversity term
+    // alone.
+    let raw_relevance: Vec<f32> = items.iter().map(|c| c.final_score).collect();
+    let (min_score, max_score) = raw_relevance
         .iter()
-        .map(|c| cosine_similarity(c.memory.embedding(), query_vec))
-        .collect();
+        .copied()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), v| {
+            (lo.min(v), hi.max(v))
+        });
+    let range = max_score - min_score;
+    let relevance: Vec<f32> = if range > f32::EPSILON {
+        raw_relevance
+            .iter()
+            .map(|&v| (v - min_score) / range)
+            .collect()
+    } else {
+        vec![0.5_f32; items.len()]
+    };
 
     // Pool tracks remaining candidates by their original index. We remove
     // selected entries via `swap_remove` for O(1) removal; selected stays

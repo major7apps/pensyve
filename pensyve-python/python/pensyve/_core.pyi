@@ -230,12 +230,11 @@ class Pensyve:
         """Recall with MMR diversity reorder (binding pre-reg
         ``pensyve-docs@64481dc`` §3.4 item 11 + §7 item 11).
 
-        Sets ``PENSYVE_MMR_LAMBDA`` for the duration of this call so the
-        existing diversity reorder in ``RecallEngine`` activates, then
-        restores the prior env-var value on return (including panic /
-        exception unwind). Behaviorally identical to :meth:`recall` when
-        ``lambda_ <= 0.0``; reorders by ``lambda_·sim − (1−lambda_)·max_j sim``
-        otherwise.
+        Passes ``lambda_`` directly to
+        :py:meth:`RecallEngine.with_mmr_lambda` so the diversity reorder
+        activates without process-env mutation (round-4 fix).
+        Behaviorally identical to :meth:`recall` when ``lambda_ <= 0.0``;
+        reorders by ``lambda_·sim − (1−lambda_)·max_j sim`` otherwise.
 
         Args:
             query: Search query string.

@@ -1029,35 +1029,27 @@ impl PyPensyve {
         // round-4 review on pensyve-python/src/lib.rs:160 — passing the
         // mode explicitly here instead of mutating env eliminates the
         // race window with parallel unguarded `recall()` callers.
-        let g3_mode_value: Option<&str> = if g3_features.is_empty() {
-            None
+        //
+        // Per coderabbit PR #86 round-5 review on lib.rs:1060: the
+        // mode mapping accepts arbitrary subsets rather than rejecting
+        // mixed combinations. The `MultiSessionCard`'s G3 mode (the
+        // only thing this value influences) only distinguishes
+        // `Some("full")` (all four flags) from `Some("router")` (any
+        // subset that includes router) from `None` (everything else);
+        // the other features (`summarizer`, `typed_slots`, `diversity`)
+        // are wired through their own paths (`want_supersession` below
+        // for the `SupersessionCard`, `recall_with_diversity` for MMR)
+        // and don't need to be encoded into the card-side mode at all.
+        let has_router = g3_features.iter().any(|f| f == "router");
+        let has_summ = g3_features.iter().any(|f| f == "summarizer");
+        let has_typed = g3_features.iter().any(|f| f == "typed_slots");
+        let has_div = g3_features.iter().any(|f| f == "diversity");
+        let g3_mode_value: Option<&str> = if has_router && has_summ && has_typed && has_div {
+            Some("full")
+        } else if has_router {
+            Some("router")
         } else {
-            let has_router = g3_features.iter().any(|f| f == "router");
-            let has_summ = g3_features.iter().any(|f| f == "summarizer");
-            let has_typed = g3_features.iter().any(|f| f == "typed_slots");
-            let has_div = g3_features.iter().any(|f| f == "diversity");
-            if has_router && has_summ && has_typed && has_div {
-                Some("full")
-            } else if has_router && !has_summ && !has_typed && !has_div {
-                Some("router")
-            } else if has_summ && !has_router && !has_typed && !has_div {
-                Some("summarizer")
-            } else if has_typed && !has_router && !has_summ && !has_div {
-                Some("typed_slots")
-            } else if has_div && !has_router && !has_summ && !has_typed {
-                // `diversity` alone has no card-side mode (MMR is wired
-                // via `engine.with_mmr_lambda(...)` in
-                // `recall_with_diversity`), so we leave the card mode
-                // unset for this combo. Caller typically pairs
-                // `diversity` with `recall_with_diversity`.
-                None
-            } else {
-                return Err(PyValueError::new_err(format!(
-                    "g3_features={g3_features:?} is not a recognized G3 layer combination; \
-                     expected one of: [], [\"router\"], [\"summarizer\"], [\"typed_slots\"], \
-                     [\"diversity\"], or [\"router\", \"summarizer\", \"typed_slots\", \"diversity\"] (full)"
-                )));
-            }
+            None
         };
 
         // Normalize `db_path` into the directory expected by
@@ -1169,12 +1161,12 @@ impl PyPensyve {
     /// Recall with MMR diversity reorder (binding pre-reg
     /// `pensyve-docs@64481dc` §3.4 item 11 + §7 item 11).
     ///
-    /// Sets `PENSYVE_MMR_LAMBDA` for the duration of this call so the
-    /// existing diversity reorder in `RecallEngine::recall_inner` activates,
-    /// then restores the prior env-var value on return (including panic /
-    /// exception unwind). Behaviorally identical to [`recall`] when
-    /// `lambda_ == 0.0` (engine treats `lambda <= 0.0` as MMR-OFF) and
-    /// reorders the result by `λ·sim − (1−λ)·max_j sim` when `lambda_ > 0.0`.
+    /// Passes `lambda_` directly to
+    /// [`RecallEngine::with_mmr_lambda`](pensyve_core::retrieval::engine::RecallEngine::with_mmr_lambda)
+    /// so the diversity reorder activates without process-env mutation
+    /// (round-4 fix). Behaviorally identical to [`recall`] when
+    /// `lambda_ <= 0.0` (engine treats those as MMR-OFF); reorders by
+    /// `λ·sim − (1−λ)·max_j sim` otherwise.
     ///
     /// Args:
     ///     query: Search query string.

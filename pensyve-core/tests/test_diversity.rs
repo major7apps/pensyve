@@ -72,16 +72,18 @@ fn unit4(x: f32, y: f32, z: f32, w: f32, marker: f32) -> ScoredCandidate {
 /// it with the diversity term.
 #[test]
 fn test_lambda_1_preserves_relevance_order() {
-    // Query is aligned with x-axis. Construct candidates with decreasing
-    // cosine sim to query: c0=1.0, c1=0.7, c2=0.4, c3=0.1.
-    let query = vec![1.0_f32, 0.0, 0.0, 0.0];
+    // Per round-5 update — relevance now derives from `final_score`
+    // (min-max normalized) rather than cosine vs. query, so the query
+    // vector is no longer needed by `rerank_mmr`. Final-scores are
+    // monotonically decreasing in the markers `(1.0, 0.7, 0.4, 0.1)`,
+    // so λ=1.0 must reproduce that order exactly.
     let c0 = unit4(1.0, 0.0, 0.0, 0.0, 1.0);
     let c1 = unit4(0.7, 0.7, 0.0, 0.0, 0.7);
     let c2 = unit4(0.4, 0.0, 0.9, 0.0, 0.4);
     let c3 = unit4(0.1, 0.0, 0.0, 0.99, 0.1);
     let input_ids: Vec<Uuid> = vec![c0.memory_id, c1.memory_id, c2.memory_id, c3.memory_id];
 
-    let out = rerank_mmr(vec![c0, c1, c2, c3], &query, 1.0, 4);
+    let out = rerank_mmr(vec![c0, c1, c2, c3], 1.0, 4);
 
     assert_eq!(out.len(), 4);
     for (i, cand) in out.iter().enumerate() {
@@ -98,10 +100,9 @@ fn test_lambda_1_preserves_relevance_order() {
 /// already-selected first item) rather than the duplicate.
 #[test]
 fn test_lambda_0_maximizes_diversity() {
-    let query = vec![1.0_f32, 0.0, 0.0, 0.0];
-    // c0 + c1 are near-duplicates aligned with the x-axis (high sim to
-    // query AND high sim to each other). c2 is orthogonal (y-axis). With
-    // λ=0.0 the first pick has redundancy 0 (no selected yet) so MMR
+    // c0 + c1 are near-duplicates aligned with the x-axis. c2 is
+    // orthogonal (y-axis). With λ=0.0 the first pick has redundancy 0
+    // (no selected yet) so MMR
     // chooses argmax(-redundancy) which is the same for everyone — but
     // ties are broken by iteration order, so c0 is picked first. The
     // second pick must avoid c1 (cos≈1.0 with c0) and prefer c2 (cos=0).
@@ -112,7 +113,7 @@ fn test_lambda_0_maximizes_diversity() {
     let c0_id = c0.memory_id;
     let c2_id = c2.memory_id;
 
-    let out = rerank_mmr(vec![c0, c1, c2], &query, 0.0, 3);
+    let out = rerank_mmr(vec![c0, c1, c2], 0.0, 3);
 
     assert_eq!(out.len(), 3);
     assert_eq!(out[0].memory_id, c0_id, "λ=0.0 first pick = first item");
@@ -149,7 +150,6 @@ fn test_lambda_0_maximizes_diversity() {
 ///   cos(c2, c0) = (0.49 + 0 + 0 + 0) / (0.99 · 0.99) ≈ 0.5
 #[test]
 fn test_lambda_05_balanced() {
-    let query = vec![1.0_f32, 0.0, 0.0, 0.0];
     let c0 = unit4(0.7, 0.0, 0.7, 0.0, 0.7071);
     let c1 = unit4(0.7, 0.0, 0.7, 0.0, 0.7071); // exact duplicate of c0
     let c2 = unit4(0.7, 0.7, 0.0, 0.0, 0.7071); // shares dim 0 with c0, diverges on dim 1
@@ -158,7 +158,7 @@ fn test_lambda_05_balanced() {
     let c1_id = c1.memory_id;
     let c2_id = c2.memory_id;
 
-    let out = rerank_mmr(vec![c0, c1, c2], &query, 0.5, 3);
+    let out = rerank_mmr(vec![c0, c1, c2], 0.5, 3);
 
     assert_eq!(out.len(), 3);
     assert_eq!(
@@ -184,12 +184,11 @@ fn test_lambda_05_balanced() {
 /// `k > input.len()` — return all items reordered (no padding).
 #[test]
 fn test_k_larger_than_input() {
-    let query = vec![1.0_f32, 0.0, 0.0, 0.0];
     let c0 = unit4(1.0, 0.0, 0.0, 0.0, 1.0);
     let c1 = unit4(0.0, 1.0, 0.0, 0.0, 0.5);
     let c2 = unit4(0.0, 0.0, 1.0, 0.0, 0.2);
 
-    let out = rerank_mmr(vec![c0, c1, c2], &query, 0.5, 10);
+    let out = rerank_mmr(vec![c0, c1, c2], 0.5, 10);
 
     assert_eq!(
         out.len(),
@@ -201,11 +200,10 @@ fn test_k_larger_than_input() {
 /// k=0 → empty output.
 #[test]
 fn test_k_zero_returns_empty() {
-    let query = vec![1.0_f32, 0.0, 0.0, 0.0];
     let c0 = unit4(1.0, 0.0, 0.0, 0.0, 1.0);
     let c1 = unit4(0.0, 1.0, 0.0, 0.0, 0.5);
 
-    let out = rerank_mmr(vec![c0, c1], &query, 0.5, 0);
+    let out = rerank_mmr(vec![c0, c1], 0.5, 0);
 
     assert!(out.is_empty(), "k=0 must return empty output");
 }
@@ -213,9 +211,7 @@ fn test_k_zero_returns_empty() {
 /// Empty input → empty output, no panic.
 #[test]
 fn test_empty_input_no_panic() {
-    let query = vec![1.0_f32, 0.0, 0.0, 0.0];
-
-    let out = rerank_mmr(Vec::new(), &query, 0.5, 5);
+    let out = rerank_mmr(Vec::new(), 0.5, 5);
 
     assert!(out.is_empty(), "Empty input must yield empty output");
 }
@@ -227,7 +223,7 @@ fn test_empty_input_no_panic() {
 /// never propagate NaN from such candidates.
 #[test]
 fn test_unnormalized_vectors() {
-    let query = vec![10.0_f32, 0.0, 0.0, 0.0];
+    let query = [10.0_f32, 0.0, 0.0, 0.0];
     // Same directions as the basic test, but with arbitrary magnitudes.
     let c0 = make_candidate(vec![100.0, 0.0, 0.0, 0.0], 1.0);
     let c1 = make_candidate(vec![0.001, 0.001, 0.0, 0.0], 0.5);
@@ -237,7 +233,7 @@ fn test_unnormalized_vectors() {
     // weren't handled (0 / 0). Sized 768 to mirror real embedder output.
     let c4 = make_candidate(vec![0.0; 768], 0.4);
 
-    let out = rerank_mmr(vec![c0, c1, c2, c3, c4], &query, 0.5, 5);
+    let out = rerank_mmr(vec![c0, c1, c2, c3, c4], 0.5, 5);
 
     assert_eq!(out.len(), 5);
     for cand in &out {
