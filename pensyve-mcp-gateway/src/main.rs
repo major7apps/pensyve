@@ -280,8 +280,19 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         };
 
     let app_state = Arc::new(AppState {
+        // Phase 23/C: AuthValidator wired with the auth circuit breaker so
+        // validate_remote() trips on repeated upstream failures and falls back
+        // to remote_cache.
         auth: auth::AuthValidator::new(&config).with_circuit_breaker(auth_cb.clone()),
-        rate_limiter: rate_limit::RateLimiter::new(config.rate_limit_per_minute),
+        // Phase 23/B: rate limiter is now Redis-backed (when REDIS_URL is set)
+        // with plan-aware daily quotas. Falls back to an in-memory sliding
+        // window when Redis is unavailable. The legacy `rate_limit_per_minute`
+        // config is intentionally no longer wired through here — limits are
+        // sourced from the caller's plan tier.
+        rate_limiter: rate_limit::RateLimiter::new(redis.clone()),
+        // Phase 23/C: UsageReporter wired with the stripe circuit breaker so
+        // failed Stripe meter events buffer (bounded VecDeque) and drain on
+        // half-open success.
         usage_reporter: UsageReporter::new_with_circuit_breaker(
             config.stripe_api_key.clone(),
             stripe_cb.clone(),
@@ -370,17 +381,9 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         .layer(TracingLayer::new())
         .with_state(app_state.clone());
 
-    // Periodic eviction of stale rate-limit entries.
-    tokio::spawn({
-        let state = app_state.clone();
-        async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-            loop {
-                interval.tick().await;
-                state.rate_limiter.evict_stale();
-            }
-        }
-    });
+    // Phase 23 Track B: the periodic `evict_stale()` task is gone — Redis
+    // TTLs handle window expiry on the primary path, and the in-memory
+    // fallback prunes entries on read inside `RateLimiter::check_fallback`.
 
     // Background consolidation — runs every PENSYVE_CONSOLIDATION_INTERVAL_SECS (default 6h).
     tokio::spawn({
