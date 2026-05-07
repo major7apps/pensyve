@@ -469,6 +469,43 @@ impl<'a> RecallEngine<'a> {
         ))
     }
 
+    /// G4 P2: variant of [`recall_grouped`](Self::recall_grouped) that
+    /// resolves the candidate-pool `limit` from a per-question-type
+    /// k-budget instead of the caller-supplied `config.limit`.
+    ///
+    /// `router.k_for_type(question_type)` is **authoritative**: any
+    /// `config.limit` value is ignored and overridden. This mirrors the
+    /// G3 `MultiSessionCard::with_g3_mode` + `g3_mode` cache pattern —
+    /// the router is the single source of truth for retrieval-side
+    /// composition decisions; the caller is not expected to also
+    /// hand-tune `limit` for the same `question_type`.
+    ///
+    /// Defaults from G4 pre-reg `pensyve-docs@8930c4a`:
+    /// `SS-Pref=22`, `MS=50`, `SSU=12`. Unknown / future
+    /// `question_type` strings fall back to the SS-Pref bucket (22),
+    /// which matches the v2.0 baseline `k`.
+    ///
+    /// Public surface of [`recall_grouped`](Self::recall_grouped) is
+    /// unchanged — this is a strictly additive method.
+    pub fn recall_grouped_with_router(
+        &self,
+        router: &crate::retrieval::intent_router::IntentRouter,
+        query: &str,
+        namespace_id: Uuid,
+        question_type: &str,
+        config: &crate::recall_grouped::RecallGroupedConfig,
+    ) -> Result<Vec<crate::recall_grouped::SessionGroup>, RecallError> {
+        // Router-resolved k-budget overrides any caller-supplied
+        // `config.limit`. Clone the config so we don't mutate the
+        // caller's struct in place — RecallGroupedConfig is small
+        // (a few words + an Option<Vec<String>>) and not on the hot
+        // critical path; the clone cost is dominated by the recall
+        // pipeline itself.
+        let mut overridden = config.clone();
+        overridden.limit = router.k_for_type(question_type);
+        self.recall_grouped(query, namespace_id, &overridden)
+    }
+
     /// Like `recall`, but allows specifying a `target_entity` for graph BFS.
     #[allow(clippy::too_many_lines)]
     #[tracing::instrument(skip_all, fields(query, namespace_id = %namespace_id, limit))]
@@ -1573,5 +1610,112 @@ mod tests {
                 cand.final_score
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // G4 P2: recall_grouped_with_router — k-budget override
+    // -----------------------------------------------------------------------
+
+    /// G4 P2: `recall_grouped_with_router` must override
+    /// `config.limit` with the router's per-question-type k-budget,
+    /// regardless of what the caller passed in `config.limit`.
+    ///
+    /// Verification strategy: seed N>budget memories, call the router
+    /// path with a question_type whose budget is < N, and assert the
+    /// candidate pool size equals the router's k. The caller's
+    /// `config.limit` is set deliberately HIGH (well above N) so a
+    /// bug that forwards `config.limit` through unchanged would
+    /// surface as the full N being returned.
+    #[test]
+    fn recall_grouped_with_router_overrides_caller_limit() {
+        use crate::recall_grouped::{OrderBy, RecallGroupedConfig};
+        use crate::retrieval::intent_router::{IntentRouter, KBudget};
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteBackend::open(dir.path()).unwrap();
+        let embedder = OnnxEmbedder::new_mock(64);
+        let mut vector_index = VectorIndex::new(64, 16);
+        let config = test_config();
+
+        let ns = Namespace::new("g4-k-budget-ns");
+        storage.save_namespace(&ns).unwrap();
+
+        // Seed 7 distinct memories — more than the SSU budget (3) but
+        // less than the SS-Pref budget (5) we'll dial in below. Each
+        // memory is in its own episode so it produces a distinct
+        // SessionGroup.
+        let n_seed = 7usize;
+        for i in 0..n_seed {
+            let content = format!("topic-{i} content for k-budget test");
+            let mem = setup_episodic(&storage, &embedder, &ns, &content);
+            vector_index.add(mem.id, &mem.embedding).unwrap();
+        }
+
+        let engine = RecallEngine::new(&storage, &embedder, &vector_index, &config);
+
+        // Hand-tuned budget: SSU=3 forces a small cap; SS-Pref=5 is
+        // the unknown-fallback bucket. Distinct values across buckets
+        // ensure we can attribute the cap to the right one.
+        let router = IntentRouter::with_budget(KBudget {
+            ss_pref: 5,
+            ms: 50,
+            ssu: 3,
+        });
+
+        // Caller passes a *very* high `config.limit` to expose any
+        // bug that lets the caller's value win over the router.
+        let cfg = RecallGroupedConfig {
+            limit: 999,
+            order: OrderBy::Relevance,
+            max_groups: None,
+            types: None,
+        };
+
+        let groups_ssu = engine
+            .recall_grouped_with_router(
+                &router,
+                "topic content",
+                ns.id,
+                "single-session-user",
+                &cfg,
+            )
+            .unwrap();
+        assert!(
+            groups_ssu.len() <= 3,
+            "SSU bucket caps at 3; got {} groups",
+            groups_ssu.len()
+        );
+
+        let groups_ms = engine
+            .recall_grouped_with_router(&router, "topic content", ns.id, "multi-session", &cfg)
+            .unwrap();
+        // MS budget (50) is above n_seed (7) so all distinct memories
+        // surface. The point is that the caller's 999 is NOT what
+        // dictates the candidate pool — the router does.
+        assert!(
+            groups_ms.len() <= 50,
+            "MS bucket caps at 50; got {} groups",
+            groups_ms.len()
+        );
+        assert!(
+            groups_ms.len() >= groups_ssu.len(),
+            "MS budget (50) must surface at least as many groups as SSU budget (3)",
+        );
+
+        // Unknown question_type → SS-Pref bucket = 5.
+        let groups_unknown = engine
+            .recall_grouped_with_router(
+                &router,
+                "topic content",
+                ns.id,
+                "future-unspecified-type",
+                &cfg,
+            )
+            .unwrap();
+        assert!(
+            groups_unknown.len() <= 5,
+            "unknown type falls back to SS-Pref bucket (5); got {} groups",
+            groups_unknown.len()
+        );
     }
 }

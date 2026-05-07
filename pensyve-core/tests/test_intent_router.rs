@@ -21,7 +21,10 @@ use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
 use pensyve_core::retrieval::cards::{MultiSessionCard, RetrievalCard};
-use pensyve_core::retrieval::intent_router::{RouterDecision, route};
+use pensyve_core::retrieval::intent_router::{
+    IntentRouter, KBudget, K_BUDGET_MS_DEFAULT, K_BUDGET_MS_ENV, K_BUDGET_SSU_DEFAULT,
+    K_BUDGET_SSU_ENV, K_BUDGET_SS_PREF_DEFAULT, K_BUDGET_SS_PREF_ENV, RouterDecision, route,
+};
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 
@@ -372,6 +375,177 @@ fn g3_router_mode_raises_cross_session_threshold_to_three() {
         "Carol (2 sessions) must NOT surface under G3 ≥3 threshold; got:\n{out}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// G4 P2: KBudget::from_env env-var fuzz
+//
+// These tests mutate `PENSYVE_K_BUDGET_*` env vars and so must serialize
+// against the same process-wide lock as the G3 router-env tests.
+// ---------------------------------------------------------------------------
+
+/// RAII guard that holds the process-wide env lock AND mutates the three
+/// `PENSYVE_K_BUDGET_*` variables for the lifetime of the guard. Previous
+/// values are captured at construction and restored on drop. Mirrors
+/// [`RouterEnvGuard`].
+struct KBudgetEnvGuard {
+    _serial: std::sync::MutexGuard<'static, ()>,
+    previous: [(&'static str, Option<String>); 3],
+}
+
+#[allow(
+    unsafe_code,
+    reason = "test-only env-var guard; std::env::set_var/remove_var require unsafe in modern Rust because env mutation is process-global. The struct holds the process-wide router_env_lock for its lifetime so concurrent test threads cannot race."
+)]
+impl KBudgetEnvGuard {
+    /// Acquire the lock and apply the given (key, Option<value>) trio.
+    /// `Some(v)` sets the key; `None` removes it.
+    fn apply(values: [(&'static str, Option<&str>); 3]) -> Self {
+        let serial = router_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous: [(&'static str, Option<String>); 3] = [
+            (values[0].0, std::env::var(values[0].0).ok()),
+            (values[1].0, std::env::var(values[1].0).ok()),
+            (values[2].0, std::env::var(values[2].0).ok()),
+        ];
+        // SAFETY: serialized via the mutex held in `serial`.
+        unsafe {
+            for (key, value) in values {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        Self {
+            _serial: serial,
+            previous,
+        }
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "test-only env-var guard; see KBudgetEnvGuard::apply for justification"
+)]
+impl Drop for KBudgetEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: drop runs while we still hold the serialization lock.
+        unsafe {
+            for (key, prev) in &self.previous {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
+/// All three env vars unset → `KBudget::from_env` returns the locked
+/// G4 defaults (`SS-Pref=22, MS=50, SSU=12`).
+#[test]
+fn k_budget_from_env_falls_back_to_defaults_when_unset() {
+    let _env = KBudgetEnvGuard::apply([
+        (K_BUDGET_SS_PREF_ENV, None),
+        (K_BUDGET_MS_ENV, None),
+        (K_BUDGET_SSU_ENV, None),
+    ]);
+    let kb = KBudget::from_env();
+    assert_eq!(kb.ss_pref, K_BUDGET_SS_PREF_DEFAULT);
+    assert_eq!(kb.ms, K_BUDGET_MS_DEFAULT);
+    assert_eq!(kb.ssu, K_BUDGET_SSU_DEFAULT);
+}
+
+/// Each env var, when set to a parseable positive integer, overrides
+/// only its own bucket — the other two stay on their locked defaults.
+#[test]
+fn k_budget_from_env_reads_each_variable_independently() {
+    {
+        let _env = KBudgetEnvGuard::apply([
+            (K_BUDGET_SS_PREF_ENV, Some("17")),
+            (K_BUDGET_MS_ENV, None),
+            (K_BUDGET_SSU_ENV, None),
+        ]);
+        let kb = KBudget::from_env();
+        assert_eq!(kb.ss_pref, 17);
+        assert_eq!(kb.ms, K_BUDGET_MS_DEFAULT);
+        assert_eq!(kb.ssu, K_BUDGET_SSU_DEFAULT);
+    }
+    {
+        let _env = KBudgetEnvGuard::apply([
+            (K_BUDGET_SS_PREF_ENV, None),
+            (K_BUDGET_MS_ENV, Some("64")),
+            (K_BUDGET_SSU_ENV, None),
+        ]);
+        let kb = KBudget::from_env();
+        assert_eq!(kb.ss_pref, K_BUDGET_SS_PREF_DEFAULT);
+        assert_eq!(kb.ms, 64);
+        assert_eq!(kb.ssu, K_BUDGET_SSU_DEFAULT);
+    }
+    {
+        let _env = KBudgetEnvGuard::apply([
+            (K_BUDGET_SS_PREF_ENV, None),
+            (K_BUDGET_MS_ENV, None),
+            (K_BUDGET_SSU_ENV, Some("9")),
+        ]);
+        let kb = KBudget::from_env();
+        assert_eq!(kb.ss_pref, K_BUDGET_SS_PREF_DEFAULT);
+        assert_eq!(kb.ms, K_BUDGET_MS_DEFAULT);
+        assert_eq!(kb.ssu, 9);
+    }
+}
+
+/// Unparseable values, negative values (which fail `usize` parse), and
+/// explicit `0` all fall back to the locked defaults. `0` is treated
+/// as unset because a zero k-budget would short-circuit recall —
+/// anyone wanting to suppress recall should use a dedicated kill
+/// switch, not `K_BUDGET_*=0`.
+#[test]
+fn k_budget_from_env_rejects_garbage_and_zero() {
+    let _env = KBudgetEnvGuard::apply([
+        (K_BUDGET_SS_PREF_ENV, Some("not-a-number")),
+        (K_BUDGET_MS_ENV, Some("0")),
+        (K_BUDGET_SSU_ENV, Some("-5")),
+    ]);
+    let kb = KBudget::from_env();
+    assert_eq!(kb.ss_pref, K_BUDGET_SS_PREF_DEFAULT);
+    assert_eq!(kb.ms, K_BUDGET_MS_DEFAULT);
+    assert_eq!(kb.ssu, K_BUDGET_SSU_DEFAULT);
+}
+
+/// `IntentRouter::from_env` threads the env-resolved budget through to
+/// `k_for_type`. Sanity check: setting only the MS bucket via env
+/// changes the `multi-session` k but leaves SS-Pref/SSU on defaults.
+#[test]
+fn intent_router_from_env_threads_budget_into_k_for_type() {
+    let _env = KBudgetEnvGuard::apply([
+        (K_BUDGET_SS_PREF_ENV, None),
+        (K_BUDGET_MS_ENV, Some("123")),
+        (K_BUDGET_SSU_ENV, None),
+    ]);
+    let router = IntentRouter::from_env();
+    assert_eq!(router.k_for_type("multi-session"), 123);
+    assert_eq!(router.k_for_type("temporal-reasoning"), 123);
+    assert_eq!(router.k_for_type("knowledge-update"), 123);
+    assert_eq!(
+        router.k_for_type("single-session-preference"),
+        K_BUDGET_SS_PREF_DEFAULT
+    );
+    assert_eq!(
+        router.k_for_type("single-session-user"),
+        K_BUDGET_SSU_DEFAULT
+    );
+    // Unknown type falls back to SS-Pref bucket (default 22).
+    assert_eq!(
+        router.k_for_type("future-unspecified"),
+        K_BUDGET_SS_PREF_DEFAULT
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (back to G3 router-mode tests)
+// ---------------------------------------------------------------------------
 
 /// **`full` mode behaves like `router` mode for MS card.** Per spec,
 /// both `router` and `full` enable the MS-card-side gates; the router
