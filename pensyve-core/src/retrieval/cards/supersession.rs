@@ -112,6 +112,40 @@ impl SupersessionCard {
     pub fn with_cap(max_entries: usize) -> Self {
         Self { max_entries }
     }
+
+    /// Build a chain-only string (G4 Approach A output-merge): the
+    /// dedupe + cap + bullet-render passes run as in [`build_from_conn`]
+    /// but the [`SUPERSESSION_CARD_HEADER`] / [`SUPERSESSION_CARD_FOOTER`]
+    /// scaffolding is **omitted**. Returns the bullet block (one
+    /// `- <summary>` line per chain) or `None` when no chain summaries
+    /// surface.
+    ///
+    /// Intended consumer: [`crate::retrieval::cards::MultiSessionCard`]
+    /// when constructed via `with_supersession_chain()`. The MS-card
+    /// wraps the returned bullet block in its own
+    /// `--- SUPERSESSION CHAIN (MS) ---` markers
+    /// (see `MS_CARD_SUPERSESSION_HEADER`) so the composite-level bullet
+    /// clipper still recognizes the merged surface as bullet-shaped and
+    /// the standalone `SupersessionCard` block remains
+    /// byte-for-byte unchanged for callers that consume it directly.
+    ///
+    /// Connection-borrow form (no `db_path` / `OpenFlags` ceremony) so
+    /// the caller can reuse a connection it already opened — saves an
+    /// extra read-only `SQLite` open on the recall hot path when both
+    /// cards run in the same composite.
+    #[must_use]
+    pub fn build_chain_only(
+        &self,
+        conn: &Connection,
+        namespace_id: Uuid,
+        agent_id: Option<&AgentId>,
+        user_id: Option<&UserId>,
+    ) -> Option<String> {
+        if self.max_entries == 0 {
+            return None;
+        }
+        build_chain_only_from_conn(conn, namespace_id, agent_id, user_id, self.max_entries)
+    }
 }
 
 impl Default for SupersessionCard {
@@ -202,6 +236,31 @@ pub(crate) fn build_from_conn(
     user_id: Option<&UserId>,
     max_entries: usize,
 ) -> Option<String> {
+    let bullets = build_chain_only_from_conn(conn, namespace_id, agent_id, user_id, max_entries)?;
+    Some(format!(
+        "{SUPERSESSION_CARD_HEADER}\n{bullets}\n{SUPERSESSION_CARD_FOOTER}"
+    ))
+}
+
+/// Internal: query, dedupe, cap, and bullet-render the chain summaries
+/// **without** the surrounding card scaffolding. Powers both
+/// [`build_from_conn`] (which adds the
+/// [`SUPERSESSION_CARD_HEADER`]/[`SUPERSESSION_CARD_FOOTER`]) and
+/// [`SupersessionCard::build_chain_only`] (which leaves the wrapping
+/// to the caller — typically [`crate::retrieval::cards::MultiSessionCard`]
+/// for the G4 Approach A output-merge).
+///
+/// Returns `None` when (a) `max_entries` is zero, (b) the SQL prepare
+/// fails (legacy v=1 store before the v=2 migration ran — `chain_summary`
+/// column does not exist), or (c) no rows have non-NULL non-empty
+/// `chain_summary`.
+fn build_chain_only_from_conn(
+    conn: &Connection,
+    namespace_id: Uuid,
+    agent_id: Option<&AgentId>,
+    user_id: Option<&UserId>,
+    max_entries: usize,
+) -> Option<String> {
     if max_entries == 0 {
         return None;
     }
@@ -277,10 +336,7 @@ pub(crate) fn build_from_conn(
         .map(|e| format!("- {e}"))
         .collect::<Vec<_>>()
         .join("\n");
-
-    Some(format!(
-        "{SUPERSESSION_CARD_HEADER}\n{bullets}\n{SUPERSESSION_CARD_FOOTER}"
-    ))
+    Some(bullets)
 }
 
 /// Build the WHERE-clause fragment and bind values for the
