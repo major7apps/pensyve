@@ -5,6 +5,21 @@ All notable changes to Pensyve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.1] - Unreleased
+
+G4 follow-up that closes one of two integration gaps surfaced by the 2026-05-08 G4 ablation wave (`pensyve-docs/research/benchmark-sprint/v3/g4/results.md` §6 H1 caveat). The wave's harness silently fell back to G3 cards on every G4-mechanism arm because the IntentRouter wire-up was not in place; the wave's H1-H5 evidence is invalidated until this and the companion `build_retrieval_card_g4` binding (separate PR) both land. Detailed phased plan: `pensyve-docs/plans/2026-05-09-pensyve-g4-followups.md`.
+
+### Added
+
+- **`Pensyve.recall_grouped(query, *, ..., question_type=None)`** — new optional `question_type` kwarg threads `PensyveInner.intent_router` through `RecallEngine::recall_grouped_with_router(..., &intent_router)` so per-question-type `k_budget` (constructor kwarg / `PENSYVE_K_BUDGET_*` env / locked defaults `{ss_pref:22, ms:50, ssu:12}`) governs the candidate pool. When `None` (default), behavior is unchanged from v2.4.0 — backward-compat for SDK consumers who don't opt in. Resolves issue #92.
+
+### Notes
+
+- **Cross-SDK parity for `question_type`** (TS/Go/WASM `recall_grouped` surfaces) is **deferred to v2.5.x** or a follow-up issue. The Python binding is the path the G4 ablation harness exercises; SDK consumers on other languages continue to use the un-routed `recall_grouped` until the parity work lands.
+- **Defaults unchanged.** G3 + G4 retrieval surface remain default-OFF behind env gates. Flipping any default is gated on the G4 ablation wave's *re-run* (with both fixes in place) per the plan referenced above. The wave-validated finding "G3 surface flip on top of reranker is a NET-NEGATIVE regression" (−17Q on MS) stands and informs the v2.5.x defaults discussion.
+- **`pensyve-python` wheel: aarch64-linux only**, same as v2.4.0.
+- **MSRV unchanged** at 1.88.
+
 ## [2.4.0] - 2026-05-07
 
 Bundles G2 + G3 + G4 retrieval-side mechanism + Phase 23 production hardening accumulated since the v2.2.0 milestone tag. The 2.2.0 → 2.4.0 jump (skipping 2.3.0) reflects the magnitude of the surface change. **The G3 and G4 retrieval mechanisms ship default-OFF behind env gates**; flipping them on is gated by the locked G4 ablation pre-registration (`pensyve-docs/research/benchmark-sprint/v3/g4/preregistration.md @ 8930c4a`) §3.6 / §4.3 decision tree, evaluated against the wave whose results land in `pensyve-docs/research/benchmark-sprint/v3/g4/results.md`.

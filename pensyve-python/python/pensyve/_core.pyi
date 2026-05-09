@@ -168,6 +168,7 @@ class Pensyve:
         order: Literal["chronological", "relevance"] = "chronological",
         max_groups: int | None = None,
         types: list[str] | None = None,
+        question_type: str | None = None,
     ) -> list[SessionGroup]:
         """Recall memories matching a query, clustered by source session.
 
@@ -181,13 +182,26 @@ class Pensyve:
         Args:
             query: Search query string.
             limit: Maximum number of memories to consider across all groups
-                (default: 50).
+                (default: 50). When ``question_type`` is provided, this
+                value is **overridden** by the resolved per-question-type
+                k-budget from the IntentRouter — the router is the
+                authoritative source for retrieval-side k decisions.
             order: "chronological" (default, oldest session first) or
                 "relevance" (highest-scoring session first).
             max_groups: Optional cap on the number of groups returned.
             types: Optional list of memory type strings to filter the
                 candidate pool *before* grouping. Mirrors the equivalent
                 kwarg on :meth:`recall`. Default ``None`` (no filter).
+            question_type: Optional ``LongMemEval``-style question-type
+                string (e.g. ``"single-session-preference"``,
+                ``"multi-session"``, ``"single-session-user"``). When
+                provided, recall routes through the cached IntentRouter
+                (resolved at construction from the ``k_budget`` kwarg /
+                ``PENSYVE_K_BUDGET_*`` env / locked defaults), and the
+                router's per-type k-budget overrides ``limit``. When
+                ``None`` (default), behavior is unchanged from prior
+                versions — backward-compat for v2.4.x SDK consumers.
+                Resolves issue #92 (G4 follow-up from PR #88).
 
         Raises:
             ValueError: If ``order`` is not one of the supported values.
