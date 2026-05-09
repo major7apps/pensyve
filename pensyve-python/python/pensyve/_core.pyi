@@ -244,6 +244,55 @@ class Pensyve:
         """
         ...
 
+    def build_retrieval_card_g4(
+        self,
+        db_path: str,
+        question_type: str,
+        g2_cards: list[str],
+        g3_features: list[str],
+        g4_features: list[str],
+    ) -> str | None:
+        """G4 retrieval-card composition (binding pre-reg
+        ``pensyve-docs@64481dc`` §3.4 item 11 + §7 item 11; G4 cycle
+        spec §4.1).
+
+        Superset of :meth:`build_retrieval_card_g3` that adds G4 layering
+        knobs via ``g4_features``. With ``g4_features=[]`` the output is
+        byte-for-byte equivalent to ``build_retrieval_card_g3`` for the
+        same first four arguments.
+
+        Args:
+            db_path: Path to a Pensyve SQLite store. Same normalization
+                rules as :meth:`build_retrieval_card_g3`.
+            question_type: LongMemEval question_type string. Threaded
+                into each card's ``build()`` call (e.g. ``"multi-session"``).
+            g2_cards: G2 base composition; subset of
+                ``["peer", "ms", "ssu"]``. Order does not matter.
+            g3_features: G3 layering knobs; subset of
+                ``["router", "summarizer", "typed_slots", "diversity"]``.
+                See :meth:`build_retrieval_card_g3` for full semantics.
+            g4_features: G4 layering knobs; subset of
+                ``["k_budget", "ms_card_v2"]``.
+
+                * ``"k_budget"`` — applies the per-question-type k-budget
+                  caps already configured on the handle (no-op at this
+                  binding layer; threaded through for symmetry with
+                  ``g3_features``).
+                * ``"ms_card_v2"`` — selects ``MultiSessionCard::v2()``
+                  in place of ``MultiSessionCard::new()``. When BOTH
+                  ``"ms"`` is in ``g2_cards`` AND ``"summarizer"`` is in
+                  ``g3_features``, the supersession chain is absorbed
+                  into the MS card body (rendered with the
+                  ``--- SUPERSESSION CHAIN (MS) ---`` marker) and the
+                  standalone ``SupersessionCard`` slot is suppressed.
+                  Otherwise the standalone slot is preserved unchanged.
+
+        Returns:
+            The synthesized card text, or ``None`` when every selected
+            card defers (e.g. empty store or no namespace match).
+        """
+        ...
+
     def recall_with_diversity(
         self,
         query: str,

@@ -135,12 +135,20 @@ def _store_db_path(store_dir: str) -> Path:
 
 
 def test_integration_ms_card_v2_returns_string_with_cross_session_marker():
-    """Populated store → ms_card_v2 returns a card containing the
-    ``--- CROSS-SESSION ENTITIES ---`` marker (MS card surface).
+    """Populated store → ms_card_v2 returns a card containing both the
+    ``--- CROSS-SESSION ENTITIES ---`` marker (MS card body surface) and
+    the v2-only ``--- SUPERSESSION CHAIN (MS) ---`` marker (chain
+    absorbed inside the MS card via Approach A).
 
     This is the load-bearing assertion: the G4 binding plumbs the v2
     builder chain end-to-end so the MS card runs against the populated
-    store and emits its standard cross-session block.
+    store, emits its standard cross-session block, AND the
+    ``with_supersession_chain(...)`` builder call is wired through so
+    the chain block appears under the v2-only header. The v2-only
+    header check guards against accidental removal of the chain
+    attachment (the generic ``CROSS-SESSION ENTITIES`` marker passes
+    even from a plain v1 MS card, which is why we also assert the
+    ``(MS)`` header here — addresses CodeRabbit nitpick on PR #97).
     """
     with tempfile.TemporaryDirectory(prefix="pensyve_g4_int_") as tmp:
         p = pensyve.Pensyve(
@@ -168,6 +176,15 @@ def test_integration_ms_card_v2_returns_string_with_cross_session_marker():
         # delegates to the underlying MS card body.
         assert "CROSS-SESSION ENTITIES" in result, (
             f"expected CROSS-SESSION ENTITIES marker in v2 card output; got:\n{result}"
+        )
+        # v2-only marker. ``MS_CARD_SUPERSESSION_HEADER`` is
+        # ``--- SUPERSESSION CHAIN (MS) ---`` (distinct from the
+        # standalone ``--- SUPERSESSION CHAIN ---``). Locks in the
+        # ``with_supersession_chain(...)`` wiring on the v2 builder —
+        # this assertion fails if that call is accidentally removed.
+        assert "--- SUPERSESSION CHAIN (MS) ---" in result, (
+            "expected v2-only SUPERSESSION CHAIN (MS) header in v2 card "
+            f"output; got:\n{result}"
         )
 
 
@@ -217,6 +234,30 @@ def test_integration_ms_card_v2_drops_standalone_supersession_slot():
         # Both paths emit the MS surface block (cross-session entities).
         assert "CROSS-SESSION ENTITIES" in with_v2
         assert "CROSS-SESSION ENTITIES" in without_v2
+        # The shape contract: v2 absorbs the chain into the MS card body
+        # (rendered under ``--- SUPERSESSION CHAIN (MS) ---``) and the
+        # standalone ``SupersessionCard`` slot is suppressed. Without v2,
+        # the standalone slot is preserved so the standalone header
+        # ``--- SUPERSESSION CHAIN ---`` (no ``(MS)`` qualifier) appears.
+        # These are distinct string headers (``MS_CARD_SUPERSESSION_HEADER``
+        # vs ``SUPERSESSION_CARD_HEADER``) so substring checks unambiguously
+        # discriminate the two paths — addresses CodeRabbit nitpick on
+        # PR #97 by guarding the actual composite-shape change.
+        assert "--- SUPERSESSION CHAIN ---" not in with_v2, (
+            "v2 path must NOT emit the standalone SupersessionCard header; "
+            f"got:\n{with_v2}"
+        )
+        assert "--- SUPERSESSION CHAIN (MS) ---" in with_v2, (
+            f"v2 path must emit the (MS) chain header; got:\n{with_v2}"
+        )
+        assert "--- SUPERSESSION CHAIN ---" in without_v2, (
+            "non-v2 path must keep the standalone SupersessionCard slot; "
+            f"got:\n{without_v2}"
+        )
+        assert "--- SUPERSESSION CHAIN (MS) ---" not in without_v2, (
+            "non-v2 path must NOT emit the v2-only (MS) chain header; "
+            f"got:\n{without_v2}"
+        )
 
 
 def test_integration_g4_empty_features_byte_for_byte_with_g3():
