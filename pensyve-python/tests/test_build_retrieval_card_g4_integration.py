@@ -104,13 +104,19 @@ def _seed_observations_with_chain_summary(
                     chain_marker_row_id,
                 ),
             )
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as exc:
             # `chain_summary` column not present in this schema version;
             # the integration test will fall back to the marker-absent
             # assertion path. The G4 v2 builder still emits the marker
             # block when the chain reader returns any rows, even with
             # NULL summaries, so the test below remains meaningful.
-            pass
+            #
+            # Narrow the catch to the expected schema-compat case so a
+            # real SQL/table bug in the fixture surfaces instead of being
+            # silently swallowed. (Addresses CodeRabbit Major + Claude bot
+            # nit on PR #97 line 113.)
+            if "no such column" not in str(exc).lower():
+                raise
         con.commit()
     return inserted
 
