@@ -1049,13 +1049,28 @@ impl PyPensyve {
     /// Args:
     ///     query: Search query string.
     ///     limit: Maximum number of memories to consider across all groups
-    ///         (default: 50).
+    ///         (default: 50). When `question_type` is provided, this value
+    ///         is **overridden** by the resolved per-question-type k-budget
+    ///         from [`IntentRouter::k_for_type`] — the router is the
+    ///         authoritative source for retrieval-side k decisions.
     ///     order: "chronological" (default, oldest session first) or
     ///         "relevance" (highest group score first).
     ///     `max_groups`: Optional cap on the number of groups returned.
     ///     types: Optional list of memory type strings to filter by, e.g.
     ///         `["episodic"]`. Mirrors the equivalent kwarg on `recall`.
-    #[pyo3(signature = (query, *, limit=50, order="chronological", max_groups=None, types=None))]
+    ///     `question_type`: Optional `LongMemEval`-style question-type
+    ///         string (e.g. `"single-session-preference"`,
+    ///         `"multi-session"`, `"single-session-user"`). When
+    ///         provided, recall routes through
+    ///         [`RecallEngine::recall_grouped_with_router`] using
+    ///         [`PensyveInner::intent_router`] (resolved at construction
+    ///         from the `k_budget` kwarg / `PENSYVE_K_BUDGET_*` env vars
+    ///         / locked defaults). The router's `k_for_type(question_
+    ///         type)` overrides `limit`. When `None` (default), behavior
+    ///         is unchanged from prior versions — backward-compat for
+    ///         v2.4.x SDK consumers. Resolves issue #92 (G4 follow-up
+    ///         from PR #88).
+    #[pyo3(signature = (query, *, limit=50, order="chronological", max_groups=None, types=None, question_type=None))]
     fn recall_grouped(
         &self,
         query: &str,
@@ -1063,6 +1078,7 @@ impl PyPensyve {
         order: &str,
         max_groups: Option<usize>,
         types: Option<Vec<String>>,
+        question_type: Option<&str>,
     ) -> PyResult<Vec<PySessionGroup>> {
         if query.is_empty() {
             return Err(PyRuntimeError::new_err("query must not be empty"));
@@ -1105,9 +1121,28 @@ impl PyPensyve {
         // G1: scope-by-default — same as `recall`.
         engine = engine.with_scope(self.inner.agent_id, self.inner.user_id);
 
-        let groups = engine
-            .recall_grouped(query, self.inner.namespace.id, &config)
-            .map_err(|e| PyRuntimeError::new_err(format!("Recall failed: {e}")))?;
+        // Issue #92: when `question_type` is provided, route through the
+        // IntentRouter so the per-question-type k-budget governs the
+        // candidate pool. The router is cached on `PensyveInner` at
+        // construction (kwarg > env > default precedence per pre-reg
+        // `pensyve-docs@8930c4a`); this method is the public entry point
+        // that surfaces it to SDK callers.
+        //
+        // When `question_type` is None, preserve existing behavior:
+        // call the un-routed `recall_grouped` directly so v2.4.x callers
+        // who don't pass the new kwarg see no change.
+        let groups = if let Some(qt) = question_type {
+            engine.recall_grouped_with_router(
+                &self.inner.intent_router,
+                query,
+                self.inner.namespace.id,
+                qt,
+                &config,
+            )
+        } else {
+            engine.recall_grouped(query, self.inner.namespace.id, &config)
+        }
+        .map_err(|e| PyRuntimeError::new_err(format!("Recall failed: {e}")))?;
 
         Ok(groups
             .into_iter()
