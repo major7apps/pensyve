@@ -64,7 +64,7 @@ fn embedding_info() -> (String, usize) {
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     init_tracing();
-    m.add("__version__", "0.1.0")?;
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<PyPensyve>()?;
     m.add_class::<PyEntity>()?;
     m.add_class::<PyEpisode>()?;
@@ -1333,6 +1333,228 @@ impl PyPensyve {
         // cards ignore it (see `RetrievalCard` trait docs). Empty string is
         // explicitly allowed and matches the harness adapter's call
         // pattern.
+        let qt: Option<&str> = if question_type.is_empty() {
+            None
+        } else {
+            Some(question_type.as_str())
+        };
+        Ok(composite.build(
+            "",
+            &backend as &dyn StorageTrait,
+            ns_id,
+            self.inner.agent_id.map(pensyve_core::types::AgentId::from),
+            self.inner.user_id.map(pensyve_core::types::UserId::from),
+            qt,
+        ))
+    }
+
+    /// G4 retrieval-card composition (binding spec
+    /// `pensyve-docs/specs/2026-05-08-pensyve-build-retrieval-card-g4-binding.md`).
+    ///
+    /// Mirrors [`PyPensyve::build_retrieval_card_g3`] with one additional
+    /// parameter — `g4_features` — that selects the G4 mechanisms layered
+    /// on top of the G3 surface. When `g4_features = []` the method is
+    /// byte-for-byte equivalent to the G3 method with the same first
+    /// four arguments (used by ARM-1-G4-BASELINE / ARM-2-G3-DEFAULT-ON
+    /// in the G4 ablation harness).
+    ///
+    /// G4 vocabulary:
+    ///
+    /// * `"k_budget"` — pass-through signal for the harness adapter to
+    ///   confirm the binding is present. The k-budget itself flows
+    ///   through [`IntentRouter::k_for_type`] on the recall path
+    ///   (issue #92 wire-up); this binding validates the feature name
+    ///   but applies no card-composition change.
+    /// * `"ms_card_v2"` — replaces [`MultiSessionCard::new`] with
+    ///   [`MultiSessionCard::v2`], threading the resolved
+    ///   [`PensyveInner::ms_card_days`] through `with_ms_days(Some(_))`
+    ///   and attaching a [`SupersessionCard`] handle via
+    ///   [`MultiSessionCard::with_supersession_chain`] (G4 Approach A
+    ///   output-merge per pre-reg `pensyve-docs@8930c4a` §3.4 LOCKED).
+    ///   When `"ms_card_v2"` is active, the standalone
+    ///   [`SupersessionCard`] slot is dropped from the composite — the
+    ///   chain output is consumed internally by the MS card's merge,
+    ///   not as a separate slot.
+    ///
+    /// Args:
+    ///     `db_path`: Same as G3.
+    ///     `question_type`: Same as G3.
+    ///     `g2_cards`: Same as G3.
+    ///     `g3_features`: Same as G3. Note that when `"ms_card_v2"` ∈
+    ///         `g4_features`, the `"summarizer"` flag's behavior is
+    ///         altered: the supersession-chain output is rendered
+    ///         inside the MS card via
+    ///         [`MultiSessionCard::with_supersession_chain`] rather than
+    ///         as an independent [`SupersessionCard`] slot.
+    ///     `g4_features`: G4 mechanism selection. Subset of
+    ///         `["k_budget", "ms_card_v2"]`. Unrecognized values raise
+    ///         [`PyValueError`] before the store is opened.
+    ///
+    /// Returns:
+    ///     The synthesized card text, or `None` when every selected
+    ///     card defers (no namespace, empty store, etc.).
+    #[pyo3(signature = (db_path, question_type, g2_cards, g3_features, g4_features))]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+    fn build_retrieval_card_g4(
+        &self,
+        db_path: String,
+        question_type: String,
+        g2_cards: Vec<String>,
+        g3_features: Vec<String>,
+        g4_features: Vec<String>,
+    ) -> PyResult<Option<String>> {
+        // Validate g2_cards membership.
+        for card in &g2_cards {
+            match card.as_str() {
+                "peer" | "ms" | "ssu" => {}
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "g2_cards element {other:?} is not recognized; expected subset of \
+                         [\"peer\", \"ms\", \"ssu\"]"
+                    )));
+                }
+            }
+        }
+        // Validate g3_features membership.
+        for feat in &g3_features {
+            match feat.as_str() {
+                "router" | "summarizer" | "typed_slots" | "diversity" => {}
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "g3_features element {other:?} is not recognized; expected subset of \
+                         [\"router\", \"summarizer\", \"typed_slots\", \"diversity\"]"
+                    )));
+                }
+            }
+        }
+        // Validate g4_features membership.
+        for feat in &g4_features {
+            match feat.as_str() {
+                "k_budget" | "ms_card_v2" => {}
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "g4_features element {other:?} is not recognized; expected subset of \
+                         [\"k_budget\", \"ms_card_v2\"]"
+                    )));
+                }
+            }
+        }
+
+        // G4 binding spec §4.1 step 2: detect ms_card_v2 once.
+        let has_ms_card_v2 = g4_features.iter().any(|f| f == "ms_card_v2");
+
+        // Translate g3_features into the G3 layering mode value passed
+        // to `MultiSessionCard::with_g3_mode(...)`. Identical to the G3
+        // path — the G4 binding does not change this calculation; it
+        // only switches `MultiSessionCard::new()` to `::v2()` when
+        // `has_ms_card_v2` is set.
+        let has_router = g3_features.iter().any(|f| f == "router");
+        let has_summ = g3_features.iter().any(|f| f == "summarizer");
+        let has_typed = g3_features.iter().any(|f| f == "typed_slots");
+        let has_div = g3_features.iter().any(|f| f == "diversity");
+        let g3_mode_value: Option<&str> = if has_router && has_summ && has_typed && has_div {
+            Some("full")
+        } else if has_router {
+            Some("router")
+        } else {
+            None
+        };
+
+        // Normalize `db_path` (identical to G3).
+        let raw = PathBuf::from(&db_path);
+        let dir = if raw.is_file() || raw.extension().and_then(|s| s.to_str()) == Some("db") {
+            raw.parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or(raw)
+        } else {
+            raw
+        };
+
+        let backend = SqliteBackend::open(&dir).map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "Failed to open SQLite backend at {}: {e}",
+                dir.display()
+            ))
+        })?;
+
+        // Resolve the namespace (identical three-try chain to G3).
+        let ns_id_opt: Option<Uuid> = backend
+            .get_namespace_by_name("longmemeval")
+            .ok()
+            .flatten()
+            .map(|ns| ns.id)
+            .or_else(|| {
+                let handle_name = self.inner.namespace.name.clone();
+                backend
+                    .get_namespace_by_name(&handle_name)
+                    .ok()
+                    .flatten()
+                    .map(|ns| ns.id)
+            })
+            .or_else(|| backend.first_namespace_id().ok().flatten());
+
+        let Some(ns_id) = ns_id_opt else {
+            return Ok(None);
+        };
+
+        // Build the composite card chain.
+        //
+        // G4 binding spec §4.1 step 7: when `has_ms_card_v2` is set, the
+        // standalone `SupersessionCard` slot is dropped because the
+        // chain output is absorbed internally by the MS card's
+        // Approach A merge. When `has_ms_card_v2` is unset, behavior is
+        // byte-for-byte identical to `build_retrieval_card_g3`.
+        let want_peer = g2_cards.iter().any(|c| c == "peer");
+        let want_ms = g2_cards.iter().any(|c| c == "ms");
+        let want_ssu = g2_cards.iter().any(|c| c == "ssu");
+        let want_supersession_standalone = has_summ && !has_ms_card_v2;
+
+        let mut cards: Vec<(Box<dyn RetrievalCard>, usize)> = Vec::with_capacity(4);
+        if want_peer {
+            cards.push((Box::new(PeerCardAdapter::new()), G2_PEER_CARD_CAP));
+        }
+        if want_ms {
+            // G4 binding spec §4.1 step 8 — `has_ms_card_v2` branch:
+            // `MultiSessionCard::v2()` (sets `ms_days` from
+            // `resolve_ms_days`) + explicit `with_ms_days(Some(_))`
+            // override (matches G3's precedence: kwarg > env > default,
+            // which is what `self.inner.ms_card_days` already encodes)
+            // + `with_supersession_chain(SupersessionCard::new())`
+            // pulls in the Approach A output-merge.
+            //
+            // Else branch: byte-for-byte identical to G3
+            // (`MultiSessionCard::new()` with the same builder chain).
+            let ms_card: Box<dyn RetrievalCard> = if has_ms_card_v2 {
+                Box::new(
+                    MultiSessionCard::v2()
+                        .with_g3_mode(g3_mode_value)
+                        .with_ms_days(Some(self.inner.ms_card_days))
+                        .with_supersession_chain(SupersessionCard::new()),
+                )
+            } else {
+                Box::new(
+                    MultiSessionCard::new()
+                        .with_g3_mode(g3_mode_value)
+                        .with_ms_days(Some(self.inner.ms_card_days)),
+                )
+            };
+            cards.push((ms_card, G2_MULTI_SESSION_CARD_CAP));
+        }
+        if want_ssu {
+            cards.push((
+                Box::new(SingleSessionUserCard::new()),
+                G2_SINGLE_SESSION_USER_CARD_CAP,
+            ));
+        }
+        if want_supersession_standalone {
+            cards.push((Box::new(SupersessionCard::new()), G3_SUPERSESSION_CARD_CAP));
+        }
+
+        if cards.is_empty() {
+            return Ok(None);
+        }
+
+        let composite = CompositeCard::new(cards);
         let qt: Option<&str> = if question_type.is_empty() {
             None
         } else {

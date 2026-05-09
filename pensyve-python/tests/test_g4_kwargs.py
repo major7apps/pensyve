@@ -225,3 +225,153 @@ def test_ms_card_days_env_zero_falls_back_to_default(monkeypatch, store_path):
     monkeypatch.setenv("PENSYVE_MS_CARD_DAYS", "0")
     p = pensyve.Pensyve(path=store_path, reranker=None)
     assert p.ms_card_days == 2
+
+
+# ---------------------------------------------------------------------------
+# build_retrieval_card_g4 — binding spec
+# `pensyve-docs/specs/2026-05-08-pensyve-build-retrieval-card-g4-binding.md`
+# ---------------------------------------------------------------------------
+
+
+def test_build_retrieval_card_g4_has_method(store_path):
+    """Binding exists — no AttributeError. Companion to ARM-3/4/5 of the
+    G4 ablation harness, which checks ``hasattr(p, "build_retrieval_card_g4")``
+    before dispatching the G4 card path (cards.py:1027-1067).
+    """
+    p = pensyve.Pensyve(path=store_path, reranker=None)
+    assert hasattr(p, "build_retrieval_card_g4")
+
+
+def test_build_retrieval_card_g4_returns_none_on_empty_store(store_path):
+    """Empty store → every card defers → None returned (defer-on-failure).
+
+    Mirrors the G3 binding's empty-store contract
+    (test_build_retrieval_card_g3_returns_none_on_empty_store).
+    """
+    p = pensyve.Pensyve(path=store_path, reranker=None)
+    db = f"{store_path}/memories.db"
+    result = p.build_retrieval_card_g4(
+        db,
+        "multi-session",
+        ["peer", "ms", "ssu"],
+        ["router", "summarizer", "typed_slots", "diversity"],
+        ["k_budget", "ms_card_v2"],
+    )
+    assert result is None
+
+
+def test_build_retrieval_card_g4_invalid_g4_feature_raises(store_path):
+    """Unknown ``g4_features`` element → ValueError before opening the store.
+
+    Parity with G3's ``test_build_retrieval_card_g3_rejects_unknown_features``.
+    """
+    p = pensyve.Pensyve(path=store_path, reranker=None)
+    db = f"{store_path}/memories.db"
+    with pytest.raises(ValueError, match="g4_features"):
+        p.build_retrieval_card_g4(
+            db,
+            "multi-session",
+            ["ms"],
+            [],
+            ["unknown_flag"],
+        )
+
+
+def test_build_retrieval_card_g4_k_budget_only_does_not_raise(store_path):
+    """``g4_features=["k_budget"]`` is recognized and runs end-to-end.
+
+    The k_budget feature is a pass-through validation signal — it
+    confirms the binding accepts it but applies no card-composition
+    change. The test verifies no exception is raised AND the empty-store
+    defer path returns ``None`` cleanly.
+    """
+    p = pensyve.Pensyve(
+        path=store_path,
+        reranker=None,
+        k_budget={"ss_pref": 22, "ms": 50, "ssu": 12},
+    )
+    db = f"{store_path}/memories.db"
+    result = p.build_retrieval_card_g4(
+        db,
+        "multi-session",
+        ["ms"],
+        [],
+        ["k_budget"],
+    )
+    assert result is None
+
+
+def test_build_retrieval_card_g4_ms_card_v2_uses_ms_card_days(store_path):
+    """``ms_card_v2`` path threads the resolved ``ms_card_days`` value.
+
+    The MS-card-v2 builder chain is
+    ``MultiSessionCard::v2().with_ms_days(Some(self.inner.ms_card_days))...``
+    — verify the kwarg-resolved value is reachable on the handle and
+    the binding does not crash when the path runs against an empty store.
+    """
+    p = pensyve.Pensyve(path=store_path, reranker=None, ms_card_days=3)
+    assert p.ms_card_days == 3
+    db = f"{store_path}/memories.db"
+    result = p.build_retrieval_card_g4(
+        db,
+        "multi-session",
+        ["ms"],
+        [],
+        ["ms_card_v2"],
+    )
+    assert result is None  # empty store
+
+
+def test_build_retrieval_card_g4_invalid_g2_card_raises(store_path):
+    """Bogus ``g2_cards`` element rejected (same validator as G3)."""
+    p = pensyve.Pensyve(path=store_path, reranker=None)
+    db = f"{store_path}/memories.db"
+    with pytest.raises(ValueError, match="g2_cards"):
+        p.build_retrieval_card_g4(
+            db,
+            "multi-session",
+            ["nonsense"],
+            [],
+            [],
+        )
+
+
+def test_build_retrieval_card_g4_invalid_g3_feature_raises(store_path):
+    """Bogus ``g3_features`` element rejected (same validator as G3)."""
+    p = pensyve.Pensyve(path=store_path, reranker=None)
+    db = f"{store_path}/memories.db"
+    with pytest.raises(ValueError, match="g3_features"):
+        p.build_retrieval_card_g4(
+            db,
+            "multi-session",
+            ["ms"],
+            ["nonsense"],
+            [],
+        )
+
+
+def test_build_retrieval_card_g4_empty_g4_features_equivalent_to_g3(store_path):
+    """``g4_features=[]`` makes G4 byte-for-byte equivalent to G3.
+
+    Spec §4.1: when ``has_ms_card_v2 = false``, the method must use
+    ``MultiSessionCard::new()`` and (per ``want_supersession_standalone``)
+    keep the standalone Supersession slot — i.e., behave identically to
+    ``build_retrieval_card_g3`` with the same first four arguments.
+    Both calls against an empty store should return ``None``.
+    """
+    p = pensyve.Pensyve(path=store_path, reranker=None)
+    db = f"{store_path}/memories.db"
+    g3_result = p.build_retrieval_card_g3(
+        db,
+        "multi-session",
+        ["peer", "ms", "ssu"],
+        ["router", "summarizer", "typed_slots", "diversity"],
+    )
+    g4_result = p.build_retrieval_card_g4(
+        db,
+        "multi-session",
+        ["peer", "ms", "ssu"],
+        ["router", "summarizer", "typed_slots", "diversity"],
+        [],  # empty G4 features
+    )
+    assert g3_result == g4_result == None  # noqa: E711  # explicit None equality
