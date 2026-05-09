@@ -260,3 +260,92 @@ def test_integration_g4_empty_features_byte_for_byte_with_g3():
             "empty g4_features must be byte-for-byte equivalent to G3.\n"
             f"G3 output:\n{g3_out}\n\nG4 output:\n{g4_out}"
         )
+
+
+def test_integration_ms_card_v2_without_summarizer_does_not_attach_chain():
+    """CodeRabbit P1 finding (PR #97 review): ``ms_card_v2`` must NOT
+    attach the supersession chain when ``"summarizer"`` is absent from
+    ``g3_features``.
+
+    Without this gate, enabling ms_card_v2 alone would surface
+    chain-summary content even though the caller did not request the
+    summarizer feature — violating the documented G3 feature contract
+    that summarizer alone controls supersession output rendering. The
+    fix adds a ``has_summ`` guard to the ``with_supersession_chain(...)``
+    attachment in ``lib.rs``.
+    """
+    with tempfile.TemporaryDirectory(prefix="pensyve_g4_no_summ_") as tmp:
+        p = pensyve.Pensyve(
+            path=tmp,
+            namespace="g4-no-summ",
+            reranker=None,
+            ms_card_days=2,
+        )
+        db = _store_db_path(tmp)
+        ns_id = _namespace_id(db, "g4-no-summ")
+        _seed_observations_with_chain_summary(db, ns_id, days=3, rows_per_day=4)
+
+        # ms_card_v2 active but summarizer NOT in g3_features → chain
+        # absorption is suppressed; output should be MS-card-v2 body
+        # without any supersession-chain block.
+        result = p.build_retrieval_card_g4(
+            str(db),
+            "multi-session",
+            ["ms"],
+            [],  # no summarizer
+            ["ms_card_v2"],
+        )
+        assert result is not None, "MS card with seeded data should render"
+        assert "CROSS-SESSION ENTITIES" in result, (
+            "MS card body should still appear without the chain block"
+        )
+        assert "SUPERSESSION CHAIN" not in result, (
+            "ms_card_v2 without summarizer must NOT attach the chain "
+            "block (P1 finding from PR #97 review)"
+        )
+
+
+def test_integration_ms_card_v2_without_ms_in_g2_keeps_standalone_supersession():
+    """CodeRabbit Major finding (PR #97 review): ``ms_card_v2`` should
+    NOT suppress the standalone ``SupersessionCard`` slot when the MS
+    card itself is not in ``g2_cards``.
+
+    Without this guard, ``ms_card_v2 + summarizer + g2_cards=["peer","ssu"]``
+    would silently drop the summarizer output: the standalone slot would
+    be removed (because ms_card_v2 is set) but no MS card exists to
+    absorb the chain. The fix gates ``want_supersession_standalone`` on
+    ``chain_absorbed_by_ms_v2`` (which requires ``want_ms``) instead of
+    just ``has_ms_card_v2``.
+    """
+    with tempfile.TemporaryDirectory(prefix="pensyve_g4_no_ms_") as tmp:
+        p = pensyve.Pensyve(
+            path=tmp,
+            namespace="g4-no-ms",
+            reranker=None,
+        )
+        db = _store_db_path(tmp)
+        ns_id = _namespace_id(db, "g4-no-ms")
+        _seed_observations_with_chain_summary(db, ns_id, days=3, rows_per_day=4)
+
+        # ms_card_v2 + summarizer requested, but NO ms in g2_cards. The
+        # standalone supersession slot must remain so the summarizer
+        # output is rendered. Card body should contain the standard
+        # supersession marker.
+        result = p.build_retrieval_card_g4(
+            str(db),
+            "multi-session",
+            ["peer", "ssu"],  # NO "ms"
+            ["summarizer"],
+            ["ms_card_v2"],
+        )
+        # With chain_summary populated, the standalone SupersessionCard
+        # should produce its standard block.
+        assert result is not None, (
+            "summarizer + ms_card_v2 + no MS in g2 must still produce a "
+            "card via the standalone supersession slot"
+        )
+        assert "SUPERSESSION" in result, (
+            "standalone SupersessionCard slot must be retained when no MS "
+            "card exists to absorb the chain (Major finding from PR #97 "
+            "review)"
+        )

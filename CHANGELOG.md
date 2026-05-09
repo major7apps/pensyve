@@ -5,6 +5,24 @@ All notable changes to Pensyve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.1] - Unreleased
+
+### Added
+
+- **`Pensyve.build_retrieval_card_g4(db_path, question_type, g2_cards, g3_features, g4_features)`** — PyO3 binding analogous to `build_retrieval_card_g3` (`pensyve-python/src/lib.rs:1173`). Closes the integration gap surfaced by the 2026-05-08 G4 ablation wave (`pensyve-docs/research/benchmark-sprint/v3/g4/results.md` §6 H1 caveat) where the harness silently fell back to G3 cards on every G4-mechanism arm.
+  - Adds `g4_features ⊆ {"k_budget", "ms_card_v2"}`. When `"ms_card_v2"` AND `"summarizer"` are both requested AND the MS card is in `g2_cards`, the MS slot uses `MultiSessionCard::v2().with_g3_mode(...).with_ms_days(Some(ms_card_days)).with_supersession_chain(SupersessionCard::new())` (Approach A output-merge per pre-reg `pensyve-docs@8930c4a` §3.4 LOCKED) and the standalone `SupersessionCard` slot is dropped.
+  - The supersession chain is gated on `"summarizer"` so activating `ms_card_v2` alone does not surface chain-summary content the caller never opted into. The standalone slot is preserved when the MS card isn't present so summarizer output is never silently lost.
+  - When `g4_features = []`, behavior is byte-for-byte equivalent to `build_retrieval_card_g3` with the same first four arguments. No `pensyve-core` changes — `MultiSessionCard::v2()` and `with_supersession_chain` already exist (`multi_session.rs:273`, `:308`). Spec: `pensyve-docs/specs/2026-05-08-pensyve-build-retrieval-card-g4-binding.md`.
+
+### Fixed
+
+- **`pensyve.__version__` now tracks `CARGO_PKG_VERSION`** instead of the stale hardcoded `"0.1.0"` in `_core` (`pensyve-python/src/lib.rs:67`). Wheel metadata was already correct; this aligns the runtime attribute. Test updated to assert semver shape (`pensyve.__version__.split(".")[0] >= "2"`) instead of pinning a literal.
+
+### Notes
+
+- **`pensyve-python` wheel: aarch64-linux only**, same as v2.4.0.
+- **MSRV unchanged** at 1.88.
+
 ## [2.4.0] - 2026-05-07
 
 Bundles G2 + G3 + G4 retrieval-side mechanism + Phase 23 production hardening accumulated since the v2.2.0 milestone tag. The 2.2.0 → 2.4.0 jump (skipping 2.3.0) reflects the magnitude of the surface change. **The G3 and G4 retrieval mechanisms ship default-OFF behind env gates**; flipping them on is gated by the locked G4 ablation pre-registration (`pensyve-docs/research/benchmark-sprint/v3/g4/preregistration.md @ 8930c4a`) §3.6 / §4.3 decision tree, evaluated against the wave whose results land in `pensyve-docs/research/benchmark-sprint/v3/g4/results.md`.

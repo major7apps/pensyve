@@ -1499,15 +1499,33 @@ impl PyPensyve {
 
         // Build the composite card chain.
         //
-        // G4 binding spec §4.1 step 7: when `has_ms_card_v2` is set, the
-        // standalone `SupersessionCard` slot is dropped because the
-        // chain output is absorbed internally by the MS card's
-        // Approach A merge. When `has_ms_card_v2` is unset, behavior is
-        // byte-for-byte identical to `build_retrieval_card_g3`.
+        // G4 binding spec §4.1 step 7: the `MS-card-v2` path absorbs the
+        // supersession-chain output into the MS card body via Approach A,
+        // BUT only when both prerequisites hold:
+        //
+        //   1. The caller actually requested the summarizer feature
+        //      (`"summarizer"` ∈ g3_features). Without this gate, enabling
+        //      `ms_card_v2` would surface chain-summary content even when
+        //      the caller did not opt into supersession output, violating
+        //      the documented G3 feature contract.
+        //   2. The MS card is actually present (`"ms"` ∈ g2_cards). Without
+        //      it there is no card to absorb the chain — the standalone
+        //      `SupersessionCard` slot must remain so the summarizer
+        //      output is not silently lost.
+        //
+        // When `has_ms_card_v2` is unset OR either prerequisite fails, the
+        // standalone `SupersessionCard` slot is preserved exactly as in
+        // `build_retrieval_card_g3`. With `g4_features = []` the method
+        // remains byte-for-byte equivalent to G3.
         let want_peer = g2_cards.iter().any(|c| c == "peer");
         let want_ms = g2_cards.iter().any(|c| c == "ms");
         let want_ssu = g2_cards.iter().any(|c| c == "ssu");
-        let want_supersession_standalone = has_summ && !has_ms_card_v2;
+        // True when the chain is absorbed inside the v2 MS card. Requires
+        // ms_card_v2 active AND summarizer requested AND MS card present.
+        let chain_absorbed_by_ms_v2 = has_ms_card_v2 && has_summ && want_ms;
+        // Standalone slot is needed whenever summarizer is requested AND
+        // the chain is NOT being absorbed elsewhere.
+        let want_supersession_standalone = has_summ && !chain_absorbed_by_ms_v2;
 
         let mut cards: Vec<(Box<dyn RetrievalCard>, usize)> = Vec::with_capacity(4);
         if want_peer {
@@ -1518,19 +1536,24 @@ impl PyPensyve {
             // `MultiSessionCard::v2()` (sets `ms_days` from
             // `resolve_ms_days`) + explicit `with_ms_days(Some(_))`
             // override (matches G3's precedence: kwarg > env > default,
-            // which is what `self.inner.ms_card_days` already encodes)
-            // + `with_supersession_chain(SupersessionCard::new())`
-            // pulls in the Approach A output-merge.
+            // which is what `self.inner.ms_card_days` already encodes).
             //
-            // Else branch: byte-for-byte identical to G3
+            // `with_supersession_chain(...)` is attached ONLY when the
+            // summarizer feature is also requested — otherwise activating
+            // ms_card_v2 alone would surface chain-summary content the
+            // caller never asked for.
+            //
+            // Else branch (no ms_card_v2): byte-for-byte identical to G3
             // (`MultiSessionCard::new()` with the same builder chain).
             let ms_card: Box<dyn RetrievalCard> = if has_ms_card_v2 {
-                Box::new(
-                    MultiSessionCard::v2()
-                        .with_g3_mode(g3_mode_value)
-                        .with_ms_days(Some(self.inner.ms_card_days))
-                        .with_supersession_chain(SupersessionCard::new()),
-                )
+                let card = MultiSessionCard::v2()
+                    .with_g3_mode(g3_mode_value)
+                    .with_ms_days(Some(self.inner.ms_card_days));
+                if has_summ {
+                    Box::new(card.with_supersession_chain(SupersessionCard::new()))
+                } else {
+                    Box::new(card)
+                }
             } else {
                 Box::new(
                     MultiSessionCard::new()

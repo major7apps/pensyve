@@ -6,7 +6,20 @@ import pensyve
 
 
 def test_version():
-    assert pensyve.__version__ == "0.1.0"
+    # `__version__` is wired to `CARGO_PKG_VERSION` at the PyO3 module
+    # boundary (pensyve-python/src/lib.rs `m.add("__version__",
+    # env!("CARGO_PKG_VERSION"))`), so it tracks the workspace version
+    # without manual maintenance. Assert the shape (semver MAJOR.MINOR.PATCH
+    # with a numeric major) instead of pinning a literal so the test
+    # doesn't fail on every release bump.
+    parts = pensyve.__version__.split(".")
+    assert len(parts) >= 3, f"unexpected __version__ shape: {pensyve.__version__!r}"
+    assert parts[0].isdigit(), (
+        f"__version__ major must be numeric, got {pensyve.__version__!r}"
+    )
+    assert int(parts[0]) >= 2, (
+        f"__version__ should be ≥2.x post-v2 release; got {pensyve.__version__!r}"
+    )
 
 
 def test_create_instance():
