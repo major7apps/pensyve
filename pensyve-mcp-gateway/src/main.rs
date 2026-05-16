@@ -93,7 +93,11 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
                 }
                 Err(mini_err) => {
                     if std::env::var("PENSYVE_ALLOW_MOCK_EMBEDDER").is_ok() {
-                        tracing::warn!("Using mock embedder (768 dims) — {mini_err}");
+                        // PENSYVE_ALLOW_MOCK_EMBEDDER is the explicit opt-in
+                        // for environments that intentionally ship without the
+                        // ONNX models (e.g. prod containers built without the
+                        // model artifacts). Surface as info, not warn.
+                        tracing::info!("Using mock embedder (768 dims) — {mini_err}");
                         OnnxEmbedder::new_mock(768)
                     } else {
                         return Err(anyhow::anyhow!(
