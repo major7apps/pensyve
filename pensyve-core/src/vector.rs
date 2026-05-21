@@ -207,6 +207,30 @@ impl VectorIndex {
     pub fn dimensions(&self) -> usize {
         self.dimensions
     }
+
+    /// Return up to `limit` embeddings from the index (no ordering
+    /// guarantee — `HashMap` iteration order is arbitrary).
+    ///
+    /// Added in Phase 2D for the D-MEM gate's surprise calculation:
+    /// the gate needs a small sample of existing embeddings to
+    /// compute `1 - max_cosine_similarity_to_existing` against the
+    /// freshly-extracted observation. Sampling without a sort keeps
+    /// the call O(min(len, limit)); the absence of an ordering
+    /// guarantee is intentional — D-MEM treats this as a statistical
+    /// sample, not a deterministic neighborhood.
+    ///
+    /// Each returned vector is a clone of the stored (pre-normalized)
+    /// embedding. Callers that need to hold the sample across mutating
+    /// operations on the index do not need to worry about iterator
+    /// invalidation.
+    #[must_use]
+    pub fn sample_embeddings(&self, limit: usize) -> Vec<Vec<f32>> {
+        self.entries
+            .values()
+            .take(limit)
+            .map(Clone::clone)
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -357,5 +381,50 @@ mod tests {
         index.add(id, &[1.0, 0.0, 0.0]).unwrap();
         let results = index.search(&[1.0, 0.0, 0.0], 100).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2D — sample_embeddings (added for D-MEM's surprise calc)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sample_embeddings_returns_up_to_limit() {
+        let mut index = VectorIndex::new(3, 16);
+        for _ in 0..5 {
+            index.add(Uuid::new_v4(), &[1.0, 0.0, 0.0]).unwrap();
+        }
+        // Asking for 3 from a pool of 5 returns exactly 3.
+        let sample = index.sample_embeddings(3);
+        assert_eq!(sample.len(), 3);
+        // Each sample is a 3-d (post-normalization) vector.
+        for v in &sample {
+            assert_eq!(v.len(), 3);
+        }
+    }
+
+    #[test]
+    fn sample_embeddings_caps_at_index_size() {
+        let mut index = VectorIndex::new(3, 16);
+        for _ in 0..3 {
+            index.add(Uuid::new_v4(), &[1.0, 0.0, 0.0]).unwrap();
+        }
+        // Asking for 100 from a pool of 3 returns exactly 3 (no
+        // padding, no error).
+        let sample = index.sample_embeddings(100);
+        assert_eq!(sample.len(), 3);
+    }
+
+    #[test]
+    fn sample_embeddings_empty_index_returns_empty() {
+        let index = VectorIndex::new(3, 16);
+        let sample = index.sample_embeddings(50);
+        assert!(sample.is_empty(), "empty index → empty sample");
+    }
+
+    #[test]
+    fn sample_embeddings_zero_limit_returns_empty() {
+        let mut index = VectorIndex::new(3, 16);
+        index.add(Uuid::new_v4(), &[1.0, 0.0, 0.0]).unwrap();
+        assert!(index.sample_embeddings(0).is_empty());
     }
 }

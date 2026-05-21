@@ -2926,6 +2926,51 @@ fn maybe_fire_dep_parse_hook(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2D D-MEM ingest context
+// ---------------------------------------------------------------------------
+
+/// Per-ingest-call context for the Phase 2D D-MEM fast/slow gate.
+///
+/// Bundles the three runtime inputs the gate needs at every route
+/// decision so the ingest entry points can take it as a single
+/// optional trailing argument. Threading the gate as a separate
+/// `&mut DMemGate` plus two slice arguments would explode the
+/// argument list of `commit_extraction_for_episode` / the bulk
+/// variant; the struct keeps the public surface to one extra
+/// parameter.
+///
+/// When `Some(ctx)` is passed AND `dmem_enabled()` returns true, the
+/// ingest path consults the gate before firing the dep-parse +
+/// typed-slot hooks. When `None` is passed OR `dmem_enabled()` is
+/// false, the ingest path is byte-for-byte identical to the pre-2D
+/// baseline.
+///
+/// Lifetimes:
+/// - `'gate` ties the mutable gate borrow to the caller's scope so
+///   the orchestrator can drain the ring buffer after the ingest call
+///   returns.
+/// - `'embeds` ties the existing-embeddings sample to the caller; the
+///   gate reads it but never extends its lifetime.
+/// - `'ctx` ties the temporal-context borrow to the caller. Passing
+///   a zero vector is acceptable when no `TemporalContext` is in
+///   scope (the utility term degrades to 0 for every observation,
+///   which is the documented safe behavior).
+pub struct DMemIngestContext<'gate, 'embeds, 'ctx> {
+    /// The stateful gate. Owns the ring buffer of fast-routed
+    /// observation ids that the orchestrator drains explicitly.
+    pub gate: &'gate mut crate::consolidation::dmem::DMemGate,
+    /// Sample of existing memory-pool embeddings for the surprise
+    /// calculation. The plan caps this at 50 in the documented
+    /// pattern — that cap is the caller's responsibility, NOT
+    /// enforced here.
+    pub existing_embeddings: &'embeds [Vec<f32>],
+    /// Drifting query-context vector from
+    /// [`crate::consolidation::TemporalContext::current`] (or a
+    /// zero vector when the caller has none in scope).
+    pub query_context_emb: &'ctx [f32],
+}
+
+// ---------------------------------------------------------------------------
 // Ingest helper — canonical post-episode-close extraction flow
 // ---------------------------------------------------------------------------
 
@@ -2952,7 +2997,56 @@ pub async fn commit_extraction_for_episode<F, E>(
     namespace_id: Uuid,
     episode_id: Uuid,
     cancel: CancellationToken,
+    embed: F,
+) -> usize
+where
+    F: FnMut(&str) -> Result<Vec<f32>, E>,
+    E: std::fmt::Display,
+{
+    // Delegate to the Phase 2D D-MEM-aware variant with `dmem = None`.
+    // When the gate is absent the body is byte-for-byte identical to
+    // the pre-2D baseline (no env-flag check, no metric increment,
+    // same dep-parse + typed-slot ordering).
+    commit_extraction_for_episode_with_dmem(
+        storage,
+        extractor,
+        namespace_id,
+        episode_id,
+        cancel,
+        embed,
+        None,
+    )
+    .await
+}
+
+/// Phase 2D variant of [`commit_extraction_for_episode`] that
+/// optionally consults the D-MEM gate before firing per-observation
+/// dep-parse + typed-slot hooks.
+///
+/// When `dmem = Some(ctx)` AND
+/// [`crate::consolidation::dmem::dmem_enabled`] returns `true`, each
+/// freshly-extracted observation is scored via the gate. Observations
+/// routed to [`crate::consolidation::dmem::DMemRoute::FastBuffer`]
+/// have their raw row persisted via `save_observation` but skip both
+/// the dep-parse hook and the typed-slot hook; their id is pushed
+/// onto the gate's ring buffer for later batch drain. Observations
+/// routed to [`crate::consolidation::dmem::DMemRoute::SlowPipeline`]
+/// run through the existing baseline path.
+///
+/// When `dmem = None` OR the env flag is off, this function is a
+/// strict no-op delegate to the pre-2D ingest body.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The D-MEM gate context is a single trailing optional argument; bundling the other six into a struct would impose its own boilerplate on every caller. The function follows the same shape as the rest of the ingest helpers in this module."
+)]
+pub async fn commit_extraction_for_episode_with_dmem<F, E>(
+    storage: &(dyn crate::storage::StorageTrait + Send + Sync),
+    extractor: &dyn ObservationExtractor,
+    namespace_id: Uuid,
+    episode_id: Uuid,
+    cancel: CancellationToken,
     mut embed: F,
+    mut dmem: Option<&mut DMemIngestContext<'_, '_, '_>>,
 ) -> usize
 where
     F: FnMut(&str) -> Result<Vec<f32>, E>,
@@ -3044,23 +3138,55 @@ where
             );
             continue;
         }
-        // Phase 2B dep-parse hook (no-op when `PENSYVE_DEP_PARSE` is off).
-        // Fires BEFORE the typed-slots gate so the KG sees every passage
-        // the consolidation engine sees, including those typed-slots
-        // skips due to action-verb gating.
-        maybe_fire_dep_parse_hook(storage, &obs);
-        // G3 per-event gate hooks (per pre-reg `pensyve-docs@64481dc` §3.7
-        // + §3.8 + addendum_01 `pensyve-docs@dd7c053` Finding 2 mitigation).
-        // No-op when both `PENSYVE_RETRIEVAL_CARDS_G3` predicates are off
-        // (zero-cost fast path: `gate_extractor` is `None`).
-        #[cfg(feature = "observation-extraction")]
-        gate_wiring::maybe_fire_gates_with_extractor(
-            storage,
-            &obs,
-            gate_extractor.as_ref(),
-            cancel.clone(),
-        )
-        .await;
+
+        // Phase 2D D-MEM gate. Active only when ALL three hold:
+        //   (a) a `DMemIngestContext` is attached
+        //   (b) `PENSYVE_DMEM=1` (cached OnceLock env read)
+        //   (c) `gate.route(...)` returns `FastBuffer`
+        // When any condition fails, fall through to the baseline path
+        // (dep-parse + typed-slot hooks fire). When all three hold,
+        // skip both hooks; the raw row from `save_observation` above
+        // is the only artifact, and the gate buffers `obs.id` for
+        // later drain.
+        let route = if let Some(ctx) = dmem.as_deref_mut()
+            && crate::consolidation::dmem::dmem_enabled()
+        {
+            let score = ctx.gate.score(
+                &obs.embedding,
+                ctx.existing_embeddings,
+                ctx.query_context_emb,
+            );
+            let route = ctx.gate.route(obs.id, &score, Some(obs.action.as_str()));
+            crate::consolidation::dmem::record_route(&score, route, ctx.gate.ring_buffer_len());
+            route
+        } else {
+            // No gate attached / flag off → baseline path (slow).
+            crate::consolidation::dmem::DMemRoute::SlowPipeline
+        };
+
+        if matches!(route, crate::consolidation::dmem::DMemRoute::SlowPipeline) {
+            // Phase 2B dep-parse hook (no-op when `PENSYVE_DEP_PARSE` is off).
+            // Fires BEFORE the typed-slots gate so the KG sees every passage
+            // the consolidation engine sees, including those typed-slots
+            // skips due to action-verb gating.
+            maybe_fire_dep_parse_hook(storage, &obs);
+            // G3 per-event gate hooks (per pre-reg `pensyve-docs@64481dc` §3.7
+            // + §3.8 + addendum_01 `pensyve-docs@dd7c053` Finding 2 mitigation).
+            // No-op when both `PENSYVE_RETRIEVAL_CARDS_G3` predicates are off
+            // (zero-cost fast path: `gate_extractor` is `None`).
+            #[cfg(feature = "observation-extraction")]
+            gate_wiring::maybe_fire_gates_with_extractor(
+                storage,
+                &obs,
+                gate_extractor.as_ref(),
+                cancel.clone(),
+            )
+            .await;
+        }
+        // Note: fast-routed observations are still counted in
+        // `persisted` because `save_observation` succeeded — the gate
+        // only defers the dep-parse + typed-slot side effects, not the
+        // raw row write.
         persisted += 1;
     }
     persisted
@@ -3105,7 +3231,47 @@ pub async fn commit_extractions_for_episodes<F, E>(
     namespace_id: Uuid,
     episode_ids: &[Uuid],
     cancel: CancellationToken,
+    embed: F,
+) -> usize
+where
+    F: FnMut(&str) -> Result<Vec<f32>, E>,
+    E: std::fmt::Display,
+{
+    // Delegate to the Phase 2D variant with `dmem = None` — same
+    // contract as the per-episode helper.
+    commit_extractions_for_episodes_with_dmem(
+        storage,
+        extractor,
+        namespace_id,
+        episode_ids,
+        cancel,
+        embed,
+        None,
+    )
+    .await
+}
+
+/// Phase 2D variant of [`commit_extractions_for_episodes`] that
+/// optionally consults the D-MEM gate. Semantics identical to
+/// [`commit_extraction_for_episode_with_dmem`], applied to every
+/// observation in every episode in the bulk batch — the gate state
+/// (ring buffer) is shared across the entire bulk call.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Same rationale as `commit_extraction_for_episode_with_dmem`: the D-MEM gate is a single trailing optional argument."
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Inherits the existing function body; the D-MEM gate adds ~25 lines of in-loop wiring. Splitting the per-observation block out would require either generic-closure threading or duplicating the gate logic between the two ingest entry points."
+)]
+pub async fn commit_extractions_for_episodes_with_dmem<F, E>(
+    storage: &(dyn crate::storage::StorageTrait + Send + Sync),
+    extractor: &dyn ObservationExtractor,
+    namespace_id: Uuid,
+    episode_ids: &[Uuid],
+    cancel: CancellationToken,
     mut embed: F,
+    mut dmem: Option<&mut DMemIngestContext<'_, '_, '_>>,
 ) -> usize
 where
     F: FnMut(&str) -> Result<Vec<f32>, E>,
@@ -3224,22 +3390,43 @@ where
                 );
                 continue;
             }
-            // Phase 2B dep-parse hook — same fast-path as the per-episode
-            // helper. No-op when `PENSYVE_DEP_PARSE` is off.
-            maybe_fire_dep_parse_hook(storage, &obs);
-            // G3 per-event gate hooks — same wiring as the per-episode
-            // helper, sharing the hoisted extractor across every
-            // observation in the bulk call. Per-observation cost is
-            // bounded by the `gate_extractor.is_none()` fast-path inside
-            // `maybe_fire_gates_with_extractor` when both predicates off.
-            #[cfg(feature = "observation-extraction")]
-            gate_wiring::maybe_fire_gates_with_extractor(
-                storage,
-                &obs,
-                gate_extractor.as_ref(),
-                cancel.clone(),
-            )
-            .await;
+
+            // Phase 2D D-MEM gate — same contract as the per-episode
+            // helper. Gate state (ring buffer) is shared across every
+            // observation in the bulk call.
+            let route = if let Some(ctx) = dmem.as_deref_mut()
+                && crate::consolidation::dmem::dmem_enabled()
+            {
+                let score = ctx.gate.score(
+                    &obs.embedding,
+                    ctx.existing_embeddings,
+                    ctx.query_context_emb,
+                );
+                let route = ctx.gate.route(obs.id, &score, Some(obs.action.as_str()));
+                crate::consolidation::dmem::record_route(&score, route, ctx.gate.ring_buffer_len());
+                route
+            } else {
+                crate::consolidation::dmem::DMemRoute::SlowPipeline
+            };
+
+            if matches!(route, crate::consolidation::dmem::DMemRoute::SlowPipeline) {
+                // Phase 2B dep-parse hook — same fast-path as the per-episode
+                // helper. No-op when `PENSYVE_DEP_PARSE` is off.
+                maybe_fire_dep_parse_hook(storage, &obs);
+                // G3 per-event gate hooks — same wiring as the per-episode
+                // helper, sharing the hoisted extractor across every
+                // observation in the bulk call. Per-observation cost is
+                // bounded by the `gate_extractor.is_none()` fast-path inside
+                // `maybe_fire_gates_with_extractor` when both predicates off.
+                #[cfg(feature = "observation-extraction")]
+                gate_wiring::maybe_fire_gates_with_extractor(
+                    storage,
+                    &obs,
+                    gate_extractor.as_ref(),
+                    cancel.clone(),
+                )
+                .await;
+            }
             episode_persisted += 1;
         }
         total_persisted += episode_persisted;
