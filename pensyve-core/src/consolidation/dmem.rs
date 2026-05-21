@@ -124,20 +124,40 @@ impl DMemGate {
     /// want env-driven defaults should call
     /// [`Self::from_env`] instead.
     ///
-    /// `threshold` and `alpha` are both clamped to `[0.0, 1.0]` to
-    /// preserve the `RpeScore` range invariants — `from_env()`
-    /// applies the same clamp via its `filter(|f| (0.0..=1.0).
-    /// contains(f))` parser, and the public constructor must match
-    /// so callers can't bypass the range check by going around
-    /// `from_env`. `CodeRabbit` PR #117 round 2.
+    /// `threshold` and `alpha` are normalized to finite values in
+    /// `[0.0, 1.0]` to preserve the `RpeScore` range invariants:
+    /// - `NaN` → fall back to the default (0.35 for threshold, 0.5
+    ///   for alpha). `f32::clamp(NaN, _, _)` returns `NaN`, which
+    ///   would bias `score.combined >= self.threshold` toward
+    ///   `FastBuffer` (every comparison with `NaN` is false → routes
+    ///   fast) — so the NaN check has to happen before the clamp.
+    /// - Out-of-range finite values are clamped via `f32::clamp`.
+    ///
+    /// Note: `from_env()` parses + filters env values via
+    /// `(0.0..=1.0).contains(f)`, which rejects both `NaN` and
+    /// out-of-range values and falls back to the same defaults.
+    /// This constructor matches the env-driven behavior so callers
+    /// can't bypass the safety contract by going around `from_env`.
+    /// `CodeRabbit` PR #117 round 3.
     ///
     /// `capacity` must be `>= 1`; a zero-capacity ring buffer would
     /// silently drop every fast-routed observation. We clamp to 1 to
     /// avoid that footgun.
     #[must_use]
     pub fn new(threshold: f32, alpha: f32, capacity: usize) -> Self {
-        let threshold = threshold.clamp(0.0, 1.0);
-        let alpha = alpha.clamp(0.0, 1.0);
+        // NaN handling: `f32::clamp` propagates NaN, so we must
+        // reject NaN BEFORE clamping. Falling back to the default
+        // matches `from_env`'s reject-and-default behavior.
+        let threshold = if threshold.is_finite() {
+            threshold.clamp(0.0, 1.0)
+        } else {
+            0.35
+        };
+        let alpha = if alpha.is_finite() {
+            alpha.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
         let capacity = capacity.max(1);
         Self {
             threshold,
@@ -290,6 +310,27 @@ impl DMemGate {
             .dmem_ring_buffer_size
             .store(0, Ordering::Relaxed);
         drained
+    }
+}
+
+/// Debug-only safety net: catch callers of the `_with_dmem` ingest
+/// variants that forget to drain the gate before it goes out of
+/// scope. Production callers MUST drain explicitly — non-drained
+/// IDs are silently lost. The `_dmem_aware` wrappers in
+/// `observation.rs` already drain (and increment
+/// `dmem_default_gate_dropped_observations` for the lost IDs), so
+/// today this assertion never fires in production builds. The
+/// debug-only assertion is a forward-looking guard so future
+/// callers can't accidentally regress the drain contract.
+/// `CodeRabbit` PR #117 round 3 (informational).
+impl Drop for DMemGate {
+    fn drop(&mut self) {
+        debug_assert!(
+            self.ring_buffer.is_empty(),
+            "DMemGate dropped with {} buffered observation IDs — call \
+             `drain_ring_buffer()` before drop to avoid silent data loss",
+            self.ring_buffer.len()
+        );
     }
 }
 
@@ -505,6 +546,9 @@ mod tests {
         let route = gate.route(id, &score, None);
         assert_eq!(route, DMemRoute::FastBuffer);
         assert_eq!(gate.ring_buffer_len(), 1);
+        // Drain before drop to satisfy the debug-only Drop
+        // assertion (CodeRabbit PR #117 round 3).
+        let _ = gate.drain_ring_buffer();
     }
 
     #[test]
@@ -568,6 +612,8 @@ mod tests {
             2,
             "buffer remains at capacity after eviction"
         );
+        // Drain before drop (CodeRabbit PR #117 round 3 Drop guard).
+        let _ = gate.drain_ring_buffer();
     }
 
     #[test]
@@ -595,6 +641,8 @@ mod tests {
             after, before,
             "under-capacity pushes must NOT increment dmem_ring_buffer_evictions"
         );
+        // Drain before drop (CodeRabbit PR #117 round 3 Drop guard).
+        let _ = gate.drain_ring_buffer();
     }
 
     #[test]
@@ -691,6 +739,7 @@ mod tests {
         // "bought" is not in TYPED_SLOT_TRIGGER_ACTIONS → no override.
         let route = gate.route(Uuid::new_v4(), &below_threshold, Some("bought"));
         assert_eq!(route, DMemRoute::FastBuffer);
+        let _ = gate.drain_ring_buffer();
     }
 
     #[test]
@@ -703,6 +752,7 @@ mod tests {
         };
         let route = gate.route(Uuid::new_v4(), &below_threshold, None);
         assert_eq!(route, DMemRoute::FastBuffer);
+        let _ = gate.drain_ring_buffer();
     }
 
     // ---- Threshold sweep ----
@@ -747,6 +797,7 @@ mod tests {
                 "threshold=1.0 must route combined<1.0 fast (combined={combined})"
             );
         }
+        let _ = gate.drain_ring_buffer();
     }
 
     // ---- Capacity clamp ----
@@ -779,11 +830,12 @@ mod tests {
 
     #[test]
     fn new_clamps_threshold_and_alpha_to_unit_interval() {
-        // CodeRabbit PR #117 round 2: `from_env()` already filters
-        // out-of-range values via its parser; `new()` must apply the
-        // same clamp so callers can't bypass the range check.
-        // Out-of-range threshold/alpha would break the `RpeScore`
-        // invariants documented at the top of this module.
+        // CodeRabbit PR #117 rounds 2 + 3: `from_env()` already
+        // filters out-of-range values via its parser; `new()` must
+        // apply the same clamp so callers can't bypass the range
+        // check. Out-of-range threshold/alpha would break the
+        // `RpeScore` invariants documented at the top of this
+        // module.
 
         // Above the upper bound → clamped to 1.0
         let gate = DMemGate::new(1.5, 2.0, 8);
@@ -799,6 +851,54 @@ mod tests {
         let gate = DMemGate::new(0.4, 0.6, 8);
         assert!((gate.threshold() - 0.4).abs() < f32::EPSILON);
         assert!((gate.alpha() - 0.6).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn new_rejects_nan_and_infinity_falls_back_to_defaults() {
+        // CodeRabbit PR #117 round 3: `f32::clamp(NaN, _, _) == NaN`,
+        // and every `>=` comparison with NaN is `false`, so a NaN
+        // threshold would force every observation to FastBuffer
+        // — a routing bias that defeats the safe-default contract.
+        // `new()` rejects non-finite inputs and falls back to the
+        // documented defaults (threshold = 0.35, alpha = 0.5),
+        // matching `from_env`'s reject-and-default behavior.
+
+        let gate = DMemGate::new(f32::NAN, 0.5, 8);
+        assert!(
+            (gate.threshold() - 0.35).abs() < f32::EPSILON,
+            "NaN threshold must fall back to 0.35; got {}",
+            gate.threshold()
+        );
+
+        let gate = DMemGate::new(0.35, f32::NAN, 8);
+        assert!(
+            (gate.alpha() - 0.5).abs() < f32::EPSILON,
+            "NaN alpha must fall back to 0.5; got {}",
+            gate.alpha()
+        );
+
+        // Infinity also non-finite → defaults.
+        let gate = DMemGate::new(f32::INFINITY, f32::NEG_INFINITY, 8);
+        assert!((gate.threshold() - 0.35).abs() < f32::EPSILON);
+        assert!((gate.alpha() - 0.5).abs() < f32::EPSILON);
+
+        // Routing-bias regression test: a NaN threshold via the
+        // bypassed-clamp shape would route everything FastBuffer
+        // (since `0.5 >= NaN` is false). With the fall-back to
+        // 0.35, a combined=0.5 score routes SlowPipeline as
+        // expected.
+        let mut gate = DMemGate::new(f32::NAN, 0.5, 8);
+        let mid_score = RpeScore {
+            surprise: 0.5,
+            utility: 0.5,
+            combined: 0.5,
+        };
+        let route = gate.route(Uuid::new_v4(), &mid_score, None);
+        assert_eq!(
+            route,
+            DMemRoute::SlowPipeline,
+            "NaN threshold must NOT bias routing to FastBuffer"
+        );
     }
 
     // ---- Env-var caches ----

@@ -1863,6 +1863,8 @@ mod tests {
             "global counters must increment by ≥ 100 (our 100 + any parallel-test increments); \
              went from {global_total_before} → {global_total_after}"
         );
+        // Drain before drop (CodeRabbit PR #117 round 3 Drop guard).
+        let _ = gate.drain_ring_buffer();
     }
 
     #[test]
@@ -1937,6 +1939,8 @@ mod tests {
             fast_rate >= 0.6,
             "realistic chat fixture should route ≥ 60% fast; got {fast}/10 = {fast_rate}"
         );
+        // Drain before drop (CodeRabbit PR #117 round 3 Drop guard).
+        let _ = gate.drain_ring_buffer();
     }
 
     #[test]
@@ -2076,5 +2080,7 @@ mod tests {
             "fast-routed observations must NOT increment dep_parse_observations_processed; \
              counter went from {dep_parse_before} → {dep_parse_after}"
         );
+        // Drain before drop (CodeRabbit PR #117 round 3 Drop guard).
+        let _ = gate.drain_ring_buffer();
     }
 }

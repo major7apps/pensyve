@@ -3104,8 +3104,12 @@ where
                  entry point — use `commit_extraction_for_episode_with_dmem` with an \
                  explicit DMemIngestContext + caller-owned drain instead."
             );
+            // Use the dedicated counter (not `dmem_ring_buffer_evictions`)
+            // so operators can distinguish "ring buffer too small at
+            // capacity overflow" from "default entry point dropped at
+            // function exit". CodeRabbit PR #117 round 3.
             crate::observability::metrics()
-                .dmem_ring_buffer_evictions
+                .dmem_default_gate_dropped_observations
                 .fetch_add(
                     drained_ids.len() as u64,
                     std::sync::atomic::Ordering::Relaxed,
@@ -3419,8 +3423,12 @@ where
                  See `commit_extraction_for_episode_dmem_aware` for the same warning + \
                  the migration to `_with_dmem` for caller-owned drain."
             );
+            // Use the dedicated counter (not `dmem_ring_buffer_evictions`)
+            // so operators can distinguish "ring buffer too small at
+            // capacity overflow" from "default entry point dropped at
+            // function exit". CodeRabbit PR #117 round 3.
             crate::observability::metrics()
-                .dmem_ring_buffer_evictions
+                .dmem_default_gate_dropped_observations
                 .fetch_add(
                     drained_ids.len() as u64,
                     std::sync::atomic::Ordering::Relaxed,

@@ -210,6 +210,20 @@ pub struct PensyveMetrics {
     /// undersized or that drain isn't running often enough.
     /// `CodeRabbit` PR #117 P0 #1.
     pub dmem_ring_buffer_evictions: AtomicU64,
+    /// Total observations dropped at function-exit by the lazy
+    /// default `DMemGate` in
+    /// `observation::commit_extraction_for_episode_dmem_aware` (or
+    /// its bulk sibling). Semantically distinct from
+    /// `dmem_ring_buffer_evictions` — these are NOT capacity-overflow
+    /// evictions, they're function-exit losses from the ephemeral
+    /// default gate not having a caller-owned drain. A non-zero
+    /// production value signals operators have tuned
+    /// `PENSYVE_DMEM_THRESHOLD` / `PENSYVE_DMEM_ALPHA` to produce
+    /// `FastBuffer` routes from the default entry point — the fix is
+    /// to migrate the caller to `commit_extraction_for_episode_with_dmem`
+    /// with a populated `DMemIngestContext` and caller-owned drain.
+    /// `CodeRabbit` PR #117 round 3.
+    pub dmem_default_gate_dropped_observations: AtomicU64,
     /// Distribution of `surprise` values across D-MEM scoring calls.
     /// `surprise = 1 - max_cosine_similarity_to_existing` in
     /// `[0.0, 1.0]`. High-surprise observations are novel relative
@@ -266,6 +280,7 @@ impl PensyveMetrics {
             dmem_slow_routed: AtomicU64::new(0),
             dmem_ring_buffer_size: AtomicU64::new(0),
             dmem_ring_buffer_evictions: AtomicU64::new(0),
+            dmem_default_gate_dropped_observations: AtomicU64::new(0),
             dmem_surprise_histogram: HistogramBuckets::new(UNIT_INTERVAL_BUCKETS),
             dmem_utility_histogram: HistogramBuckets::new(UNIT_INTERVAL_BUCKETS),
             recall_duration: HistogramBuckets::new(DURATION_BUCKETS),
@@ -530,6 +545,9 @@ impl PensyveMetrics {
         let dmem_slow = self.dmem_slow_routed.load(Ordering::Relaxed);
         let dmem_buf = self.dmem_ring_buffer_size.load(Ordering::Relaxed);
         let dmem_evictions = self.dmem_ring_buffer_evictions.load(Ordering::Relaxed);
+        let dmem_dropped = self
+            .dmem_default_gate_dropped_observations
+            .load(Ordering::Relaxed);
         let _ = writeln!(
             buf,
             "# HELP pensyve_dmem_fast_routed_total Observations routed to the Phase 2D fast buffer (skipped dep-parse + typed-slot hooks)."
@@ -559,6 +577,18 @@ impl PensyveMetrics {
         let _ = writeln!(
             buf,
             "pensyve_dmem_ring_buffer_evictions_total {dmem_evictions}"
+        );
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_dmem_default_gate_dropped_observations_total Observations dropped at function-exit by the lazy default DMemGate — semantically distinct from capacity-overflow evictions; signals operators have tuned PENSYVE_DMEM_* to produce FastBuffer routes under the default entry point."
+        );
+        let _ = writeln!(
+            buf,
+            "# TYPE pensyve_dmem_default_gate_dropped_observations_total counter"
+        );
+        let _ = writeln!(
+            buf,
+            "pensyve_dmem_default_gate_dropped_observations_total {dmem_dropped}"
         );
 
         // Histograms
