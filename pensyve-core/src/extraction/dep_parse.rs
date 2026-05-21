@@ -323,29 +323,37 @@ pub fn extract_triples(passage_id: Uuid, text: &str) -> ParsedPassage {
 /// - The function never emits 0.3 — fragments simply return `None`.
 fn extract_one_triple(tokens: &[&str]) -> Option<Triple> {
     let mut lexicon_miss_for_sentence = 0u64;
+    let mut verb_hit: Option<(usize, &'static str)> = None;
 
-    let (verb_idx, predicate) = (0..tokens.len()).find_map(|i| {
-        let lower = strip_punct(tokens[i]).to_ascii_lowercase();
+    // Walk tokens manually so the lexicon-miss counter is always
+    // flushed — `find_map(...)?` previously dropped the accumulated
+    // misses on the no-verb-found path. CodeRabbit + chatgpt-codex
+    // PR #115 P1 #6: every verb-shaped token absent from the lexicon
+    // must increment `dep_parse_lexicon_miss_count`, regardless of
+    // whether the sentence ultimately produces a triple.
+    for (i, tok) in tokens.iter().enumerate() {
+        let lower = strip_punct(tok).to_ascii_lowercase();
         // Verbs are looked up in the lexicon directly. Surface forms
         // not present are recorded as misses ONLY when the token shape
         // looks like a verb (lowercase, alphabetic, length >= 3) — we
         // do not record every noun as a "lexicon miss".
         if let Some(predicate) = PREDICATE_LEXICON.get(lower.as_str()) {
-            Some((i, *predicate))
-        } else {
-            if looks_like_verb(&lower) {
-                lexicon_miss_for_sentence += 1;
-            }
-            None
+            verb_hit = Some((i, *predicate));
+            break;
+        } else if looks_like_verb(&lower) {
+            lexicon_miss_for_sentence += 1;
         }
-    })?;
+    }
 
+    // Flush the miss counter on BOTH paths — the previous shape leaked
+    // misses on the no-verb branch via the `?` short-circuit.
     if lexicon_miss_for_sentence > 0 {
         crate::observability::metrics()
             .dep_parse_lexicon_miss_count
             .fetch_add(lexicon_miss_for_sentence, Ordering::Relaxed);
     }
 
+    let (verb_idx, predicate) = verb_hit?;
     let subject_tokens = &tokens[..verb_idx];
     let object_tokens = &tokens[verb_idx + 1..];
 
@@ -942,6 +950,40 @@ mod tests {
             embed_kg_granules(&parsed, embed, &mut entity_index, &mut relation_index);
         assert!(ents > 0, "no entities embedded");
         assert!(rels > 0, "no relations embedded");
+    }
+
+    // ---- Lexicon-miss counter flush (CodeRabbit + claude-bot PR #115 P1 #6) ----
+
+    #[test]
+    fn lexicon_miss_counter_flushes_when_no_verb_matches() {
+        // Sentence with several verb-shaped tokens, none in
+        // PREDICATE_LEXICON. The earlier shape used `find_map(...)?`
+        // and dropped the accumulated miss count on the no-verb path;
+        // we now flush before the early return, so the global counter
+        // must rise by at least the number of unmapped verb-shaped
+        // tokens in the input.
+        let before = crate::observability::metrics()
+            .dep_parse_lexicon_miss_count
+            .load(Ordering::Relaxed);
+
+        // "glorked", "foo", "bar" are all alphabetic length >= 3 ->
+        // counted as "looks_like_verb" misses. "She" and "the" are
+        // filtered out by `looks_like_verb` (uppercase / stopword
+        // shape) so they don't contribute.
+        let p = extract_triples(Uuid::nil(), "She glorked the foo bar.");
+        assert!(
+            p.triples.is_empty(),
+            "no verb in PREDICATE_LEXICON should produce no triple; got {:?}",
+            p.triples
+        );
+
+        let after = crate::observability::metrics()
+            .dep_parse_lexicon_miss_count
+            .load(Ordering::Relaxed);
+        assert!(
+            after >= before + 3,
+            "expected lexicon_miss_count to rise by >=3 (glorked/foo/bar); was {before}, now {after}"
+        );
     }
 
     // ---- Pronoun-led subjects (CodeRabbit + chatgpt-codex PR #115 P0 #4) ----

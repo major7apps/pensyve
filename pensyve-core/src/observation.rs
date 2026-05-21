@@ -2893,6 +2893,22 @@ fn maybe_fire_dep_parse_hook(
     // Match the primary backend's 5s busy timeout so WAL contention does
     // not bounce the dep-parse write.
     let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    // Enable foreign-key enforcement on this fresh connection.
+    // SQLite turns FK enforcement OFF per-connection by default — the
+    // primary `SqliteBackend::open` issues `PRAGMA foreign_keys=ON` at
+    // construction but a separately-opened `Connection` does not
+    // inherit that. Without this PRAGMA, the `REFERENCES kg_entities(id)`
+    // constraints on `kg_triples` and `kg_passage_entities` are
+    // silently unenforced. claude-bot PR #115 P1 #7.
+    if let Err(e) = conn.execute_batch("PRAGMA foreign_keys=ON;") {
+        tracing::warn!(
+            target: "pensyve::observation::dep_parse",
+            error = %e,
+            observation_id = %observation.id,
+            "failed to enable foreign_keys on dep-parse connection"
+        );
+        return;
+    }
 
     if let Err(e) = crate::consolidation::run_dep_parse_hook(
         &conn,
