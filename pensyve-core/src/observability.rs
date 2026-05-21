@@ -131,6 +131,30 @@ pub struct PensyveMetrics {
     /// Distribution of `SelRoute` classification confidence values.
     pub selroute_confidence_histogram: HistogramBuckets,
 
+    // Phase 2B: dependency-parse KG construction metrics.
+    /// Total `(subject, predicate, object)` triples extracted from
+    /// observation passages by the Phase 2B shallow dependency parser.
+    /// Only incremented when `PENSYVE_DEP_PARSE` is enabled and the
+    /// consolidation hook fires.
+    pub dep_parse_triples_extracted: AtomicU64,
+    /// Total observations the dep-parse hook handled (one increment per
+    /// observation, regardless of how many triples it produced).
+    pub dep_parse_observations_processed: AtomicU64,
+    /// Total candidate verbs that were not present in
+    /// [`crate::extraction::dep_parse::PREDICATE_LEXICON`]. Surfaces
+    /// coverage gaps for monitoring; expanding the lexicon in an
+    /// addendum is the documented hedge per the Phase 2B plan.
+    pub dep_parse_lexicon_miss_count: AtomicU64,
+    /// Total sentences skipped because they exceeded the 200-token cap.
+    /// The shallow parser produces noisier output as clause depth grows;
+    /// tracking the skip rate lets operators decide whether to enable
+    /// the deferred LLM re-extraction path (Phase 3).
+    pub dep_parse_skipped_long_sentence: AtomicU64,
+    /// Latency distribution of the per-observation
+    /// `extract_triples + persist` pipeline. The Phase 2B acceptance
+    /// criterion is < 5ms p95.
+    pub dep_parse_duration: HistogramBuckets,
+
     // Histograms
     pub recall_duration: HistogramBuckets,
     pub embed_duration: HistogramBuckets,
@@ -162,6 +186,11 @@ impl PensyveMetrics {
                 AtomicU64::new(0),
             ],
             selroute_confidence_histogram: HistogramBuckets::new(CONFIDENCE_BUCKETS),
+            dep_parse_triples_extracted: AtomicU64::new(0),
+            dep_parse_observations_processed: AtomicU64::new(0),
+            dep_parse_lexicon_miss_count: AtomicU64::new(0),
+            dep_parse_skipped_long_sentence: AtomicU64::new(0),
+            dep_parse_duration: HistogramBuckets::new(DURATION_BUCKETS),
             recall_duration: HistogramBuckets::new(DURATION_BUCKETS),
             embed_duration: HistogramBuckets::new(DURATION_BUCKETS),
             store_duration: HistogramBuckets::new(DURATION_BUCKETS),
@@ -339,6 +368,56 @@ impl PensyveMetrics {
             );
         }
 
+        // Phase 2B: dep-parse KG construction counters.
+        let dep_parse_triples = self.dep_parse_triples_extracted.load(Ordering::Relaxed);
+        let dep_parse_obs = self
+            .dep_parse_observations_processed
+            .load(Ordering::Relaxed);
+        let dep_parse_miss = self.dep_parse_lexicon_miss_count.load(Ordering::Relaxed);
+        let dep_parse_skipped = self.dep_parse_skipped_long_sentence.load(Ordering::Relaxed);
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_dep_parse_triples_extracted_total Total (subject, predicate, object) triples extracted by Phase 2B dep-parse."
+        );
+        let _ = writeln!(
+            buf,
+            "# TYPE pensyve_dep_parse_triples_extracted_total counter"
+        );
+        let _ = writeln!(
+            buf,
+            "pensyve_dep_parse_triples_extracted_total {dep_parse_triples}"
+        );
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_dep_parse_observations_processed_total Total observations handled by the dep-parse hook."
+        );
+        let _ = writeln!(
+            buf,
+            "# TYPE pensyve_dep_parse_observations_processed_total counter"
+        );
+        let _ = writeln!(
+            buf,
+            "pensyve_dep_parse_observations_processed_total {dep_parse_obs}"
+        );
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_dep_parse_lexicon_miss_total Total candidate verbs not present in the predicate lexicon."
+        );
+        let _ = writeln!(buf, "# TYPE pensyve_dep_parse_lexicon_miss_total counter");
+        let _ = writeln!(buf, "pensyve_dep_parse_lexicon_miss_total {dep_parse_miss}");
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_dep_parse_skipped_long_sentence_total Total sentences skipped because they exceeded the 200-token cap."
+        );
+        let _ = writeln!(
+            buf,
+            "# TYPE pensyve_dep_parse_skipped_long_sentence_total counter"
+        );
+        let _ = writeln!(
+            buf,
+            "pensyve_dep_parse_skipped_long_sentence_total {dep_parse_skipped}"
+        );
+
         // Histograms
         buf.push_str(&self.recall_duration.prometheus_text(
             "pensyve_recall_duration_seconds",
@@ -355,6 +434,10 @@ impl PensyveMetrics {
         buf.push_str(&self.selroute_confidence_histogram.prometheus_text(
             "pensyve_selroute_confidence",
             "SelRoute classification confidence distribution in [0.0, 1.0].",
+        ));
+        buf.push_str(&self.dep_parse_duration.prometheus_text(
+            "pensyve_dep_parse_duration_seconds",
+            "Phase 2B dep-parse + persist pipeline duration in seconds.",
         ));
 
         buf

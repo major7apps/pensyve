@@ -105,15 +105,17 @@ fn fresh_store_lands_v2_migration() {
 
     let conn = open_raw(tmp.path());
 
-    // schema_versions has v=1 AND v=2.
+    // schema_versions has v=1 + v=2 + v=3 (Phase 2B added the
+    // dep-parse KG tables, so v=3 lands on every fresh-store open).
     let versions = schema_version_rows(&conn);
     assert_eq!(
         versions.len(),
-        2,
-        "expected v=1 and v=2 migration rows, got {versions:?}"
+        3,
+        "expected v=1 + v=2 + v=3 migration rows, got {versions:?}"
     );
     assert_eq!(versions[0].0, 1);
     assert_eq!(versions[1].0, 2);
+    assert_eq!(versions[2].0, 3);
 
     // observation_memories has the new columns.
     assert_v2_columns_present(&conn);
@@ -174,8 +176,8 @@ fn v2_migration_idempotent_on_third_open() {
     let versions = schema_version_rows(&conn);
     assert_eq!(
         versions.len(),
-        2,
-        "exactly 2 schema_versions rows after 3 opens; got {versions:?}"
+        3,
+        "exactly 3 schema_versions rows after 3 opens (v=1+v=2+v=3); got {versions:?}"
     );
     assert_v2_columns_present(&conn);
 }
@@ -321,7 +323,10 @@ fn v1_only_fixture_upgrades_to_v2() {
         let _backend = SqliteBackend::open(tmp.path()).expect("initial open");
     }
 
-    // Step 2: Manually roll back to a v=1-only state.
+    // Step 2: Manually roll back to a v=1-only state. The migration
+    // runner skips migrations whose version is `<= max_applied`, so we
+    // must also drop the v=3 row + kg_* tables — otherwise max_applied
+    // would stay at 3 and the v=2 migration would never re-run.
     {
         let conn = open_raw(tmp.path());
         for col in V2_NEW_COLUMNS {
@@ -331,8 +336,14 @@ fn v1_only_fixture_upgrades_to_v2() {
             )
             .unwrap_or_else(|e| panic!("drop column {col}: {e}"));
         }
-        conn.execute("DELETE FROM schema_versions WHERE version = 2", [])
-            .expect("delete v=2 schema_versions row");
+        conn.execute("DELETE FROM schema_versions WHERE version IN (2, 3)", [])
+            .expect("delete v=2 and v=3 schema_versions rows");
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS kg_passage_entities;
+             DROP TABLE IF EXISTS kg_triples;
+             DROP TABLE IF EXISTS kg_entities;",
+        )
+        .expect("drop kg_* tables");
     }
 
     // Insert a row in the v=1 schema (no new columns yet).
@@ -364,12 +375,12 @@ fn v1_only_fixture_upgrades_to_v2() {
     // v=2 columns now present.
     assert_v2_columns_present(&conn);
 
-    // schema_versions has both v=1 and v=2 again.
+    // schema_versions has v=1 + v=2 + v=3 again (Phase 2B added v=3).
     let versions = schema_version_rows(&conn);
     assert_eq!(
         versions.len(),
-        2,
-        "expected v=1 + v=2 after upgrade; got {versions:?}"
+        3,
+        "expected v=1 + v=2 + v=3 after upgrade; got {versions:?}"
     );
 
     // The legacy row survived with NULL across all new columns.

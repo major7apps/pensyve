@@ -718,6 +718,274 @@ markdown.";
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2B per-event gate hook: dependency-parse KG construction
+// ---------------------------------------------------------------------------
+
+/// Weight bonus applied to `kg_passage_entities` for each entity that
+/// appears as a triple endpoint (subject or object). Smaller than
+/// [`CAPITALIZED_ENTITY_WEIGHT`] so PPR (Phase 2C) does not over-
+/// emphasize lowercase / pronoun endpoints when a capitalized proper
+/// noun is also present in the passage. Conservative starting point;
+/// Phase 2F can tune.
+const TRIPLE_ENDPOINT_WEIGHT: f32 = 0.5;
+
+/// Weight applied to `kg_passage_entities` for each appearance of a
+/// capitalized non-stopword entity candidate in the passage. Stronger
+/// signal than the triple-endpoint weight because proper nouns / named
+/// entities are higher-precision PPR seeds.
+const CAPITALIZED_ENTITY_WEIGHT: f32 = 1.0;
+
+/// Per-event gate hook: shallow dependency parse + KG materialization.
+///
+/// Fires from the observation ingest path (alongside `run_typed_slots_hook`)
+/// when [`crate::extraction::dep_parse::dep_parse_enabled`] is on. Extracts
+/// `(subject, predicate, object)` triples from `observation_content` via
+/// the Rust-native shallow parser and persists them into the migration v3
+/// tables (`kg_entities`, `kg_triples`, `kg_passage_entities`). Phase 2C's
+/// Personalized `PageRank` reads from those tables at recall time; Phase 2B
+/// only writes.
+///
+/// The hook is intentionally synchronous (no `async fn`) — unlike the
+/// LLM-backed typed-slots hook, dep-parse is CPU-bound and runs in tens
+/// of microseconds per observation. Keeping it sync avoids unnecessary
+/// `await` plumbing on the ingest hot path.
+///
+/// ## Behavior
+///
+/// - Returns `Ok(0)` when [`crate::extraction::dep_parse::dep_parse_enabled`]
+///   is `false` (the no-op fast path the rollout's default-off rollout
+///   depends on).
+/// - Returns `Ok(triples_written)` on success.
+/// - Returns `Err(StorageError)` only on hard SQL failure — extract /
+///   persist is one logical unit; partial writes do not happen because
+///   each insert is independent and we only count successful ones.
+///
+/// Metric side-effects (via global `PensyveMetrics`):
+/// - `dep_parse_observations_processed` += 1 per call (even when no
+///   triples were extracted — we still observed the passage).
+/// - `dep_parse_triples_extracted` += number of triple rows actually
+///   written.
+/// - `dep_parse_duration` records the wall-clock duration of the
+///   extract + persist combined path.
+pub fn run_dep_parse_hook(
+    conn: &rusqlite::Connection,
+    namespace_id: Uuid,
+    passage_id: Uuid,
+    content: &str,
+) -> Result<usize, StorageError> {
+    if !crate::extraction::dep_parse::dep_parse_enabled() {
+        return Ok(0);
+    }
+    run_dep_parse_hook_inner(conn, namespace_id, passage_id, content)
+}
+
+/// Env-gate-free entry point for the dep-parse hook. Used by the
+/// integration tests so we can exercise the extraction + persist path
+/// without depending on the cached `OnceLock` env-flag read in
+/// [`crate::extraction::dep_parse::dep_parse_enabled`].
+#[doc(hidden)]
+pub fn run_dep_parse_hook_inner(
+    conn: &rusqlite::Connection,
+    namespace_id: Uuid,
+    passage_id: Uuid,
+    content: &str,
+) -> Result<usize, StorageError> {
+    use crate::extraction::dep_parse;
+
+    let metrics = crate::observability::metrics();
+    metrics
+        .dep_parse_observations_processed
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let started = Instant::now();
+    let parsed = dep_parse::extract_triples(passage_id, content);
+
+    // ---- Atomic transaction (CodeRabbit + claude-bot PR #115 P0 #2) ----
+    //
+    // The KG write set spans three tables (`kg_entities`, `kg_triples`,
+    // `kg_passage_entities`) and ~3N inserts per passage. Without an
+    // explicit transaction a mid-hook failure would leave partial state
+    // — orphaned entities with no triples referencing them, or triples
+    // with no companion `kg_passage_entities` row.
+    //
+    // `unchecked_transaction()` returns a `Transaction` that commits on
+    // an explicit `.commit()?` and otherwise rolls back via the `Drop`
+    // guard. We use `unchecked_*` instead of `transaction()` because the
+    // hook is called with `&Connection` (not `&mut Connection`) from
+    // both the production wiring in `observation::maybe_fire_dep_parse_hook`
+    // and the integration tests; the underlying guarantee (one writer at
+    // a time per SQLite connection) holds because the hook itself never
+    // hands the connection out to another thread.
+    let tx = conn.unchecked_transaction()?;
+
+    let now_unix: i64 = chrono::Utc::now().timestamp();
+    let namespace_str = namespace_id.to_string();
+    let passage_str = passage_id.to_string();
+
+    // ---- Persist entities (upsert by (namespace_id, lemma)) ----
+    //
+    // Map lemma → entity row id so subsequent `kg_triples` /
+    // `kg_passage_entities` rows can reference the correct id.
+    let mut entity_id_by_lemma: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+
+    for lemma in &parsed.entities {
+        // INSERT OR IGNORE handles the race / re-ingest case where the
+        // entity is already present. The follow-up SELECT resolves the
+        // canonical id either way.
+        tx.execute(
+            "INSERT OR IGNORE INTO kg_entities (namespace_id, lemma, created_at) \
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![namespace_str, lemma, now_unix],
+        )?;
+        let id: i64 = tx.query_row(
+            "SELECT id FROM kg_entities WHERE namespace_id = ?1 AND lemma = ?2",
+            rusqlite::params![namespace_str, lemma],
+            |row| row.get(0),
+        )?;
+        entity_id_by_lemma.insert(lemma.clone(), id);
+    }
+
+    // ---- Persist triples ----
+    //
+    // `INSERT OR IGNORE` against the migration-v3 UNIQUE constraint
+    // `(namespace_id, passage_id, subject_id, predicate, object_id)`
+    // makes re-ingest of the same passage a no-op at the row level.
+    // The returned `changes()` reports rows actually inserted (0 on
+    // duplicate, 1 on insert) so `triples_written` reflects new edges
+    // only.
+    let mut triples_written = 0usize;
+    for t in &parsed.triples {
+        let subject_lemma = canonical_lemma(&t.subject);
+        let object_lemma = canonical_lemma(&t.object);
+
+        // The subject / object lemma must already exist as an entity so
+        // the FK lookup succeeds. Resolve via `entity_id_by_lemma`;
+        // upsert a new row if the lemma was not promoted by the
+        // entity-candidate pass (e.g., a lowercase pronoun subject).
+        let subject_id = resolve_or_upsert_entity(
+            &tx,
+            &namespace_str,
+            &subject_lemma,
+            now_unix,
+            &mut entity_id_by_lemma,
+        )?;
+        let object_id = resolve_or_upsert_entity(
+            &tx,
+            &namespace_str,
+            &object_lemma,
+            now_unix,
+            &mut entity_id_by_lemma,
+        )?;
+
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO kg_triples (namespace_id, passage_id, subject_id, predicate, object_id, confidence, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                namespace_str,
+                passage_str,
+                subject_id,
+                t.predicate,
+                object_id,
+                t.confidence,
+                now_unix,
+            ],
+        )?;
+        triples_written += inserted;
+    }
+
+    // ---- Persist passage-entity weights ----
+    //
+    // Build a weighted set of every entity that participates in the
+    // passage — capitalized candidates (weight = 1.0 per appearance) AND
+    // every subject/object endpoint of an inserted triple (weight bonus
+    // = 0.5). Triple-endpoint inclusion fixes coderabbit + chatgpt-codex
+    // P0 #5 on PR #115: lowercase / pronoun endpoints used to fall out
+    // of `kg_passage_entities` entirely because they were not in
+    // `parsed.entities`, so PPR (Phase 2C) would lose them.
+    //
+    // Weight rationale: capitalized candidates are stronger signals
+    // (proper nouns, named entities) — bias slightly toward them so PPR
+    // does not over-emphasize pronoun endpoints when both are present.
+    // 1.0 vs 0.5 is a conservative starting point; Phase 2F can tune.
+    //
+    // `INSERT OR REPLACE` (vs the `INSERT OR IGNORE` used elsewhere)
+    // because the desired semantics on re-ingest is "overwrite with the
+    // latest weight" rather than "first-write wins" — re-extraction
+    // with an expanded lexicon should be reflected immediately.
+    let mut weight_by_entity: std::collections::HashMap<i64, f32> =
+        std::collections::HashMap::new();
+    for lemma in &parsed.entities {
+        if let Some(&id) = entity_id_by_lemma.get(lemma) {
+            *weight_by_entity.entry(id).or_insert(0.0) += CAPITALIZED_ENTITY_WEIGHT;
+        }
+    }
+    for t in &parsed.triples {
+        let subject_lemma = canonical_lemma(&t.subject);
+        let object_lemma = canonical_lemma(&t.object);
+        if let Some(&id) = entity_id_by_lemma.get(&subject_lemma) {
+            *weight_by_entity.entry(id).or_insert(0.0) += TRIPLE_ENDPOINT_WEIGHT;
+        }
+        if let Some(&id) = entity_id_by_lemma.get(&object_lemma) {
+            *weight_by_entity.entry(id).or_insert(0.0) += TRIPLE_ENDPOINT_WEIGHT;
+        }
+    }
+    for (entity_id, weight) in &weight_by_entity {
+        tx.execute(
+            "INSERT OR REPLACE INTO kg_passage_entities (passage_id, entity_id, weight) \
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![passage_str, entity_id, weight],
+        )?;
+    }
+
+    // Commit atomically — any earlier `?` would have dropped the tx
+    // unwound and rolled back automatically.
+    tx.commit()?;
+
+    metrics
+        .dep_parse_triples_extracted
+        .fetch_add(triples_written as u64, std::sync::atomic::Ordering::Relaxed);
+    let elapsed_secs = started.elapsed().as_secs_f64();
+    metrics.dep_parse_duration.observe(elapsed_secs);
+
+    Ok(triples_written)
+}
+
+/// Normalize a subject / object surface form into its canonical lemma
+/// (the key under which `kg_entities` is indexed). Today this is just
+/// a trim — capitalization is preserved so multi-word proper nouns stay
+/// readable when inspected via SQL. Centralized so future tweaks land
+/// in one place.
+fn canonical_lemma(raw: &str) -> String {
+    raw.trim().to_string()
+}
+
+/// Resolve an entity row id by lemma, upserting if absent.
+fn resolve_or_upsert_entity(
+    conn: &rusqlite::Connection,
+    namespace_str: &str,
+    lemma: &str,
+    now_unix: i64,
+    cache: &mut std::collections::HashMap<String, i64>,
+) -> Result<i64, StorageError> {
+    if let Some(&id) = cache.get(lemma) {
+        return Ok(id);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO kg_entities (namespace_id, lemma, created_at) \
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![namespace_str, lemma, now_unix],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM kg_entities WHERE namespace_id = ?1 AND lemma = ?2",
+        rusqlite::params![namespace_str, lemma],
+        |row| row.get(0),
+    )?;
+    cache.insert(lemma.to_string(), id);
+    Ok(id)
+}
+
 /// Apply a [`TypedSlots`] result to the column-name → value mapping the
 /// caller will bind into a SQL UPDATE statement. Centralises the slot-
 /// column naming convention (column = `{kind}_slot`) so SQL sites cannot
@@ -1205,5 +1473,302 @@ mod tests {
         assert_eq!(stats.promoted, 0);
         assert_eq!(stats.decayed, 0);
         assert_eq!(stats.archived, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2B integration tests — dep-parse hook + KG persistence
+    //
+    // We call `run_dep_parse_hook_inner` directly so the test does not
+    // depend on the cached `PENSYVE_DEP_PARSE` env-flag (which would
+    // otherwise pollute every subsequent test in the binary).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dep_parse_hook_populates_kg_tables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = make_storage(tmp.path().to_str().unwrap());
+        let ns = Namespace::new("dep-parse-it");
+        storage.save_namespace(&ns).unwrap();
+
+        let passage_id = Uuid::new_v4();
+        let content = "Alice works at Acme. Bob lives in Brooklyn.";
+
+        // Open a fresh rusqlite connection on the same DB file.
+        let db_path = storage.db_path().unwrap().to_path_buf();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+        let triples_written = run_dep_parse_hook_inner(&conn, ns.id, passage_id, content).unwrap();
+        assert!(
+            triples_written >= 2,
+            "expected at least 2 triples from the test passage, wrote {triples_written}"
+        );
+
+        // Verify kg_entities has Alice + Acme + Bob + Brooklyn.
+        let entity_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kg_entities WHERE namespace_id = ?1",
+                rusqlite::params![ns.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            entity_count >= 4,
+            "expected ≥4 kg_entities rows (Alice/Acme/Bob/Brooklyn); got {entity_count}"
+        );
+
+        // Verify kg_triples has the expected predicates.
+        let mut stmt = conn
+            .prepare("SELECT predicate FROM kg_triples WHERE namespace_id = ?1 AND passage_id = ?2")
+            .unwrap();
+        let preds: Vec<String> = stmt
+            .query_map(
+                rusqlite::params![ns.id.to_string(), passage_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            preds.iter().any(|p| p == "works_at"),
+            "expected works_at predicate; got {preds:?}"
+        );
+        assert!(
+            preds.iter().any(|p| p == "lives_in"),
+            "expected lives_in predicate; got {preds:?}"
+        );
+
+        // Verify kg_passage_entities is populated for this passage.
+        let pe_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kg_passage_entities WHERE passage_id = ?1",
+                rusqlite::params![passage_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            pe_count >= 2,
+            "expected ≥2 kg_passage_entities rows; got {pe_count}"
+        );
+    }
+
+    #[test]
+    fn dep_parse_hook_handles_empty_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = make_storage(tmp.path().to_str().unwrap());
+        let ns = Namespace::new("dep-parse-empty");
+        storage.save_namespace(&ns).unwrap();
+
+        let conn = rusqlite::Connection::open(storage.db_path().unwrap()).unwrap();
+        let n = run_dep_parse_hook_inner(&conn, ns.id, Uuid::new_v4(), "").unwrap();
+        assert_eq!(n, 0, "empty content should write zero triples");
+    }
+
+    #[test]
+    fn dep_parse_hook_reingest_does_not_double_kg_triples() {
+        // Re-running the hook against the same passage_id must NOT
+        // double the kg_triples row count. CodeRabbit PR #115 P0 #1:
+        // earlier draft used a bare `INSERT` for triples and would
+        // duplicate every edge on each re-ingest. Migration v3 now
+        // carries a UNIQUE(namespace_id, passage_id, subject_id,
+        // predicate, object_id) constraint and the hook uses
+        // `INSERT OR IGNORE`, so the second run reports 0 new rows
+        // and the row count is stable.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = make_storage(tmp.path().to_str().unwrap());
+        let ns = Namespace::new("dep-parse-reingest");
+        storage.save_namespace(&ns).unwrap();
+
+        let conn = rusqlite::Connection::open(storage.db_path().unwrap()).unwrap();
+        let passage_id = Uuid::new_v4();
+        let content = "Carol owns Acme.";
+
+        let first = run_dep_parse_hook_inner(&conn, ns.id, passage_id, content).unwrap();
+        assert!(first > 0, "first ingest should insert ≥1 triple");
+
+        // Row count after first ingest — captured BEFORE the second
+        // run so we can compare exactly.
+        let triples_after_first: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kg_triples WHERE passage_id = ?1",
+                rusqlite::params![passage_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            triples_after_first as usize, first,
+            "row count after first ingest must equal the reported insertion count"
+        );
+
+        let second = run_dep_parse_hook_inner(&conn, ns.id, passage_id, content).unwrap();
+        assert_eq!(
+            second, 0,
+            "second ingest of the same passage must report 0 new triples (UNIQUE constraint short-circuits INSERT OR IGNORE)"
+        );
+
+        // Row count after second ingest — MUST equal the first run's
+        // count. Doubling here would mean the UNIQUE constraint is
+        // missing or the INSERT OR IGNORE was reverted.
+        let triples_after_second: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kg_triples WHERE passage_id = ?1",
+                rusqlite::params![passage_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            triples_after_second, triples_after_first,
+            "kg_triples doubled on re-ingest: was {triples_after_first} rows, now {triples_after_second}"
+        );
+
+        // kg_entities for the namespace should not duplicate (UNIQUE
+        // constraint on (namespace_id, lemma)).
+        let entity_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kg_entities WHERE namespace_id = ?1",
+                rusqlite::params![ns.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            entity_count, 2,
+            "expected exactly 2 entities (Carol, Acme); got {entity_count}"
+        );
+    }
+
+    #[test]
+    fn dep_parse_hook_rolls_back_on_mid_hook_failure() {
+        // CodeRabbit + claude-bot PR #115 P0 #2: the hook must be
+        // atomic. We simulate a mid-hook failure by dropping the
+        // `kg_passage_entities` table after the connection opens but
+        // before the hook runs — the entity + triple inserts will
+        // succeed (transaction not yet committed), then the
+        // `kg_passage_entities` insert will fail, and the `Drop` guard
+        // on the unchecked transaction will roll the whole thing back.
+        // After the failure, NO rows should exist in any of the three
+        // KG tables for this namespace / passage.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = make_storage(tmp.path().to_str().unwrap());
+        let ns = Namespace::new("dep-parse-rollback");
+        storage.save_namespace(&ns).unwrap();
+
+        let conn = rusqlite::Connection::open(storage.db_path().unwrap()).unwrap();
+        // Drop the third write target so the hook's final insert step
+        // fails. Entity + triple inserts will all execute against the
+        // transaction; the final pass-entity insert raises a SQLite
+        // error, the `?` short-circuits, the transaction `Drop`s,
+        // SQLite rolls back, and the entity / triple rows from this
+        // call evaporate too.
+        conn.execute_batch("DROP TABLE kg_passage_entities;")
+            .unwrap();
+
+        let passage_id = Uuid::new_v4();
+        let content = "Alice works at Acme.";
+
+        let result = run_dep_parse_hook_inner(&conn, ns.id, passage_id, content);
+        assert!(
+            result.is_err(),
+            "hook must propagate the mid-write SQL error"
+        );
+
+        // Re-create the table so the post-failure assertions can run
+        // against the same DB (migration v3's `IF NOT EXISTS` would
+        // have left a vacuum-shaped schema, but we need the table back
+        // to query it).
+        conn.execute_batch(
+            "CREATE TABLE kg_passage_entities (
+                passage_id TEXT NOT NULL,
+                entity_id  INTEGER NOT NULL REFERENCES kg_entities(id),
+                weight     REAL NOT NULL,
+                PRIMARY KEY(passage_id, entity_id)
+            );",
+        )
+        .unwrap();
+
+        for table in ["kg_entities", "kg_triples", "kg_passage_entities"] {
+            let scoped_count: i64 = match table {
+                "kg_entities" => conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM kg_entities WHERE namespace_id = ?1",
+                        rusqlite::params![ns.id.to_string()],
+                        |r| r.get(0),
+                    )
+                    .unwrap(),
+                "kg_triples" => conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM kg_triples WHERE passage_id = ?1",
+                        rusqlite::params![passage_id.to_string()],
+                        |r| r.get(0),
+                    )
+                    .unwrap(),
+                "kg_passage_entities" => conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM kg_passage_entities WHERE passage_id = ?1",
+                        rusqlite::params![passage_id.to_string()],
+                        |r| r.get(0),
+                    )
+                    .unwrap(),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                scoped_count, 0,
+                "{table} should be empty after rollback (transaction must NOT leave partial state); got {scoped_count} rows"
+            );
+        }
+    }
+
+    #[test]
+    fn dep_parse_hook_includes_triple_endpoints_in_kg_passage_entities() {
+        // CodeRabbit + chatgpt-codex PR #115 P0 #5: every triple
+        // endpoint (subject AND object) must land in
+        // `kg_passage_entities` even when the endpoint lemma is
+        // lowercase / pronoun / multi-word and therefore not in
+        // `parsed.entities`. Without this, PPR (Phase 2C) loses every
+        // edge whose endpoints aren't capitalized.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = make_storage(tmp.path().to_str().unwrap());
+        let ns = Namespace::new("dep-parse-endpoints");
+        storage.save_namespace(&ns).unwrap();
+
+        let conn = rusqlite::Connection::open(storage.db_path().unwrap()).unwrap();
+        let passage_id = Uuid::new_v4();
+        // Mixed passage:
+        //   "I prefer dark mode."   → triple (I, prefers, dark mode)
+        //     — "I" + "dark mode" are NOT in parsed.entities (pronoun /
+        //       lowercase) but must reach kg_passage_entities via the
+        //       triple-endpoint pass.
+        //   "She works at Acme."    → triple (She, works_at, Acme)
+        //     — "Acme" IS in parsed.entities; "She" is not (pronoun).
+        let content = "I prefer dark mode. She works at Acme.";
+
+        run_dep_parse_hook_inner(&conn, ns.id, passage_id, content).unwrap();
+
+        // Map lemma → (entity_id, weight) for this passage.
+        let mut stmt = conn
+            .prepare(
+                "SELECT e.lemma, p.weight \
+                 FROM kg_passage_entities p \
+                 JOIN kg_entities e ON e.id = p.entity_id \
+                 WHERE p.passage_id = ?1",
+            )
+            .unwrap();
+        let endpoints: Vec<(String, f32)> = stmt
+            .query_map(rusqlite::params![passage_id.to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        let lemmas: Vec<&str> = endpoints.iter().map(|(l, _)| l.as_str()).collect();
+        for expected in &["I", "dark mode", "She", "Acme"] {
+            assert!(
+                lemmas.contains(expected),
+                "expected lemma {expected:?} in kg_passage_entities; got {lemmas:?}"
+            );
+        }
+        // Every recorded weight is strictly positive.
+        for (lemma, w) in &endpoints {
+            assert!(*w > 0.0, "lemma {lemma:?} has non-positive weight {w}");
+        }
     }
 }

@@ -17,7 +17,7 @@ name = "pensyve_core"
 
 [dependencies]
 rusqlite = { version = "0.39", features = ["bundled", "vtab"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -26,6 +26,11 @@ dirs = "6"
 regex = "1"
 fastembed = "^5.13"
 petgraph = "0.8"
+# Phase 2B: compile-time predicate-verb lexicon for the shallow dependency
+# parser (`extraction::dep_parse`). `phf::Map` keys are interned at build
+# time, so verb→relation lookups are zero-allocation and branch-light on
+# the ingest hot path.
+phf = { version = "0.11", features = ["macros"] }
 dashmap = "6"
 rayon = "1.10"
 tracing = "0.1"

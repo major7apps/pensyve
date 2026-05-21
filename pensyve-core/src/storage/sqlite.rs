@@ -93,6 +93,10 @@ impl SqliteBackend {
     ///     all migrations against the legacy projection tables; existing rows
     ///     get NULL for the new columns per the locked NULL-default design)
     ///   * a store where this runner already ran (no-op)
+    #[allow(
+        clippy::too_many_lines,
+        reason = "linear migration registry — each new migration version grows the body by ~25 lines. Splitting per-version would obscure the ordering invariant (max_applied is read once at top; versions must fire in monotonically-increasing order)."
+    )]
     fn run_versioned_migrations(conn: &Connection) -> StorageResult<()> {
         // Bootstrap: ensure the registry table exists before we read from it.
         conn.execute_batch(
@@ -200,6 +204,85 @@ impl SqliteBackend {
                     2_i64,
                     Utc::now().to_rfc3339(),
                     "G3: add typed-slot + chain_summary NULLABLE columns to observation_memories",
+                ],
+            )?;
+        }
+
+        // ----- Migration v3: Phase 2B dependency-parse KG tables. -----
+        //
+        // Materializes a knowledge graph populated by
+        // `extraction::dep_parse::extract_triples` so Phase 2C's
+        // Personalized PageRank can read entity / triple / passage-entity
+        // structure at recall time. Phase 2B itself only writes; the read
+        // path lands in Phase 2C.
+        //
+        // All three tables use `CREATE TABLE IF NOT EXISTS` for
+        // idempotency (mirrors the v1 / v2 pattern). The `kg_entities`
+        // unique constraint on `(namespace_id, lemma)` makes the hook's
+        // upsert path a simple INSERT OR IGNORE followed by a SELECT.
+        // Indexes on `namespace_id`, `subject_id`, `object_id`, and
+        // `passage_id` make the Phase 2C PPR adjacency build a covering
+        // lookup rather than a full table scan.
+        //
+        // Schema design locked in the Phase 2B agentic worker instructions
+        // at `pensyve-docs/plans/2026-05-21-pensyve-phase2-algorithmic-stack.md`
+        // §"Phase 2B — Schema migration (v3)".
+        if max_applied < 3 {
+            // NOTE: `namespace_id` is stored as TEXT here (UUID string)
+            // for consistency with the rest of the Pensyve schema —
+            // every existing projection table (`episodic_memories`,
+            // `semantic_memories`, `procedural_memories`,
+            // `observation_memories`, `entities`, `episodes`) stores
+            // `namespace_id` as TEXT. The Phase 2B plan task list reads
+            // "INTEGER NOT NULL" but that conflicts with the FK target
+            // (`namespaces.id TEXT NOT NULL`); TEXT is the consistent
+            // choice.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS kg_entities (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    namespace_id TEXT NOT NULL,
+                    lemma        TEXT NOT NULL,
+                    embedding    BLOB,
+                    created_at   INTEGER NOT NULL,
+                    UNIQUE(namespace_id, lemma)
+                );
+                CREATE TABLE IF NOT EXISTS kg_triples (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    namespace_id TEXT NOT NULL,
+                    passage_id   TEXT NOT NULL,
+                    subject_id   INTEGER NOT NULL REFERENCES kg_entities(id),
+                    predicate    TEXT NOT NULL,
+                    object_id    INTEGER NOT NULL REFERENCES kg_entities(id),
+                    confidence   REAL NOT NULL,
+                    created_at   INTEGER NOT NULL,
+                    -- Re-ingest of the same passage must NOT double the
+                    -- KG row count. The logical edge identity is
+                    -- `(namespace, passage, subject, predicate, object)`;
+                    -- the hook uses `INSERT OR IGNORE` against this
+                    -- constraint, so a repeated extraction is a no-op.
+                    UNIQUE(namespace_id, passage_id, subject_id, predicate, object_id)
+                );
+                CREATE TABLE IF NOT EXISTS kg_passage_entities (
+                    passage_id TEXT NOT NULL,
+                    entity_id  INTEGER NOT NULL REFERENCES kg_entities(id),
+                    weight     REAL NOT NULL,
+                    PRIMARY KEY(passage_id, entity_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_kg_entities_ns      ON kg_entities(namespace_id);
+                CREATE INDEX IF NOT EXISTS idx_kg_triples_ns       ON kg_triples(namespace_id);
+                CREATE INDEX IF NOT EXISTS idx_kg_triples_subj     ON kg_triples(subject_id);
+                CREATE INDEX IF NOT EXISTS idx_kg_triples_obj      ON kg_triples(object_id);
+                CREATE INDEX IF NOT EXISTS idx_kg_triples_pass     ON kg_triples(passage_id);
+                CREATE INDEX IF NOT EXISTS idx_kgpe_entity         ON kg_passage_entities(entity_id);",
+            )?;
+
+            conn.execute(
+                "INSERT INTO schema_versions (version, applied_at, description)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    3_i64,
+                    Utc::now().to_rfc3339(),
+                    "Phase 2B: dep-parse KG tables (kg_entities, kg_triples, kg_passage_entities) + indexes",
                 ],
             )?;
         }
@@ -1344,6 +1427,37 @@ impl StorageTrait for SqliteBackend {
         let id_str = entity_id.to_string();
         conn.execute_batch("BEGIN")?;
         let result = (|| -> StorageResult<usize> {
+            // Phase 2B cascade (CodeRabbit PR #115 round 2): the
+            // observations slated for delete may have populated
+            // `kg_triples` / `kg_passage_entities` rows keyed by their
+            // `id` (== `passage_id`). Remove those BEFORE deleting the
+            // owning observation rows so the cleanup matches the
+            // observation set being deleted; `kg_entities` are kept
+            // (they're namespace-scoped, not passage-scoped, and may
+            // be referenced by other observations' triples — they
+            // only get purged in `purge_namespace`).
+            conn.execute(
+                "DELETE FROM kg_triples \
+                 WHERE passage_id IN (\
+                   SELECT id FROM observation_memories \
+                    WHERE episode_id IN (\
+                      SELECT DISTINCT episode_id FROM episodic_memories \
+                       WHERE about_entity = ?1 OR source_entity = ?1\
+                    )\
+                 )",
+                params![&id_str],
+            )?;
+            conn.execute(
+                "DELETE FROM kg_passage_entities \
+                 WHERE passage_id IN (\
+                   SELECT id FROM observation_memories \
+                    WHERE episode_id IN (\
+                      SELECT DISTINCT episode_id FROM episodic_memories \
+                       WHERE about_entity = ?1 OR source_entity = ?1\
+                    )\
+                 )",
+                params![&id_str],
+            )?;
             // Strip FTS entries first — we need the observation IDs before
             // the rows are gone.
             conn.execute(
@@ -1385,6 +1499,21 @@ impl StorageTrait for SqliteBackend {
         let ep_str = episode_id.to_string();
         conn.execute_batch("BEGIN")?;
         let result = (|| -> StorageResult<usize> {
+            // Phase 2B cascade (CodeRabbit PR #115 round 2): drop
+            // `kg_triples` and `kg_passage_entities` keyed by the
+            // departing observation IDs before the owning rows are
+            // gone. `kg_entities` are namespace-scoped and may still
+            // be referenced by surviving observations; leave them.
+            conn.execute(
+                "DELETE FROM kg_triples \
+                 WHERE passage_id IN (SELECT id FROM observation_memories WHERE episode_id = ?1)",
+                params![&ep_str],
+            )?;
+            conn.execute(
+                "DELETE FROM kg_passage_entities \
+                 WHERE passage_id IN (SELECT id FROM observation_memories WHERE episode_id = ?1)",
+                params![&ep_str],
+            )?;
             conn.execute(
                 "DELETE FROM memory_fts \
                  WHERE memory_type = 'observation' \
@@ -1980,6 +2109,19 @@ impl StorageTrait for SqliteBackend {
         )?;
         if n > 0 {
             deleted = true;
+            // Phase 2B cascade (CodeRabbit PR #115 round 2): if the
+            // departing row was an observation, drop its `kg_triples`
+            // and `kg_passage_entities` (both keyed by `passage_id ==
+            // observation.id`). Other memory types do not populate
+            // KG tables so the cascade is observation-only.
+            conn.execute(
+                "DELETE FROM kg_triples WHERE passage_id = ?1",
+                params![&id_str],
+            )?;
+            conn.execute(
+                "DELETE FROM kg_passage_entities WHERE passage_id = ?1",
+                params![&id_str],
+            )?;
         }
 
         // Remove from FTS index.
@@ -2001,6 +2143,31 @@ impl StorageTrait for SqliteBackend {
 
         let result = (|| -> StorageResult<usize> {
             let mut total = 0usize;
+
+            // Phase 2B cascade (CodeRabbit PR #115 round 2): purge the
+            // KG before the owning observation rows are gone. Order:
+            //   1. kg_passage_entities (no namespace column → must
+            //      reach them via the observation IDs about to be
+            //      deleted, OR via the kg_entities IDs about to be
+            //      deleted; we use the latter since kg_entities is
+            //      namespace-scoped).
+            //   2. kg_triples (namespace-scoped, direct delete).
+            //   3. kg_entities (namespace-scoped, direct delete) —
+            //      done LAST so the FK from kg_passage_entities is
+            //      intact when row 1 runs.
+            conn.execute(
+                "DELETE FROM kg_passage_entities \
+                 WHERE entity_id IN (SELECT id FROM kg_entities WHERE namespace_id = ?1)",
+                params![&ns_str],
+            )?;
+            conn.execute(
+                "DELETE FROM kg_triples WHERE namespace_id = ?1",
+                params![&ns_str],
+            )?;
+            conn.execute(
+                "DELETE FROM kg_entities WHERE namespace_id = ?1",
+                params![&ns_str],
+            )?;
 
             // Bulk delete from each memory table by namespace_id.
             total += conn.execute(
@@ -3498,5 +3665,360 @@ mod tests {
             })
             .collect();
         assert_eq!(instances_a, vec!["a-instance"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2B migration v3 tests — dep-parse KG tables
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn migration_v3_creates_kg_tables_on_fresh_db() {
+        let (_dir, db) = setup();
+        let conn = db.conn.lock().unwrap();
+
+        for table in ["kg_entities", "kg_triples", "kg_passage_entities"] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                exists, 1,
+                "expected table {table} to exist after migration v3"
+            );
+        }
+
+        for idx in [
+            "idx_kg_entities_ns",
+            "idx_kg_triples_ns",
+            "idx_kg_triples_subj",
+            "idx_kg_triples_obj",
+            "idx_kg_triples_pass",
+            "idx_kgpe_entity",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name = ?1",
+                    [idx],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                exists, 1,
+                "expected index {idx} to exist after migration v3"
+            );
+        }
+
+        // schema_versions registry should contain v3.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_versions WHERE version = 3",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "schema_versions registry missing v3 row");
+    }
+
+    #[test]
+    fn migration_v3_is_idempotent_on_rerun() {
+        let dir = TempDir::new().unwrap();
+        // Open + close + reopen: the second open triggers `run_versioned_migrations`
+        // against a store where v3 is already applied. Idempotency = no panic,
+        // no duplicate `schema_versions` row.
+        {
+            let _db = SqliteBackend::open(dir.path()).unwrap();
+        }
+        let db = SqliteBackend::open(dir.path()).unwrap();
+        let conn = db.conn.lock().unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_versions WHERE version = 3",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "migration v3 ran twice — schema_versions has {count} rows for v3 (expected 1)"
+        );
+    }
+
+    #[test]
+    fn migration_v3_upgrades_existing_pre_v3_store() {
+        // Simulate a store that previously stopped at v2 (no kg_* tables)
+        // by removing the v3 row + tables, then re-running migrations
+        // and asserting the tables come back.
+        let (_dir, db) = setup();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute("DELETE FROM schema_versions WHERE version = 3", [])
+                .unwrap();
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS kg_passage_entities;
+                 DROP TABLE IF EXISTS kg_triples;
+                 DROP TABLE IF EXISTS kg_entities;",
+            )
+            .unwrap();
+        }
+        // Re-run migrations against the now-degraded store.
+        {
+            let conn = db.conn.lock().unwrap();
+            SqliteBackend::run_versioned_migrations(&conn).unwrap();
+        }
+        let conn = db.conn.lock().unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'kg_triples'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            exists, 1,
+            "kg_triples should be recreated by migration v3 re-run"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2B KG cascade-delete tests (CodeRabbit PR #115 round 2)
+    //
+    // Each test seeds the kg_* tables directly via raw SQL so the
+    // assertions stay independent of the dep-parse hook's extraction
+    // contract. The cascade paths we exercise are:
+    //   - delete_observations_by_episode
+    //   - delete_observations_by_entity
+    //   - delete_memory_by_id (observation case)
+    //   - purge_namespace
+    // -----------------------------------------------------------------------
+
+    /// Insert a synthetic `kg_entities` row and return its rowid.
+    fn seed_kg_entity(db: &SqliteBackend, namespace_id: Uuid, lemma: &str) -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO kg_entities (namespace_id, lemma, created_at) VALUES (?1, ?2, 0)",
+            params![namespace_id.to_string(), lemma],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// Insert a synthetic `kg_triples` + `kg_passage_entities` pair so
+    /// the cascade tests have rows to delete.
+    fn seed_kg_triple(
+        db: &SqliteBackend,
+        namespace_id: Uuid,
+        passage_id: Uuid,
+        subject_id: i64,
+        object_id: i64,
+    ) {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO kg_triples (namespace_id, passage_id, subject_id, predicate, object_id, confidence, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            params![
+                namespace_id.to_string(),
+                passage_id.to_string(),
+                subject_id,
+                "test_relation",
+                object_id,
+                0.9_f32,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kg_passage_entities (passage_id, entity_id, weight) VALUES (?1, ?2, 1.0)",
+            params![passage_id.to_string(), subject_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kg_passage_entities (passage_id, entity_id, weight) VALUES (?1, ?2, 1.0)",
+            params![passage_id.to_string(), object_id],
+        )
+        .unwrap();
+    }
+
+    fn kg_triples_count_for_passage(db: &SqliteBackend, passage_id: Uuid) -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM kg_triples WHERE passage_id = ?1",
+            params![passage_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn kg_passage_entities_count_for_passage(db: &SqliteBackend, passage_id: Uuid) -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM kg_passage_entities WHERE passage_id = ?1",
+            params![passage_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn kg_entities_count_for_namespace(db: &SqliteBackend, namespace_id: Uuid) -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM kg_entities WHERE namespace_id = ?1",
+            params![namespace_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn delete_observations_by_episode_cascades_kg_rows() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let ep = Uuid::new_v4();
+
+        let obs = ObservationMemory::new(ns.id, ep, "x", "y", "z", "c");
+        db.save_observation(&obs).unwrap();
+
+        let alice = seed_kg_entity(&db, ns.id, "Alice");
+        let acme = seed_kg_entity(&db, ns.id, "Acme");
+        seed_kg_triple(&db, ns.id, obs.id, alice, acme);
+
+        assert_eq!(kg_triples_count_for_passage(&db, obs.id), 1);
+        assert_eq!(kg_passage_entities_count_for_passage(&db, obs.id), 2);
+
+        db.delete_observations_by_episode(ep).unwrap();
+
+        assert_eq!(
+            kg_triples_count_for_passage(&db, obs.id),
+            0,
+            "kg_triples must cascade with the observation episode"
+        );
+        assert_eq!(
+            kg_passage_entities_count_for_passage(&db, obs.id),
+            0,
+            "kg_passage_entities must cascade with the observation episode"
+        );
+        // kg_entities are namespace-scoped — they survive an
+        // episode-scoped delete because they may be referenced by
+        // other (surviving) episodes' triples.
+        assert_eq!(
+            kg_entities_count_for_namespace(&db, ns.id),
+            2,
+            "kg_entities are namespace-scoped and must NOT cascade with an episode delete"
+        );
+    }
+
+    #[test]
+    fn delete_observations_by_entity_cascades_kg_rows() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+
+        // To exercise the cascade we need an episodic memory that
+        // references the entity to delete, plus an observation tied
+        // to that episode. The episodic.about_entity / source_entity
+        // columns drive the cascade JOIN.
+        let about = Uuid::new_v4();
+        let ep = Uuid::new_v4();
+        let episode = Episode::new(ns.id, vec![about]);
+        let ep_id = episode.id;
+        db.save_episode(&episode).unwrap();
+
+        let mut episodic = EpisodicMemory::new(ns.id, ep_id, about, Uuid::new_v4(), "msg");
+        episodic.episode_id = ep;
+        db.save_episodic(&episodic).unwrap();
+
+        let obs = ObservationMemory::new(ns.id, ep, "x", "y", "z", "c");
+        db.save_observation(&obs).unwrap();
+
+        let s = seed_kg_entity(&db, ns.id, "S");
+        let o = seed_kg_entity(&db, ns.id, "O");
+        seed_kg_triple(&db, ns.id, obs.id, s, o);
+
+        assert_eq!(kg_triples_count_for_passage(&db, obs.id), 1);
+        assert_eq!(kg_passage_entities_count_for_passage(&db, obs.id), 2);
+
+        db.delete_observations_by_entity(about).unwrap();
+
+        assert_eq!(
+            kg_triples_count_for_passage(&db, obs.id),
+            0,
+            "kg_triples must cascade with delete_observations_by_entity"
+        );
+        assert_eq!(
+            kg_passage_entities_count_for_passage(&db, obs.id),
+            0,
+            "kg_passage_entities must cascade with delete_observations_by_entity"
+        );
+        assert_eq!(
+            kg_entities_count_for_namespace(&db, ns.id),
+            2,
+            "kg_entities are namespace-scoped and must NOT cascade with entity-scoped observation delete"
+        );
+    }
+
+    #[test]
+    fn delete_memory_by_id_cascades_kg_rows_for_observation() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let ep = Uuid::new_v4();
+
+        let obs = ObservationMemory::new(ns.id, ep, "x", "y", "z", "c");
+        db.save_observation(&obs).unwrap();
+
+        let s = seed_kg_entity(&db, ns.id, "S");
+        let o = seed_kg_entity(&db, ns.id, "O");
+        seed_kg_triple(&db, ns.id, obs.id, s, o);
+
+        let deleted = db.delete_memory_by_id(obs.id).unwrap();
+        assert!(deleted);
+
+        assert_eq!(
+            kg_triples_count_for_passage(&db, obs.id),
+            0,
+            "kg_triples must cascade with delete_memory_by_id(observation)"
+        );
+        assert_eq!(
+            kg_passage_entities_count_for_passage(&db, obs.id),
+            0,
+            "kg_passage_entities must cascade with delete_memory_by_id(observation)"
+        );
+        // Namespace-scoped entities survive.
+        assert_eq!(kg_entities_count_for_namespace(&db, ns.id), 2);
+    }
+
+    #[test]
+    fn purge_namespace_cascades_kg_rows_including_entities() {
+        let (_dir, db) = setup();
+        let ns_a = make_namespace(&db);
+        let ns_b = Namespace::new("other-ns");
+        db.save_namespace(&ns_b).unwrap();
+
+        let ep_a = Uuid::new_v4();
+        let obs_a = ObservationMemory::new(ns_a.id, ep_a, "x", "i-a", "did", "c");
+        db.save_observation(&obs_a).unwrap();
+        let s_a = seed_kg_entity(&db, ns_a.id, "S-A");
+        let o_a = seed_kg_entity(&db, ns_a.id, "O-A");
+        seed_kg_triple(&db, ns_a.id, obs_a.id, s_a, o_a);
+
+        let ep_b = Uuid::new_v4();
+        let obs_b = ObservationMemory::new(ns_b.id, ep_b, "x", "i-b", "did", "c");
+        db.save_observation(&obs_b).unwrap();
+        let s_b = seed_kg_entity(&db, ns_b.id, "S-B");
+        let o_b = seed_kg_entity(&db, ns_b.id, "O-B");
+        seed_kg_triple(&db, ns_b.id, obs_b.id, s_b, o_b);
+
+        // Purge only ns_a — every KG row tied to ns_a must vanish AND
+        // ns_b's KG state must be untouched (namespace isolation).
+        db.purge_namespace(ns_a.id).unwrap();
+
+        assert_eq!(kg_entities_count_for_namespace(&db, ns_a.id), 0);
+        assert_eq!(kg_triples_count_for_passage(&db, obs_a.id), 0);
+        assert_eq!(kg_passage_entities_count_for_passage(&db, obs_a.id), 0);
+
+        // ns_b survives the purge intact.
+        assert_eq!(kg_entities_count_for_namespace(&db, ns_b.id), 2);
+        assert_eq!(kg_triples_count_for_passage(&db, obs_b.id), 1);
+        assert_eq!(kg_passage_entities_count_for_passage(&db, obs_b.id), 2);
     }
 }
