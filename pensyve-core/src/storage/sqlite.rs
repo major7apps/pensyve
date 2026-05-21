@@ -254,7 +254,13 @@ impl SqliteBackend {
                     predicate    TEXT NOT NULL,
                     object_id    INTEGER NOT NULL REFERENCES kg_entities(id),
                     confidence   REAL NOT NULL,
-                    created_at   INTEGER NOT NULL
+                    created_at   INTEGER NOT NULL,
+                    -- Re-ingest of the same passage must NOT double the
+                    -- KG row count. The logical edge identity is
+                    -- `(namespace, passage, subject, predicate, object)`;
+                    -- the hook uses `INSERT OR IGNORE` against this
+                    -- constraint, so a repeated extraction is a no-op.
+                    UNIQUE(namespace_id, passage_id, subject_id, predicate, object_id)
                 );
                 CREATE TABLE IF NOT EXISTS kg_passage_entities (
                     passage_id TEXT NOT NULL,
