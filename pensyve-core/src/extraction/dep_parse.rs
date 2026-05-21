@@ -415,8 +415,11 @@ fn build_subject(tokens: &[&str]) -> Option<(String, bool)> {
 }
 
 /// Build the object string from the tokens following the verb. Strips
-/// at most one leading preposition (so "in Brooklyn" → "Brooklyn") and
-/// trailing punctuation. `None` when the resulting span is empty.
+/// all consecutive leading prepositions (so "in Brooklyn" → "Brooklyn"
+/// and the rarer "in at the office" → "the office") and trailing
+/// punctuation. `None` when the resulting span is empty. claude-bot
+/// PR #115 P2 #8 — doc previously claimed "at most one" but the loop
+/// strips every leading preposition.
 fn build_object(tokens: &[&str]) -> Option<String> {
     let mut start = 0usize;
     while start < tokens.len() {
