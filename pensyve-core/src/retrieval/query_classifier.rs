@@ -120,6 +120,18 @@ pub struct PipelineConfig {
     /// preserved unchanged to keep entity-affinity tuning independent
     /// of `SelRoute` decisions.
     pub signal_mask: [f32; 8],
+    /// Phase 2E: per-route Vendi-Score diversity rerank weight. Values
+    /// in `[0.0, 1.0]` blend the joint objective
+    /// `alpha * relevance + (1 - alpha) * diversity` at the greedy
+    /// selection step.
+    ///
+    /// - `1.0` → pure relevance (Vendi is a no-op; output equals input
+    ///   order). Equivalent to "Vendi off."
+    /// - `0.0` → pure diversity (DPP-style spanner selection).
+    /// - Per-route defaults below balance the two; the engine uses the
+    ///   `IDENTITY` 0.7 only when classification confidence < 0.5 or
+    ///   when `SelRoute` is disabled.
+    pub vendi_alpha: f32,
 }
 
 impl PipelineConfig {
@@ -130,8 +142,13 @@ impl PipelineConfig {
     /// the engine emits a PPR ranking only when `PENSYVE_PPR=1` AND a
     /// `PprIndex` is attached; multiplying an absent ranking by any
     /// finite mask value remains a no-op.
+    ///
+    /// `vendi_alpha = 0.7` is the brief's default for unrouted queries
+    /// — mildly relevance-dominant but with diversity weight high
+    /// enough to break ties and surface novel candidates.
     pub const IDENTITY: Self = Self {
         signal_mask: [1.0; 8],
+        vendi_alpha: 0.7,
     };
 }
 
@@ -298,31 +315,50 @@ pub fn pipeline_config_for(question_type: &str) -> PipelineConfig {
         // continuity (e.g., "what did I do before X?" — PPR's restart
         // vector seeded by entities in X picks up earlier sessions
         // that share entity context). Mild boost.
+        // Phase 2E vendi_alpha = 0.6: moderate diversity tilt to
+        // surface chronologically distinct candidates rather than
+        // duplicate the most-recent event.
         "temporal-reasoning" => PipelineConfig {
             signal_mask: [1.0, 1.0, 0.5, 1.0, 1.0, 0.5, 0.0, 1.2],
+            vendi_alpha: 0.6,
         },
         // multi-session: PPR is the headline win — multi-hop entity
         // chains across sessions are exactly what HippoRAG-style
         // PPR is built for. Strong boost.
+        // Phase 2E vendi_alpha = 0.5: highest diversity weight — the
+        // multi-session route is exactly where cross-session synthesis
+        // benefits from selecting a diverse set of distinct sessions.
         "multi-session" => PipelineConfig {
             signal_mask: [1.0, 1.0, 1.0, 1.5, 1.0, 1.0, 0.0, 1.5],
+            vendi_alpha: 0.5,
         },
         // knowledge-update: PPR helps establish entity-relation
         // freshness — the most recently updated triple endpoints
         // surface in the PPR restart vector. Mild boost.
+        // Phase 2E vendi_alpha = 0.7: identity default — relevance-
+        // dominant. Knowledge-update queries want the most-recent
+        // matching fact, not a diverse panorama of versions.
         "knowledge-update" => PipelineConfig {
             signal_mask: [1.0, 1.5, 1.0, 0.5, 1.0, 1.0, 0.0, 1.2],
+            vendi_alpha: 0.7,
         },
         // single-session-user: local-session queries; graph signal
         // is less valuable than dense similarity. Dampen PPR.
+        // Phase 2E vendi_alpha = 0.8: relevance-dominant — within one
+        // session the user is anchored to a specific topic; diversity
+        // brings noise more than coverage.
         "single-session-user" => PipelineConfig {
             signal_mask: [1.5, 1.0, 1.0, 0.5, 1.0, 1.0, 0.0, 0.5],
+            vendi_alpha: 0.8,
         },
         // single-session-assistant: same reasoning as -user; graph
         // adds noise when the question is about the assistant's own
         // prior output. Dampen PPR.
+        // Phase 2E vendi_alpha = 0.8: relevance-dominant — same
+        // single-session rationale.
         "single-session-assistant" => PipelineConfig {
             signal_mask: [1.0, 1.0, 1.0, 0.5, 1.0, 1.5, 0.0, 0.5],
+            vendi_alpha: 0.8,
         },
         // single-session-preference: broad-baseline fallback. Most
         // slots stay at identity (1.0), but PPR is explicitly damped
@@ -330,8 +366,11 @@ pub fn pipeline_config_for(question_type: &str) -> PipelineConfig {
         // from cross-session entity traversal. Phase 2C breaks the
         // pre-2C "preference == IDENTITY" invariant; the bot-tests
         // that pinned that invariant are updated.
+        // Phase 2E vendi_alpha = 0.8: relevance-dominant — preferences
+        // are usually unambiguous (top match is the right answer).
         "single-session-preference" => PipelineConfig {
             signal_mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.5],
+            vendi_alpha: 0.8,
         },
         // Unknown / future types: identity mask, strictly non-destructive.
         _ => PipelineConfig::IDENTITY,
@@ -680,6 +719,48 @@ mod tests {
             (pipeline_config_for("single-session-preference").signal_mask[7] - 0.5).abs()
                 < f32::EPSILON,
             "single-session-preference: PPR damped"
+        );
+    }
+
+    #[test]
+    fn pipeline_config_vendi_alpha_per_route() {
+        // Phase 2E: lock in the per-route Vendi alpha so future tuning
+        // is visible in PR diffs. Values were chosen per the Phase 2E
+        // brief:
+        //   - multi-session 0.5: highest diversity (cross-session synth)
+        //   - temporal-reasoning 0.6: moderate diversity (distinct events)
+        //   - knowledge-update 0.7: identity default (single-fact bias)
+        //   - single-session-* 0.8: relevance-dominant (intra-session)
+        assert!(
+            (pipeline_config_for("multi-session").vendi_alpha - 0.5).abs() < f32::EPSILON,
+            "multi-session: highest diversity weight"
+        );
+        assert!(
+            (pipeline_config_for("temporal-reasoning").vendi_alpha - 0.6).abs() < f32::EPSILON,
+            "temporal-reasoning: moderate diversity"
+        );
+        assert!(
+            (pipeline_config_for("knowledge-update").vendi_alpha - 0.7).abs() < f32::EPSILON,
+            "knowledge-update: identity default"
+        );
+        assert!(
+            (pipeline_config_for("single-session-user").vendi_alpha - 0.8).abs() < f32::EPSILON,
+            "single-session-user: relevance-dominant"
+        );
+        assert!(
+            (pipeline_config_for("single-session-assistant").vendi_alpha - 0.8).abs()
+                < f32::EPSILON,
+            "single-session-assistant: relevance-dominant"
+        );
+        assert!(
+            (pipeline_config_for("single-session-preference").vendi_alpha - 0.8).abs()
+                < f32::EPSILON,
+            "single-session-preference: relevance-dominant"
+        );
+        // Unknown / IDENTITY default is 0.7.
+        assert!(
+            (PipelineConfig::IDENTITY.vendi_alpha - 0.7).abs() < f32::EPSILON,
+            "IDENTITY default vendi_alpha = 0.7"
         );
     }
 
