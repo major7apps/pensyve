@@ -594,6 +594,40 @@ impl<'a> RecallEngine<'a> {
         // Classify query intent for intent-based scoring.
         let intent = classify_intent(query);
 
+        // Phase 2A SelRoute: optional question-type classification +
+        // per-route RRF weight mask. Strictly gated behind the
+        // `PENSYVE_SELROUTE` env-var (read once via OnceLock — see
+        // `query_classifier::selroute_enabled`); when the gate is off
+        // the entire block is bypassed and the recall path is
+        // byte-for-byte identical to pre-Phase-2A behavior.
+        let selroute_mask: Option<[f32; 7]> = if crate::retrieval::query_classifier::selroute_enabled() {
+            let classification = crate::retrieval::query_classifier::classify_query(query);
+            let metrics = crate::observability::metrics();
+            metrics.record_selroute_classification(
+                crate::retrieval::query_classifier::selroute_metric_index(
+                    classification.question_type,
+                ),
+                classification.confidence,
+            );
+            // Apply the per-route mask only when confidence >= 0.5;
+            // below that the caller's contract says to use IDENTITY
+            // (which is a no-op and we just skip).
+            if classification.confidence >= 0.5 {
+                let cfg = crate::retrieval::query_classifier::pipeline_config_for(
+                    classification.question_type,
+                );
+                if cfg == crate::retrieval::query_classifier::PipelineConfig::IDENTITY {
+                    None
+                } else {
+                    Some(cfg.signal_mask)
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Step 6–7: Build 6 independent rankings and merge via RRF.
         let candidates_found = candidates.len();
         let now = Utc::now();
@@ -696,17 +730,34 @@ impl<'a> RecallEngine<'a> {
         };
         ranking_entity.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
+        // Phase 2A SelRoute mask: when the env-gate fired and the
+        // classification confidence cleared the 0.5 threshold,
+        // `selroute_mask` holds a `[f32; 7]` to multiply against the
+        // engine's per-signal RRF weights. Slots 0..6 align with
+        // `[vec, bm25, activation, spread, intent, confidence]`; the
+        // 7th slot is reserved for the future PPR signal (Phase 2C)
+        // and the entity-affinity weight at `rrf_weights[6]` is left
+        // unchanged regardless of the mask. When the mask is None the
+        // expression below is a strict no-op (identity).
+        let masked_weight = |idx: usize| -> f32 {
+            let base = self.config.rrf_weights[idx];
+            match selroute_mask {
+                Some(mask) if idx < 6 => base * mask[idx],
+                _ => base,
+            }
+        };
+
         // Merge via RRF — only include rankings with discriminative signal.
         // A ranking where all scores are identical (e.g., empty graph, no access history)
         // adds noise and dilutes the strong signals like vector similarity.
         let all_rankings = vec![
-            (ranking_vec, self.config.rrf_weights[0]),
-            (ranking_bm25, self.config.rrf_weights[1]),
-            (ranking_activation, self.config.rrf_weights[2]),
-            (ranking_spread, self.config.rrf_weights[3]),
-            (ranking_intent, self.config.rrf_weights[4]),
-            (ranking_confidence, self.config.rrf_weights[5]),
-            (ranking_entity, self.config.rrf_weights[6]),
+            (ranking_vec, masked_weight(0)),
+            (ranking_bm25, masked_weight(1)),
+            (ranking_activation, masked_weight(2)),
+            (ranking_spread, masked_weight(3)),
+            (ranking_intent, masked_weight(4)),
+            (ranking_confidence, masked_weight(5)),
+            (ranking_entity, masked_weight(6)),
         ];
 
         let (rankings, rrf_weights): (Vec<_>, Vec<_>) = all_rankings
