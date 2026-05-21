@@ -27,6 +27,7 @@ pub mod cards;
 pub mod diversity;
 pub mod engine;
 pub mod intent_router;
+pub mod ppr;
 pub mod query_classifier;
 
 // Flat re-export keeps the v2.x API surface intact after the
