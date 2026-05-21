@@ -222,6 +222,18 @@ const LEADING_PREPS: &[&str] = &[
     "in", "at", "on", "to", "for", "with", "by", "from", "into", "onto", "about", "of", "as",
 ];
 
+/// Pronoun forms that ARE valid subjects in their lower-case form even
+/// though they also live in [`STOP_WORDS`] (so they cannot serve as
+/// generic entity candidates). Without this allow-list the
+/// `build_subject` fallback would reject everything except `"I"` and
+/// drop perfectly extractable sentences like `"She works at Acme"`,
+/// `"They bought tickets"`, `"He prefers tea"`.
+///
+/// `CodeRabbit` + `chatgpt-codex` PR #115 P0 #4.
+static PRONOUN_SUBJECTS: phf::Set<&'static str> = phf::phf_set! {
+    "i", "we", "you", "he", "she", "they", "it",
+};
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -367,8 +379,12 @@ fn build_subject(tokens: &[&str]) -> Option<(String, bool)> {
     }
 
     // Fallback: no capitalized run — use the first non-stopword token
-    // (commonly "I" / "she" / etc. — pronoun-led subjects). We
-    // preserve original case in that path so "I" stays "I".
+    // OR a pronoun subject (`PRONOUN_SUBJECTS` is a `phf::Set` of the
+    // seven common subject pronouns; they're also in `STOP_WORDS` so
+    // they get filtered out of entity candidacy, but they ARE valid
+    // sentence subjects). We preserve original case in this path so
+    // "She" / "They" / "I" stay capitalised even when promoted by the
+    // lowercase pronoun allow-list.
     if out.is_empty() {
         for tok in tokens {
             let stripped = strip_punct(tok);
@@ -376,7 +392,7 @@ fn build_subject(tokens: &[&str]) -> Option<(String, bool)> {
                 continue;
             }
             let lower = stripped.to_ascii_lowercase();
-            if !STOP_WORDS.contains(&lower.as_str()) || lower == "i" {
+            if !STOP_WORDS.contains(&lower.as_str()) || PRONOUN_SUBJECTS.contains(lower.as_str()) {
                 out.push(stripped.to_string());
                 break;
             }
@@ -926,6 +942,71 @@ mod tests {
             embed_kg_granules(&parsed, embed, &mut entity_index, &mut relation_index);
         assert!(ents > 0, "no entities embedded");
         assert!(rels > 0, "no relations embedded");
+    }
+
+    // ---- Pronoun-led subjects (CodeRabbit + chatgpt-codex PR #115 P0 #4) ----
+
+    #[test]
+    fn she_pronoun_subject_extracts_triple() {
+        let p = extract_triples(Uuid::nil(), "She likes pizza.");
+        let triple = p
+            .triples
+            .iter()
+            .find(|t| t.predicate == "likes")
+            .expect("verb 'likes' should fire");
+        assert_eq!(triple.subject, "She");
+        assert!(triple.object.to_ascii_lowercase().contains("pizza"));
+    }
+
+    #[test]
+    fn they_pronoun_subject_extracts_triple() {
+        let p = extract_triples(Uuid::nil(), "They bought tickets.");
+        let triple = p
+            .triples
+            .iter()
+            .find(|t| t.predicate == "bought")
+            .expect("verb 'bought' should fire");
+        assert_eq!(triple.subject, "They");
+        assert!(triple.object.to_ascii_lowercase().contains("tickets"));
+    }
+
+    #[test]
+    fn he_pronoun_subject_extracts_triple() {
+        let p = extract_triples(Uuid::nil(), "He prefers tea.");
+        let triple = p
+            .triples
+            .iter()
+            .find(|t| t.predicate == "prefers")
+            .expect("verb 'prefers' should fire");
+        assert_eq!(triple.subject, "He");
+        assert!(triple.object.to_ascii_lowercase().contains("tea"));
+    }
+
+    #[test]
+    fn pronoun_subject_without_object_produces_no_triple() {
+        // "It works" — verb fires but object span is empty.
+        let p = extract_triples(Uuid::nil(), "It works.");
+        assert!(
+            p.triples.is_empty(),
+            "subject-verb-only sentence must not produce a fragment triple"
+        );
+    }
+
+    #[test]
+    fn we_you_pronoun_subjects_extract() {
+        // Spot-check the remaining members of PRONOUN_SUBJECTS that
+        // weren't exercised by the per-pronoun tests above.
+        let p = extract_triples(Uuid::nil(), "We built Pensyve. You watched the demo.");
+        assert!(
+            p.triples
+                .iter()
+                .any(|t| t.subject == "We" && t.predicate == "builds")
+        );
+        assert!(
+            p.triples
+                .iter()
+                .any(|t| t.subject == "You" && t.predicate == "watches")
+        );
     }
 
     // ---- Granule UUID stability (CodeRabbit + claude-bot PR #115 P0 #3) ----

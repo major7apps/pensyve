@@ -1715,4 +1715,60 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn dep_parse_hook_includes_triple_endpoints_in_kg_passage_entities() {
+        // CodeRabbit + chatgpt-codex PR #115 P0 #5: every triple
+        // endpoint (subject AND object) must land in
+        // `kg_passage_entities` even when the endpoint lemma is
+        // lowercase / pronoun / multi-word and therefore not in
+        // `parsed.entities`. Without this, PPR (Phase 2C) loses every
+        // edge whose endpoints aren't capitalized.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = make_storage(tmp.path().to_str().unwrap());
+        let ns = Namespace::new("dep-parse-endpoints");
+        storage.save_namespace(&ns).unwrap();
+
+        let conn = rusqlite::Connection::open(storage.db_path().unwrap()).unwrap();
+        let passage_id = Uuid::new_v4();
+        // Mixed passage:
+        //   "I prefer dark mode."   → triple (I, prefers, dark mode)
+        //     — "I" + "dark mode" are NOT in parsed.entities (pronoun /
+        //       lowercase) but must reach kg_passage_entities via the
+        //       triple-endpoint pass.
+        //   "She works at Acme."    → triple (She, works_at, Acme)
+        //     — "Acme" IS in parsed.entities; "She" is not (pronoun).
+        let content = "I prefer dark mode. She works at Acme.";
+
+        run_dep_parse_hook_inner(&conn, ns.id, passage_id, content).unwrap();
+
+        // Map lemma → (entity_id, weight) for this passage.
+        let mut stmt = conn
+            .prepare(
+                "SELECT e.lemma, p.weight \
+                 FROM kg_passage_entities p \
+                 JOIN kg_entities e ON e.id = p.entity_id \
+                 WHERE p.passage_id = ?1",
+            )
+            .unwrap();
+        let endpoints: Vec<(String, f32)> = stmt
+            .query_map(rusqlite::params![passage_id.to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        let lemmas: Vec<&str> = endpoints.iter().map(|(l, _)| l.as_str()).collect();
+        for expected in &["I", "dark mode", "She", "Acme"] {
+            assert!(
+                lemmas.contains(expected),
+                "expected lemma {expected:?} in kg_passage_entities; got {lemmas:?}"
+            );
+        }
+        // Every recorded weight is strictly positive.
+        for (lemma, w) in &endpoints {
+            assert!(*w > 0.0, "lemma {lemma:?} has non-positive weight {w}");
+        }
+    }
 }
