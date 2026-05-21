@@ -68,9 +68,25 @@ pub struct RetrievalConfig {
     /// RRF constant k. Default 60.
     #[serde(default = "default_rrf_k")]
     pub rrf_k: u32,
-    /// Per-signal RRF weights: vec, bm25, activation, spread, intent, confidence, entity affinity.
+    /// Per-signal RRF weights, indexed in the order the engine emits
+    /// rankings:
+    ///   0: vector similarity
+    ///   1: BM25 / FTS
+    ///   2: ACT-R activation
+    ///   3: spreading-activation BFS
+    ///   4: intent alignment
+    ///   5: confidence / reliability
+    ///   6: entity affinity
+    ///   7: Personalized `PageRank` (Phase 2C; PPR ranking is emitted only
+    ///      when `PENSYVE_PPR=1` AND a `PprIndex` is attached to the
+    ///      `RecallEngine` — otherwise slot 7 is a no-op placeholder).
+    ///
+    /// Slot 7 was added in Phase 2C; the v2.4.x baseline shipped a
+    /// 7-slot array. Default value 1.0 keeps PPR at parity with the
+    /// other graph signals when it IS active, and is a strict no-op
+    /// when it is not (no ranking emitted → no weight applied).
     #[serde(default = "default_rrf_weights")]
-    pub rrf_weights: [f32; 7],
+    pub rrf_weights: [f32; 8],
     /// Beam search width. Default 10.
     #[serde(default = "default_beam_width")]
     pub beam_width: usize,
@@ -82,8 +98,12 @@ pub struct RetrievalConfig {
 fn default_rrf_k() -> u32 {
     60
 }
-fn default_rrf_weights() -> [f32; 7] {
-    [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2]
+fn default_rrf_weights() -> [f32; 8] {
+    // [vector, bm25, activation, spread, intent, confidence, entity_affinity, ppr]
+    // Slot 7 (PPR) added in Phase 2C; default 1.0 keeps PPR at parity
+    // with the other graph signals when the engine emits a PPR ranking
+    // (gated on `PENSYVE_PPR=1` AND an attached `PprIndex`).
+    [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.0]
 }
 fn default_beam_width() -> usize {
     10
@@ -151,7 +171,7 @@ impl Default for PensyveConfig {
                 weights: [0.25, 0.10, 0.15, 0.05, 0.20, 0.10, 0.10, 0.05],
                 recall_timeout_secs: 5,
                 rrf_k: 60,
-                rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2],
+                rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.0],
                 beam_width: 10,
                 max_depth: 4,
             },

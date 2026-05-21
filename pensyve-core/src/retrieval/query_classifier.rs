@@ -37,31 +37,31 @@
 //! requirement for the Phase 2 rollout (the orchestrator A/B's the gate
 //! against the v2.2 baseline).
 //!
-//! ## Per-route RRF mask rationale (Phase 2A starting points)
+//! ## Per-route RRF mask rationale (Phase 2A + 2C)
 //!
 //! The [`PipelineConfig::signal_mask`] values below are conservative
 //! starting points pending Phase 2F's A/B tuning sweep. The mask is
-//! aligned with the engine's 6-signal RRF assembly
-//! (`[vector, bm25, activation, spreading, intent, confidence]`) plus a
-//! reserved 7th slot for the Phase 2C PPR signal (currently 0.0 — the
-//! engine does not yet emit a PPR ranking, so the mask value is a no-op
-//! placeholder).
+//! aligned with the engine's 8-signal RRF assembly:
+//! `[vector, bm25, activation, spreading, intent, confidence, entity_affinity, ppr]`.
+//! Slot 7 (PPR) was added in Phase 2C; before that the array was 7-wide
+//! and the PPR slot held a placeholder.
 //!
-//! - **temporal-reasoning**: down-weight activation + confidence; temporal
-//!   reasoning needs the recall path to lean on lexical and content
-//!   signals rather than access-history activation.
-//! - **multi-session**: up-weight spreading activation; cross-session
-//!   references benefit from graph traversal connecting separate
-//!   conversations.
-//! - **knowledge-update**: up-weight BM25 (lexical match on "updated" /
-//!   "changed"), down-weight spreading (a change cue is local to the
-//!   most-recent session).
-//! - **single-session-user**: lean on dense similarity; less graph
-//!   spreading needed within a single session.
-//! - **single-session-assistant**: up-weight confidence; assistant-emitted
-//!   facts are typed and the confidence signal is more diagnostic.
-//! - **single-session-preference**: identity mask — preferences are the
-//!   broadest baseline.
+//! - **temporal-reasoning**: down-weight activation + confidence; mild
+//!   PPR boost (cross-session entity continuity).
+//! - **multi-session**: up-weight spreading activation; STRONG PPR
+//!   boost — multi-hop entity chains are the headline win for
+//!   HippoRAG-style PPR.
+//! - **knowledge-update**: up-weight BM25, down-weight spreading; mild
+//!   PPR boost for entity-relation freshness.
+//! - **single-session-user**: lean on dense similarity; dampen PPR
+//!   (graph signal less valuable within one session).
+//! - **single-session-assistant**: up-weight confidence; dampen PPR
+//!   for the same single-session reason.
+//! - **single-session-preference**: identity on slots 0..5; dampen
+//!   PPR (slot 7 = 0.5). Phase 2C broke the pre-2C
+//!   "preference == IDENTITY" invariant — preferences are usually
+//!   local-session and don't benefit from cross-session entity
+//!   traversal.
 //!
 //! ## Out of scope
 //!
@@ -100,24 +100,38 @@ pub struct QueryClassification {
 /// Per-question-type RRF weight overrides (applied only when `SelRoute`
 /// is enabled AND classification confidence `>= 0.5`).
 ///
-/// Indices mirror the existing 6-signal RRF assembly in `engine.rs`:
-/// `[vector, bm25, activation, spreading, intent, confidence]`. A 7th
-/// slot is reserved for the future PPR signal (Phase 2C); the mask
-/// value at that slot is currently a placeholder (`0.0`) — the engine
-/// integration applies the mask only to slots `0..6`, so the PPR slot
-/// is a no-op until the engine emits a PPR ranking.
+/// Indices mirror the engine's 8-signal RRF assembly in `engine.rs`:
+/// `[vector, bm25, activation, spreading, intent, confidence, entity_affinity, ppr]`.
+/// Slot 7 (PPR) was added in Phase 2C; the engine integration applies
+/// the mask to slots `0..5` AND slot `7`, skipping slot `6`
+/// (`entity_affinity`) so that signal's weight stays decoupled from
+/// `SelRoute` decisions.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PipelineConfig {
     /// Multiplicative mask applied to each signal's RRF weight. Use
     /// `0.0` to disable a signal entirely; `1.0` to leave unchanged.
-    pub signal_mask: [f32; 7],
+    ///
+    /// Slots align with the engine's ranking emission order:
+    ///   0: vec   1: bm25   2: activation   3: spread
+    ///   4: intent   5: confidence   6: `entity_affinity`   7: PPR
+    ///
+    /// Slot 7 was added in Phase 2C. The engine applies the mask to
+    /// slots 0..5 and slot 7; slot 6 (`entity_affinity`) is explicitly
+    /// preserved unchanged to keep entity-affinity tuning independent
+    /// of `SelRoute` decisions.
+    pub signal_mask: [f32; 8],
 }
 
 impl PipelineConfig {
     /// Identity mask — preserves engine defaults. Used as fallback when
     /// confidence `< 0.5` or when `SelRoute` is disabled.
+    ///
+    /// All 8 slots are 1.0 (no-op) — including the PPR slot 7, since
+    /// the engine emits a PPR ranking only when `PENSYVE_PPR=1` AND a
+    /// `PprIndex` is attached; multiplying an absent ranking by any
+    /// finite mask value remains a no-op.
     pub const IDENTITY: Self = Self {
-        signal_mask: [1.0; 7],
+        signal_mask: [1.0; 8],
     };
 }
 
@@ -268,32 +282,57 @@ pub fn classify_query(query: &str) -> QueryClassification {
 /// Returns [`PipelineConfig::IDENTITY`] for unknown types or when no
 /// override is configured for the type — strictly non-destructive.
 #[must_use]
-#[allow(
-    clippy::match_same_arms,
-    reason = "the explicit `single-session-preference` arm and the wildcard fallback both return IDENTITY *today*, but they encode distinct intents — the explicit arm is the binding Phase 2A mask for that question_type (identity per the broadest-baseline rationale); the wildcard is a conservative non-destructive fallback for unknown / future types. Collapsing them would silently couple future tuning of the preference mask to the unknown-type fallback. Keep them split for forward extensibility (mirrors the same pattern in intent_router::k_for_type)."
-)]
 pub fn pipeline_config_for(question_type: &str) -> PipelineConfig {
-    // Per-route masks per the Phase 2A spec. The 7th slot is the
-    // reserved-for-PPR placeholder (engine integration applies only
-    // slots 0..6 to existing rrf_weights[0..6]; the entity-affinity
-    // signal at rrf_weights[6] is left unchanged regardless).
+    // Per-route masks per the Phase 2A / 2C spec. Slot layout (8 slots):
+    //   0: vec   1: bm25   2: activation   3: spread
+    //   4: intent   5: confidence   6: entity_affinity   7: PPR
+    //
+    // Slot 6 (entity_affinity) is left at 0.0 in the explicit per-route
+    // masks because the engine's `masked_weight` guard preserves
+    // `rrf_weights[6]` unchanged regardless of the mask — so the mask
+    // value at slot 6 is operationally a no-op today. Slot 7 (PPR)
+    // values are Phase 2C additions chosen per the plan + brief
+    // rationale (see comment per route).
     match question_type {
+        // temporal-reasoning: PPR helps with cross-session entity
+        // continuity (e.g., "what did I do before X?" — PPR's restart
+        // vector seeded by entities in X picks up earlier sessions
+        // that share entity context). Mild boost.
         "temporal-reasoning" => PipelineConfig {
-            signal_mask: [1.0, 1.0, 0.5, 1.0, 1.0, 0.5, 0.0],
+            signal_mask: [1.0, 1.0, 0.5, 1.0, 1.0, 0.5, 0.0, 1.2],
         },
+        // multi-session: PPR is the headline win — multi-hop entity
+        // chains across sessions are exactly what HippoRAG-style
+        // PPR is built for. Strong boost.
         "multi-session" => PipelineConfig {
-            signal_mask: [1.0, 1.0, 1.0, 1.5, 1.0, 1.0, 0.0],
+            signal_mask: [1.0, 1.0, 1.0, 1.5, 1.0, 1.0, 0.0, 1.5],
         },
+        // knowledge-update: PPR helps establish entity-relation
+        // freshness — the most recently updated triple endpoints
+        // surface in the PPR restart vector. Mild boost.
         "knowledge-update" => PipelineConfig {
-            signal_mask: [1.0, 1.5, 1.0, 0.5, 1.0, 1.0, 0.0],
+            signal_mask: [1.0, 1.5, 1.0, 0.5, 1.0, 1.0, 0.0, 1.2],
         },
+        // single-session-user: local-session queries; graph signal
+        // is less valuable than dense similarity. Dampen PPR.
         "single-session-user" => PipelineConfig {
-            signal_mask: [1.5, 1.0, 1.0, 0.5, 1.0, 1.0, 0.0],
+            signal_mask: [1.5, 1.0, 1.0, 0.5, 1.0, 1.0, 0.0, 0.5],
         },
+        // single-session-assistant: same reasoning as -user; graph
+        // adds noise when the question is about the assistant's own
+        // prior output. Dampen PPR.
         "single-session-assistant" => PipelineConfig {
-            signal_mask: [1.0, 1.0, 1.0, 0.5, 1.0, 1.5, 0.0],
+            signal_mask: [1.0, 1.0, 1.0, 0.5, 1.0, 1.5, 0.0, 0.5],
         },
-        "single-session-preference" => PipelineConfig::IDENTITY,
+        // single-session-preference: broad-baseline fallback. Most
+        // slots stay at identity (1.0), but PPR is explicitly damped
+        // — preferences are usually local-session and don't benefit
+        // from cross-session entity traversal. Phase 2C breaks the
+        // pre-2C "preference == IDENTITY" invariant; the bot-tests
+        // that pinned that invariant are updated.
+        "single-session-preference" => PipelineConfig {
+            signal_mask: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.5],
+        },
         // Unknown / future types: identity mask, strictly non-destructive.
         _ => PipelineConfig::IDENTITY,
     }
@@ -532,13 +571,17 @@ mod tests {
     fn pipeline_config_unknown_type_is_identity() {
         let cfg = pipeline_config_for("unknown-type");
         assert_eq!(cfg, PipelineConfig::IDENTITY);
-        assert_eq!(cfg.signal_mask, [1.0; 7]);
+        assert_eq!(cfg.signal_mask, [1.0; 8]);
     }
 
     #[test]
     fn pipeline_config_temporal_mask() {
+        // Slot order: [vec, bm25, activation, spread, intent,
+        // confidence, entity_affinity, ppr]. Phase 2C added the PPR
+        // slot at index 7; for temporal-reasoning it is 1.2 per the
+        // brief (mild boost — cross-session entity continuity).
         let cfg = pipeline_config_for("temporal-reasoning");
-        assert_eq!(cfg.signal_mask, [1.0, 1.0, 0.5, 1.0, 1.0, 0.5, 0.0]);
+        assert_eq!(cfg.signal_mask, [1.0, 1.0, 0.5, 1.0, 1.0, 0.5, 0.0, 1.2]);
     }
 
     #[test]
@@ -552,49 +595,92 @@ mod tests {
             "single-session-preference",
         ] {
             let cfg = pipeline_config_for(qt);
+            assert_eq!(
+                cfg.signal_mask.len(),
+                8,
+                "signal_mask must be 8 slots after Phase 2C: {qt}"
+            );
             // Each mask entry must be non-negative (multiplicative
             // masks; negative would invert the RRF ranking sign).
             for (i, &v) in cfg.signal_mask.iter().enumerate() {
                 assert!(v >= 0.0, "negative mask value at idx {i} for {qt}: {v}");
             }
         }
-        // The PPR slot (index 6) is reserved for the future PPR signal
-        // (Phase 2C). For the five explicit per-route masks it is
-        // currently 0.0; the `single-session-preference` route uses
-        // IDENTITY ([1.0; 7]) per the broadest-baseline rationale.
-        // The engine integration applies the mask only to slots 0..6,
-        // so the slot-6 value is operationally a no-op today either
-        // way.
+        // Slot 6 (entity_affinity) is left at 0.0 in every explicit
+        // per-route mask because the engine's `masked_weight` guard
+        // preserves `rrf_weights[6]` regardless of the mask value —
+        // so a 0.0 here is operationally a no-op. The
+        // `single-session-preference` route also pins slot 6 to 0.0
+        // for consistency with the other explicit routes.
         for qt in [
             "temporal-reasoning",
             "multi-session",
             "knowledge-update",
             "single-session-user",
             "single-session-assistant",
+            "single-session-preference",
         ] {
             let cfg = pipeline_config_for(qt);
             assert!(
                 (cfg.signal_mask[6] - 0.0).abs() < f32::EPSILON,
-                "explicit per-route mask PPR slot should be 0.0 for {qt}"
+                "explicit per-route mask entity_affinity slot should be 0.0 for {qt}"
             );
         }
-        // single-session-preference uses IDENTITY ([1.0; 7]).
-        assert_eq!(
-            pipeline_config_for("single-session-preference"),
-            PipelineConfig::IDENTITY
+    }
+
+    #[test]
+    fn pipeline_config_preference_dampens_ppr_keeps_other_slots_at_identity() {
+        // Phase 2C breaks the pre-2C "preference == IDENTITY"
+        // invariant: preferences are usually local-session and do not
+        // benefit from cross-session entity traversal, so slot 7
+        // (PPR) is dampened to 0.5 while slots 0..5 remain at 1.0.
+        // Slot 6 (entity_affinity) is the conventional 0.0 no-op
+        // marker shared with the other explicit per-route masks.
+        let cfg = pipeline_config_for("single-session-preference");
+        for i in 0..6 {
+            assert!(
+                (cfg.signal_mask[i] - 1.0).abs() < f32::EPSILON,
+                "preference mask should be identity at slot {i} (got {})",
+                cfg.signal_mask[i]
+            );
+        }
+        assert!(
+            (cfg.signal_mask[7] - 0.5).abs() < f32::EPSILON,
+            "preference PPR slot should be dampened to 0.5 (got {})",
+            cfg.signal_mask[7]
         );
     }
 
     #[test]
-    fn pipeline_config_preference_is_identity() {
-        let cfg = pipeline_config_for("single-session-preference");
-        // Identity mask on slots 0..5 (preferences are the broadest baseline).
-        for i in 0..6 {
-            assert!(
-                (cfg.signal_mask[i] - 1.0).abs() < f32::EPSILON,
-                "preference mask should be identity at slot {i}"
-            );
-        }
+    fn pipeline_config_ppr_slot_per_route() {
+        // Phase 2C: lock in the per-route PPR weights so future tuning
+        // is visible in PR diffs.
+        assert!(
+            (pipeline_config_for("multi-session").signal_mask[7] - 1.5).abs() < f32::EPSILON,
+            "multi-session: PPR boost"
+        );
+        assert!(
+            (pipeline_config_for("temporal-reasoning").signal_mask[7] - 1.2).abs() < f32::EPSILON,
+            "temporal-reasoning: mild PPR boost"
+        );
+        assert!(
+            (pipeline_config_for("knowledge-update").signal_mask[7] - 1.2).abs() < f32::EPSILON,
+            "knowledge-update: mild PPR boost"
+        );
+        assert!(
+            (pipeline_config_for("single-session-user").signal_mask[7] - 0.5).abs() < f32::EPSILON,
+            "single-session-user: PPR damped"
+        );
+        assert!(
+            (pipeline_config_for("single-session-assistant").signal_mask[7] - 0.5).abs()
+                < f32::EPSILON,
+            "single-session-assistant: PPR damped"
+        );
+        assert!(
+            (pipeline_config_for("single-session-preference").signal_mask[7] - 0.5).abs()
+                < f32::EPSILON,
+            "single-session-preference: PPR damped"
+        );
     }
 
     #[test]

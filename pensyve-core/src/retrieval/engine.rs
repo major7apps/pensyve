@@ -592,7 +592,7 @@ impl<'a> RecallEngine<'a> {
         // `selroute_by_type` / confidence-histogram telemetry covers
         // ALL SelRoute decisions, not just queries that returned hits.
         // Per CodeRabbit review on #114 (2026-05-21).
-        let selroute_mask: Option<[f32; 7]> =
+        let selroute_mask: Option<[f32; 8]> =
             if crate::retrieval::query_classifier::selroute_enabled() {
                 let classification = crate::retrieval::query_classifier::classify_query(query);
                 let metrics = crate::observability::metrics();
@@ -737,19 +737,28 @@ impl<'a> RecallEngine<'a> {
         };
         ranking_entity.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Phase 2A SelRoute mask: when the env-gate fired and the
+        // Phase 2A/2C SelRoute mask: when the env-gate fired and the
         // classification confidence cleared the 0.5 threshold,
-        // `selroute_mask` holds a `[f32; 7]` to multiply against the
-        // engine's per-signal RRF weights. Slots 0..6 align with
-        // `[vec, bm25, activation, spread, intent, confidence]`; the
-        // 7th slot is reserved for the future PPR signal (Phase 2C)
-        // and the entity-affinity weight at `rrf_weights[6]` is left
-        // unchanged regardless of the mask. When the mask is None the
-        // expression below is a strict no-op (identity).
+        // `selroute_mask` holds a `[f32; 8]` to multiply against the
+        // engine's per-signal RRF weights. Slots align with the engine
+        // ranking emission order:
+        //   0: vec   1: bm25   2: activation   3: spread
+        //   4: intent   5: confidence   6: entity_affinity   7: PPR
+        //
+        // The Phase 2A guard kept slot 6 (entity affinity) unchanged so
+        // A/B sweeps could isolate the SelRoute effect from the
+        // entity-affinity signal. Phase 2C keeps that guard at slot 6
+        // and EXTENDS the mask to slot 7 (PPR) so per-route PPR weights
+        // (e.g., 1.5 for multi-session, 0.5 for preference) propagate
+        // through. When the mask is None the expression below is a
+        // strict no-op (identity).
         let masked_weight = |idx: usize| -> f32 {
             let base = self.config.rrf_weights[idx];
             match selroute_mask {
-                Some(mask) if idx < 6 => base * mask[idx],
+                // Mask applies to slots 0..5 (Phase 2A) and slot 7
+                // (Phase 2C PPR). Slot 6 (entity affinity) is
+                // explicitly preserved unchanged.
+                Some(mask) if idx < 6 || idx == 7 => base * mask[idx],
                 _ => base,
             }
         };
@@ -1296,7 +1305,7 @@ mod tests {
             weights: TEST_WEIGHTS,
             recall_timeout_secs: 5,
             rrf_k: 60,
-            rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2],
+            rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.0],
             beam_width: 10,
             max_depth: 4,
         }
