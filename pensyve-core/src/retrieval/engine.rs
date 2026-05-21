@@ -826,7 +826,20 @@ impl<'a> RecallEngine<'a> {
         let mut ppr_score_by_id: std::collections::HashMap<Uuid, f32> =
             std::collections::HashMap::new();
         let mut ranking_ppr: Vec<(Uuid, f32)> = Vec::new();
-        let ppr_enabled_flag = self.ppr_index.is_some() && crate::retrieval::ppr::ppr_enabled();
+        // PPR honors the Phase 2C runtime contract: the engine fires
+        // PPR only when ALL three preconditions hold:
+        //   (a) a `PprIndex` is attached via `with_ppr`
+        //   (b) `PENSYVE_PPR=1` (cached OnceLock env read)
+        //   (c) `PENSYVE_DEP_PARSE=1` (CodeRabbit PR #116 round 2:
+        //       a stale `PprIndex` attached after dep-parse was
+        //       turned off would otherwise still drive PPR rankings
+        //       — the contract documented at the top of Phase 2C is
+        //       "PPR is useful only when `PENSYVE_DEP_PARSE=1` is
+        //       also set", so the runtime check enforces that
+        //       contract.)
+        let ppr_enabled_flag = self.ppr_index.is_some()
+            && crate::retrieval::ppr::ppr_enabled()
+            && crate::extraction::dep_parse::dep_parse_enabled();
         if ppr_enabled_flag {
             // Safety: `ppr_enabled_flag` checks `is_some()` above.
             let ppr_index = self.ppr_index.unwrap();
@@ -1941,19 +1954,20 @@ mod tests {
 
     #[test]
     fn recall_with_ppr_index_populates_ppr_score_when_flag_enabled() {
-        // This test runs only when `PENSYVE_PPR=1` because the flag
-        // is OnceLock-cached process-wide; we can't safely flip it
-        // here without affecting parallel tests. The test is skipped
-        // (returns early) when the flag is off, matching the
+        // This test runs only when BOTH `PENSYVE_PPR=1` AND
+        // `PENSYVE_DEP_PARSE=1` are set, because the engine's PPR
+        // gate (CodeRabbit PR #116 round 2 P0) requires both. Both
+        // flags are OnceLock-cached process-wide so we can't safely
+        // flip them here without affecting parallel tests; the test
+        // returns early when either is off, matching the
         // process-cached env-flag pattern used elsewhere in the
         // codebase. To exercise it locally, run:
-        //   PENSYVE_PPR=1 cargo test -p pensyve-core --lib \
-        //     recall_with_ppr_index_populates_ppr_score_when_flag_enabled \
-        //     -- --ignored
-        // (We mark it #[ignore] specifically to prevent test-suite
-        // pollution; the engineering value is in the recall_*
-        // integration tests below that assert no regression.)
-        if !crate::retrieval::ppr::ppr_enabled() {
+        //   PENSYVE_PPR=1 PENSYVE_DEP_PARSE=1 \
+        //     cargo test -p pensyve-core --lib \
+        //     recall_with_ppr_index_populates_ppr_score_when_flag_enabled
+        if !crate::retrieval::ppr::ppr_enabled()
+            || !crate::extraction::dep_parse::dep_parse_enabled()
+        {
             return;
         }
 
@@ -2012,35 +2026,38 @@ mod tests {
             .expect("Alice memory should appear in recall");
         assert!(
             found.ppr_score.is_some(),
-            "ppr_score must be populated when PprIndex is attached AND PENSYVE_PPR=1"
+            "ppr_score must be populated when PprIndex is attached AND PENSYVE_PPR=1 AND PENSYVE_DEP_PARSE=1"
         );
     }
 
     #[test]
     fn recall_with_ppr_flag_but_no_kg_overlap_preserves_bfs_spread() {
-        // CodeRabbit PR #116 P1 #2: when PENSYVE_PPR=1 is set AND a
+        // CodeRabbit PR #116 P1 #2 + Round 2 inline: when
+        // `PENSYVE_PPR=1` + `PENSYVE_DEP_PARSE=1` are set AND a
         // PprIndex is attached BUT the query has zero entity overlap
         // with the KG, `ranking_ppr` comes back empty and
         // `has_discriminative_signal` filters it out. Before the fix,
         // `spread_weight = 0.0` was triggered by the flag alone, so
         // the BFS spread signal got zeroed AND the empty PPR ranking
         // got dropped — leaving the graph dimension of RRF
-        // unrepresented for this query. The fixed behavior: when PPR
-        // does NOT contribute, the BFS spread signal stays at its
-        // unmasked weight.
+        // unrepresented for this query.
         //
-        // This test exercises the runtime contract by:
-        // 1. Building a PprIndex from a namespace whose KG has no
-        //    overlap with the query lemmas (KG contains "Acme" only;
-        //    query is "quantum physics" — no entity match).
-        // 2. Asserting the recall still returns results AND that the
-        //    BFS spread signal could have contributed (i.e., recall
-        //    did not collapse into a degenerate single-signal mix).
+        // The round-2 review pointed out that the original test was
+        // an incomplete probe: calling `recall(...)` with no target
+        // entity leaves `ranking_spread` empty by construction (the
+        // engine never invokes `MemoryGraph::beam_search` without a
+        // target entity), so it couldn't actually exercise the
+        // BFS-preservation path. This rewrite uses
+        // `recall_with_entity(...)` with an attached `MemoryGraph` so
+        // `ranking_spread` is non-empty and we can observe whether
+        // the engine zeroed out its weight.
         //
-        // Returns early when PENSYVE_PPR is off, matching the
+        // Returns early when either flag is off, matching the
         // process-cached env-flag pattern in
         // `recall_with_ppr_index_populates_ppr_score_when_flag_enabled`.
-        if !crate::retrieval::ppr::ppr_enabled() {
+        if !crate::retrieval::ppr::ppr_enabled()
+            || !crate::extraction::dep_parse::dep_parse_enabled()
+        {
             return;
         }
 
@@ -2052,15 +2069,29 @@ mod tests {
 
         let ns = Namespace::new("ppr-no-overlap-test");
         storage.save_namespace(&ns).unwrap();
-        // The stored memory's content includes "quantum physics" so
-        // BM25 / vector signals have something to match on.
-        let mem = setup_episodic(
+        // Memory `mem_q` matches the query lexically; memory `mem_bfs`
+        // is reachable from the target entity via the MemoryGraph but
+        // does NOT match the query lexically — it's the "BFS-only"
+        // signal. If the engine correctly preserves the BFS weight
+        // when PPR contributes no signal, `mem_bfs` will surface
+        // through the spread ranking.
+        let mem_q = setup_episodic(
             &storage,
             &embedder,
             &ns,
             "quantum physics relativity theory",
         );
-        vector_index.add(mem.id, &mem.embedding).unwrap();
+        let mem_bfs = setup_episodic(&storage, &embedder, &ns, "unrelated bookkeeping content");
+        vector_index.add(mem_q.id, &mem_q.embedding).unwrap();
+        vector_index.add(mem_bfs.id, &mem_bfs.embedding).unwrap();
+
+        // Build a MemoryGraph with an edge from a target entity to
+        // `mem_bfs`. `beam_search` walks outgoing edges from the
+        // target, so this guarantees `ranking_spread` is non-empty
+        // when we pass the target entity to `recall_with_entity`.
+        let target_entity = Uuid::new_v4();
+        let mut graph = crate::graph::MemoryGraph::new();
+        graph.add_edge(target_entity, mem_bfs.id, 1.0);
 
         // Seed a KG with an entity ("Acme") that does NOT appear in
         // the query. The PprIndex will be non-empty (so the engine
@@ -2091,31 +2122,50 @@ mod tests {
         let ppr_index =
             crate::retrieval::ppr::PprIndex::build_from_storage(&conn, &ns.id.to_string()).unwrap();
 
-        // Query "quantum physics" has zero KG overlap with the
-        // "Acme"-only KG.
-        let engine =
-            RecallEngine::new(&storage, &embedder, &vector_index, &config).with_ppr(&ppr_index);
-        let result = engine.recall("quantum physics", ns.id, 5).unwrap();
+        // Query "quantum physics" has zero KG overlap. Pass the
+        // target entity so `recall_with_entity` runs `beam_search`
+        // and populates `ranking_spread`.
+        let engine = RecallEngine::new(&storage, &embedder, &vector_index, &config)
+            .with_ppr(&ppr_index)
+            .with_graph(&graph);
+        let result = engine
+            .recall_with_entity("quantum physics", ns.id, 5, Some(target_entity))
+            .unwrap();
 
-        // The non-zero-overlap memory MUST still appear in the
-        // results — recall must NOT collapse just because PPR is
-        // enabled but produced no signal.
+        // The query-matching memory MUST appear in the results —
+        // recall must NOT collapse just because PPR is enabled but
+        // produced no signal.
         assert!(
             !result.memories.is_empty(),
             "recall must still return results when PPR is enabled but produces no signal"
         );
-        let found = result.memories.iter().find(|c| c.memory_id == mem.id);
+        let found_q = result.memories.iter().find(|c| c.memory_id == mem_q.id);
         assert!(
-            found.is_some(),
-            "the matching memory must survive the no-PPR-signal path"
+            found_q.is_some(),
+            "the lexically-matching memory must survive the no-PPR-signal path"
         );
-        // ppr_score for this memory is None because the query had
+
+        // The BFS-reachable memory MUST also surface — this is the
+        // load-bearing assertion that proves the BFS-spread weight
+        // was NOT zeroed when PPR produced no signal. Before the
+        // P1 #2 fix, `spread_weight = 0.0` would filter
+        // `ranking_spread` out of the RRF fusion and `mem_bfs`
+        // would not appear.
+        let found_bfs = result.memories.iter().find(|c| c.memory_id == mem_bfs.id);
+        assert!(
+            found_bfs.is_some(),
+            "BFS-reachable memory must surface when PPR produces no signal — \
+             implies ranking_spread weight was preserved (not zeroed)"
+        );
+
+        // ppr_score for both candidates is None because the query had
         // no KG overlap (no entity seeds → empty ranking → no
         // ppr_score_by_id entry).
-        let candidate = found.unwrap();
-        assert!(
-            candidate.ppr_score.is_none(),
-            "ppr_score must be None when PPR produced no discriminative signal for this query"
-        );
+        for candidate in &result.memories {
+            assert!(
+                candidate.ppr_score.is_none(),
+                "ppr_score must be None when PPR produced no discriminative signal for this query"
+            );
+        }
     }
 }
