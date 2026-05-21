@@ -415,6 +415,36 @@ mod tests {
     }
 
     #[test]
+    fn bare_now_does_not_trigger_knowledge_update() {
+        // Regression: bare `\bnow\b` was previously too broad and
+        // would false-positive on routine queries like "Tell me about
+        // X now", which currently triggers BM25-boost + spreading-
+        // suppression masks under the knowledge-update route. The
+        // narrowed regex requires "right now", "as of now",
+        // "now that/it/uses/is", or one of the specific state-change
+        // cues ("currently", "updated", "changed", "instead",
+        // "no longer"). Per CodeRabbit review on #114 (2026-05-21).
+        let c = classify_query("Tell me about Rust now.");
+        assert_ne!(
+            c.question_type, "knowledge-update",
+            "bare 'now' must not trigger knowledge-update classification"
+        );
+    }
+
+    #[test]
+    fn right_now_still_triggers_knowledge_update() {
+        // Regression-paired positive case: the narrowed regex still
+        // fires on the intended state-change forms — `\bright now\b`
+        // remains in the alternation. Locks in the post-narrowing
+        // behavior against future tuning.
+        let c = classify_query("Tell me about Rust right now.");
+        assert_eq!(
+            c.question_type, "knowledge-update",
+            "narrow 'right now' should still classify as knowledge-update"
+        );
+    }
+
+    #[test]
     fn single_session_user_classification() {
         for q in [
             "I want a summary of my notes.",

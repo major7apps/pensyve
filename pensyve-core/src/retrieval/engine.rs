@@ -580,26 +580,18 @@ impl<'a> RecallEngine<'a> {
             self.gather_candidates(query, namespace_id, max_candidates)?
         };
 
-        if candidates.is_empty() {
-            return Ok(RecallResult { memories: vec![] });
-        }
-
-        if start.elapsed() > timeout {
-            return Err(RecallError::Timeout(self.config.recall_timeout_secs));
-        }
-
-        // Step 5: Normalize BM25 scores (positional rank).
-        let bm25_map = self.build_bm25_map(query, namespace_id, max_candidates)?;
-
-        // Classify query intent for intent-based scoring.
-        let intent = classify_intent(query);
-
         // Phase 2A SelRoute: optional question-type classification +
         // per-route RRF weight mask. Strictly gated behind the
         // `PENSYVE_SELROUTE` env-var (read once via OnceLock — see
         // `query_classifier::selroute_enabled`); when the gate is off
         // the entire block is bypassed and the recall path is
         // byte-for-byte identical to pre-Phase-2A behavior.
+        //
+        // This block runs BEFORE the zero-candidate early return so
+        // `selroute_classified` / `selroute_fallback_count` /
+        // `selroute_by_type` / confidence-histogram telemetry covers
+        // ALL SelRoute decisions, not just queries that returned hits.
+        // Per CodeRabbit review on #114 (2026-05-21).
         let selroute_mask: Option<[f32; 7]> =
             if crate::retrieval::query_classifier::selroute_enabled() {
                 let classification = crate::retrieval::query_classifier::classify_query(query);
@@ -628,6 +620,20 @@ impl<'a> RecallEngine<'a> {
             } else {
                 None
             };
+
+        if candidates.is_empty() {
+            return Ok(RecallResult { memories: vec![] });
+        }
+
+        if start.elapsed() > timeout {
+            return Err(RecallError::Timeout(self.config.recall_timeout_secs));
+        }
+
+        // Step 5: Normalize BM25 scores (positional rank).
+        let bm25_map = self.build_bm25_map(query, namespace_id, max_candidates)?;
+
+        // Classify query intent for intent-based scoring.
+        let intent = classify_intent(query);
 
         // Step 6–7: Build 6 independent rankings and merge via RRF.
         let candidates_found = candidates.len();
