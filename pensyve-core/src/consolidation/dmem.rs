@@ -74,6 +74,19 @@ pub struct RpeScore {
     pub combined: f32,
 }
 
+/// Default ring-buffer capacity for the lazy-constructed
+/// `DMemGate` used by the production ingest entry points
+/// (`commit_extraction_for_episode` / `commit_extractions_for_episodes`)
+/// when `PENSYVE_DMEM=1` is set without an explicit
+/// `DMemIngestContext`.
+///
+/// Sized at 1024 to comfortably hold one observation per second for
+/// ~17 minutes of sustained ingest before the eviction counter
+/// starts firing. Operators that need a larger or smaller buffer
+/// should switch to the `_with_dmem` entry-point variant and
+/// construct a `DMemGate` with `DMemGate::new` directly.
+pub const DEFAULT_RING_BUFFER_CAPACITY: usize = 1024;
+
 /// Route decision for a freshly-ingested observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DMemRoute {

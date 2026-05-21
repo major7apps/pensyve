@@ -3003,20 +3003,88 @@ where
     F: FnMut(&str) -> Result<Vec<f32>, E>,
     E: std::fmt::Display,
 {
-    // Delegate to the Phase 2D D-MEM-aware variant with `dmem = None`.
-    // When the gate is absent the body is byte-for-byte identical to
-    // the pre-2D baseline (no env-flag check, no metric increment,
-    // same dep-parse + typed-slot ordering).
-    commit_extraction_for_episode_with_dmem(
+    commit_extraction_for_episode_dmem_aware(
         storage,
         extractor,
         namespace_id,
         episode_id,
         cancel,
         embed,
-        None,
+        crate::consolidation::dmem::dmem_enabled(),
     )
     .await
+}
+
+/// Internal Phase 2D production-reachability helper (CodeRabbit +
+/// chatgpt-codex PR #117 P0 #2).
+///
+/// Splits the lazy-default-gate construction out from
+/// `commit_extraction_for_episode` so tests can exercise the
+/// dmem-enabled code path WITHOUT relying on the `OnceLock`-cached
+/// `dmem_enabled()` env-flag read (which can't be flipped per-test).
+/// Production calls pass `dmem_enabled = crate::consolidation::dmem::
+/// dmem_enabled()`; tests pass `true` directly to force the
+/// default-gate branch.
+///
+/// When `dmem_enabled = true`, lazily construct a default
+/// [`crate::consolidation::dmem::DMemGate`] (params from env via
+/// `DMemGate::from_env`) and run the gate-aware ingest path. The
+/// default gate operates in "telemetry-only" mode — empty
+/// existing-embeddings + zero query-context — so every observation
+/// routes slow but the routing counters increment, making the
+/// env-flag observable from prod. Callers that want useful fast
+/// routing should switch to `commit_extraction_for_episode_with_dmem`
+/// and provide a populated `DMemIngestContext`.
+///
+/// When `dmem_enabled = false`, delegate with `dmem = None` —
+/// byte-for-byte identical to the pre-2D baseline.
+#[doc(hidden)]
+pub async fn commit_extraction_for_episode_dmem_aware<F, E>(
+    storage: &(dyn crate::storage::StorageTrait + Send + Sync),
+    extractor: &dyn ObservationExtractor,
+    namespace_id: Uuid,
+    episode_id: Uuid,
+    cancel: CancellationToken,
+    embed: F,
+    dmem_enabled: bool,
+) -> usize
+where
+    F: FnMut(&str) -> Result<Vec<f32>, E>,
+    E: std::fmt::Display,
+{
+    if dmem_enabled {
+        let mut gate = crate::consolidation::dmem::DMemGate::from_env(
+            crate::consolidation::dmem::DEFAULT_RING_BUFFER_CAPACITY,
+        );
+        let existing: Vec<Vec<f32>> = Vec::new();
+        let context = Vec::<f32>::new();
+        let mut ctx = DMemIngestContext {
+            gate: &mut gate,
+            existing_embeddings: &existing,
+            query_context_emb: &context,
+        };
+        commit_extraction_for_episode_with_dmem(
+            storage,
+            extractor,
+            namespace_id,
+            episode_id,
+            cancel,
+            embed,
+            Some(&mut ctx),
+        )
+        .await
+    } else {
+        commit_extraction_for_episode_with_dmem(
+            storage,
+            extractor,
+            namespace_id,
+            episode_id,
+            cancel,
+            embed,
+            None,
+        )
+        .await
+    }
 }
 
 /// Phase 2D variant of [`commit_extraction_for_episode`] that
@@ -3144,13 +3212,21 @@ where
         //   (b) `PENSYVE_DMEM=1` (cached OnceLock env read)
         //   (c) `gate.route(...)` returns `FastBuffer`
         // When any condition fails, fall through to the baseline path
-        // (dep-parse + typed-slot hooks fire). When all three hold,
-        // skip both hooks; the raw row from `save_observation` above
-        // is the only artifact, and the gate buffers `obs.id` for
+        // (dep-parse + typed-slot hooks fire). When BOTH hold, skip
+        // both hooks; the raw row from `save_observation` above is
+        // the only artifact, and the gate buffers `obs.id` for
         // later drain.
-        let route = if let Some(ctx) = dmem.as_deref_mut()
-            && crate::consolidation::dmem::dmem_enabled()
-        {
+        //
+        // Note: the env-flag check (`dmem_enabled()`) happens at the
+        // DEFAULT entry point (`commit_extraction_for_episode_dmem_aware`)
+        // which only constructs and passes a `DMemIngestContext` when
+        // the flag is true. Callers of the `_with_dmem` variant that
+        // pass `Some(ctx)` explicitly are signalling that the gate
+        // IS active — we don't re-check the env flag here, because
+        // that would prevent tests from exercising the gate-active
+        // path without flipping the OnceLock-cached env read.
+        // CodeRabbit + chatgpt-codex PR #117 P0 #2.
+        let route = if let Some(ctx) = dmem.as_deref_mut() {
             let score = ctx.gate.score(
                 &obs.embedding,
                 ctx.existing_embeddings,
@@ -3160,7 +3236,7 @@ where
             crate::consolidation::dmem::record_route(&score, route, ctx.gate.ring_buffer_len());
             route
         } else {
-            // No gate attached / flag off → baseline path (slow).
+            // No gate attached → baseline path (slow).
             crate::consolidation::dmem::DMemRoute::SlowPipeline
         };
 
@@ -3237,18 +3313,69 @@ where
     F: FnMut(&str) -> Result<Vec<f32>, E>,
     E: std::fmt::Display,
 {
-    // Delegate to the Phase 2D variant with `dmem = None` — same
-    // contract as the per-episode helper.
-    commit_extractions_for_episodes_with_dmem(
+    commit_extractions_for_episodes_dmem_aware(
         storage,
         extractor,
         namespace_id,
         episode_ids,
         cancel,
         embed,
-        None,
+        crate::consolidation::dmem::dmem_enabled(),
     )
     .await
+}
+
+/// Internal Phase 2D production-reachability helper for the bulk
+/// ingest variant. Symmetric to
+/// `commit_extraction_for_episode_dmem_aware` — see that function's
+/// doc for the test-vs-prod parameterization rationale.
+#[doc(hidden)]
+pub async fn commit_extractions_for_episodes_dmem_aware<F, E>(
+    storage: &(dyn crate::storage::StorageTrait + Send + Sync),
+    extractor: &dyn ObservationExtractor,
+    namespace_id: Uuid,
+    episode_ids: &[Uuid],
+    cancel: CancellationToken,
+    embed: F,
+    dmem_enabled: bool,
+) -> usize
+where
+    F: FnMut(&str) -> Result<Vec<f32>, E>,
+    E: std::fmt::Display,
+{
+    if dmem_enabled {
+        let mut gate = crate::consolidation::dmem::DMemGate::from_env(
+            crate::consolidation::dmem::DEFAULT_RING_BUFFER_CAPACITY,
+        );
+        let existing: Vec<Vec<f32>> = Vec::new();
+        let context = Vec::<f32>::new();
+        let mut ctx = DMemIngestContext {
+            gate: &mut gate,
+            existing_embeddings: &existing,
+            query_context_emb: &context,
+        };
+        commit_extractions_for_episodes_with_dmem(
+            storage,
+            extractor,
+            namespace_id,
+            episode_ids,
+            cancel,
+            embed,
+            Some(&mut ctx),
+        )
+        .await
+    } else {
+        commit_extractions_for_episodes_with_dmem(
+            storage,
+            extractor,
+            namespace_id,
+            episode_ids,
+            cancel,
+            embed,
+            None,
+        )
+        .await
+    }
 }
 
 /// Phase 2D variant of [`commit_extractions_for_episodes`] that
@@ -3393,10 +3520,11 @@ where
 
             // Phase 2D D-MEM gate — same contract as the per-episode
             // helper. Gate state (ring buffer) is shared across every
-            // observation in the bulk call.
-            let route = if let Some(ctx) = dmem.as_deref_mut()
-                && crate::consolidation::dmem::dmem_enabled()
-            {
+            // observation in the bulk call. The env-flag check
+            // happens at the default entry point; callers of this
+            // `_with_dmem` variant that pass `Some(ctx)` are
+            // signalling that the gate IS active.
+            let route = if let Some(ctx) = dmem.as_deref_mut() {
                 let score = ctx.gate.score(
                     &obs.embedding,
                     ctx.existing_embeddings,
