@@ -208,21 +208,34 @@ impl VectorIndex {
         self.dimensions
     }
 
-    /// Return up to `limit` embeddings from the index (no ordering
-    /// guarantee — `HashMap` iteration order is arbitrary).
+    /// Return up to `limit` embeddings from the index by taking the
+    /// first `min(len, limit)` entries in `HashMap` iteration order.
+    ///
+    /// IMPORTANT: this is NOT a uniform random sample. `HashMap`
+    /// iteration order is unspecified but deterministic for a given
+    /// `(RandomState, contents)` pair — once the index is built,
+    /// repeated calls return the same prefix. For uniform random
+    /// sampling, the caller must shuffle the result (e.g., via the
+    /// `rand` crate) or perform reservoir sampling externally.
+    /// Pensyve's stdlib-only dependency budget (no `rand` in the
+    /// workspace) keeps the implementation here; callers that need
+    /// statistical guarantees should sample externally.
     ///
     /// Added in Phase 2D for the D-MEM gate's surprise calculation:
     /// the gate needs a small sample of existing embeddings to
-    /// compute `1 - max_cosine_similarity_to_existing` against the
-    /// freshly-extracted observation. Sampling without a sort keeps
-    /// the call O(min(len, limit)); the absence of an ordering
-    /// guarantee is intentional — D-MEM treats this as a statistical
-    /// sample, not a deterministic neighborhood.
+    /// compute `surprise = 1 - max_cosine_similarity_to_existing`
+    /// against the freshly-extracted observation. For the D-MEM use
+    /// case, a biased sample that MISSES the new observation's true
+    /// nearest neighbor will compute a LOWER sample-max-similarity
+    /// → a HIGHER `surprise` value → wrong-side-out routing (route
+    /// `SlowPipeline` when truly redundant). Per the threshold-sweep
+    /// safety contract documented in `consolidation::dmem`,
+    /// wrong-side-out is the safe direction — the dep-parse +
+    /// typed-slot enrichment runs unnecessarily, but no information
+    /// is lost. `CodeRabbit` PR #117 round 2.
     ///
     /// Each returned vector is a clone of the stored (pre-normalized)
-    /// embedding. Callers that need to hold the sample across mutating
-    /// operations on the index do not need to worry about iterator
-    /// invalidation.
+    /// embedding. `O(min(len, limit))` time + O(limit) allocation.
     #[must_use]
     pub fn sample_embeddings(&self, limit: usize) -> Vec<Vec<f32>> {
         self.entries

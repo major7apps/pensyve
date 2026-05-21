@@ -78,6 +78,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// Serializes the two Phase 2D production-reachability tests so
+/// they can take before/after snapshots of the global D-MEM counters
+/// without racing each other. CodeRabbit PR #117 round 2.
+static DMEM_COUNTER_LOCK: Mutex<()> = Mutex::new(());
+
 // ---------------------------------------------------------------------------
 // Mock extractor
 //
@@ -604,12 +609,9 @@ async fn test_noop_extractor_produces_no_gate_firings() {
 
 #[tokio::test]
 async fn test_dmem_default_entry_point_reaches_gate_when_flag_enabled() {
-    // Snapshot the global counters BEFORE the test so we can isolate
-    // this test's contribution from any parallel tests that hit the
-    // same global metrics (the global counter pollution that motivated
-    // PR #117 P1 #3 — addressed in a follow-up commit, but the
-    // before/after pattern is robust here because we assert a strict
-    // lower bound on the delta, not an exact equality).
+    // Hold DMEM_COUNTER_LOCK so the baseline test below doesn't
+    // race our counter snapshots. CodeRabbit PR #117 round 2.
+    let _guard = DMEM_COUNTER_LOCK.lock().unwrap();
     let metrics = pensyve_core::observability::metrics();
     let fast_before = metrics
         .dmem_fast_routed
@@ -651,30 +653,37 @@ async fn test_dmem_default_entry_point_reaches_gate_when_flag_enabled() {
     let slow_after = metrics
         .dmem_slow_routed
         .load(std::sync::atomic::Ordering::Relaxed);
-    let delta = (fast_after - fast_before) + (slow_after - slow_before);
-    assert!(
-        delta >= 1,
-        "default entry point with dmem_enabled=true must fire the gate at least once \
-         (fast+slow counter delta: {delta})"
-    );
 
+    // Tight equality assertions, robust under DMEM_COUNTER_LOCK.
     // The default gate's telemetry-only mode (empty existing pool +
-    // zero query context) routes every observation slow. Pin the
-    // routing direction so a future change that breaks "every default
-    // observation routes slow" trips this test.
-    assert!(
-        slow_after > slow_before,
-        "default gate (empty pool + zero context) must route slow; \
-         slow_routed went from {slow_before} → {slow_after}"
+    // zero query context) routes every observation slow at the
+    // default tuning (threshold=0.35, alpha=0.5 → combined=0.5):
+    //   - fast delta = 0
+    //   - slow delta = 1 (one canned observation)
+    assert_eq!(
+        fast_after - fast_before,
+        0,
+        "telemetry-only default gate (empty pool + zero context + default tuning) \
+         must NOT produce fast routes; fast delta = {}",
+        fast_after - fast_before
+    );
+    assert_eq!(
+        slow_after - slow_before,
+        1,
+        "exactly 1 slow route for the canned observation; slow delta = {}",
+        slow_after - slow_before
     );
 }
 
 #[tokio::test]
 async fn test_dmem_default_entry_point_baseline_when_flag_off() {
-    // Symmetric to the above: when `dmem_enabled = false`, the
-    // default entry point delegates to the pre-2D baseline path
-    // and does NOT fire the gate. The fast+slow counter delta stays
-    // at 0 across this run.
+    // Hold DMEM_COUNTER_LOCK so the reachability test above doesn't
+    // race our counter snapshots. CodeRabbit PR #117 round 2: this
+    // test was previously a no-op (snapshots discarded). Now it
+    // asserts exact equality on the deltas — both counters must
+    // stay at their before-values because `dmem_enabled = false`
+    // bypasses the gate entirely.
+    let _guard = DMEM_COUNTER_LOCK.lock().unwrap();
     let metrics = pensyve_core::observability::metrics();
     let fast_before = metrics
         .dmem_fast_routed
@@ -713,23 +722,18 @@ async fn test_dmem_default_entry_point_baseline_when_flag_off() {
     let slow_after = metrics
         .dmem_slow_routed
         .load(std::sync::atomic::Ordering::Relaxed);
-    // The dmem-disabled branch must NOT increment from THIS test, but
-    // parallel tests might. We use the strict lower-bound check on
-    // the slow counter: with the gate disabled, our run cannot have
-    // contributed to the slow_routed delta. Other tests' increments
-    // would still satisfy `slow_after >= slow_before`, but the
-    // assertion that's load-bearing is "our test did NOT contribute"
-    // — which we can't assert across a shared counter without
-    // serialization. The best we can do here is assert the contract
-    // that the disabled branch never produces a gate-fire signal
-    // larger than the parallel tests; in practice this means the
-    // test's failure mode is "false negative" (counter went up due
-    // to parallel tests) rather than "false positive."
-    //
-    // The complementary assertion above (test_dmem_default_entry_
-    // point_reaches_gate_when_flag_enabled) is the load-bearing
-    // positive case; this test exists to pin the symmetric negative
-    // case in code so a refactor that always fires the gate is
-    // caught at review time.
-    let _ = (fast_before, slow_before, fast_after, slow_after);
+
+    // Load-bearing assertions: the disabled branch must NOT fire
+    // the gate, so neither counter increments. A refactor that
+    // accidentally always fires the gate would trip this test.
+    assert_eq!(
+        fast_after, fast_before,
+        "disabled branch must NOT increment dmem_fast_routed; \
+         {fast_before} → {fast_after}"
+    );
+    assert_eq!(
+        slow_after, slow_before,
+        "disabled branch must NOT increment dmem_slow_routed; \
+         {slow_before} → {slow_after}"
+    );
 }

@@ -124,11 +124,20 @@ impl DMemGate {
     /// want env-driven defaults should call
     /// [`Self::from_env`] instead.
     ///
+    /// `threshold` and `alpha` are both clamped to `[0.0, 1.0]` to
+    /// preserve the `RpeScore` range invariants — `from_env()`
+    /// applies the same clamp via its `filter(|f| (0.0..=1.0).
+    /// contains(f))` parser, and the public constructor must match
+    /// so callers can't bypass the range check by going around
+    /// `from_env`. `CodeRabbit` PR #117 round 2.
+    ///
     /// `capacity` must be `>= 1`; a zero-capacity ring buffer would
     /// silently drop every fast-routed observation. We clamp to 1 to
     /// avoid that footgun.
     #[must_use]
     pub fn new(threshold: f32, alpha: f32, capacity: usize) -> Self {
+        let threshold = threshold.clamp(0.0, 1.0);
+        let alpha = alpha.clamp(0.0, 1.0);
         let capacity = capacity.max(1);
         Self {
             threshold,
@@ -500,6 +509,12 @@ mod tests {
 
     #[test]
     fn ring_buffer_evicts_oldest_at_capacity() {
+        // Hold EVICTION_COUNTER_LOCK because this test triggers
+        // 2 capacity-overflow evictions that mutate the shared
+        // `dmem_ring_buffer_evictions` counter. Without the lock,
+        // the eviction-counter snapshot tests would race with this
+        // test's mutations. CodeRabbit PR #117 round 2.
+        let _guard = test_locks::EVICTION_COUNTER_LOCK.lock().unwrap();
         let mut gate = DMemGate::new(0.35, 0.5, 3);
         let low_score = RpeScore {
             surprise: 0.0,
@@ -741,6 +756,8 @@ mod tests {
         // Zero-capacity would silently drop every fast-routed
         // observation; we clamp to 1 to make the failure mode at
         // least observable (every fast route evicts the previous).
+        // Hold EVICTION_COUNTER_LOCK — this test fires evictions.
+        let _guard = test_locks::EVICTION_COUNTER_LOCK.lock().unwrap();
         let gate = DMemGate::new(0.35, 0.5, 0);
         let mut g = gate;
         let low = RpeScore {
@@ -758,6 +775,30 @@ mod tests {
             vec![b],
             "capacity 0 → clamped to 1 → only newest survives"
         );
+    }
+
+    #[test]
+    fn new_clamps_threshold_and_alpha_to_unit_interval() {
+        // CodeRabbit PR #117 round 2: `from_env()` already filters
+        // out-of-range values via its parser; `new()` must apply the
+        // same clamp so callers can't bypass the range check.
+        // Out-of-range threshold/alpha would break the `RpeScore`
+        // invariants documented at the top of this module.
+
+        // Above the upper bound → clamped to 1.0
+        let gate = DMemGate::new(1.5, 2.0, 8);
+        assert!((gate.threshold() - 1.0).abs() < f32::EPSILON);
+        assert!((gate.alpha() - 1.0).abs() < f32::EPSILON);
+
+        // Below the lower bound → clamped to 0.0
+        let gate = DMemGate::new(-0.5, -1.0, 8);
+        assert!((gate.threshold() - 0.0).abs() < f32::EPSILON);
+        assert!((gate.alpha() - 0.0).abs() < f32::EPSILON);
+
+        // In-range values pass through unchanged.
+        let gate = DMemGate::new(0.4, 0.6, 8);
+        assert!((gate.threshold() - 0.4).abs() < f32::EPSILON);
+        assert!((gate.alpha() - 0.6).abs() < f32::EPSILON);
     }
 
     // ---- Env-var caches ----

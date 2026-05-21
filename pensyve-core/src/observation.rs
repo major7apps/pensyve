@@ -3058,21 +3058,61 @@ where
         );
         let existing: Vec<Vec<f32>> = Vec::new();
         let context = Vec::<f32>::new();
-        let mut ctx = DMemIngestContext {
-            gate: &mut gate,
-            existing_embeddings: &existing,
-            query_context_emb: &context,
+        let persisted = {
+            let mut ctx = DMemIngestContext {
+                gate: &mut gate,
+                existing_embeddings: &existing,
+                query_context_emb: &context,
+            };
+            commit_extraction_for_episode_with_dmem(
+                storage,
+                extractor,
+                namespace_id,
+                episode_id,
+                cancel,
+                embed,
+                Some(&mut ctx),
+            )
+            .await
         };
-        commit_extraction_for_episode_with_dmem(
-            storage,
-            extractor,
-            namespace_id,
-            episode_id,
-            cancel,
-            embed,
-            Some(&mut ctx),
-        )
-        .await
+
+        // Drain the lazy gate before it drops. CodeRabbit PR #117
+        // round 2: the ephemeral default gate operates in
+        // "telemetry-only" mode (empty existing pool + zero context →
+        // every observation routes slow at default tuning), but
+        // operators setting non-default `PENSYVE_DMEM_THRESHOLD` /
+        // `PENSYVE_DMEM_ALPHA` could land FastBuffer routes here.
+        // Without an explicit drain, those buffered IDs are dropped
+        // silently — the observation's dep-parse + typed-slot
+        // enrichment is lost forever.
+        //
+        // We can't replay dep-parse without access to the
+        // observation content (and round-tripping through storage to
+        // fetch them is scope-creep). Instead: drain + log + count
+        // via the ring-buffer-evictions counter so operators see the
+        // signal. Production callers that want useful fast routing
+        // should switch to `commit_extraction_for_episode_with_dmem`
+        // with a populated context AND own the drain themselves.
+        let drained_ids = gate.drain_ring_buffer();
+        if !drained_ids.is_empty() {
+            tracing::warn!(
+                target: "pensyve::observation::dmem",
+                drained = drained_ids.len(),
+                "Phase 2D default gate dropped buffered observation IDs at function exit; \
+                 their deferred dep-parse + typed-slot enrichment is permanently lost. \
+                 This indicates non-default PENSYVE_DMEM_* tuning under the default \
+                 entry point — use `commit_extraction_for_episode_with_dmem` with an \
+                 explicit DMemIngestContext + caller-owned drain instead."
+            );
+            crate::observability::metrics()
+                .dmem_ring_buffer_evictions
+                .fetch_add(
+                    drained_ids.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+        }
+
+        persisted
     } else {
         commit_extraction_for_episode_with_dmem(
             storage,
@@ -3349,21 +3389,45 @@ where
         );
         let existing: Vec<Vec<f32>> = Vec::new();
         let context = Vec::<f32>::new();
-        let mut ctx = DMemIngestContext {
-            gate: &mut gate,
-            existing_embeddings: &existing,
-            query_context_emb: &context,
+        let persisted = {
+            let mut ctx = DMemIngestContext {
+                gate: &mut gate,
+                existing_embeddings: &existing,
+                query_context_emb: &context,
+            };
+            commit_extractions_for_episodes_with_dmem(
+                storage,
+                extractor,
+                namespace_id,
+                episode_ids,
+                cancel,
+                embed,
+                Some(&mut ctx),
+            )
+            .await
         };
-        commit_extractions_for_episodes_with_dmem(
-            storage,
-            extractor,
-            namespace_id,
-            episode_ids,
-            cancel,
-            embed,
-            Some(&mut ctx),
-        )
-        .await
+
+        // Same dropped-buffer warning as the per-episode variant.
+        // CodeRabbit PR #117 round 2.
+        let drained_ids = gate.drain_ring_buffer();
+        if !drained_ids.is_empty() {
+            tracing::warn!(
+                target: "pensyve::observation::dmem",
+                drained = drained_ids.len(),
+                "Phase 2D default gate (bulk) dropped buffered observation IDs at function exit; \
+                 their deferred dep-parse + typed-slot enrichment is permanently lost. \
+                 See `commit_extraction_for_episode_dmem_aware` for the same warning + \
+                 the migration to `_with_dmem` for caller-owned drain."
+            );
+            crate::observability::metrics()
+                .dmem_ring_buffer_evictions
+                .fetch_add(
+                    drained_ids.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+        }
+
+        persisted
     } else {
         commit_extractions_for_episodes_with_dmem(
             storage,
