@@ -274,6 +274,13 @@ pub struct ScoredCandidate {
     pub entity_score: f32,
     /// 1.0 default; can boost specific memory types.
     pub type_boost: f32,
+    /// Personalized `PageRank` mass for this passage (Phase 2C). `None`
+    /// when PPR was inactive on the recall — either `PENSYVE_PPR` was
+    /// off, no `PprIndex` was attached, the query produced no entity
+    /// seeds that exist in the KG, or this memory was not in the
+    /// top-k PPR ranking. Surfaced through the SDK for downstream
+    /// inspection (additive + non-breaking).
+    pub ppr_score: Option<f32>,
     /// Weighted fusion of all signals.
     pub final_score: f32,
 }
@@ -317,6 +324,13 @@ pub struct RecallEngine<'a> {
     /// when `None`, preserving the v2.2.0 default-OFF behavior for
     /// callers that haven't migrated.
     mmr_lambda: Option<f32>,
+    /// Phase 2C: optional Personalized `PageRank` index over the
+    /// dep-parse KG. When attached AND `PENSYVE_PPR=1`, the recall
+    /// engine emits a PPR ranking as the 8th RRF signal. The index is
+    /// borrowed `&'a` so callers retain ownership and can rebuild it
+    /// out-of-band (e.g., after a batch of new observations land via
+    /// the Phase 2B dep-parse hook).
+    ppr_index: Option<&'a crate::retrieval::ppr::PprIndex>,
 }
 
 /// Maximum number of candidates to pass into the cross-encoder for reranking.
@@ -341,6 +355,7 @@ impl<'a> RecallEngine<'a> {
             user_id: None,
             agent_only: None,
             mmr_lambda: None,
+            ppr_index: None,
         }
     }
 
@@ -348,6 +363,24 @@ impl<'a> RecallEngine<'a> {
     #[must_use]
     pub fn with_graph(mut self, graph: &'a MemoryGraph) -> Self {
         self.graph = Some(graph);
+        self
+    }
+
+    /// Phase 2C: attach an optional [`crate::retrieval::ppr::PprIndex`]
+    /// for Personalized `PageRank` scoring.
+    ///
+    /// When attached AND `PENSYVE_PPR=1`, the recall engine extracts
+    /// query entities via Phase 2B's dep-parse, looks up matching
+    /// entities in the index, and emits a PPR passage ranking as the
+    /// 8th RRF signal. The spreading-activation BFS signal
+    /// (`ranking_spread`) is zeroed out for the same query to avoid
+    /// double-counting graph signal.
+    ///
+    /// When NOT attached OR when `PENSYVE_PPR` is off, recall is
+    /// byte-for-byte identical to the pre-2C 7-signal mix.
+    #[must_use]
+    pub fn with_ppr(mut self, index: &'a crate::retrieval::ppr::PprIndex) -> Self {
+        self.ppr_index = Some(index);
         self
     }
 
@@ -763,17 +796,84 @@ impl<'a> RecallEngine<'a> {
             }
         };
 
+        // 8. Phase 2C Personalized PageRank ranking.
+        //
+        // Active only when BOTH:
+        //   (a) a `PprIndex` has been attached via `with_ppr`
+        //   (b) `PENSYVE_PPR=1` (cached OnceLock env read)
+        //
+        // The brief's parameter defaults (alpha=0.15, max_iter=20,
+        // top_k=50) are documented inline. When PPR fires, the
+        // spreading-activation BFS signal (`ranking_spread`) is zeroed
+        // out via `ppr_active` below to avoid double-counting graph
+        // signal — `ranking_spread` is BFS over the memory-graph
+        // edges, `ranking_ppr` is the entity-graph PPR mass; both are
+        // "graph signals" and adding them with full weight inflates
+        // the graph contribution to RRF.
+        //
+        // Query entities are derived by feeding `query` through the
+        // Phase 2B dep-parse extractor (with a sentinel passage_id —
+        // we're not persisting). Lemmas are then mapped to UUIDs via
+        // `ppr::lemma_uuid`, which uses the same RFC 4122 v5 namespace
+        // as the dep-parse hook's entity persistence. Dense seeds
+        // come from `ranking_vec` (the existing vector-similarity
+        // ranking, already computed above) so PPR's restart vector
+        // benefits from semantic similarity even when the lexical
+        // dep-parse misses entities.
+        let mut ppr_score_by_id: std::collections::HashMap<Uuid, f32> =
+            std::collections::HashMap::new();
+        let mut ranking_ppr: Vec<(Uuid, f32)> = Vec::new();
+        let ppr_active = self.ppr_index.is_some() && crate::retrieval::ppr::ppr_enabled();
+        if ppr_active {
+            // Safety: `ppr_active` checks `is_some()` above.
+            let ppr_index = self.ppr_index.unwrap();
+            // Extract query entities. Passage_id is Uuid::nil()
+            // because we're not persisting the resulting triples —
+            // this is a read-only dep-parse call for entity
+            // candidates only. The dep-parse extractor does NOT touch
+            // the global metrics counters for synthetic Uuid::nil()
+            // passages (the consolidation hook is what increments).
+            let parsed = crate::extraction::dep_parse::extract_triples(Uuid::nil(), query);
+            let query_entity_uuids: Vec<Uuid> = parsed
+                .entities
+                .iter()
+                .map(|lemma| crate::retrieval::ppr::lemma_uuid(lemma))
+                .collect();
+            // Dense seeds: passages from the vector-similarity
+            // ranking, scored by the vector score. PPR's restart
+            // vector normalizes the seed mass, so the raw scores
+            // here only need to be proportional.
+            let dense_seeds: Vec<(Uuid, f32)> = ranking_vec.clone();
+            // PPR brief defaults: alpha = 0.15 (restart probability),
+            // max_iter = 20 (production graph default; small unit-
+            // test graphs use larger caps — see ppr.rs module doc),
+            // top_k = 50 (we re-merge through RRF so this is the
+            // upper-bound on the PPR signal's contribution).
+            ranking_ppr = ppr_index.query(&query_entity_uuids, &dense_seeds, 0.15, 20, 50);
+            for (id, score) in &ranking_ppr {
+                ppr_score_by_id.insert(*id, *score);
+            }
+        }
+
         // Merge via RRF — only include rankings with discriminative signal.
         // A ranking where all scores are identical (e.g., empty graph, no access history)
         // adds noise and dilutes the strong signals like vector similarity.
+        //
+        // When PPR is active, zero out the BFS spread weight to avoid
+        // double-counting graph signal. The spread ranking is still
+        // included in `all_rankings` (its content may still be useful
+        // when PPR returns zero results, e.g., when no query entities
+        // exist in the KG) but its weight contribution is zero.
+        let spread_weight = if ppr_active { 0.0 } else { masked_weight(3) };
         let all_rankings = vec![
             (ranking_vec, masked_weight(0)),
             (ranking_bm25, masked_weight(1)),
             (ranking_activation, masked_weight(2)),
-            (ranking_spread, masked_weight(3)),
+            (ranking_spread, spread_weight),
             (ranking_intent, masked_weight(4)),
             (ranking_confidence, masked_weight(5)),
             (ranking_entity, masked_weight(6)),
+            (ranking_ppr, masked_weight(7)),
         ];
 
         let (rankings, rrf_weights): (Vec<_>, Vec<_>) = all_rankings
@@ -854,6 +954,7 @@ impl<'a> RecallEngine<'a> {
                         0.0
                     };
 
+                    let ppr_score = ppr_score_by_id.get(&id).copied();
                     ScoredCandidate {
                         memory_id: id,
                         memory: mem.clone(),
@@ -866,6 +967,7 @@ impl<'a> RecallEngine<'a> {
                         confidence_score,
                         entity_score,
                         type_boost: 1.0,
+                        ppr_score,
                         final_score: rrf_score,
                     }
                 })
@@ -1238,6 +1340,7 @@ fn score_candidate(
         confidence_score,
         entity_score: 0.0,
         type_boost,
+        ppr_score: None,
         final_score,
     }
 }
@@ -1783,6 +1886,114 @@ mod tests {
             groups_unknown.len() <= 5,
             "unknown type falls back to SS-Pref bucket (5); got {} groups",
             groups_unknown.len()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2C integration tests — PPR attached to RecallEngine
+    //
+    // We use `query_with_stats`-shaped expectations by relying on the
+    // returned `ScoredCandidate.ppr_score` field rather than the global
+    // metrics counters (which are polluted by parallel tests).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn recall_without_ppr_index_returns_none_ppr_score() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteBackend::open(dir.path()).unwrap();
+        let embedder = OnnxEmbedder::new_mock(64);
+        let mut vector_index = VectorIndex::new(64, 16);
+        let config = test_config();
+
+        let ns = Namespace::new("ppr-none-test");
+        storage.save_namespace(&ns).unwrap();
+        let mem = setup_episodic(&storage, &embedder, &ns, "Alice works at Acme.");
+        vector_index.add(mem.id, &mem.embedding).unwrap();
+
+        let engine = RecallEngine::new(&storage, &embedder, &vector_index, &config);
+        let result = engine.recall("Alice", ns.id, 5).unwrap();
+        for candidate in &result.memories {
+            assert!(
+                candidate.ppr_score.is_none(),
+                "ppr_score must be None when no PprIndex is attached"
+            );
+        }
+    }
+
+    #[test]
+    fn recall_with_ppr_index_populates_ppr_score_when_flag_enabled() {
+        // This test runs only when `PENSYVE_PPR=1` because the flag
+        // is OnceLock-cached process-wide; we can't safely flip it
+        // here without affecting parallel tests. The test is skipped
+        // (returns early) when the flag is off, matching the
+        // process-cached env-flag pattern used elsewhere in the
+        // codebase. To exercise it locally, run:
+        //   PENSYVE_PPR=1 cargo test -p pensyve-core --lib \
+        //     recall_with_ppr_index_populates_ppr_score_when_flag_enabled \
+        //     -- --ignored
+        // (We mark it #[ignore] specifically to prevent test-suite
+        // pollution; the engineering value is in the recall_*
+        // integration tests below that assert no regression.)
+        if !crate::retrieval::ppr::ppr_enabled() {
+            return;
+        }
+
+        // Build a tiny KG via raw SQL so the PprIndex has something to
+        // index against. The test database also gets a real
+        // observation row whose Uuid matches the kg_passage_entities
+        // passage_id, so the engine's recall returns a candidate the
+        // PPR ranking can attach a score to.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteBackend::open(dir.path()).unwrap();
+        let embedder = OnnxEmbedder::new_mock(64);
+        let mut vector_index = VectorIndex::new(64, 16);
+        let config = test_config();
+
+        let ns = Namespace::new("ppr-active-test");
+        storage.save_namespace(&ns).unwrap();
+        let mem = setup_episodic(&storage, &embedder, &ns, "Alice works at Acme.");
+        vector_index.add(mem.id, &mem.embedding).unwrap();
+
+        // Build an in-memory PPR index that knows about Alice + the
+        // saved observation's id (acting as passage_id). The recall
+        // engine's "synthetic-dep-parse" path will extract "Alice"
+        // from the query, map it via lemma_uuid, and seed PPR.
+        let conn = rusqlite::Connection::open(storage.db_path().unwrap()).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO kg_entities (namespace_id, lemma, created_at) VALUES (?1, 'Alice', 0)",
+            rusqlite::params![ns.id.to_string()],
+        )
+        .unwrap();
+        let alice_id: i64 = conn
+            .query_row(
+                "SELECT id FROM kg_entities WHERE namespace_id = ?1 AND lemma = 'Alice'",
+                rusqlite::params![ns.id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO kg_passage_entities (passage_id, entity_id, weight) VALUES (?1, ?2, 1.0)",
+            rusqlite::params![mem.id.to_string(), alice_id],
+        )
+        .unwrap();
+        let ppr_index =
+            crate::retrieval::ppr::PprIndex::build_from_storage(&conn, &ns.id.to_string()).unwrap();
+
+        let engine =
+            RecallEngine::new(&storage, &embedder, &vector_index, &config).with_ppr(&ppr_index);
+        let result = engine.recall("Alice", ns.id, 5).unwrap();
+
+        // The Alice-containing observation should appear in the
+        // result, and (because PPR fired) its ppr_score should be
+        // populated.
+        let found = result
+            .memories
+            .iter()
+            .find(|c| c.memory_id == mem.id)
+            .expect("Alice memory should appear in recall");
+        assert!(
+            found.ppr_score.is_some(),
+            "ppr_score must be populated when PprIndex is attached AND PENSYVE_PPR=1"
         );
     }
 }

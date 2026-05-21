@@ -382,6 +382,7 @@ mod tests {
             confidence_score: 0.0,
             entity_score: 0.0,
             type_boost: 1.0,
+            ppr_score: None,
             final_score,
         }
     }

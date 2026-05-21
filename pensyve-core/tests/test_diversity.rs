@@ -46,6 +46,7 @@ fn make_candidate(embedding: Vec<f32>, relevance_marker: f32) -> ScoredCandidate
         confidence_score: 1.0,
         entity_score: 0.0,
         type_boost: 1.0,
+        ppr_score: None,
         final_score: relevance_marker,
     }
 }
