@@ -165,9 +165,12 @@ pub struct PensyveMetrics {
     /// `max_iter` and the `alpha` damping factor.
     pub ppr_iterations_total: AtomicU64,
     /// Number of PPR queries that reached `max_iter` without
-    /// converging to the `||·||_1 < 1e-6` threshold. The acceptance
-    /// criterion is 0 on the unit-test graphs; a non-zero production
-    /// value signals degenerate restart vectors or pathological graphs.
+    /// converging to the configured convergence tolerance (currently
+    /// `CONVERGENCE_TOL = 1e-4` in
+    /// [`crate::retrieval::ppr`] — see that constant's doc for the
+    /// f32 / bipartite-graph rationale). The acceptance criterion is
+    /// 0 on the unit-test graphs; a non-zero production value signals
+    /// degenerate restart vectors or pathological graphs.
     pub ppr_convergence_failures: AtomicU64,
     /// Wall-clock distribution of `PprIndex::query` execution.
     pub ppr_duration: HistogramBuckets,
@@ -464,7 +467,7 @@ impl PensyveMetrics {
         let _ = writeln!(buf, "pensyve_ppr_iterations_total {ppr_iters}");
         let _ = writeln!(
             buf,
-            "# HELP pensyve_ppr_convergence_failures_total PPR queries that reached max_iter without converging."
+            "# HELP pensyve_ppr_convergence_failures_total PPR queries that reached max_iter without converging to the configured tolerance."
         );
         let _ = writeln!(buf, "# TYPE pensyve_ppr_convergence_failures_total counter");
         let _ = writeln!(buf, "pensyve_ppr_convergence_failures_total {ppr_failures}");

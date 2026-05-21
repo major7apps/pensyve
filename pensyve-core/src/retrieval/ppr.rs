@@ -302,7 +302,16 @@ impl PprIndex {
         // CSR build can lay them out contiguously.
         let mut outgoing: Vec<Vec<(usize, f32)>> = vec![Vec::new(); total_nodes];
         for (ent_idx, pas_idx, raw_weight) in &valid_edges {
-            let damper = 1.0 + (entity_degree[*ent_idx] as f32).ln();
+            // `entity_degree[ent_idx] >= 1` is invariant here by
+            // construction — the same loop that built `valid_edges`
+            // also incremented `entity_degree[ent_idx]` (step 3
+            // above), so every entry in `valid_edges` corresponds to
+            // an entity with degree >= 1. The `.max(1)` is defensive
+            // belt-and-suspenders: if a future refactor decouples
+            // the two passes, a degree of 0 would yield `ln(0) = -inf`
+            // and propagate NaN through PPR. Keep the guard.
+            let degree = entity_degree[*ent_idx].max(1);
+            let damper = 1.0 + (degree as f32).ln();
             let effective = raw_weight / damper;
             // entity -> passage (passage indexed at n_entities + pas_idx)
             outgoing[*ent_idx].push((n_entities + *pas_idx, effective));
@@ -455,6 +464,14 @@ impl PprIndex {
         // graph, return empty (no signal).
         let mut restart: Vec<f32> = vec![0.0; total];
 
+        // Phase 3 perf note: these two HashMaps are rebuilt on every
+        // query. For per-query latencies in the µs range (measured
+        // 385 µs on 10k passages, per the criterion bench) the
+        // allocation cost is in the noise, but if Phase 3 wants to
+        // squeeze the query path further the natural fix is to cache
+        // these on `PprIndex` itself — populated at build time and
+        // updated alongside `last_rebuilt` whenever
+        // `rebuild_incremental` fires.
         let entity_lookup: std::collections::HashMap<Uuid, usize> = self
             .entity_ids
             .iter()
