@@ -45,6 +45,7 @@
 //!   per-event gate. See its module docs for the prompt and parser
 //!   contract.
 
+pub mod dmem;
 pub mod typed_slots;
 
 use std::collections::HashMap;
