@@ -152,9 +152,13 @@ fn patterns() -> &'static PatternBundle {
             r"(?i)(\bremember\b|\blast time\b|\bpreviously\b|\bearlier\b|\bin our (last|previous)\b|\bwe (discussed|talked|covered)\b)",
         )
         .expect("multi_session pattern compiles"),
-        // Knowledge-update: state-change cues.
+        // Knowledge-update: state-change cues. `now` alone is too
+        // common (fires on routine queries like "Tell me about X now")
+        // and would degrade retrieval — restrict to constructions that
+        // actually signal a state change: "right now", "as of now",
+        // "now that/it/uses/is".
         knowledge_update: Regex::new(
-            r"(?i)(\bnow\b|\bcurrently\b|\bcurrent\b|\bupdated?\b|\bchanged?\b|\binstead\b|\bno longer\b)",
+            r"(?i)(\bright now\b|\bas of now\b|\bnow (that|it|uses?|is)\b|\bcurrently\b|\bcurrent\b|\bupdated?\b|\bchanged?\b|\binstead\b|\bno longer\b)",
         )
         .expect("knowledge_update pattern compiles"),
         // Single-session-user: first-person self-references.
@@ -166,7 +170,7 @@ fn patterns() -> &'static PatternBundle {
         // assistant's prior output. Verb stems accept both past-tense
         // ("you said") and present-tense ("did you suggest") forms.
         single_assistant: Regex::new(
-            r"(?i)(\byou (said|told|wrote|suggested|suggest|recommended|recommend|wrote|write)\b|\byour (answer|response|suggestion|recommendation)\b)",
+            r"(?i)(\byou (said|told|wrote|write|suggested|suggest|recommended|recommend)\b|\byour (answer|response|suggestion|recommendation)\b)",
         )
         .expect("single_assistant pattern compiles"),
     })
@@ -187,12 +191,11 @@ fn patterns() -> &'static PatternBundle {
 /// - `0.7` — multiple groups fire and the highest-precedence one is
 ///   chosen (the caller still applies the per-route mask, but the
 ///   reduced confidence flags ambiguity for downstream logging).
-/// - `0.5` — no group fires; classifier returns the
-///   `single-session-preference` fallback at the confidence boundary
-///   (the caller's `>= 0.5` guard treats this as "use the IDENTITY mask
-///   but still record the route").
-/// - `0.0` — empty / whitespace-only query (caller should bypass
-///   per-route mask entirely).
+/// - `0.0` — no group fires (unclassified) OR the query is empty /
+///   whitespace-only. The caller's `>= 0.5` guard unconditionally
+///   bypasses per-route mask application in both cases, decoupling
+///   the fallback path from threshold or IDENTITY-mask tuning that
+///   may happen in a later phase.
 #[must_use]
 pub fn classify_query(query: &str) -> QueryClassification {
     let trimmed = query.trim();
@@ -239,10 +242,13 @@ pub fn classify_query(query: &str) -> QueryClassification {
     };
 
     let confidence = if groups_fired == 0 {
-        // Fallback: at the >=0.5 confidence boundary so the caller can
-        // either treat this as "apply the identity mask" or as "log
-        // route but skip masking", depending on its own threshold.
-        0.5
+        // Unclassified: return 0.0 so the caller's `>= 0.5` guard
+        // unconditionally bypasses per-route mask application. This
+        // decouples the fallback path from threshold tuning or
+        // IDENTITY-mask changes in later phases — if either is tuned
+        // independently, unclassified queries still won't accidentally
+        // start applying a non-identity mask.
+        0.0
     } else if groups_fired == 1 {
         1.0
     } else {
@@ -435,8 +441,7 @@ mod tests {
             // precedence is multi-session > assistant, so that query
             // classifies as multi-session. Verify only the unambiguous ones.
             assert!(
-                c.question_type == "single-session-assistant"
-                    || c.question_type == "multi-session",
+                c.question_type == "single-session-assistant" || c.question_type == "multi-session",
                 "unexpected classification {} for {q:?}",
                 c.question_type
             );
@@ -464,9 +469,7 @@ mod tests {
     #[test]
     fn temporal_outranks_other_signals() {
         // "before" + "my" + "we discussed" — temporal wins by precedence.
-        let c = classify_query(
-            "Before our meeting last week, we discussed my Rust project plans.",
-        );
+        let c = classify_query("Before our meeting last week, we discussed my Rust project plans.");
         assert_eq!(c.question_type, "temporal-reasoning");
         assert!(c.confidence >= 0.7);
     }
@@ -485,10 +488,12 @@ mod tests {
     fn unrelated_query_falls_back_to_preference() {
         let c = classify_query("Tell something about cats.");
         assert_eq!(c.question_type, "single-session-preference");
-        // No group fired -> fallback confidence 0.5.
+        // No group fired -> fallback confidence 0.0 (caller's `>= 0.5`
+        // guard unconditionally bypasses mask application; decouples
+        // fallback from threshold/IDENTITY-mask tuning in later phases).
         assert!(
-            (c.confidence - 0.5).abs() < f32::EPSILON,
-            "expected 0.5 fallback confidence, got {}",
+            c.confidence.abs() < f32::EPSILON,
+            "expected 0.0 fallback confidence, got {}",
             c.confidence
         );
     }
@@ -520,10 +525,7 @@ mod tests {
             // Each mask entry must be non-negative (multiplicative
             // masks; negative would invert the RRF ranking sign).
             for (i, &v) in cfg.signal_mask.iter().enumerate() {
-                assert!(
-                    v >= 0.0,
-                    "negative mask value at idx {i} for {qt}: {v}"
-                );
+                assert!(v >= 0.0, "negative mask value at idx {i} for {qt}: {v}");
             }
         }
         // The PPR slot (index 6) is reserved for the future PPR signal

@@ -71,10 +71,17 @@ impl HistogramBuckets {
     }
 
     /// Format as Prometheus histogram exposition text.
-    pub fn prometheus_text(&self, name: &str) -> String {
+    ///
+    /// `help` is rendered into the `# HELP {name} {help}` line so that
+    /// non-duration histograms (e.g. dimensionless confidence) can carry
+    /// accurate semantics. Duration histograms should pass a phrase
+    /// ending in "in seconds" or "in milliseconds" for monitoring-tool
+    /// auto-detection; other observations should describe their unit
+    /// (e.g. "Classification confidence in [0.0, 1.0]").
+    pub fn prometheus_text(&self, name: &str, help: &str) -> String {
         use std::fmt::Write;
         let mut buf = String::new();
-        let _ = writeln!(buf, "# HELP {name} Duration in seconds");
+        let _ = writeln!(buf, "# HELP {name} {help}");
         let _ = writeln!(buf, "# TYPE {name} histogram");
         for (i, &boundary) in self.boundaries.iter().enumerate() {
             let count = self.counts[i].load(Ordering::Relaxed);
@@ -306,7 +313,10 @@ impl PensyveMetrics {
             "# HELP pensyve_selroute_classified_total Total queries auto-classified by SelRoute."
         );
         let _ = writeln!(buf, "# TYPE pensyve_selroute_classified_total counter");
-        let _ = writeln!(buf, "pensyve_selroute_classified_total {selroute_classified}");
+        let _ = writeln!(
+            buf,
+            "pensyve_selroute_classified_total {selroute_classified}"
+        );
         let _ = writeln!(
             buf,
             "# HELP pensyve_selroute_fallback_total Total SelRoute classifications with confidence below 0.5."
@@ -330,26 +340,22 @@ impl PensyveMetrics {
         }
 
         // Histograms
-        buf.push_str(
-            &self
-                .recall_duration
-                .prometheus_text("pensyve_recall_duration_seconds"),
-        );
-        buf.push_str(
-            &self
-                .embed_duration
-                .prometheus_text("pensyve_embed_duration_seconds"),
-        );
-        buf.push_str(
-            &self
-                .store_duration
-                .prometheus_text("pensyve_store_duration_seconds"),
-        );
-        buf.push_str(
-            &self
-                .selroute_confidence_histogram
-                .prometheus_text("pensyve_selroute_confidence"),
-        );
+        buf.push_str(&self.recall_duration.prometheus_text(
+            "pensyve_recall_duration_seconds",
+            "Recall operation duration in seconds.",
+        ));
+        buf.push_str(&self.embed_duration.prometheus_text(
+            "pensyve_embed_duration_seconds",
+            "Embedding generation duration in seconds.",
+        ));
+        buf.push_str(&self.store_duration.prometheus_text(
+            "pensyve_store_duration_seconds",
+            "Memory store operation duration in seconds.",
+        ));
+        buf.push_str(&self.selroute_confidence_histogram.prometheus_text(
+            "pensyve_selroute_confidence",
+            "SelRoute classification confidence distribution in [0.0, 1.0].",
+        ));
 
         buf
     }
@@ -470,7 +476,7 @@ mod tests {
         h.observe(0.15); // falls in 0.25 bucket
         h.observe(20.0); // only +Inf
 
-        let text = h.prometheus_text("test_duration_seconds");
+        let text = h.prometheus_text("test_duration_seconds", "Test duration in seconds.");
         assert!(text.contains("test_duration_seconds_bucket{le=\"0.005\"} 1"));
         assert!(text.contains("test_duration_seconds_bucket{le=\"+Inf\"} 3"));
         assert!(text.contains("test_duration_seconds_count 3"));

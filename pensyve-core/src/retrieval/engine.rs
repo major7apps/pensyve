@@ -600,33 +600,34 @@ impl<'a> RecallEngine<'a> {
         // `query_classifier::selroute_enabled`); when the gate is off
         // the entire block is bypassed and the recall path is
         // byte-for-byte identical to pre-Phase-2A behavior.
-        let selroute_mask: Option<[f32; 7]> = if crate::retrieval::query_classifier::selroute_enabled() {
-            let classification = crate::retrieval::query_classifier::classify_query(query);
-            let metrics = crate::observability::metrics();
-            metrics.record_selroute_classification(
-                crate::retrieval::query_classifier::selroute_metric_index(
-                    classification.question_type,
-                ),
-                classification.confidence,
-            );
-            // Apply the per-route mask only when confidence >= 0.5;
-            // below that the caller's contract says to use IDENTITY
-            // (which is a no-op and we just skip).
-            if classification.confidence >= 0.5 {
-                let cfg = crate::retrieval::query_classifier::pipeline_config_for(
-                    classification.question_type,
+        let selroute_mask: Option<[f32; 7]> =
+            if crate::retrieval::query_classifier::selroute_enabled() {
+                let classification = crate::retrieval::query_classifier::classify_query(query);
+                let metrics = crate::observability::metrics();
+                metrics.record_selroute_classification(
+                    crate::retrieval::query_classifier::selroute_metric_index(
+                        classification.question_type,
+                    ),
+                    classification.confidence,
                 );
-                if cfg == crate::retrieval::query_classifier::PipelineConfig::IDENTITY {
-                    None
+                // Apply the per-route mask only when confidence >= 0.5;
+                // below that the caller's contract says to use IDENTITY
+                // (which is a no-op and we just skip).
+                if classification.confidence >= 0.5 {
+                    let cfg = crate::retrieval::query_classifier::pipeline_config_for(
+                        classification.question_type,
+                    );
+                    if cfg == crate::retrieval::query_classifier::PipelineConfig::IDENTITY {
+                        None
+                    } else {
+                        Some(cfg.signal_mask)
+                    }
                 } else {
-                    Some(cfg.signal_mask)
+                    None
                 }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
         // Step 6–7: Build 6 independent rankings and merge via RRF.
         let candidates_found = candidates.len();
