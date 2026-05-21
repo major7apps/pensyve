@@ -1,3 +1,9 @@
+// Phase 2B (`PENSYVE_DEP_PARSE`): Rust-native shallow dependency parser
+// for `(subject, predicate, object)` triple extraction. Kept as a sibling
+// submodule because it shares the "extract semantic structure from raw
+// observation text" concern with the regex pattern extractor below.
+pub mod dep_parse;
+
 use std::sync::LazyLock;
 
 use regex::Regex;

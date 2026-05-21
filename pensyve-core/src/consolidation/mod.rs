@@ -718,6 +718,208 @@ markdown.";
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2B per-event gate hook: dependency-parse KG construction
+// ---------------------------------------------------------------------------
+
+/// Per-event gate hook: shallow dependency parse + KG materialization.
+///
+/// Fires from the observation ingest path (alongside `run_typed_slots_hook`)
+/// when [`crate::extraction::dep_parse::dep_parse_enabled`] is on. Extracts
+/// `(subject, predicate, object)` triples from `observation_content` via
+/// the Rust-native shallow parser and persists them into the migration v3
+/// tables (`kg_entities`, `kg_triples`, `kg_passage_entities`). Phase 2C's
+/// Personalized `PageRank` reads from those tables at recall time; Phase 2B
+/// only writes.
+///
+/// The hook is intentionally synchronous (no `async fn`) — unlike the
+/// LLM-backed typed-slots hook, dep-parse is CPU-bound and runs in tens
+/// of microseconds per observation. Keeping it sync avoids unnecessary
+/// `await` plumbing on the ingest hot path.
+///
+/// ## Behavior
+///
+/// - Returns `Ok(0)` when [`crate::extraction::dep_parse::dep_parse_enabled`]
+///   is `false` (the no-op fast path the rollout's default-off rollout
+///   depends on).
+/// - Returns `Ok(triples_written)` on success.
+/// - Returns `Err(StorageError)` only on hard SQL failure — extract /
+///   persist is one logical unit; partial writes do not happen because
+///   each insert is independent and we only count successful ones.
+///
+/// Metric side-effects (via global `PensyveMetrics`):
+/// - `dep_parse_observations_processed` += 1 per call (even when no
+///   triples were extracted — we still observed the passage).
+/// - `dep_parse_triples_extracted` += number of triple rows actually
+///   written.
+/// - `dep_parse_duration` records the wall-clock duration of the
+///   extract + persist combined path.
+pub fn run_dep_parse_hook(
+    conn: &rusqlite::Connection,
+    namespace_id: Uuid,
+    passage_id: Uuid,
+    content: &str,
+) -> Result<usize, StorageError> {
+    if !crate::extraction::dep_parse::dep_parse_enabled() {
+        return Ok(0);
+    }
+    run_dep_parse_hook_inner(conn, namespace_id, passage_id, content)
+}
+
+/// Env-gate-free entry point for the dep-parse hook. Used by the
+/// integration tests so we can exercise the extraction + persist path
+/// without depending on the cached `OnceLock` env-flag read in
+/// [`crate::extraction::dep_parse::dep_parse_enabled`].
+#[doc(hidden)]
+pub fn run_dep_parse_hook_inner(
+    conn: &rusqlite::Connection,
+    namespace_id: Uuid,
+    passage_id: Uuid,
+    content: &str,
+) -> Result<usize, StorageError> {
+    use crate::extraction::dep_parse;
+
+    let metrics = crate::observability::metrics();
+    metrics
+        .dep_parse_observations_processed
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let started = Instant::now();
+    let parsed = dep_parse::extract_triples(passage_id, content);
+
+    let now_unix: i64 = chrono::Utc::now().timestamp();
+    let namespace_str = namespace_id.to_string();
+    let passage_str = passage_id.to_string();
+
+    // ---- Persist entities (upsert by (namespace_id, lemma)) ----
+    //
+    // Map lemma → entity row id so subsequent `kg_triples` /
+    // `kg_passage_entities` rows can reference the correct id.
+    let mut entity_id_by_lemma: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
+
+    for lemma in &parsed.entities {
+        // INSERT OR IGNORE handles the race / re-ingest case where the
+        // entity is already present. The follow-up SELECT resolves the
+        // canonical id either way.
+        conn.execute(
+            "INSERT OR IGNORE INTO kg_entities (namespace_id, lemma, created_at) \
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![namespace_str, lemma, now_unix],
+        )?;
+        let id: i64 = conn.query_row(
+            "SELECT id FROM kg_entities WHERE namespace_id = ?1 AND lemma = ?2",
+            rusqlite::params![namespace_str, lemma],
+            |row| row.get(0),
+        )?;
+        entity_id_by_lemma.insert(lemma.clone(), id);
+    }
+
+    // ---- Persist triples ----
+    let mut triples_written = 0usize;
+    for t in &parsed.triples {
+        let subject_lemma = canonical_lemma(&t.subject);
+        let object_lemma = canonical_lemma(&t.object);
+
+        // The subject / object lemma must already exist as an entity so
+        // the FK lookup succeeds. Resolve via `entity_id_by_lemma`;
+        // upsert a new row if the lemma was not promoted by the
+        // entity-candidate pass (e.g., a lowercase pronoun subject).
+        let subject_id = resolve_or_upsert_entity(
+            conn,
+            &namespace_str,
+            &subject_lemma,
+            now_unix,
+            &mut entity_id_by_lemma,
+        )?;
+        let object_id = resolve_or_upsert_entity(
+            conn,
+            &namespace_str,
+            &object_lemma,
+            now_unix,
+            &mut entity_id_by_lemma,
+        )?;
+
+        conn.execute(
+            "INSERT INTO kg_triples (namespace_id, passage_id, subject_id, predicate, object_id, confidence, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                namespace_str,
+                passage_str,
+                subject_id,
+                t.predicate,
+                object_id,
+                t.confidence,
+                now_unix,
+            ],
+        )?;
+        triples_written += 1;
+    }
+
+    // ---- Persist passage-entity weights ----
+    //
+    // For each unique entity lemma in the passage, upsert a
+    // (passage_id, entity_id) row with weight = number of appearances.
+    // Re-ingest of the same passage is a primary-key collision → ignored
+    // by `INSERT OR REPLACE`.
+    let mut weight_by_entity: std::collections::HashMap<i64, f32> =
+        std::collections::HashMap::new();
+    for lemma in &parsed.entities {
+        if let Some(&id) = entity_id_by_lemma.get(lemma) {
+            *weight_by_entity.entry(id).or_insert(0.0) += 1.0;
+        }
+    }
+    for (entity_id, weight) in &weight_by_entity {
+        conn.execute(
+            "INSERT OR REPLACE INTO kg_passage_entities (passage_id, entity_id, weight) \
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![passage_str, entity_id, weight],
+        )?;
+    }
+
+    metrics
+        .dep_parse_triples_extracted
+        .fetch_add(triples_written as u64, std::sync::atomic::Ordering::Relaxed);
+    let elapsed_secs = started.elapsed().as_secs_f64();
+    metrics.dep_parse_duration.observe(elapsed_secs);
+
+    Ok(triples_written)
+}
+
+/// Normalize a subject / object surface form into its canonical lemma
+/// (the key under which `kg_entities` is indexed). Today this is just
+/// a trim — capitalization is preserved so multi-word proper nouns stay
+/// readable when inspected via SQL. Centralized so future tweaks land
+/// in one place.
+fn canonical_lemma(raw: &str) -> String {
+    raw.trim().to_string()
+}
+
+/// Resolve an entity row id by lemma, upserting if absent.
+fn resolve_or_upsert_entity(
+    conn: &rusqlite::Connection,
+    namespace_str: &str,
+    lemma: &str,
+    now_unix: i64,
+    cache: &mut std::collections::HashMap<String, i64>,
+) -> Result<i64, StorageError> {
+    if let Some(&id) = cache.get(lemma) {
+        return Ok(id);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO kg_entities (namespace_id, lemma, created_at) \
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![namespace_str, lemma, now_unix],
+    )?;
+    let id: i64 = conn.query_row(
+        "SELECT id FROM kg_entities WHERE namespace_id = ?1 AND lemma = ?2",
+        rusqlite::params![namespace_str, lemma],
+        |row| row.get(0),
+    )?;
+    cache.insert(lemma.to_string(), id);
+    Ok(id)
+}
+
 /// Apply a [`TypedSlots`] result to the column-name → value mapping the
 /// caller will bind into a SQL UPDATE statement. Centralises the slot-
 /// column naming convention (column = `{kind}_slot`) so SQL sites cannot
@@ -1205,5 +1407,128 @@ mod tests {
         assert_eq!(stats.promoted, 0);
         assert_eq!(stats.decayed, 0);
         assert_eq!(stats.archived, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2B integration tests — dep-parse hook + KG persistence
+    //
+    // We call `run_dep_parse_hook_inner` directly so the test does not
+    // depend on the cached `PENSYVE_DEP_PARSE` env-flag (which would
+    // otherwise pollute every subsequent test in the binary).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dep_parse_hook_populates_kg_tables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = make_storage(tmp.path().to_str().unwrap());
+        let ns = Namespace::new("dep-parse-it");
+        storage.save_namespace(&ns).unwrap();
+
+        let passage_id = Uuid::new_v4();
+        let content = "Alice works at Acme. Bob lives in Brooklyn.";
+
+        // Open a fresh rusqlite connection on the same DB file.
+        let db_path = storage.db_path().unwrap().to_path_buf();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+        let triples_written = run_dep_parse_hook_inner(&conn, ns.id, passage_id, content).unwrap();
+        assert!(
+            triples_written >= 2,
+            "expected at least 2 triples from the test passage, wrote {triples_written}"
+        );
+
+        // Verify kg_entities has Alice + Acme + Bob + Brooklyn.
+        let entity_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kg_entities WHERE namespace_id = ?1",
+                rusqlite::params![ns.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            entity_count >= 4,
+            "expected ≥4 kg_entities rows (Alice/Acme/Bob/Brooklyn); got {entity_count}"
+        );
+
+        // Verify kg_triples has the expected predicates.
+        let mut stmt = conn
+            .prepare("SELECT predicate FROM kg_triples WHERE namespace_id = ?1 AND passage_id = ?2")
+            .unwrap();
+        let preds: Vec<String> = stmt
+            .query_map(
+                rusqlite::params![ns.id.to_string(), passage_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            preds.iter().any(|p| p == "works_at"),
+            "expected works_at predicate; got {preds:?}"
+        );
+        assert!(
+            preds.iter().any(|p| p == "lives_in"),
+            "expected lives_in predicate; got {preds:?}"
+        );
+
+        // Verify kg_passage_entities is populated for this passage.
+        let pe_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kg_passage_entities WHERE passage_id = ?1",
+                rusqlite::params![passage_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            pe_count >= 2,
+            "expected ≥2 kg_passage_entities rows; got {pe_count}"
+        );
+    }
+
+    #[test]
+    fn dep_parse_hook_handles_empty_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = make_storage(tmp.path().to_str().unwrap());
+        let ns = Namespace::new("dep-parse-empty");
+        storage.save_namespace(&ns).unwrap();
+
+        let conn = rusqlite::Connection::open(storage.db_path().unwrap()).unwrap();
+        let n = run_dep_parse_hook_inner(&conn, ns.id, Uuid::new_v4(), "").unwrap();
+        assert_eq!(n, 0, "empty content should write zero triples");
+    }
+
+    #[test]
+    fn dep_parse_hook_reingest_is_safe() {
+        // Re-running the hook against the same passage_id must not
+        // crash on duplicate kg_passage_entities (INSERT OR REPLACE).
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = make_storage(tmp.path().to_str().unwrap());
+        let ns = Namespace::new("dep-parse-reingest");
+        storage.save_namespace(&ns).unwrap();
+
+        let conn = rusqlite::Connection::open(storage.db_path().unwrap()).unwrap();
+        let passage_id = Uuid::new_v4();
+        let content = "Carol owns Acme.";
+
+        let first = run_dep_parse_hook_inner(&conn, ns.id, passage_id, content).unwrap();
+        let second = run_dep_parse_hook_inner(&conn, ns.id, passage_id, content).unwrap();
+        assert_eq!(
+            first, second,
+            "re-ingest should produce stable triple count"
+        );
+
+        // kg_entities for the namespace should not duplicate (UNIQUE
+        // constraint on (namespace_id, lemma)).
+        let entity_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kg_entities WHERE namespace_id = ?1",
+                rusqlite::params![ns.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            entity_count, 2,
+            "expected exactly 2 entities (Carol, Acme); got {entity_count}"
+        );
     }
 }

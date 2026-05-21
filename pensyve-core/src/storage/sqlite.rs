@@ -93,6 +93,10 @@ impl SqliteBackend {
     ///     all migrations against the legacy projection tables; existing rows
     ///     get NULL for the new columns per the locked NULL-default design)
     ///   * a store where this runner already ran (no-op)
+    #[allow(
+        clippy::too_many_lines,
+        reason = "linear migration registry — each new migration version grows the body by ~25 lines. Splitting per-version would obscure the ordering invariant (max_applied is read once at top; versions must fire in monotonically-increasing order)."
+    )]
     fn run_versioned_migrations(conn: &Connection) -> StorageResult<()> {
         // Bootstrap: ensure the registry table exists before we read from it.
         conn.execute_batch(
@@ -200,6 +204,79 @@ impl SqliteBackend {
                     2_i64,
                     Utc::now().to_rfc3339(),
                     "G3: add typed-slot + chain_summary NULLABLE columns to observation_memories",
+                ],
+            )?;
+        }
+
+        // ----- Migration v3: Phase 2B dependency-parse KG tables. -----
+        //
+        // Materializes a knowledge graph populated by
+        // `extraction::dep_parse::extract_triples` so Phase 2C's
+        // Personalized PageRank can read entity / triple / passage-entity
+        // structure at recall time. Phase 2B itself only writes; the read
+        // path lands in Phase 2C.
+        //
+        // All three tables use `CREATE TABLE IF NOT EXISTS` for
+        // idempotency (mirrors the v1 / v2 pattern). The `kg_entities`
+        // unique constraint on `(namespace_id, lemma)` makes the hook's
+        // upsert path a simple INSERT OR IGNORE followed by a SELECT.
+        // Indexes on `namespace_id`, `subject_id`, `object_id`, and
+        // `passage_id` make the Phase 2C PPR adjacency build a covering
+        // lookup rather than a full table scan.
+        //
+        // Schema design locked in the Phase 2B agentic worker instructions
+        // at `pensyve-docs/plans/2026-05-21-pensyve-phase2-algorithmic-stack.md`
+        // §"Phase 2B — Schema migration (v3)".
+        if max_applied < 3 {
+            // NOTE: `namespace_id` is stored as TEXT here (UUID string)
+            // for consistency with the rest of the Pensyve schema —
+            // every existing projection table (`episodic_memories`,
+            // `semantic_memories`, `procedural_memories`,
+            // `observation_memories`, `entities`, `episodes`) stores
+            // `namespace_id` as TEXT. The Phase 2B plan task list reads
+            // "INTEGER NOT NULL" but that conflicts with the FK target
+            // (`namespaces.id TEXT NOT NULL`); TEXT is the consistent
+            // choice.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS kg_entities (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    namespace_id TEXT NOT NULL,
+                    lemma        TEXT NOT NULL,
+                    embedding    BLOB,
+                    created_at   INTEGER NOT NULL,
+                    UNIQUE(namespace_id, lemma)
+                );
+                CREATE TABLE IF NOT EXISTS kg_triples (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    namespace_id TEXT NOT NULL,
+                    passage_id   TEXT NOT NULL,
+                    subject_id   INTEGER NOT NULL REFERENCES kg_entities(id),
+                    predicate    TEXT NOT NULL,
+                    object_id    INTEGER NOT NULL REFERENCES kg_entities(id),
+                    confidence   REAL NOT NULL,
+                    created_at   INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS kg_passage_entities (
+                    passage_id TEXT NOT NULL,
+                    entity_id  INTEGER NOT NULL REFERENCES kg_entities(id),
+                    weight     REAL NOT NULL,
+                    PRIMARY KEY(passage_id, entity_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_kg_entities_ns      ON kg_entities(namespace_id);
+                CREATE INDEX IF NOT EXISTS idx_kg_triples_ns       ON kg_triples(namespace_id);
+                CREATE INDEX IF NOT EXISTS idx_kg_triples_subj     ON kg_triples(subject_id);
+                CREATE INDEX IF NOT EXISTS idx_kg_triples_obj      ON kg_triples(object_id);
+                CREATE INDEX IF NOT EXISTS idx_kg_triples_pass     ON kg_triples(passage_id);
+                CREATE INDEX IF NOT EXISTS idx_kgpe_entity         ON kg_passage_entities(entity_id);",
+            )?;
+
+            conn.execute(
+                "INSERT INTO schema_versions (version, applied_at, description)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    3_i64,
+                    Utc::now().to_rfc3339(),
+                    "Phase 2B: dep-parse KG tables (kg_entities, kg_triples, kg_passage_entities) + indexes",
                 ],
             )?;
         }
@@ -3498,5 +3575,121 @@ mod tests {
             })
             .collect();
         assert_eq!(instances_a, vec!["a-instance"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2B migration v3 tests — dep-parse KG tables
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn migration_v3_creates_kg_tables_on_fresh_db() {
+        let (_dir, db) = setup();
+        let conn = db.conn.lock().unwrap();
+
+        for table in ["kg_entities", "kg_triples", "kg_passage_entities"] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                exists, 1,
+                "expected table {table} to exist after migration v3"
+            );
+        }
+
+        for idx in [
+            "idx_kg_entities_ns",
+            "idx_kg_triples_ns",
+            "idx_kg_triples_subj",
+            "idx_kg_triples_obj",
+            "idx_kg_triples_pass",
+            "idx_kgpe_entity",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name = ?1",
+                    [idx],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                exists, 1,
+                "expected index {idx} to exist after migration v3"
+            );
+        }
+
+        // schema_versions registry should contain v3.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_versions WHERE version = 3",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "schema_versions registry missing v3 row");
+    }
+
+    #[test]
+    fn migration_v3_is_idempotent_on_rerun() {
+        let dir = TempDir::new().unwrap();
+        // Open + close + reopen: the second open triggers `run_versioned_migrations`
+        // against a store where v3 is already applied. Idempotency = no panic,
+        // no duplicate `schema_versions` row.
+        {
+            let _db = SqliteBackend::open(dir.path()).unwrap();
+        }
+        let db = SqliteBackend::open(dir.path()).unwrap();
+        let conn = db.conn.lock().unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_versions WHERE version = 3",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "migration v3 ran twice — schema_versions has {count} rows for v3 (expected 1)"
+        );
+    }
+
+    #[test]
+    fn migration_v3_upgrades_existing_pre_v3_store() {
+        // Simulate a store that previously stopped at v2 (no kg_* tables)
+        // by removing the v3 row + tables, then re-running migrations
+        // and asserting the tables come back.
+        let (_dir, db) = setup();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute("DELETE FROM schema_versions WHERE version = 3", [])
+                .unwrap();
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS kg_passage_entities;
+                 DROP TABLE IF EXISTS kg_triples;
+                 DROP TABLE IF EXISTS kg_entities;",
+            )
+            .unwrap();
+        }
+        // Re-run migrations against the now-degraded store.
+        {
+            let conn = db.conn.lock().unwrap();
+            SqliteBackend::run_versioned_migrations(&conn).unwrap();
+        }
+        let conn = db.conn.lock().unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'kg_triples'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            exists, 1,
+            "kg_triples should be recreated by migration v3 re-run"
+        );
     }
 }

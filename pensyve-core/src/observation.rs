@@ -2845,6 +2845,71 @@ mod gate_wiring {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2B dep-parse wiring
+//
+// Fires the synchronous `consolidation::run_dep_parse_hook` from the
+// observation ingest path after `save_observation` succeeds. The hook is
+// itself a no-op when `PENSYVE_DEP_PARSE` is off (env-cached `OnceLock`
+// in `dep_parse::dep_parse_enabled`), so this helper is zero-cost on the
+// default-off rollout: one env check (cached), one branch, return.
+// ---------------------------------------------------------------------------
+
+/// Open a fresh writable rusqlite connection at the storage backend's
+/// on-disk path and run the Phase 2B dep-parse hook against the freshly-
+/// persisted observation. No-op on backends without an on-disk path
+/// (returns immediately) and on observations whose `content` is empty.
+///
+/// Errors are logged via `tracing::warn!` and swallowed — Phase 2B is a
+/// best-effort additive write path; a transient SQL failure must not
+/// crash the ingest of the underlying observation.
+fn maybe_fire_dep_parse_hook(
+    storage: &(dyn crate::storage::StorageTrait + Send + Sync),
+    observation: &crate::types::ObservationMemory,
+) {
+    if !crate::extraction::dep_parse::dep_parse_enabled() {
+        return;
+    }
+    if observation.content.trim().is_empty() {
+        return;
+    }
+    let Some(db_path) = storage.db_path() else {
+        return;
+    };
+    let conn = match rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                target: "pensyve::observation::dep_parse",
+                error = %e,
+                observation_id = %observation.id,
+                "failed to open writable connection for dep-parse hook"
+            );
+            return;
+        }
+    };
+    // Match the primary backend's 5s busy timeout so WAL contention does
+    // not bounce the dep-parse write.
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+
+    if let Err(e) = crate::consolidation::run_dep_parse_hook(
+        &conn,
+        observation.namespace_id,
+        observation.id,
+        &observation.content,
+    ) {
+        tracing::warn!(
+            target: "pensyve::observation::dep_parse",
+            error = %e,
+            observation_id = %observation.id,
+            "dep-parse hook failed; kg_* tables not updated for this observation"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Ingest helper — canonical post-episode-close extraction flow
 // ---------------------------------------------------------------------------
 
@@ -2963,6 +3028,11 @@ where
             );
             continue;
         }
+        // Phase 2B dep-parse hook (no-op when `PENSYVE_DEP_PARSE` is off).
+        // Fires BEFORE the typed-slots gate so the KG sees every passage
+        // the consolidation engine sees, including those typed-slots
+        // skips due to action-verb gating.
+        maybe_fire_dep_parse_hook(storage, &obs);
         // G3 per-event gate hooks (per pre-reg `pensyve-docs@64481dc` §3.7
         // + §3.8 + addendum_01 `pensyve-docs@dd7c053` Finding 2 mitigation).
         // No-op when both `PENSYVE_RETRIEVAL_CARDS_G3` predicates are off
@@ -3138,6 +3208,9 @@ where
                 );
                 continue;
             }
+            // Phase 2B dep-parse hook — same fast-path as the per-episode
+            // helper. No-op when `PENSYVE_DEP_PARSE` is off.
+            maybe_fire_dep_parse_hook(storage, &obs);
             // G3 per-event gate hooks — same wiring as the per-episode
             // helper, sharing the hoisted extractor across every
             // observation in the bulk call. Per-observation cost is

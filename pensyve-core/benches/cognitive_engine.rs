@@ -51,11 +51,30 @@ fn bench_ring_buffer(c: &mut Criterion) {
     });
 }
 
+/// Phase 2B — per-passage extraction throughput (target: <5ms p95).
+fn bench_dep_parse_extract(c: &mut Criterion) {
+    // Representative chat-style memory passage: 3 sentences, mix of
+    // nsubj→root→dobj + nsubj→root→pobj shapes. Length is ~30 tokens,
+    // well under the 200-token skip cap.
+    let passage = "Alice works at Acme Corp. \
+        Bob lives in Brooklyn with his family. \
+        Carol bought a Tesla last weekend.";
+    c.bench_function("dep_parse_extract_passage", |bencher| {
+        bencher.iter(|| {
+            let _ = pensyve_core::extraction::dep_parse::extract_triples(
+                black_box(Uuid::nil()),
+                black_box(passage),
+            );
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_cosine_768,
     bench_base_level_activation,
     bench_rrf_fusion,
-    bench_ring_buffer
+    bench_ring_buffer,
+    bench_dep_parse_extract,
 );
 criterion_main!(benches);

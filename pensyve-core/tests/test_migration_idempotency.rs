@@ -105,15 +105,17 @@ fn fresh_store_migration_is_idempotent() {
 
         let rows = schema_version_rows(&conn);
         // G3 added v=2 (typed-slot + chain_summary NULLABLE columns on
-        // observation_memories). Fresh-store open lands BOTH v=1 and
-        // v=2 in one pass.
+        // observation_memories). Phase 2B added v=3 (kg_entities,
+        // kg_triples, kg_passage_entities). Fresh-store open lands
+        // v=1 + v=2 + v=3 in one pass.
         assert_eq!(
             rows.len(),
-            2,
-            "expected v=1 AND v=2 migration rows after G3, got {rows:?}"
+            3,
+            "expected v=1 + v=2 + v=3 migration rows after Phase 2B, got {rows:?}"
         );
         assert_eq!(rows[0].0, 1, "expected version=1");
         assert_eq!(rows[1].0, 2, "expected version=2");
+        assert_eq!(rows[2].0, 3, "expected version=3");
 
         assert_migration_v1_landed(&conn);
     }
@@ -151,11 +153,12 @@ fn fresh_store_migration_is_idempotent() {
             rows, versions_first,
             "schema_versions changed on re-open: {rows:?} vs {versions_first:?}"
         );
-        // G3: 2 rows (v=1 + v=2); both must remain stable across reopens.
+        // Phase 2B: 3 rows (v=1 + v=2 + v=3); all must remain stable
+        // across reopens.
         assert_eq!(
             rows.len(),
-            2,
-            "duplicate schema_versions row inserted on re-run; expected 2 (v=1+v=2), got {rows:?}"
+            3,
+            "duplicate schema_versions row inserted on re-run; expected 3 (v=1+v=2+v=3), got {rows:?}"
         );
 
         for (i, table) in PROJECTION_TABLES.iter().enumerate() {
@@ -332,17 +335,18 @@ fn v2_1_fixture_upgrade_lands_alters_and_preserves_rows() {
     // Schema landed.
     assert_migration_v1_landed(&conn);
 
-    // schema_versions registered TWO rows: v=1 (G1) and v=2 (G3).
-    // The v2.1 fixture starts pre-G1, so the upgrade open lands BOTH
-    // migrations in one pass.
+    // schema_versions registered THREE rows: v=1 (G1), v=2 (G3), and
+    // v=3 (Phase 2B). The v2.1 fixture starts pre-G1, so the upgrade
+    // open lands all three migrations in one pass.
     let rows = schema_version_rows(&conn);
     assert_eq!(
         rows.len(),
-        2,
-        "expected v=1 + v=2 schema_versions rows, got {rows:?}"
+        3,
+        "expected v=1 + v=2 + v=3 schema_versions rows, got {rows:?}"
     );
     assert_eq!(rows[0].0, 1);
     assert_eq!(rows[1].0, 2);
+    assert_eq!(rows[2].0, 3);
 
     // Existing rows preserved with NULL agent_id + user_id (the locked
     // NULL-default design).
@@ -377,7 +381,7 @@ fn v2_1_fixture_upgrade_lands_alters_and_preserves_rows() {
     let rows = schema_version_rows(&conn);
     assert_eq!(
         rows.len(),
-        2,
-        "duplicate schema_versions row on re-run against fixture; expected 2 (v=1+v=2), got {rows:?}"
+        3,
+        "duplicate schema_versions row on re-run against fixture; expected 3 (v=1+v=2+v=3), got {rows:?}"
     );
 }
