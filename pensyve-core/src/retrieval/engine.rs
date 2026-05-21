@@ -803,29 +803,32 @@ impl<'a> RecallEngine<'a> {
         //   (b) `PENSYVE_PPR=1` (cached OnceLock env read)
         //
         // The brief's parameter defaults (alpha=0.15, max_iter=20,
-        // top_k=50) are documented inline. When PPR fires, the
-        // spreading-activation BFS signal (`ranking_spread`) is zeroed
-        // out via `ppr_active` below to avoid double-counting graph
-        // signal — `ranking_spread` is BFS over the memory-graph
-        // edges, `ranking_ppr` is the entity-graph PPR mass; both are
-        // "graph signals" and adding them with full weight inflates
-        // the graph contribution to RRF.
+        // top_k=50) are documented inline. Query entities are derived
+        // by feeding `query` through the Phase 2B dep-parse extractor
+        // (with a sentinel passage_id — we're not persisting). Lemmas
+        // are then mapped to UUIDs via `ppr::lemma_uuid`, which uses
+        // the same RFC 4122 v5 namespace as the dep-parse hook's
+        // entity persistence. Dense seeds come from `ranking_vec` (the
+        // existing vector-similarity ranking, already computed above)
+        // so PPR's restart vector benefits from semantic similarity
+        // even when the lexical dep-parse misses entities.
         //
-        // Query entities are derived by feeding `query` through the
-        // Phase 2B dep-parse extractor (with a sentinel passage_id —
-        // we're not persisting). Lemmas are then mapped to UUIDs via
-        // `ppr::lemma_uuid`, which uses the same RFC 4122 v5 namespace
-        // as the dep-parse hook's entity persistence. Dense seeds
-        // come from `ranking_vec` (the existing vector-similarity
-        // ranking, already computed above) so PPR's restart vector
-        // benefits from semantic similarity even when the lexical
-        // dep-parse misses entities.
+        // BFS-spread suppression is gated on whether PPR actually
+        // CONTRIBUTED a discriminative signal (CodeRabbit PR #116 P1
+        // #2), not just on the flag being on. Before that fix, a
+        // query with no KG overlap would zero out the BFS spread
+        // weight AND drop the empty `ranking_ppr` (via
+        // `has_discriminative_signal`), leaving the graph dimension of
+        // RRF unrepresented for that query. The new behavior: only
+        // suppress BFS spread when `ranking_ppr` clears the
+        // discriminative-signal filter, i.e., when PPR is actually
+        // adding signal worth de-duplicating against.
         let mut ppr_score_by_id: std::collections::HashMap<Uuid, f32> =
             std::collections::HashMap::new();
         let mut ranking_ppr: Vec<(Uuid, f32)> = Vec::new();
-        let ppr_active = self.ppr_index.is_some() && crate::retrieval::ppr::ppr_enabled();
-        if ppr_active {
-            // Safety: `ppr_active` checks `is_some()` above.
+        let ppr_enabled_flag = self.ppr_index.is_some() && crate::retrieval::ppr::ppr_enabled();
+        if ppr_enabled_flag {
+            // Safety: `ppr_enabled_flag` checks `is_some()` above.
             let ppr_index = self.ppr_index.unwrap();
             // Extract query entities. Passage_id is Uuid::nil()
             // because we're not persisting the resulting triples —
@@ -855,16 +858,32 @@ impl<'a> RecallEngine<'a> {
             }
         }
 
+        // Did PPR actually emit a discriminative signal on THIS query?
+        // `has_discriminative_signal` rejects empty rankings and
+        // rankings where every score is identical (degenerate). When
+        // it accepts `ranking_ppr`, PPR is "contributing" and we want
+        // to zero out the BFS-spread weight to avoid double-counting
+        // graph signal. When it rejects (e.g., no query entities
+        // exist in the KG → empty ranking), we keep the BFS signal
+        // at full weight so the graph dimension of RRF still has a
+        // representative.
+        let ppr_contributed = has_discriminative_signal(&ranking_ppr);
+
         // Merge via RRF — only include rankings with discriminative signal.
         // A ranking where all scores are identical (e.g., empty graph, no access history)
         // adds noise and dilutes the strong signals like vector similarity.
         //
-        // When PPR is active, zero out the BFS spread weight to avoid
-        // double-counting graph signal. The spread ranking is still
-        // included in `all_rankings` (its content may still be useful
-        // when PPR returns zero results, e.g., when no query entities
-        // exist in the KG) but its weight contribution is zero.
-        let spread_weight = if ppr_active { 0.0 } else { masked_weight(3) };
+        // When PPR is active AND contributing, zero out the BFS spread
+        // weight to avoid double-counting graph signal. The spread
+        // ranking is still included in `all_rankings` (its content
+        // may still be useful when PPR returns zero results, e.g.,
+        // when no query entities exist in the KG) but its weight
+        // contribution is zero.
+        let spread_weight = if ppr_contributed {
+            0.0
+        } else {
+            masked_weight(3)
+        };
         let all_rankings = vec![
             (ranking_vec, masked_weight(0)),
             (ranking_bm25, masked_weight(1)),
@@ -1994,6 +2013,109 @@ mod tests {
         assert!(
             found.ppr_score.is_some(),
             "ppr_score must be populated when PprIndex is attached AND PENSYVE_PPR=1"
+        );
+    }
+
+    #[test]
+    fn recall_with_ppr_flag_but_no_kg_overlap_preserves_bfs_spread() {
+        // CodeRabbit PR #116 P1 #2: when PENSYVE_PPR=1 is set AND a
+        // PprIndex is attached BUT the query has zero entity overlap
+        // with the KG, `ranking_ppr` comes back empty and
+        // `has_discriminative_signal` filters it out. Before the fix,
+        // `spread_weight = 0.0` was triggered by the flag alone, so
+        // the BFS spread signal got zeroed AND the empty PPR ranking
+        // got dropped — leaving the graph dimension of RRF
+        // unrepresented for this query. The fixed behavior: when PPR
+        // does NOT contribute, the BFS spread signal stays at its
+        // unmasked weight.
+        //
+        // This test exercises the runtime contract by:
+        // 1. Building a PprIndex from a namespace whose KG has no
+        //    overlap with the query lemmas (KG contains "Acme" only;
+        //    query is "quantum physics" — no entity match).
+        // 2. Asserting the recall still returns results AND that the
+        //    BFS spread signal could have contributed (i.e., recall
+        //    did not collapse into a degenerate single-signal mix).
+        //
+        // Returns early when PENSYVE_PPR is off, matching the
+        // process-cached env-flag pattern in
+        // `recall_with_ppr_index_populates_ppr_score_when_flag_enabled`.
+        if !crate::retrieval::ppr::ppr_enabled() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteBackend::open(dir.path()).unwrap();
+        let embedder = OnnxEmbedder::new_mock(64);
+        let mut vector_index = VectorIndex::new(64, 16);
+        let config = test_config();
+
+        let ns = Namespace::new("ppr-no-overlap-test");
+        storage.save_namespace(&ns).unwrap();
+        // The stored memory's content includes "quantum physics" so
+        // BM25 / vector signals have something to match on.
+        let mem = setup_episodic(
+            &storage,
+            &embedder,
+            &ns,
+            "quantum physics relativity theory",
+        );
+        vector_index.add(mem.id, &mem.embedding).unwrap();
+
+        // Seed a KG with an entity ("Acme") that does NOT appear in
+        // the query. The PprIndex will be non-empty (so the engine
+        // doesn't bail out at "no PPR seeds") but the query's
+        // dep-parse output will not match any KG entity, so
+        // ranking_ppr comes back empty.
+        let conn = rusqlite::Connection::open(storage.db_path().unwrap()).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO kg_entities (namespace_id, lemma, created_at) VALUES (?1, 'Acme', 0)",
+            rusqlite::params![ns.id.to_string()],
+        )
+        .unwrap();
+        let acme_id: i64 = conn
+            .query_row(
+                "SELECT id FROM kg_entities WHERE namespace_id = ?1 AND lemma = 'Acme'",
+                rusqlite::params![ns.id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Tie Acme to a synthetic passage_id so kg_passage_entities
+        // is non-empty — the PprIndex requires at least one edge.
+        let synthetic_passage = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO kg_passage_entities (passage_id, entity_id, weight) VALUES (?1, ?2, 1.0)",
+            rusqlite::params![synthetic_passage, acme_id],
+        )
+        .unwrap();
+        let ppr_index =
+            crate::retrieval::ppr::PprIndex::build_from_storage(&conn, &ns.id.to_string()).unwrap();
+
+        // Query "quantum physics" has zero KG overlap with the
+        // "Acme"-only KG.
+        let engine =
+            RecallEngine::new(&storage, &embedder, &vector_index, &config).with_ppr(&ppr_index);
+        let result = engine.recall("quantum physics", ns.id, 5).unwrap();
+
+        // The non-zero-overlap memory MUST still appear in the
+        // results — recall must NOT collapse just because PPR is
+        // enabled but produced no signal.
+        assert!(
+            !result.memories.is_empty(),
+            "recall must still return results when PPR is enabled but produces no signal"
+        );
+        let found = result.memories.iter().find(|c| c.memory_id == mem.id);
+        assert!(
+            found.is_some(),
+            "the matching memory must survive the no-PPR-signal path"
+        );
+        // ppr_score for this memory is None because the query had
+        // no KG overlap (no entity seeds → empty ranking → no
+        // ppr_score_by_id entry).
+        let candidate = found.unwrap();
+        assert!(
+            candidate.ppr_score.is_none(),
+            "ppr_score must be None when PPR produced no discriminative signal for this query"
         );
     }
 }
