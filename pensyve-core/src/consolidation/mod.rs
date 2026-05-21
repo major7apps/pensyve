@@ -1798,12 +1798,14 @@ mod tests {
 
     #[test]
     fn dmem_routes_100_observations_and_counts_balance() {
+        use crate::consolidation::dmem;
         // Contract: every observation gets exactly one route decision,
         // so `dmem_fast_routed + dmem_slow_routed` increments by 100
         // across this run. We snapshot the global counters before and
-        // after to isolate this test's contribution from concurrent
-        // parallel tests.
-        use crate::consolidation::dmem;
+        // after; the lock (shared with `dmem::tests::ROUTING_COUNTER_LOCK`)
+        // serializes us against other tests in this lib-test binary
+        // that mutate the same counters. CodeRabbit PR #117 P1 #3.
+        let _guard = dmem::test_locks::ROUTING_COUNTER_LOCK.lock().unwrap();
         let metrics = crate::observability::metrics();
         let fast_before = metrics.dmem_fast_routed.load(Ordering::Relaxed);
         let slow_before = metrics.dmem_slow_routed.load(Ordering::Relaxed);

@@ -201,6 +201,15 @@ pub struct PensyveMetrics {
     /// after each route decision). Useful for sizing the buffer
     /// capacity in production tuning.
     pub dmem_ring_buffer_size: AtomicU64,
+    /// Total observations silently evicted from the ring buffer
+    /// because it reached capacity. Each eviction is a permanent
+    /// loss of the observation's deferred dep-parse + typed-slot
+    /// enrichment — the raw row was persisted at ingest, but the
+    /// slow-path side effects will never run for that observation.
+    /// A non-zero production value signals the ring buffer is
+    /// undersized or that drain isn't running often enough.
+    /// `CodeRabbit` PR #117 P0 #1.
+    pub dmem_ring_buffer_evictions: AtomicU64,
     /// Distribution of `surprise` values across D-MEM scoring calls.
     /// `surprise = 1 - max_cosine_similarity_to_existing` in
     /// `[0.0, 1.0]`. High-surprise observations are novel relative
@@ -256,6 +265,7 @@ impl PensyveMetrics {
             dmem_fast_routed: AtomicU64::new(0),
             dmem_slow_routed: AtomicU64::new(0),
             dmem_ring_buffer_size: AtomicU64::new(0),
+            dmem_ring_buffer_evictions: AtomicU64::new(0),
             dmem_surprise_histogram: HistogramBuckets::new(UNIT_INTERVAL_BUCKETS),
             dmem_utility_histogram: HistogramBuckets::new(UNIT_INTERVAL_BUCKETS),
             recall_duration: HistogramBuckets::new(DURATION_BUCKETS),
@@ -519,6 +529,7 @@ impl PensyveMetrics {
         let dmem_fast = self.dmem_fast_routed.load(Ordering::Relaxed);
         let dmem_slow = self.dmem_slow_routed.load(Ordering::Relaxed);
         let dmem_buf = self.dmem_ring_buffer_size.load(Ordering::Relaxed);
+        let dmem_evictions = self.dmem_ring_buffer_evictions.load(Ordering::Relaxed);
         let _ = writeln!(
             buf,
             "# HELP pensyve_dmem_fast_routed_total Observations routed to the Phase 2D fast buffer (skipped dep-parse + typed-slot hooks)."
@@ -537,6 +548,18 @@ impl PensyveMetrics {
         );
         let _ = writeln!(buf, "# TYPE pensyve_dmem_ring_buffer_size gauge");
         let _ = writeln!(buf, "pensyve_dmem_ring_buffer_size {dmem_buf}");
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_dmem_ring_buffer_evictions_total Observations silently evicted from the Phase 2D ring buffer at capacity overflow — permanent loss of deferred dep-parse + typed-slot enrichment."
+        );
+        let _ = writeln!(
+            buf,
+            "# TYPE pensyve_dmem_ring_buffer_evictions_total counter"
+        );
+        let _ = writeln!(
+            buf,
+            "pensyve_dmem_ring_buffer_evictions_total {dmem_evictions}"
+        );
 
         // Histograms
         buf.push_str(&self.recall_duration.prometheus_text(

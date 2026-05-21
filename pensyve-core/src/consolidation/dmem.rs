@@ -246,8 +246,18 @@ impl DMemGate {
             // FastBuffer path: enqueue, evicting the oldest entry on
             // capacity overflow. `pop_front` -> `push_back` keeps the
             // FIFO ordering callers expect for drain().
+            //
+            // CodeRabbit PR #117 P0 #1: increment
+            // `dmem_ring_buffer_evictions` on every silent eviction
+            // so operators can observe ring-buffer pressure. A
+            // persisted-but-undrained observation's dep-parse +
+            // typed-slot enrichment is permanently lost on eviction;
+            // a non-zero counter is the only signal operators have.
             if self.ring_buffer.len() >= self.capacity {
                 self.ring_buffer.pop_front();
+                crate::observability::metrics()
+                    .dmem_ring_buffer_evictions
+                    .fetch_add(1, Ordering::Relaxed);
             }
             self.ring_buffer.push_back(id);
             DMemRoute::FastBuffer
@@ -258,8 +268,18 @@ impl DMemGate {
     /// re-run the deferred dep-parse + typed-slot hooks against each
     /// drained id; the drain itself does NOT touch storage or fire
     /// any hooks. After drain, `ring_buffer_len()` returns 0.
+    ///
+    /// Side effect: zeroes the `dmem_ring_buffer_size` gauge so the
+    /// telemetry reflects the post-drain state immediately. Without
+    /// this, the gauge would stay at the pre-drain occupancy until
+    /// the next ingest call's `record_route` overwrote it — a stale
+    /// signal that would mislead operators monitoring ring-buffer
+    /// pressure. `CodeRabbit` PR #117 P2 #4.
     pub fn drain_ring_buffer(&mut self) -> Vec<Uuid> {
         let drained: Vec<Uuid> = self.ring_buffer.drain(..).collect();
+        crate::observability::metrics()
+            .dmem_ring_buffer_size
+            .store(0, Ordering::Relaxed);
         drained
     }
 }
@@ -350,6 +370,29 @@ pub fn record_route(score: &RpeScore, route: DMemRoute, ring_buffer_size: usize)
     metrics
         .dmem_utility_histogram
         .observe(f64::from(score.utility));
+}
+
+// ---------------------------------------------------------------------------
+// Test-only telemetry-counter locks
+//
+// These statics are #[cfg(test)] so they don't ship in release builds.
+// They're `pub(crate)` so sibling test modules (consolidation::tests)
+// can use the same lock — cargo runs unit tests in parallel by
+// default, and tests that take before/after snapshots of the global
+// metrics counters would otherwise race with each other.
+//
+// CodeRabbit PR #117 P0 #1 / P1 #3.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) mod test_locks {
+    /// Serializes tests that read the global
+    /// `dmem_ring_buffer_evictions` counter.
+    pub(crate) static EVICTION_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serializes tests that read OR mutate the global
+    /// `dmem_fast_routed` / `dmem_slow_routed` counters.
+    pub(crate) static ROUTING_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +516,72 @@ mod tests {
         assert_eq!(drained, ids[2..].to_vec());
     }
 
+    use super::test_locks::{EVICTION_COUNTER_LOCK, ROUTING_COUNTER_LOCK};
+
+    #[test]
+    fn ring_buffer_eviction_increments_evictions_counter() {
+        // CodeRabbit PR #117 P0 #1: every silent eviction is a
+        // permanent loss of the observation's deferred dep-parse +
+        // typed-slot enrichment. Operators get a signal via the
+        // `dmem_ring_buffer_evictions` counter. This test pushes
+        // `capacity + 1` observations and asserts the counter went
+        // up by exactly 1.
+        let _guard = EVICTION_COUNTER_LOCK.lock().unwrap();
+        let metrics = crate::observability::metrics();
+        let before = metrics.dmem_ring_buffer_evictions.load(Ordering::Relaxed);
+
+        let mut gate = DMemGate::new(0.35, 0.5, 2);
+        let low_score = RpeScore {
+            surprise: 0.0,
+            utility: 0.0,
+            combined: 0.0,
+        };
+        // capacity = 2; push 3 → exactly 1 eviction at the third push.
+        gate.route(Uuid::new_v4(), &low_score, None);
+        gate.route(Uuid::new_v4(), &low_score, None);
+        gate.route(Uuid::new_v4(), &low_score, None);
+
+        let after = metrics.dmem_ring_buffer_evictions.load(Ordering::Relaxed);
+        assert_eq!(
+            after - before,
+            1,
+            "capacity+1 push must increment dmem_ring_buffer_evictions by exactly 1; got delta {}",
+            after - before
+        );
+        assert_eq!(
+            gate.ring_buffer_len(),
+            2,
+            "buffer remains at capacity after eviction"
+        );
+    }
+
+    #[test]
+    fn ring_buffer_no_eviction_below_capacity() {
+        // Symmetric negative case: under capacity, no eviction
+        // counter increment should fire (load-bearing for the
+        // "operator sees only real evictions" contract).
+        let _guard = EVICTION_COUNTER_LOCK.lock().unwrap();
+        let metrics = crate::observability::metrics();
+        let before = metrics.dmem_ring_buffer_evictions.load(Ordering::Relaxed);
+
+        let mut gate = DMemGate::new(0.35, 0.5, 8);
+        let low_score = RpeScore {
+            surprise: 0.0,
+            utility: 0.0,
+            combined: 0.0,
+        };
+        // 3 pushes < capacity 8 → no evictions.
+        for _ in 0..3 {
+            gate.route(Uuid::new_v4(), &low_score, None);
+        }
+
+        let after = metrics.dmem_ring_buffer_evictions.load(Ordering::Relaxed);
+        assert_eq!(
+            after, before,
+            "under-capacity pushes must NOT increment dmem_ring_buffer_evictions"
+        );
+    }
+
     #[test]
     fn drain_returns_all_and_empties_buffer() {
         let mut gate = DMemGate::new(0.35, 0.5, 8);
@@ -489,6 +598,43 @@ mod tests {
         assert_eq!(gate.ring_buffer_len(), 0, "drain must empty the buffer");
         let drained_again = gate.drain_ring_buffer();
         assert!(drained_again.is_empty(), "double-drain is empty");
+    }
+
+    #[test]
+    fn drain_resets_ring_buffer_size_gauge_to_zero() {
+        // CodeRabbit PR #117 P2 #4: `dmem_ring_buffer_size` is a
+        // gauge that should reflect the post-drain state immediately.
+        // Without the explicit reset, the gauge stayed at the pre-
+        // drain value until the next `record_route` overwrote it —
+        // misleading operators monitoring ring-buffer pressure.
+        let _guard = test_locks::ROUTING_COUNTER_LOCK.lock().unwrap();
+        let metrics = crate::observability::metrics();
+
+        let mut gate = DMemGate::new(0.35, 0.5, 8);
+        let low_score = RpeScore {
+            surprise: 0.0,
+            utility: 0.0,
+            combined: 0.0,
+        };
+        // Push 3 obs and emit telemetry via record_route so the
+        // gauge reflects the buffer occupancy.
+        for _ in 0..3 {
+            let route = gate.route(Uuid::new_v4(), &low_score, None);
+            record_route(&low_score, route, gate.ring_buffer_len());
+        }
+        assert_eq!(
+            metrics.dmem_ring_buffer_size.load(Ordering::Relaxed),
+            3,
+            "gauge tracks the pre-drain occupancy"
+        );
+
+        let _ = gate.drain_ring_buffer();
+        assert_eq!(
+            metrics.dmem_ring_buffer_size.load(Ordering::Relaxed),
+            0,
+            "drain must zero the dmem_ring_buffer_size gauge"
+        );
+        assert_eq!(gate.ring_buffer_len(), 0);
     }
 
     // ---- Forced-slow override (TYPED_SLOT_TRIGGER_ACTIONS) ----
@@ -641,6 +787,10 @@ mod tests {
 
     #[test]
     fn record_route_increments_fast_and_slow_counters() {
+        // Hold ROUTING_COUNTER_LOCK so this test doesn't race the
+        // 100-obs test in `consolidation::tests`. CodeRabbit PR #117
+        // P1 #3.
+        let _guard = ROUTING_COUNTER_LOCK.lock().unwrap();
         let metrics = crate::observability::metrics();
         let fast_before = metrics.dmem_fast_routed.load(Ordering::Relaxed);
         let slow_before = metrics.dmem_slow_routed.load(Ordering::Relaxed);
