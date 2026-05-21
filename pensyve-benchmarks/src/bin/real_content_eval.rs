@@ -613,7 +613,7 @@ fn main() {
         weights: [0.25, 0.10, 0.15, 0.05, 0.20, 0.10, 0.10, 0.05],
         recall_timeout_secs: 5,
         rrf_k: 60,
-        rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2],
+        rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.0],
         beam_width: 10,
         max_depth: 4,
     };

@@ -68,9 +68,32 @@ pub struct RetrievalConfig {
     /// RRF constant k. Default 60.
     #[serde(default = "default_rrf_k")]
     pub rrf_k: u32,
-    /// Per-signal RRF weights: vec, bm25, activation, spread, intent, confidence, entity affinity.
-    #[serde(default = "default_rrf_weights")]
-    pub rrf_weights: [f32; 7],
+    /// Per-signal RRF weights, indexed in the order the engine emits
+    /// rankings:
+    ///   0: vector similarity
+    ///   1: BM25 / FTS
+    ///   2: ACT-R activation
+    ///   3: spreading-activation BFS
+    ///   4: intent alignment
+    ///   5: confidence / reliability
+    ///   6: entity affinity
+    ///   7: Personalized `PageRank` (Phase 2C; PPR ranking is emitted only
+    ///      when `PENSYVE_PPR=1` AND a `PprIndex` is attached to the
+    ///      `RecallEngine` — otherwise slot 7 is a no-op placeholder).
+    ///
+    /// Slot 7 was added in Phase 2C; the v2.4.x baseline shipped a
+    /// 7-slot array. Default value 1.0 keeps PPR at parity with the
+    /// other graph signals when it IS active, and is a strict no-op
+    /// when it is not (no ranking emitted → no weight applied).
+    ///
+    /// The custom deserializer [`deserialize_rrf_weights`] accepts
+    /// BOTH 7- and 8-element inputs for backwards compatibility —
+    /// see that function's doc for the migration contract.
+    #[serde(
+        default = "default_rrf_weights",
+        deserialize_with = "deserialize_rrf_weights"
+    )]
+    pub rrf_weights: [f32; 8],
     /// Beam search width. Default 10.
     #[serde(default = "default_beam_width")]
     pub beam_width: usize,
@@ -82,8 +105,62 @@ pub struct RetrievalConfig {
 fn default_rrf_k() -> u32 {
     60
 }
-fn default_rrf_weights() -> [f32; 7] {
-    [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2]
+fn default_rrf_weights() -> [f32; 8] {
+    // [vector, bm25, activation, spread, intent, confidence, entity_affinity, ppr]
+    // Slot 7 (PPR) added in Phase 2C; default 1.0 keeps PPR at parity
+    // with the other graph signals when the engine emits a PPR ranking
+    // (gated on `PENSYVE_PPR=1` AND an attached `PprIndex`).
+    [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.0]
+}
+
+/// Custom deserializer for `rrf_weights` that accepts BOTH the
+/// pre-Phase-2C 7-element shape AND the Phase 2C 8-element shape.
+///
+/// Backwards-compatibility contract (`CodeRabbit` PR #116 P0 #1):
+/// `#[serde(default)]` alone only fires when the field is absent from
+/// the input. Existing user configs that explicitly write a 7-element
+/// array (the v2.4.x baseline) would otherwise fail to deserialize
+/// into `[f32; 8]` and silently break every downstream consumer.
+///
+/// Behavior:
+/// - 8 elements → pass through unchanged.
+/// - 7 elements → pad with the PPR-slot default (`1.0`). This is a
+///   strict no-op at runtime because the engine emits a PPR ranking
+///   only when `PENSYVE_PPR=1` AND a `PprIndex` is attached; a 1.0
+///   multiplier on an absent ranking does nothing. The migration is
+///   silent (no warning, no log) because the new default reproduces
+///   baseline behavior byte-for-byte for callers that haven't opted
+///   into PPR.
+/// - Anything else → deserialization error with a clear message.
+fn deserialize_rrf_weights<'de, D>(deserializer: D) -> Result<[f32; 8], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let raw: Vec<f32> = Vec::deserialize(deserializer)?;
+    match raw.len() {
+        8 => {
+            // Safety: length matches the target array; from_slice is
+            // bounds-checked once.
+            let mut out = [0.0_f32; 8];
+            out.copy_from_slice(&raw);
+            Ok(out)
+        }
+        7 => {
+            // Pad with the PPR slot default (1.0). Note: we don't
+            // delegate to `default_rrf_weights()[7]` to avoid coupling
+            // the migration semantics to a future default-tuning
+            // change; the 1.0 here is the *pad* value, fixed for the
+            // backwards-compat contract.
+            let mut out = [0.0_f32; 8];
+            out[..7].copy_from_slice(&raw);
+            out[7] = 1.0;
+            Ok(out)
+        }
+        n => Err(D::Error::custom(format!(
+            "rrf_weights must contain 7 (pre-Phase-2C) or 8 (Phase 2C) elements; got {n}"
+        ))),
+    }
 }
 fn default_beam_width() -> usize {
     10
@@ -151,7 +228,7 @@ impl Default for PensyveConfig {
                 weights: [0.25, 0.10, 0.15, 0.05, 0.20, 0.10, 0.10, 0.05],
                 recall_timeout_secs: 5,
                 rrf_k: 60,
-                rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2],
+                rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.0],
                 beam_width: 10,
                 max_depth: 4,
             },
@@ -287,5 +364,108 @@ mod tests {
         assert_eq!(config.storage.path, "/tmp/test-pensyve");
         assert_eq!(config.extraction.default_tier, 2);
         assert_eq!(config.retrieval.default_limit, 10);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2C backwards-compatibility tests (CodeRabbit PR #116 P0 #1)
+    //
+    // Existing v2.4.x configs use a 7-element rrf_weights array; the
+    // Phase 2C extension to 8 elements would silently break those
+    // configs without `deserialize_rrf_weights`. These tests pin both
+    // shapes against future regressions.
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a minimal `RetrievalConfig` JSON document with the
+    /// given `rrf_weights` array. All other fields are non-optional
+    /// and must be present for `Deserialize` to succeed.
+    fn retrieval_json(weights_lit: &str) -> String {
+        format!(
+            r#"{{
+                "default_limit": 5,
+                "max_candidates": 100,
+                "weights": [0.25, 0.10, 0.15, 0.05, 0.20, 0.10, 0.10, 0.05],
+                "recall_timeout_secs": 5,
+                "rrf_k": 60,
+                "rrf_weights": {weights_lit},
+                "beam_width": 10,
+                "max_depth": 4
+            }}"#
+        )
+    }
+
+    #[test]
+    fn deserialize_8_element_rrf_weights_passes_through() {
+        let json = retrieval_json("[1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.5]");
+        let cfg: RetrievalConfig = serde_json::from_str(&json).expect("8-element parse");
+        assert_eq!(
+            cfg.rrf_weights,
+            [1.0_f32, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.5],
+            "8-element rrf_weights must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn deserialize_7_element_rrf_weights_pads_with_one() {
+        // CodeRabbit PR #116 P0 #1: a v2.4.x config with a 7-element
+        // rrf_weights array MUST continue to deserialize. The
+        // missing slot 7 (PPR) gets padded with 1.0 so the migration
+        // is a strict no-op at runtime (engine emits PPR ranking
+        // only when `PENSYVE_PPR=1` + PprIndex attached; 1.0 mask
+        // multiplier on an absent ranking does nothing).
+        let json = retrieval_json("[1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2]");
+        let cfg: RetrievalConfig = serde_json::from_str(&json).expect(
+            "v2.4.x 7-element rrf_weights MUST deserialize for backwards compat (PR #116 P0 #1)",
+        );
+        assert_eq!(
+            cfg.rrf_weights,
+            [1.0_f32, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.0],
+            "7-element array must pad slot 7 with 1.0 (PPR default no-op)"
+        );
+    }
+
+    #[test]
+    fn deserialize_wrong_length_rrf_weights_errors_with_clear_message() {
+        // 6 elements → error.
+        let json = retrieval_json("[1.0, 0.8, 1.0, 0.8, 0.5, 0.5]");
+        let err = serde_json::from_str::<RetrievalConfig>(&json).expect_err("must reject 6 elts");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rrf_weights") && msg.contains('7') && msg.contains('8'),
+            "error message must name the field and the accepted shapes; got {msg}"
+        );
+
+        // 9 elements → error.
+        let json = retrieval_json("[1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.0, 0.5]");
+        let err = serde_json::from_str::<RetrievalConfig>(&json).expect_err("must reject 9 elts");
+        assert!(
+            err.to_string().contains("rrf_weights"),
+            "error message must name the field"
+        );
+
+        // 0 elements → error.
+        let json = retrieval_json("[]");
+        let err = serde_json::from_str::<RetrievalConfig>(&json).expect_err("must reject 0 elts");
+        assert!(
+            err.to_string().contains("rrf_weights"),
+            "error message must name the field"
+        );
+    }
+
+    #[test]
+    fn deserialize_missing_rrf_weights_uses_default() {
+        // When the field is absent entirely, `#[serde(default)]`
+        // still fires (independent of the custom deserializer) and
+        // populates from `default_rrf_weights()`.
+        let json = r#"{
+            "default_limit": 5,
+            "max_candidates": 100,
+            "weights": [0.25, 0.10, 0.15, 0.05, 0.20, 0.10, 0.10, 0.05],
+            "recall_timeout_secs": 5,
+            "rrf_k": 60,
+            "beam_width": 10,
+            "max_depth": 4
+        }"#;
+        let cfg: RetrievalConfig = serde_json::from_str(json).expect("missing field uses default");
+        assert_eq!(cfg.rrf_weights, default_rrf_weights());
     }
 }

@@ -155,6 +155,31 @@ pub struct PensyveMetrics {
     /// criterion is < 5ms p95.
     pub dep_parse_duration: HistogramBuckets,
 
+    // Phase 2C: Personalized `PageRank` retrieval metrics.
+    /// Total recall calls that emitted a PPR ranking (incremented only
+    /// when `PENSYVE_PPR` is enabled AND a `PprIndex` is attached to
+    /// the `RecallEngine`).
+    pub ppr_query_count: AtomicU64,
+    /// Sum of power-iteration iterations across all PPR queries. Divide
+    /// by `ppr_query_count` for the average; useful for tuning
+    /// `max_iter` and the `alpha` damping factor.
+    pub ppr_iterations_total: AtomicU64,
+    /// Number of PPR queries that reached `max_iter` without
+    /// converging to the configured convergence tolerance (currently
+    /// `CONVERGENCE_TOL = 1e-4` in
+    /// [`crate::retrieval::ppr`] — see that constant's doc for the
+    /// f32 / bipartite-graph rationale). The acceptance criterion is
+    /// 0 on the unit-test graphs; a non-zero production value signals
+    /// degenerate restart vectors or pathological graphs.
+    pub ppr_convergence_failures: AtomicU64,
+    /// Wall-clock distribution of `PprIndex::query` execution.
+    pub ppr_duration: HistogramBuckets,
+    /// Sum of entity-seed counts across PPR queries (sum of
+    /// `query_entities.len()` per call). Together with
+    /// `ppr_query_count` this gives average restart-vector size — a
+    /// proxy for dep-parse query-entity coverage.
+    pub ppr_entity_seeds_count: AtomicU64,
+
     // Histograms
     pub recall_duration: HistogramBuckets,
     pub embed_duration: HistogramBuckets,
@@ -191,6 +216,11 @@ impl PensyveMetrics {
             dep_parse_lexicon_miss_count: AtomicU64::new(0),
             dep_parse_skipped_long_sentence: AtomicU64::new(0),
             dep_parse_duration: HistogramBuckets::new(DURATION_BUCKETS),
+            ppr_query_count: AtomicU64::new(0),
+            ppr_iterations_total: AtomicU64::new(0),
+            ppr_convergence_failures: AtomicU64::new(0),
+            ppr_duration: HistogramBuckets::new(DURATION_BUCKETS),
+            ppr_entity_seeds_count: AtomicU64::new(0),
             recall_duration: HistogramBuckets::new(DURATION_BUCKETS),
             embed_duration: HistogramBuckets::new(DURATION_BUCKETS),
             store_duration: HistogramBuckets::new(DURATION_BUCKETS),
@@ -418,6 +448,36 @@ impl PensyveMetrics {
             "pensyve_dep_parse_skipped_long_sentence_total {dep_parse_skipped}"
         );
 
+        // Phase 2C: Personalized PageRank retrieval counters.
+        let ppr_queries = self.ppr_query_count.load(Ordering::Relaxed);
+        let ppr_iters = self.ppr_iterations_total.load(Ordering::Relaxed);
+        let ppr_failures = self.ppr_convergence_failures.load(Ordering::Relaxed);
+        let ppr_seeds = self.ppr_entity_seeds_count.load(Ordering::Relaxed);
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_ppr_query_count_total Total recall calls that emitted a Phase 2C PPR ranking."
+        );
+        let _ = writeln!(buf, "# TYPE pensyve_ppr_query_count_total counter");
+        let _ = writeln!(buf, "pensyve_ppr_query_count_total {ppr_queries}");
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_ppr_iterations_total Sum of PPR power-iteration iterations across all queries."
+        );
+        let _ = writeln!(buf, "# TYPE pensyve_ppr_iterations_total counter");
+        let _ = writeln!(buf, "pensyve_ppr_iterations_total {ppr_iters}");
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_ppr_convergence_failures_total PPR queries that reached max_iter without converging to the configured tolerance."
+        );
+        let _ = writeln!(buf, "# TYPE pensyve_ppr_convergence_failures_total counter");
+        let _ = writeln!(buf, "pensyve_ppr_convergence_failures_total {ppr_failures}");
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_ppr_entity_seeds_count_total Sum of restart-vector entity-seed counts across PPR queries."
+        );
+        let _ = writeln!(buf, "# TYPE pensyve_ppr_entity_seeds_count_total counter");
+        let _ = writeln!(buf, "pensyve_ppr_entity_seeds_count_total {ppr_seeds}");
+
         // Histograms
         buf.push_str(&self.recall_duration.prometheus_text(
             "pensyve_recall_duration_seconds",
@@ -438,6 +498,10 @@ impl PensyveMetrics {
         buf.push_str(&self.dep_parse_duration.prometheus_text(
             "pensyve_dep_parse_duration_seconds",
             "Phase 2B dep-parse + persist pipeline duration in seconds.",
+        ));
+        buf.push_str(&self.ppr_duration.prometheus_text(
+            "pensyve_ppr_duration_seconds",
+            "Phase 2C Personalized PageRank query duration in seconds.",
         ));
 
         buf
