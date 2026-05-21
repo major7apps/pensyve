@@ -332,15 +332,20 @@ fn extract_one_triple(tokens: &[&str]) -> Option<Triple> {
     // must increment `dep_parse_lexicon_miss_count`, regardless of
     // whether the sentence ultimately produces a triple.
     for (i, tok) in tokens.iter().enumerate() {
-        let lower = strip_punct(tok).to_ascii_lowercase();
+        let stripped = strip_punct(tok);
+        let lower = stripped.to_ascii_lowercase();
         // Verbs are looked up in the lexicon directly. Surface forms
-        // not present are recorded as misses ONLY when the token shape
-        // looks like a verb (lowercase, alphabetic, length >= 3) — we
-        // do not record every noun as a "lexicon miss".
+        // not present are recorded as misses ONLY when the **original**
+        // (case-preserving) token shape looks like a verb — running
+        // `looks_like_verb` against the lowercased copy makes
+        // capitalized subjects ("She") and stopwords ("The") register
+        // as misses, which contaminates the metric. CodeRabbit
+        // PR #115 round 2: pass the punctuation-stripped original so
+        // only lowercase verb-shaped tokens contribute to the count.
         if let Some(predicate) = PREDICATE_LEXICON.get(lower.as_str()) {
             verb_hit = Some((i, *predicate));
             break;
-        } else if looks_like_verb(&lower) {
+        } else if looks_like_verb(stripped) {
             lexicon_miss_for_sentence += 1;
         }
     }
@@ -477,8 +482,17 @@ fn strip_punct(token: &str) -> &str {
 /// Heuristic for whether a token shape looks like a verb (for
 /// lexicon-miss accounting). Required: all-lowercase alphabetic,
 /// length >= 3. Avoids inflating the miss counter on every noun.
-fn looks_like_verb(lower: &str) -> bool {
-    lower.len() >= 3 && lower.chars().all(|c| c.is_ascii_alphabetic())
+/// Whether a token's surface form looks like a verb (for lexicon-miss
+/// accounting). Required: length >= 3, all-ASCII-alphabetic, and **all
+/// lowercase** in the original-case spelling so capitalized subjects
+/// ("She") and sentence-initial stopwords ("The") do not register as
+/// "looks like an unmapped verb". Pass the punctuation-stripped
+/// original token (NOT a lowercased copy) for the case check to be
+/// meaningful.
+fn looks_like_verb(token: &str) -> bool {
+    token.len() >= 3
+        && token.chars().all(|c| c.is_ascii_alphabetic())
+        && token.chars().all(|c| c.is_ascii_lowercase())
 }
 
 /// Compiled sentence-splitter regex.
@@ -956,6 +970,23 @@ mod tests {
     }
 
     // ---- Lexicon-miss counter flush (CodeRabbit + claude-bot PR #115 P1 #6) ----
+
+    #[test]
+    fn looks_like_verb_rejects_capitalized_and_mixed_case() {
+        // CodeRabbit PR #115 round 2: `looks_like_verb` previously
+        // accepted any 3+ alphabetic chars regardless of case (it was
+        // called against a lowercased copy), so capitalized subjects
+        // and stopwords inflated `dep_parse_lexicon_miss_count`. The
+        // contract now requires all-lowercase original spelling.
+        assert!(looks_like_verb("glorks"), "lowercase verb-shaped → miss");
+        assert!(looks_like_verb("glorked"), "past tense lowercase → miss");
+        assert!(!looks_like_verb("She"), "capitalized subject → not a miss");
+        assert!(!looks_like_verb("The"), "capitalized stopword → not a miss");
+        assert!(!looks_like_verb("MIXED"), "uppercase → not a miss");
+        assert!(!looks_like_verb("mIxEd"), "mixed case → not a miss");
+        assert!(!looks_like_verb("ok"), "<3 chars → not a miss");
+        assert!(!looks_like_verb("abc123"), "contains digits → not a miss");
+    }
 
     #[test]
     fn lexicon_miss_counter_flushes_when_no_verb_matches() {
