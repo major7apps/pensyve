@@ -10,6 +10,25 @@ const DURATION_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// Histogram buckets for `SelRoute` classifier confidence values (range
+/// `[0.0, 1.0]`). Boundaries are dense at the 0.5 threshold because the
+/// engine integration falls back to the `IDENTITY` mask when
+/// `confidence < 0.5`, so observing the distribution around that cut-off
+/// is the most diagnostic question.
+const CONFIDENCE_BUCKETS: &[f64] = &[0.0, 0.1, 0.25, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+
+/// Per-question-type label set for the `selroute_by_type` Prometheus
+/// counters. Index order MUST match
+/// [`crate::retrieval::query_classifier::selroute_metric_index`].
+const SELROUTE_TYPE_LABELS: [&str; 6] = [
+    "temporal-reasoning",
+    "multi-session",
+    "knowledge-update",
+    "single-session-user",
+    "single-session-assistant",
+    "single-session-preference",
+];
+
 /// A hand-rolled Prometheus-compatible histogram backed by `AtomicU64` counters.
 ///
 /// Buckets are cumulative: each bucket counts all observations <= its boundary,
@@ -52,10 +71,17 @@ impl HistogramBuckets {
     }
 
     /// Format as Prometheus histogram exposition text.
-    pub fn prometheus_text(&self, name: &str) -> String {
+    ///
+    /// `help` is rendered into the `# HELP {name} {help}` line so that
+    /// non-duration histograms (e.g. dimensionless confidence) can carry
+    /// accurate semantics. Duration histograms should pass a phrase
+    /// ending in "in seconds" or "in milliseconds" for monitoring-tool
+    /// auto-detection; other observations should describe their unit
+    /// (e.g. "Classification confidence in [0.0, 1.0]").
+    pub fn prometheus_text(&self, name: &str, help: &str) -> String {
         use std::fmt::Write;
         let mut buf = String::new();
-        let _ = writeln!(buf, "# HELP {name} Duration in seconds");
+        let _ = writeln!(buf, "# HELP {name} {help}");
         let _ = writeln!(buf, "# TYPE {name} histogram");
         for (i, &boundary) in self.boundaries.iter().enumerate() {
             let count = self.counts[i].load(Ordering::Relaxed);
@@ -89,6 +115,22 @@ pub struct PensyveMetrics {
     pub extraction_fallback_count: AtomicU64,
     pub embedding_failure_count: AtomicU64,
 
+    // Phase 2A: SelRoute query-classifier metrics.
+    /// Total queries classified by the `SelRoute` pipeline (incremented
+    /// only when `PENSYVE_SELROUTE` is enabled).
+    pub selroute_classified: AtomicU64,
+    /// Classifications where confidence `< 0.5` — the caller applies
+    /// the `IDENTITY` mask but still records the route for diagnostics.
+    pub selroute_fallback_count: AtomicU64,
+    /// Per-question-type classification counters. Index layout matches
+    /// `query_classifier::selroute_metric_index`:
+    /// `[temporal_reasoning, multi_session, knowledge_update,
+    ///   single_session_user, single_session_assistant,
+    ///   single_session_preference]`.
+    pub selroute_by_type: [AtomicU64; 6],
+    /// Distribution of `SelRoute` classification confidence values.
+    pub selroute_confidence_histogram: HistogramBuckets,
+
     // Histograms
     pub recall_duration: HistogramBuckets,
     pub embed_duration: HistogramBuckets,
@@ -107,10 +149,49 @@ impl PensyveMetrics {
             consolidation_count: AtomicU64::new(0),
             extraction_fallback_count: AtomicU64::new(0),
             embedding_failure_count: AtomicU64::new(0),
+            selroute_classified: AtomicU64::new(0),
+            selroute_fallback_count: AtomicU64::new(0),
+            // [AtomicU64; 6] cannot use [AtomicU64::new(0); 6] because
+            // AtomicU64 is !Copy; build the array element-wise.
+            selroute_by_type: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+            selroute_confidence_histogram: HistogramBuckets::new(CONFIDENCE_BUCKETS),
             recall_duration: HistogramBuckets::new(DURATION_BUCKETS),
             embed_duration: HistogramBuckets::new(DURATION_BUCKETS),
             store_duration: HistogramBuckets::new(DURATION_BUCKETS),
         }
+    }
+
+    /// Record a `SelRoute` classification.
+    ///
+    /// - `type_index` is the result of
+    ///   [`crate::retrieval::query_classifier::selroute_metric_index`] —
+    ///   `Some(idx)` for recognized types, `None` for unknown (the
+    ///   counter is still bumped on `selroute_classified` but no
+    ///   per-type slot is incremented).
+    /// - `confidence` is recorded in the confidence histogram, and a
+    ///   value below `0.5` increments `selroute_fallback_count`.
+    pub fn record_selroute_classification(&self, type_index: Option<usize>, confidence: f32) {
+        self.selroute_classified.fetch_add(1, Ordering::Relaxed);
+        if confidence < 0.5 {
+            self.selroute_fallback_count.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(idx) = type_index
+            && let Some(slot) = self.selroute_by_type.get(idx)
+        {
+            slot.fetch_add(1, Ordering::Relaxed);
+        }
+        // Clamp negatives defensively before observation; the
+        // classifier always returns >=0.0 today but the histogram
+        // expects non-negative observations.
+        self.selroute_confidence_histogram
+            .observe(f64::from(confidence.max(0.0)));
     }
 
     /// Record a completed recall operation with its duration in milliseconds.
@@ -149,6 +230,10 @@ impl PensyveMetrics {
     }
 
     /// Export all metrics in Prometheus text exposition format.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "linear writeln! sequence per Prometheus metric — splitting per metric would add indirection without clarity. Grows by ~10 lines per new metric set."
+    )]
     pub fn prometheus_text(&self) -> String {
         let mut buf = String::with_capacity(512);
 
@@ -220,22 +305,57 @@ impl PensyveMetrics {
         let _ = writeln!(buf, "# TYPE pensyve_embedding_failure_total counter");
         let _ = writeln!(buf, "pensyve_embedding_failure_total {embedding_failure}");
 
+        // Phase 2A: SelRoute classifier counters.
+        let selroute_classified = self.selroute_classified.load(Ordering::Relaxed);
+        let selroute_fallback = self.selroute_fallback_count.load(Ordering::Relaxed);
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_selroute_classified_total Total queries auto-classified by SelRoute."
+        );
+        let _ = writeln!(buf, "# TYPE pensyve_selroute_classified_total counter");
+        let _ = writeln!(
+            buf,
+            "pensyve_selroute_classified_total {selroute_classified}"
+        );
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_selroute_fallback_total Total SelRoute classifications with confidence below 0.5."
+        );
+        let _ = writeln!(buf, "# TYPE pensyve_selroute_fallback_total counter");
+        let _ = writeln!(buf, "pensyve_selroute_fallback_total {selroute_fallback}");
+
+        // Per-question-type counters. Labels match the
+        // `selroute_metric_index` ordering in `query_classifier.rs`.
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_selroute_by_type_total SelRoute classifications by question_type."
+        );
+        let _ = writeln!(buf, "# TYPE pensyve_selroute_by_type_total counter");
+        for (idx, label) in SELROUTE_TYPE_LABELS.iter().enumerate() {
+            let count = self.selroute_by_type[idx].load(Ordering::Relaxed);
+            let _ = writeln!(
+                buf,
+                "pensyve_selroute_by_type_total{{question_type=\"{label}\"}} {count}"
+            );
+        }
+
         // Histograms
-        buf.push_str(
-            &self
-                .recall_duration
-                .prometheus_text("pensyve_recall_duration_seconds"),
-        );
-        buf.push_str(
-            &self
-                .embed_duration
-                .prometheus_text("pensyve_embed_duration_seconds"),
-        );
-        buf.push_str(
-            &self
-                .store_duration
-                .prometheus_text("pensyve_store_duration_seconds"),
-        );
+        buf.push_str(&self.recall_duration.prometheus_text(
+            "pensyve_recall_duration_seconds",
+            "Recall operation duration in seconds.",
+        ));
+        buf.push_str(&self.embed_duration.prometheus_text(
+            "pensyve_embed_duration_seconds",
+            "Embedding generation duration in seconds.",
+        ));
+        buf.push_str(&self.store_duration.prometheus_text(
+            "pensyve_store_duration_seconds",
+            "Memory store operation duration in seconds.",
+        ));
+        buf.push_str(&self.selroute_confidence_histogram.prometheus_text(
+            "pensyve_selroute_confidence",
+            "SelRoute classification confidence distribution in [0.0, 1.0].",
+        ));
 
         buf
     }
@@ -356,7 +476,7 @@ mod tests {
         h.observe(0.15); // falls in 0.25 bucket
         h.observe(20.0); // only +Inf
 
-        let text = h.prometheus_text("test_duration_seconds");
+        let text = h.prometheus_text("test_duration_seconds", "Test duration in seconds.");
         assert!(text.contains("test_duration_seconds_bucket{le=\"0.005\"} 1"));
         assert!(text.contains("test_duration_seconds_bucket{le=\"+Inf\"} 3"));
         assert!(text.contains("test_duration_seconds_count 3"));
