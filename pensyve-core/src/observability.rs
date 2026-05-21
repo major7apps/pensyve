@@ -24,6 +24,14 @@ const CONFIDENCE_BUCKETS: &[f64] = &[0.0, 0.1, 0.25, 0.4, 0.5, 0.6, 0.7, 0.8, 0.
 /// boundary, which both fall on the uniform grid.
 const UNIT_INTERVAL_BUCKETS: &[f64] = &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
 
+/// Histogram buckets for Phase 2E Vendi-Score values. Vendi scores lie
+/// in `[1.0, k]` where `k` is the selected top-k size — capped at 50
+/// by the brief's `VendiReranker::max_k` default. Boundaries are
+/// chosen to give roughly even coverage across that range while staying
+/// dense at the low end (small Vendi → diversity collapse, the most
+/// diagnostically interesting case).
+const VENDI_SCORE_BUCKETS: &[f64] = &[1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 50.0];
+
 /// Per-question-type label set for the `selroute_by_type` Prometheus
 /// counters. Index order MUST match
 /// [`crate::retrieval::query_classifier::selroute_metric_index`].
@@ -235,6 +243,20 @@ pub struct PensyveMetrics {
     /// observations align with the current query context.
     pub dmem_utility_histogram: HistogramBuckets,
 
+    // Phase 2E: Vendi-Score diversity rerank metrics.
+    /// Total recall calls that ran the Vendi diversity rerank
+    /// (incremented only when `PENSYVE_VENDI` is enabled AND a
+    /// `VendiReranker` is attached to the `RecallEngine`).
+    pub vendi_rerank_count: AtomicU64,
+    /// Distribution of the FINAL Vendi Score of the selected top-`k`
+    /// set (in `[1.0, k]` — not the alpha-blended joint score). Buckets
+    /// are dimensioned for `k` up to 50, matching the
+    /// `VendiReranker::max_k` brief default.
+    pub vendi_score_histogram: HistogramBuckets,
+    /// Wall-clock distribution of `VendiReranker::rerank` execution.
+    /// Phase 2E target: p99 < 1ms for k = 50 candidates at 384 dims.
+    pub vendi_duration: HistogramBuckets,
+
     // Histograms
     pub recall_duration: HistogramBuckets,
     pub embed_duration: HistogramBuckets,
@@ -283,6 +305,9 @@ impl PensyveMetrics {
             dmem_default_gate_dropped_observations: AtomicU64::new(0),
             dmem_surprise_histogram: HistogramBuckets::new(UNIT_INTERVAL_BUCKETS),
             dmem_utility_histogram: HistogramBuckets::new(UNIT_INTERVAL_BUCKETS),
+            vendi_rerank_count: AtomicU64::new(0),
+            vendi_score_histogram: HistogramBuckets::new(VENDI_SCORE_BUCKETS),
+            vendi_duration: HistogramBuckets::new(DURATION_BUCKETS),
             recall_duration: HistogramBuckets::new(DURATION_BUCKETS),
             embed_duration: HistogramBuckets::new(DURATION_BUCKETS),
             store_duration: HistogramBuckets::new(DURATION_BUCKETS),
@@ -623,6 +648,23 @@ impl PensyveMetrics {
         buf.push_str(&self.dmem_utility_histogram.prometheus_text(
             "pensyve_dmem_utility",
             "Phase 2D D-MEM utility distribution in [0.0, 1.0].",
+        ));
+
+        // Phase 2E: Vendi-Score diversity rerank counters + histograms.
+        let vendi_count = self.vendi_rerank_count.load(Ordering::Relaxed);
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_vendi_rerank_count_total Total recall calls that ran the Phase 2E Vendi-Score diversity rerank."
+        );
+        let _ = writeln!(buf, "# TYPE pensyve_vendi_rerank_count_total counter");
+        let _ = writeln!(buf, "pensyve_vendi_rerank_count_total {vendi_count}");
+        buf.push_str(&self.vendi_score_histogram.prometheus_text(
+            "pensyve_vendi_score",
+            "Phase 2E Vendi Score of the selected top-k set in [1.0, k].",
+        ));
+        buf.push_str(&self.vendi_duration.prometheus_text(
+            "pensyve_vendi_duration_seconds",
+            "Phase 2E Vendi rerank duration in seconds.",
         ));
 
         buf
