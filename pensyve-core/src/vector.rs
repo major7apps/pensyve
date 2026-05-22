@@ -109,6 +109,15 @@ impl VectorIndex {
         self.entity_map.get(&id).copied()
     }
 
+    /// Look up the stored (pre-normalized) embedding for a memory ID.
+    ///
+    /// Returns `None` if the ID is not in the index. The returned slice
+    /// is the L2-normalized vector — callers like the Phase 2E Vendi
+    /// reranker can use it directly as a unit-norm input.
+    pub fn get(&self, id: Uuid) -> Option<&[f32]> {
+        self.entries.get(&id).map(Vec::as_slice)
+    }
+
     /// Search for the `limit` nearest neighbors to `query`.
     /// Returns `(id, similarity_score)` pairs sorted by score descending.
     ///

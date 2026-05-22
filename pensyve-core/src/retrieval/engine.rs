@@ -331,6 +331,15 @@ pub struct RecallEngine<'a> {
     /// out-of-band (e.g., after a batch of new observations land via
     /// the Phase 2B dep-parse hook).
     ppr_index: Option<&'a crate::retrieval::ppr::PprIndex>,
+    /// Phase 2E: optional Vendi-Score diversity reranker. When attached
+    /// AND `PENSYVE_VENDI=1`, the recall engine runs Vendi greedy
+    /// selection on the top-`max_k` candidates after the cross-encoder
+    /// rerank, balancing relevance against the Vendi Score of the
+    /// selected set's embedding kernel matrix. The reranker is borrowed
+    /// `&'a` so callers retain ownership; `VendiReranker` is `Copy`
+    /// but the borrow keeps the surface consistent with the other
+    /// optional stages (`reranker`, `ppr_index`).
+    vendi_reranker: Option<&'a crate::retrieval::vendi::VendiReranker>,
 }
 
 /// Maximum number of candidates to pass into the cross-encoder for reranking.
@@ -356,6 +365,7 @@ impl<'a> RecallEngine<'a> {
             agent_only: None,
             mmr_lambda: None,
             ppr_index: None,
+            vendi_reranker: None,
         }
     }
 
@@ -381,6 +391,31 @@ impl<'a> RecallEngine<'a> {
     #[must_use]
     pub fn with_ppr(mut self, index: &'a crate::retrieval::ppr::PprIndex) -> Self {
         self.ppr_index = Some(index);
+        self
+    }
+
+    /// Phase 2E: attach an optional
+    /// [`crate::retrieval::vendi::VendiReranker`] for Vendi-Score
+    /// diversity reranking.
+    ///
+    /// When attached AND `PENSYVE_VENDI=1`, the recall engine runs
+    /// Vendi greedy selection on the top-`max_k` candidates produced
+    /// by the cross-encoder reranker stage, balancing relevance against
+    /// the diversity of the selected set's embedding kernel matrix.
+    /// Vendi runs AFTER the cross-encoder — it does not replace it.
+    /// The cross-encoder picks the most-relevant `max_k` candidates,
+    /// and Vendi picks a diverse subset from those.
+    ///
+    /// When NOT attached OR when `PENSYVE_VENDI` is off, recall is
+    /// byte-for-byte identical to the pre-2E pipeline.
+    ///
+    /// The reranker's `alpha` is overridden per-route by the
+    /// `SelRoute` `PipelineConfig::vendi_alpha` when `SelRoute` is
+    /// enabled AND classification confidence `>= 0.5`; otherwise the
+    /// reranker's own `alpha` is used.
+    #[must_use]
+    pub fn with_vendi(mut self, reranker: &'a crate::retrieval::vendi::VendiReranker) -> Self {
+        self.vendi_reranker = Some(reranker);
         self
     }
 
@@ -625,7 +660,13 @@ impl<'a> RecallEngine<'a> {
         // `selroute_by_type` / confidence-histogram telemetry covers
         // ALL SelRoute decisions, not just queries that returned hits.
         // Per CodeRabbit review on #114 (2026-05-21).
-        let selroute_mask: Option<[f32; 8]> =
+        // Phase 2E: capture `vendi_alpha` alongside `signal_mask`.
+        // Both come from the same `PipelineConfig`, so a single
+        // classification pass populates both. When SelRoute is OFF or
+        // confidence is below threshold, both stay `None` and the
+        // engine falls back to the reranker's own `alpha` (configured
+        // at `with_vendi` time).
+        let (selroute_mask, selroute_vendi_alpha): (Option<[f32; 8]>, Option<f32>) =
             if crate::retrieval::query_classifier::selroute_enabled() {
                 let classification = crate::retrieval::query_classifier::classify_query(query);
                 let metrics = crate::observability::metrics();
@@ -635,7 +676,7 @@ impl<'a> RecallEngine<'a> {
                     ),
                     classification.confidence,
                 );
-                // Apply the per-route mask only when confidence >= 0.5;
+                // Apply the per-route config only when confidence >= 0.5;
                 // below that the caller's contract says to use IDENTITY
                 // (which is a no-op and we just skip).
                 if classification.confidence >= 0.5 {
@@ -643,15 +684,20 @@ impl<'a> RecallEngine<'a> {
                         classification.question_type,
                     );
                     if cfg == crate::retrieval::query_classifier::PipelineConfig::IDENTITY {
-                        None
+                        // IDENTITY mask is a no-op; emit None to skip
+                        // the mask branch entirely. We still surface
+                        // `vendi_alpha` from IDENTITY (= 0.7) so the
+                        // Vendi stage sees a consistent value when
+                        // SelRoute fires.
+                        (None, Some(cfg.vendi_alpha))
                     } else {
-                        Some(cfg.signal_mask)
+                        (Some(cfg.signal_mask), Some(cfg.vendi_alpha))
                     }
                 } else {
-                    None
+                    (None, None)
                 }
             } else {
-                None
+                (None, None)
             };
 
         if candidates.is_empty() {
@@ -1009,6 +1055,36 @@ impl<'a> RecallEngine<'a> {
         // Step 8: Optional cross-encoder reranking.
         if let Some(reranker) = self.reranker {
             scored = apply_reranking(scored, reranker, query)?;
+        }
+
+        // Phase 2E: Optional Vendi-Score diversity rerank.
+        //
+        // Active only when BOTH:
+        //   (a) a `VendiReranker` has been attached via `with_vendi`
+        //   (b) `PENSYVE_VENDI=1` (cached OnceLock env read)
+        //
+        // Runs AFTER the cross-encoder — does NOT replace it. The
+        // cross-encoder ordered the candidates by relevance; Vendi
+        // picks a diverse subset from the top-`max_k` (50 per the
+        // brief) by joint relevance + Vendi-Score maximization, with
+        // `target_k = limit` so the output set matches the caller's
+        // recall budget. MMR (G3-P5, below) is preserved for callers
+        // that haven't migrated; in practice Vendi + MMR are mutually
+        // exclusive in production but the engine doesn't enforce
+        // that — both stages are default-OFF and only one is
+        // realistically set in any given recall.
+        //
+        // Per-route `alpha` override: when SelRoute fired and produced
+        // a confidence-cleared classification, `selroute_vendi_alpha`
+        // holds the route's preferred `alpha`. Falls back to the
+        // reranker's own `alpha` otherwise (set at `with_vendi` time).
+        if let Some(vendi) = self.vendi_reranker
+            && crate::retrieval::vendi::vendi_enabled()
+            && !scored.is_empty()
+        {
+            scored = vendi_merge_candidates(scored, vendi, selroute_vendi_alpha, limit, |id| {
+                self.vector_index.get(id).map(<[f32]>::to_vec)
+            });
         }
 
         // G3-P5: optional MMR diversity rerank, BEFORE card prepend AND
@@ -1375,6 +1451,89 @@ fn score_candidate(
         ppr_score: None,
         final_score,
     }
+}
+
+/// Phase 2E: merge a Vendi rerank into a pre-sorted `Vec<ScoredCandidate>`.
+///
+/// Extracted from `RecallEngine::recall_inner` so the merge path is
+/// directly testable without flipping `PENSYVE_VENDI` (which is
+/// `OnceLock`-cached and would race other tests).
+///
+/// Algorithm:
+/// 1. Take the top `min(scored.len(), reranker.max_k)` candidates as
+///    the Vendi-eligible pool. The brief's `max_k = 50` caps Jacobi
+///    cost; today's pipeline produces at most `RERANK_TOP_N = 20`.
+/// 2. Build the `(id, relevance, embedding)` triples by calling
+///    `embedding_lookup` on each pool candidate. Candidates whose
+///    lookup returns `None` are silently skipped from the Vendi
+///    input — they re-emerge in the residue drain (step 4) so we
+///    never lose a candidate just because its vector wasn't indexed.
+/// 3. If at least 2 candidates carry embeddings, run Vendi greedy
+///    selection with `target_k = limit`.
+/// 4. Reassemble the output in this order:
+///    - Vendi-selected candidates in greedy-selection order;
+///    - In-pool candidates Vendi did NOT select AND in-pool
+///      candidates with no indexed embedding, iterated in the
+///      original pool order so the residue ordering is deterministic
+///      and follows the pre-Vendi relevance ranking;
+///    - The post-pool tail (anything past index `max_k`) appended
+///      last.
+///
+/// Per `CodeRabbit` review on PR #119 rounds 1 and 2:
+/// - Round 1: a separate `vendi_missing` rescue list was duplicating
+///   missing-embedding candidates by appending them twice;
+/// - Round 2: pool-order iteration of the residue replaces a
+///   nondeterministic `HashMap::into_values` drain.
+fn vendi_merge_candidates<F>(
+    scored: Vec<ScoredCandidate>,
+    reranker: &crate::retrieval::vendi::VendiReranker,
+    selroute_alpha: Option<f32>,
+    limit: usize,
+    mut embedding_lookup: F,
+) -> Vec<ScoredCandidate>
+where
+    F: FnMut(Uuid) -> Option<Vec<f32>>,
+{
+    let pool_size = scored.len().min(reranker.max_k);
+    let mut vendi_input: Vec<(Uuid, f32, Vec<f32>)> = Vec::with_capacity(pool_size);
+    for cand in scored.iter().take(pool_size) {
+        if let Some(emb) = embedding_lookup(cand.memory_id) {
+            vendi_input.push((cand.memory_id, cand.final_score, emb));
+        }
+    }
+
+    // Only run Vendi if at least two candidates carry embeddings —
+    // a single-candidate "set" has Vendi=1.0 by definition and the
+    // rerank is degenerate.
+    if vendi_input.len() < 2 {
+        return scored;
+    }
+
+    let alpha = selroute_alpha.unwrap_or(reranker.alpha);
+    let route = crate::retrieval::vendi::VendiReranker::new(alpha, reranker.max_k);
+    let reordered = crate::retrieval::vendi::timed_rerank(&route, &vendi_input, limit);
+
+    let mut by_id: std::collections::HashMap<Uuid, ScoredCandidate> = scored
+        .iter()
+        .take(pool_size)
+        .map(|c| (c.memory_id, c.clone()))
+        .collect();
+    let tail: Vec<ScoredCandidate> = scored.iter().skip(pool_size).cloned().collect();
+    let mut reordered_scored: Vec<ScoredCandidate> = Vec::with_capacity(scored.len());
+    for (id, _vendi_score) in &reordered {
+        if let Some(c) = by_id.remove(id) {
+            reordered_scored.push(c);
+        }
+    }
+    // Drain the residue in original-pool order so the tail is
+    // deterministic and matches pre-Vendi relevance ranking.
+    for cand in scored.iter().take(pool_size) {
+        if let Some(c) = by_id.remove(&cand.memory_id) {
+            reordered_scored.push(c);
+        }
+    }
+    reordered_scored.extend(tail);
+    reordered_scored
 }
 
 /// Apply cross-encoder reranking to the top-N candidates.
@@ -1812,6 +1971,259 @@ mod tests {
                 cand.final_score
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2E: Vendi-Score diversity rerank engine integration.
+    // -----------------------------------------------------------------------
+
+    /// Build a synthetic `ScoredCandidate` with a given id +
+    /// `final_score`. Used by the Vendi merge tests; the memory body
+    /// is a stub `EpisodicMemory` because the merge logic only reads
+    /// `memory_id` + `final_score`.
+    fn synthetic_candidate(id: Uuid, final_score: f32) -> ScoredCandidate {
+        let ns_id = Uuid::new_v4();
+        let ep_id = Uuid::new_v4();
+        let ent = Uuid::new_v4();
+        ScoredCandidate {
+            memory_id: id,
+            memory: Memory::Episodic(EpisodicMemory::new(ns_id, ep_id, ent, ent, "stub")),
+            vector_score: final_score,
+            bm25_score: 0.0,
+            graph_score: 0.0,
+            intent_score: 0.0,
+            recency_score: 0.0,
+            access_score: 0.0,
+            confidence_score: 0.0,
+            entity_score: 0.0,
+            type_boost: 1.0,
+            ppr_score: None,
+            final_score,
+        }
+    }
+
+    /// L2-normalize a vector in place (test helper — matches
+    /// `VectorIndex::add`'s pre-normalization).
+    fn l2_normalize(v: &mut [f32]) {
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for x in v.iter_mut() {
+                *x /= norm;
+            }
+        }
+    }
+
+    #[test]
+    fn vendi_merge_does_not_duplicate_when_embeddings_missing() {
+        // Regression guard for chatgpt-codex + CodeRabbit review on
+        // PR #119: the merge path must NOT duplicate any candidate
+        // whose embedding lookup misses. The earlier
+        // `vendi_missing` rescue list was double-appending these
+        // candidates (once via `by_id.into_values()`, once via
+        // `vendi_missing.extend()`).
+        let candidates: Vec<ScoredCandidate> = (0..5)
+            .map(|i| synthetic_candidate(Uuid::new_v4(), 1.0 - (i as f32) * 0.1))
+            .collect();
+        let ids: Vec<Uuid> = candidates.iter().map(|c| c.memory_id).collect();
+
+        // Indexed: candidates 0, 2, 4 (orthogonal-ish embeddings to
+        // exercise the Vendi greedy loop). Candidates 1 + 3 are
+        // missing embeddings.
+        let mut indexed: std::collections::HashMap<Uuid, Vec<f32>> =
+            std::collections::HashMap::new();
+        let mut e0 = vec![1.0_f32, 0.05, 0.0];
+        let mut e2 = vec![0.0_f32, 1.0, 0.05];
+        let mut e4 = vec![0.05_f32, 0.0, 1.0];
+        l2_normalize(&mut e0);
+        l2_normalize(&mut e2);
+        l2_normalize(&mut e4);
+        indexed.insert(ids[0], e0);
+        indexed.insert(ids[2], e2);
+        indexed.insert(ids[4], e4);
+
+        let reranker = crate::retrieval::vendi::VendiReranker::new(0.5, 50);
+        let merged = vendi_merge_candidates(candidates, &reranker, None, 5, |id| {
+            indexed.get(&id).cloned()
+        });
+
+        // No duplicates.
+        let mut seen = std::collections::HashSet::new();
+        for c in &merged {
+            assert!(
+                seen.insert(c.memory_id),
+                "duplicate memory_id in merged output: {}",
+                c.memory_id
+            );
+        }
+        // All 5 originals present (no losses either).
+        assert_eq!(merged.len(), 5, "merge must preserve total count");
+        for id in &ids {
+            assert!(
+                seen.contains(id),
+                "missing candidate {id} after merge — must NOT lose candidates"
+            );
+        }
+    }
+
+    #[test]
+    fn vendi_merge_residue_follows_pool_order() {
+        // Per CodeRabbit PR #119 round 2: when Vendi selects fewer
+        // than the full pool, the residue must drain in original
+        // pool order (descending `final_score`), not HashMap
+        // iteration order.
+        let candidates: Vec<ScoredCandidate> = (0..4)
+            .map(|i| synthetic_candidate(Uuid::new_v4(), 1.0 - (i as f32) * 0.1))
+            .collect();
+        let ids: Vec<Uuid> = candidates.iter().map(|c| c.memory_id).collect();
+
+        // All four indexed. Three near-identical + one orthogonal —
+        // alpha = 0.0 picks the orthogonal one early, leaving two
+        // near-identicals in the residue at target_k = 2.
+        let mut indexed: std::collections::HashMap<Uuid, Vec<f32>> =
+            std::collections::HashMap::new();
+        let mut near_a = vec![1.0_f32, 0.05, 0.0];
+        let mut near_b = vec![1.0_f32, 0.0, 0.05];
+        let mut near_c = vec![1.0_f32, 0.05, 0.05];
+        let mut orth = vec![0.0_f32, 0.0, 1.0];
+        for v in [&mut near_a, &mut near_b, &mut near_c, &mut orth] {
+            l2_normalize(v);
+        }
+        indexed.insert(ids[0], near_a);
+        indexed.insert(ids[1], near_b);
+        indexed.insert(ids[2], near_c);
+        indexed.insert(ids[3], orth);
+
+        let reranker = crate::retrieval::vendi::VendiReranker::new(0.0, 50);
+        let merged = vendi_merge_candidates(candidates, &reranker, None, 2, |id| {
+            indexed.get(&id).cloned()
+        });
+
+        // All four still present (no loss).
+        assert_eq!(merged.len(), 4);
+
+        // The residue (positions 2-3) must follow original pool
+        // order: lower-index pool candidates come first.
+        let residue: Vec<Uuid> = merged.iter().skip(2).map(|c| c.memory_id).collect();
+        let pos = |u: Uuid| ids.iter().position(|x| *x == u).unwrap();
+        assert!(
+            pos(residue[0]) < pos(residue[1]),
+            "residue order must follow original pool order: got {:?} (positions {} → {})",
+            residue,
+            pos(residue[0]),
+            pos(residue[1])
+        );
+    }
+
+    #[test]
+    fn vendi_merge_below_two_indexed_returns_unchanged() {
+        // When fewer than 2 candidates carry embeddings, Vendi is
+        // skipped entirely and the input is returned untouched.
+        let candidates: Vec<ScoredCandidate> = (0..3)
+            .map(|i| synthetic_candidate(Uuid::new_v4(), 1.0 - (i as f32) * 0.1))
+            .collect();
+        let original_ids: Vec<Uuid> = candidates.iter().map(|c| c.memory_id).collect();
+
+        // Only 1 indexed — below the 2-minimum.
+        let mut indexed: std::collections::HashMap<Uuid, Vec<f32>> =
+            std::collections::HashMap::new();
+        let mut e = vec![1.0_f32, 0.0];
+        l2_normalize(&mut e);
+        indexed.insert(original_ids[0], e);
+
+        let reranker = crate::retrieval::vendi::VendiReranker::new(0.5, 50);
+        let merged = vendi_merge_candidates(candidates, &reranker, None, 3, |id| {
+            indexed.get(&id).cloned()
+        });
+
+        let merged_ids: Vec<Uuid> = merged.iter().map(|c| c.memory_id).collect();
+        assert_eq!(
+            merged_ids, original_ids,
+            "below-2-indexed pool must return unchanged"
+        );
+    }
+
+    #[test]
+    fn vendi_merge_alpha_one_preserves_relevance_order() {
+        // alpha = 1.0 inside the merge: pure relevance — Vendi
+        // reproduces input order, and the merge output matches the
+        // input. Regression guard against the merge step accidentally
+        // reordering the relevance-stable case.
+        let candidates: Vec<ScoredCandidate> = (0..4)
+            .map(|i| synthetic_candidate(Uuid::new_v4(), 1.0 - (i as f32) * 0.1))
+            .collect();
+        let original_ids: Vec<Uuid> = candidates.iter().map(|c| c.memory_id).collect();
+
+        // All four indexed with distinct unit basis vectors.
+        let mut indexed: std::collections::HashMap<Uuid, Vec<f32>> =
+            std::collections::HashMap::new();
+        for (i, id) in original_ids.iter().enumerate() {
+            let mut v = vec![0.0_f32; 4];
+            v[i] = 1.0;
+            l2_normalize(&mut v);
+            indexed.insert(*id, v);
+        }
+
+        let reranker = crate::retrieval::vendi::VendiReranker::new(1.0, 50);
+        let merged = vendi_merge_candidates(candidates, &reranker, None, 4, |id| {
+            indexed.get(&id).cloned()
+        });
+
+        let merged_ids: Vec<Uuid> = merged.iter().map(|c| c.memory_id).collect();
+        assert_eq!(
+            merged_ids, original_ids,
+            "alpha=1.0 must preserve input relevance order through the merge"
+        );
+    }
+
+    #[test]
+    fn recall_with_vendi_attached_but_flag_off_is_byte_for_byte_baseline() {
+        // Default-OFF guarantee: attaching a `VendiReranker` without
+        // setting `PENSYVE_VENDI=1` must NOT alter recall output. The
+        // env-flag check inside the recall pipeline is the gate.
+        //
+        // This test does NOT mutate `PENSYVE_VENDI` because the var is
+        // cached via `OnceLock` at first call — concurrent tests
+        // would race. Instead we rely on the test-binary default
+        // (unset) to keep the flag off.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteBackend::open(dir.path()).unwrap();
+        let embedder = OnnxEmbedder::new_mock(64);
+        let mut vector_index = VectorIndex::new(64, 16);
+        let config = test_config();
+        let vendi = crate::retrieval::vendi::VendiReranker::new(0.7, 50);
+
+        let ns = Namespace::new("vendi-off-ns");
+        storage.save_namespace(&ns).unwrap();
+
+        let mem_a = setup_episodic(&storage, &embedder, &ns, "rust async programming systems");
+        let mem_b = setup_episodic(
+            &storage,
+            &embedder,
+            &ns,
+            "ocean tidepool ecology kelp forests",
+        );
+        vector_index.add(mem_a.id, &mem_a.embedding).unwrap();
+        vector_index.add(mem_b.id, &mem_b.embedding).unwrap();
+
+        let baseline = RecallEngine::new(&storage, &embedder, &vector_index, &config)
+            .recall("rust async", ns.id, 5)
+            .unwrap();
+        let with_vendi = RecallEngine::new(&storage, &embedder, &vector_index, &config)
+            .with_vendi(&vendi)
+            .recall("rust async", ns.id, 5)
+            .unwrap();
+
+        // With `PENSYVE_VENDI` off, the two recalls must produce
+        // identical id ordering. Final scores can differ only in
+        // cosmetic float noise (they don't here because the only
+        // change is the optional stage being a no-op), but we
+        // compare ids as the load-bearing invariant.
+        let baseline_ids: Vec<Uuid> = baseline.memories.iter().map(|c| c.memory_id).collect();
+        let vendi_ids: Vec<Uuid> = with_vendi.memories.iter().map(|c| c.memory_id).collect();
+        assert_eq!(
+            baseline_ids, vendi_ids,
+            "Vendi attached but flag off must not alter recall order"
+        );
     }
 
     // -----------------------------------------------------------------------

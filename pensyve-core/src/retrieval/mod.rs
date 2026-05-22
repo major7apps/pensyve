@@ -29,6 +29,7 @@ pub mod engine;
 pub mod intent_router;
 pub mod ppr;
 pub mod query_classifier;
+pub mod vendi;
 
 // Flat re-export keeps the v2.x API surface intact after the
 // retrieval.rs -> retrieval/engine.rs refactor. New code introduced by G2
