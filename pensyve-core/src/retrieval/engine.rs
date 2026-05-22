@@ -1141,13 +1141,19 @@ impl<'a> RecallEngine<'a> {
                 }
                 // Drain the remainder: in-pool candidates Vendi did
                 // not select PLUS in-pool candidates with no indexed
-                // embedding. Order within this group is HashMap-
-                // iteration unspecified, but at most a handful of
-                // candidates fall through here in production traffic
-                // (and `truncate(limit)` typically drops them anyway).
-                for c in by_id.into_values() {
-                    reordered_scored.push(c);
-                }
+                // embedding. Sort the residue by descending
+                // `final_score` so the order is deterministic (the
+                // raw HashMap iteration order is unspecified and
+                // could shift across Rust versions, breaking
+                // snapshot-based regression tests). Per claude bot
+                // review on PR #119.
+                let mut residue: Vec<ScoredCandidate> = by_id.into_values().collect();
+                residue.sort_by(|a, b| {
+                    b.final_score
+                        .partial_cmp(&a.final_score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                reordered_scored.extend(residue);
                 reordered_scored.extend(tail);
                 scored = reordered_scored;
             }

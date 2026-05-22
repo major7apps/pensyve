@@ -635,14 +635,19 @@ pub fn timed_rerank(
     // diversity component of the last step's joint score; we
     // recompute it explicitly here so the histogram reads a clean
     // [1.0, k] value rather than the alpha-blended joint score.
+    //
+    // Use a HashMap for the id → embedding lookup so the post-rerank
+    // recompute is O(n + k) instead of O(n · k). Per claude bot
+    // review on PR #119 — at production sizes (k=20, n≤50) the
+    // difference is negligible, but the helper might be reused at
+    // larger scales, and the HashMap form is dirt-cheap here.
+    let emb_lookup: std::collections::HashMap<Uuid, &[f32]> = candidates
+        .iter()
+        .map(|(id, _, emb)| (*id, emb.as_slice()))
+        .collect();
     let selected_embs: Vec<&[f32]> = result
         .iter()
-        .filter_map(|(id, _)| {
-            candidates
-                .iter()
-                .find(|(cid, _, _)| cid == id)
-                .map(|(_, _, e)| e.as_slice())
-        })
+        .filter_map(|(id, _)| emb_lookup.get(id).copied())
         .collect();
     let final_score = vendi_score_from_refs(&selected_embs);
     record_rerank(final_score, elapsed);
