@@ -207,6 +207,43 @@ impl VectorIndex {
     pub fn dimensions(&self) -> usize {
         self.dimensions
     }
+
+    /// Return up to `limit` embeddings from the index by taking the
+    /// first `min(len, limit)` entries in `HashMap` iteration order.
+    ///
+    /// IMPORTANT: this is NOT a uniform random sample. `HashMap`
+    /// iteration order is unspecified but deterministic for a given
+    /// `(RandomState, contents)` pair — once the index is built,
+    /// repeated calls return the same prefix. For uniform random
+    /// sampling, the caller must shuffle the result (e.g., via the
+    /// `rand` crate) or perform reservoir sampling externally.
+    /// Pensyve's stdlib-only dependency budget (no `rand` in the
+    /// workspace) keeps the implementation here; callers that need
+    /// statistical guarantees should sample externally.
+    ///
+    /// Added in Phase 2D for the D-MEM gate's surprise calculation:
+    /// the gate needs a small sample of existing embeddings to
+    /// compute `surprise = 1 - max_cosine_similarity_to_existing`
+    /// against the freshly-extracted observation. For the D-MEM use
+    /// case, a biased sample that MISSES the new observation's true
+    /// nearest neighbor will compute a LOWER sample-max-similarity
+    /// → a HIGHER `surprise` value → wrong-side-out routing (route
+    /// `SlowPipeline` when truly redundant). Per the threshold-sweep
+    /// safety contract documented in `consolidation::dmem`,
+    /// wrong-side-out is the safe direction — the dep-parse +
+    /// typed-slot enrichment runs unnecessarily, but no information
+    /// is lost. `CodeRabbit` PR #117 round 2.
+    ///
+    /// Each returned vector is a clone of the stored (pre-normalized)
+    /// embedding. `O(min(len, limit))` time + O(limit) allocation.
+    #[must_use]
+    pub fn sample_embeddings(&self, limit: usize) -> Vec<Vec<f32>> {
+        self.entries
+            .values()
+            .take(limit)
+            .map(Clone::clone)
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -357,5 +394,50 @@ mod tests {
         index.add(id, &[1.0, 0.0, 0.0]).unwrap();
         let results = index.search(&[1.0, 0.0, 0.0], 100).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2D — sample_embeddings (added for D-MEM's surprise calc)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sample_embeddings_returns_up_to_limit() {
+        let mut index = VectorIndex::new(3, 16);
+        for _ in 0..5 {
+            index.add(Uuid::new_v4(), &[1.0, 0.0, 0.0]).unwrap();
+        }
+        // Asking for 3 from a pool of 5 returns exactly 3.
+        let sample = index.sample_embeddings(3);
+        assert_eq!(sample.len(), 3);
+        // Each sample is a 3-d (post-normalization) vector.
+        for v in &sample {
+            assert_eq!(v.len(), 3);
+        }
+    }
+
+    #[test]
+    fn sample_embeddings_caps_at_index_size() {
+        let mut index = VectorIndex::new(3, 16);
+        for _ in 0..3 {
+            index.add(Uuid::new_v4(), &[1.0, 0.0, 0.0]).unwrap();
+        }
+        // Asking for 100 from a pool of 3 returns exactly 3 (no
+        // padding, no error).
+        let sample = index.sample_embeddings(100);
+        assert_eq!(sample.len(), 3);
+    }
+
+    #[test]
+    fn sample_embeddings_empty_index_returns_empty() {
+        let index = VectorIndex::new(3, 16);
+        let sample = index.sample_embeddings(50);
+        assert!(sample.is_empty(), "empty index → empty sample");
+    }
+
+    #[test]
+    fn sample_embeddings_zero_limit_returns_empty() {
+        let mut index = VectorIndex::new(3, 16);
+        index.add(Uuid::new_v4(), &[1.0, 0.0, 0.0]).unwrap();
+        assert!(index.sample_embeddings(0).is_empty());
     }
 }

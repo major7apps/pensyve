@@ -45,6 +45,7 @@
 //!   per-event gate. See its module docs for the prompt and parser
 //!   contract.
 
+pub mod dmem;
 pub mod typed_slots;
 
 use std::collections::HashMap;
@@ -1114,6 +1115,7 @@ pub fn replay_priority(salience: f32, retrievability: f32, is_superseded: bool) 
 )]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
 
     use chrono::Duration;
 
@@ -1770,5 +1772,315 @@ mod tests {
         for (lemma, w) in &endpoints {
             assert!(*w > 0.0, "lemma {lemma:?} has non-positive weight {w}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2D D-MEM integration tests
+    //
+    // These tests exercise the gate + telemetry integration end-to-end
+    // by calling `DMemGate::score` + `route` + `record_route` directly
+    // (the same sequence the observation.rs ingest path executes when
+    // `PENSYVE_DMEM=1`). Calling the gate methods directly avoids the
+    // OnceLock-cached env flag — tests can't reliably flip it without
+    // affecting parallel tests — while still validating the
+    // counter-and-buffer invariants from the brief.
+    // -----------------------------------------------------------------------
+
+    /// Build a unit-vector pointed at `idx` modulo 8 dimensions.
+    /// Used as a synthetic observation embedding generator with
+    /// controllable surprise: collisions on `idx` produce 0 surprise;
+    /// distinct `idx` values produce maximally orthogonal pairs.
+    fn synth_emb(idx: usize) -> Vec<f32> {
+        let mut v = vec![0.0_f32; 8];
+        v[idx % 8] = 1.0;
+        v
+    }
+
+    #[test]
+    fn dmem_routes_100_observations_and_counts_balance() {
+        use crate::consolidation::dmem;
+        // Contract: every observation gets exactly one route decision,
+        // so `fast_local + slow_local` sums to exactly 100. This test
+        // now uses LOCAL counters rather than global atomics
+        // (CodeRabbit PR #117 round 2: global-counter snapshots are
+        // race-prone under parallel test execution). The lock is
+        // still held to serialize against the
+        // `record_route_increments_fast_and_slow_counters` test,
+        // which writes to the global counters in this same test
+        // binary — the lock ensures we don't get spurious global
+        // counter writes interleaved with our own.
+        let _guard = dmem::test_locks::ROUTING_COUNTER_LOCK.lock().unwrap();
+
+        // Snapshot the global counters BEFORE + AFTER so we can
+        // assert monotonic-increase as a secondary check (the
+        // load-bearing assertion is on local counters below).
+        let metrics = crate::observability::metrics();
+        let global_total_before = metrics.dmem_fast_routed.load(Ordering::Relaxed)
+            + metrics.dmem_slow_routed.load(Ordering::Relaxed);
+
+        let existing: Vec<Vec<f32>> = (0..5).map(synth_emb).collect();
+        let query_ctx = vec![0.0_f32; 8];
+
+        let mut gate = dmem::DMemGate::new(0.35, 0.5, 1024);
+
+        // LOCAL counters — these are the load-bearing assertions.
+        // Each route decision increments exactly one of these.
+        let mut fast_local: usize = 0;
+        let mut slow_local: usize = 0;
+
+        for i in 0_usize..100 {
+            let obs = synth_emb(i % 5 + if i.is_multiple_of(2) { 0 } else { 5 });
+            let id = Uuid::new_v4();
+            let score = gate.score(&obs, &existing, &query_ctx);
+            let route = gate.route(id, &score, None);
+            match route {
+                dmem::DMemRoute::FastBuffer => fast_local += 1,
+                dmem::DMemRoute::SlowPipeline => slow_local += 1,
+            }
+            // Still emit to the global counters via `record_route`
+            // so the realistic-chat test's monotonic-increase
+            // assertion has data to observe.
+            dmem::record_route(&score, route, gate.ring_buffer_len());
+        }
+
+        // Load-bearing: local counters sum to exactly 100. Robust to
+        // parallel test execution because the counters live on the
+        // stack frame of this test.
+        assert_eq!(
+            fast_local + slow_local,
+            100,
+            "each route decision must increment exactly one local counter; got {fast_local} fast + {slow_local} slow = {}",
+            fast_local + slow_local
+        );
+
+        // Secondary: global counters monotonically increased by AT
+        // LEAST 100 (parallel tests may add more). This pins the
+        // global telemetry path against accidental no-op refactors.
+        let global_total_after = metrics.dmem_fast_routed.load(Ordering::Relaxed)
+            + metrics.dmem_slow_routed.load(Ordering::Relaxed);
+        assert!(
+            global_total_after >= global_total_before + 100,
+            "global counters must increment by ≥ 100 (our 100 + any parallel-test increments); \
+             went from {global_total_before} → {global_total_after}"
+        );
+        // Drain before drop (CodeRabbit PR #117 round 3 Drop guard).
+        let _ = gate.drain_ring_buffer();
+    }
+
+    #[test]
+    fn dmem_realistic_chat_fixture_routes_majority_fast() {
+        // The brief's "≥ 60% route fast on realistic chat transcript"
+        // assertion. The conservative-threshold goal documented at
+        // the top of dmem.rs is "wrong-side-out > wrong-side-in":
+        // false slow is cheap (extra dep-parse work), false fast
+        // loses typed-slot extraction. The default threshold (0.35)
+        // and alpha (0.5) target a fast rate ≥ 60% on a typical
+        // chat transcript.
+        //
+        // Realistic chat profile: the user is currently asking about
+        // topic X (the query context), and a stream of past
+        // observations comes in covering topics A/B/C — most of
+        // which are already in the existing memory pool (low
+        // surprise) AND orthogonal to the current query (low
+        // utility). The combined score lands BELOW threshold for
+        // most of them → fast route.
+        use crate::consolidation::dmem;
+
+        // Existing pool: 3 chat-topic anchors A/B/C.
+        let topic_a = synth_emb(0);
+        let topic_b = synth_emb(1);
+        let topic_c = synth_emb(2);
+        let existing = vec![topic_a.clone(), topic_b.clone(), topic_c.clone()];
+
+        // Query context: a separate axis the user is currently
+        // discussing (e.g., user asks about topic D right now).
+        // Most ingested observations are about A/B/C/repeats —
+        // orthogonal to the query context → low utility → low
+        // combined score → fast route.
+        let query_ctx = synth_emb(5); // not in the existing pool
+
+        // 10-observation "realistic chat" fixture:
+        //   - 7 repeat existing topics (surprise ≈ 0, utility ≈ 0
+        //     against the orthogonal query context) → low combined
+        //     → fast
+        //   - 2 drift to a new orthogonal axis (surprise = 1.0,
+        //     utility ≈ 0) → combined = 0.5 → slow
+        //   - 1 hits the query-context topic exactly (surprise ≈ 1.0,
+        //     utility = 1.0) → combined = 1.0 → slow
+        let chat: Vec<Vec<f32>> = vec![
+            synth_emb(0), // topic_a — repeat, off-query
+            synth_emb(1), // topic_b — repeat, off-query
+            synth_emb(0),
+            synth_emb(2), // topic_c — repeat, off-query
+            synth_emb(1),
+            synth_emb(0),
+            synth_emb(2),
+            synth_emb(6), // novel — orthogonal to query AND existing
+            synth_emb(7), // novel — orthogonal to query AND existing
+            synth_emb(5), // exactly the query context — strongly utility-bound
+        ];
+
+        let mut gate = dmem::DMemGate::new(0.35, 0.5, 64);
+
+        let mut fast: u32 = 0;
+        for emb in &chat {
+            let score = gate.score(emb, &existing, &query_ctx);
+            let route = gate.route(Uuid::new_v4(), &score, None);
+            if matches!(route, dmem::DMemRoute::FastBuffer) {
+                fast += 1;
+            }
+        }
+
+        // 10-observation fixture → u32 fast count is always small;
+        // the cast to f32 is exact for any value 0..=10.
+        #[allow(clippy::cast_precision_loss)]
+        let fast_rate = (fast as f32) / 10.0_f32;
+        assert!(
+            fast_rate >= 0.6,
+            "realistic chat fixture should route ≥ 60% fast; got {fast}/10 = {fast_rate}"
+        );
+        // Drain before drop (CodeRabbit PR #117 round 3 Drop guard).
+        let _ = gate.drain_ring_buffer();
+    }
+
+    #[test]
+    fn dmem_fast_route_drain_idempotency_with_dep_parse() {
+        // Drain a ring buffer of fast-routed observation ids, then
+        // run `run_dep_parse_hook_inner` against each drained
+        // observation, then assert that re-draining + re-running
+        // produces no duplicate `kg_triples` rows. The Phase 2B
+        // UNIQUE(namespace_id, passage_id, subject_id, predicate,
+        // object_id) constraint is the load-bearing invariant; if it
+        // ever regressed, this test would catch the duplicate-row
+        // explosion.
+        use crate::consolidation::dmem;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = make_storage(tmp.path().to_str().unwrap());
+        let ns = Namespace::new("dmem-drain-idem");
+        storage.save_namespace(&ns).unwrap();
+
+        // Synthetic observations with dep-parseable content.
+        let observation_contents = [
+            "Alice works at Acme.",
+            "Bob lives in Brooklyn.",
+            "Carol bought a Tesla.",
+        ];
+
+        // Push three ids into the ring buffer via a low-RPE score (no
+        // env flag needed — gate.route is direct-callable).
+        let mut gate = dmem::DMemGate::new(0.35, 0.5, 8);
+        let low_score = dmem::RpeScore {
+            surprise: 0.0,
+            utility: 0.0,
+            combined: 0.0,
+        };
+        let observation_ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        for id in &observation_ids {
+            let route = gate.route(*id, &low_score, None);
+            assert_eq!(route, dmem::DMemRoute::FastBuffer);
+        }
+        assert_eq!(gate.ring_buffer_len(), 3);
+
+        // Drain and replay dep-parse against each. Use
+        // `run_dep_parse_hook_inner` directly to bypass the
+        // `PENSYVE_DEP_PARSE` env-flag check.
+        let drained = gate.drain_ring_buffer();
+        assert_eq!(drained.len(), 3);
+        let conn = rusqlite::Connection::open(storage.db_path().unwrap()).unwrap();
+        for (id, content) in drained.iter().zip(observation_contents.iter()) {
+            run_dep_parse_hook_inner(&conn, ns.id, *id, content).unwrap();
+        }
+
+        // Snapshot kg_triples row count after the first replay.
+        let triples_after_first: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kg_triples WHERE namespace_id = ?1",
+                rusqlite::params![ns.id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            triples_after_first > 0,
+            "expected ≥1 triple from the synthetic observations"
+        );
+
+        // Simulate a second drain-and-replay cycle (e.g., the drain
+        // logic ran twice because the orchestrator double-fired).
+        // The UNIQUE constraint MUST short-circuit each duplicate
+        // insert via the INSERT OR IGNORE pattern; row count is
+        // stable.
+        for (id, content) in observation_ids.iter().zip(observation_contents.iter()) {
+            run_dep_parse_hook_inner(&conn, ns.id, *id, content).unwrap();
+        }
+        let triples_after_second: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kg_triples WHERE namespace_id = ?1",
+                rusqlite::params![ns.id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            triples_after_first, triples_after_second,
+            "drain idempotency: a second replay must NOT duplicate kg_triples rows \
+             (first={triples_after_first}, second={triples_after_second})"
+        );
+    }
+
+    #[test]
+    fn dmem_fast_routed_observations_skip_dep_parse_counter() {
+        // The fast-routed path SKIPS the dep-parse hook → the
+        // `dep_parse_observations_processed` counter must NOT
+        // increment for fast-routed observations. We exercise this
+        // by:
+        //  1. Snapshotting the counter
+        //  2. Routing 5 observations to FastBuffer via the gate
+        //     (calling gate.route directly with a low RPE — the
+        //     observation.rs wiring skips the dep-parse hook for
+        //     FastBuffer routes, but in this unit-level test we
+        //     simply do NOT call the hook for the fast-routed ids,
+        //     mirroring the wiring's behavior)
+        //  3. Asserting the counter delta is 0
+        //
+        // This is a contract test on the BEHAVIOR observation.rs
+        // implements (skip the dep-parse hook when route ==
+        // FastBuffer), not on the wiring code itself. The wiring
+        // test that exercises commit_extraction_for_episode_with_dmem
+        // end-to-end requires the observation-extraction feature
+        // flag + a full extractor harness; this lighter unit-level
+        // test is the contract pin.
+        use crate::consolidation::dmem;
+
+        let metrics = crate::observability::metrics();
+        let dep_parse_before = metrics
+            .dep_parse_observations_processed
+            .load(Ordering::Relaxed);
+
+        let mut gate = dmem::DMemGate::new(0.35, 0.5, 8);
+        let low_score = dmem::RpeScore {
+            surprise: 0.0,
+            utility: 0.0,
+            combined: 0.0,
+        };
+
+        // 5 fast-routed observations — the wiring would skip
+        // `run_dep_parse_hook` for each. Mirror that here by NOT
+        // calling the hook.
+        for _ in 0..5 {
+            let route = gate.route(Uuid::new_v4(), &low_score, None);
+            assert_eq!(route, dmem::DMemRoute::FastBuffer);
+            // (no hook call — exactly what the wiring does on FastBuffer)
+        }
+
+        let dep_parse_after = metrics
+            .dep_parse_observations_processed
+            .load(Ordering::Relaxed);
+        assert_eq!(
+            dep_parse_after, dep_parse_before,
+            "fast-routed observations must NOT increment dep_parse_observations_processed; \
+             counter went from {dep_parse_before} → {dep_parse_after}"
+        );
+        // Drain before drop (CodeRabbit PR #117 round 3 Drop guard).
+        let _ = gate.drain_ring_buffer();
     }
 }

@@ -51,7 +51,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use pensyve_core::observation::{
     ExtractionMessage, ExtractionResult, NoopExtractor, ObservationExtractor,
-    commit_extraction_for_episode,
+    commit_extraction_for_episode, commit_extraction_for_episode_dmem_aware,
 };
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
@@ -77,6 +77,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 // ---------------------------------------------------------------------------
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serializes the two Phase 2D production-reachability tests so
+/// they can take before/after snapshots of the global D-MEM counters
+/// without racing each other. CodeRabbit PR #117 round 2.
+static DMEM_COUNTER_LOCK: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------
 // Mock extractor
@@ -580,4 +585,155 @@ async fn test_noop_extractor_produces_no_gate_firings() {
     );
 
     clear_g3_env();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2D production-reachability test (CodeRabbit + chatgpt-codex
+// PR #117 P0 #2)
+//
+// Verifies that when the env-flag predicate is true, the DEFAULT
+// ingest entry point (the one prod callers actually use —
+// `pensyve-mcp-gateway/src/rest.rs` + `pensyve-python/src/lib.rs`)
+// constructs a default D-MEM gate internally and fires it on every
+// observation. We invoke `commit_extraction_for_episode_dmem_aware`
+// (the test-only doc-hidden helper) with `dmem_enabled = true` so the
+// test doesn't depend on the OnceLock-cached `dmem_enabled()` read,
+// which we can't flip per-test.
+//
+// The brief's contract: after ingest, `dmem_fast_routed +
+// dmem_slow_routed > 0`. The default gate operates in
+// telemetry-only mode (empty existing-embeddings + zero
+// query-context → every observation routes slow), so we expect the
+// slow counter to increment by exactly the number of observations.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_dmem_default_entry_point_reaches_gate_when_flag_enabled() {
+    // Hold DMEM_COUNTER_LOCK so the baseline test below doesn't
+    // race our counter snapshots. CodeRabbit PR #117 round 2.
+    let _guard = DMEM_COUNTER_LOCK.lock().unwrap();
+    let metrics = pensyve_core::observability::metrics();
+    let fast_before = metrics
+        .dmem_fast_routed
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let slow_before = metrics
+        .dmem_slow_routed
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let (_tmp, backend, ns_id, ep_id) = setup_backend();
+    let obs = make_obs(
+        ns_id,
+        ep_id,
+        "biography",
+        "user",
+        "discussed",
+        "test reachability",
+    );
+    let extractor = CannedExtractor { obs: obs.clone() };
+
+    // Drive the gate-aware path explicitly with `dmem_enabled = true`.
+    // In production this branch is taken by the default entry point
+    // when `PENSYVE_DMEM=1` is set in the environment.
+    let persisted = commit_extraction_for_episode_dmem_aware(
+        &backend,
+        &extractor,
+        ns_id,
+        ep_id,
+        CancellationToken::new(),
+        |_text| Ok::<Vec<f32>, &'static str>(vec![0.0_f32; 4]),
+        true, // <-- force the dmem-enabled branch
+    )
+    .await;
+
+    assert_eq!(persisted, 1, "the canned observation should persist");
+
+    let fast_after = metrics
+        .dmem_fast_routed
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let slow_after = metrics
+        .dmem_slow_routed
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    // Tight equality assertions, robust under DMEM_COUNTER_LOCK.
+    // The default gate's telemetry-only mode (empty existing pool +
+    // zero query context) routes every observation slow at the
+    // default tuning (threshold=0.35, alpha=0.5 → combined=0.5):
+    //   - fast delta = 0
+    //   - slow delta = 1 (one canned observation)
+    assert_eq!(
+        fast_after - fast_before,
+        0,
+        "telemetry-only default gate (empty pool + zero context + default tuning) \
+         must NOT produce fast routes; fast delta = {}",
+        fast_after - fast_before
+    );
+    assert_eq!(
+        slow_after - slow_before,
+        1,
+        "exactly 1 slow route for the canned observation; slow delta = {}",
+        slow_after - slow_before
+    );
+}
+
+#[tokio::test]
+async fn test_dmem_default_entry_point_baseline_when_flag_off() {
+    // Hold DMEM_COUNTER_LOCK so the reachability test above doesn't
+    // race our counter snapshots. CodeRabbit PR #117 round 2: this
+    // test was previously a no-op (snapshots discarded). Now it
+    // asserts exact equality on the deltas — both counters must
+    // stay at their before-values because `dmem_enabled = false`
+    // bypasses the gate entirely.
+    let _guard = DMEM_COUNTER_LOCK.lock().unwrap();
+    let metrics = pensyve_core::observability::metrics();
+    let fast_before = metrics
+        .dmem_fast_routed
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let slow_before = metrics
+        .dmem_slow_routed
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let (_tmp, backend, ns_id, ep_id) = setup_backend();
+    let obs = make_obs(
+        ns_id,
+        ep_id,
+        "biography",
+        "user",
+        "discussed",
+        "test baseline",
+    );
+    let extractor = CannedExtractor { obs };
+
+    let persisted = commit_extraction_for_episode_dmem_aware(
+        &backend,
+        &extractor,
+        ns_id,
+        ep_id,
+        CancellationToken::new(),
+        |_text| Ok::<Vec<f32>, &'static str>(vec![0.0_f32; 4]),
+        false, // <-- pre-2D baseline branch
+    )
+    .await;
+
+    assert_eq!(persisted, 1);
+
+    let fast_after = metrics
+        .dmem_fast_routed
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let slow_after = metrics
+        .dmem_slow_routed
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    // Load-bearing assertions: the disabled branch must NOT fire
+    // the gate, so neither counter increments. A refactor that
+    // accidentally always fires the gate would trip this test.
+    assert_eq!(
+        fast_after, fast_before,
+        "disabled branch must NOT increment dmem_fast_routed; \
+         {fast_before} → {fast_after}"
+    );
+    assert_eq!(
+        slow_after, slow_before,
+        "disabled branch must NOT increment dmem_slow_routed; \
+         {slow_before} → {slow_after}"
+    );
 }

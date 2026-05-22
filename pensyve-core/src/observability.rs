@@ -17,6 +17,13 @@ const DURATION_BUCKETS: &[f64] = &[
 /// is the most diagnostic question.
 const CONFIDENCE_BUCKETS: &[f64] = &[0.0, 0.1, 0.25, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
 
+/// Histogram buckets for `[0.0, 1.0]`-ranged unit-interval signals
+/// (Phase 2D D-MEM surprise + utility). Uniform 0.1 spacing keeps the
+/// distribution legible across the full range; the threshold defaults
+/// to 0.35 so the dense region near the threshold is the 0.3/0.4
+/// boundary, which both fall on the uniform grid.
+const UNIT_INTERVAL_BUCKETS: &[f64] = &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+
 /// Per-question-type label set for the `selroute_by_type` Prometheus
 /// counters. Index order MUST match
 /// [`crate::retrieval::query_classifier::selroute_metric_index`].
@@ -180,6 +187,54 @@ pub struct PensyveMetrics {
     /// proxy for dep-parse query-entity coverage.
     pub ppr_entity_seeds_count: AtomicU64,
 
+    // Phase 2D: RPE-gated D-MEM fast/slow consolidation metrics.
+    /// Number of observations routed to the fast buffer (skipped
+    /// dep-parse + typed-slot hooks at ingest, deferred until drain).
+    /// Only incremented when `PENSYVE_DMEM=1` AND a `DMemGate` is
+    /// attached to the ingest call.
+    pub dmem_fast_routed: AtomicU64,
+    /// Number of observations routed through the slow pipeline (full
+    /// dep-parse + typed-slot hook firing at ingest, same as the
+    /// pre-2D baseline path).
+    pub dmem_slow_routed: AtomicU64,
+    /// Current ring-buffer occupancy (snapshotted by the ingest call
+    /// after each route decision). Useful for sizing the buffer
+    /// capacity in production tuning.
+    pub dmem_ring_buffer_size: AtomicU64,
+    /// Total observations silently evicted from the ring buffer
+    /// because it reached capacity. Each eviction is a permanent
+    /// loss of the observation's deferred dep-parse + typed-slot
+    /// enrichment — the raw row was persisted at ingest, but the
+    /// slow-path side effects will never run for that observation.
+    /// A non-zero production value signals the ring buffer is
+    /// undersized or that drain isn't running often enough.
+    /// `CodeRabbit` PR #117 P0 #1.
+    pub dmem_ring_buffer_evictions: AtomicU64,
+    /// Total observations dropped at function-exit by the lazy
+    /// default `DMemGate` in
+    /// `observation::commit_extraction_for_episode_dmem_aware` (or
+    /// its bulk sibling). Semantically distinct from
+    /// `dmem_ring_buffer_evictions` — these are NOT capacity-overflow
+    /// evictions, they're function-exit losses from the ephemeral
+    /// default gate not having a caller-owned drain. A non-zero
+    /// production value signals operators have tuned
+    /// `PENSYVE_DMEM_THRESHOLD` / `PENSYVE_DMEM_ALPHA` to produce
+    /// `FastBuffer` routes from the default entry point — the fix is
+    /// to migrate the caller to `commit_extraction_for_episode_with_dmem`
+    /// with a populated `DMemIngestContext` and caller-owned drain.
+    /// `CodeRabbit` PR #117 round 3.
+    pub dmem_default_gate_dropped_observations: AtomicU64,
+    /// Distribution of `surprise` values across D-MEM scoring calls.
+    /// `surprise = 1 - max_cosine_similarity_to_existing` in
+    /// `[0.0, 1.0]`. High-surprise observations are novel relative
+    /// to the existing memory pool.
+    pub dmem_surprise_histogram: HistogramBuckets,
+    /// Distribution of `utility` values across D-MEM scoring calls.
+    /// `utility = cosine_similarity(observation, query_context)` in
+    /// `[0.0, 1.0]` (negative similarities are clamped). High-utility
+    /// observations align with the current query context.
+    pub dmem_utility_histogram: HistogramBuckets,
+
     // Histograms
     pub recall_duration: HistogramBuckets,
     pub embed_duration: HistogramBuckets,
@@ -221,6 +276,13 @@ impl PensyveMetrics {
             ppr_convergence_failures: AtomicU64::new(0),
             ppr_duration: HistogramBuckets::new(DURATION_BUCKETS),
             ppr_entity_seeds_count: AtomicU64::new(0),
+            dmem_fast_routed: AtomicU64::new(0),
+            dmem_slow_routed: AtomicU64::new(0),
+            dmem_ring_buffer_size: AtomicU64::new(0),
+            dmem_ring_buffer_evictions: AtomicU64::new(0),
+            dmem_default_gate_dropped_observations: AtomicU64::new(0),
+            dmem_surprise_histogram: HistogramBuckets::new(UNIT_INTERVAL_BUCKETS),
+            dmem_utility_histogram: HistogramBuckets::new(UNIT_INTERVAL_BUCKETS),
             recall_duration: HistogramBuckets::new(DURATION_BUCKETS),
             embed_duration: HistogramBuckets::new(DURATION_BUCKETS),
             store_duration: HistogramBuckets::new(DURATION_BUCKETS),
@@ -478,6 +540,57 @@ impl PensyveMetrics {
         let _ = writeln!(buf, "# TYPE pensyve_ppr_entity_seeds_count_total counter");
         let _ = writeln!(buf, "pensyve_ppr_entity_seeds_count_total {ppr_seeds}");
 
+        // Phase 2D: D-MEM fast/slow consolidation counters.
+        let dmem_fast = self.dmem_fast_routed.load(Ordering::Relaxed);
+        let dmem_slow = self.dmem_slow_routed.load(Ordering::Relaxed);
+        let dmem_buf = self.dmem_ring_buffer_size.load(Ordering::Relaxed);
+        let dmem_evictions = self.dmem_ring_buffer_evictions.load(Ordering::Relaxed);
+        let dmem_dropped = self
+            .dmem_default_gate_dropped_observations
+            .load(Ordering::Relaxed);
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_dmem_fast_routed_total Observations routed to the Phase 2D fast buffer (skipped dep-parse + typed-slot hooks)."
+        );
+        let _ = writeln!(buf, "# TYPE pensyve_dmem_fast_routed_total counter");
+        let _ = writeln!(buf, "pensyve_dmem_fast_routed_total {dmem_fast}");
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_dmem_slow_routed_total Observations routed through the Phase 2D slow pipeline (full dep-parse + typed-slot hooks)."
+        );
+        let _ = writeln!(buf, "# TYPE pensyve_dmem_slow_routed_total counter");
+        let _ = writeln!(buf, "pensyve_dmem_slow_routed_total {dmem_slow}");
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_dmem_ring_buffer_size Current ring-buffer occupancy after the most recent route decision."
+        );
+        let _ = writeln!(buf, "# TYPE pensyve_dmem_ring_buffer_size gauge");
+        let _ = writeln!(buf, "pensyve_dmem_ring_buffer_size {dmem_buf}");
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_dmem_ring_buffer_evictions_total Observations silently evicted from the Phase 2D ring buffer at capacity overflow — permanent loss of deferred dep-parse + typed-slot enrichment."
+        );
+        let _ = writeln!(
+            buf,
+            "# TYPE pensyve_dmem_ring_buffer_evictions_total counter"
+        );
+        let _ = writeln!(
+            buf,
+            "pensyve_dmem_ring_buffer_evictions_total {dmem_evictions}"
+        );
+        let _ = writeln!(
+            buf,
+            "# HELP pensyve_dmem_default_gate_dropped_observations_total Observations dropped at function-exit by the lazy default DMemGate — semantically distinct from capacity-overflow evictions; signals operators have tuned PENSYVE_DMEM_* to produce FastBuffer routes under the default entry point."
+        );
+        let _ = writeln!(
+            buf,
+            "# TYPE pensyve_dmem_default_gate_dropped_observations_total counter"
+        );
+        let _ = writeln!(
+            buf,
+            "pensyve_dmem_default_gate_dropped_observations_total {dmem_dropped}"
+        );
+
         // Histograms
         buf.push_str(&self.recall_duration.prometheus_text(
             "pensyve_recall_duration_seconds",
@@ -502,6 +615,14 @@ impl PensyveMetrics {
         buf.push_str(&self.ppr_duration.prometheus_text(
             "pensyve_ppr_duration_seconds",
             "Phase 2C Personalized PageRank query duration in seconds.",
+        ));
+        buf.push_str(&self.dmem_surprise_histogram.prometheus_text(
+            "pensyve_dmem_surprise",
+            "Phase 2D D-MEM surprise distribution in [0.0, 1.0].",
+        ));
+        buf.push_str(&self.dmem_utility_histogram.prometheus_text(
+            "pensyve_dmem_utility",
+            "Phase 2D D-MEM utility distribution in [0.0, 1.0].",
         ));
 
         buf
