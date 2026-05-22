@@ -1096,16 +1096,19 @@ impl<'a> RecallEngine<'a> {
             // contract crisp.
             let pool_size = scored.len().min(vendi.max_k);
             let mut vendi_input: Vec<(Uuid, f32, Vec<f32>)> = Vec::with_capacity(pool_size);
-            let mut vendi_missing: Vec<ScoredCandidate> = Vec::new();
             for cand in scored.iter().take(pool_size) {
                 if let Some(emb) = self.vector_index.get(cand.memory_id) {
                     vendi_input.push((cand.memory_id, cand.final_score, emb.to_vec()));
-                } else {
-                    // Embedding not indexed — preserve the candidate
-                    // by stashing it; we'll append after the Vendi
-                    // reorder so it isn't lost.
-                    vendi_missing.push(cand.clone());
                 }
+                // Candidates with no indexed embedding are NOT lost:
+                // they stay in the `by_id` map built below, fall
+                // through the Vendi-match loop unmatched, and emerge
+                // via `by_id.into_values()` after the matched ones —
+                // tail-ordered behind the Vendi-selected set, exactly
+                // where they would have been if Vendi was off. Per
+                // chatgpt-codex review on PR #119 — a separate
+                // `vendi_missing` rescue list was duplicating these
+                // candidates by appending them twice.
             }
 
             // Only run Vendi if at least two candidates carry
@@ -1117,11 +1120,13 @@ impl<'a> RecallEngine<'a> {
                 let reordered = crate::retrieval::vendi::timed_rerank(&route, &vendi_input, limit);
 
                 // Reorder `scored` to match Vendi's selection order
-                // for the in-pool candidates, then append the tail
-                // (anything past `pool_size`) and the missing-
-                // embedding rescue list at the end. The tail and
-                // rescues preserve their relative order so the result
-                // remains stable.
+                // for the in-pool candidates that Vendi could rank.
+                // Candidates without indexed embeddings AND in-pool
+                // candidates Vendi did not select (when
+                // `target_k < pool_size`) both fall through to
+                // `by_id.into_values()` after the matched set; the
+                // post-pool tail is appended last. The truncate
+                // below trims to `limit`.
                 let mut by_id: std::collections::HashMap<Uuid, ScoredCandidate> = scored
                     .iter()
                     .take(pool_size)
@@ -1134,19 +1139,16 @@ impl<'a> RecallEngine<'a> {
                         reordered_scored.push(c);
                     }
                 }
-                // Append any in-pool candidates Vendi did not select
-                // (when `target_k < pool_size`) so the recall result
-                // still has them available beyond the top-`limit`
-                // cut — `scored.truncate(limit)` below trims to the
-                // requested budget. Order within the unselected set
-                // follows the original relevance order (HashMap
-                // iteration is unspecified, but at most a handful of
-                // candidates fall through here in production).
+                // Drain the remainder: in-pool candidates Vendi did
+                // not select PLUS in-pool candidates with no indexed
+                // embedding. Order within this group is HashMap-
+                // iteration unspecified, but at most a handful of
+                // candidates fall through here in production traffic
+                // (and `truncate(limit)` typically drops them anyway).
                 for c in by_id.into_values() {
                     reordered_scored.push(c);
                 }
                 reordered_scored.extend(tail);
-                reordered_scored.extend(vendi_missing);
                 scored = reordered_scored;
             }
         }
@@ -1957,6 +1959,68 @@ mod tests {
     // -----------------------------------------------------------------------
     // Phase 2E: Vendi-Score diversity rerank engine integration.
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn vendi_recall_with_missing_embedding_does_not_duplicate() {
+        // Regression guard (chatgpt-codex review on PR #119): the
+        // engine's Vendi integration must NOT duplicate candidates
+        // whose embedding lookup misses the VectorIndex. We can't
+        // exercise the actual Vendi reorder here without flipping
+        // `PENSYVE_VENDI` (OnceLock-cached, would race with other
+        // tests), but we CAN assert the closely-related invariant:
+        // recall result IDs are pairwise distinct even when a stored
+        // memory has no indexed embedding. This pins the precondition
+        // that lets the in-engine de-dup work correctly on the gated
+        // hot path.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteBackend::open(dir.path()).unwrap();
+        let embedder = OnnxEmbedder::new_mock(64);
+        let mut vector_index = VectorIndex::new(64, 16);
+        let config = test_config();
+
+        let ns = Namespace::new("vendi-missing-emb-ns");
+        storage.save_namespace(&ns).unwrap();
+
+        let mem_indexed = setup_episodic(&storage, &embedder, &ns, "indexed memory text");
+        let mem_unindexed = setup_episodic(&storage, &embedder, &ns, "unindexed memory text");
+        // Only index ONE of the two memories — the other will be a
+        // missing-embedding candidate from the engine's perspective.
+        vector_index
+            .add(mem_indexed.id, &mem_indexed.embedding)
+            .unwrap();
+
+        let result = RecallEngine::new(&storage, &embedder, &vector_index, &config)
+            .recall("memory text", ns.id, 5)
+            .unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        for cand in &result.memories {
+            assert!(
+                seen.insert(cand.memory_id),
+                "duplicate memory_id in recall result: {}",
+                cand.memory_id
+            );
+        }
+        // Sanity: we should still find at least the indexed memory.
+        assert!(
+            result
+                .memories
+                .iter()
+                .any(|c| c.memory_id == mem_indexed.id),
+            "expected indexed memory in recall result"
+        );
+        // The unindexed memory may or may not appear depending on FTS
+        // hits; whether it does, it must appear at most once.
+        let unindexed_hits = result
+            .memories
+            .iter()
+            .filter(|c| c.memory_id == mem_unindexed.id)
+            .count();
+        assert!(
+            unindexed_hits <= 1,
+            "unindexed memory appeared {unindexed_hits} times — must be at most 1"
+        );
+    }
 
     #[test]
     fn recall_with_vendi_attached_but_flag_off_is_byte_for_byte_baseline() {
