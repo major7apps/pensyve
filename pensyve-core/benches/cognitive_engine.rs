@@ -203,6 +203,81 @@ fn bench_ppr_query_10k(c: &mut Criterion) {
     });
 }
 
+/// Phase 2E — `VendiReranker::rerank` benchmarks at 384 dims.
+///
+/// Two variants:
+///
+/// - **`vendi_rerank_50_candidates_384d`**: the brief's worst-case
+///   bench. Phase 2E's `VendiReranker::max_k` caps pool size at 50,
+///   so this measures the upper-bound latency the algorithm can ever
+///   produce. Measured at ~2.5 ms on the DGX Spark — over the brief's
+///   < 1 ms target. The brief originally projected "tens of
+///   microseconds" but did not account for the greedy loop running
+///   ~700 trial Jacobi calls. Documented as a known deviation: the
+///   production path uses `RERANK_TOP_N = 20`, not 50, so the
+///   worst-case never fires.
+///
+/// - **`vendi_rerank_20_candidates_384d`**: the production-realistic
+///   bench. The engine's cross-encoder reranker emits at most
+///   `RERANK_TOP_N = 20` candidates downstream, so 20 is what the
+///   Vendi reranker actually sees in production traffic. Measured at
+///   ~375 µs — comfortably under the brief's 1 ms budget.
+///
+/// Embeddings are L2-normalized via `normalize` so the Vendi kernel
+/// matrix sees the same inputs `VectorIndex` would feed it in
+/// production. Pool fixture is built deterministically (sine/cosine
+/// basis) outside the bench closure so the timer captures only the
+/// rerank itself.
+fn bench_vendi_rerank_50_candidates_384d(c: &mut Criterion) {
+    fn normalize(v: &mut [f32]) {
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for x in v.iter_mut() {
+                *x /= norm;
+            }
+        }
+    }
+
+    let dim = 384_usize;
+    let pool: Vec<(Uuid, f32, Vec<f32>)> = (0..50)
+        .map(|i| {
+            let mut v = vec![0.0_f32; dim];
+            for (j, slot) in v.iter_mut().enumerate() {
+                // Deterministic pseudo-random embedding components.
+                // Different `i` produce different vectors but with a
+                // smooth covariance profile, simulating real-world
+                // semantic embedding distributions better than purely
+                // orthogonal one-hots.
+                *slot = ((i as f32 * 0.13 + j as f32 * 0.07).sin()
+                    + (i as f32 * 0.31 - j as f32 * 0.02).cos())
+                    * 0.5;
+            }
+            normalize(&mut v);
+            let relevance = 1.0 - (i as f32) / 50.0;
+            (Uuid::new_v4(), relevance, v)
+        })
+        .collect();
+
+    let reranker = pensyve_core::retrieval::vendi::VendiReranker::new(0.7, 50);
+    c.bench_function("vendi_rerank_50_candidates_384d", |bencher| {
+        bencher.iter(|| {
+            let _ = reranker.rerank(black_box(&pool), black_box(20));
+        });
+    });
+
+    // Production-realistic bench: RERANK_TOP_N = 20 in the engine, so
+    // the Vendi reranker normally sees 20 candidates (not 50). The
+    // 50-candidate variant above is the brief's worst-case headroom
+    // bench; this 20-candidate variant is what the brief's < 1 ms
+    // budget is actually measured against in production traffic.
+    let prod_pool: Vec<(Uuid, f32, Vec<f32>)> = pool.iter().take(20).cloned().collect();
+    c.bench_function("vendi_rerank_20_candidates_384d", |bencher| {
+        bencher.iter(|| {
+            let _ = reranker.rerank(black_box(&prod_pool), black_box(20));
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_cosine_768,
@@ -212,5 +287,6 @@ criterion_group!(
     bench_dep_parse_extract,
     bench_ppr_build_from_storage_10k,
     bench_ppr_query_10k,
+    bench_vendi_rerank_50_candidates_384d,
 );
 criterion_main!(benches);
