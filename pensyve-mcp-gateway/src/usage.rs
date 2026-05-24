@@ -1,6 +1,8 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::circuit_breaker::CircuitBreaker;
@@ -128,7 +130,10 @@ impl UsageReporter {
         buffer_capacity: usize,
     ) {
         // Reuse the HTTP client across all flushes for connection pooling.
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("usage reporter HTTP client should build");
         let mut batch: Vec<UsageEvent> = Vec::new();
         // Bounded buffer for events received while the breaker is Open.
         // Wrapped in std::sync::Mutex so internal drain helpers can take
@@ -260,9 +265,9 @@ impl UsageReporter {
         // contents would otherwise be silently lost. Take a defensive
         // clone so we can requeue on failure into the same bounded
         // buffer the Open path uses (drop-oldest semantics preserved).
-        let preserved = batch.clone();
-        let success = Self::flush_batch_returning_success(batch, stripe_api_key, client).await;
-        if success {
+        let failed_events =
+            Self::flush_batch_returning_failed_events(batch, stripe_api_key, client).await;
+        if failed_events.is_empty() {
             cb.record_success().await;
             // First successful flush after Open → drain the buffer. We
             // always attempt to drain whenever there are buffered events,
@@ -279,7 +284,7 @@ impl UsageReporter {
             {
                 let mut buf = buffer.lock().expect("usage buffer mutex poisoned");
                 let mut dropped = 0usize;
-                for event in preserved {
+                for event in failed_events {
                     if buf.len() >= buffer_capacity && buf.pop_front().is_some() {
                         dropped += 1;
                     }
@@ -321,24 +326,22 @@ impl UsageReporter {
                 buf.drain(..take).collect()
             };
             let chunk_len = chunk.len();
-            // Keep an untouched copy for the requeue path.
-            // `flush_batch_returning_success` calls `aggregate_batch` which
-            // *drains* its input vec, so by the time the !success branch
-            // runs there's nothing left in the borrowed copy to push back.
-            // Without this clone the failed events would be silently lost.
-            let mut working_copy = chunk.clone();
-            let success =
-                Self::flush_batch_returning_success(&mut working_copy, stripe_api_key, client)
-                    .await;
-            if !success {
-                // Push the original (un-drained) chunk back to the front
-                // so order is preserved on the next drain attempt. Take
-                // care to drop the MutexGuard before .await — std Mutex
-                // guards are !Send and would un-Send the report_loop
-                // future.
+            let mut working_copy = chunk;
+            let failed_events = Self::flush_batch_returning_failed_events(
+                &mut working_copy,
+                stripe_api_key,
+                client,
+            )
+            .await;
+            if !failed_events.is_empty() {
+                // Push only the failed customer/tier groups back to the
+                // front so successful groups are not double-counted on
+                // the next drain attempt. Take care to drop the
+                // MutexGuard before .await — std Mutex guards are !Send
+                // and would un-Send the report_loop future.
                 let remaining = {
                     let mut buf = buffer.lock().expect("usage buffer mutex poisoned");
-                    for event in chunk.into_iter().rev() {
+                    for event in failed_events.into_iter().rev() {
                         buf.push_front(event);
                     }
                     buf.len()
@@ -358,22 +361,23 @@ impl UsageReporter {
     /// Flush a batch and report whether the Stripe call(s) ultimately
     /// succeeded. Used by the circuit-breaker wrapper so we can classify
     /// the outcome.
-    async fn flush_batch_returning_success(
+    async fn flush_batch_returning_failed_events(
         batch: &mut Vec<UsageEvent>,
         stripe_api_key: Option<&str>,
         client: &reqwest::Client,
-    ) -> bool {
+    ) -> Vec<UsageEvent> {
         let Some(api_key) = stripe_api_key else {
             // No Stripe configured — events are intentionally dropped at
             // the source (dev mode). Treat as success so we don't trip
             // the breaker on operator misconfiguration.
             batch.clear();
-            return true;
+            return Vec::new();
         };
 
+        let original = batch.clone();
         let aggregated = Self::aggregate_batch(batch);
         if aggregated.is_empty() {
-            return true;
+            return Vec::new();
         }
 
         tracing::info!(
@@ -382,7 +386,7 @@ impl UsageReporter {
             "Flushing usage to Stripe"
         );
 
-        let mut overall_success = true;
+        let mut failed_groups: HashSet<(&str, OperationTier)> = HashSet::new();
         for ((customer_id, tier), (count, traceparent)) in &aggregated {
             let success = Self::post_meter_event(
                 client,
@@ -394,7 +398,7 @@ impl UsageReporter {
             )
             .await;
             if !success {
-                overall_success = false;
+                failed_groups.insert((customer_id.as_str(), *tier));
                 tracing::error!(
                     customer = customer_id,
                     count,
@@ -402,7 +406,24 @@ impl UsageReporter {
                 );
             }
         }
-        overall_success
+        Self::events_for_failed_groups(original, &failed_groups)
+    }
+
+    fn events_for_failed_groups(
+        events: Vec<UsageEvent>,
+        failed_groups: &HashSet<(&str, OperationTier)>,
+    ) -> Vec<UsageEvent> {
+        events
+            .into_iter()
+            .filter(|event| {
+                event
+                    .stripe_customer_id
+                    .as_ref()
+                    .is_some_and(|customer_id| {
+                        failed_groups.contains(&(customer_id.as_str(), event.tier))
+                    })
+            })
+            .collect()
     }
 
     /// Legacy flush path — used only when no circuit breaker is attached.
@@ -486,6 +507,9 @@ impl UsageReporter {
         count: u32,
         traceparent: Option<&str>,
     ) -> bool {
+        let count_value = count.to_string();
+        let idempotency_key =
+            Self::meter_event_idempotency_key(customer_id, tier, count, traceparent);
         for attempt in 0..3 {
             if attempt > 0 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500 * 2u64.pow(attempt)))
@@ -494,10 +518,11 @@ impl UsageReporter {
             let mut req = client
                 .post("https://api.stripe.com/v1/billing/meter_events")
                 .bearer_auth(api_key)
+                .header("Idempotency-Key", &idempotency_key)
                 .form(&[
                     ("event_name", tier.event_name()),
                     ("payload[stripe_customer_id]", customer_id),
-                    ("payload[value]", &count.to_string()),
+                    ("payload[value]", count_value.as_str()),
                 ]);
             // Phase 23/A: propagate W3C trace context so Stripe's
             // request logs (and our own egress logs) can be correlated
@@ -533,6 +558,26 @@ impl UsageReporter {
             }
         }
         false
+    }
+
+    fn meter_event_idempotency_key(
+        customer_id: &str,
+        tier: OperationTier,
+        count: u32,
+        traceparent: Option<&str>,
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"pensyve-meter-event-v1\0");
+        hasher.update(customer_id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(tier.event_name().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(count.to_be_bytes());
+        hasher.update(b"\0");
+        if let Some(traceparent) = traceparent {
+            hasher.update(traceparent.as_bytes());
+        }
+        format!("pensyve-meter-{}", hex::encode(hasher.finalize()))
     }
 }
 
@@ -586,6 +631,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_meter_event_idempotency_key_stable_for_same_payload() {
+        let a = UsageReporter::meter_event_idempotency_key(
+            "cus_123",
+            OperationTier::Standard,
+            4,
+            Some("00-aaa-bbb-01"),
+        );
+        let b = UsageReporter::meter_event_idempotency_key(
+            "cus_123",
+            OperationTier::Standard,
+            4,
+            Some("00-aaa-bbb-01"),
+        );
+        let c = UsageReporter::meter_event_idempotency_key(
+            "cus_123",
+            OperationTier::Standard,
+            5,
+            Some("00-aaa-bbb-01"),
+        );
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a.starts_with("pensyve-meter-"));
+    }
+
     #[tokio::test]
     async fn test_flush_batch_aggregates_same_customer_tier() {
         let client = reqwest::Client::new();
@@ -608,6 +679,48 @@ mod tests {
         // Without a real Stripe key, this just discards.
         UsageReporter::flush_batch(&mut batch, None, &client).await;
         assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn test_partial_stripe_failure_requeues_only_failed_groups() {
+        let events = vec![
+            UsageEvent {
+                key_id: "k_success".into(),
+                stripe_customer_id: Some("cus_success".into()),
+                tier: OperationTier::Standard,
+                count: 3,
+                traceparent: None,
+            },
+            UsageEvent {
+                key_id: "k_failed_a".into(),
+                stripe_customer_id: Some("cus_failed".into()),
+                tier: OperationTier::Standard,
+                count: 7,
+                traceparent: None,
+            },
+            UsageEvent {
+                key_id: "k_failed_b".into(),
+                stripe_customer_id: Some("cus_failed".into()),
+                tier: OperationTier::Standard,
+                count: 2,
+                traceparent: Some("00-aaa-bbb-01".into()),
+            },
+            UsageEvent {
+                key_id: "k_other_tier".into(),
+                stripe_customer_id: Some("cus_failed".into()),
+                tier: OperationTier::Extraction,
+                count: 1,
+                traceparent: None,
+            },
+        ];
+        let failed_groups = HashSet::from([("cus_failed", OperationTier::Standard)]);
+
+        let requeued = UsageReporter::events_for_failed_groups(events, &failed_groups);
+
+        assert_eq!(requeued.len(), 2);
+        assert_eq!(requeued[0].key_id, "k_failed_a");
+        assert_eq!(requeued[1].key_id, "k_failed_b");
+        assert_eq!(requeued[1].traceparent.as_deref(), Some("00-aaa-bbb-01"));
     }
 
     /// Phase 23/C: when the circuit breaker is Open, events going

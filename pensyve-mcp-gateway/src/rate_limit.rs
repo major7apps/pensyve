@@ -14,8 +14,9 @@
 //! the cluster is running in degraded mode.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{HeaderValue, Request, Response, StatusCode};
@@ -27,6 +28,9 @@ use tower::{Layer, Service};
 
 use crate::AppState;
 use crate::auth::AuthContext;
+
+const REDIS_RATE_LIMIT_TIMEOUT: Duration = Duration::from_millis(150);
+const FALLBACK_EVICT_EVERY_CHECKS: u64 = 64;
 
 /// Plan-tier limits, keyed by the `plan` string returned from auth.
 ///
@@ -131,6 +135,9 @@ impl CheckOutcome {
 struct FallbackBucket {
     /// Unix-second timestamps for the sliding minute window.
     timestamps: Vec<u64>,
+    /// Last request seen for this bucket. Lets the degraded path evict
+    /// idle tenant buckets even when their timestamp vector has gone empty.
+    last_seen: u64,
 }
 
 /// Plan-aware rate limiter. See module docs for the full contract.
@@ -145,6 +152,9 @@ pub struct RateLimiter {
     /// One-shot flag so the "Redis unavailable, falling back to memory"
     /// warning only fires once per process even under sustained failure.
     fallback_warned: Arc<AtomicBool>,
+    fallback_sweep_counter: Arc<AtomicU64>,
+    #[cfg(test)]
+    force_redis_error: Arc<AtomicBool>,
 }
 
 impl RateLimiter {
@@ -155,6 +165,9 @@ impl RateLimiter {
             fallback: Arc::new(DashMap::new()),
             script: Arc::new(Script::new(RATE_LIMIT_LUA)),
             fallback_warned: Arc::new(AtomicBool::new(false)),
+            fallback_sweep_counter: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            force_redis_error: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -169,33 +182,48 @@ impl RateLimiter {
             return CheckOutcome::unlimited(now_secs);
         }
 
+        #[cfg(test)]
+        if self.force_redis_error.load(Ordering::Relaxed) {
+            self.handle_redis_failure(&"forced redis failure");
+            return self.check_fallback(tenant_id, limits, now_secs);
+        }
+
         if let Some(conn) = self.redis.as_ref() {
-            match self.check_redis(conn, tenant_id, limits, now_secs).await {
-                Ok(outcome) => return outcome,
-                Err(e) => {
-                    // Warn once per process, not once per request.
-                    // `swap(true, _)` returns the *previous* value: false
-                    // on the very first failure (which is when we want
-                    // the loud warning), true thereafter (when we drop
-                    // to debug-level so we don't flood the logs).
-                    // Reading `if !swap(...)` matches that mental model
-                    // (negate "have we already warned?") even though
-                    // clippy::if_not_else prefers the inverted form.
-                    #[allow(clippy::if_not_else)]
-                    if !self.fallback_warned.swap(true, Ordering::Relaxed) {
-                        tracing::warn!(
-                            error = %e,
-                            "Rate limiter falling back to in-memory; daily quota NOT enforced"
-                        );
-                    } else {
-                        tracing::debug!(error = %e, "Rate limit Redis call failed; using fallback");
-                    }
+            match tokio::time::timeout(
+                REDIS_RATE_LIMIT_TIMEOUT,
+                self.check_redis(conn, tenant_id, limits, now_secs),
+            )
+            .await
+            {
+                Ok(Ok(outcome)) => return outcome,
+                Ok(Err(e)) => {
+                    self.handle_redis_failure(&e);
+                    // Fall through to the in-memory path.
+                }
+                Err(_) => {
+                    self.handle_redis_failure(&"redis rate-limit timeout");
                     // Fall through to the in-memory path.
                 }
             }
         }
 
         self.check_fallback(tenant_id, limits, now_secs)
+    }
+
+    fn handle_redis_failure(&self, error: &dyn std::fmt::Display) {
+        // Warn once per process, not once per request.
+        // `swap(true, _)` returns the *previous* value: false on the
+        // very first failure (which is when we want the loud warning),
+        // true thereafter (when we drop to debug-level so logs stay useful).
+        #[allow(clippy::if_not_else)]
+        if !self.fallback_warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                error = %error,
+                "Rate limiter falling back to in-memory; daily quota NOT enforced"
+            );
+        } else {
+            tracing::debug!(error = %error, "Rate limit Redis call failed; using fallback");
+        }
     }
 
     /// Redis-backed path. Single Lua call that prunes the sliding window,
@@ -250,10 +278,13 @@ impl RateLimiter {
     /// Pure in-memory path. Implements the same sliding-minute semantics
     /// as the Redis script, minus the daily quota (see module docs).
     fn check_fallback(&self, tenant_id: &str, limits: Limits, now_secs: u64) -> CheckOutcome {
+        self.maybe_evict_idle_fallback_buckets(now_secs);
+
         let mut entry = self.fallback.entry(tenant_id.to_string()).or_default();
         let bucket = entry.value_mut();
         let window_start = now_secs.saturating_sub(60);
         bucket.timestamps.retain(|&ts| ts > window_start);
+        bucket.last_seen = now_secs;
 
         let count = bucket.timestamps.len() as u32;
         let allowed = count < limits.rpm;
@@ -283,6 +314,38 @@ impl RateLimiter {
                 Some(u32::try_from(wait).unwrap_or(60))
             },
         }
+    }
+
+    fn maybe_evict_idle_fallback_buckets(&self, now_secs: u64) {
+        let check = self.fallback_sweep_counter.fetch_add(1, Ordering::Relaxed);
+        if check.is_multiple_of(FALLBACK_EVICT_EVERY_CHECKS) {
+            self.evict_idle_fallback_buckets(now_secs);
+        }
+    }
+
+    fn evict_idle_fallback_buckets(&self, now_secs: u64) {
+        let window_start = now_secs.saturating_sub(60);
+        self.fallback.retain(|_, bucket| {
+            bucket.timestamps.retain(|&ts| ts > window_start);
+            !bucket.timestamps.is_empty() || bucket.last_seen > window_start
+        });
+    }
+
+    #[cfg(test)]
+    fn new_forced_redis_error_for_test() -> Self {
+        let limiter = Self::new(None);
+        limiter.force_redis_error.store(true, Ordering::Relaxed);
+        limiter
+    }
+
+    #[cfg(test)]
+    fn fallback_warning_emitted_for_test(&self) -> bool {
+        self.fallback_warned.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn fallback_bucket_count_for_test(&self) -> usize {
+        self.fallback.len()
     }
 }
 
@@ -425,10 +488,7 @@ where
             // before reaching here, so this is mostly belt-and-suspenders.
             let (tenant_id, plan) = req.extensions().get::<AuthContext>().map_or_else(
                 || ("anonymous".to_string(), "free".to_string()),
-                |ctx| {
-                    let tenant = ctx.user_id.clone().unwrap_or_else(|| ctx.key_id.clone());
-                    (tenant, ctx.plan.clone())
-                },
+                |ctx| (quota_bucket_key(ctx), ctx.plan.clone()),
             );
 
             let outcome = state.rate_limiter.check(&tenant_id, &plan).await;
@@ -444,6 +504,13 @@ where
             Ok(response)
         })
     }
+}
+
+fn quota_bucket_key(ctx: &AuthContext) -> String {
+    ctx.tenant_id
+        .clone()
+        .or_else(|| ctx.user_id.clone())
+        .unwrap_or_else(|| ctx.key_id.clone())
 }
 
 /// Build a 429 response with all rate-limit / retry headers populated.
@@ -578,14 +645,63 @@ mod tests {
 
     #[tokio::test]
     async fn test_grace_period_on_redis_failure() {
-        // Redis = None simulates "Redis configured but every call fails".
-        // The limiter must continue serving traffic via the in-memory path
-        // and only emit ONE warning across many requests.
+        // Redis = None forces the degraded in-memory path. The separate
+        // forced-error test below exercises the Redis failure branch.
         let rl = limiter();
         for _ in 0..5 {
             let outcome = rl.check("u_grace", "free").await;
             assert!(outcome.allowed);
         }
+    }
+
+    #[tokio::test]
+    async fn test_redis_error_path_sets_warn_once_and_serves_fallback() {
+        let rl = RateLimiter::new_forced_redis_error_for_test();
+        assert!(!rl.fallback_warning_emitted_for_test());
+
+        for _ in 0..5 {
+            let outcome = rl.check("u_grace_forced", "free").await;
+            assert!(outcome.allowed);
+        }
+
+        assert!(rl.fallback_warning_emitted_for_test());
+        assert_eq!(rl.fallback_bucket_count_for_test(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_fallback_evicts_idle_buckets() {
+        let rl = limiter();
+        let limits = PlanLimits::for_plan("free");
+
+        let first = rl.check_fallback("tenant_idle", limits, 1_000);
+        assert!(first.allowed);
+        assert_eq!(rl.fallback_bucket_count_for_test(), 1);
+
+        rl.evict_idle_fallback_buckets(1_061);
+        assert_eq!(
+            rl.fallback_bucket_count_for_test(),
+            0,
+            "idle tenant bucket should be evicted after the sliding window"
+        );
+    }
+
+    #[test]
+    fn test_quota_bucket_prefers_tenant_then_user_then_key() {
+        let mut ctx = AuthContext {
+            key_id: "key_123".to_string(),
+            tenant_id: Some("tenant_abc".to_string()),
+            user_id: Some("user_123".to_string()),
+            scope: "mcp".to_string(),
+            stripe_customer_id: None,
+            plan: "business".to_string(),
+        };
+        assert_eq!(quota_bucket_key(&ctx), "tenant_abc");
+
+        ctx.tenant_id = None;
+        assert_eq!(quota_bucket_key(&ctx), "user_123");
+
+        ctx.user_id = None;
+        assert_eq!(quota_bucket_key(&ctx), "key_123");
     }
 
     #[tokio::test]

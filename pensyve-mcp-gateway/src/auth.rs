@@ -19,6 +19,7 @@ use crate::middleware::tracing::TraceContext;
 #[derive(Clone, Debug)]
 pub struct AuthContext {
     pub key_id: String,
+    pub tenant_id: Option<String>,
     pub user_id: Option<String>,
     pub scope: String,
     pub stripe_customer_id: Option<String>,
@@ -31,6 +32,10 @@ struct OAuthClaims {
     sub: String,
     #[serde(default)]
     client_id: String,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
     scope: Option<String>,
 }
 
@@ -151,11 +156,17 @@ impl AuthValidator {
         validation.set_audience(&["https://mcp.pensyve.com"]);
 
         let token_data = decode::<OAuthClaims>(token, decoding_key, &validation).ok()?;
+        let claims = token_data.claims;
+        let tenant_id = claims
+            .tenant_id
+            .filter(|s| !s.is_empty())
+            .or_else(|| claims.account_id.filter(|s| !s.is_empty()));
 
         Some(AuthContext {
-            key_id: format!("oauth:{}", &token_data.claims.client_id),
-            user_id: Some(token_data.claims.sub),
-            scope: token_data.claims.scope.unwrap_or_else(|| "mcp".to_string()),
+            key_id: format!("oauth:{}", &claims.client_id),
+            tenant_id,
+            user_id: Some(claims.sub),
+            scope: claims.scope.unwrap_or_else(|| "mcp".to_string()),
             stripe_customer_id: None,
             plan: "free".to_string(),
         })
@@ -172,6 +183,7 @@ impl AuthValidator {
             let user_id = self.key_user_hashes.get(&hash).cloned();
             return Some(AuthContext {
                 key_id: prefix.clone(),
+                tenant_id: None,
                 user_id,
                 scope: "mcp".to_string(),
                 stripe_customer_id: None,
@@ -375,6 +387,7 @@ fn parse_auth_context(body: &serde_json::Value) -> AuthContext {
             .and_then(|v| v.as_str())
             .unwrap_or("remote")
             .to_string(),
+        tenant_id: string_field(body, &["tenantId", "tenant_id", "accountId", "account_id"]),
         user_id: body
             .get("userId")
             .and_then(|v| v.as_str())
@@ -394,6 +407,15 @@ fn parse_auth_context(body: &serde_json::Value) -> AuthContext {
             .unwrap_or("free")
             .to_string(),
     }
+}
+
+fn string_field(body: &serde_json::Value, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        body.get(*name)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    })
 }
 
 /// Describe the top-level shape of a JSON payload as a comma-joined
@@ -499,6 +521,7 @@ where
             if !state.auth_required {
                 req.extensions_mut().insert(AuthContext {
                     key_id: "dev".to_string(),
+                    tenant_id: None,
                     user_id: None,
                     scope: "mcp".to_string(),
                     stripe_customer_id: None,
@@ -615,6 +638,23 @@ mod tests {
         assert!(validator.validate("psy_anything", None).await.is_none());
     }
 
+    #[test]
+    fn test_parse_auth_context_accepts_tenant_identity_fields() {
+        for field in ["tenantId", "tenant_id", "accountId", "account_id"] {
+            let body = serde_json::json!({
+                "valid": true,
+                "keyId": "key_123",
+                field: "tenant_abc",
+                "userId": "user_123",
+                "plan": "business",
+            });
+            let ctx = parse_auth_context(&body);
+            assert_eq!(ctx.tenant_id.as_deref(), Some("tenant_abc"));
+            assert_eq!(ctx.user_id.as_deref(), Some("user_123"));
+            assert_eq!(ctx.plan, "business");
+        }
+    }
+
     // Ed25519 test key pair generated for unit tests only — not a real secret.
     const TEST_ED25519_PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
         MC4CAQAwBQYDK2VwBCIEIAPzDoD/2KJqXdOOUG6XdP1GD0tXbv1DDOFdXwhG/0DQ\n\
@@ -634,6 +674,10 @@ mod tests {
         iat: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         scope: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tenant_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
     }
 
     /// Helper: build an `AuthValidator` with JWT support using the test key pair.
@@ -669,6 +713,8 @@ mod tests {
             iat: now,
             exp: now + 3600,
             scope: Some("mcp".to_string()),
+            tenant_id: None,
+            account_id: None,
         }
     }
 
@@ -787,6 +833,18 @@ mod tests {
         let token = sign_jwt(&valid_claims());
         let ctx = validator.validate(&token, None).await.expect("valid JWT");
         assert_eq!(ctx.scope, "mcp");
+    }
+
+    #[tokio::test]
+    async fn test_jwt_empty_tenant_id_falls_back_to_account_id() {
+        let validator = validator_with_jwt(vec![]);
+        let mut claims = valid_claims();
+        claims.tenant_id = Some(String::new());
+        claims.account_id = Some("acct_123".to_string());
+        let token = sign_jwt(&claims);
+
+        let ctx = validator.validate(&token, None).await.expect("valid JWT");
+        assert_eq!(ctx.tenant_id.as_deref(), Some("acct_123"));
     }
 
     #[tokio::test]
