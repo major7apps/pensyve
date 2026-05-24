@@ -237,6 +237,17 @@ enum CheckDecision {
     Continue,
 }
 
+fn redis_opened_at_to_instant(opened_at: Option<&str>) -> Option<Instant> {
+    let opened_at = chrono::DateTime::parse_from_rfc3339(opened_at?)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    let elapsed = chrono::Utc::now()
+        .signed_duration_since(opened_at)
+        .to_std()
+        .ok()?;
+    Instant::now().checked_sub(elapsed)
+}
+
 // ---------------------------------------------------------------------------
 // Breaker
 // ---------------------------------------------------------------------------
@@ -411,15 +422,20 @@ impl CircuitBreaker {
                 .await
                 .ok()
                 .flatten();
-            (state, closed, probe)
+            let opened_at: Option<String> = redis
+                .get(redis_opened_at_key(self.config.name))
+                .await
+                .ok()
+                .flatten();
+            (state, closed, probe, opened_at)
         })
         .await;
 
-        let Ok((state, closed, probe)) = result else {
+        let Ok((state, closed, probe, opened_at)) = result else {
             return CheckDecision::Continue;
         };
         if state.as_deref() == Some("open") {
-            self.mirror_open_from_redis();
+            self.mirror_open_from_redis(opened_at.as_deref());
             return CheckDecision::Reject(self.threshold_open_error());
         }
         if closed.is_some() {
@@ -432,15 +448,13 @@ impl CircuitBreaker {
         CheckDecision::Continue
     }
 
-    fn mirror_open_from_redis(&self) {
+    fn mirror_open_from_redis(&self, opened_at: Option<&str>) {
         let mut fb = self
             .fallback
             .lock()
             .expect("circuit fallback mutex poisoned");
         fb.state = CircuitState::Open;
-        if fb.opened_at.is_none() {
-            fb.opened_at = Some(Instant::now());
-        }
+        fb.opened_at = Some(redis_opened_at_to_instant(opened_at).unwrap_or_else(Instant::now));
         fb.half_opened_at = None;
     }
 
@@ -449,8 +463,11 @@ impl CircuitBreaker {
             .fallback
             .lock()
             .expect("circuit fallback mutex poisoned");
+        let previous_state = fb.state;
         fb.state = CircuitState::Closed;
-        fb.failures.clear();
+        if !matches!(previous_state, CircuitState::Closed) {
+            fb.failures.clear();
+        }
         fb.opened_at = None;
         fb.half_opened_at = None;
     }
@@ -742,6 +759,16 @@ mod tests {
         assert_eq!(err.name, "test_breaker");
     }
 
+    #[test]
+    fn redis_opened_at_to_instant_preserves_elapsed_cooldown() {
+        let opened_at = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let instant = redis_opened_at_to_instant(Some(&opened_at)).expect("timestamp should parse");
+        let elapsed = instant.elapsed();
+
+        assert!(elapsed >= Duration::from_secs(4), "elapsed was {elapsed:?}");
+        assert!(elapsed <= Duration::from_secs(6), "elapsed was {elapsed:?}");
+    }
+
     #[tokio::test]
     async fn cooldown_elapses_transitions_to_halfopen() {
         let cb = CircuitBreaker::new(test_config(), None);
@@ -781,6 +808,35 @@ mod tests {
         cb.record_success().await;
         assert_eq!(cb.current_state(), CircuitState::Closed);
         assert!(cb.check().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn close_fallback_state_preserves_closed_failure_window() {
+        let cb = CircuitBreaker::new(test_config(), None);
+        cb.record_failure().await;
+        cb.record_failure().await;
+        assert_eq!(cb.current_state(), CircuitState::Closed);
+        assert_eq!(cb.failure_count(), 2);
+
+        cb.close_fallback_state();
+
+        assert_eq!(cb.current_state(), CircuitState::Closed);
+        assert_eq!(cb.failure_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn close_fallback_state_clears_stale_open_failure_window() {
+        let cb = CircuitBreaker::new(test_config(), None);
+        for _ in 0..3 {
+            cb.record_failure().await;
+        }
+        assert_eq!(cb.current_state(), CircuitState::Open);
+        assert_eq!(cb.failure_count(), 3);
+
+        cb.close_fallback_state();
+
+        assert_eq!(cb.current_state(), CircuitState::Closed);
+        assert_eq!(cb.failure_count(), 0);
     }
 
     #[tokio::test]
