@@ -2,7 +2,7 @@
 
 Validates the embedder/reranker process-wide cache fix staged in
 `pensyve-docs/research/benchmark-sprint/_leak_diagnosis.md`. Pre-fix the
-ONNX session pool (4× GTE-base ≈ 1.3 GB) and BGE reranker (~250 MB) were
+ONNX session pool (4x GTE-base ~1.3 GB) and BGE reranker (~250 MB) were
 rebuilt every constructor and not returned to the OS allocator on Drop,
 producing ~250 MB-per-iteration RSS growth. Post-fix the cache reuses
 `Arc<OnnxEmbedder>` / `Arc<Reranker>` so RSS plateaus after iteration 1.
@@ -11,7 +11,7 @@ Run directly (not via pytest — this is a long-running diagnostic):
 
     conda run -n pensyve-longmemeval python pensyve-python/tests/stress_construct.py
 
-Acceptance: peak RSS plateaus within ±100 MB after iteration 1; no linear
+Acceptance: peak RSS plateaus within +/-100 MB after iteration 1; no linear
 growth across 100 iterations.
 """
 

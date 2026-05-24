@@ -12,11 +12,29 @@ Persistent working-memory substrate for the [OpenAI Codex CLI](https://github.co
 
 ## Install
 
-Two steps: configure the MCP server, then install the instructions file.
+Recommended path: install the Codex plugin package, then authenticate the bundled MCP server.
 
-### 1. Configure the MCP server
+Tagged Pensyve releases include a `pensyve-codex-plugin-v*.tar.gz` asset containing this plugin directory for pinned installs.
 
-Copy `.agents/mcp.json.example` to `.agents/mcp.json` in your project root and edit for your setup.
+### 1. Add the local marketplace
+
+From any Codex session on the machine:
+
+```bash
+codex plugin marketplace add /path/to/pensyve/integrations/codex-plugin
+codex plugin add pensyve@pensyve-codex
+```
+
+You can also open `/plugins`, find **Pensyve**, and install it from the **Pensyve Codex** marketplace.
+
+The plugin bundles:
+
+- `.mcp.json` for the Pensyve MCP server
+- `skills/` including the first-class `pensyve` skill for `$pensyve` invocation
+- `hooks/hooks.json` for SessionStart and UserPromptSubmit memory guidance
+- install metadata and assets for Codex plugin surfaces
+
+### 2. Authenticate the MCP server
 
 **Cloud with API key (recommended):**
 
@@ -24,21 +42,24 @@ Copy `.agents/mcp.json.example` to `.agents/mcp.json` in your project root and e
 export PENSYVE_API_KEY="psy_your_key_here"
 ```
 
+The plugin's bundled `.mcp.json` uses `bearer_token_env_var: "PENSYVE_API_KEY"`, so no per-project MCP file is required for the cloud path.
+
+Create your key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys). Put the `export` in `~/.bashrc` or `~/.zshrc` to persist.
+
+**Manual MCP config fallback:**
+
+Copy `.agents/mcp.json.example` to `.agents/mcp.json` in your project root if you do not want to install the plugin package.
+
 ```json
 {
   "mcpServers": {
     "pensyve": {
-      "type": "http",
       "url": "https://mcp.pensyve.com/mcp",
-      "headers": {
-        "Authorization": "Bearer ${PENSYVE_API_KEY}"
-      }
+      "bearer_token_env_var": "PENSYVE_API_KEY"
     }
   }
 }
 ```
-
-Create your key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys). Put the `export` in `~/.bashrc` or `~/.zshrc` to persist.
 
 **Local (offline, self-hosted):**
 
@@ -59,9 +80,9 @@ Create your key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/
 
 Build the binary: `cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
 
-### 2. Install the instructions file
+### 3. Project instruction fallback
 
-Copy `AGENTS.md` to your project root (Codex CLI loads `AGENTS.md` automatically as its agent instruction file):
+If you cannot install Codex plugins, copy `AGENTS.md` to your project root. Codex loads project `AGENTS.md` files automatically:
 
 ```bash
 cp /path/to/pensyve/integrations/codex-plugin/AGENTS.md .
@@ -73,9 +94,11 @@ Codex CLI automatically loads `AGENTS.md` from the project root into every agent
 
 ## How It Works
 
-Codex CLI has no hook/event surface, so the entire substrate is delivered through `AGENTS.md`. The Memory Reflex Rule section establishes the discipline: *before substantive answers, recall by entity; when a lesson lands, observe immediately with a one-line surface*. Flow sections (When Debugging, When Designing, When Refactoring, Longitudinal Work) guide the model through consult-memory + capture-lesson steps.
+Pensyve now ships as a native Codex plugin package. The manifest points Codex at bundled skills, the plugin-scoped `.mcp.json`, and lifecycle hooks. The Memory Reflex Rule in `AGENTS.md` remains the reasoning layer: *before substantive answers, recall by entity; when a lesson lands, observe immediately with a one-line surface*. Flow sections (When Debugging, When Designing, When Refactoring, Longitudinal Work) guide the model through consult-memory + capture-lesson steps.
 
-**Episode lifecycle:** Codex CLI has no session-start/session-end hooks, so episodes open lazily on the first `pensyve_observe` call and are not explicitly closed under normal operation. Server-side consolidation handles aging.
+**Codex-native invocation:** select the `pensyve` skill through `/skills` or type `$pensyve` in the prompt. Current Codex docs use `$skill` and `$app-slug` mentions for explicit invocation; the plugin is structured so a future registered Pensyve app/connector can be added via `.app.json` without changing the memory rules.
+
+**Episode lifecycle:** Hooks can prime the model at session start and prompt submit, but episodes still open lazily on the first `pensyve_observe` call. Server-side consolidation handles aging.
 
 **Continuity primer:** The Context Loader section runs a best-effort recall at the start of substantive conversations to surface prior relevant observations.
 
@@ -99,7 +122,7 @@ Pensyve behaves as working memory for the agent — always-on, ambient, continuo
 
 ## Opt-Out
 
-Codex CLI's native pattern is to edit or delete `AGENTS.md`:
+Use `/plugins` to disable or uninstall the plugin. If you installed the fallback `AGENTS.md` manually, edit or delete that file:
 
 - **Full opt-out** — delete `AGENTS.md` from your project root
 - **Partial opt-out** — delete specific sections from the file (e.g., remove the "Longitudinal Work" section if you don't do research work)
@@ -123,10 +146,11 @@ See [MCP Tools Reference](https://pensyve.com/docs/api-reference/mcp-tools) for 
 ## Design Philosophy
 
 - **Memory as substrate** — not a feature the user invokes; always there, continuous, carried across sessions
-- **Reasoning-layer only** — no platform-layer code in v1; the entire adapter is the `AGENTS.md` file
-- **1:1 with Claude Code** — same skill structure, same conventions, same memory types
+- **Codex-first package** — plugin manifest, bundled MCP server, hooks, skills, assets, and local marketplace metadata
+- **Skill invocation** — `$pensyve` gives users an explicit memory entry point while implicit recall still works for substantive work
+- **1:1 memory model with Claude Code** — same conventions and same memory types, adapted to Codex's plugin and skill surfaces
 - **MCP contract-respecting** — every rule's call examples verified against `pensyve-mcp-tools/src/params.rs`
-- **Single-file delivery** — Codex CLI's `AGENTS.md` is a single file; all 8 rules consolidated with clear section headings
+- **Single-file fallback** — Codex CLI's `AGENTS.md` remains available for environments that cannot install plugins
 
 ## Links
 

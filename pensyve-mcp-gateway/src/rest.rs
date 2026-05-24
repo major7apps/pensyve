@@ -457,7 +457,7 @@ pub fn router() -> Router<Arc<AppState>> {
 async fn health() -> impl IntoResponse {
     Json(json!({
         "status": "ok",
-        "version": "0.1.0",
+        "version": env!("CARGO_PKG_VERSION"),
     }))
 }
 

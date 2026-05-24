@@ -77,9 +77,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
-
 N_RUNS = 10
 GATE_THRESHOLD_MB = 300
 
@@ -219,8 +216,6 @@ def test_i6_footprint_gate():
     full = _measure("full_embedder", {})
 
     median_total_mock = mock["total_pensyve_delta_mb"]["median"]
-    median_total_full = full["total_pensyve_delta_mb"]["median"]
-
     # G1-additive cost approximation: since both mock and full paths
     # share the same construction path (fastembed init) up to the
     # final embedder choice, the mock_embedder measurement IS the

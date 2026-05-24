@@ -24,7 +24,7 @@ enum OutputFormat {
 #[command(
     name = "pensyve",
     about = "Universal memory runtime for AI agents",
-    version = "0.1.0"
+    version
 )]
 struct Cli {
     #[command(subcommand)]

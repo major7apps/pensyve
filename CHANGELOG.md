@@ -5,9 +5,9 @@ All notable changes to Pensyve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.4.1] - Unreleased
+## [2.5.0] - 2026-05-24
 
-Two G4 follow-ups that close both integration gaps surfaced by the 2026-05-08 G4 ablation wave (`pensyve-docs/research/benchmark-sprint/v3/g4/results.md` §6 H1 caveat). The wave's harness silently fell back to G3 cards on every G4-mechanism arm because (a) `build_retrieval_card_g4` did not exist as a PyO3 binding and (b) the IntentRouter wire-up through `Pensyve.recall_grouped(...)` was not in place. The wave's H1–H5 evidence is invalidated until both fixes land — both are in this point release. Detailed phased plan: `pensyve-docs/plans/2026-05-09-pensyve-g4-followups.md`.
+Feature release since v2.4.0. This cut includes the two G4 public-surface follow-ups plus the Phase 2A-2E algorithm stack: SelRoute query classification, dependency-parse KG materialization, Personalized PageRank retrieval, RPE-gated fast/slow consolidation, and Vendi-Score diversity reranking. The new retrieval and consolidation mechanisms remain opt-in behind env gates unless called through explicit SDK surfaces.
 
 ### Added
 
@@ -15,16 +15,29 @@ Two G4 follow-ups that close both integration gaps surfaced by the 2026-05-08 G4
   - The supersession chain is gated on `"summarizer"` so activating `ms_card_v2` alone does not surface chain-summary content the caller never opted into. The standalone slot is preserved when the MS card isn't present so summarizer output is never silently lost.
   - When `g4_features = []`, behavior is byte-for-byte equivalent to `build_retrieval_card_g3` with the same first four arguments. No `pensyve-core` changes — `MultiSessionCard::v2()` and `with_supersession_chain` already exist (`multi_session.rs:273`, `:308`). Spec: `pensyve-docs/specs/2026-05-08-pensyve-build-retrieval-card-g4-binding.md`.
 - **`Pensyve.recall_grouped(query, *, ..., question_type=None)`** — new optional `question_type` kwarg threads `PensyveInner.intent_router` through `RecallEngine::recall_grouped_with_router(..., &intent_router)` so per-question-type `k_budget` (constructor kwarg / `PENSYVE_K_BUDGET_*` env / locked defaults `{ss_pref:22, ms:50, ssu:12}`) governs the candidate pool. When `None` (default), behavior is unchanged from v2.4.0 — backward-compat for SDK consumers who don't opt in. Resolves issue #92.
+- **Phase 2A — SelRoute query classifier** (`pensyve-core::retrieval::query_classifier`): maps raw recall queries into the six `IntentRouter` question types and supplies per-route 8-signal RRF masks. Enabled by `PENSYVE_SELROUTE`.
+- **Phase 2B — dependency-parse KG construction** (`pensyve-core::extraction::dep_parse`): shallow parser and SQLite v3 migration for `kg_entities`, `kg_triples`, and `kg_passage_entities`. Enabled by `PENSYVE_DEP_PARSE`.
+- **Phase 2C — Personalized PageRank retrieval** (`pensyve-core::retrieval::ppr`): bipartite entity/passage CSR index, PPR score plumbing, and recall-engine integration. Requires an attached `PprIndex`, `PENSYVE_PPR=1`, and `PENSYVE_DEP_PARSE=1`.
+- **Phase 2D — RPE-gated D-MEM consolidation** (`pensyve-core::consolidation::dmem`): routes low-RPE observations through a fast buffer and high-RPE observations through the slower consolidation pipeline. Enabled by `PENSYVE_DMEM`; tunables include `PENSYVE_DMEM_THRESHOLD` and `PENSYVE_DMEM_ALPHA`.
+- **Phase 2E — Vendi-Score diversity rerank** (`pensyve-core::retrieval::vendi`): optional reranker that blends relevance and diversity over embedded candidate sets. Enabled by `PENSYVE_VENDI` when a `VendiReranker` is attached.
+- **Codex plugin v1.4.0** (`integrations/codex-plugin`): refreshed to the current Codex plugin package shape with `.mcp.json`, bundled hooks, richer install metadata, a local marketplace file, assets, and a first-class `pensyve` skill for Codex-native `$pensyve` invocation.
 
 ### Fixed
 
 - **`pensyve.__version__` now tracks `CARGO_PKG_VERSION`** instead of the stale hardcoded `"0.1.0"` in `_core` (`pensyve-python/src/lib.rs:67`). Wheel metadata was already correct; this aligns the runtime attribute. Test updated to assert semver shape (`pensyve.__version__.split(".")[0] >= "2"`) instead of pinning a literal.
+- **CLI and gateway runtime version surfaces now track crate metadata** instead of returning `"0.1.0"` from `pensyve --version` and `/v1/health`.
+
+### Changed
+
+- **Core release version bumped `2.4.0 -> 2.5.0`** across Rust manifests, Python metadata, Cargo/uv locks, and the TypeScript SDK package version so tag-triggered PyPI/npm/crates release jobs stay aligned.
+- **`@pensyve/sdk` moves `2.1.0 -> 2.5.0`** to match the core release because the release workflow publishes npm on `v*` tags when `NPM_TOKEN` is configured.
+- **Release workflow now packages the Codex plugin** as `pensyve-codex-plugin-v1.4.0.tar.gz` so the GitHub Release created from a `v*` tag includes the native Codex plugin artifact.
 
 ### Notes
 
-- **Cross-SDK parity for `question_type`** (TS/Go/WASM `recall_grouped` surfaces) is **deferred to v2.5.x** or a follow-up issue. The Python binding is the path the G4 ablation harness exercises; SDK consumers on other languages continue to use the un-routed `recall_grouped` until the parity work lands.
-- **Defaults unchanged.** G3 + G4 retrieval surface remain default-OFF behind env gates. Flipping any default is gated on the G4 ablation wave's *re-run* (with both fixes in place) per the plan referenced above. The wave-validated finding "G3 surface flip on top of reranker is a NET-NEGATIVE regression" (−17Q on MS) stands and informs the v2.5.x defaults discussion.
-- **`pensyve-python` wheel: aarch64-linux only**, same as v2.4.0.
+- **Cross-SDK parity for `question_type`** (TS/Go/WASM `recall_grouped` surfaces) is still deferred; the Python binding is the path the G4 ablation harness exercises.
+- **Defaults unchanged.** G3/G4 and Phase 2A-2E mechanisms stay opt-in behind explicit env gates or builder attachment. Flipping defaults remains gated on benchmark evidence.
+- **`pensyve-python` wheels** follow the release workflow matrix: Linux x64, Linux ARM64, macOS ARM64, and Windows x64.
 - **MSRV unchanged** at 1.88.
 
 ## [2.4.0] - 2026-05-07

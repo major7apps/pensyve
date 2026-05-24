@@ -8,7 +8,7 @@ Pensyve integrations connect the memory runtime to AI coding agents, IDEs, and a
 | ------------------------------- | ------------------- | -------- | ------------------------------------------------------------- |
 | [Claude Code](claude-code/)     | `claude-code/`      | Stable   | Plugin with hooks, skills, commands, and memory-curator agent |
 | [Gemini CLI](gemini-extension/) | `gemini-extension/` | Stable   | Extension with skills, commands, and context injection        |
-| [Codex](codex-plugin/)          | `codex-plugin/`     | Stable   | Plugin with hooks and skills                                  |
+| [Codex](codex-plugin/)          | `codex-plugin/`     | Stable   | Native Codex plugin with bundled MCP, hooks, and `$pensyve` skill |
 | [OpenCode](opencode-plugin/)    | `opencode-plugin/`  | Stable   | Plugin with MCP integration                                   |
 | [OpenClaw](openclaw-plugin/)    | `openclaw-plugin/`  | Stable   | Plugin with MCP integration                                   |
 | [Amazon Q](amazon-q/)           | `amazon-q/`         | Scaffold | Memory for Amazon Q Developer via MCP                         |

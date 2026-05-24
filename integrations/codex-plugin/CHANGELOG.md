@@ -4,6 +4,28 @@ All notable changes to the Pensyve Codex CLI adapter are documented in this file
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The Codex CLI adapter versions independently of the Claude Code plugin.
 
+## [1.4.0] - 2026-05-24
+
+### Added
+
+- Native Codex plugin package shape: `plugin.json` now points to a companion `.mcp.json` file instead of embedding stale MCP configuration inline.
+- First-class `pensyve` skill for Codex-native `$pensyve` invocation and `/skills` discovery.
+- Bundled `SessionStart` and `UserPromptSubmit` hooks that inject memory-recall and capture guidance using Codex's plugin hook environment.
+- Local marketplace metadata under `.agents/plugins/marketplace.json`, allowing this directory to be added as a Codex local plugin marketplace.
+- Plugin assets and richer install-surface metadata for Codex plugin browsers.
+- GitHub Release packaging as `pensyve-codex-plugin-v1.4.0.tar.gz` from the root `v*` release workflow.
+
+### Changed
+
+- MCP cloud config now uses Codex's `bearer_token_env_var` shape for `PENSYVE_API_KEY`.
+- README now documents plugin installation, bundled hooks, skill invocation, and the current Codex `$skill`/`$app-slug` mention model.
+- Install copy reflects the v2.5.0 algorithm stack: SelRoute, dependency-parse KG construction, PPR, D-MEM, and Vendi reranking.
+
+### Fixed
+
+- Removed the contradictory "Codex has no hook/event surface" guidance from release-current docs.
+- Replaced non-executable hook commands with concrete `cat "${PLUGIN_ROOT}/hooks/*.md"` commands.
+
 ## [1.3.0] - 2026-04-20
 
 ### Added

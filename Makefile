@@ -13,8 +13,8 @@ test: build
 # Lint
 lint:
 	cargo clippy --workspace -- -D warnings
-	uv run ruff check .
-	uv run pyright
+	uv run ruff check pensyve_server/ integrations/ tests/
+	uv run pyright pensyve_server/
 
 # Format
 format:

@@ -1,0 +1,20 @@
+{
+  "name": "pensyve-codex",
+  "interface": {
+    "displayName": "Pensyve Codex"
+  },
+  "plugins": [
+    {
+      "name": "pensyve",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

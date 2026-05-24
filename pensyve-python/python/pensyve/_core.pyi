@@ -320,7 +320,7 @@ class Pensyve:
         :py:meth:`RecallEngine.with_mmr_lambda` so the diversity reorder
         activates without process-env mutation (round-4 fix).
         Behaviorally identical to :meth:`recall` when ``lambda_ <= 0.0``;
-        reorders by ``lambda_·sim − (1−lambda_)·max_j sim`` otherwise.
+        reorders by ``lambda_ * sim - (1 - lambda_) * max_j sim`` otherwise.
 
         Args:
             query: Search query string.
