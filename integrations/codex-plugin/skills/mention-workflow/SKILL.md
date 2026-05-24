@@ -63,4 +63,4 @@ routing yet.
 - Do not fabricate memories or imply that `@pensyve` is a native Codex composer primitive.
 - If Pensyve MCP tools are unavailable, say: "Pensyve MCP is not connected for this session."
   Then continue with non-memory work when possible.
-- Strip secrets, tokens, passwords, private keys, and credentials before writing memory.
+- Strip secrets, API keys, passwords, tokens, private URLs, and credentials before writing memory.
