@@ -88,9 +88,11 @@ Try it:
 ```
 $pensyve what do you remember about this project?
 $pensyve remember that auth-service uses RS256 signing
+/pensyve status
+@pensyve recall release workflow decisions
 ```
 
-The plugin bundles its `.mcp.json`, skills, hooks, assets, and install metadata. Current Codex explicit invocation uses `/skills` or `$pensyve`; app-style `$app-slug` invocation can be added later through `.app.json` when a registered Pensyve Codex app/connector exists.
+The plugin bundles its `.mcp.json`, skills, commands, hooks, assets, and install metadata. Current reliable Codex explicit invocation uses `/skills`, `$pensyve`, or `/pensyve`. The `@pensyve` form is a text-level compatibility convention, not native autocomplete or selector behavior; app-style `$app-slug` invocation can be added later through `.app.json` when a registered Pensyve Codex app/connector exists.
 
 ### Local
 

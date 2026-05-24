@@ -1,7 +1,7 @@
 {
   "name": "pensyve",
-  "version": "1.4.0",
-  "description": "Persistent working memory for Codex with Pensyve recall, capture, hooks, skills, and MCP tools",
+  "version": "1.4.1",
+  "description": "Persistent working memory for Codex with Pensyve recall, capture, hooks, skills, commands, and MCP tools",
   "author": {
     "name": "Major7 Apps",
     "url": "https://github.com/major7apps/pensyve"
@@ -15,10 +15,10 @@
   "interface": {
     "displayName": "Pensyve",
     "shortDescription": "Working memory for Codex agents",
-    "longDescription": "Give Codex persistent project memory that survives across sessions. Pensyve stores decisions, patterns, preferences, and outcomes, then retrieves the right context with the current retrieval stack: SelRoute classification, dependency-parse knowledge graph construction, Personalized PageRank, RPE-gated consolidation, and Vendi-Score diversity reranking when their gates are enabled.",
+    "longDescription": "Give Codex persistent project memory that survives across sessions. Pensyve stores decisions, patterns, preferences, and outcomes, then retrieves the right context with the current retrieval stack: SelRoute classification, dependency-parse knowledge graph construction, Personalized PageRank, RPE-gated consolidation, and Vendi-Score diversity reranking when their gates are enabled. Explicit workflows are available through $pensyve, /pensyve, and a text-level @pensyve compatibility convention while native Codex @-mention dispatch is pending platform support.",
     "developerName": "Major7 Apps",
     "category": "Productivity",
-    "capabilities": ["Interactive", "Write", "MCP", "Skills", "Hooks"],
+    "capabilities": ["Interactive", "Write", "MCP", "Skills", "Hooks", "Commands"],
     "websiteURL": "https://pensyve.com",
     "brandColor": "#2E6F68",
     "composerIcon": "./assets/pensyve-icon.svg",
@@ -26,6 +26,7 @@
     "defaultPrompt": [
       "Use Pensyve to recall relevant project memory before we continue.",
       "$pensyve what do you remember about this project?",
+      "/pensyve status",
       "$pensyve review my memory health and suggest cleanup."
     ]
   }

@@ -159,6 +159,7 @@ First-class OpenAI Codex plugin package:
 
 - Bundled `.mcp.json` for the Pensyve Cloud MCP server using `PENSYVE_API_KEY`
 - Skills including `pensyve` for Codex-native `$pensyve` invocation
+- `/pensyve` command and `mention-workflow` skill for explicit and text-level `@pensyve` memory requests
 - Lifecycle hooks: SessionStart and UserPromptSubmit
 - Local marketplace metadata under `.agents/plugins/marketplace.json`
 - Manual `AGENTS.md` fallback for Codex environments without plugin support

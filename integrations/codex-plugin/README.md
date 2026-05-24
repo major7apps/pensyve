@@ -31,6 +31,7 @@ The plugin bundles:
 
 - `.mcp.json` for the Pensyve MCP server
 - `skills/` including the first-class `pensyve` skill for `$pensyve` invocation
+- `commands/` including `/pensyve` for explicit recall, remember, inspect, status, and review flows
 - `hooks/hooks.json` for SessionStart and UserPromptSubmit memory guidance
 - install metadata and assets for Codex plugin surfaces
 
@@ -96,7 +97,17 @@ Codex CLI automatically loads `AGENTS.md` from the project root into every agent
 
 Pensyve now ships as a native Codex plugin package. The manifest points Codex at bundled skills, the plugin-scoped `.mcp.json`, and lifecycle hooks. The Memory Reflex Rule in `AGENTS.md` remains the reasoning layer: *before substantive answers, recall by entity; when a lesson lands, observe immediately with a one-line surface*. Flow sections (When Debugging, When Designing, When Refactoring, Longitudinal Work) guide the model through consult-memory + capture-lesson steps.
 
-**Codex-native invocation:** select the `pensyve` skill through `/skills` or type `$pensyve` in the prompt. Current Codex docs use `$skill` and `$app-slug` mentions for explicit invocation; the plugin is structured so a future registered Pensyve app/connector can be added via `.app.json` without changing the memory rules.
+**Codex-native invocation:** select the `pensyve` skill through `/skills`, type `$pensyve`, or use `/pensyve` for explicit memory work. Current Codex plugin guidance supports plugin and skill installation/discovery, while the local plugin model does not expose true `@pensyve` composer dispatch. The plugin therefore treats `@pensyve recall ...` as a text-level compatibility convention when the model sees it, and is structured so a future registered Pensyve app/connector can be added via `.app.json` without changing the memory rules.
+
+**Mention-style examples:**
+
+```text
+$pensyve what do you remember about this project?
+/pensyve recall release workflow decisions
+@pensyve recall Codex plugin install decisions
+```
+
+The `@pensyve` form is not native autocomplete or selector behavior today. It is a readable convention that routes through the same MCP tools as `$pensyve` and `/pensyve`.
 
 **Episode lifecycle:** Hooks can prime the model at session start and prompt submit, but episodes still open lazily on the first `pensyve_observe` call. Server-side consolidation handles aging.
 
@@ -148,6 +159,8 @@ See [MCP Tools Reference](https://pensyve.com/docs/api-reference/mcp-tools) for 
 - **Memory as substrate** — not a feature the user invokes; always there, continuous, carried across sessions
 - **Codex-first package** — plugin manifest, bundled MCP server, hooks, skills, assets, and local marketplace metadata
 - **Skill invocation** — `$pensyve` gives users an explicit memory entry point while implicit recall still works for substantive work
+- **Command invocation** — `/pensyve` gives users a command-shaped entry point for recall, remember, inspect, status, and review
+- **Mention-compatible convention** — `@pensyve` is accepted as user intent in text while true Codex @-mention dispatch waits on platform support
 - **1:1 memory model with Claude Code** — same conventions and same memory types, adapted to Codex's plugin and skill surfaces
 - **MCP contract-respecting** — every rule's call examples verified against `pensyve-mcp-tools/src/params.rs`
 - **Single-file fallback** — Codex CLI's `AGENTS.md` remains available for environments that cannot install plugins
@@ -157,6 +170,7 @@ See [MCP Tools Reference](https://pensyve.com/docs/api-reference/mcp-tools) for 
 - **Website:** [pensyve.com](https://pensyve.com)
 - **GitHub:** [github.com/major7apps/pensyve](https://github.com/major7apps/pensyve)
 - **Spec:** [Working-memory substrate design](https://github.com/major7apps/pensyve-docs/blob/main/specs/2026-04-18-pensyve-working-memory-substrate-design.md)
+- **Codex plugin architecture:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ## License
 

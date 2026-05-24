@@ -4,6 +4,18 @@ All notable changes to the Pensyve Codex CLI adapter are documented in this file
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The Codex CLI adapter versions independently of the Claude Code plugin.
 
+## [1.4.1] - 2026-05-24
+
+### Added
+
+- `/pensyve` Codex command for explicit recall, remember, observe, inspect, status, review, forget, and mention-help workflows.
+- `mention-workflow` skill that treats literal `@pensyve` text as explicit memory intent while documenting that true Codex @-mention dispatch is not currently exposed for local plugin bundles.
+- Short architecture brief covering desired UX, @-mention feasibility, plugin layout, MCP/local integration, auth/config, and migration from the Claude Code plugin.
+
+### Changed
+
+- Plugin metadata, README, and static validation now include command and mention-workflow surfaces.
+
 ## [1.4.0] - 2026-05-24
 
 ### Added

@@ -1,27 +1,43 @@
 #!/usr/bin/env bash
 # Static MCP contract linter for the Pensyve Codex CLI adapter.
 #
-# Verifies that every pensyve_* call example in AGENTS.md
+# Verifies that every pensyve_* call example in the Codex plugin instructions
 # conforms to the current MCP tool schema in pensyve-mcp-tools/src/params.rs.
 # Catches the category of bug PR #58 surfaced in the Claude Code adapter
 # (unsupported parameters, missing required fields).
 #
-# Codex CLI uses a single consolidated AGENTS.md file for agent instructions,
-# so this script targets AGENTS.md directly.
-
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RULES_FILE="$SCRIPT_DIR/../AGENTS.md"
+PLUGIN_ROOT="$SCRIPT_DIR/.."
+MCP_REF_FILES=(
+  "$PLUGIN_ROOT/AGENTS.md"
+  "$PLUGIN_ROOT/skills/pensyve/SKILL.md"
+  "$PLUGIN_ROOT/skills/mention-workflow/SKILL.md"
+  "$PLUGIN_ROOT/commands/pensyve.md"
+  "$PLUGIN_ROOT/docs/ARCHITECTURE.md"
+)
 
 EXIT_CODE=0
 
-if [ ! -f "$RULES_FILE" ]; then
-  echo "ERROR: AGENTS.md not found: $RULES_FILE"
-  exit 1
+echo "Checking required Codex plugin surfaces..."
+for file in "${MCP_REF_FILES[@]}"; do
+  if [ ! -f "$file" ]; then
+    echo "  FAIL: required file missing: $file"
+    EXIT_CODE=1
+  else
+    echo "  PASS: $file"
+  fi
+done
+echo ""
+
+if [ "$EXIT_CODE" != "0" ]; then
+  echo "Codex plugin surface checks FAILED."
+  exit "$EXIT_CODE"
 fi
 
-echo "Linting MCP references in $RULES_FILE..."
+echo "Linting MCP references in:"
+printf '  %s\n' "${MCP_REF_FILES[@]}"
 echo ""
 
 # Check 1: no actual use of unsupported 'related_entities' parameter in call examples.
@@ -40,7 +56,7 @@ done < <(awk '/pensyve_recall\(/{capture=1; buf=""}
        if(buf ~ /related_entities/ && buf !~ /\*\*no\*\*/ && buf !~ /no `related_entities`/)
        print FILENAME ": related_entities found in pensyve_recall block: " buf;
        capture=0
-       }' "$RULES_FILE")
+       }' "${MCP_REF_FILES[@]}")
 if [ "$FOUND_RELATED" = "0" ]; then
   echo "  PASS"
 else
@@ -62,7 +78,7 @@ done < <(awk '/pensyve_episode_start\(/{capture=1; buf=""}
        if(buf ~ /continuation_of/ && buf !~ /\*\*no\*\*/ && buf !~ /no `continuation_of`/)
        print FILENAME ": continuation_of found in pensyve_episode_start block: " buf;
        capture=0
-       }' "$RULES_FILE")
+       }' "${MCP_REF_FILES[@]}")
 if [ "$FOUND_CONT" = "0" ]; then
   echo "  PASS"
 else
@@ -89,7 +105,7 @@ done < <(awk '/pensyve_observe\(/{capture=1; buf=""; depth=0}
        if(buf !~ /source_entity/) print FILENAME ": missing source_entity near: " buf;
        if(buf !~ /about_entity/) print FILENAME ": missing about_entity near: " buf;
        capture=0;
-       }}' "$RULES_FILE")
+       }}' "${MCP_REF_FILES[@]}")
 if [ "$MISSING_FIELDS" = "0" ]; then
   echo "  PASS"
 else
@@ -100,7 +116,7 @@ echo ""
 # Check 4: provenance tag format — every proactive/auto-capture tag uses [<origin>/<trigger>/<tier>]
 echo "Check 4: provenance tag format"
 VALID_PROVENANCE_RE='\[(proactive|auto-capture)/(in-flight|stop|pre-compact|curator|user)/(tier-1|tier-2|residual/tier-1|residual/tier-2|open-question)\]'
-if rg -n '\[(proactive|auto-capture)' "$RULES_FILE" | rg -v "$VALID_PROVENANCE_RE"; then
+if rg -n '\[(proactive|auto-capture)' "${MCP_REF_FILES[@]}" | rg -v "$VALID_PROVENANCE_RE"; then
   echo "  FAIL: some provenance tags do not match [<origin>/<trigger>/<tier>] format"
   EXIT_CODE=1
 else
@@ -110,10 +126,23 @@ echo ""
 
 # Check 5: procedural memory convention — [procedural] prefix is used in observe content
 echo "Check 5: procedural convention uses [procedural] prefix in pensyve_observe content"
-if ! rg -q '\[procedural\]' "$RULES_FILE"; then
+if ! rg -q '\[procedural\]' "${MCP_REF_FILES[@]}"; then
   echo "  WARN: no [procedural] prefix usage found. Expected in AGENTS.md."
 else
   echo "  PASS"
+fi
+echo ""
+
+# Check 6: @-mention compatibility is explicit about today's Codex limitation.
+echo "Check 6: @-mention workflow documents current Codex dispatch limitation"
+if rg -q 'true @-mention dispatch is not currently exposed|Codex does not currently expose true @-mention dispatch' \
+  "$PLUGIN_ROOT/skills/mention-workflow/SKILL.md" \
+  "$PLUGIN_ROOT/commands/pensyve.md" \
+  "$PLUGIN_ROOT/docs/ARCHITECTURE.md"; then
+  echo "  PASS"
+else
+  echo "  FAIL: mention workflow must document that true @-mention dispatch is not currently exposed"
+  EXIT_CODE=1
 fi
 echo ""
 

@@ -5,7 +5,7 @@ description: Use when the user explicitly invokes Pensyve, asks what the agent r
 
 # Pensyve
 
-Use Pensyve as Codex's persistent working memory. The skill is intended for explicit `$pensyve` invocation from Codex, selection through `/skills`, and implicit routing when a task clearly depends on prior project memory.
+Use Pensyve as Codex's persistent working memory. The skill is intended for explicit `$pensyve` invocation from Codex, selection through `/skills`, `/pensyve` command workflows, text-level `@pensyve` compatibility requests, and implicit routing when a task clearly depends on prior project memory.
 
 ## When To Use
 
@@ -14,6 +14,7 @@ Use Pensyve as Codex's persistent working memory. The skill is intended for expl
 - You are about to make a substantive recommendation that prior project decisions could affect.
 - The user asks to review, clean up, or inspect memory state.
 - The user asks Codex to continue prior work without re-briefing.
+- The user types `@pensyve` as a mention-style memory request.
 
 Do not use this skill for trivial commands, simple formatting, one-off shell output, or facts that should not be persisted.
 
@@ -45,3 +46,4 @@ Do not use this skill for trivial commands, simple formatting, one-off shell out
 - If Pensyve MCP tools are unavailable, say: "Pensyve MCP is not connected for this session." Then continue without memory.
 - If a write fails, report the failed item and continue with any remaining requested work.
 - Never fabricate memories. Only present what Pensyve returned or what the current session established.
+- Do not claim true `@pensyve` platform dispatch. Current Codex support is `$pensyve`, `/skills`, `/pensyve`, and text-level `@pensyve` interpretation by the model.
