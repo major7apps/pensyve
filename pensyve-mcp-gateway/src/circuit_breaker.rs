@@ -392,6 +392,11 @@ impl CircuitBreaker {
             Ok(Ok(Some(_))) => true,
             Ok(Ok(None)) => false,
             Ok(Err(e)) => {
+                // Redis coordinates the cross-pod single-probe contract
+                // only while it is reachable. If Redis is itself down,
+                // degrade to the in-memory single-process claim so the
+                // circuit can still recover instead of staying Open
+                // forever.
                 tracing::debug!(
                     circuit = self.config.name,
                     error = %e,
@@ -400,6 +405,9 @@ impl CircuitBreaker {
                 true
             }
             Err(_) => {
+                // Same availability trade-off as the Redis error branch:
+                // prefer a local probe over a permanently stuck Open
+                // circuit when the coordinator is unavailable.
                 tracing::debug!(
                     circuit = self.config.name,
                     "Redis HalfOpen probe claim timed out; using in-memory fallback claim"

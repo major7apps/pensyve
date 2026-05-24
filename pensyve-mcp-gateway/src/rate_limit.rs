@@ -14,7 +14,7 @@
 //! the cluster is running in degraded mode.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -30,6 +30,7 @@ use crate::AppState;
 use crate::auth::AuthContext;
 
 const REDIS_RATE_LIMIT_TIMEOUT: Duration = Duration::from_millis(150);
+const FALLBACK_EVICT_EVERY_CHECKS: u64 = 64;
 
 /// Plan-tier limits, keyed by the `plan` string returned from auth.
 ///
@@ -151,6 +152,7 @@ pub struct RateLimiter {
     /// One-shot flag so the "Redis unavailable, falling back to memory"
     /// warning only fires once per process even under sustained failure.
     fallback_warned: Arc<AtomicBool>,
+    fallback_sweep_counter: Arc<AtomicU64>,
     #[cfg(test)]
     force_redis_error: Arc<AtomicBool>,
 }
@@ -163,6 +165,7 @@ impl RateLimiter {
             fallback: Arc::new(DashMap::new()),
             script: Arc::new(Script::new(RATE_LIMIT_LUA)),
             fallback_warned: Arc::new(AtomicBool::new(false)),
+            fallback_sweep_counter: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             force_redis_error: Arc::new(AtomicBool::new(false)),
         }
@@ -275,7 +278,7 @@ impl RateLimiter {
     /// Pure in-memory path. Implements the same sliding-minute semantics
     /// as the Redis script, minus the daily quota (see module docs).
     fn check_fallback(&self, tenant_id: &str, limits: Limits, now_secs: u64) -> CheckOutcome {
-        self.evict_idle_fallback_buckets(now_secs);
+        self.maybe_evict_idle_fallback_buckets(now_secs);
 
         let mut entry = self.fallback.entry(tenant_id.to_string()).or_default();
         let bucket = entry.value_mut();
@@ -310,6 +313,13 @@ impl RateLimiter {
                 let wait = (oldest + 60).saturating_sub(now_secs).max(1);
                 Some(u32::try_from(wait).unwrap_or(60))
             },
+        }
+    }
+
+    fn maybe_evict_idle_fallback_buckets(&self, now_secs: u64) {
+        let check = self.fallback_sweep_counter.fetch_add(1, Ordering::Relaxed);
+        if check % FALLBACK_EVICT_EVERY_CHECKS == 0 {
+            self.evict_idle_fallback_buckets(now_secs);
         }
     }
 
@@ -667,11 +677,10 @@ mod tests {
         assert!(first.allowed);
         assert_eq!(rl.fallback_bucket_count_for_test(), 1);
 
-        let second = rl.check_fallback("tenant_active", limits, 1_061);
-        assert!(second.allowed);
+        rl.evict_idle_fallback_buckets(1_061);
         assert_eq!(
             rl.fallback_bucket_count_for_test(),
-            1,
+            0,
             "idle tenant bucket should be evicted after the sliding window"
         );
     }
