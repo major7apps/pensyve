@@ -278,7 +278,7 @@ See [`integrations/claude-code/README.md`](integrations/claude-code/README.md) f
 
 ### Codex Plugin
 
-First-class working memory for OpenAI Codex with a plugin manifest, bundled MCP server config, hooks, skills, and `$pensyve` skill invocation.
+First-class working memory for OpenAI Codex with a plugin manifest, bundled MCP server config, hooks, skills, `/pensyve`, and `$pensyve` skill invocation.
 
 Add this repo's Codex plugin as a local marketplace, then install it:
 
@@ -293,7 +293,7 @@ Set your API key for the bundled MCP server:
 export PENSYVE_API_KEY="psy_your_key_here"
 ```
 
-The plugin bundles `integrations/codex-plugin/.mcp.json`, so Codex can load the Pensyve MCP server without copying a project config file. Use `/skills` or `$pensyve` for explicit memory work, or let the bundled hooks and instructions prompt Codex to recall before substantive project decisions.
+The plugin bundles `integrations/codex-plugin/.mcp.json`, so Codex can load the Pensyve MCP server without copying a project config file. Use `/skills`, `$pensyve`, or `/pensyve` for explicit memory work, or let the bundled hooks and instructions prompt Codex to recall before substantive project decisions. `@pensyve` is documented as a text-level compatibility convention; true native Codex @-mention dispatch still needs platform support.
 
 See [`integrations/codex-plugin/README.md`](integrations/codex-plugin/README.md) for the manual fallback and local-stdio setup.
 
