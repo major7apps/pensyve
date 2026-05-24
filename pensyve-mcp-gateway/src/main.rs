@@ -545,8 +545,7 @@ fn positive_millis_value(value: Option<&str>, default: Duration) -> Duration {
     value
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|millis| *millis > 0)
-        .map(Duration::from_millis)
-        .unwrap_or(default)
+        .map_or(default, Duration::from_millis)
 }
 
 async fn health_handler() -> &'static str {

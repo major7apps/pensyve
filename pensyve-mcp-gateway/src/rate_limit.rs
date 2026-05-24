@@ -204,7 +204,7 @@ impl RateLimiter {
                     self.handle_redis_failure(&"redis rate-limit timeout");
                     // Fall through to the in-memory path.
                 }
-            };
+            }
         }
 
         self.check_fallback(tenant_id, limits, now_secs)
@@ -318,7 +318,7 @@ impl RateLimiter {
 
     fn maybe_evict_idle_fallback_buckets(&self, now_secs: u64) {
         let check = self.fallback_sweep_counter.fetch_add(1, Ordering::Relaxed);
-        if check % FALLBACK_EVICT_EVERY_CHECKS == 0 {
+        if check.is_multiple_of(FALLBACK_EVICT_EVERY_CHECKS) {
             self.evict_idle_fallback_buckets(now_secs);
         }
     }
