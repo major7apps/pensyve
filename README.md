@@ -280,12 +280,15 @@ See [`integrations/claude-code/README.md`](integrations/claude-code/README.md) f
 
 First-class working memory for OpenAI Codex with a plugin manifest, bundled MCP server config, hooks, skills, `/pensyve`, and `$pensyve` skill invocation.
 
-Add this repo's Codex plugin as a local marketplace, then install it:
+Add this repo as a Codex plugin marketplace, then install Pensyve:
 
 ```bash
-codex plugin marketplace add /path/to/pensyve/integrations/codex-plugin
+codex plugin marketplace add major7apps/pensyve
 codex plugin add pensyve@pensyve-codex
 ```
+
+For local development from a checkout, use
+`codex plugin marketplace add /path/to/pensyve/integrations/codex-plugin` instead.
 
 Set your API key for the bundled MCP server:
 

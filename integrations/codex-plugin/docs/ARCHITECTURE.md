@@ -32,11 +32,12 @@ Pensyve app/connector surface that Codex can expose in the composer.
 
 ## Plugin Layout
 
-The current bundle is `integrations/codex-plugin/`:
+The upstream repo exposes a root Codex marketplace at `.agents/plugins/marketplace.json` that
+points to `./integrations/codex-plugin`. The current plugin bundle is:
 
 ```text
 .codex-plugin/plugin.json       # Codex plugin manifest
-.agents/plugins/marketplace.json # Local marketplace metadata
+.agents/plugins/marketplace.json # Local marketplace metadata for this subdirectory
 .mcp.json                       # Pensyve Cloud MCP config using PENSYVE_API_KEY
 AGENTS.md                       # Single-file memory substrate fallback
 skills/                         # Codex skills, including pensyve and mention-workflow

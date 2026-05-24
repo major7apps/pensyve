@@ -70,14 +70,14 @@ First-class working memory for OpenAI Codex.
 
 ### Cloud
 
-Add the local marketplace from a checkout of this repo:
+Add the upstream repository as a Codex marketplace:
 
 ```bash
-codex plugin marketplace add /path/to/pensyve/integrations/codex-plugin
+codex plugin marketplace add major7apps/pensyve
 codex plugin add pensyve@pensyve-codex
 ```
 
-You can also use `/plugins` to inspect or install **Pensyve** from the **Pensyve Codex** marketplace. Then set your API key:
+You can also use `/plugins` to inspect or install **Pensyve** from the **Pensyve Codex** marketplace. For local development from a checkout, use `codex plugin marketplace add /path/to/pensyve/integrations/codex-plugin` instead. Then set your API key:
 
 ```bash
 export PENSYVE_API_KEY="psy_your_key"

@@ -16,16 +16,23 @@ Recommended path: install the Codex plugin package, then authenticate the bundle
 
 Tagged Pensyve releases include a `pensyve-codex-plugin-v*.tar.gz` asset containing this plugin directory for pinned installs.
 
-### 1. Add the local marketplace
+### 1. Add the upstream marketplace
 
 From any Codex session on the machine:
+
+```bash
+codex plugin marketplace add major7apps/pensyve
+codex plugin add pensyve@pensyve-codex
+```
+
+You can also open `/plugins`, find **Pensyve**, and install it from the **Pensyve Codex** marketplace.
+
+For local development from a checkout, use:
 
 ```bash
 codex plugin marketplace add /path/to/pensyve/integrations/codex-plugin
 codex plugin add pensyve@pensyve-codex
 ```
-
-You can also open `/plugins`, find **Pensyve**, and install it from the **Pensyve Codex** marketplace.
 
 The plugin bundles:
 
