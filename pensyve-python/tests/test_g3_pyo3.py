@@ -87,8 +87,8 @@ def _seed_observations(
             episode_id = str(uuid.uuid4())
             for row in range(rows_per_day):
                 obs_id = str(uuid.uuid4())
-                # Two distinct entities × two days each → cross-session
-                # entities (the MS card filter requires ≥2 distinct days).
+                # Two distinct entities x two days each -> cross-session
+                # entities (the MS card filter requires >=2 distinct days).
                 entity_type = "game_played" if row % 2 == 0 else "place_lived"
                 instance = "Hades" if row % 2 == 0 else "Portland"
                 action = "played" if row % 2 == 0 else "lives"

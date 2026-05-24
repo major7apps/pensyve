@@ -55,7 +55,7 @@ npm install pensyve          # TypeScript (npm)
 go get github.com/major7apps/pensyve/pensyve-go@latest  # Go
 ```
 
-Or use the MCP server directly with Claude Code, Cursor, or any MCP client — see [MCP Setup](https://pensyve.com/docs/getting-started/mcp-setup).
+Or use the MCP server directly with Codex, Claude Code, Cursor, or any MCP client — see [MCP Setup](https://pensyve.com/docs/getting-started/mcp-setup).
 
 ## Quick Start
 
@@ -275,6 +275,27 @@ Plugin contents:
 ```
 
 See [`integrations/claude-code/README.md`](integrations/claude-code/README.md) for full documentation.
+
+### Codex Plugin
+
+First-class working memory for OpenAI Codex with a plugin manifest, bundled MCP server config, hooks, skills, and `$pensyve` skill invocation.
+
+Add this repo's Codex plugin as a local marketplace, then install it:
+
+```bash
+codex plugin marketplace add /path/to/pensyve/integrations/codex-plugin
+codex plugin add pensyve@pensyve-codex
+```
+
+Set your API key for the bundled MCP server:
+
+```bash
+export PENSYVE_API_KEY="psy_your_key_here"
+```
+
+The plugin bundles `integrations/codex-plugin/.mcp.json`, so Codex can load the Pensyve MCP server without copying a project config file. Use `/skills` or `$pensyve` for explicit memory work, or let the bundled hooks and instructions prompt Codex to recall before substantive project decisions.
+
+See [`integrations/codex-plugin/README.md`](integrations/codex-plugin/README.md) for the manual fallback and local-stdio setup.
 
 ### REST API
 

@@ -1,0 +1,14 @@
+interface:
+  display_name: Pensyve
+  short_description: Persistent working memory for Codex
+  brand_color: "#2E6F68"
+  default_prompt: "Recall relevant Pensyve memory for this project before proceeding."
+policy:
+  allow_implicit_invocation: true
+dependencies:
+  tools:
+    - pensyve_recall
+    - pensyve_remember
+    - pensyve_observe
+    - pensyve_inspect
+    - pensyve_status

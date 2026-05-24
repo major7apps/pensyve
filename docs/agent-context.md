@@ -153,6 +153,16 @@ Feature-complete plugin for the Claude Code marketplace:
 - 4 hooks: SessionStart, Stop, PreCompact, UserPromptSubmit
 - All operations go through MCP tools — plugin never accesses `.claude/` files
 
+### Codex Plugin (`integrations/codex-plugin/`)
+
+First-class OpenAI Codex plugin package:
+
+- Bundled `.mcp.json` for the Pensyve Cloud MCP server using `PENSYVE_API_KEY`
+- Skills including `pensyve` for Codex-native `$pensyve` invocation
+- Lifecycle hooks: SessionStart and UserPromptSubmit
+- Local marketplace metadata under `.agents/plugins/marketplace.json`
+- Manual `AGENTS.md` fallback for Codex environments without plugin support
+
 ## Conventions
 
 - **Rust edition 2024**, min MSRV 1.88. Clippy pedantic enabled workspace-wide (see allowed lints in root `Cargo.toml`).

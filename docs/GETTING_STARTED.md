@@ -5,6 +5,7 @@ Choose your path based on how you want to use Pensyve.
 | I want to...                                       | Start here                                     |
 | -------------------------------------------------- | ---------------------------------------------- |
 | Add memory to Claude Code                          | [Claude Code Plugin](#claude-code-plugin)      |
+| Add memory to Codex                                | [Codex Plugin](#codex-plugin)                  |
 | Add memory to Cursor, Cline, or another MCP client | [MCP Server](#mcp-server)                      |
 | Build a Python agent with memory                   | [Python SDK](#python-sdk)                      |
 | Build a TypeScript agent with memory               | [TypeScript SDK](#typescript-sdk)              |
@@ -60,6 +61,56 @@ Build the MCP server first ([Building from Source](#building-from-source)), then
 No API key needed.
 
 See [`integrations/claude-code/README.md`](../integrations/claude-code/README.md) for full documentation on commands, skills, agents, and hooks.
+
+---
+
+## Codex Plugin
+
+First-class working memory for OpenAI Codex.
+
+### Cloud
+
+Add the local marketplace from a checkout of this repo:
+
+```bash
+codex plugin marketplace add /path/to/pensyve/integrations/codex-plugin
+codex plugin add pensyve@pensyve-codex
+```
+
+You can also use `/plugins` to inspect or install **Pensyve** from the **Pensyve Codex** marketplace. Then set your API key:
+
+```bash
+export PENSYVE_API_KEY="psy_your_key"
+```
+
+Try it:
+
+```
+$pensyve what do you remember about this project?
+$pensyve remember that auth-service uses RS256 signing
+```
+
+The plugin bundles its `.mcp.json`, skills, hooks, assets, and install metadata. Current Codex explicit invocation uses `/skills` or `$pensyve`; app-style `$app-slug` invocation can be added later through `.app.json` when a registered Pensyve Codex app/connector exists.
+
+### Local
+
+Build the MCP server first ([Building from Source](#building-from-source)), then use a project MCP config:
+
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "command": "pensyve-mcp",
+      "args": ["--stdio"],
+      "env": {
+        "PENSYVE_NAMESPACE": "my-project"
+      }
+    }
+  }
+}
+```
+
+See [`integrations/codex-plugin/README.md`](../integrations/codex-plugin/README.md) for full documentation.
 
 ---
 

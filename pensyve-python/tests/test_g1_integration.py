@@ -3,7 +3,7 @@
 Exercises the complete G1 surface in one flow:
 
   1. Build a v2.1-shaped store fixture (legacy unscoped writes →
-     NULL/NULL agent×user rows).
+     NULL/NULL agent x user rows).
   2. Construct a G1 Pensyve handle with `(A1, U1)` against the SAME
      store. The migration applies on construction.
   3. Write 5 new memories under `(A1, U1)`.
@@ -35,7 +35,6 @@ from pathlib import Path
 import pytest
 
 import pensyve
-
 
 # ---------------------------------------------------------------------------
 # Helpers

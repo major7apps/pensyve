@@ -26,10 +26,8 @@ path.
 from __future__ import annotations
 
 import tempfile
-from typing import List
 
 import pensyve
-
 
 # Fixed query suite — chosen to exercise different memory types and to
 # return a stable ordered set under RRF scoring on the seed corpus below.
@@ -63,7 +61,7 @@ def _ingest_corpus(p: pensyve.Pensyve) -> None:
             ep.message("user", content)
 
 
-def _capture(p: pensyve.Pensyve) -> List[List[tuple]]:
+def _capture(p: pensyve.Pensyve) -> list[list[tuple]]:
     """Run the query suite and return ordered (id, content) tuples per query."""
     return [
         [(m.id, m.content) for m in p.recall(q, limit=5)]
@@ -94,7 +92,7 @@ def test_recall_parity_unscoped_handle_post_migration():
         del p2
 
         # Byte-for-byte parity on result IDs and content per query.
-        for query, b, a in zip(QUERIES, baseline, post):
+        for query, b, a in zip(QUERIES, baseline, post, strict=True):
             assert a == b, (
                 f"recall divergence on query {query!r}:\n"
                 f"  pre  ({len(b)} rows): {b}\n"
@@ -103,7 +101,7 @@ def test_recall_parity_unscoped_handle_post_migration():
 
         # Also verify the legacy NULL bucket was not silently emptied or
         # leaked by the migration: every result is a real row from CORPUS.
-        for q, rows in zip(QUERIES, post):
+        for q, rows in zip(QUERIES, post, strict=True):
             for _, content in rows:
                 assert content in CORPUS, (
                     f"unexpected row content for {q!r}: {content!r}"

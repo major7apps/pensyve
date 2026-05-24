@@ -1,0 +1,1 @@
+Before answering a substantive prompt, consider whether prior project memory would change the answer. If yes, recall with `pensyve_recall` scoped to the detected entity. When the session confirms a durable decision, root cause, constraint, or reusable workflow, capture it with `pensyve_remember` or `pensyve_observe` after stripping secrets.

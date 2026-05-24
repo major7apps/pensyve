@@ -16,13 +16,13 @@ from pensyve.reader import (
 )
 
 __all__ = [
+    "V7_OBSERVATION_WRAPPER_PREFIX",
+    "V7_OBSERVATION_WRAPPER_SUFFIX",
     "Entity",
     "Episode",
     "Memory",
     "Pensyve",
     "SessionGroup",
-    "V7_OBSERVATION_WRAPPER_PREFIX",
-    "V7_OBSERVATION_WRAPPER_SUFFIX",
     "__version__",
     "classify_query_naive",
     "embedding_info",

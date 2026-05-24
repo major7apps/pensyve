@@ -198,10 +198,32 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.*
 
+  # ── Package Codex plugin ──────────────────────────────────────────────────
+  package-codex-plugin:
+    name: Package Codex plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Validate plugin metadata
+        run: |
+          python -m json.tool integrations/codex-plugin/.codex-plugin/plugin.json >/dev/null
+          python -m json.tool integrations/codex-plugin/.mcp.json >/dev/null
+          python -m json.tool integrations/codex-plugin/.agents/plugins/marketplace.json >/dev/null
+          bash integrations/codex-plugin/scripts/lint-mcp-refs.sh
+      - name: Package plugin
+        run: |
+          PLUGIN_VERSION="$(python -c "import json; print(json.load(open('integrations/codex-plugin/.codex-plugin/plugin.json'))['version'])")"
+          tar -czf "pensyve-codex-plugin-v${PLUGIN_VERSION}.tar.gz" -C integrations codex-plugin
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pensyve-codex-plugin
+          path: pensyve-codex-plugin-v*.tar.gz
+
   # ── GitHub Release ─────────────────────────────────────────────────────────
   github-release:
     name: Create GitHub Release
-    needs: [build-cli, build-mcp, build-python, build-python-sdist]
+    needs: [build-cli, build-mcp, build-python, build-python-sdist, package-codex-plugin]
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:

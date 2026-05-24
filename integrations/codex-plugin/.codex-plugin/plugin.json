@@ -1,7 +1,7 @@
 {
   "name": "pensyve",
-  "version": "1.3.0",
-  "description": "Persistent memory for Codex — your agent remembers decisions, patterns, and context across sessions",
+  "version": "1.4.0",
+  "description": "Persistent working memory for Codex with Pensyve recall, capture, hooks, skills, and MCP tools",
   "author": {
     "name": "Major7 Apps",
     "url": "https://github.com/major7apps/pensyve"
@@ -9,28 +9,24 @@
   "homepage": "https://pensyve.com",
   "repository": "https://github.com/major7apps/pensyve",
   "license": "Apache-2.0",
-  "keywords": ["memory", "agents", "mcp", "retrieval", "ai"],
+  "keywords": ["memory", "agents", "mcp", "retrieval", "codex", "ai"],
   "skills": "./skills/",
-  "mcpServers": {
-    "pensyve": {
-      "url": "https://mcp.pensyve.com/mcp",
-      "env": {
-        "PENSYVE_API_KEY": "${PENSYVE_API_KEY}"
-      }
-    }
-  },
+  "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "Pensyve Memory",
-    "shortDescription": "Cross-session memory runtime for AI agents",
-    "longDescription": "Give your Codex agent persistent memory that survives across sessions. Pensyve stores decisions, patterns, preferences, and outcomes — and retrieves the right context at the right time with 8-signal fusion ranking.",
+    "displayName": "Pensyve",
+    "shortDescription": "Working memory for Codex agents",
+    "longDescription": "Give Codex persistent project memory that survives across sessions. Pensyve stores decisions, patterns, preferences, and outcomes, then retrieves the right context with the current retrieval stack: SelRoute classification, dependency-parse knowledge graph construction, Personalized PageRank, RPE-gated consolidation, and Vendi-Score diversity reranking when their gates are enabled.",
     "developerName": "Major7 Apps",
     "category": "Productivity",
-    "capabilities": ["Interactive", "Write"],
+    "capabilities": ["Interactive", "Write", "MCP", "Skills", "Hooks"],
     "websiteURL": "https://pensyve.com",
+    "brandColor": "#2E6F68",
+    "composerIcon": "./assets/pensyve-icon.svg",
+    "logo": "./assets/pensyve-logo.svg",
     "defaultPrompt": [
-      "What do you remember about this project?",
-      "Remember that we decided to use Postgres for production.",
-      "Review my memory health and suggest cleanup."
+      "Use Pensyve to recall relevant project memory before we continue.",
+      "$pensyve what do you remember about this project?",
+      "$pensyve review my memory health and suggest cleanup."
     ]
   }
 }

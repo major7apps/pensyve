@@ -60,8 +60,8 @@ def _seed_observations_with_chain_summary(
                 obs_id = str(uuid.uuid4())
                 if chain_marker_row_id is None:
                     chain_marker_row_id = obs_id
-                # Two distinct entities × multiple days each → cross-
-                # session entities (MS card filter requires ≥2 days).
+                # Two distinct entities x multiple days each -> cross-
+                # session entities (MS card filter requires >=2 days).
                 entity_type = "game_played" if row % 2 == 0 else "place_lived"
                 instance = "Hades" if row % 2 == 0 else "Portland"
                 action = "played" if row % 2 == 0 else "lives"

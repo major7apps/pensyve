@@ -51,7 +51,7 @@ Use `content_type: "code"` for code-related outcomes.
 
 ### Episode lifecycle (lazy-open)
 
-Codex CLI has no session-start/session-end hooks, so you own the episode lifecycle:
+The Codex plugin bundles light SessionStart/UserPromptSubmit hooks, but they do not own episode state. You own the episode lifecycle:
 
 - Before your first `pensyve_observe` call in this conversation, check whether a working `episode_id` is tracked. If none exists, call `pensyve_episode_start(participants: ["codex", "<project entity>"])` first.
 - Reuse the same `episode_id` for all subsequent observations in the same conversation.
