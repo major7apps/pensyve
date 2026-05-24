@@ -26,8 +26,8 @@ routing yet.
 ## Workflow
 
 1. Parse the text after `@pensyve`.
-   - If it is empty, ask one short question about whether the user wants recall, remember, status,
-     inspect, or memory review.
+   - If it is empty, ask one short question about whether the user wants recall, remember, observe,
+     inspect, status, review, or forget, and how they want to mention or reference the subject.
    - If it contains a repo, file, feature, service, or person, use that as the primary entity.
    - Otherwise fall back to the current repository name.
 

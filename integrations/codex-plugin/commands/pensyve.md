@@ -1,5 +1,5 @@
 ---
-description: Route explicit Pensyve memory requests through the bundled MCP server; supports recall, remember, inspect, status, review, and mention-style guidance.
+description: Route explicit Pensyve memory requests through the bundled MCP server; supports recall, remember, observe, inspect, status, review, forget, and mention-style guidance.
 ---
 
 # Pensyve Memory Command
@@ -11,8 +11,8 @@ the existing Pensyve MCP tools and CLI surfaces instead of duplicating memory lo
 
 1. Read the user's request after `/pensyve`.
    - Treat literal `@pensyve` text as the same explicit memory intent.
-   - If no action is specified, ask whether the user wants recall, remember, inspect, status, or
-     memory review.
+   - If no action is specified, ask whether the user wants recall, remember, observe, inspect,
+     status, review, forget, or mention-help.
 2. Check whether Pensyve MCP tools are available.
    - If available, call `pensyve_status` for status requests or proceed directly to the requested
      MCP operation.
