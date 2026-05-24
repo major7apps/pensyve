@@ -4,6 +4,13 @@ All notable changes to the Pensyve Codex CLI adapter are documented in this file
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The Codex CLI adapter versions independently of the Claude Code plugin.
 
+## [1.4.2] - 2026-05-24
+
+### Fixed
+
+- Replaced the Codex plugin's placeholder green "P" assets with the canonical Pensyve purple stacked-bar mark used by the project branding.
+- Updated the Codex plugin brand color to match the Pensyve project mark.
+
 ## [1.4.1] - 2026-05-24
 
 ### Added

@@ -1,6 +1,6 @@
 {
   "name": "pensyve",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "Persistent working memory for Codex with Pensyve recall, capture, hooks, skills, commands, and MCP tools",
   "author": {
     "name": "Major7 Apps",
@@ -20,7 +20,7 @@
     "category": "Productivity",
     "capabilities": ["Interactive", "Write", "MCP", "Skills", "Hooks", "Commands"],
     "websiteURL": "https://pensyve.com",
-    "brandColor": "#2E6F68",
+    "brandColor": "#7C3AED",
     "composerIcon": "./assets/pensyve-icon.svg",
     "logo": "./assets/pensyve-logo.svg",
     "defaultPrompt": [
