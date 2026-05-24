@@ -193,6 +193,9 @@ impl FallbackState {
 //   pensyve:cb:<name>:failures -> integer counter (TTL = window_secs)
 //   pensyve:cb:<name>:opened_at-> RFC3339 timestamp (TTL = cooldown_secs)
 //   pensyve:cb:<name>:probe    -> short-lived single HalfOpen probe claim
+//   pensyve:cb:<name>:closed   -> short-lived marker written by a successful
+//                                 probe so sibling pods can clear stale local
+//                                 Open state without waiting for their own probe
 //
 // State is derived as: if `state` key is "open" → Open; else if
 // `failures >= threshold` → trip to Open inside the breaker; else Closed.
@@ -215,6 +218,10 @@ fn redis_opened_at_key(name: &str) -> String {
 
 fn redis_probe_key(name: &str) -> String {
     format!("pensyve:cb:{name}:probe")
+}
+
+fn redis_closed_key(name: &str) -> String {
+    format!("pensyve:cb:{name}:closed")
 }
 
 /// Maximum time we wait on a Redis call inside a breaker check before
@@ -278,27 +285,48 @@ impl CircuitBreaker {
                     .await
                     .ok()
                     .flatten();
-                state
+                let closed: Option<String> = redis
+                    .get(redis_closed_key(self.config.name))
+                    .await
+                    .ok()
+                    .flatten();
+                let probe: Option<String> = redis
+                    .get(redis_probe_key(self.config.name))
+                    .await
+                    .ok()
+                    .flatten();
+                (state, closed, probe)
             })
             .await;
-            if let Ok(Some(s)) = result
-                && s == "open"
-            {
-                // Mirror to in-memory so HalfOpen probe logic stays consistent.
-                let mut fb = self
-                    .fallback
-                    .lock()
-                    .expect("circuit fallback mutex poisoned");
-                fb.state = CircuitState::Open;
-                if fb.opened_at.is_none() {
-                    fb.opened_at = Some(Instant::now());
+            if let Ok((state, closed, probe)) = result {
+                if state.as_deref() == Some("open") {
+                    // Mirror to in-memory so HalfOpen probe logic stays consistent.
+                    let mut fb = self
+                        .fallback
+                        .lock()
+                        .expect("circuit fallback mutex poisoned");
+                    fb.state = CircuitState::Open;
+                    if fb.opened_at.is_none() {
+                        fb.opened_at = Some(Instant::now());
+                    }
+                    fb.half_opened_at = None;
+                    return Err(CircuitOpen {
+                        name: self.config.name,
+                        failures: self.config.failure_threshold,
+                        window_secs: self.config.window_secs,
+                    });
                 }
-                fb.half_opened_at = None;
-                return Err(CircuitOpen {
-                    name: self.config.name,
-                    failures: self.config.failure_threshold,
-                    window_secs: self.config.window_secs,
-                });
+                if closed.is_some() {
+                    self.close_fallback_state();
+                    return Ok(());
+                }
+                if probe.is_some() {
+                    return Err(CircuitOpen {
+                        name: self.config.name,
+                        failures: self.config.failure_threshold,
+                        window_secs: self.config.window_secs,
+                    });
+                }
             }
             // Redis says not-open OR Redis timed out — fall through to
             // in-memory check; it will be authoritative.
@@ -405,6 +433,17 @@ impl CircuitBreaker {
         })
     }
 
+    fn close_fallback_state(&self) {
+        let mut fb = self
+            .fallback
+            .lock()
+            .expect("circuit fallback mutex poisoned");
+        fb.state = CircuitState::Closed;
+        fb.failures.clear();
+        fb.opened_at = None;
+        fb.half_opened_at = None;
+    }
+
     async fn claim_redis_probe(&self) -> bool {
         let Some(mut redis) = self.redis.clone() else {
             return true;
@@ -492,16 +531,17 @@ impl CircuitBreaker {
         }
 
         if let Some(mut redis) = self.redis.clone() {
+            let name = self.config.name;
+            let cooldown_secs = self.config.cooldown_secs.max(1);
             let _ = tokio::time::timeout(REDIS_TIMEOUT, async {
                 // Best-effort cleanup; failures here are non-fatal.
-                let _: Result<(), _> = redis.del::<_, ()>(redis_state_key(self.config.name)).await;
+                let _: Result<(), _> = redis.del::<_, ()>(redis_state_key(name)).await;
+                let _: Result<(), _> = redis.del::<_, ()>(redis_failures_key(name)).await;
+                let _: Result<(), _> = redis.del::<_, ()>(redis_opened_at_key(name)).await;
+                let _: Result<(), _> = redis.del::<_, ()>(redis_probe_key(name)).await;
                 let _: Result<(), _> = redis
-                    .del::<_, ()>(redis_failures_key(self.config.name))
+                    .set_ex::<_, _, ()>(redis_closed_key(name), "1", u64::from(cooldown_secs))
                     .await;
-                let _: Result<(), _> = redis
-                    .del::<_, ()>(redis_opened_at_key(self.config.name))
-                    .await;
-                let _: Result<(), _> = redis.del::<_, ()>(redis_probe_key(self.config.name)).await;
             })
             .await;
         }
@@ -597,6 +637,7 @@ impl CircuitBreaker {
                     }
                 }
                 if should_mark_open {
+                    let _: Result<(), _> = redis.del::<_, ()>(redis_closed_key(name)).await;
                     let _: Result<(), _> = redis.del::<_, ()>(redis_probe_key(name)).await;
                     // Mark Open in Redis with cooldown TTL so sibling
                     // pods see the same state.

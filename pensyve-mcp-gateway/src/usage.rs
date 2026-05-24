@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::circuit_breaker::CircuitBreaker;
@@ -385,7 +386,7 @@ impl UsageReporter {
             "Flushing usage to Stripe"
         );
 
-        let mut failed_groups = HashSet::new();
+        let mut failed_groups: HashSet<(&str, OperationTier)> = HashSet::new();
         for ((customer_id, tier), (count, traceparent)) in &aggregated {
             let success = Self::post_meter_event(
                 client,
@@ -397,7 +398,7 @@ impl UsageReporter {
             )
             .await;
             if !success {
-                failed_groups.insert((customer_id.clone(), *tier));
+                failed_groups.insert((customer_id.as_str(), *tier));
                 tracing::error!(
                     customer = customer_id,
                     count,
@@ -410,7 +411,7 @@ impl UsageReporter {
 
     fn events_for_failed_groups(
         events: Vec<UsageEvent>,
-        failed_groups: &HashSet<(String, OperationTier)>,
+        failed_groups: &HashSet<(&str, OperationTier)>,
     ) -> Vec<UsageEvent> {
         events
             .into_iter()
@@ -419,7 +420,7 @@ impl UsageReporter {
                     .stripe_customer_id
                     .as_ref()
                     .is_some_and(|customer_id| {
-                        failed_groups.contains(&(customer_id.clone(), event.tier))
+                        failed_groups.contains(&(customer_id.as_str(), event.tier))
                     })
             })
             .collect()
@@ -506,6 +507,9 @@ impl UsageReporter {
         count: u32,
         traceparent: Option<&str>,
     ) -> bool {
+        let count_value = count.to_string();
+        let idempotency_key =
+            Self::meter_event_idempotency_key(customer_id, tier, count, traceparent);
         for attempt in 0..3 {
             if attempt > 0 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500 * 2u64.pow(attempt)))
@@ -514,10 +518,11 @@ impl UsageReporter {
             let mut req = client
                 .post("https://api.stripe.com/v1/billing/meter_events")
                 .bearer_auth(api_key)
+                .header("Idempotency-Key", &idempotency_key)
                 .form(&[
                     ("event_name", tier.event_name()),
                     ("payload[stripe_customer_id]", customer_id),
-                    ("payload[value]", &count.to_string()),
+                    ("payload[value]", count_value.as_str()),
                 ]);
             // Phase 23/A: propagate W3C trace context so Stripe's
             // request logs (and our own egress logs) can be correlated
@@ -553,6 +558,26 @@ impl UsageReporter {
             }
         }
         false
+    }
+
+    fn meter_event_idempotency_key(
+        customer_id: &str,
+        tier: OperationTier,
+        count: u32,
+        traceparent: Option<&str>,
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"pensyve-meter-event-v1\0");
+        hasher.update(customer_id.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(tier.event_name().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(count.to_be_bytes());
+        hasher.update(b"\0");
+        if let Some(traceparent) = traceparent {
+            hasher.update(traceparent.as_bytes());
+        }
+        format!("pensyve-meter-{}", hex::encode(hasher.finalize()))
     }
 }
 
@@ -604,6 +629,32 @@ mod tests {
             OperationTier::Extraction.event_name(),
             "pensyve_extraction_operation"
         );
+    }
+
+    #[test]
+    fn test_meter_event_idempotency_key_stable_for_same_payload() {
+        let a = UsageReporter::meter_event_idempotency_key(
+            "cus_123",
+            OperationTier::Standard,
+            4,
+            Some("00-aaa-bbb-01"),
+        );
+        let b = UsageReporter::meter_event_idempotency_key(
+            "cus_123",
+            OperationTier::Standard,
+            4,
+            Some("00-aaa-bbb-01"),
+        );
+        let c = UsageReporter::meter_event_idempotency_key(
+            "cus_123",
+            OperationTier::Standard,
+            5,
+            Some("00-aaa-bbb-01"),
+        );
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a.starts_with("pensyve-meter-"));
     }
 
     #[tokio::test]
@@ -662,7 +713,7 @@ mod tests {
                 traceparent: None,
             },
         ];
-        let failed_groups = HashSet::from([("cus_failed".to_string(), OperationTier::Standard)]);
+        let failed_groups = HashSet::from([("cus_failed", OperationTier::Standard)]);
 
         let requeued = UsageReporter::events_for_failed_groups(events, &failed_groups);
 

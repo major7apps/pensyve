@@ -156,12 +156,17 @@ impl AuthValidator {
         validation.set_audience(&["https://mcp.pensyve.com"]);
 
         let token_data = decode::<OAuthClaims>(token, decoding_key, &validation).ok()?;
+        let claims = token_data.claims;
+        let tenant_id = claims
+            .tenant_id
+            .filter(|s| !s.is_empty())
+            .or_else(|| claims.account_id.filter(|s| !s.is_empty()));
 
         Some(AuthContext {
-            key_id: format!("oauth:{}", &token_data.claims.client_id),
-            tenant_id: token_data.claims.tenant_id.or(token_data.claims.account_id),
-            user_id: Some(token_data.claims.sub),
-            scope: token_data.claims.scope.unwrap_or_else(|| "mcp".to_string()),
+            key_id: format!("oauth:{}", &claims.client_id),
+            tenant_id,
+            user_id: Some(claims.sub),
+            scope: claims.scope.unwrap_or_else(|| "mcp".to_string()),
             stripe_customer_id: None,
             plan: "free".to_string(),
         })
@@ -669,6 +674,10 @@ mod tests {
         iat: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         scope: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tenant_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        account_id: Option<String>,
     }
 
     /// Helper: build an `AuthValidator` with JWT support using the test key pair.
@@ -704,6 +713,8 @@ mod tests {
             iat: now,
             exp: now + 3600,
             scope: Some("mcp".to_string()),
+            tenant_id: None,
+            account_id: None,
         }
     }
 
@@ -822,6 +833,18 @@ mod tests {
         let token = sign_jwt(&valid_claims());
         let ctx = validator.validate(&token, None).await.expect("valid JWT");
         assert_eq!(ctx.scope, "mcp");
+    }
+
+    #[tokio::test]
+    async fn test_jwt_empty_tenant_id_falls_back_to_account_id() {
+        let validator = validator_with_jwt(vec![]);
+        let mut claims = valid_claims();
+        claims.tenant_id = Some(String::new());
+        claims.account_id = Some("acct_123".to_string());
+        let token = sign_jwt(&claims);
+
+        let ctx = validator.validate(&token, None).await.expect("valid JWT");
+        assert_eq!(ctx.tenant_id.as_deref(), Some("acct_123"));
     }
 
     #[tokio::test]
