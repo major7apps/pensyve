@@ -51,7 +51,7 @@ Your agent stops being amnesiac. Decisions, patterns, and outcomes persist acros
 
 ```bash
 pip install pensyve          # Python (PyPI)
-npm install pensyve          # TypeScript (npm)
+npm install @pensyve/sdk     # TypeScript (npm)
 go get github.com/major7apps/pensyve/pensyve-go@latest  # Go
 ```
 
@@ -330,7 +330,7 @@ curl -X POST http://localhost:3000/v1/recall_grouped \
 HTTP client with timeout, retry, and structured errors.
 
 ```typescript
-import { Pensyve } from "pensyve";
+import { Pensyve } from "@pensyve/sdk";
 
 const p = new Pensyve({
   baseUrl: "http://localhost:3000",
