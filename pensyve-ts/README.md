@@ -1,6 +1,6 @@
-# pensyve
+# @pensyve/sdk
 
-[![npm](https://img.shields.io/npm/v/pensyve)](https://www.npmjs.com/package/pensyve)
+[![npm](https://img.shields.io/npm/v/@pensyve/sdk)](https://www.npmjs.com/package/@pensyve/sdk)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/major7apps/pensyve/blob/main/LICENSE)
 
 TypeScript SDK for **[Pensyve](https://pensyve.com)** — the universal memory runtime for AI agents.
@@ -10,15 +10,15 @@ Give your agents durable memory that persists across sessions, learns from outco
 ## Install
 
 ```bash
-npm install pensyve
+npm install @pensyve/sdk
 # or
-bun add pensyve
+bun add @pensyve/sdk
 ```
 
 ## Quick Start
 
 ```typescript
-import { Pensyve } from "pensyve";
+import { Pensyve } from "@pensyve/sdk";
 
 const pensyve = new Pensyve({
   baseUrl: "http://localhost:8000",

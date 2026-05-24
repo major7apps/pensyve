@@ -235,15 +235,15 @@ HTTP client with configurable timeout, retry, and structured errors.
 ### Install
 
 ```bash
-npm install pensyve
+npm install @pensyve/sdk
 # or
-bun add pensyve
+bun add @pensyve/sdk
 ```
 
 ### Quick start
 
 ```typescript
-import { Pensyve } from "pensyve";
+import { Pensyve } from "@pensyve/sdk";
 
 const p = new Pensyve({
   baseUrl: "http://localhost:3000", // local gateway

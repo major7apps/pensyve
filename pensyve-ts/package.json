@@ -17,7 +17,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/major7apps/pensyve.git",
+    "url": "git+https://github.com/major7apps/pensyve.git",
     "directory": "pensyve-ts"
   },
   "homepage": "https://pensyve.com",

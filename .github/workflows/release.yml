@@ -88,6 +88,9 @@ jobs:
     name: Publish to npm
     runs-on: ubuntu-latest
     environment: release
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v5
       - uses: oven-sh/setup-bun@v2
@@ -100,10 +103,49 @@ jobs:
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
-      - name: Publish to npm
+      - name: Check npm publish access
         if: env.HAS_NPM_TOKEN != ''
         working-directory: pensyve-ts
-        run: npm publish --access public
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          PACKAGE_NAME="$(node -p "require('./package.json').name")"
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+
+          if npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version --json >/dev/null 2>&1; then
+            echo "${PACKAGE_NAME}@${PACKAGE_VERSION} already exists on npm; skipping publish."
+            echo "NPM_SHOULD_PUBLISH=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if ! NPM_USER="$(npm whoami 2>/tmp/npm-whoami.err)"; then
+            echo "::error::NPM_TOKEN is set but npm authentication failed. Replace it with an automation or granular token that can publish ${PACKAGE_NAME}."
+            cat /tmp/npm-whoami.err >&2
+            exit 1
+          fi
+
+          if ! OWNERS="$(npm owner ls "${PACKAGE_NAME}" 2>/tmp/npm-owner.err)"; then
+            echo "::error::Unable to read owners for ${PACKAGE_NAME}. The NPM_TOKEN user may not have package access."
+            cat /tmp/npm-owner.err >&2
+            exit 1
+          fi
+
+          if ! printf '%s\n' "$OWNERS" | awk '{print $1}' | grep -Fx "$NPM_USER" >/dev/null; then
+            echo "::error::NPM_TOKEN authenticates as ${NPM_USER}, but that user is not an owner of ${PACKAGE_NAME}."
+            echo "Owners returned by npm:"
+            printf '%s\n' "$OWNERS"
+            exit 1
+          fi
+
+          echo "NPM_SHOULD_PUBLISH=true" >> "$GITHUB_ENV"
+      - name: Publish to npm
+        if: env.HAS_NPM_TOKEN != '' && env.NPM_SHOULD_PUBLISH == 'true'
+        working-directory: pensyve-ts
+        run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -128,6 +170,7 @@ jobs:
     name: Build CLI (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -143,6 +186,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        continue-on-error: true
         with:
           key: cli-${{ matrix.target }}
       - name: Build CLI
@@ -183,6 +227,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        continue-on-error: true
         with:
           key: mcp-${{ matrix.target }}
       - name: Build MCP server
