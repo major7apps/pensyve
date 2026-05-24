@@ -224,7 +224,7 @@ jobs:
   github-release:
     name: Create GitHub Release
     needs: [build-cli, build-mcp, build-python, build-python-sdist, package-codex-plugin]
-    if: always() && !cancelled()
+    if: always() && !cancelled() && needs.package-codex-plugin.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

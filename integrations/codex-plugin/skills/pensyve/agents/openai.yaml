@@ -12,3 +12,4 @@ dependencies:
     - pensyve_observe
     - pensyve_inspect
     - pensyve_status
+    - pensyve_forget
