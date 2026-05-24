@@ -40,7 +40,7 @@ comparison, or write-after-read workflow.
 
 Use the existing MCP surface:
 
-```
+```text
 pensyve_status
 pensyve_recall(query, entity?, types?, limit?, min_confidence?)
 pensyve_remember(entity, fact, confidence?)
@@ -52,7 +52,7 @@ pensyve_forget(entity)
 
 Examples:
 
-```
+```text
 /pensyve recall decisions about release workflow
 /pensyve remember that npm provenance needs id-token: write
 /pensyve status
@@ -86,7 +86,7 @@ For destructive actions:
 
 Return a concise result:
 
-```
+```md
 ## Result
 - Action: recall | remember | observe | inspect | status | review | forget | mention-help
 - Entity: <entity or none>

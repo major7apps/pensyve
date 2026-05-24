@@ -43,7 +43,7 @@ routing yet.
    - For session outcomes or procedures, ensure an episode exists with
      `pensyve_episode_start(participants)`, then call:
 
-     ```
+     ```text
      pensyve_observe(
        episode_id: <working episode_id>,
        content: "[proactive/in-flight/tier-1] <observation>",

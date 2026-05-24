@@ -17,6 +17,11 @@ MCP_REF_FILES=(
   "$PLUGIN_ROOT/commands/pensyve.md"
   "$PLUGIN_ROOT/docs/ARCHITECTURE.md"
 )
+MENTION_DOC_FILES=(
+  "$PLUGIN_ROOT/skills/mention-workflow/SKILL.md"
+  "$PLUGIN_ROOT/commands/pensyve.md"
+  "$PLUGIN_ROOT/docs/ARCHITECTURE.md"
+)
 
 EXIT_CODE=0
 
@@ -127,7 +132,7 @@ echo ""
 # Check 5: procedural memory convention — [procedural] prefix is used in observe content
 echo "Check 5: procedural convention uses [procedural] prefix in pensyve_observe content"
 if ! rg -q '\[procedural\]' "${MCP_REF_FILES[@]}"; then
-  echo "  WARN: no [procedural] prefix usage found. Expected in AGENTS.md."
+  echo "  WARN: no [procedural] prefix usage found in configured plugin surfaces."
 else
   echo "  PASS"
 fi
@@ -135,13 +140,17 @@ echo ""
 
 # Check 6: @-mention compatibility is explicit about today's Codex limitation.
 echo "Check 6: @-mention workflow documents current Codex dispatch limitation"
-if rg -q 'true @-mention dispatch is not currently exposed|Codex does not currently expose true @-mention dispatch' \
-  "$PLUGIN_ROOT/skills/mention-workflow/SKILL.md" \
-  "$PLUGIN_ROOT/commands/pensyve.md" \
-  "$PLUGIN_ROOT/docs/ARCHITECTURE.md"; then
-  echo "  PASS"
-else
-  echo "  FAIL: mention workflow must document that true @-mention dispatch is not currently exposed"
+MISSING_MENTION_DOC=0
+for file in "${MENTION_DOC_FILES[@]}"; do
+  if rg -qi 'true @-mention dispatch is not currently exposed|Codex does not currently expose true @-mention dispatch' "$file"; then
+    echo "  PASS: $file"
+  else
+    echo "  FAIL: $file"
+    MISSING_MENTION_DOC=1
+  fi
+done
+if [ "$MISSING_MENTION_DOC" != "0" ]; then
+  echo "  FAIL: mention workflow must document that true @-mention dispatch is not currently exposed in every mention surface"
   EXIT_CODE=1
 fi
 echo ""

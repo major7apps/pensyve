@@ -47,7 +47,10 @@ docs/ARCHITECTURE.md            # This brief
 ```
 
 The manifest should stay thin and point at bundled surfaces. Memory behavior belongs in skills,
-commands, hooks, and the MCP server.
+commands, hooks, and the MCP server. Commands are shipped in the `commands/` directory by Codex
+plugin package convention rather than as a `commands` manifest key; the current Codex plugin
+validation schema accepts `skills` and `mcpServers` path fields but rejects unsupported manifest
+fields.
 
 ## MCP And Local Command Integration
 

@@ -144,6 +144,7 @@ Use `/plugins` to disable or uninstall the plugin. If you installed the fallback
 
 | Tool | Description |
 |---|---|
+| `pensyve_status` | Check connection, namespace, and memory stats for `/pensyve status` |
 | `pensyve_recall` | Search memories by semantic similarity |
 | `pensyve_remember` | Store a durable fact (semantic memory) |
 | `pensyve_observe` | Record a session observation (episodic / procedural via `[procedural]` prefix) |
