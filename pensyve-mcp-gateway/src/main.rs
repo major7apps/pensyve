@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use axum::Router;
@@ -389,6 +390,8 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
     // TTLs handle window expiry on the primary path, and the in-memory
     // fallback prunes entries on read inside `RateLimiter::check_fallback`.
 
+    spawn_runtime_stall_watchdog();
+
     // Background consolidation — runs every PENSYVE_CONSOLIDATION_INTERVAL_SECS (default 6h).
     tokio::spawn({
         let state = app_state;
@@ -405,19 +408,27 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                 for ns_id in state.tenant_mgr.active_namespace_ids() {
                     if let Some(ps) = state.tenant_mgr.get_state_by_namespace_id(ns_id) {
                         let config = pensyve_core::config::ConsolidationConfig::default();
+                        let storage = ps.storage.clone();
+                        let embedder = ps.embedder.clone();
+                        let run_storage = storage.clone();
+                        let run_embedder = embedder.clone();
                         // G1/P3a: ConsolidationEngine::run gained `policy`
                         // + `cancel`. The engine performs no network calls
                         // today; pass Disabled (fail-closed) and a fresh
                         // never-cancelled token for this background loop.
-                        match pensyve_core::consolidation::ConsolidationEngine::run(
-                            ps.storage.as_ref(),
-                            &ps.embedder,
-                            &config,
-                            ns_id,
-                            &pensyve_core::network_policy::NetworkPolicy::Disabled,
-                            &tokio_util::sync::CancellationToken::new(),
-                        ) {
-                            Ok(cs) => {
+                        let run = tokio::task::spawn_blocking(move || {
+                            pensyve_core::consolidation::ConsolidationEngine::run(
+                                run_storage.as_ref(),
+                                &run_embedder,
+                                &config,
+                                ns_id,
+                                &pensyve_core::network_policy::NetworkPolicy::Disabled,
+                                &tokio_util::sync::CancellationToken::new(),
+                            )
+                        })
+                        .await;
+                        match run {
+                            Ok(Ok(cs)) => {
                                 if cs.promoted > 0 || cs.archived > 0 {
                                     tracing::info!(
                                         namespace_id = %ns_id,
@@ -427,7 +438,7 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                                         "Background consolidation complete"
                                     );
                                 }
-                                let _ = ps.storage.log_activity(
+                                let _ = storage.log_activity(
                                     ns_id,
                                     "consolidate",
                                     &serde_json::json!({
@@ -437,11 +448,18 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                                     }),
                                 );
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 tracing::warn!(
                                     namespace_id = %ns_id,
                                     error = %e,
                                     "Background consolidation failed"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    namespace_id = %ns_id,
+                                    error = %e,
+                                    "Background consolidation task failed"
                                 );
                             }
                         }
@@ -472,6 +490,41 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         .await?;
 
     Ok(())
+}
+
+fn spawn_runtime_stall_watchdog() {
+    let interval = std::env::var("PENSYVE_RUNTIME_WATCHDOG_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_secs(1));
+    let threshold = std::env::var("PENSYVE_RUNTIME_WATCHDOG_LAG_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_secs(2));
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.tick().await;
+        let mut last = Instant::now();
+        loop {
+            ticker.tick().await;
+            let now = Instant::now();
+            let elapsed = now.saturating_duration_since(last);
+            if let Some(lag) = elapsed.checked_sub(interval)
+                && lag >= threshold
+            {
+                tracing::warn!(
+                    elapsed_ms = elapsed.as_millis(),
+                    lag_ms = lag.as_millis(),
+                    threshold_ms = threshold.as_millis(),
+                    "Tokio runtime scheduling delay detected"
+                );
+            }
+            last = now;
+        }
+    });
 }
 
 async fn health_handler() -> &'static str {

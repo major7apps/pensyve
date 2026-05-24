@@ -19,6 +19,7 @@ use crate::middleware::tracing::TraceContext;
 #[derive(Clone, Debug)]
 pub struct AuthContext {
     pub key_id: String,
+    pub tenant_id: Option<String>,
     pub user_id: Option<String>,
     pub scope: String,
     pub stripe_customer_id: Option<String>,
@@ -31,6 +32,10 @@ struct OAuthClaims {
     sub: String,
     #[serde(default)]
     client_id: String,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
     scope: Option<String>,
 }
 
@@ -154,6 +159,7 @@ impl AuthValidator {
 
         Some(AuthContext {
             key_id: format!("oauth:{}", &token_data.claims.client_id),
+            tenant_id: token_data.claims.tenant_id.or(token_data.claims.account_id),
             user_id: Some(token_data.claims.sub),
             scope: token_data.claims.scope.unwrap_or_else(|| "mcp".to_string()),
             stripe_customer_id: None,
@@ -172,6 +178,7 @@ impl AuthValidator {
             let user_id = self.key_user_hashes.get(&hash).cloned();
             return Some(AuthContext {
                 key_id: prefix.clone(),
+                tenant_id: None,
                 user_id,
                 scope: "mcp".to_string(),
                 stripe_customer_id: None,
@@ -375,6 +382,7 @@ fn parse_auth_context(body: &serde_json::Value) -> AuthContext {
             .and_then(|v| v.as_str())
             .unwrap_or("remote")
             .to_string(),
+        tenant_id: string_field(body, &["tenantId", "tenant_id", "accountId", "account_id"]),
         user_id: body
             .get("userId")
             .and_then(|v| v.as_str())
@@ -394,6 +402,15 @@ fn parse_auth_context(body: &serde_json::Value) -> AuthContext {
             .unwrap_or("free")
             .to_string(),
     }
+}
+
+fn string_field(body: &serde_json::Value, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        body.get(*name)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    })
 }
 
 /// Describe the top-level shape of a JSON payload as a comma-joined
@@ -499,6 +516,7 @@ where
             if !state.auth_required {
                 req.extensions_mut().insert(AuthContext {
                     key_id: "dev".to_string(),
+                    tenant_id: None,
                     user_id: None,
                     scope: "mcp".to_string(),
                     stripe_customer_id: None,
@@ -613,6 +631,23 @@ mod tests {
     async fn test_auth_validator_empty_config_rejects_all() {
         let validator = AuthValidator::new(&test_config(vec![]));
         assert!(validator.validate("psy_anything", None).await.is_none());
+    }
+
+    #[test]
+    fn test_parse_auth_context_accepts_tenant_identity_fields() {
+        for field in ["tenantId", "tenant_id", "accountId", "account_id"] {
+            let body = serde_json::json!({
+                "valid": true,
+                "keyId": "key_123",
+                field: "tenant_abc",
+                "userId": "user_123",
+                "plan": "business",
+            });
+            let ctx = parse_auth_context(&body);
+            assert_eq!(ctx.tenant_id.as_deref(), Some("tenant_abc"));
+            assert_eq!(ctx.user_id.as_deref(), Some("user_123"));
+            assert_eq!(ctx.plan, "business");
+        }
     }
 
     // Ed25519 test key pair generated for unit tests only — not a real secret.
