@@ -44,14 +44,57 @@
 
 ## Subproject Map
 
-| Project          | Language      | Type                    | Depends On            |
-| ---------------- | ------------- | ----------------------- | --------------------- |
-| `pensyve-core`   | Rust          | Library (rlib)          | —                     |
-| `pensyve-python` | Rust + Python | PyO3 cdylib             | pensyve-core          |
-| `pensyve-mcp`    | Rust          | Binary                  | pensyve-core          |
-| `pensyve-cli`    | Rust          | Binary                  | pensyve-core          |
-| `pensyve-ts`     | TypeScript    | npm package             | pensyve_server (REST) |
-| `pensyve_server` | Python        | Shared Python utilities | pensyve (Python SDK)  |
+| Project               | Language      | Type                    | Depends On                  |
+| --------------------- | ------------- | ----------------------- | --------------------------- |
+| `pensyve-core`        | Rust          | Library (rlib)          | —                           |
+| `pensyve-python`      | Rust + Python | PyO3 cdylib            | pensyve-core                |
+| `pensyve-mcp`         | Rust          | Binary (stdio)          | pensyve-core, pensyve-mcp-tools |
+| `pensyve-mcp-tools`   | Rust          | Library (rlib)          | pensyve-core                |
+| `pensyve-mcp-gateway` | Rust          | Binary (Axum HTTP)      | pensyve-core, pensyve-mcp-tools |
+| `pensyve-cli`         | Rust          | Binary (`pensyve`)      | pensyve-core                |
+| `pensyve-benchmarks`  | Rust          | Bench harness           | pensyve-core                |
+| `pensyve-ts`          | TypeScript    | npm package (bun)       | REST API (HTTP)             |
+| `pensyve-go`          | Go            | Go module               | REST API (HTTP)             |
+| `pensyve-wasm`        | Rust          | cdylib (wasm-bindgen)   | — (standalone, not in workspace) |
+| `pensyve-vscode`      | TypeScript    | VS Code extension       | REST API (HTTP)             |
+| `pensyve-plugin`      | TypeScript    | Claude Code plugin      | MCP server                  |
+| `pensyve_server`      | Python        | Shared Python utilities | pensyve (Python SDK)        |
+| `integrations/`       | Python        | Framework adapters      | pensyve (Python SDK)        |
+
+## Core Engine Modules (`pensyve-core/src/`)
+
+| Module | Responsibility |
+|---|---|
+| `storage/sqlite.rs` | SQLite with WAL mode, FTS5 for BM25, multimodal content types, ACL table |
+| `storage/postgres.rs` | Postgres backend (feature-gated) with pgvector, tsvector FTS, JSONB |
+| `embedding.rs` | ONNX embeddings via `fastembed`; stored as raw f32 BLOBs |
+| `vector.rs` | In-memory vector index for cosine similarity search |
+| `graph.rs` | Entity relationship graph via `petgraph`; BFS traversal for proximity scoring |
+| `retrieval.rs` | `RecallEngine` — 8-signal fusion with weighted sum, cross-encoder reranking, `QueryIntent` classifier |
+| `decay.rs` | FSRS forgetting curve: `R(t, S) = (1 + t/(9*S))^(-1)` |
+| `consolidation.rs` | Background "dreaming": episodic-to-semantic promotion, decay, archival |
+| `procedural.rs` | Beta-binomial Bayesian reliability for action-outcome procedures |
+| `extraction.rs` | Tier 1 pattern-based fact extraction (regex, always runs) |
+| `observability.rs` | Atomic metrics counters, Prometheus text export, `tracing` instrumentation |
+| `mesh.rs` | RBAC with Role (Owner/Writer/Reader), Visibility (Private/Shared/Public), ACL entries |
+| `types.rs` | Data model including `ContentType` enum (Text/Code/Image/ToolOutput/Structured) |
+
+Storage is abstracted via `StorageTrait`, allowing SQLite and Postgres to be swapped transparently.
+
+## Cloud Gateway (`pensyve-mcp-gateway/`)
+
+Single Rust/Axum binary serving REST (`/v1/*`) and MCP (`/mcp`) on port 3000:
+
+| Module | Responsibility |
+|---|---|
+| `rest.rs` | REST API handlers (recall, remember, entities, stats, inspect, usage) |
+| `auth.rs` | API key validation (local + remote with caching) and OAuth JWT (EdDSA) |
+| `rate_limit.rs` | Per-key token-bucket rate limiting |
+| `usage.rs` | Stripe usage event reporting (fire-and-forget, batched) |
+| `usage_counter.rs` | In-memory per-(user, month, tier) operation counter |
+| `tenant.rs` | Multi-tenant state management |
+| `cache.rs` | Optional Redis cache for recall responses (`REDIS_URL`) |
+| `oauth.rs` | OAuth 2.1 authorization server endpoints |
 
 ## Data Model
 
@@ -95,15 +138,15 @@ Namespace (isolation boundary)
 
 ## Retrieval Scoring Formula
 
-```
-relevance = w1 * vector_similarity     (0.25)
-          + w2 * bm25_score            (0.10)
-          + w3 * graph_proximity       (0.15)
-          + w4 * intent_similarity     (0.00 — Phase 3)
-          + w5 * recency_decay         (0.20)
-          + w6 * access_frequency      (0.10)
-          + w7 * confidence            (0.10)
-          + w8 * type_boost            (0.10)
+```text
+slot 1: vector_similarity       (1.0)
+slot 2: bm25_score              (0.8)
+slot 3: activation              (1.0)  — ACT-R base-level activation
+slot 4: spreading_activation    (0.8)  — graph BFS
+slot 5: intent_alignment        (0.5)  — query-type routing
+slot 6: confidence              (0.5)  — reliability
+slot 7: entity_affinity         (1.2)  — entity-scoped boost
+slot 8: ppr                     (1.0)  — Personalized PageRank (Phase 2C, opt-in)
 ```
 
 ## Storage Schema
