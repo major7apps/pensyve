@@ -28,11 +28,11 @@ cd pensyve-go && go test ./...            # Go SDK tests
 
 | Ecosystem  | Tests | Status |
 |---|---|---|
-| Rust       | 127   | All passing (6 ignored; require model download) |
-| Python     | 92    | All passing |
+| Rust       | ~798  | All passing (some ignored; require model download) |
+| Python     | ~62   | All passing |
 | TypeScript | 38    | All passing |
-| Go         | 17    | All passing |
-| **Total**  | **274** | **274 passing** |
+| Go         | 43    | All passing |
+| **Total**  | **900+** | **All passing** |
 
 New code adds tests; test count regressions block merge.
 
