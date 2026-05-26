@@ -166,6 +166,7 @@ struct PatternBundle {
     knowledge_update: Regex,
     single_user: Regex,
     single_assistant: Regex,
+    preference: Regex,
 }
 
 fn patterns() -> &'static PatternBundle {
@@ -204,6 +205,16 @@ fn patterns() -> &'static PatternBundle {
             r"(?i)(\byou (said|told|wrote|write|suggested|suggest|recommended|recommend)\b|\byour (answer|response|suggestion|recommendation)\b)",
         )
         .expect("single_assistant pattern compiles"),
+        // Preference: explicit preference/favourite cues. Phase 2A.1:
+        // without this, preference queries containing "my"/"me" get
+        // misclassified as single-session-user and receive a 0.5x
+        // spreading-activation penalty that regresses ss-preference
+        // accuracy by -17.6pp. The ss-preference mask is identity on
+        // slots 0-5, so false positives are harmless.
+        preference: Regex::new(
+            r"(?i)(\bfavou?rite\b|\bprefer(red|ence|s)?\b|\blike best\b|\bgo-to\b)",
+        )
+        .expect("preference pattern compiles"),
     })
 }
 
@@ -243,21 +254,29 @@ pub fn classify_query(query: &str) -> QueryClassification {
     let knowledge = p.knowledge_update.is_match(trimmed);
     let user = p.single_user.is_match(trimmed);
     let assistant = p.single_assistant.is_match(trimmed);
+    let preference = p.preference.is_match(trimmed);
 
     let groups_fired = u8::from(temporal)
         + u8::from(multi)
         + u8::from(knowledge)
         + u8::from(user)
-        + u8::from(assistant);
+        + u8::from(assistant)
+        + u8::from(preference);
 
     // Precedence: temporal > multi-session > knowledge-update >
-    // single-session-assistant > single-session-user > fallback.
+    // single-session-assistant > single-session-preference >
+    // single-session-user > fallback.
     //
-    // assistant before user: an "you said X about my Y" query is
-    // primarily about the assistant's prior output even though "my"
-    // also fires the user pattern. The IntentRouter k-budget treats
-    // both single-session-* types as the SSU bucket (k=12), so the
-    // distinction is purely for the per-route mask.
+    // Phase 2A.1: preference before user — "What is my favorite X?"
+    // fires both preference and user patterns, but preference is more
+    // specific and routes to the identity mask (no RRF distortion).
+    // Without this, such queries hit single-session-user and take a
+    // 0.5x spreading-activation penalty.
+    //
+    // assistant before preference: "you recommended my favorite Y" is
+    // primarily about the assistant's prior output. The IntentRouter
+    // k-budget treats all single-session-* types as the SSU bucket
+    // (k=12), so the distinction is purely for the per-route mask.
     let question_type: &'static str = if temporal {
         "temporal-reasoning"
     } else if multi {
@@ -266,6 +285,8 @@ pub fn classify_query(query: &str) -> QueryClassification {
         "knowledge-update"
     } else if assistant {
         "single-session-assistant"
+    } else if preference {
+        "single-session-preference"
     } else if user {
         "single-session-user"
     } else {
@@ -604,6 +625,94 @@ mod tests {
             "expected 0.0 fallback confidence, got {}",
             c.confidence
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2A.1: preference-detection tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn preference_query_with_my_classifies_as_preference_not_user() {
+        // Phase 2A.1 regression fix: "my favorite" fires both preference
+        // and user patterns. Preference takes precedence → identity mask
+        // instead of the single-session-user spreading-activation penalty.
+        for q in [
+            "What is my favorite color?",
+            "What is my favourite restaurant?",
+            "My preferred programming language is what?",
+        ] {
+            let c = classify_query(q);
+            assert_eq!(
+                c.question_type, "single-session-preference",
+                "query should classify as preference, not user: {q:?}"
+            );
+            // Both preference + user ("my") fire → 0.7 ambiguous confidence.
+            assert!(
+                (c.confidence - 0.7).abs() < f32::EPSILON,
+                "expected 0.7 (ambiguous: preference + user fired) for {q:?}, got {}",
+                c.confidence
+            );
+        }
+        // "I prefer" — only preference fires (user pattern requires
+        // I am/have/did/want/like, not "I prefer") → confidence 1.0.
+        let c = classify_query("What kind of food do I prefer?");
+        assert_eq!(c.question_type, "single-session-preference");
+        assert!(
+            (c.confidence - 1.0).abs() < f32::EPSILON,
+            "expected 1.0 (only preference fired), got {}",
+            c.confidence
+        );
+    }
+
+    #[test]
+    fn pure_preference_query_without_user_pattern() {
+        for q in [
+            "What are the preferred hotels in Paris?",
+            "Which go-to snacks should we stock?",
+        ] {
+            let c = classify_query(q);
+            assert_eq!(
+                c.question_type, "single-session-preference",
+                "pure preference query: {q:?}"
+            );
+            assert!(
+                (c.confidence - 1.0).abs() < f32::EPSILON,
+                "expected 1.0 (only preference fired) for {q:?}, got {}",
+                c.confidence
+            );
+        }
+    }
+
+    #[test]
+    fn cross_session_preference_uses_multi_session_precedence() {
+        // "remember" fires multi-session; "favorite" fires preference.
+        // Multi-session takes precedence.
+        let c = classify_query("Do you remember my favorite food?");
+        assert_eq!(c.question_type, "multi-session");
+        assert!(c.confidence >= 0.7);
+    }
+
+    #[test]
+    fn temporal_outranks_preference() {
+        let c = classify_query("What was my favorite color before we moved?");
+        assert_eq!(c.question_type, "temporal-reasoning");
+    }
+
+    #[test]
+    fn non_preference_user_query_still_classifies_as_user() {
+        // Queries with "my"/"me"/"I want" but no preference words stay
+        // as single-session-user.
+        for q in [
+            "Tell me about my schedule.",
+            "I want a summary of the meeting.",
+            "I have a question about my project.",
+        ] {
+            let c = classify_query(q);
+            assert_eq!(
+                c.question_type, "single-session-user",
+                "non-preference user query should stay as user: {q:?}"
+            );
+        }
     }
 
     #[test]
