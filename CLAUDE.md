@@ -13,5 +13,7 @@
 ## See also
 
 - [`AGENTS.md`](AGENTS.md) — canonical agent entry point (read first)
-- [`docs/agent-context.md`](docs/agent-context.md) — long-form companion with full build/test commands, architecture, and conventions
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system architecture, data flow, module boundaries
+- [`docs/SECURITY.md`](docs/SECURITY.md) — authentication, RBAC, tenant isolation, execution bounds
+- [`docs/RELIABILITY.md`](docs/RELIABILITY.md) — test suite, performance, memory model guarantees
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — how to set up the dev environment and submit changes
