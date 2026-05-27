@@ -431,11 +431,10 @@ pub fn selroute_metric_index(question_type: &str) -> Option<usize> {
 pub fn selroute_enabled() -> bool {
     static SELROUTE: OnceLock<bool> = OnceLock::new();
     *SELROUTE.get_or_init(|| {
-        std::env::var("PENSYVE_SELROUTE")
-            .map_or(true, |v| {
-                let lower = v.trim().to_ascii_lowercase();
-                !matches!(lower.as_str(), "0" | "false" | "off" | "no")
-            })
+        std::env::var("PENSYVE_SELROUTE").map_or(true, |v| {
+            let lower = v.trim().to_ascii_lowercase();
+            !matches!(lower.as_str(), "0" | "false" | "off" | "no")
+        })
     })
 }
 
