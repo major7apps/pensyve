@@ -648,12 +648,12 @@ impl<'a> RecallEngine<'a> {
             self.gather_candidates(query, namespace_id, max_candidates)?
         };
 
-        // Phase 2A SelRoute: optional question-type classification +
-        // per-route RRF weight mask. Strictly gated behind the
-        // `PENSYVE_SELROUTE` env-var (read once via OnceLock — see
-        // `query_classifier::selroute_enabled`); when the gate is off
-        // the entire block is bypassed and the recall path is
-        // byte-for-byte identical to pre-Phase-2A behavior.
+        // Phase 2A SelRoute: question-type classification + per-route
+        // RRF weight mask. Enabled by default; set `PENSYVE_SELROUTE=0`
+        // to disable (read once via OnceLock — see
+        // `query_classifier::selroute_enabled`). When disabled, the
+        // entire block is bypassed and the recall path is byte-for-byte
+        // identical to pre-Phase-2A behavior.
         //
         // This block runs BEFORE the zero-candidate early return so
         // `selroute_classified` / `selroute_fallback_count` /
