@@ -421,23 +421,22 @@ pub fn selroute_metric_index(question_type: &str) -> Option<usize> {
     }
 }
 
-/// Check whether the `SelRoute` env-var gate is enabled.
+/// Check whether the `SelRoute` query-type classifier is enabled.
+///
+/// **Default-on** since Phase 2A.1 validated `SelRoute` as net positive
+/// (+2.0pp aggregate, +11.8pp ss-preference, zero regressions).
 ///
 /// Reads `PENSYVE_SELROUTE` once via `OnceLock` — env-var changes
-/// post-init are NOT picked up. This matches the existing `IntentRouter`
-/// pattern of caching env reads at construction (`MultiSessionCard::g3_mode`,
-/// `KBudget::from_env`).
-///
-/// Accepted truthy values (case-insensitive): `"1"`, `"true"`, `"on"`,
-/// `"yes"`. Anything else — including unset — disables `SelRoute`.
+/// post-init are NOT picked up. Set `PENSYVE_SELROUTE=0` to disable.
 #[must_use]
 pub fn selroute_enabled() -> bool {
     static SELROUTE: OnceLock<bool> = OnceLock::new();
     *SELROUTE.get_or_init(|| {
-        std::env::var("PENSYVE_SELROUTE").is_ok_and(|v| {
-            let lower = v.trim().to_ascii_lowercase();
-            matches!(lower.as_str(), "1" | "true" | "on" | "yes")
-        })
+        std::env::var("PENSYVE_SELROUTE")
+            .map_or(true, |v| {
+                let lower = v.trim().to_ascii_lowercase();
+                !matches!(lower.as_str(), "0" | "false" | "off" | "no")
+            })
     })
 }
 
