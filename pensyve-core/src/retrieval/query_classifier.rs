@@ -33,10 +33,9 @@
 //!
 //! The Phase 2A integration in `engine.rs` is wrapped behind a
 //! `PENSYVE_SELROUTE` env-var gate read once at process start via
-//! `OnceLock`. When unset / `0` / `false`, the recall pipeline is
-//! byte-for-byte identical to pre-Phase-2A behavior — this is a hard
-//! requirement for the Phase 2 rollout (the orchestrator A/B's the gate
-//! against the v2.2 baseline).
+//! `OnceLock`. **`SelRoute` is enabled by default**; set
+//! `PENSYVE_SELROUTE=0` (or `false` / `off` / `no`) to disable and
+//! restore the byte-for-byte pre-Phase-2A recall pipeline.
 //!
 //! ## Per-route RRF mask rationale (Phase 2A + 2C)
 //!
