@@ -240,9 +240,9 @@ static PRONOUN_SUBJECTS: phf::Set<&'static str> = phf::phf_set! {
 
 /// Check whether the `PENSYVE_DEP_PARSE` env-var gate is enabled.
 ///
-/// Reads once via `OnceLock` (matches the Phase 2A `SelRoute` pattern in
-/// [`crate::retrieval::query_classifier::selroute_enabled`]). Accepted
-/// truthy values (case-insensitive): `"1"`, `"true"`, `"on"`, `"yes"`.
+/// Reads once via `OnceLock`. Default-off (unlike `SelRoute` which is
+/// default-on). Accepted truthy values (case-insensitive): `"1"`,
+/// `"true"`, `"on"`, `"yes"`.
 #[must_use]
 pub fn dep_parse_enabled() -> bool {
     static DEP_PARSE: OnceLock<bool> = OnceLock::new();
