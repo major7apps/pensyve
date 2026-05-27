@@ -19,14 +19,15 @@
 //! - `"single-session-user"` — first-person self-references (I am, my, me)
 //! - `"single-session-assistant"` — second-person references to the
 //!   assistant's prior output (you said, your answer)
-//! - `"single-session-preference"` — broad fallback (the conservative
-//!   default; maps to the v2.0 baseline k=22 bucket in the
-//!   `IntentRouter`)
+//! - `"single-session-preference"` — preference cues (favorite, prefer,
+//!   like best, go-to) or unclassified fallback; maps to the v2.0
+//!   baseline k=22 bucket in the `IntentRouter`
 //!
 //! Precedence: temporal-reasoning > multi-session > knowledge-update >
-//! single-session-* (user vs assistant) > single-session-preference. The
-//! ordering reflects specificity — temporal cues are the most discriminative,
-//! preferences are the broadest fallback.
+//! single-session-assistant > single-session-preference >
+//! single-session-user. Preference takes precedence over user so that
+//! "What is my favorite X?" routes to the identity mask rather than the
+//! single-session-user spreading-activation penalty (Phase 2A.1 fix).
 //!
 //! ## `SelRoute` env-var gate
 //!
@@ -212,7 +213,7 @@ fn patterns() -> &'static PatternBundle {
         // accuracy by -17.6pp. The ss-preference mask is identity on
         // slots 0-5, so false positives are harmless.
         preference: Regex::new(
-            r"(?i)(\bfavou?rite\b|\bprefer(red|ence|s)?\b|\blike best\b|\bgo-to\b)",
+            r"(?i)(\bfavou?rites?\b|\bprefer(red|ences?|s)?\b|\blike best\b|\bgo-to\b)",
         )
         .expect("preference pattern compiles"),
     })
@@ -274,9 +275,10 @@ pub fn classify_query(query: &str) -> QueryClassification {
     // 0.5x spreading-activation penalty.
     //
     // assistant before preference: "you recommended my favorite Y" is
-    // primarily about the assistant's prior output. The IntentRouter
-    // k-budget treats all single-session-* types as the SSU bucket
-    // (k=12), so the distinction is purely for the per-route mask.
+    // primarily about the assistant's prior output. The distinction
+    // affects both the per-route mask and the k-budget: preference
+    // uses the SS-Pref bucket (k=22) per `IntentRouter::k_for_type`,
+    // while user/assistant use SSU (k=12).
     let question_type: &'static str = if temporal {
         "temporal-reasoning"
     } else if multi {
@@ -669,6 +671,8 @@ mod tests {
         for q in [
             "What are the preferred hotels in Paris?",
             "Which go-to snacks should we stock?",
+            "What are the top preferences?",
+            "List all favorites.",
         ] {
             let c = classify_query(q);
             assert_eq!(
