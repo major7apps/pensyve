@@ -37,7 +37,7 @@ tracing = "0.1"
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 sqlx-core = { version = "0.8.6", features = ["_rt-tokio", "_tls-rustls-aws-lc-rs", "json", "chrono", "uuid"], optional = true }
-sqlx-postgres = { version = "0.8.6", features = ["json", "chrono", "uuid"], optional = true }
+sqlx-postgres = { version = "0.9.0", features = ["json", "chrono", "uuid"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"], optional = true }
 # `CancellationToken` for cooperative cancellation of long-running operators.
 # Plumbed through `ConsolidationEngine::run` and the LocalLLM extractors in
