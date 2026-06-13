@@ -724,7 +724,7 @@ async fn remember(
     let _ = ps.storage.log_activity(
         ps.namespace.id,
         "remember",
-        &json!({"entity": body.entity, "preview": &body.fact[..body.fact.len().min(50)]}),
+        &json!({"entity": body.entity, "preview": body.fact.chars().take(50).collect::<String>()}),
     );
 
     // Invalidate recall cache for this namespace.
