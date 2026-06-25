@@ -70,7 +70,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache fastembed ONNX models
         id: model-cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ github.workspace }}/.fastembed_cache
           # Key only changes when the supported-models list changes (bump
