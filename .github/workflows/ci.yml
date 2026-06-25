@@ -16,7 +16,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -44,7 +44,7 @@ jobs:
     name: Rust Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Run tests
         run: cargo test --workspace
@@ -66,7 +66,7 @@ jobs:
       # canonical absolute path independent of cwd.
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache fastembed ONNX models
         id: model-cache
@@ -98,7 +98,7 @@ jobs:
     name: Python Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v7
       - uses: actions/setup-python@v6
@@ -114,7 +114,7 @@ jobs:
     name: TypeScript Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
       - name: Install and test
         working-directory: pensyve-ts
@@ -127,7 +127,7 @@ jobs:
     name: Go Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: "1.22"
@@ -140,7 +140,7 @@ jobs:
     name: WASM Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -154,7 +154,7 @@ jobs:
     name: Gateway Build & Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Build gateway
         run: cargo build -p pensyve-mcp-gateway
