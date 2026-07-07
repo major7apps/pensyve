@@ -1,6 +1,6 @@
 [package]
 name = "pensyve-mcp"
-version = "2.5.0"
+version = "2.6.0"
 edition = "2024"
 description = "Pensyve MCP server (stdio transport) — universal memory runtime for AI agents"
 rust-version = "1.88"
@@ -14,8 +14,8 @@ name = "pensyve-mcp"
 path = "src/main.rs"
 
 [dependencies]
-pensyve-core = { path = "../pensyve-core", version = "2.5.0" }
-pensyve-mcp-tools = { path = "../pensyve-mcp-tools", version = "2.5.0" }
+pensyve-core = { path = "../pensyve-core", version = "2.6.0" }
+pensyve-mcp-tools = { path = "../pensyve-mcp-tools", version = "2.6.0" }
 rmcp = { version = "1.7", features = ["server", "transport-io", "macros"] }
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
