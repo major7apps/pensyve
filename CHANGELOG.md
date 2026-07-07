@@ -5,6 +5,33 @@ All notable changes to Pensyve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-07-07
+
+Minor release since v2.5.0, headlined by the `SelRoute` query-type classifier (Phase 2A) moving from opt-in to default-on — the behavior change that makes this a minor bump rather than a patch. Also ships tenant-scoped gateway rate limiting/quotas, gateway resilience hardening, a native Codex `/pensyve` command, a documentation decomposition pass, and a UTF-8 panic fix in gateway logging.
+
+### Added
+
+- **Native Codex `/pensyve` command** (`integrations/codex-plugin`) for explicit recall / remember / observe / inspect / status / review / forget workflows, plus a `mention-workflow` skill that treats literal `@pensyve` text as explicit memory intent. Ships as Codex plugin v1.4.1/v1.4.2 (versioned independently of the core crate — see `integrations/codex-plugin/CHANGELOG.md`). Resolves #122.
+- **`docs/SECURITY.md` and `docs/RELIABILITY.md`** — dedicated security (auth, RBAC, `NetworkPolicy`, multi-tenant isolation, PII detection) and reliability (test counts, FSRS guarantees) references, split out of the retired `docs/agent-context.md` alongside an expanded `docs/ARCHITECTURE.md`. Resolves #124.
+
+### Fixed
+
+- **Phase 2A.1 — preference-detection for the `SelRoute` query classifier** (`pensyve-core::retrieval::query_classifier`). Queries like "What is my favorite color?" previously matched the single-session-user pattern (`\bmy\b`) and took a spreading-activation penalty meant for a different question type — there was no preference-specific detector. Added a preference regex (favourite/favorite, prefer/preferred/preferences, like best, go-to) with precedence above single-session-user but below single-session-assistant, so preference queries now route to the identity mask instead. This fix is what unblocked the default-on flip below. Resolves #125.
+- **Gateway resilience hardening** (`pensyve-mcp-gateway`): the auth/Stripe circuit breaker now recovers from abandoned `HalfOpen` probes and mirrors state across gateway instances via Redis instead of waiting out a full cooldown; the usage reporter requeues only the specific customer/tier groups that failed to flush (instead of the whole batch) and applies a bounded HTTP timeout so a slow Stripe call can no longer stall reporting. Part of #123.
+- **UTF-8 panic in the gateway's `/v1/remember` request logging.** Byte-index slicing of the `fact` field for a log preview could panic when the truncation boundary fell inside a multi-byte character (e.g. accented letters), which surfaced to clients as `socket connection closed unexpectedly`. Truncation now walks `chars()` so it always respects character boundaries. Resolves #151.
+
+### Changed
+
+- **`SelRoute` query-type classifier is now default-on** (`pensyve-core::retrieval::query_classifier`). `PENSYVE_SELROUTE` previously required explicit opt-in; it now defaults to enabled, with `PENSYVE_SELROUTE=0` (or `false` / `off` / `no`) to disable and restore the byte-for-byte pre-Phase-2A recall pipeline. SelRoute maps recall queries into the six `IntentRouter` question types and applies a per-route 8-signal RRF mask. The flip follows the Phase 2A.1 fix above and validated positive on Pensyve's internal n=100 validation set: +2.0pp aggregate accuracy and +11.8pp on single-session-preference queries specifically, with zero regressions on other question types. Resolves #126.
+- **Gateway rate limiting and usage quotas are now tenant-scoped** (`pensyve-mcp-gateway`). `AuthContext` carries an optional `tenant_id` (from OAuth claims or the auth-service response body); the rate-limit/quota bucket key now resolves `tenant_id > user_id > key_id`, so multiple API keys under the same tenant share one quota bucket instead of each key getting its own. Part of #123.
+- **Core release version bumped `2.5.0 -> 2.6.0`** across Rust manifests, Python metadata, and Cargo/uv locks; `@pensyve/sdk` moves in lockstep.
+
+### Notes
+
+- **Defaults for G3/G4 and Phase 2B-2E mechanisms (dependency-parse KG, PPR, D-MEM, Vendi rerank) are unchanged** — still opt-in behind their respective env gates. Only SelRoute (Phase 2A) flips to default-on in this release.
+- **`pensyve-python` wheels** follow the same release workflow matrix as v2.5.0: Linux x64, Linux ARM64, macOS ARM64, and Windows x64.
+- **MSRV unchanged** at 1.88.
+
 ## [2.5.0] - 2026-05-24
 
 Feature release since v2.4.0. This cut includes the two G4 public-surface follow-ups plus the Phase 2A-2E algorithm stack: SelRoute query classification, dependency-parse KG materialization, Personalized PageRank retrieval, RPE-gated fast/slow consolidation, and Vendi-Score diversity reranking. The new retrieval and consolidation mechanisms remain opt-in behind env gates unless called through explicit SDK surfaces.
