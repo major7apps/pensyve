@@ -912,6 +912,28 @@ mod localllm {
     // 3.5-27B dense, Qwen3-coder) finish in ~5-10s and aren't affected.
     const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
+    /// Parse an override for the extractor HTTP timeout. Batched extraction
+    /// of a full `LongMemEval` session (40+ conversations) can exceed 300s on
+    /// slower reader stacks (observed 2026-07-12: the MTP deployment at
+    /// ~20 tok/s single-stream timed out batches the earlier `DFlash` stack
+    /// finished in time; each timeout silently drops the whole batch).
+    /// Zero, negative, and non-numeric values fall back to the default.
+    fn timeout_secs_from(raw: Option<&str>) -> u64 {
+        raw.and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+    }
+
+    /// Effective extractor timeout: `PENSYVE_EXTRACTOR_TIMEOUT_SECS` env
+    /// override, else [`DEFAULT_TIMEOUT_SECS`].
+    fn extractor_timeout_secs() -> u64 {
+        timeout_secs_from(
+            std::env::var("PENSYVE_EXTRACTOR_TIMEOUT_SECS")
+                .ok()
+                .as_deref(),
+        )
+    }
+
     /// Extractor that hits an OpenAI-compatible `chat.completions` endpoint —
     /// designed for local vLLM serving a small open-weight model (Qwen 3.6-35B
     /// `MoE`, Nemotron Nano, etc.). Default extraction path under the v2
@@ -953,7 +975,7 @@ mod localllm {
             policy: NetworkPolicy,
         ) -> ExtractionResult<Self> {
             let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+                .timeout(Duration::from_secs(extractor_timeout_secs()))
                 .build()
                 .map_err(|e| ExtractionError::Config(format!("http client build: {e}")))?;
             Ok(Self {
@@ -976,6 +998,11 @@ mod localllm {
         ///     `permissive`; defaults to `LocalOnly { url: <base_url> }`
         ///     when unset — the v2.1 fail-closed default for the local
         ///     extractor configured for a known endpoint).
+        ///   - `PENSYVE_EXTRACTOR_TIMEOUT_SECS` (HTTP client timeout in
+        ///     seconds; default 300. Zero, negative, and non-numeric values
+        ///     fall back to the default. Raise for slow reader stacks where
+        ///     a full batched extraction exceeds 300s — see
+        ///     [`timeout_secs_from`].)
         pub fn from_env() -> ExtractionResult<Self> {
             let base_url =
                 std::env::var("PENSYVE_EXTRACTOR_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into());
@@ -1346,6 +1373,16 @@ mod localllm {
         use chrono::{DateTime, Utc};
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[test]
+        fn timeout_override_parses_and_rejects_junk() {
+            assert_eq!(timeout_secs_from(None), DEFAULT_TIMEOUT_SECS);
+            assert_eq!(timeout_secs_from(Some("1800")), 1800);
+            assert_eq!(timeout_secs_from(Some(" 900 ")), 900);
+            assert_eq!(timeout_secs_from(Some("0")), DEFAULT_TIMEOUT_SECS);
+            assert_eq!(timeout_secs_from(Some("-5")), DEFAULT_TIMEOUT_SECS);
+            assert_eq!(timeout_secs_from(Some("soon")), DEFAULT_TIMEOUT_SECS);
+        }
 
         fn openai_response_body(text: &str) -> serde_json::Value {
             serde_json::json!({
