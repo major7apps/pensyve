@@ -141,27 +141,32 @@ pub fn is_model_available_offline(model_name: &str) -> bool {
 }
 
 /// Map a supported model name to its fastembed enum, dimensionality, and
-/// `HuggingFace` model code. Errors on unknown names.
+/// `HuggingFace` model code. Errors on unknown names. Dimensionality is
+/// looked up in [`SUPPORTED_MODELS`] so the registry stays the single
+/// source of truth.
 fn resolve_model(model_name: &str) -> EmbeddingResult<(EmbeddingModel, usize, &'static str)> {
-    match model_name {
-        "Alibaba-NLP/gte-base-en-v1.5" => Ok((
-            EmbeddingModel::GTEBaseENV15,
-            768,
-            "Alibaba-NLP/gte-base-en-v1.5",
-        )),
-        "all-MiniLM-L6-v2" | "sentence-transformers/all-MiniLM-L6-v2" => Ok((
+    let (model, hf_model_code) = match model_name {
+        "Alibaba-NLP/gte-base-en-v1.5" => {
+            (EmbeddingModel::GTEBaseENV15, "Alibaba-NLP/gte-base-en-v1.5")
+        }
+        "all-MiniLM-L6-v2" | "sentence-transformers/all-MiniLM-L6-v2" => (
             EmbeddingModel::AllMiniLML6V2,
-            384,
             "Qdrant/all-MiniLM-L6-v2-onnx",
-        )),
+        ),
         other => {
             let supported: Vec<&str> = SUPPORTED_MODELS.iter().map(|(name, _)| *name).collect();
-            Err(EmbeddingError::ModelLoad(format!(
+            return Err(EmbeddingError::ModelLoad(format!(
                 "Unknown model: '{other}'. Supported: {}",
                 supported.join(", ")
-            )))
+            )));
         }
-    }
+    };
+    let dims = model_dimensions(model_name).ok_or_else(|| {
+        EmbeddingError::ModelLoad(format!(
+            "BUG: model '{model_name}' resolves but is missing from SUPPORTED_MODELS"
+        ))
+    })?;
+    Ok((model, dims, hf_model_code))
 }
 
 /// Build a pool of `pool_size` ONNX sessions for `model`. This is the
