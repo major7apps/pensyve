@@ -121,7 +121,7 @@ echo ""
 # Check 4: provenance tag format — every proactive/auto-capture tag uses [<origin>/<trigger>/<tier>]
 echo "Check 4: provenance tag format"
 VALID_PROVENANCE_RE='\[(proactive|auto-capture)/(in-flight|stop|pre-compact|curator|user)/(tier-1|tier-2|residual/tier-1|residual/tier-2|open-question)\]'
-if rg -n '\[(proactive|auto-capture)' "${MCP_REF_FILES[@]}" | rg -v "$VALID_PROVENANCE_RE"; then
+if grep -nE '\[(proactive|auto-capture)' "${MCP_REF_FILES[@]}" | grep -vE "$VALID_PROVENANCE_RE"; then
   echo "  FAIL: some provenance tags do not match [<origin>/<trigger>/<tier>] format"
   EXIT_CODE=1
 else
@@ -131,7 +131,7 @@ echo ""
 
 # Check 5: procedural memory convention — [procedural] prefix is used in observe content
 echo "Check 5: procedural convention uses [procedural] prefix in pensyve_observe content"
-if ! rg -q '\[procedural\]' "${MCP_REF_FILES[@]}"; then
+if ! grep -qE '\[procedural\]' "${MCP_REF_FILES[@]}"; then
   echo "  WARN: no [procedural] prefix usage found in configured plugin surfaces."
 else
   echo "  PASS"
@@ -142,7 +142,7 @@ echo ""
 echo "Check 6: @-mention workflow documents current Codex dispatch limitation"
 MISSING_MENTION_DOC=0
 for file in "${MENTION_DOC_FILES[@]}"; do
-  if rg -qi 'true @-mention dispatch is not currently exposed|Codex does not currently expose true @-mention dispatch' "$file"; then
+  if grep -qiE 'true @-mention dispatch is not currently exposed|Codex does not currently expose true @-mention dispatch' "$file"; then
     echo "  PASS: $file"
   else
     echo "  FAIL: $file"
