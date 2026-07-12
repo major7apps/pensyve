@@ -63,8 +63,8 @@ fn resolve_stdio_pool_size() -> usize {
 /// if necessary download) the model at startup, falling back
 /// GTE → `MiniLM` → mock exactly as before.
 fn build_embedder(stored_dims: Option<usize>) -> anyhow::Result<OnnxEmbedder> {
-    if std::env::var("PENSYVE_EAGER_EMBEDDER").is_ok() {
-        return build_eager_embedder();
+    if eager_embedder_enabled() {
+        return build_eager_embedder(stored_dims);
     }
 
     if std::env::var("PENSYVE_ALLOW_MOCK_EMBEDDER").is_ok() {
@@ -95,6 +95,18 @@ fn build_embedder(stored_dims: Option<usize>) -> anyhow::Result<OnnxEmbedder> {
 
 const GTE: &str = "Alibaba-NLP/gte-base-en-v1.5";
 const MINILM: &str = "all-MiniLM-L6-v2";
+
+/// Whether `PENSYVE_EAGER_EMBEDDER` is set to an enabled value. Falsy
+/// values (`0`, `false`, `off`, `no`, empty) leave the default lazy path
+/// active, matching the `PENSYVE_SELROUTE` truthiness convention.
+fn eager_embedder_enabled() -> bool {
+    std::env::var("PENSYVE_EAGER_EMBEDDER").is_ok_and(|v| flag_is_truthy(&v))
+}
+
+fn flag_is_truthy(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    !matches!(lower.as_str(), "" | "0" | "false" | "off" | "no")
+}
 
 /// Pick the lazy model for the stdio server.
 ///
@@ -135,29 +147,49 @@ fn cache_preferred_model(gte_cached: bool, minilm_cached: bool) -> &'static str 
     }
 }
 
-/// Pre-lazy startup behavior: try GTE (768d), then `MiniLM` (384d), then mock.
-fn build_eager_embedder() -> anyhow::Result<OnnxEmbedder> {
-    match OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5") {
+/// Try order for the eager path: existing embeddings' dimensionality
+/// promotes the matching model to first choice (384 → `MiniLM` before
+/// GTE); otherwise the pre-lazy GTE → `MiniLM` order applies.
+fn eager_model_order(stored_dims: Option<usize>) -> [&'static str; 2] {
+    match stored_dims {
+        Some(384) => [MINILM, GTE],
+        _ => [GTE, MINILM],
+    }
+}
+
+/// Pre-lazy startup behavior: load a model at startup (downloading if
+/// needed), falling back to mock when permitted. Try order honors
+/// existing embeddings' dimensionality — see `eager_model_order`.
+fn build_eager_embedder(stored_dims: Option<usize>) -> anyhow::Result<OnnxEmbedder> {
+    let [first, second] = eager_model_order(stored_dims);
+    match OnnxEmbedder::new(first) {
         Ok(e) => {
-            tracing::info!("Using real ONNX embedder (Alibaba-NLP/gte-base-en-v1.5, 768 dims)");
+            tracing::info!(
+                "Using real ONNX embedder ({first}, {} dims)",
+                e.dimensions()
+            );
             Ok(e)
         }
-        Err(gte_err) => {
-            tracing::warn!("GTE model unavailable ({gte_err}), trying all-MiniLM-L6-v2 fallback");
-            match OnnxEmbedder::new("all-MiniLM-L6-v2") {
+        Err(first_err) => {
+            tracing::warn!("{first} unavailable ({first_err}), trying {second} fallback");
+            match OnnxEmbedder::new(second) {
                 Ok(e) => {
-                    tracing::info!("Using fallback ONNX embedder (all-MiniLM-L6-v2, 384 dims)");
+                    tracing::info!(
+                        "Using fallback ONNX embedder ({second}, {} dims)",
+                        e.dimensions()
+                    );
                     Ok(e)
                 }
-                Err(mini_err) => {
+                Err(second_err) => {
                     if std::env::var("PENSYVE_ALLOW_MOCK_EMBEDDER").is_ok() {
+                        let mock_dims = stored_dims.unwrap_or(768);
                         tracing::warn!(
-                            "ONNX embedders unavailable ({mini_err}), falling back to mock (768 dims)"
+                            "ONNX embedders unavailable ({second_err}), falling back to mock ({mock_dims} dims)"
                         );
-                        Ok(OnnxEmbedder::new_mock(768))
+                        Ok(OnnxEmbedder::new_mock(mock_dims))
                     } else {
                         Err(anyhow::anyhow!(
-                            "No ONNX model available. Set PENSYVE_ALLOW_MOCK_EMBEDDER=1 to use mock. Error: {mini_err}"
+                            "No ONNX model available. Set PENSYVE_ALLOW_MOCK_EMBEDDER=1 to use mock. Error: {second_err}"
                         ))
                     }
                 }
@@ -320,6 +352,23 @@ mod tests {
         assert_eq!(choose_lazy_model(None, true, true), GTE);
         assert_eq!(choose_lazy_model(None, false, true), MINILM);
         assert_eq!(choose_lazy_model(None, false, false), GTE);
+    }
+
+    #[test]
+    fn falsy_flag_values_stay_lazy() {
+        for v in ["0", "false", "off", "no", "", " FALSE "] {
+            assert!(!flag_is_truthy(v), "{v:?} must be falsy");
+        }
+        for v in ["1", "true", "yes", "on"] {
+            assert!(flag_is_truthy(v), "{v:?} must be truthy");
+        }
+    }
+
+    #[test]
+    fn eager_order_honors_stored_dims() {
+        assert_eq!(eager_model_order(Some(384)), [MINILM, GTE]);
+        assert_eq!(eager_model_order(Some(768)), [GTE, MINILM]);
+        assert_eq!(eager_model_order(None), [GTE, MINILM]);
     }
 
     #[test]
