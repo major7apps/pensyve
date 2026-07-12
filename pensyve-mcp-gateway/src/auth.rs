@@ -163,7 +163,7 @@ impl AuthValidator {
             .or_else(|| claims.account_id.filter(|s| !s.is_empty()));
 
         Some(AuthContext {
-            key_id: format!("oauth:{}", &claims.client_id),
+            key_id: format!("oauth:{}", claims.client_id),
             tenant_id,
             user_id: Some(claims.sub),
             scope: claims.scope.unwrap_or_else(|| "mcp".to_string()),
