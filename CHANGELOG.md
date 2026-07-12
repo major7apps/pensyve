@@ -5,6 +5,19 @@ All notable changes to Pensyve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.1] - 2026-07-12
+
+Patch release: CI/release-pipeline fixes and a full dependency refresh. No functional changes to the memory runtime.
+
+### Fixed
+
+- **Lint failure on Rust 1.97** — removed a redundant `&` in a `format!` argument in `pensyve-mcp-gateway` auth that tripped the new `useless_borrows_in_formatting` clippy lint, which broke every CI run under `-D warnings` once the stable toolchain moved to 1.97. (#163)
+- **Release workflow "Package Codex plugin" job** — `integrations/codex-plugin/scripts/lint-mcp-refs.sh` shelled out to `rg`, which is not installed on GitHub-hosted runners; every tagged release since v2.1.0 failed there, skipping the GitHub Release step (registry publishes were unaffected). The script now uses portable `grep -E`. (#163)
+
+### Changed
+
+- **Dependency refresh across all ecosystems** (#164): sqlx-core/sqlx-postgres 0.8.6 → 0.9.0, phf 0.11 → 0.13, rusqlite 0.39 → 0.40, fastembed → 5.17.2, redis → 1.3.0, plus uuid/regex/chrono/serde_json patch bumps and a full `cargo update`; eslint → 10.7.0 and typescript-eslint → 8.63.0 (TypeScript stays on 6.x until typescript-eslint supports 7.x); `uv lock --upgrade` for the Python tree (llama-cpp-python 0.3.34, pyright 1.1.411, huggingface-hub 1.23.0, ruff 0.15.21, pytest-asyncio 1.4.0); actions/checkout → v7 and actions/cache → v6.
+
 ## [2.6.0] - 2026-07-07
 
 Minor release since v2.5.0, headlined by the `SelRoute` query-type classifier (Phase 2A) moving from opt-in to default-on — the behavior change that makes this a minor bump rather than a patch. Also ships tenant-scoped gateway rate limiting/quotas, gateway resilience hardening, a native Codex `/pensyve` command, a documentation decomposition pass, and a UTF-8 panic fix in gateway logging.
