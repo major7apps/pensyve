@@ -6,7 +6,12 @@ on:
 
 jobs:
   claude-review:
-    if: github.event.pull_request.draft == false && github.actor != 'dependabot[bot]'
+    # Fork PRs receive neither repo secrets nor `id-token: write` from
+    # GitHub, so the action can only fail there (see PR #162) — skip them.
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.actor != 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: read

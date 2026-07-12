@@ -396,7 +396,8 @@ Pensyve uses the following environment variables across its components:
 | `PENSYVE_PATH`                | `~/.pensyve/<namespace>` | SQLite database directory                                 |
 | `PENSYVE_NAMESPACE`           | `default`                | Memory namespace name                                     |
 | `RUST_LOG`                    | `pensyve=info`           | Tracing filter (e.g. `debug`, `pensyve=debug,hyper=warn`) |
-| `PENSYVE_ALLOW_MOCK_EMBEDDER` | `false`                  | Fall back to mock embedder if real models unavailable     |
+| `PENSYVE_ALLOW_MOCK_EMBEDDER` | `false`                  | Fall back to mock embedder if real models unavailable (eager startup only, i.e. with `PENSYVE_EAGER_EMBEDDER=1`) |
+| `PENSYVE_EAGER_EMBEDDER`      | `false`                  | Load the ONNX model at startup instead of on first use    |
 
 ### Gateway / REST API
 

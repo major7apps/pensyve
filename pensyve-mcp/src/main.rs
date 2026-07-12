@@ -4,7 +4,6 @@ use std::sync::Arc;
 use anyhow::Result;
 use rmcp::ServiceExt;
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::{OnnxEmbedder, is_model_available_offline};
@@ -53,30 +52,33 @@ fn resolve_stdio_pool_size() -> usize {
 /// most of which never embed anything; eager loading multiplied ~2.9 GB
 /// per process and has caused system-wide memory exhaustion.
 ///
-/// Model choice mirrors the eager fallback chain without any load: prefer
-/// GTE if it is already in the fastembed cache, else `MiniLM` if cached,
-/// else GTE (downloaded on first use).
+/// Model choice: if the namespace already holds embeddings, the model whose
+/// dimensionality matches them wins outright — picking anything else would
+/// silently drop every stored vector from the index at load. Otherwise
+/// mirror the eager fallback chain without any load: prefer GTE if it is
+/// already in the fastembed cache, else `MiniLM` if cached, else GTE
+/// (downloaded on first use).
 ///
 /// `PENSYVE_EAGER_EMBEDDER=1` restores the pre-lazy behavior: load (and
 /// if necessary download) the model at startup, falling back
 /// GTE → `MiniLM` → mock exactly as before.
-fn build_embedder() -> anyhow::Result<OnnxEmbedder> {
-    const GTE: &str = "Alibaba-NLP/gte-base-en-v1.5";
-    const MINILM: &str = "all-MiniLM-L6-v2";
-
-    if std::env::var("PENSYVE_EAGER_EMBEDDER").is_ok() {
-        return build_eager_embedder();
+fn build_embedder(stored_dims: Option<usize>) -> anyhow::Result<OnnxEmbedder> {
+    if eager_embedder_enabled() {
+        return build_eager_embedder(stored_dims);
     }
 
-    let model_name = if is_model_available_offline(GTE) {
-        GTE
-    } else if is_model_available_offline(MINILM) {
-        MINILM
-    } else {
-        // Neither model cached: stay lazy on the preferred model; the
-        // download happens on the first embedding tool call.
-        GTE
-    };
+    if std::env::var("PENSYVE_ALLOW_MOCK_EMBEDDER").is_ok() {
+        tracing::warn!(
+            "PENSYVE_ALLOW_MOCK_EMBEDDER has no effect on the default lazy path; \
+             it only applies with PENSYVE_EAGER_EMBEDDER=1"
+        );
+    }
+
+    let model_name = choose_lazy_model(
+        stored_dims,
+        is_model_available_offline(GTE),
+        is_model_available_offline(MINILM),
+    );
 
     let embedder = OnnxEmbedder::new_lazy_with_options(
         model_name,
@@ -91,29 +93,103 @@ fn build_embedder() -> anyhow::Result<OnnxEmbedder> {
     Ok(embedder)
 }
 
-/// Pre-lazy startup behavior: try GTE (768d), then `MiniLM` (384d), then mock.
-fn build_eager_embedder() -> anyhow::Result<OnnxEmbedder> {
-    match OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5") {
+const GTE: &str = "Alibaba-NLP/gte-base-en-v1.5";
+const MINILM: &str = "all-MiniLM-L6-v2";
+
+/// Whether `PENSYVE_EAGER_EMBEDDER` is set to an enabled value. Falsy
+/// values (`0`, `false`, `off`, `no`, empty) leave the default lazy path
+/// active, matching the `PENSYVE_SELROUTE` truthiness convention.
+fn eager_embedder_enabled() -> bool {
+    std::env::var("PENSYVE_EAGER_EMBEDDER").is_ok_and(|v| flag_is_truthy(&v))
+}
+
+fn flag_is_truthy(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    !matches!(lower.as_str(), "" | "0" | "false" | "off" | "no")
+}
+
+/// Pick the lazy model for the stdio server.
+///
+/// Precedence:
+/// 1. Existing embeddings' dimensionality (768 → GTE, 384 → `MiniLM`) —
+///    even for an uncached model, matching the eager path's willingness to
+///    download rather than orphan the stored vectors.
+/// 2. Whichever preferred model is already cached (GTE, then `MiniLM`).
+/// 3. GTE, downloaded lazily on first use.
+fn choose_lazy_model(
+    stored_dims: Option<usize>,
+    gte_cached: bool,
+    minilm_cached: bool,
+) -> &'static str {
+    match stored_dims {
+        Some(768) => GTE,
+        Some(384) => MINILM,
+        Some(other) => {
+            tracing::warn!(
+                "Existing embeddings have unrecognized dimensionality {other}; \
+                 falling back to cache-preference model choice"
+            );
+            cache_preferred_model(gte_cached, minilm_cached)
+        }
+        None => cache_preferred_model(gte_cached, minilm_cached),
+    }
+}
+
+fn cache_preferred_model(gte_cached: bool, minilm_cached: bool) -> &'static str {
+    if gte_cached {
+        GTE
+    } else if minilm_cached {
+        MINILM
+    } else {
+        // Neither model cached: stay lazy on the preferred model; the
+        // download happens on the first embedding tool call.
+        GTE
+    }
+}
+
+/// Try order for the eager path: existing embeddings' dimensionality
+/// promotes the matching model to first choice (384 → `MiniLM` before
+/// GTE); otherwise the pre-lazy GTE → `MiniLM` order applies.
+fn eager_model_order(stored_dims: Option<usize>) -> [&'static str; 2] {
+    match stored_dims {
+        Some(384) => [MINILM, GTE],
+        _ => [GTE, MINILM],
+    }
+}
+
+/// Pre-lazy startup behavior: load a model at startup (downloading if
+/// needed), falling back to mock when permitted. Try order honors
+/// existing embeddings' dimensionality — see `eager_model_order`.
+fn build_eager_embedder(stored_dims: Option<usize>) -> anyhow::Result<OnnxEmbedder> {
+    let [first, second] = eager_model_order(stored_dims);
+    match OnnxEmbedder::new(first) {
         Ok(e) => {
-            tracing::info!("Using real ONNX embedder (Alibaba-NLP/gte-base-en-v1.5, 768 dims)");
+            tracing::info!(
+                "Using real ONNX embedder ({first}, {} dims)",
+                e.dimensions()
+            );
             Ok(e)
         }
-        Err(gte_err) => {
-            tracing::warn!("GTE model unavailable ({gte_err}), trying all-MiniLM-L6-v2 fallback");
-            match OnnxEmbedder::new("all-MiniLM-L6-v2") {
+        Err(first_err) => {
+            tracing::warn!("{first} unavailable ({first_err}), trying {second} fallback");
+            match OnnxEmbedder::new(second) {
                 Ok(e) => {
-                    tracing::info!("Using fallback ONNX embedder (all-MiniLM-L6-v2, 384 dims)");
+                    tracing::info!(
+                        "Using fallback ONNX embedder ({second}, {} dims)",
+                        e.dimensions()
+                    );
                     Ok(e)
                 }
-                Err(mini_err) => {
+                Err(second_err) => {
                     if std::env::var("PENSYVE_ALLOW_MOCK_EMBEDDER").is_ok() {
+                        let mock_dims = stored_dims.unwrap_or(768);
                         tracing::warn!(
-                            "ONNX embedders unavailable ({mini_err}), falling back to mock (768 dims)"
+                            "ONNX embedders unavailable ({second_err}), falling back to mock ({mock_dims} dims)"
                         );
-                        Ok(OnnxEmbedder::new_mock(768))
+                        Ok(OnnxEmbedder::new_mock(mock_dims))
                     } else {
                         Err(anyhow::anyhow!(
-                            "No ONNX model available. Set PENSYVE_ALLOW_MOCK_EMBEDDER=1 to use mock. Error: {mini_err}"
+                            "No ONNX model available. Set PENSYVE_ALLOW_MOCK_EMBEDDER=1 to use mock. Error: {second_err}"
                         ))
                     }
                 }
@@ -122,53 +198,52 @@ fn build_eager_embedder() -> anyhow::Result<OnnxEmbedder> {
     }
 }
 
-fn load_vector_index(
-    storage: &dyn StorageTrait,
-    namespace_id: Uuid,
-    dimensions: usize,
-) -> VectorIndex {
+/// Dimensionality of the namespace's existing embeddings, from the first
+/// non-observation memory with a non-empty embedding. `None` for a fresh
+/// namespace. Drives model choice in `build_embedder` so we never pick a
+/// model that orphans the stored vectors.
+fn stored_embedding_dims(memories: &[pensyve_core::types::Memory]) -> Option<usize> {
+    memories
+        .iter()
+        .filter(|m| !matches!(m, pensyve_core::types::Memory::Observation(_)))
+        .map(|m| m.embedding().len())
+        .find(|&len| len > 0)
+}
+
+fn build_vector_index(memories: &[pensyve_core::types::Memory], dimensions: usize) -> VectorIndex {
     let mut index = VectorIndex::new(dimensions, 1024);
 
-    match storage.get_all_memories_by_namespace(namespace_id) {
-        Ok(memories) => {
-            let mut loaded = 0usize;
-            for memory in &memories {
-                // Observations are recall-time enrichment — they attach to
-                // top-k session groups via `recall_grouped::attach_observations_to_groups`
-                // and MUST NOT enter the RRF candidate pool.
-                if matches!(memory, pensyve_core::types::Memory::Observation(_)) {
-                    continue;
-                }
-                let embedding = memory.embedding();
-                if !embedding.is_empty() {
-                    let result = match memory {
-                        pensyve_core::types::Memory::Semantic(s) => {
-                            index.add_with_entity(memory.id(), embedding, s.subject)
-                        }
-                        pensyve_core::types::Memory::Episodic(e) => {
-                            index.add_with_entity(memory.id(), embedding, e.about_entity)
-                        }
-                        pensyve_core::types::Memory::Procedural(_) => {
-                            index.add(memory.id(), embedding)
-                        }
-                        pensyve_core::types::Memory::Observation(_) => unreachable!(),
-                    };
-                    if let Err(e) = result {
-                        tracing::warn!("Skipping memory in index load: {e}");
-                    } else {
-                        loaded += 1;
-                    }
-                }
-            }
-            tracing::info!(
-                "Loaded {loaded}/{} memories into vector index",
-                memories.len()
-            );
+    let mut loaded = 0usize;
+    for memory in memories {
+        // Observations are recall-time enrichment — they attach to
+        // top-k session groups via `recall_grouped::attach_observations_to_groups`
+        // and MUST NOT enter the RRF candidate pool.
+        if matches!(memory, pensyve_core::types::Memory::Observation(_)) {
+            continue;
         }
-        Err(e) => {
-            tracing::warn!("Failed to load memories for vector index: {e}");
+        let embedding = memory.embedding();
+        if !embedding.is_empty() {
+            let result = match memory {
+                pensyve_core::types::Memory::Semantic(s) => {
+                    index.add_with_entity(memory.id(), embedding, s.subject)
+                }
+                pensyve_core::types::Memory::Episodic(e) => {
+                    index.add_with_entity(memory.id(), embedding, e.about_entity)
+                }
+                pensyve_core::types::Memory::Procedural(_) => index.add(memory.id(), embedding),
+                pensyve_core::types::Memory::Observation(_) => unreachable!(),
+            };
+            if let Err(e) = result {
+                tracing::warn!("Skipping memory in index load: {e}");
+            } else {
+                loaded += 1;
+            }
         }
     }
+    tracing::info!(
+        "Loaded {loaded}/{} memories into vector index",
+        memories.len()
+    );
 
     index
 }
@@ -204,13 +279,22 @@ async fn main() -> Result<()> {
         Err(e) => return Err(anyhow::anyhow!("Storage error: {e}")),
     };
 
+    // Fetch memories once: they drive both the embedder's model choice
+    // (existing embedding dimensionality wins) and the vector index build.
+    let memories = storage
+        .get_all_memories_by_namespace(namespace.id)
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to load memories for vector index: {e}");
+            Vec::new()
+        });
+
     // Initialize embedder — lazy by default (see `build_embedder`).
-    let embedder = build_embedder()?;
+    let embedder = build_embedder(stored_embedding_dims(&memories))?;
 
     let dimensions = embedder.dimensions();
 
     // Load existing embeddings into the vector index.
-    let vector_index = load_vector_index(&storage, namespace.id, dimensions);
+    let vector_index = build_vector_index(&memories, dimensions);
 
     let retrieval_config = RetrievalConfig {
         default_limit: 5,
@@ -247,4 +331,69 @@ async fn main() -> Result<()> {
 
     tracing::info!("pensyve-mcp shut down");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pensyve_core::types::{Memory, SemanticMemory};
+    use uuid::Uuid;
+
+    #[test]
+    fn stored_dims_win_over_cache_state() {
+        // Existing 768-d embeddings force GTE even when only MiniLM is
+        // cached — anything else orphans the stored vectors at index load.
+        assert_eq!(choose_lazy_model(Some(768), false, true), GTE);
+        assert_eq!(choose_lazy_model(Some(384), true, false), MINILM);
+    }
+
+    #[test]
+    fn fresh_namespace_prefers_cached_model() {
+        assert_eq!(choose_lazy_model(None, true, true), GTE);
+        assert_eq!(choose_lazy_model(None, false, true), MINILM);
+        assert_eq!(choose_lazy_model(None, false, false), GTE);
+    }
+
+    #[test]
+    fn falsy_flag_values_stay_lazy() {
+        for v in ["0", "false", "off", "no", "", " FALSE "] {
+            assert!(!flag_is_truthy(v), "{v:?} must be falsy");
+        }
+        for v in ["1", "true", "yes", "on"] {
+            assert!(flag_is_truthy(v), "{v:?} must be truthy");
+        }
+    }
+
+    #[test]
+    fn eager_order_honors_stored_dims() {
+        assert_eq!(eager_model_order(Some(384)), [MINILM, GTE]);
+        assert_eq!(eager_model_order(Some(768)), [GTE, MINILM]);
+        assert_eq!(eager_model_order(None), [GTE, MINILM]);
+    }
+
+    #[test]
+    fn unrecognized_dims_fall_back_to_cache_preference() {
+        assert_eq!(choose_lazy_model(Some(512), false, true), MINILM);
+        assert_eq!(choose_lazy_model(Some(512), false, false), GTE);
+    }
+
+    #[test]
+    fn stored_embedding_dims_finds_first_nonempty() {
+        let ns = Uuid::new_v4();
+        let entity = Uuid::new_v4();
+        let mut without = SemanticMemory::new(ns, entity, "likes", "rust", 0.9);
+        without.embedding = vec![];
+        let mut with = SemanticMemory::new(ns, entity, "likes", "onnx", 0.9);
+        with.embedding = vec![0.0; 768];
+
+        assert_eq!(stored_embedding_dims(&[]), None);
+        assert_eq!(
+            stored_embedding_dims(&[Memory::Semantic(without.clone())]),
+            None
+        );
+        assert_eq!(
+            stored_embedding_dims(&[Memory::Semantic(without), Memory::Semantic(with)]),
+            Some(768)
+        );
+    }
 }
