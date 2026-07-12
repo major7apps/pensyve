@@ -1934,7 +1934,6 @@ mod batched_localllm {
     mod tests {
         use super::*;
         use crate::network_policy::NetworkPolicy;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2097,41 +2096,35 @@ mod batched_localllm {
 
         #[tokio::test]
         async fn batched_fans_out_concurrent_calls() {
-            // Observe peak in-flight concurrency by holding each request
-            // open for ~150ms while counting active calls. The semaphore
-            // caps the number of futures that can call `inner.extract`
-            // concurrently — with max_concurrency=4 and 8 episodes,
-            // wiremock should see at least 2 in-flight requests at peak
-            // (lower bound is loose to tolerate scheduler/runtime
-            // variance — what we're really asserting is "more than one
-            // request is in flight", proving fan-out happened).
+            // Observe peak in-flight concurrency by recording each
+            // request's ARRIVAL TIMESTAMP and computing interval overlap
+            // post-hoc: request i is in flight over
+            // [arrival_i, arrival_i + delay) (the response is held open
+            // for `delay`). This measurement is race-free — an earlier
+            // version counted with a live atomic decremented by a spawned
+            // `sleep(delay)` task, which had zero margin against the
+            // permit-release boundary: under loaded CI runners, lagging
+            // decrements overlapped fresh arrivals and the "peak"
+            // overshot the semaphore limit (observed 6 with 4 permits)
+            // even though clamping worked correctly.
             //
-            // Mechanism: a background tokio task per request increments
-            // on arrival and decrements AFTER the response delay has
-            // elapsed. wiremock's `respond_with` closure is synchronous
-            // (it must return a `ResponseTemplate`), so the decrement
-            // can't live inside it directly without firing before the
-            // delayed response goes out the wire. Spawning a fire-and-
-            // forget task that sleeps the same duration as the response
-            // delay gives a faithful picture of concurrent request
-            // lifetimes.
+            // With timestamps the upper bound is exact: a same-permit
+            // successor can only arrive after its predecessor's response
+            // was delivered, i.e. strictly after arrival + delay, so its
+            // interval never overlaps — peak overlap > max_concurrency
+            // is possible only if the semaphore genuinely over-admits.
             let server = MockServer::start().await;
-            let in_flight = Arc::new(AtomicUsize::new(0));
-            let peak = Arc::new(AtomicUsize::new(0));
+            let arrivals = Arc::new(std::sync::Mutex::new(Vec::<std::time::Instant>::new()));
             let delay = Duration::from_millis(150);
-            let in_flight_resp = in_flight.clone();
-            let peak_resp = peak.clone();
+            let arrivals_resp = arrivals.clone();
 
             Mock::given(method("POST"))
                 .and(path("/v1/chat/completions"))
                 .respond_with(move |_req: &wiremock::Request| {
-                    let cur = in_flight_resp.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak_resp.fetch_max(cur, Ordering::SeqCst);
-                    let in_flight_task = in_flight_resp.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        in_flight_task.fetch_sub(1, Ordering::SeqCst);
-                    });
+                    arrivals_resp
+                        .lock()
+                        .expect("arrivals lock")
+                        .push(std::time::Instant::now());
                     ResponseTemplate::new(200)
                         .set_body_json(openai_response_body("[]"))
                         .set_delay(delay)
@@ -2162,7 +2155,20 @@ mod batched_localllm {
                 .expect("ok");
             assert_eq!(out.len(), 8);
 
-            let observed_peak = peak.load(Ordering::SeqCst);
+            // Peak overlap of the [arrival, arrival + delay) intervals.
+            // n = 8, so the quadratic sweep is fine.
+            let arrivals = arrivals.lock().expect("arrivals lock");
+            assert_eq!(arrivals.len(), 8, "every episode must reach the mock");
+            let observed_peak = arrivals
+                .iter()
+                .map(|t| {
+                    arrivals
+                        .iter()
+                        .filter(|o| **o <= *t && *t < **o + delay)
+                        .count()
+                })
+                .max()
+                .unwrap_or(0);
             assert!(
                 (2..=4).contains(&observed_peak),
                 "observed peak concurrency {observed_peak} should be in [2, 4] \
