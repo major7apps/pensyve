@@ -7,7 +7,8 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use pensyve_core::config::RetrievalConfig;
-use pensyve_core::embedding::OnnxEmbedder;
+use pensyve_core::embedding::{OnnxEmbedder, is_model_available_offline};
+use pensyve_core::network_policy::NetworkPolicy;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::Namespace;
@@ -28,6 +29,97 @@ fn resolve_storage_path() -> PathBuf {
 
 fn resolve_namespace() -> String {
     std::env::var("PENSYVE_NAMESPACE").unwrap_or_else(|_| "default".to_string())
+}
+
+/// Pool size for the stdio server's embedder. This server has exactly one
+/// client and serves tool calls serially, so one ONNX session is enough;
+/// the CPU-derived default in pensyve-core (up to 4 sessions ≈ 4× the
+/// resident memory) is meant for multi-threaded harnesses.
+/// `PENSYVE_EMBEDDING_POOL_SIZE` still overrides.
+fn resolve_stdio_pool_size() -> usize {
+    std::env::var("PENSYVE_EMBEDDING_POOL_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1)
+}
+
+/// Build the embedder for the stdio server.
+///
+/// Default path: a *lazy* embedder — model name validated and dimensions
+/// resolved at startup, but the ONNX session pool (hundreds of MB per
+/// slot) is only built on the first tool call that needs an embedding.
+/// Agent harnesses routinely hold many concurrent pensyve-mcp processes,
+/// most of which never embed anything; eager loading multiplied ~2.9 GB
+/// per process and has caused system-wide memory exhaustion.
+///
+/// Model choice mirrors the eager fallback chain without any load: prefer
+/// GTE if it is already in the fastembed cache, else `MiniLM` if cached,
+/// else GTE (downloaded on first use).
+///
+/// `PENSYVE_EAGER_EMBEDDER=1` restores the pre-lazy behavior: load (and
+/// if necessary download) the model at startup, falling back
+/// GTE → `MiniLM` → mock exactly as before.
+fn build_embedder() -> anyhow::Result<OnnxEmbedder> {
+    const GTE: &str = "Alibaba-NLP/gte-base-en-v1.5";
+    const MINILM: &str = "all-MiniLM-L6-v2";
+
+    if std::env::var("PENSYVE_EAGER_EMBEDDER").is_ok() {
+        return build_eager_embedder();
+    }
+
+    let model_name = if is_model_available_offline(GTE) {
+        GTE
+    } else if is_model_available_offline(MINILM) {
+        MINILM
+    } else {
+        // Neither model cached: stay lazy on the preferred model; the
+        // download happens on the first embedding tool call.
+        GTE
+    };
+
+    let embedder = OnnxEmbedder::new_lazy_with_options(
+        model_name,
+        &NetworkPolicy::Permissive,
+        resolve_stdio_pool_size(),
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to prepare embedder: {e}"))?;
+    tracing::info!(
+        "Using lazy ONNX embedder ({model_name}, {} dims) — model loads on first use",
+        embedder.dimensions()
+    );
+    Ok(embedder)
+}
+
+/// Pre-lazy startup behavior: try GTE (768d), then `MiniLM` (384d), then mock.
+fn build_eager_embedder() -> anyhow::Result<OnnxEmbedder> {
+    match OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5") {
+        Ok(e) => {
+            tracing::info!("Using real ONNX embedder (Alibaba-NLP/gte-base-en-v1.5, 768 dims)");
+            Ok(e)
+        }
+        Err(gte_err) => {
+            tracing::warn!("GTE model unavailable ({gte_err}), trying all-MiniLM-L6-v2 fallback");
+            match OnnxEmbedder::new("all-MiniLM-L6-v2") {
+                Ok(e) => {
+                    tracing::info!("Using fallback ONNX embedder (all-MiniLM-L6-v2, 384 dims)");
+                    Ok(e)
+                }
+                Err(mini_err) => {
+                    if std::env::var("PENSYVE_ALLOW_MOCK_EMBEDDER").is_ok() {
+                        tracing::warn!(
+                            "ONNX embedders unavailable ({mini_err}), falling back to mock (768 dims)"
+                        );
+                        Ok(OnnxEmbedder::new_mock(768))
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "No ONNX model available. Set PENSYVE_ALLOW_MOCK_EMBEDDER=1 to use mock. Error: {mini_err}"
+                        ))
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn load_vector_index(
@@ -112,34 +204,8 @@ async fn main() -> Result<()> {
         Err(e) => return Err(anyhow::anyhow!("Storage error: {e}")),
     };
 
-    // Initialize embedder: try GTE (768d) first, then MiniLM (384d), then mock.
-    let embedder = match OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5") {
-        Ok(e) => {
-            tracing::info!("Using real ONNX embedder (Alibaba-NLP/gte-base-en-v1.5, 768 dims)");
-            e
-        }
-        Err(gte_err) => {
-            tracing::warn!("GTE model unavailable ({gte_err}), trying all-MiniLM-L6-v2 fallback");
-            match OnnxEmbedder::new("all-MiniLM-L6-v2") {
-                Ok(e) => {
-                    tracing::info!("Using fallback ONNX embedder (all-MiniLM-L6-v2, 384 dims)");
-                    e
-                }
-                Err(mini_err) => {
-                    if std::env::var("PENSYVE_ALLOW_MOCK_EMBEDDER").is_ok() {
-                        tracing::warn!(
-                            "ONNX embedders unavailable ({mini_err}), falling back to mock (768 dims)"
-                        );
-                        OnnxEmbedder::new_mock(768)
-                    } else {
-                        return Err(anyhow::anyhow!(
-                            "No ONNX model available. Set PENSYVE_ALLOW_MOCK_EMBEDDER=1 to use mock. Error: {mini_err}"
-                        ));
-                    }
-                }
-            }
-        }
-    };
+    // Initialize embedder — lazy by default (see `build_embedder`).
+    let embedder = build_embedder()?;
 
     let dimensions = embedder.dimensions();
 

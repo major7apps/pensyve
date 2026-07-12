@@ -96,6 +96,19 @@ enum EmbedderInner {
         pool: Vec<Mutex<TextEmbedding>>,
         next: AtomicUsize,
     },
+    /// Deferred variant: the ONNX session pool (and any load-time HF
+    /// download) is built on the first `embed`/`embed_batch` call instead
+    /// of at construction. `dimensions()` is available immediately because
+    /// dimensionality is a static property of the model name. A failed
+    /// pool build is NOT cached — the next embed call retries.
+    Lazy {
+        model: EmbeddingModel,
+        hf_model_code: &'static str,
+        policy: NetworkPolicy,
+        pool_size: usize,
+        pool: Mutex<Option<Arc<Vec<Mutex<TextEmbedding>>>>>,
+        next: AtomicUsize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +128,59 @@ pub fn model_dimensions(model_name: &str) -> Option<usize> {
         .iter()
         .find(|(name, _)| *name == model_name)
         .map(|(_, dims)| *dims)
+}
+
+/// Returns whether a supported model is already present in the local
+/// fastembed cache, i.e. can be loaded without any network I/O. Unknown
+/// model names return `false`.
+///
+/// Useful for callers that want to pick a model without triggering a
+/// download (e.g. the MCP stdio server's lazy startup path).
+pub fn is_model_available_offline(model_name: &str) -> bool {
+    resolve_model(model_name).is_ok_and(|(_, _, hf_model_code)| is_model_cached(hf_model_code))
+}
+
+/// Map a supported model name to its fastembed enum, dimensionality, and
+/// `HuggingFace` model code. Errors on unknown names.
+fn resolve_model(model_name: &str) -> EmbeddingResult<(EmbeddingModel, usize, &'static str)> {
+    match model_name {
+        "Alibaba-NLP/gte-base-en-v1.5" => Ok((
+            EmbeddingModel::GTEBaseENV15,
+            768,
+            "Alibaba-NLP/gte-base-en-v1.5",
+        )),
+        "all-MiniLM-L6-v2" | "sentence-transformers/all-MiniLM-L6-v2" => Ok((
+            EmbeddingModel::AllMiniLML6V2,
+            384,
+            "Qdrant/all-MiniLM-L6-v2-onnx",
+        )),
+        other => {
+            let supported: Vec<&str> = SUPPORTED_MODELS.iter().map(|(name, _)| *name).collect();
+            Err(EmbeddingError::ModelLoad(format!(
+                "Unknown model: '{other}'. Supported: {}",
+                supported.join(", ")
+            )))
+        }
+    }
+}
+
+/// Build a pool of `pool_size` ONNX sessions for `model`. This is the
+/// expensive step (~hundreds of MB of session state per slot for
+/// GTE-base) shared by the eager and lazy construction paths.
+fn build_pool(
+    model: &EmbeddingModel,
+    pool_size: usize,
+) -> EmbeddingResult<Vec<Mutex<TextEmbedding>>> {
+    let mut pool = Vec::with_capacity(pool_size);
+    for i in 0..pool_size {
+        let show_progress = i == 0;
+        let session = TextEmbedding::try_new(
+            InitOptions::new(model.clone()).with_show_download_progress(show_progress),
+        )
+        .map_err(|e| EmbeddingError::ModelLoad(e.to_string()))?;
+        pool.push(Mutex::new(session));
+    }
+    Ok(pool)
 }
 
 // ---------------------------------------------------------------------------
@@ -157,25 +223,7 @@ impl OnnxEmbedder {
     /// This is the fail-closed-friendly entry point. Callers that want
     /// the v2.1 always-permissive behavior keep using [`Self::new`].
     pub fn new_with_policy(model_name: &str, policy: &NetworkPolicy) -> EmbeddingResult<Self> {
-        let (model_enum, dims, hf_model_code) = match model_name {
-            "Alibaba-NLP/gte-base-en-v1.5" => (
-                EmbeddingModel::GTEBaseENV15,
-                768,
-                "Alibaba-NLP/gte-base-en-v1.5",
-            ),
-            "all-MiniLM-L6-v2" | "sentence-transformers/all-MiniLM-L6-v2" => (
-                EmbeddingModel::AllMiniLML6V2,
-                384,
-                "Qdrant/all-MiniLM-L6-v2-onnx",
-            ),
-            other => {
-                let supported: Vec<&str> = SUPPORTED_MODELS.iter().map(|(name, _)| *name).collect();
-                return Err(EmbeddingError::ModelLoad(format!(
-                    "Unknown model: '{other}'. Supported: {}",
-                    supported.join(", ")
-                )));
-            }
-        };
+        let (model_enum, dims, hf_model_code) = resolve_model(model_name)?;
 
         // Cache pre-check: if the model directory already exists in the
         // fastembed cache, fastembed's `pull_from_hf` short-circuits and
@@ -191,17 +239,7 @@ impl OnnxEmbedder {
             policy.check(&hf_url)?;
         }
 
-        let pool_size = resolve_pool_size();
-
-        let mut pool = Vec::with_capacity(pool_size);
-        for i in 0..pool_size {
-            let show_progress = i == 0;
-            let model = TextEmbedding::try_new(
-                InitOptions::new(model_enum.clone()).with_show_download_progress(show_progress),
-            )
-            .map_err(|e| EmbeddingError::ModelLoad(e.to_string()))?;
-            pool.push(Mutex::new(model));
-        }
+        let pool = build_pool(&model_enum, resolve_pool_size())?;
 
         Ok(Self {
             dimensions: dims,
@@ -210,6 +248,92 @@ impl OnnxEmbedder {
                 next: AtomicUsize::new(0),
             },
         })
+    }
+
+    /// Create a lazy ONNX-backed embedder: the model name is validated and
+    /// dimensionality resolved immediately, but the ONNX session pool (and
+    /// any load-time `HuggingFace` download) is deferred until the first
+    /// `embed`/`embed_batch` call.
+    ///
+    /// Intended for per-session processes like the MCP stdio server, where
+    /// many concurrent instances may exist but most never embed anything —
+    /// an idle lazy embedder holds no ONNX session memory at all.
+    ///
+    /// The [`NetworkPolicy`] is captured at construction and enforced at
+    /// first load, mirroring [`Self::new_with_policy`]: an uncached model
+    /// under [`NetworkPolicy::Disabled`] surfaces
+    /// [`EmbeddingError::Network`] — just at first use instead of startup.
+    /// A failed load is not cached; subsequent calls retry.
+    ///
+    /// Equivalent to `new_lazy_with_options(model_name,
+    /// &NetworkPolicy::Permissive, resolved pool size)`.
+    pub fn new_lazy(model_name: &str) -> EmbeddingResult<Self> {
+        Self::new_lazy_with_options(model_name, &NetworkPolicy::Permissive, resolve_pool_size())
+    }
+
+    /// Lazy constructor with an explicit [`NetworkPolicy`] and pool size.
+    ///
+    /// `pool_size` is taken explicitly (rather than from
+    /// `PENSYVE_EMBEDDING_POOL_SIZE`) so single-client callers like the MCP
+    /// stdio server can default to 1 session instead of the CPU-derived
+    /// default meant for multi-threaded harnesses.
+    pub fn new_lazy_with_options(
+        model_name: &str,
+        policy: &NetworkPolicy,
+        pool_size: usize,
+    ) -> EmbeddingResult<Self> {
+        let (model_enum, dims, hf_model_code) = resolve_model(model_name)?;
+        Ok(Self {
+            dimensions: dims,
+            inner: EmbedderInner::Lazy {
+                model: model_enum,
+                hf_model_code,
+                policy: policy.clone(),
+                pool_size: pool_size.max(1),
+                pool: Mutex::new(None),
+                next: AtomicUsize::new(0),
+            },
+        })
+    }
+
+    /// Get the session pool of a `Lazy` embedder, building it on first use.
+    /// The mutex guard is held across the build so concurrent first calls
+    /// serialize instead of double-loading. Errors are returned without
+    /// being cached so a transient failure (e.g. download denied/offline)
+    /// is retried on the next call.
+    fn ensure_lazy_pool(&self) -> EmbeddingResult<Arc<Vec<Mutex<TextEmbedding>>>> {
+        let EmbedderInner::Lazy {
+            model,
+            hf_model_code,
+            policy,
+            pool_size,
+            pool,
+            ..
+        } = &self.inner
+        else {
+            return Err(EmbeddingError::Inference(
+                "ensure_lazy_pool called on non-lazy embedder".into(),
+            ));
+        };
+
+        let mut guard = pool
+            .lock()
+            .map_err(|e| EmbeddingError::Inference(format!("Lock poisoned: {e}")))?;
+        if let Some(existing) = guard.as_ref() {
+            return Ok(Arc::clone(existing));
+        }
+
+        // Same load-time network gating as `new_with_policy`, deferred to
+        // first use.
+        if !is_model_cached(hf_model_code) {
+            let hf_url = format!("https://huggingface.co/{hf_model_code}");
+            policy.check(&hf_url)?;
+        }
+
+        tracing::info!("Lazily loading ONNX embedder (pool_size={pool_size})");
+        let built = Arc::new(build_pool(model, *pool_size)?);
+        *guard = Some(Arc::clone(&built));
+        Ok(built)
     }
 
     /// Cached variant of [`Self::new`]. Returns an `Arc<OnnxEmbedder>` shared
@@ -272,18 +396,10 @@ impl OnnxEmbedder {
     pub fn embed(&self, text: &str) -> EmbeddingResult<Vec<f32>> {
         match &self.inner {
             EmbedderInner::Mock => Ok(mock_embed(text, self.dimensions)),
-            EmbedderInner::Real { pool, next } => {
-                let idx = next.fetch_add(1, Ordering::Relaxed) % pool.len();
-                let mut model = pool[idx]
-                    .lock()
-                    .map_err(|e| EmbeddingError::Inference(format!("Lock poisoned: {e}")))?;
-                let embeddings = model
-                    .embed(vec![text], None)
-                    .map_err(|e| EmbeddingError::Inference(e.to_string()))?;
-                embeddings
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| EmbeddingError::Inference("No embedding returned".into()))
+            EmbedderInner::Real { pool, next } => embed_one_in_pool(pool, next, text),
+            EmbedderInner::Lazy { next, .. } => {
+                let pool = self.ensure_lazy_pool()?;
+                embed_one_in_pool(&pool, next, text)
             }
         }
     }
@@ -295,14 +411,10 @@ impl OnnxEmbedder {
                 .iter()
                 .map(|t| Ok(mock_embed(t, self.dimensions)))
                 .collect(),
-            EmbedderInner::Real { pool, next } => {
-                let idx = next.fetch_add(1, Ordering::Relaxed) % pool.len();
-                let mut model = pool[idx]
-                    .lock()
-                    .map_err(|e| EmbeddingError::Inference(format!("Lock poisoned: {e}")))?;
-                model
-                    .embed(texts, None)
-                    .map_err(|e| EmbeddingError::Inference(e.to_string()))
+            EmbedderInner::Real { pool, next } => embed_batch_in_pool(pool, next, texts),
+            EmbedderInner::Lazy { next, .. } => {
+                let pool = self.ensure_lazy_pool()?;
+                embed_batch_in_pool(&pool, next, texts)
             }
         }
     }
@@ -311,6 +423,44 @@ impl OnnxEmbedder {
     pub fn dimensions(&self) -> usize {
         self.dimensions
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pool embedding internals (shared by Real and Lazy variants)
+// ---------------------------------------------------------------------------
+
+/// Embed one text on the next round-robin slot of `pool`.
+fn embed_one_in_pool(
+    pool: &[Mutex<TextEmbedding>],
+    next: &AtomicUsize,
+    text: &str,
+) -> EmbeddingResult<Vec<f32>> {
+    let idx = next.fetch_add(1, Ordering::Relaxed) % pool.len();
+    let mut model = pool[idx]
+        .lock()
+        .map_err(|e| EmbeddingError::Inference(format!("Lock poisoned: {e}")))?;
+    let embeddings = model
+        .embed(vec![text], None)
+        .map_err(|e| EmbeddingError::Inference(e.to_string()))?;
+    embeddings
+        .into_iter()
+        .next()
+        .ok_or_else(|| EmbeddingError::Inference("No embedding returned".into()))
+}
+
+/// Embed a batch of texts on the next round-robin slot of `pool`.
+fn embed_batch_in_pool(
+    pool: &[Mutex<TextEmbedding>],
+    next: &AtomicUsize,
+    texts: &[&str],
+) -> EmbeddingResult<Vec<Vec<f32>>> {
+    let idx = next.fetch_add(1, Ordering::Relaxed) % pool.len();
+    let mut model = pool[idx]
+        .lock()
+        .map_err(|e| EmbeddingError::Inference(format!("Lock poisoned: {e}")))?;
+    model
+        .embed(texts, None)
+        .map_err(|e| EmbeddingError::Inference(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -505,6 +655,40 @@ mod tests {
             assert_eq!(emb.len(), 384);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Lazy embedder tests (offline-safe — construction never loads ONNX)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lazy_unknown_model_errors_at_construction() {
+        let result = OnnxEmbedder::new_lazy("nonexistent-model");
+        assert!(result.is_err());
+        assert!(result.err().unwrap().to_string().contains("Unknown model"));
+    }
+
+    #[test]
+    fn test_lazy_dimensions_available_without_load() {
+        // Construction must not touch ONNX or the network, yet dimensions
+        // are already correct.
+        let gte = OnnxEmbedder::new_lazy("Alibaba-NLP/gte-base-en-v1.5").unwrap();
+        assert_eq!(gte.dimensions(), 768);
+        let mini = OnnxEmbedder::new_lazy("all-MiniLM-L6-v2").unwrap();
+        assert_eq!(mini.dimensions(), 384);
+    }
+
+    #[test]
+    fn test_lazy_pool_size_clamped_to_one() {
+        // pool_size 0 would panic on `% pool.len()` — must clamp to 1.
+        let embedder =
+            OnnxEmbedder::new_lazy_with_options("all-MiniLM-L6-v2", &NetworkPolicy::Permissive, 0)
+                .unwrap();
+        assert_eq!(embedder.dimensions(), 384);
+    }
+
+    // The Disabled-policy-at-first-use behavior is covered in
+    // `tests/test_no_network_invariants.rs`, which owns the serialized
+    // `FASTEMBED_CACHE_DIR` env-var guard needed to force an uncached model.
 
     // -----------------------------------------------------------------------
     // Model registry tests

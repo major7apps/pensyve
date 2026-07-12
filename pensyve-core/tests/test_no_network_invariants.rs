@@ -390,6 +390,73 @@ fn onnx_embedder_constructor_under_disabled_with_cached_model_succeeds() {
     );
 }
 
+/// **Invariant I4.OnnxEmbedder.lazy-disabled-uncached**: a *lazy*
+/// embedder (`new_lazy_with_options`) constructed under
+/// `NetworkPolicy::Disabled` for an uncached model MUST succeed at
+/// construction (nothing is loaded yet) and MUST surface
+/// `EmbeddingError::Network` at the first `embed()` call — the same
+/// policy gate as the eager constructor, deferred to first use. A
+/// denied load MUST NOT leave a partial-download artifact and MUST NOT
+/// be cached as a permanent failure (the pool stays unbuilt, so a later
+/// call under a permissive environment can retry).
+///
+/// Mechanical proof:
+///   1. Point `FASTEMBED_CACHE_DIR` at a fresh tempdir — guarantees the
+///      model is NOT cached.
+///   2. `new_lazy_with_options(<model>, &Disabled, 1)` returns `Ok` and
+///      reports the correct dimensionality without loading anything.
+///   3. `embed("hello")` returns `Err(EmbeddingError::Network(_))`.
+///   4. The cache tempdir has no `models--*` subdirectory.
+#[test]
+fn onnx_embedder_lazy_under_disabled_with_uncached_model_errors_at_first_use() {
+    let _ = real_cache_dir();
+    let _serial = cache_env_lock().lock().expect("env lock poisoned");
+
+    let cache_tempdir = TempDir::new().expect("tempdir for empty fastembed cache");
+    let _guard = FastembedCacheGuard::set(cache_tempdir.path());
+
+    let embedder = OnnxEmbedder::new_lazy_with_options(
+        "Alibaba-NLP/gte-base-en-v1.5",
+        &NetworkPolicy::Disabled,
+        1,
+    )
+    .expect("lazy construction must succeed without loading the model");
+    assert_eq!(
+        embedder.dimensions(),
+        768,
+        "dimensions must be available before the model is loaded"
+    );
+
+    match embedder.embed("hello") {
+        Err(EmbeddingError::Network(msg)) => {
+            assert!(
+                msg.contains("Disabled") || msg.contains("not permitted"),
+                "expected Disabled-policy error message, got: {msg}"
+            );
+        }
+        Err(other) => panic!(
+            "expected EmbeddingError::Network at first use for uncached model \
+             under Disabled, got {other:?}"
+        ),
+        Ok(_) => panic!(
+            "lazy embed succeeded under Disabled with empty cache — \
+             the deferred load-time policy gate did not fire"
+        ),
+    }
+
+    // No partial download artifact: the policy gate fires BEFORE
+    // fastembed's `pull_from_hf` is invoked, even on the lazy path.
+    let entries: Vec<_> = std::fs::read_dir(cache_tempdir.path())
+        .expect("read tempdir")
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("models--"))
+        .collect();
+    assert!(
+        entries.is_empty(),
+        "expected no model subdirectory after denied lazy load, found: {entries:?}"
+    );
+}
+
 // -------------------------------------------------------------------------
 // FASTEMBED_CACHE_DIR env-var guard
 // -------------------------------------------------------------------------
