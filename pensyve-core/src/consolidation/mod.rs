@@ -1940,6 +1940,9 @@ mod tests {
             "realistic chat fixture should route ≥ 60% fast; got {fast}/10 = {fast_rate}"
         );
         // Drain before drop (CodeRabbit PR #117 round 3 Drop guard).
+        // Locked: drain stores 0 into the shared `dmem_ring_buffer_size`
+        // gauge and would otherwise race the gauge-snapshot test.
+        let _guard = dmem::test_locks::ROUTING_COUNTER_LOCK.lock().unwrap();
         let _ = gate.drain_ring_buffer();
     }
 
@@ -1985,7 +1988,11 @@ mod tests {
         // Drain and replay dep-parse against each. Use
         // `run_dep_parse_hook_inner` directly to bypass the
         // `PENSYVE_DEP_PARSE` env-flag check.
-        let drained = gate.drain_ring_buffer();
+        let drained = {
+            // Locked: drain stores 0 into the shared gauge.
+            let _guard = dmem::test_locks::ROUTING_COUNTER_LOCK.lock().unwrap();
+            gate.drain_ring_buffer()
+        };
         assert_eq!(drained.len(), 3);
         let conn = rusqlite::Connection::open(storage.db_path().unwrap()).unwrap();
         for (id, content) in drained.iter().zip(observation_contents.iter()) {
@@ -2081,6 +2088,8 @@ mod tests {
              counter went from {dep_parse_before} → {dep_parse_after}"
         );
         // Drain before drop (CodeRabbit PR #117 round 3 Drop guard).
+        // Locked: drain stores 0 into the shared gauge.
+        let _guard = dmem::test_locks::ROUTING_COUNTER_LOCK.lock().unwrap();
         let _ = gate.drain_ring_buffer();
     }
 }

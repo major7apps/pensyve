@@ -547,7 +547,11 @@ mod tests {
         assert_eq!(route, DMemRoute::FastBuffer);
         assert_eq!(gate.ring_buffer_len(), 1);
         // Drain before drop to satisfy the debug-only Drop
-        // assertion (CodeRabbit PR #117 round 3).
+        // assertion (CodeRabbit PR #117 round 3). Hold
+        // ROUTING_COUNTER_LOCK: drain stores 0 into the shared
+        // `dmem_ring_buffer_size` gauge and would otherwise race
+        // the gauge-snapshot test.
+        let _guard = test_locks::ROUTING_COUNTER_LOCK.lock().unwrap();
         let _ = gate.drain_ring_buffer();
     }
 
@@ -558,6 +562,10 @@ mod tests {
         // `dmem_ring_buffer_evictions` counter. Without the lock,
         // the eviction-counter snapshot tests would race with this
         // test's mutations. CodeRabbit PR #117 round 2.
+        // Also hold ROUTING_COUNTER_LOCK (acquired first — keep the
+        // ROUTING -> EVICTION order everywhere): the drain below
+        // stores 0 into the shared `dmem_ring_buffer_size` gauge.
+        let _routing_guard = test_locks::ROUTING_COUNTER_LOCK.lock().unwrap();
         let _guard = test_locks::EVICTION_COUNTER_LOCK.lock().unwrap();
         let mut gate = DMemGate::new(0.35, 0.5, 3);
         let low_score = RpeScore {
@@ -584,7 +592,10 @@ mod tests {
         // typed-slot enrichment. Operators get a signal via the
         // `dmem_ring_buffer_evictions` counter. This test pushes
         // `capacity + 1` observations and asserts the counter went
-        // up by exactly 1.
+        // up by exactly 1. ROUTING_COUNTER_LOCK is acquired first
+        // (ROUTING -> EVICTION order): the drain below stores 0 into
+        // the shared `dmem_ring_buffer_size` gauge.
+        let _routing_guard = ROUTING_COUNTER_LOCK.lock().unwrap();
         let _guard = EVICTION_COUNTER_LOCK.lock().unwrap();
         let metrics = crate::observability::metrics();
         let before = metrics.dmem_ring_buffer_evictions.load(Ordering::Relaxed);
@@ -621,6 +632,9 @@ mod tests {
         // Symmetric negative case: under capacity, no eviction
         // counter increment should fire (load-bearing for the
         // "operator sees only real evictions" contract).
+        // ROUTING_COUNTER_LOCK acquired first (ROUTING -> EVICTION
+        // order): the drain below writes the shared gauge.
+        let _routing_guard = ROUTING_COUNTER_LOCK.lock().unwrap();
         let _guard = EVICTION_COUNTER_LOCK.lock().unwrap();
         let metrics = crate::observability::metrics();
         let before = metrics.dmem_ring_buffer_evictions.load(Ordering::Relaxed);
@@ -647,6 +661,10 @@ mod tests {
 
     #[test]
     fn drain_returns_all_and_empties_buffer() {
+        // Hold ROUTING_COUNTER_LOCK: drain stores 0 into the shared
+        // `dmem_ring_buffer_size` gauge and would otherwise race the
+        // gauge-snapshot test.
+        let _guard = ROUTING_COUNTER_LOCK.lock().unwrap();
         let mut gate = DMemGate::new(0.35, 0.5, 8);
         let low_score = RpeScore {
             surprise: 0.0,
@@ -739,6 +757,8 @@ mod tests {
         // "bought" is not in TYPED_SLOT_TRIGGER_ACTIONS → no override.
         let route = gate.route(Uuid::new_v4(), &below_threshold, Some("bought"));
         assert_eq!(route, DMemRoute::FastBuffer);
+        // Locked drain: stores 0 into the shared gauge.
+        let _guard = ROUTING_COUNTER_LOCK.lock().unwrap();
         let _ = gate.drain_ring_buffer();
     }
 
@@ -752,6 +772,8 @@ mod tests {
         };
         let route = gate.route(Uuid::new_v4(), &below_threshold, None);
         assert_eq!(route, DMemRoute::FastBuffer);
+        // Locked drain: stores 0 into the shared gauge.
+        let _guard = ROUTING_COUNTER_LOCK.lock().unwrap();
         let _ = gate.drain_ring_buffer();
     }
 
@@ -797,6 +819,8 @@ mod tests {
                 "threshold=1.0 must route combined<1.0 fast (combined={combined})"
             );
         }
+        // Locked drain: stores 0 into the shared gauge.
+        let _guard = ROUTING_COUNTER_LOCK.lock().unwrap();
         let _ = gate.drain_ring_buffer();
     }
 
@@ -808,6 +832,9 @@ mod tests {
         // observation; we clamp to 1 to make the failure mode at
         // least observable (every fast route evicts the previous).
         // Hold EVICTION_COUNTER_LOCK — this test fires evictions.
+        // ROUTING_COUNTER_LOCK acquired first (ROUTING -> EVICTION
+        // order): the drain below writes the shared gauge.
+        let _routing_guard = test_locks::ROUTING_COUNTER_LOCK.lock().unwrap();
         let _guard = test_locks::EVICTION_COUNTER_LOCK.lock().unwrap();
         let gate = DMemGate::new(0.35, 0.5, 0);
         let mut g = gate;
