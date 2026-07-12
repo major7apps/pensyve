@@ -998,6 +998,11 @@ mod localllm {
         ///     `permissive`; defaults to `LocalOnly { url: <base_url> }`
         ///     when unset — the v2.1 fail-closed default for the local
         ///     extractor configured for a known endpoint).
+        ///   - `PENSYVE_EXTRACTOR_TIMEOUT_SECS` (HTTP client timeout in
+        ///     seconds; default 300. Zero, negative, and non-numeric values
+        ///     fall back to the default. Raise for slow reader stacks where
+        ///     a full batched extraction exceeds 300s — see
+        ///     [`timeout_secs_from`].)
         pub fn from_env() -> ExtractionResult<Self> {
             let base_url =
                 std::env::var("PENSYVE_EXTRACTOR_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.into());
