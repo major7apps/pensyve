@@ -3,22 +3,27 @@
   "name": "io.github.major7apps/pensyve",
   "title": "Pensyve",
   "description": "Universal memory runtime for AI agents — episodic, semantic, and procedural memory.",
-  "version": "1.0.4",
+  "version": "2.6.1",
   "repository": {
     "url": "https://github.com/major7apps/pensyve",
     "source": "github"
   },
   "websiteUrl": "https://pensyve.com",
   "license": "Apache-2.0",
-  "runtime": {
-    "type": "http",
-    "url": "https://mcp.pensyve.com/mcp",
-    "transport": "streamable-http",
-    "authentication": {
-      "type": "bearer",
-      "environmentVariable": "PENSYVE_API_KEY"
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.pensyve.com/mcp",
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Bearer token for authentication, e.g. 'Bearer <PENSYVE_API_KEY>'",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
     }
-  },
+  ],
   "tools": [
     {
       "name": "pensyve_recall",
@@ -27,6 +32,10 @@
     {
       "name": "pensyve_remember",
       "description": "Store a fact about a named entity as semantic memory"
+    },
+    {
+      "name": "pensyve_observe",
+      "description": "Record an observation within an active episode"
     },
     {
       "name": "pensyve_episode_start",
