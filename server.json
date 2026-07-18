@@ -10,15 +10,20 @@
   },
   "websiteUrl": "https://pensyve.com",
   "license": "Apache-2.0",
-  "runtime": {
-    "type": "http",
-    "url": "https://mcp.pensyve.com/mcp",
-    "transport": "streamable-http",
-    "authentication": {
-      "type": "bearer",
-      "environmentVariable": "PENSYVE_API_KEY"
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.pensyve.com/mcp",
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Bearer token for authentication, e.g. 'Bearer <PENSYVE_API_KEY>'",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
     }
-  },
+  ],
   "tools": [
     {
       "name": "pensyve_recall",
