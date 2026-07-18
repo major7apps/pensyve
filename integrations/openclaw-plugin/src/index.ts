@@ -188,8 +188,8 @@ export default definePluginEntry({
 
     // ── Chat Command (/pensyve search <query> | /pensyve stats) ──────
     // OpenClaw's registerCommand takes a single OpenClawPluginCommandDefinition
-    // (name/description/handler), not the (name, {subcommands}) shape used by
-    // some other plugin hosts — see AGENTS.md / CHANGELOG for the fix note.
+    // (name/description/handler) — not a (name, {subcommands}) call. See
+    // CHANGELOG.md [1.3.1] for the fix note (previous shape never worked).
 
     api.registerCommand?.({
       name: "pensyve",
