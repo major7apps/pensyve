@@ -14,7 +14,7 @@ name = "pensyve_mcp_tools"
 
 [dependencies]
 pensyve-core = { path = "../pensyve-core", version = "2.6.1" }
-rmcp = { version = "1.7", features = ["server", "macros"] }
+rmcp = { version = "2.2", features = ["server", "macros"] }
 tokio = { version = "1", features = ["full"] }
 # G1/P3a: needed for `CancellationToken::new()` passed to
 # `ConsolidationEngine::run` from the post-`episode_end` background spawn.
