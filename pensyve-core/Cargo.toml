@@ -30,7 +30,7 @@ petgraph = "0.8"
 # parser (`extraction::dep_parse`). `phf::Map` keys are interned at build
 # time, so verb→relation lookups are zero-allocation and branch-light on
 # the ingest hot path.
-phf = { version = "0.13", features = ["macros"] }
+phf = { version = "0.14", features = ["macros"] }
 dashmap = "6"
 rayon = "1.10"
 tracing = "0.1"
