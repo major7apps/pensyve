@@ -27,8 +27,6 @@ export interface PensyveConfig {
   apiKey?: string;
   /** Entity name for memory storage. */
   entity?: string;
-  /** Memory namespace for isolation. */
-  namespace?: string;
   /** Inject memories before each turn. */
   autoRecall?: boolean;
   /** Store conversation context after each turn. */
@@ -100,7 +98,6 @@ export function resolveConfig(raw: Partial<PensyveConfig> = {}): Required<Pensyv
     baseUrl: raw.baseUrl ?? "",
     apiKey: apiKey ?? "",
     entity: raw.entity ?? "pensyve-agent",
-    namespace: raw.namespace ?? "default",
     autoRecall: raw.autoRecall ?? true,
     autoCapture: raw.autoCapture ?? true,
     recallLimit: raw.recallLimit ?? 5,

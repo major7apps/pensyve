@@ -66,7 +66,7 @@ openclaw mcp add pensyve \
   --arg --stdio
 ```
 
-```
+```text
 $ openclaw mcp probe pensyve
 MCP probe (<your openclaw.json>):
 - pensyve: 9 tools
@@ -136,7 +136,7 @@ stored for an entity.
 
 **(verified)** — full round trip against the local binary:
 
-```
+```text
 remember(entity: "my-project", fact: "chose Postgres over SQLite for the prod deploy", confidence: 0.95)
   -> stored, id f0eddbf0-...
 
@@ -175,7 +175,6 @@ honored as of 1.3.1 (it was previously ignored — see Troubleshooting)
   "config": {
     "baseUrl": "https://mcp.pensyve.com",   // or "http://localhost:3000" for a local pensyve-mcp-gateway
     "entity": "my-agent",
-    "namespace": "openclaw",
     "autoRecall": true,
     "autoCapture": true,
     "recallLimit": 5
@@ -221,6 +220,14 @@ native plugin (not just the MCP path), you need `pensyve-mcp-gateway`
 running locally, not `pensyve-mcp`. The generic MCP path is the simpler
 choice for a pure-local setup.
 
+There is no `namespace` config field for the native plugin — the gateway's
+REST API has no per-request namespace parameter; it derives an isolated
+namespace purely from the authenticated tenant (API key in cloud mode, a
+single shared default namespace in local/dev mode). Isolation for the native
+plugin path is by `entity` only. If you need real namespace isolation, use
+the MCP path's `PENSYVE_NAMESPACE` env var instead (see above), which is
+honored by the `pensyve-mcp` binary the MCP path drives.
+
 ## Config reference
 
 | Field | Default | Notes |
@@ -228,7 +235,6 @@ choice for a pure-local setup.
 | `baseUrl` | `http://localhost:3000` | Pensyve REST endpoint (native plugin only) |
 | `apiKey` | — | Cloud mode auto-activates when set; omit for local |
 | `entity` | `openclaw-agent` | Who memories are stored/recalled against |
-| `namespace` | `openclaw` | Isolation boundary for this install |
 | `autoRecall` | `true` | Inject memories before each turn |
 | `autoCapture` | `true` | Store conversation context after each turn |
 | `recallLimit` | `5` | Max memories injected per turn |
@@ -264,6 +270,15 @@ local. Set `mode` explicitly if you need to override the auto-detect.
   built-in local default was `:8000`, not the gateway's real default port
   `:3000`. If you're still on an older checkout, either upgrade or set
   `local: { baseUrl: "http://localhost:3000" }` (nested form) explicitly.
+- **A `namespace` config value for the native plugin has no effect** — this
+  was a pre-1.3.1 documentation and manifest bug, not a caller error: the
+  shared client accepted and defaulted a `namespace` field but never sent it
+  anywhere, and `pensyve-mcp-gateway`'s REST API has no per-request
+  namespace parameter to receive it (namespace is derived entirely from the
+  authenticated tenant). The field has been removed from
+  `openclaw.plugin.json`'s `configSchema` and the shared client as of 1.3.1
+  rather than left as a silent no-op. Use the MCP path's `PENSYVE_NAMESPACE`
+  if you need namespace isolation.
 - **No memories found on recall** — check you're querying the same
   `entity`/`namespace` you stored under. For the local MCP path, check
   `PENSYVE_PATH` and `PENSYVE_NAMESPACE` match between the process that

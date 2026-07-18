@@ -25,12 +25,10 @@ describe("resolveConfig", () => {
   it("merges custom config", () => {
     const cfg = resolveConfig({
       entity: "my-agent",
-      namespace: "my-ns",
       recallLimit: 10,
       local: { baseUrl: "http://custom:9000" },
     });
     expect(cfg.entity).toBe("my-agent");
-    expect(cfg.namespace).toBe("my-ns");
     expect(cfg.recallLimit).toBe(10);
     expect(cfg.local.baseUrl).toBe("http://custom:9000");
   });

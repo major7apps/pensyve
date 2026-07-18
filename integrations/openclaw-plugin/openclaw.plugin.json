@@ -28,11 +28,6 @@
         "description": "Entity name for memory storage",
         "default": "openclaw-agent"
       },
-      "namespace": {
-        "type": "string",
-        "description": "Memory namespace for isolation",
-        "default": "openclaw"
-      },
       "autoRecall": {
         "type": "boolean",
         "description": "Inject memories before each turn",

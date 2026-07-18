@@ -12,7 +12,6 @@ describe("PensyveStore", () => {
       baseUrl: "http://custom:9000",
       apiKey: "test-key",
       entity: "my-agent",
-      namespace: "test",
     });
     expect(store).toBeDefined();
   });
