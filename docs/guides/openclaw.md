@@ -164,14 +164,16 @@ npm install && npm run build
 **(verified)** — `npm install`, `npm run build`, and the plugin's own test
 suite (`npx vitest run`, 6 tests) all pass clean as of 1.3.1.
 
-Then wire it into `openclaw.json`:
+Then wire it into `openclaw.json` — the flat `baseUrl` field below is
+honored as of 1.3.1 (it was previously ignored — see Troubleshooting)
+**(verified)**:
 
 ```json5
 // plugins.entries
 "pensyve": {
   "enabled": true,
   "config": {
-    "baseUrl": "https://mcp.pensyve.com",   // or "http://localhost:8000" for a local pensyve-mcp-gateway
+    "baseUrl": "https://mcp.pensyve.com",   // or "http://localhost:3000" for a local pensyve-mcp-gateway
     "entity": "my-agent",
     "namespace": "openclaw",
     "autoRecall": true,
@@ -223,7 +225,7 @@ choice for a pure-local setup.
 
 | Field | Default | Notes |
 |---|---|---|
-| `baseUrl` | `http://localhost:8000` | Pensyve REST endpoint (native plugin only) |
+| `baseUrl` | `http://localhost:3000` | Pensyve REST endpoint (native plugin only) |
 | `apiKey` | — | Cloud mode auto-activates when set; omit for local |
 | `entity` | `openclaw-agent` | Who memories are stored/recalled against |
 | `namespace` | `openclaw` | Isolation boundary for this install |
@@ -255,6 +257,13 @@ local. Set `mode` explicitly if you need to override the auto-detect.
   reports 0** — pre-1.3.1 field-name mismatch between the shared TypeScript
   client and the gateway's actual REST response shape (`memory_type` vs.
   `type`, `semantic_memories` vs. `semantic`). Fixed in 1.3.1.
+- **Native plugin reports offline against a locally-started
+  `pensyve-mcp-gateway`** — two separate pre-1.3.1 issues, both fixed: the
+  flat `baseUrl` config field was silently ignored (`resolveConfig` only read
+  the nested `local.baseUrl`/`cloud.baseUrl` shapes), and the client's
+  built-in local default was `:8000`, not the gateway's real default port
+  `:3000`. If you're still on an older checkout, either upgrade or set
+  `local: { baseUrl: "http://localhost:3000" }` (nested form) explicitly.
 - **No memories found on recall** — check you're querying the same
   `entity`/`namespace` you stored under. For the local MCP path, check
   `PENSYVE_PATH` and `PENSYVE_NAMESPACE` match between the process that

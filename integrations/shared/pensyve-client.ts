@@ -16,6 +16,13 @@ export interface PensyveConfig {
   mode?: string;
   local?: { baseUrl?: string };
   cloud?: { baseUrl?: string; apiKey?: string };
+  /**
+   * Pensyve endpoint (shorthand — applied to whichever of local.baseUrl /
+   * cloud.baseUrl the resolved mode uses; ignored if that mode's nested
+   * baseUrl is set explicitly). This is the flat field plugin manifests
+   * (e.g. openclaw.plugin.json's configSchema) document.
+   */
+  baseUrl?: string;
   /** Pensyve API key (shorthand — merged into cloud.apiKey). */
   apiKey?: string;
   /** Entity name for memory storage. */
@@ -59,7 +66,11 @@ export class PensyveError extends Error {
 
 // -- Config resolution ------------------------------------------------------
 
-const LOCAL_DEFAULT = "http://localhost:8000";
+// Matches pensyve-mcp-gateway's real default bind port (GatewayConfig::from_env,
+// PORT defaults to 3000 — see pensyve-mcp-gateway/README.md and the root
+// README's own runnable examples). This constant previously said 8000, which
+// doesn't match any locally-started gateway out of the box.
+const LOCAL_DEFAULT = "http://localhost:3000";
 const REMOTE_DEFAULT = typeof globalThis.process !== "undefined"
   ? (globalThis.process as any).env?.PENSYVE_REMOTE_URL ?? LOCAL_DEFAULT
   : LOCAL_DEFAULT;
@@ -84,8 +95,9 @@ export function resolveConfig(raw: Partial<PensyveConfig> = {}): Required<Pensyv
 
   return {
     mode,
-    local: { baseUrl: raw.local?.baseUrl ?? LOCAL_DEFAULT },
-    cloud: { baseUrl: raw.cloud?.baseUrl ?? REMOTE_DEFAULT, apiKey },
+    local: { baseUrl: raw.local?.baseUrl ?? raw.baseUrl ?? LOCAL_DEFAULT },
+    cloud: { baseUrl: raw.cloud?.baseUrl ?? raw.baseUrl ?? REMOTE_DEFAULT, apiKey },
+    baseUrl: raw.baseUrl ?? "",
     apiKey: apiKey ?? "",
     entity: raw.entity ?? "pensyve-agent",
     namespace: raw.namespace ?? "default",
