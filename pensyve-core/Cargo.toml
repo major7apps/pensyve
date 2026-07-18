@@ -24,7 +24,9 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 dirs = "6"
 regex = "1"
-fastembed = "^5.13"
+# Pinned to 5.17.2: 5.17.3 breaks cached-model resolution for existing model
+# caches (offline-first regression); see the tracking issue for details.
+fastembed = "=5.17.2"
 petgraph = "0.8"
 # Phase 2B: compile-time predicate-verb lexicon for the shallow dependency
 # parser (`extraction::dep_parse`). `phf::Map` keys are interned at build
