@@ -22,7 +22,7 @@ pensyve-core = { path = "../pensyve-core", version = "2.6.1", features = ["postg
 pensyve-mcp-tools = { path = "../pensyve-mcp-tools", version = "2.6.1" }
 rmcp = { version = "2.2", features = ["server", "transport-streamable-http-server", "macros"] }
 axum = "0.8"
-tower-http = { version = "0.6", features = ["compression-gzip", "compression-br"] }
+tower-http = { version = "0.7", features = ["compression-gzip", "compression-br"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 serde = { version = "1", features = ["derive"] }
