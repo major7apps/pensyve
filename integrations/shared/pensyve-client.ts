@@ -141,7 +141,15 @@ export class PensyveClient {
       throw new PensyveError(`recall failed: ${res.status} ${res.statusText}`, res.status);
     }
     const data = await res.json();
-    return data.memories ?? data.results ?? [];
+    const raw = data.memories ?? data.results ?? [];
+    // The gateway's RecallMemory wire type uses `memory_type`; normalize to
+    // this client's `type` field (see pensyve-mcp-gateway/src/rest.rs).
+    return raw.map((m: any) => ({
+      type: m.type ?? m.memory_type ?? "unknown",
+      content: m.content,
+      confidence: m.confidence,
+      score: m.score,
+    }));
   }
 
   async remember(fact: string, confidence = 0.85): Promise<void> {
@@ -180,9 +188,12 @@ export class PensyveClient {
         connected: true,
         baseUrl: this.baseUrl,
         entities: s.entities ?? 0,
-        semantic: s.semantic ?? 0,
-        episodic: s.episodic ?? 0,
-        procedural: s.procedural ?? 0,
+        // The gateway's StatsResponse wire type uses the `*_memories` suffix
+        // (see pensyve-mcp-gateway/src/rest.rs); fall back to the short
+        // names for other server implementations.
+        semantic: s.semantic_memories ?? s.semantic ?? 0,
+        episodic: s.episodic_memories ?? s.episodic ?? 0,
+        procedural: s.procedural_memories ?? s.procedural ?? 0,
       };
     } catch {
       return {

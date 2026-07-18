@@ -165,7 +165,7 @@ export default definePluginEntry({
         } catch {
           // Non-fatal
         }
-      });
+      }, { name: "pensyve-auto-recall", description: "Injects recalled Pensyve memories before prompt build." });
     }
 
     // ── Auto-Capture (after_agent_response) ─────────────────────────
@@ -183,29 +183,30 @@ export default definePluginEntry({
         } catch {
           // Non-fatal
         }
-      });
+      }, { name: "pensyve-auto-capture", description: "Stores the last exchange after each agent response." });
     }
 
-    // ── CLI Commands ────────────────────────────────────────────────
+    // ── Chat Command (/pensyve search <query> | /pensyve stats) ──────
+    // OpenClaw's registerCommand takes a single OpenClawPluginCommandDefinition
+    // (name/description/handler), not the (name, {subcommands}) shape used by
+    // some other plugin hosts — see AGENTS.md / CHANGELOG for the fix note.
 
-    api.registerCommand?.("pensyve", {
-      description: "Pensyve memory management",
-      subcommands: {
-        search: {
-          description: "Search Pensyve memory",
-          args: [{ name: "query", required: true }],
-          async execute(args: { query: string }) {
-            const results = await client.recall(args.query, 10);
-            console.log(formatMemories(results));
-          },
-        },
-        stats: {
-          description: "Show memory statistics",
-          async execute() {
-            const s = await client.status();
-            console.log(formatStatus(s));
-          },
-        },
+    api.registerCommand?.({
+      name: "pensyve",
+      description: "Search Pensyve memory (default) or show status with 'stats'.",
+      acceptsArgs: true,
+      async handler(ctx: any) {
+        const parts = String(ctx.args ?? "").trim().split(/\s+/).filter(Boolean);
+        if (parts[0] === "stats") {
+          const s = await client.status();
+          return { text: `Pensyve Status\n${"─".repeat(40)}\n${formatStatus(s)}` };
+        }
+        const query = (parts[0] === "search" ? parts.slice(1) : parts).join(" ");
+        if (!query) {
+          return { text: "Usage: /pensyve <query>  or  /pensyve stats" };
+        }
+        const results = await client.recall(query, 10);
+        return { text: formatMemories(results) };
       },
     });
   },

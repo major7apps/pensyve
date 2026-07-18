@@ -2,6 +2,15 @@
   "id": "pensyve",
   "name": "Pensyve Memory",
   "description": "Offline-first memory with 8-signal fusion retrieval. Replaces default memory-core with Pensyve's semantic, episodic, and procedural memory types.",
+  "contracts": {
+    "tools": [
+      "memory_recall",
+      "memory_store",
+      "memory_get",
+      "memory_forget",
+      "memory_status"
+    ]
+  },
   "configSchema": {
     "type": "object",
     "properties": {

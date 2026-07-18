@@ -4,6 +4,20 @@ All notable changes to the Pensyve OpenClaw adapter are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The OpenClaw adapter versions independently of the Claude Code plugin.
 
+## [1.3.1] - 2026-07-18
+
+### Fixed
+
+Found by end-to-end verification against a real OpenClaw 2026.7.1 install (`openclaw plugins install --link` + `openclaw plugins doctor`) while writing the integration guide. Every item below reproduced against the current OpenClaw plugin SDK before the fix and is clean after it.
+
+- **`npm run build` produced an entry point the plugin manifest didn't point at.** `index.ts` imports the shared client from outside `src/` (`../../shared/pensyve-client`, by design — see "Not Included" below), so `tsc` infers the compilation root one level up and emits `dist/openclaw-plugin/src/index.js` + `dist/shared/pensyve-client.js`, not `dist/index.js`. `package.json`'s `main` and `openclaw.extensions` pointed at the latter, so `openclaw plugins install` failed with `extension entry not found: ./dist/index.js`. Fixed by pointing both fields at the real (stable, deterministic) build output path.
+- **`registerHook` calls crashed plugin registration.** Current OpenClaw (`registerHook(events, handler, opts)`) requires `opts.name` — a stable hook-registration id distinct from the event name — since a recent SDK revision. Both hook registrations were missing the third argument, throwing `hook registration missing name` and taking the whole plugin down with them (tools included). Fixed by adding `{ name: "pensyve-auto-recall" | "pensyve-auto-capture", description }`.
+- **`registerCommand` used a calling convention OpenClaw never supported.** The CLI-command block called `api.registerCommand("pensyve", { subcommands: {...} })`; the real signature is `registerCommand(command: OpenClawPluginCommandDefinition)` — one object, `name`/`description`/`handler`, no subcommand nesting. The mismatch crashed registration with `Cannot read properties of undefined (reading 'trim')` (`"pensyve".name` is `undefined`). Rewritten as a single `/pensyve <query>` / `/pensyve stats` chat command against the real contract.
+- **The 5 agent tools were silently dropped.** OpenClaw drops any plugin tool not declared in the manifest's `contracts.tools`, logging a diagnostic rather than failing loud. `openclaw.plugin.json` declared no `contracts` at all, so `memory_recall`/`memory_store`/`memory_get`/`memory_forget`/`memory_status` never actually registered even though `register()` ran without error. Fixed by declaring `contracts.tools` with all 5 names.
+- **`PensyveClient.recall()`/`.status()` read fields the gateway doesn't send.** `pensyve-mcp-gateway`'s `/v1/recall` returns `memory_type` (not `type`) per memory, and `/v1/stats` returns `semantic_memories`/`episodic_memories`/`procedural_memories` (not the short names). The shared client read the short names, so every recalled memory printed `[undefined]` and every status report showed 0 semantic/episodic/procedural regardless of actual counts. Fixed in `integrations/shared/pensyve-client.ts` (shared with `opencode-plugin`) by mapping the gateway's real field names, with a fallback to the short names for other server implementations. Not caught by existing unit tests because they only exercise the formatting helpers with already-normalized input, never the wire-response mapping.
+
+None of the fixes touch the MCP tool surface (`pensyve_recall`, `pensyve_remember`, etc.) or the generic MCP path — those were separately verified via direct stdio JSON-RPC against `pensyve-mcp --stdio` and were already correct.
+
 ## [1.3.0] - 2026-04-20
 
 ### Added
