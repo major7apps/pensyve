@@ -3,7 +3,7 @@
   "name": "io.github.major7apps/pensyve",
   "title": "Pensyve",
   "description": "Universal memory runtime for AI agents — episodic, semantic, and procedural memory.",
-  "version": "1.0.4",
+  "version": "2.6.1",
   "repository": {
     "url": "https://github.com/major7apps/pensyve",
     "source": "github"
@@ -27,6 +27,10 @@
     {
       "name": "pensyve_remember",
       "description": "Store a fact about a named entity as semantic memory"
+    },
+    {
+      "name": "pensyve_observe",
+      "description": "Record an observation within an active episode"
     },
     {
       "name": "pensyve_episode_start",
