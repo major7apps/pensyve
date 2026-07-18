@@ -89,7 +89,6 @@ Then add to your `openclaw.json`:
   "config": {
     "baseUrl": "https://mcp.pensyve.com",
     "entity": "my-agent",
-    "namespace": "openclaw",
     "autoRecall": true,
     "autoCapture": true,
     "recallLimit": 5

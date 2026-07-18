@@ -15,6 +15,7 @@ Pensyve — the universal memory runtime for AI agents. Apache 2.0 open-core eng
 5. **`docs/RECIPES.md`** — common task patterns (recall, remember, episodes, multimodal).
 6. **`docs/SECURITY.md`** — authentication, RBAC, tenant isolation, execution bounds.
 7. **`docs/RELIABILITY.md`** — test suite, performance, memory model guarantees.
+8. **`docs/guides/`** — per-integration user guides (e.g. `docs/guides/openclaw.md`).
 
 ## Directory map
 

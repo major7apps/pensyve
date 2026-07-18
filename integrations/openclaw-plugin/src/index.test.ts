@@ -32,7 +32,7 @@ describe("Plugin Registration", () => {
       logger: { info: () => {} },
       registerTool: (tool: any) => registered.tools.push(tool.name),
       registerHook: (name: string, _fn: any) => registered.hooks.push(name),
-      registerCommand: (name: string, _cmd: any) => registered.commands.push(name),
+      registerCommand: (command: any) => registered.commands.push(command.name),
     };
 
     plugin.register(mockApi);
