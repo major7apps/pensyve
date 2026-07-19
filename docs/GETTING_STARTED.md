@@ -457,7 +457,7 @@ curl http://localhost:3000/v1/health
 | `POST`   | `/v1/inspect`         | View entity memories     |
 | `POST`   | `/v1/consolidate`     | Trigger consolidation    |
 | `POST`   | `/v1/entities`        | Create an entity         |
-| `DELETE` | `/v1/entities/{name}` | Delete entity + memories |
+| `DELETE` | `/v1/entities/{name}` | Delete entity + memories (name or UUID; 404 if unknown) |
 | `GET`    | `/v1/stats`           | Memory statistics        |
 | `GET`    | `/v1/health`          | Health check             |
 | `GET`    | `/metrics`            | Prometheus metrics       |
