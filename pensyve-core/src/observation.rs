@@ -11,7 +11,7 @@
 //! (behind the `observation-extraction` feature) — the crate has no
 //! cloud-LLM call site.
 
-use std::fmt::Debug;
+use std::{fmt::Debug, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -20,6 +20,12 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::types::ObservationMemory;
+
+/// Maximum number of calls made for a retryable bulk extraction attempt.
+const BATCH_EXTRACTION_MAX_ATTEMPTS: usize = 3;
+
+/// Delay before each of the two bulk extraction retries (1 second, then 4 seconds).
+const BATCH_EXTRACTION_RETRY_BACKOFF_SECS: [u64; BATCH_EXTRACTION_MAX_ATTEMPTS - 1] = [1, 4];
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -3357,11 +3363,13 @@ where
 
 /// Bulk variant of [`commit_extraction_for_episode`].
 ///
-/// Loads each episode's stored messages, dispatches a SINGLE
-/// [`ObservationExtractor::extract_batch`] call across every episode, then
-/// persists per-episode observations sequentially. Extractors that override
-/// `extract_batch` (e.g. [`BatchedLocalLLMExtractor`]) get to fan out the
-/// per-episode HTTP calls concurrently — that is the within-question
+/// Loads each episode's stored messages, dispatches
+/// [`ObservationExtractor::extract_batch`] across every episode, then persists
+/// per-episode observations sequentially. Retryable failures use a bounded
+/// three-attempt backoff. A persistently wrong result count is split into
+/// smaller batches until each result can be attributed safely. Extractors that
+/// override `extract_batch` (e.g. [`BatchedLocalLLMExtractor`]) get to fan out
+/// the per-episode HTTP calls concurrently — that is the within-question
 /// throughput win this helper exists for. Extractors that DON'T override get
 /// the trait's default sequential loop, preserving the legacy semantics.
 ///
@@ -3371,19 +3379,18 @@ where
 ///   are unaffected.
 /// * Embedding failures are logged per-observation; surviving observations
 ///   for the same episode still persist.
-/// * If the batch call itself fails (e.g. transport error to vLLM) the helper
-///   logs once and returns 0 — no observations land for any episode in the
-///   batch. Callers that need partial-success across episodes should chunk
-///   their input or use `commit_extraction_for_episode` per episode.
+/// * If all attempts for a range fail (e.g. transport error to vLLM), the
+///   helper logs and drops that range. Already-aligned sibling ranges still
+///   persist.
 ///
 /// `episode_ids` is a slice (not consumed) so callers can also use it for
 /// post-call logging without cloning. Empty input is a no-op (returns 0).
 ///
 /// `cancel` is forwarded into [`ObservationExtractor::extract_batch`] so
 /// long-running fan-outs honor cooperative cancellation per G1 pre-reg
-/// I5. On `Err(Cancelled)` from the extractor the helper returns 0 (same
-/// shape as any batch failure — no partial persistence). Callers that
-/// don't care about cancellation pass `CancellationToken::new()`.
+/// I5. On `Err(Cancelled)` from the extractor the helper returns 0 and performs
+/// no partial persistence. Callers that don't care about cancellation pass
+/// `CancellationToken::new()`.
 ///
 /// Returns the total number of observations successfully persisted across
 /// every episode in the batch.
@@ -3493,6 +3500,172 @@ where
     }
 }
 
+/// Wait for the next bulk extraction retry unless cancellation wins first.
+async fn wait_for_batch_extraction_retry(cancel: &CancellationToken, delay_secs: u64) -> bool {
+    cancel
+        .run_until_cancelled(tokio::time::sleep(Duration::from_secs(delay_secs)))
+        .await
+        .is_some()
+}
+
+/// Extract a fully aligned batch, retrying transport and initial shape failures.
+///
+/// After the initial batch exhausts its wrong-length retries, pending ranges are
+/// split in half. Each split range gets one shape attempt before it is split
+/// again; transport failures remain eligible for the normal bounded retry. The
+/// returned outer vector always has exactly one entry per input episode;
+/// terminally failed ranges retain empty entries. Cancellation aborts the
+/// entire operation and returns `None`.
+#[allow(
+    clippy::too_many_lines,
+    reason = "The retry and recursive-split state machine stays together so its attempt limits, cancellation points, and result-alignment invariant can be audited in one place."
+)]
+async fn extract_aligned_batch_with_retry(
+    extractor: &dyn ObservationExtractor,
+    namespace_id: Uuid,
+    episode_ids: &[Uuid],
+    episodes: &[Vec<ExtractionMessage>],
+    cancel: &CancellationToken,
+) -> Option<Vec<Vec<ObservationMemory>>> {
+    let mut aligned_results: Vec<Vec<ObservationMemory>> =
+        (0..episode_ids.len()).map(|_| Vec::new()).collect();
+    let mut pending_ranges = vec![(0, episode_ids.len(), true)];
+
+    while let Some((start, end, retry_wrong_length)) = pending_ranges.pop() {
+        let ids = &episode_ids[start..end];
+        let batch_size = ids.len();
+        let mut attempt = 1usize;
+
+        loop {
+            if cancel.is_cancelled() {
+                tracing::warn!(
+                    target: "pensyve::observation",
+                    attempt,
+                    batch_size,
+                    "batched extraction cancelled before retry attempt"
+                );
+                return None;
+            }
+
+            let episode_slices: Vec<&[ExtractionMessage]> =
+                episodes[start..end].iter().map(Vec::as_slice).collect();
+            match extractor
+                .extract_batch(namespace_id, ids, episode_slices, cancel.clone())
+                .await
+            {
+                Ok(results) if results.len() == batch_size => {
+                    for (offset, observations) in results.into_iter().enumerate() {
+                        aligned_results[start + offset] = observations;
+                    }
+                    break;
+                }
+                Ok(results) => {
+                    let got = results.len();
+                    if retry_wrong_length && attempt < BATCH_EXTRACTION_MAX_ATTEMPTS {
+                        let next_attempt = attempt + 1;
+                        let delay_secs = BATCH_EXTRACTION_RETRY_BACKOFF_SECS[attempt - 1];
+                        tracing::warn!(
+                            target: "pensyve::observation",
+                            expected = batch_size,
+                            got,
+                            attempt = next_attempt,
+                            total_attempts = BATCH_EXTRACTION_MAX_ATTEMPTS,
+                            delay_secs,
+                            "batched extractor returned wrong-length result — retrying"
+                        );
+                        if !wait_for_batch_extraction_retry(cancel, delay_secs).await {
+                            tracing::warn!(
+                                target: "pensyve::observation",
+                                attempts = attempt,
+                                batch_size,
+                                "batched extraction cancelled during retry backoff"
+                            );
+                            return None;
+                        }
+                        attempt = next_attempt;
+                        continue;
+                    }
+
+                    if batch_size == 1 {
+                        tracing::warn!(
+                            target: "pensyve::observation",
+                            episode_id = %ids[0],
+                            expected = 1,
+                            got,
+                            attempts = attempt,
+                            "batched extractor returned wrong-length result for single episode — dropping episode"
+                        );
+                        break;
+                    }
+
+                    let midpoint = start + batch_size / 2;
+                    tracing::warn!(
+                        target: "pensyve::observation",
+                        expected = batch_size,
+                        got,
+                        attempts = attempt,
+                        "batched extractor returned wrong-length result — splitting batch"
+                    );
+                    pending_ranges.push((midpoint, end, false));
+                    pending_ranges.push((start, midpoint, false));
+                    break;
+                }
+                Err(error) => {
+                    if matches!(&error, ExtractionError::Cancelled(_)) {
+                        tracing::warn!(
+                            target: "pensyve::observation",
+                            error = %error,
+                            episode_ids = ?ids,
+                            batch_size,
+                            attempts = attempt,
+                            "batched extraction cancelled"
+                        );
+                        return None;
+                    }
+
+                    let retryable = matches!(&error, ExtractionError::Transport(_));
+                    if retryable && attempt < BATCH_EXTRACTION_MAX_ATTEMPTS {
+                        let next_attempt = attempt + 1;
+                        let delay_secs = BATCH_EXTRACTION_RETRY_BACKOFF_SECS[attempt - 1];
+                        tracing::warn!(
+                            target: "pensyve::observation",
+                            error = %error,
+                            batch_size,
+                            attempt = next_attempt,
+                            total_attempts = BATCH_EXTRACTION_MAX_ATTEMPTS,
+                            delay_secs,
+                            "batched extractor failed — retrying"
+                        );
+                        if !wait_for_batch_extraction_retry(cancel, delay_secs).await {
+                            tracing::warn!(
+                                target: "pensyve::observation",
+                                attempts = attempt,
+                                batch_size,
+                                "batched extraction cancelled during retry backoff"
+                            );
+                            return None;
+                        }
+                        attempt = next_attempt;
+                        continue;
+                    }
+
+                    tracing::warn!(
+                        target: "pensyve::observation",
+                        error = %error,
+                        episode_ids = ?ids,
+                        batch_size,
+                        attempts = attempt,
+                        "batched extractor failed permanently — dropping sub-range"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    Some(aligned_results)
+}
+
 /// Phase 2D variant of [`commit_extractions_for_episodes`] that
 /// optionally consults the D-MEM gate. Semantics identical to
 /// [`commit_extraction_for_episode_with_dmem`], applied to every
@@ -3562,40 +3735,17 @@ where
         return 0;
     }
 
-    // Borrow-shape gymnastics: `extract_batch` wants `Vec<&[ExtractionMessage]>`,
-    // but the owning `surviving_messages` Vec must outlive the borrow. Build the
-    // slice view in a tight scope right before the await.
-    let episode_slices: Vec<&[ExtractionMessage]> =
-        surviving_messages.iter().map(Vec::as_slice).collect();
-
-    let batch_results = match extractor
-        .extract_batch(namespace_id, &surviving_ids, episode_slices, cancel.clone())
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                target: "pensyve::observation",
-                error = %e,
-                batch_size = surviving_ids.len(),
-                "batched extractor failed — no observations persisted for this batch"
-            );
-            return 0;
-        }
-    };
-
-    if batch_results.len() != surviving_ids.len() {
-        // Defensive: a well-behaved extractor returns one result vec per
-        // input. If it doesn't, drop the batch rather than mis-attributing
-        // observations to wrong episodes.
-        tracing::warn!(
-            target: "pensyve::observation",
-            expected = surviving_ids.len(),
-            got = batch_results.len(),
-            "batched extractor returned wrong-length result — dropping batch"
-        );
+    let Some(batch_results) = extract_aligned_batch_with_retry(
+        extractor,
+        namespace_id,
+        &surviving_ids,
+        &surviving_messages,
+        &cancel,
+    )
+    .await
+    else {
         return 0;
-    }
+    };
 
     // Hoist gate-extractor construction once for the whole bulk call —
     // shared across every episode + every observation. Per coderabbit
@@ -4110,6 +4260,171 @@ mod tests {
         }
     }
 
+    /// Batch extractor that fails a configured number of calls before
+    /// returning one observation vector per requested episode.
+    #[derive(Debug)]
+    struct FlakyBatchExtractor {
+        calls: std::sync::atomic::AtomicUsize,
+        failures_before_success: usize,
+        by_episode: std::collections::HashMap<Uuid, Vec<ObservationMemory>>,
+    }
+
+    #[async_trait]
+    impl ObservationExtractor for FlakyBatchExtractor {
+        async fn extract(
+            &self,
+            _namespace_id: Uuid,
+            _episode_id: Uuid,
+            _messages: &[ExtractionMessage],
+            _cancel: CancellationToken,
+        ) -> ExtractionResult<Vec<ObservationMemory>> {
+            unreachable!("bulk retry tests call extract_batch directly")
+        }
+
+        async fn extract_batch(
+            &self,
+            _namespace_id: Uuid,
+            episode_ids: &[Uuid],
+            _episodes: Vec<&[ExtractionMessage]>,
+            _cancel: CancellationToken,
+        ) -> ExtractionResult<Vec<Vec<ObservationMemory>>> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if call <= self.failures_before_success {
+                return Err(ExtractionError::Transport(format!(
+                    "transient failure {call}"
+                )));
+            }
+            Ok(episode_ids
+                .iter()
+                .map(|episode_id| self.by_episode.get(episode_id).cloned().unwrap_or_default())
+                .collect())
+        }
+    }
+
+    /// Returns the wrong result count for multi-episode batches and valid
+    /// results for singleton batches, recording every requested batch size.
+    #[derive(Debug, Default)]
+    struct SplitRecoveryExtractor {
+        batch_sizes: std::sync::Mutex<Vec<usize>>,
+    }
+
+    #[async_trait]
+    impl ObservationExtractor for SplitRecoveryExtractor {
+        async fn extract(
+            &self,
+            _namespace_id: Uuid,
+            _episode_id: Uuid,
+            _messages: &[ExtractionMessage],
+            _cancel: CancellationToken,
+        ) -> ExtractionResult<Vec<ObservationMemory>> {
+            unreachable!("split recovery test calls extract_batch directly")
+        }
+
+        async fn extract_batch(
+            &self,
+            namespace_id: Uuid,
+            episode_ids: &[Uuid],
+            _episodes: Vec<&[ExtractionMessage]>,
+            _cancel: CancellationToken,
+        ) -> ExtractionResult<Vec<Vec<ObservationMemory>>> {
+            self.batch_sizes.lock().unwrap().push(episode_ids.len());
+            if episode_ids.len() > 1 {
+                return Ok(vec![Vec::new(); episode_ids.len() - 1]);
+            }
+            let episode_id = episode_ids[0];
+            Ok(vec![vec![ObservationMemory::new(
+                namespace_id,
+                episode_id,
+                "recovered",
+                episode_id.to_string(),
+                "split",
+                "recovered after split",
+            )]])
+        }
+    }
+
+    /// Returns a wrong result count for multi-episode batches, succeeds for
+    /// one configured singleton, and permanently transport-fails the other.
+    #[derive(Debug)]
+    struct PartialSplitRecoveryExtractor {
+        successful_episode_id: Uuid,
+        failed_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ObservationExtractor for PartialSplitRecoveryExtractor {
+        async fn extract(
+            &self,
+            _namespace_id: Uuid,
+            _episode_id: Uuid,
+            _messages: &[ExtractionMessage],
+            _cancel: CancellationToken,
+        ) -> ExtractionResult<Vec<ObservationMemory>> {
+            unreachable!("partial split recovery test calls extract_batch directly")
+        }
+
+        async fn extract_batch(
+            &self,
+            namespace_id: Uuid,
+            episode_ids: &[Uuid],
+            _episodes: Vec<&[ExtractionMessage]>,
+            _cancel: CancellationToken,
+        ) -> ExtractionResult<Vec<Vec<ObservationMemory>>> {
+            if episode_ids.len() > 1 {
+                return Ok(vec![Vec::new(); episode_ids.len() - 1]);
+            }
+
+            let episode_id = episode_ids[0];
+            if episode_id != self.successful_episode_id {
+                self.failed_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(ExtractionError::Transport("permanent split failure".into()));
+            }
+
+            Ok(vec![vec![ObservationMemory::new(
+                namespace_id,
+                episode_id,
+                "recovered",
+                episode_id.to_string(),
+                "split",
+                "recovered sibling range",
+            )]])
+        }
+    }
+
+    /// Signals its first transport failure so the test can cancel while the
+    /// bulk helper is waiting in retry backoff.
+    #[derive(Debug, Default)]
+    struct BackoffCancellationExtractor {
+        calls: std::sync::atomic::AtomicUsize,
+        first_call: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl ObservationExtractor for BackoffCancellationExtractor {
+        async fn extract(
+            &self,
+            _namespace_id: Uuid,
+            _episode_id: Uuid,
+            _messages: &[ExtractionMessage],
+            _cancel: CancellationToken,
+        ) -> ExtractionResult<Vec<ObservationMemory>> {
+            unreachable!("backoff cancellation test calls extract_batch directly")
+        }
+
+        async fn extract_batch(
+            &self,
+            _namespace_id: Uuid,
+            _episode_ids: &[Uuid],
+            _episodes: Vec<&[ExtractionMessage]>,
+            _cancel: CancellationToken,
+        ) -> ExtractionResult<Vec<Vec<ObservationMemory>>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.first_call.notify_one();
+            Err(ExtractionError::Transport("retry me".into()))
+        }
+    }
+
     #[tokio::test]
     async fn commit_extractions_batch_persists_per_episode_observations() {
         let (_dir, db, ns, ep_a, ep_b) = setup_two_episodes();
@@ -4156,6 +4471,169 @@ mod tests {
         let stored_b = db.list_observations_by_episode_ids(&[ep_b], 100).unwrap();
         assert_eq!(stored_b.len(), 1);
         assert_eq!(stored_b[0].instance, "sourdough");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commit_extractions_batch_retries_transient_failure_and_persists() {
+        let (_dir, db, ns, ep_a, ep_b) = setup_two_episodes();
+        let mut by_episode = std::collections::HashMap::new();
+        for (episode_id, instance) in [(ep_a, "AC Odyssey"), (ep_b, "sourdough")] {
+            by_episode.insert(
+                episode_id,
+                vec![ObservationMemory::new(
+                    ns.id,
+                    episode_id,
+                    "recovered",
+                    instance,
+                    "retry",
+                    format!("recovered {instance}"),
+                )],
+            );
+        }
+        let extractor = FlakyBatchExtractor {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            failures_before_success: 1,
+            by_episode,
+        };
+
+        let persisted = commit_extractions_for_episodes(
+            &db,
+            &extractor,
+            ns.id,
+            &[ep_a, ep_b],
+            CancellationToken::new(),
+            fake_embed,
+        )
+        .await;
+
+        assert_eq!(persisted, 2);
+        assert_eq!(extractor.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            db.list_observations_by_episode_ids(&[ep_a, ep_b], 100)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commit_extractions_batch_wrong_length_splits_and_recovers() {
+        let (_dir, db, ns, ep_a, ep_b) = setup_two_episodes();
+        let extractor = SplitRecoveryExtractor::default();
+
+        let persisted = commit_extractions_for_episodes(
+            &db,
+            &extractor,
+            ns.id,
+            &[ep_a, ep_b],
+            CancellationToken::new(),
+            fake_embed,
+        )
+        .await;
+
+        assert_eq!(persisted, 2);
+        assert_eq!(*extractor.batch_sizes.lock().unwrap(), [2, 2, 2, 1, 1]);
+        for episode_id in [ep_a, ep_b] {
+            let stored = db
+                .list_observations_by_episode_ids(&[episode_id], 100)
+                .unwrap();
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].episode_id, episode_id);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commit_extractions_batch_permanent_split_failure_persists_sibling_success() {
+        let (_dir, db, ns, ep_a, ep_b) = setup_two_episodes();
+        let extractor = PartialSplitRecoveryExtractor {
+            successful_episode_id: ep_a,
+            failed_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let persisted = commit_extractions_for_episodes(
+            &db,
+            &extractor,
+            ns.id,
+            &[ep_a, ep_b],
+            CancellationToken::new(),
+            fake_embed,
+        )
+        .await;
+
+        assert_eq!(persisted, 1);
+        assert_eq!(
+            extractor
+                .failed_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
+
+        let stored_a = db.list_observations_by_episode_ids(&[ep_a], 100).unwrap();
+        assert_eq!(stored_a.len(), 1);
+        assert_eq!(stored_a[0].episode_id, ep_a);
+
+        let stored_b = db.list_observations_by_episode_ids(&[ep_b], 100).unwrap();
+        assert!(stored_b.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commit_extractions_batch_cancellation_interrupts_backoff() {
+        let (_dir, db, ns, ep_a, ep_b) = setup_two_episodes();
+        let extractor = BackoffCancellationExtractor::default();
+        let cancel = CancellationToken::new();
+        let episode_ids = [ep_a, ep_b];
+        let mut commit = Box::pin(commit_extractions_for_episodes(
+            &db,
+            &extractor,
+            ns.id,
+            &episode_ids,
+            cancel.clone(),
+            fake_embed,
+        ));
+
+        tokio::select! {
+            biased;
+            persisted = &mut commit => {
+                panic!("bulk extraction completed before entering backoff: {persisted}");
+            }
+            () = extractor.first_call.notified() => {}
+        }
+        assert_eq!(extractor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        cancel.cancel();
+        let persisted = tokio::time::timeout(std::time::Duration::from_millis(100), commit)
+            .await
+            .expect("cancellation should interrupt retry backoff promptly");
+        assert_eq!(persisted, 0);
+        assert_eq!(extractor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commit_extractions_batch_permanent_failure_stops_after_three_attempts() {
+        let (_dir, db, ns, ep_a, ep_b) = setup_two_episodes();
+        let extractor = FlakyBatchExtractor {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            failures_before_success: usize::MAX,
+            by_episode: std::collections::HashMap::new(),
+        };
+
+        let persisted = commit_extractions_for_episodes(
+            &db,
+            &extractor,
+            ns.id,
+            &[ep_a, ep_b],
+            CancellationToken::new(),
+            fake_embed,
+        )
+        .await;
+
+        assert_eq!(persisted, 0);
+        assert_eq!(extractor.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(
+            db.list_observations_by_episode_ids(&[ep_a, ep_b], 100)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
