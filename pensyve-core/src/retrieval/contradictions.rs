@@ -5,6 +5,29 @@ use uuid::Uuid;
 
 use crate::types::Memory;
 
+/// Predicates conservatively excluded from contradiction detection because they commonly describe
+/// multi-valued relationships. This deny-list is a heuristic; memory supersession (issue #187) is
+/// the systematic long-term fix.
+const CONTRADICTION_PREDICATE_DENY_LIST: &[&str] = &[
+    "knows",
+    "has_skill",
+    "has_skills",
+    "member_of",
+    "likes",
+    "loves",
+    "owns",
+    "uses",
+    "works_on",
+    "interested_in",
+    "collaborates_with",
+    "friend_of",
+    "has_hobby",
+    "speaks",
+    "attended",
+    "visited",
+    "related_to",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Contradiction {
     pub subject: Uuid,
@@ -32,6 +55,10 @@ pub fn detect_contradictions(memories: &[Memory]) -> Vec<Contradiction> {
         }
 
         let predicate = memory.predicate.to_lowercase();
+        let deny_list_predicate = predicate.replace(' ', "_");
+        if CONTRADICTION_PREDICATE_DENY_LIST.contains(&deny_list_predicate.as_str()) {
+            continue;
+        }
         let group = groups.entry((memory.subject, predicate)).or_default();
         group.memory_ids.push(memory.id);
         group.objects.push(memory.object.clone());
@@ -101,6 +128,45 @@ mod tests {
         let contradictions = detect_contradictions(&[
             Memory::Semantic(semantic(namespace_id, subject, "works_at", "Acme")),
             Memory::Semantic(semantic(namespace_id, subject, "WORKS_AT", " acme ")),
+        ]);
+
+        assert!(contradictions.is_empty());
+    }
+
+    #[test]
+    fn knows_with_different_objects_is_not_flagged() {
+        let namespace_id = Uuid::from_u128(1);
+        let subject = Uuid::from_u128(2);
+
+        let contradictions = detect_contradictions(&[
+            Memory::Semantic(semantic(namespace_id, subject, "knows", "Bob")),
+            Memory::Semantic(semantic(namespace_id, subject, "knows", "Carol")),
+        ]);
+
+        assert!(contradictions.is_empty());
+    }
+
+    #[test]
+    fn works_at_with_different_objects_is_flagged() {
+        let namespace_id = Uuid::from_u128(1);
+        let subject = Uuid::from_u128(2);
+
+        let contradictions = detect_contradictions(&[
+            Memory::Semantic(semantic(namespace_id, subject, "works_at", "Acme")),
+            Memory::Semantic(semantic(namespace_id, subject, "works_at", "Globex")),
+        ]);
+
+        assert_eq!(contradictions.len(), 1);
+    }
+
+    #[test]
+    fn space_separated_has_skill_with_different_objects_is_not_flagged() {
+        let namespace_id = Uuid::from_u128(1);
+        let subject = Uuid::from_u128(2);
+
+        let contradictions = detect_contradictions(&[
+            Memory::Semantic(semantic(namespace_id, subject, "has skill", "Rust")),
+            Memory::Semantic(semantic(namespace_id, subject, "has skill", "Go")),
         ]);
 
         assert!(contradictions.is_empty());

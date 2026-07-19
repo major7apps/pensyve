@@ -78,7 +78,7 @@ func TestRecallWithOptions(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(recallResponse{
+		json.NewEncoder(w).Encode(RecallResult{
 			Memories: []Memory{
 				{
 					ID:         "mem-1",
@@ -127,7 +127,7 @@ func TestRecallWithNilOptions(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(recallResponse{Memories: []Memory{}})
+		json.NewEncoder(w).Encode(RecallResult{Memories: []Memory{}})
 	}))
 	defer server.Close()
 
@@ -141,6 +141,47 @@ func TestRecallWithNilOptions(t *testing.T) {
 	}
 	if len(memories) != 0 {
 		t.Fatalf("expected 0 memories, got %d", len(memories))
+	}
+}
+
+func TestRecallWithResultReturnsContradictions(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"memories": []Memory{{ID: "mem-1", Content: "Alice works at Acme"}},
+			"contradictions": []map[string]interface{}{{
+				"subject":    "alice",
+				"predicate":  "works_at",
+				"memory_ids": []string{"mem-1", "mem-2"},
+				"objects":    []string{"Acme", "Globex"},
+			}},
+		})
+	}))
+	defer server.Close()
+
+	client, err := NewClient(Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.RecallWithResult(context.Background(), "employment", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Memories) != 1 {
+		t.Fatalf("expected 1 memory, got %d", len(result.Memories))
+	}
+	if len(result.Contradictions) != 1 {
+		t.Fatalf("expected 1 contradiction, got %d", len(result.Contradictions))
+	}
+	contradiction := result.Contradictions[0]
+	if contradiction.Subject != "alice" || contradiction.Predicate != "works_at" {
+		t.Errorf("unexpected contradiction: %+v", contradiction)
+	}
+	if len(contradiction.MemoryIDs) != 2 || contradiction.MemoryIDs[1] != "mem-2" {
+		t.Errorf("unexpected memory IDs: %v", contradiction.MemoryIDs)
+	}
+	if len(contradiction.Objects) != 2 || contradiction.Objects[1] != "Globex" {
+		t.Errorf("unexpected objects: %v", contradiction.Objects)
 	}
 }
 
