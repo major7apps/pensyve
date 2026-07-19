@@ -92,7 +92,7 @@ Python env setup: `uv sync --extra dev && uv run maturin develop --manifest-path
 | `PENSYVE_TIER2_ENABLED` | `false` | Enable LLM-based Tier 2 extraction |
 | `PENSYVE_TIER2_MODEL_PATH` | (unset) | Path to GGUF model for Tier 2 |
 | `DATABASE_URL` | (unset) | Postgres connection string (optional) |
-| `REDIS_URL` | (unset) | Redis URL for episode state (optional) |
+| `REDIS_URL` | (unset) | Redis for caching, rate limiting, and daily quota enforcement (optional) |
 
 ## When in doubt
 
