@@ -415,8 +415,8 @@ Pensyve uses the following environment variables across its components:
 | ---------------------- | ----------------------- | ----------------------------- |
 | `PENSYVE_API_KEY`      | _(none)_                | Cloud API key for remote mode |
 | `PENSYVE_REMOTE_URL`   | `http://localhost:8000` | Remote server URL             |
-| `PENSYVE_DATABASE_URL` | _(none)_                | Postgres connection string    |
-| `PENSYVE_REDIS_URL`    | _(none)_                | Redis URL for episode state   |
+| `DATABASE_URL` | _(none)_                | Postgres connection string    |
+| `REDIS_URL`    | _(none)_                | Redis for caching, rate limiting, daily quotas |
 
 ### Quotas (managed service)
 

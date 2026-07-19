@@ -89,5 +89,5 @@ tracks operations per (user, month, tier) for billing and abuse prevention.
 
 - ONNX embeddings via `fastembed` (no external API calls in offline mode).
 - Optional Postgres backend is feature-gated; SQLite is the default.
-- Optional Redis cache is feature-gated (`PENSYVE_REDIS_URL`).
+- Optional Redis cache is environment-gated: enabled when `REDIS_URL` is set.
 - Go SDK uses standard library only; no third-party dependencies.
