@@ -6,6 +6,7 @@ All tests mock the pensyve SDK so they run without a native binary.
 from __future__ import annotations
 
 import json
+import urllib.error
 from dataclasses import dataclass
 from unittest.mock import MagicMock, patch
 
@@ -401,6 +402,33 @@ class TestCloudMode:
             call_args = mock_req.call_args
             assert call_args[0][0] == "DELETE"
             assert "/v1/entities/user" in call_args[0][1]
+
+    def test_cloud_delete_ignores_not_found(self, cloud_store):
+        error = urllib.error.HTTPError(
+            "https://api.pensyve.com/v1/entities/missing",
+            404,
+            "Not Found",
+            None,
+            None,
+        )
+        with patch("pensyve_langchain._cloud_request", side_effect=error):
+            cloud_store.delete(("missing",), "nope")
+
+    def test_cloud_delete_reraises_other_http_errors(self, cloud_store):
+        error = urllib.error.HTTPError(
+            "https://api.pensyve.com/v1/entities/user",
+            500,
+            "Server Error",
+            None,
+            None,
+        )
+        with (
+            patch("pensyve_langchain._cloud_request", side_effect=error),
+            pytest.raises(urllib.error.HTTPError) as exc_info,
+        ):
+            cloud_store.delete(("user",), "k1")
+
+        assert exc_info.value is error
 
     def test_cloud_get_not_found(self, cloud_store):
         with patch("pensyve_langchain._cloud_request") as mock_req:

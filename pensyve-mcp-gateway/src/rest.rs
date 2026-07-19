@@ -299,6 +299,36 @@ fn get_or_create_entity(
     }
 }
 
+fn resolve_entity_identifier(
+    storage: &dyn StorageTrait,
+    identifier: &str,
+    namespace_id: Uuid,
+) -> Result<Option<Entity>, RestError> {
+    match storage.get_entity_by_name(identifier, namespace_id) {
+        Ok(Some(entity)) => return Ok(Some(entity)),
+        Ok(None) => {}
+        Err(err) => {
+            return Err(RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Error looking up entity '{identifier}': {err}"),
+            ));
+        }
+    }
+
+    let Ok(entity_id) = Uuid::parse_str(identifier) else {
+        return Ok(None);
+    };
+
+    match storage.get_entity(entity_id) {
+        Ok(Some(entity)) if entity.namespace_id == namespace_id => Ok(Some(entity)),
+        Ok(_) => Ok(None),
+        Err(err) => Err(RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Error looking up entity '{identifier}': {err}"),
+        )),
+    }
+}
+
 fn memory_type_name(memory: &Memory) -> &'static str {
     memory.type_name()
 }
@@ -779,16 +809,13 @@ async fn forget_entity(
 ) -> Result<impl IntoResponse, RestError> {
     let ps = get_pensyve_state(&state, &auth_ctx)?;
 
-    let entity = match ps.storage.get_entity_by_name(&entity_name, ps.namespace.id) {
-        Ok(Some(e)) => e,
-        Ok(None) => return Ok(Json(ForgetResponse { forgotten_count: 0 })),
-        Err(err) => {
-            return Err(RestError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Error looking up entity: {err}"),
-            ));
-        }
-    };
+    let entity = resolve_entity_identifier(ps.storage.as_ref(), &entity_name, ps.namespace.id)?
+        .ok_or_else(|| {
+            RestError(
+                StatusCode::NOT_FOUND,
+                format!("Entity '{entity_name}' not found"),
+            )
+        })?;
 
     // Collect memory IDs before deletion so we can remove them from the vector index.
     let mut memory_ids: Vec<Uuid> = Vec::new();
@@ -1067,24 +1094,13 @@ async fn inspect(
         }));
     }
 
-    let entity = match ps.storage.get_entity_by_name(&body.entity, ps.namespace.id) {
-        Ok(Some(e)) => e,
-        Ok(None) => {
-            return Ok(Json(InspectResponse {
-                entity: body.entity,
-                episodic: vec![],
-                semantic: vec![],
-                procedural: vec![],
-                observation: vec![],
-            }));
-        }
-        Err(err) => {
-            return Err(RestError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Error looking up entity: {err}"),
-            ));
-        }
-    };
+    let entity = resolve_entity_identifier(ps.storage.as_ref(), &body.entity, ps.namespace.id)?
+        .ok_or_else(|| {
+            RestError(
+                StatusCode::NOT_FOUND,
+                format!("Entity '{}' not found", body.entity),
+            )
+        })?;
 
     let mut episodic = Vec::new();
     if let Ok(mems) = ps.storage.list_episodic_by_entity(entity.id, limit) {
