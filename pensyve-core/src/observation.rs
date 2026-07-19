@@ -3379,17 +3379,18 @@ where
 ///   are unaffected.
 /// * Embedding failures are logged per-observation; surviving observations
 ///   for the same episode still persist.
-/// * If all attempts fail (e.g. transport error to vLLM), the helper logs and
-///   returns 0 — no observations land for any episode in the batch.
+/// * If all attempts for a range fail (e.g. transport error to vLLM), the
+///   helper logs and drops that range. Already-aligned sibling ranges still
+///   persist.
 ///
 /// `episode_ids` is a slice (not consumed) so callers can also use it for
 /// post-call logging without cloning. Empty input is a no-op (returns 0).
 ///
 /// `cancel` is forwarded into [`ObservationExtractor::extract_batch`] so
 /// long-running fan-outs honor cooperative cancellation per G1 pre-reg
-/// I5. On `Err(Cancelled)` from the extractor the helper returns 0 (same
-/// shape as any batch failure — no partial persistence). Callers that
-/// don't care about cancellation pass `CancellationToken::new()`.
+/// I5. On `Err(Cancelled)` from the extractor the helper returns 0 and performs
+/// no partial persistence. Callers that don't care about cancellation pass
+/// `CancellationToken::new()`.
 ///
 /// Returns the total number of observations successfully persisted across
 /// every episode in the batch.
@@ -3501,10 +3502,10 @@ where
 
 /// Wait for the next bulk extraction retry unless cancellation wins first.
 async fn wait_for_batch_extraction_retry(cancel: &CancellationToken, delay_secs: u64) -> bool {
-    tokio::select! {
-        () = cancel.cancelled() => false,
-        () = tokio::time::sleep(Duration::from_secs(delay_secs)) => true,
-    }
+    cancel
+        .run_until_cancelled(tokio::time::sleep(Duration::from_secs(delay_secs)))
+        .await
+        .is_some()
 }
 
 /// Extract a fully aligned batch, retrying transport and initial shape failures.
@@ -3512,7 +3513,9 @@ async fn wait_for_batch_extraction_retry(cancel: &CancellationToken, delay_secs:
 /// After the initial batch exhausts its wrong-length retries, pending ranges are
 /// split in half. Each split range gets one shape attempt before it is split
 /// again; transport failures remain eligible for the normal bounded retry. The
-/// returned outer vector always has exactly one entry per input episode.
+/// returned outer vector always has exactly one entry per input episode;
+/// terminally failed ranges retain empty entries. Cancellation aborts the
+/// entire operation and returns `None`.
 #[allow(
     clippy::too_many_lines,
     reason = "The retry and recursive-split state machine stays together so its attempt limits, cancellation points, and result-alignment invariant can be audited in one place."
@@ -3608,7 +3611,19 @@ async fn extract_aligned_batch_with_retry(
                     break;
                 }
                 Err(error) => {
-                    let retryable = matches!(error, ExtractionError::Transport(_));
+                    if matches!(&error, ExtractionError::Cancelled(_)) {
+                        tracing::warn!(
+                            target: "pensyve::observation",
+                            error = %error,
+                            episode_ids = ?ids,
+                            batch_size,
+                            attempts = attempt,
+                            "batched extraction cancelled"
+                        );
+                        return None;
+                    }
+
+                    let retryable = matches!(&error, ExtractionError::Transport(_));
                     if retryable && attempt < BATCH_EXTRACTION_MAX_ATTEMPTS {
                         let next_attempt = attempt + 1;
                         let delay_secs = BATCH_EXTRACTION_RETRY_BACKOFF_SECS[attempt - 1];
@@ -3637,11 +3652,12 @@ async fn extract_aligned_batch_with_retry(
                     tracing::warn!(
                         target: "pensyve::observation",
                         error = %error,
+                        episode_ids = ?ids,
                         batch_size,
                         attempts = attempt,
-                        "batched extractor failed — no observations persisted for this batch"
+                        "batched extractor failed permanently — dropping sub-range"
                     );
-                    return None;
+                    break;
                 }
             }
         }
@@ -4327,6 +4343,55 @@ mod tests {
         }
     }
 
+    /// Returns a wrong result count for multi-episode batches, succeeds for
+    /// one configured singleton, and permanently transport-fails the other.
+    #[derive(Debug)]
+    struct PartialSplitRecoveryExtractor {
+        successful_episode_id: Uuid,
+        failed_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ObservationExtractor for PartialSplitRecoveryExtractor {
+        async fn extract(
+            &self,
+            _namespace_id: Uuid,
+            _episode_id: Uuid,
+            _messages: &[ExtractionMessage],
+            _cancel: CancellationToken,
+        ) -> ExtractionResult<Vec<ObservationMemory>> {
+            unreachable!("partial split recovery test calls extract_batch directly")
+        }
+
+        async fn extract_batch(
+            &self,
+            namespace_id: Uuid,
+            episode_ids: &[Uuid],
+            _episodes: Vec<&[ExtractionMessage]>,
+            _cancel: CancellationToken,
+        ) -> ExtractionResult<Vec<Vec<ObservationMemory>>> {
+            if episode_ids.len() > 1 {
+                return Ok(vec![Vec::new(); episode_ids.len() - 1]);
+            }
+
+            let episode_id = episode_ids[0];
+            if episode_id != self.successful_episode_id {
+                self.failed_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(ExtractionError::Transport("permanent split failure".into()));
+            }
+
+            Ok(vec![vec![ObservationMemory::new(
+                namespace_id,
+                episode_id,
+                "recovered",
+                episode_id.to_string(),
+                "split",
+                "recovered sibling range",
+            )]])
+        }
+    }
+
     /// Signals its first transport failure so the test can cancel while the
     /// bulk helper is waiting in retry backoff.
     #[derive(Debug, Default)]
@@ -4475,6 +4540,40 @@ mod tests {
             assert_eq!(stored.len(), 1);
             assert_eq!(stored[0].episode_id, episode_id);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commit_extractions_batch_permanent_split_failure_persists_sibling_success() {
+        let (_dir, db, ns, ep_a, ep_b) = setup_two_episodes();
+        let extractor = PartialSplitRecoveryExtractor {
+            successful_episode_id: ep_a,
+            failed_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let persisted = commit_extractions_for_episodes(
+            &db,
+            &extractor,
+            ns.id,
+            &[ep_a, ep_b],
+            CancellationToken::new(),
+            fake_embed,
+        )
+        .await;
+
+        assert_eq!(persisted, 1);
+        assert_eq!(
+            extractor
+                .failed_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
+
+        let stored_a = db.list_observations_by_episode_ids(&[ep_a], 100).unwrap();
+        assert_eq!(stored_a.len(), 1);
+        assert_eq!(stored_a[0].episode_id, ep_a);
+
+        let stored_b = db.list_observations_by_episode_ids(&[ep_b], 100).unwrap();
+        assert!(stored_b.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
