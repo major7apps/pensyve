@@ -5,6 +5,7 @@ All tests mock the pensyve SDK so they run without a real Pensyve engine.
 
 from __future__ import annotations
 
+import urllib.error
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -395,6 +396,53 @@ async def test_cloud_clear(mock_pensyve):
         await mem.clear()
 
         mock_urlopen.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_cloud_clear_ignores_not_found(mock_pensyve):
+    """clear() should treat a missing cloud entity as already clean."""
+    mem = PensyveMemory(
+        namespace="test",
+        entity="missing-agent",
+        mode="cloud",
+        base_url="http://fake-server:8000",
+    )
+    error = urllib.error.HTTPError(
+        "http://fake-server:8000/v1/entities/missing-agent",
+        404,
+        "Not Found",
+        None,
+        None,
+    )
+
+    with patch("urllib.request.urlopen", side_effect=error):
+        await mem.clear()
+
+
+@pytest.mark.asyncio
+async def test_cloud_clear_reraises_other_http_errors(mock_pensyve):
+    """clear() should preserve non-404 cloud failures."""
+    mem = PensyveMemory(
+        namespace="test",
+        entity="cloud-agent",
+        mode="cloud",
+        base_url="http://fake-server:8000",
+    )
+    error = urllib.error.HTTPError(
+        "http://fake-server:8000/v1/entities/cloud-agent",
+        500,
+        "Server Error",
+        None,
+        None,
+    )
+
+    with (
+        patch("urllib.request.urlopen", side_effect=error),
+        pytest.raises(urllib.error.HTTPError) as exc_info,
+    ):
+        await mem.clear()
+
+    assert exc_info.value is error
 
 
 # ---------------------------------------------------------------------------

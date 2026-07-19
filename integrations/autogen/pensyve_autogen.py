@@ -24,7 +24,6 @@ to ``AssistantAgent(memory=[...])`` or used standalone.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import os
 from dataclasses import dataclass, field
 from enum import Enum
@@ -486,6 +485,7 @@ class PensyveMemory:
 
     async def _cloud_forget(self) -> None:
         """Delete all memories for the entity via the cloud REST API."""
+        import urllib.error
         import urllib.request
 
         headers: dict[str, str] = {}
@@ -498,5 +498,8 @@ class PensyveMemory:
             method="DELETE",
         )
 
-        with contextlib.suppress(Exception):
+        try:
             await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                raise

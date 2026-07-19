@@ -5,7 +5,7 @@ use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
-use pensyve_core::types::Namespace;
+use pensyve_core::types::{Entity, EntityKind, Namespace, SemanticMemory};
 use pensyve_core::vector::VectorIndex;
 use pensyve_mcp_gateway::AppState;
 use pensyve_mcp_gateway::auth::{AuthContext, AuthValidator};
@@ -249,6 +249,55 @@ async fn inspect_unknown_entity_returns_not_found() {
 
     let response = inspect(&client, &url, "unknown-entity").await;
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    cancellation.cancel();
+}
+
+#[tokio::test]
+async fn foreign_namespace_entity_uuid_returns_not_found_without_deleting_memories() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (url, state, cancellation) = start_test_server(&dir).await;
+    let client = reqwest::Client::new();
+    let foreign_state = state
+        .tenant_mgr
+        .get_tenant_state("foreign-rest-tenant")
+        .expect("foreign tenant state");
+    let mut foreign_entity = Entity::new("foreign-alice", EntityKind::User);
+    foreign_entity.namespace_id = foreign_state.namespace.id;
+    foreign_state
+        .storage
+        .save_entity(&foreign_entity)
+        .expect("save foreign entity");
+    let foreign_memory = SemanticMemory::new(
+        foreign_state.namespace.id,
+        foreign_entity.id,
+        "likes",
+        "coffee",
+        0.9,
+    );
+    foreign_state
+        .storage
+        .save_semantic(&foreign_memory)
+        .expect("save foreign memory");
+
+    let response = forget(&client, &url, &foreign_entity.id.to_string()).await;
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    assert!(
+        foreign_state
+            .storage
+            .get_semantic(foreign_memory.id)
+            .expect("foreign memory lookup after forget")
+            .is_some()
+    );
+
+    let response = inspect(&client, &url, &foreign_entity.id.to_string()).await;
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    assert!(
+        foreign_state
+            .storage
+            .get_semantic(foreign_memory.id)
+            .expect("foreign memory lookup after inspect")
+            .is_some()
+    );
     cancellation.cancel();
 }
 

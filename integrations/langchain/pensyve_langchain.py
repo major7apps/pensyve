@@ -21,7 +21,6 @@ Usage::
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import time
@@ -382,12 +381,15 @@ class PensyveStore:
         entity_name = _ns_to_entity(namespace)
 
         if self._is_cloud:
-            with contextlib.suppress(urllib.error.HTTPError):
+            try:
                 _cloud_request(
                     "DELETE",
                     f"{self._base_url}/v1/entities/{entity_name}",
                     api_key=self._api_key,
                 )
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    raise
         else:
             entity = self._get_entity(namespace)
             self._pensyve.forget(entity=entity)

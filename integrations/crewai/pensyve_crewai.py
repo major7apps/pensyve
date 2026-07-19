@@ -204,7 +204,16 @@ class _CloudBackend:
         return results
 
     def reset(self) -> None:
-        self._client.forget(self._entity_name)
+        # Local import: httpx ships with the pensyve SDK that cloud mode
+        # requires; keeping it out of module scope preserves embedded-mode
+        # and test importability (same reason PensyveClient is lazy-loaded).
+        import httpx
+
+        try:
+            self._client.forget(self._entity_name)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 404:
+                raise
 
 
 # ---------------------------------------------------------------------------

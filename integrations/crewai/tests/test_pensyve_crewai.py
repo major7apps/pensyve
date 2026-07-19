@@ -6,6 +6,7 @@ import os
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from pensyve_crewai import MemoryMatch, MemoryRecord, PensyveMemory
@@ -285,6 +286,36 @@ class TestCloudBackend:
             memory.reset()
 
             mock_client.forget.assert_called_once_with("crew-agent")
+
+    def test_cloud_reset_ignores_not_found(self) -> None:
+        with patch("pensyve_crewai._make_cloud_client") as mock_factory:
+            request = httpx.Request("DELETE", "https://api.pensyve.com/v1/entities/crew-agent")
+            response = httpx.Response(404, request=request)
+            mock_client = MagicMock()
+            mock_client.forget.side_effect = httpx.HTTPStatusError(
+                "entity not found", request=request, response=response
+            )
+            mock_factory.return_value = mock_client
+
+            memory = PensyveMemory(namespace="test", api_key="psy_test")
+            memory.reset()
+
+    def test_cloud_reset_reraises_other_http_errors(self) -> None:
+        with patch("pensyve_crewai._make_cloud_client") as mock_factory:
+            request = httpx.Request("DELETE", "https://api.pensyve.com/v1/entities/crew-agent")
+            response = httpx.Response(500, request=request)
+            mock_client = MagicMock()
+            error = httpx.HTTPStatusError(
+                "server error", request=request, response=response
+            )
+            mock_client.forget.side_effect = error
+            mock_factory.return_value = mock_client
+
+            memory = PensyveMemory(namespace="test", api_key="psy_test")
+            with pytest.raises(httpx.HTTPStatusError) as exc_info:
+                memory.reset()
+
+            assert exc_info.value is error
 
 
 # ---------------------------------------------------------------------------
