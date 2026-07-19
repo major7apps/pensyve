@@ -271,9 +271,9 @@ impl PostgresBackend {
 
 const SCHEMA: &str = include_str!("postgres_schema.sql");
 
-const LIST_OBSERVATIONS_BY_ENTITY_INSTANCE_SQL: &str = r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
-             unit, content, embedding::text, confidence, event_time, created_at,
-             stability, retrievability
+const LIST_OBSERVATIONS_BY_ENTITY_INSTANCE_SQL: &str = r"SELECT id, namespace_id, episode_id, entity_type, instance, action,
+             quantity, unit, content, embedding::text, confidence, event_time,
+             created_at, stability, retrievability
       FROM observation_memories
       WHERE namespace_id = $1 AND instance = $2
       ORDER BY created_at DESC LIMIT $3";
