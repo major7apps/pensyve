@@ -527,7 +527,7 @@ async fn test_mcp_forget_and_inspect() {
         state.namespace.id,
         uuid::Uuid::new_v4(),
         "person",
-        "BOB",
+        "bob",
         "mentioned",
         "Bob was mentioned",
     );

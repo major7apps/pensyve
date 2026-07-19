@@ -693,12 +693,13 @@ impl PensyveMcpServer {
 
         let remaining = limit.saturating_sub(memories.len());
         if remaining > 0 && (type_filter.is_none() || type_filter == Some("observation")) {
-            match state
-                .storage
-                .list_observations_by_entity_instance(state.namespace.id, &entity.name)
-            {
+            match state.storage.list_observations_by_entity_instance(
+                state.namespace.id,
+                &entity.name,
+                remaining,
+            ) {
                 Ok(observations) => {
-                    for mem in observations.into_iter().take(remaining) {
+                    for mem in observations {
                         let mut val = serde_json::to_value(&mem).unwrap_or_default();
                         strip_embedding(&mut val);
                         if let serde_json::Value::Object(ref mut map) = val {

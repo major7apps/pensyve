@@ -260,7 +260,7 @@ async fn inspect_by_entity_returns_instance_matched_observations_and_no_procedur
         pensyve_state.namespace.id,
         Uuid::new_v4(),
         "person",
-        "ALICE",
+        "alice",
         "mentioned",
         "Alice was mentioned",
     );

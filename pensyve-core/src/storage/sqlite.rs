@@ -1389,6 +1389,7 @@ impl StorageTrait for SqliteBackend {
         &self,
         namespace_id: Uuid,
         instance: &str,
+        limit: usize,
     ) -> StorageResult<Vec<ObservationMemory>> {
         let conn = lock_conn!(self);
         let mut stmt = conn.prepare(
@@ -1396,11 +1397,15 @@ impl StorageTrait for SqliteBackend {
                       unit, content, embedding, confidence, event_time, created_at,
                       stability, retrievability, agent_id, user_id
                FROM observation_memories
-               WHERE namespace_id = ?1 AND LOWER(instance) = LOWER(?2)
-               ORDER BY created_at DESC",
+               WHERE namespace_id = ?1 AND instance = ?2
+               ORDER BY created_at DESC LIMIT ?3",
         )?;
         let rows = stmt.query_map(
-            params![namespace_id.to_string(), instance],
+            params![
+                namespace_id.to_string(),
+                instance,
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
             row_to_observation,
         )?;
         let mut out = Vec::new();
@@ -3570,7 +3575,7 @@ mod tests {
 
         for (namespace_id, instance) in [
             (ns.id, "Alice"),
-            (ns.id, "ALICE"),
+            (ns.id, "alice"),
             (ns.id, "Bob"),
             (other_ns.id, "alice"),
         ] {
@@ -3586,14 +3591,37 @@ mod tests {
         }
 
         let fetched = db
-            .list_observations_by_entity_instance(ns.id, "alice")
+            .list_observations_by_entity_instance(ns.id, "alice", 10)
             .unwrap();
-        assert_eq!(fetched.len(), 2);
+        assert_eq!(fetched.len(), 1);
         assert!(
             fetched
                 .iter()
-                .all(|obs| obs.namespace_id == ns.id && obs.instance.eq_ignore_ascii_case("alice"))
+                .all(|obs| obs.namespace_id == ns.id && obs.instance == "alice")
         );
+    }
+
+    #[test]
+    fn test_observations_list_by_entity_instance_respects_limit() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+
+        for content in ["first", "second", "third"] {
+            let obs = ObservationMemory::new(
+                ns.id,
+                Uuid::new_v4(),
+                "person",
+                "alice",
+                "mentioned",
+                content,
+            );
+            db.save_observation(&obs).unwrap();
+        }
+
+        let fetched = db
+            .list_observations_by_entity_instance(ns.id, "alice", 2)
+            .unwrap();
+        assert_eq!(fetched.len(), 2);
     }
 
     #[test]

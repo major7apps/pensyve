@@ -148,11 +148,17 @@ pub trait StorageTrait: Send + Sync {
         Ok(None)
     }
 
+    /// Fetch observations linked to an entity by exact, case-sensitive instance string,
+    /// bounded by `limit` (G3 semantics). This deliberately differs from the forget path's
+    /// episode-to-entity join, which may use different matching semantics.
     fn list_observations_by_entity_instance(
         &self,
-        namespace_id: Uuid,
-        instance: &str,
-    ) -> StorageResult<Vec<ObservationMemory>>;
+        _namespace_id: Uuid,
+        _instance: &str,
+        _limit: usize,
+    ) -> StorageResult<Vec<ObservationMemory>> {
+        Ok(Vec::new())
+    }
 
     /// Fetch all observations attached to any of the given episode IDs,
     /// bounded by `limit` (applied after fetch). Used by `recall_grouped` to
