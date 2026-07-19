@@ -287,6 +287,37 @@ impl SqliteBackend {
             )?;
         }
 
+        // ----- Migration v4: uniform memory supersession columns. -----
+        if max_applied < 4 {
+            const V4_COLUMNS: &[(&str, &str, &str)] = &[
+                ("episodic_memories", "superseded_by", "TEXT"),
+                ("episodic_memories", "invalid_at", "TEXT"),
+                ("semantic_memories", "superseded_by", "TEXT"),
+                ("procedural_memories", "superseded_by", "TEXT"),
+                ("procedural_memories", "invalid_at", "TEXT"),
+                ("observation_memories", "superseded_by", "TEXT"),
+                ("observation_memories", "invalid_at", "TEXT"),
+            ];
+
+            for (table, column, column_type) in V4_COLUMNS {
+                if !Self::column_exists(conn, table, column)? {
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE {table} ADD COLUMN {column} {column_type};"
+                    ))?;
+                }
+            }
+
+            conn.execute(
+                "INSERT INTO schema_versions (version, applied_at, description)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    4_i64,
+                    Utc::now().to_rfc3339(),
+                    "Issue 187: add uniform superseded_by + invalid_at columns to memory tables",
+                ],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -952,8 +983,9 @@ impl StorageTrait for SqliteBackend {
             r"INSERT OR REPLACE INTO episodic_memories
                (id, namespace_id, episode_id, source_entity, about_entity, content, content_type,
                 summary, embedding, context_intent, timestamp, stability, retrievability,
-                access_count, last_accessed, event_time, agent_id, user_id)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                access_count, last_accessed, event_time, agent_id, user_id, superseded_by,
+                invalid_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 mem.id.to_string(),
                 mem.namespace_id.to_string(),
@@ -973,6 +1005,8 @@ impl StorageTrait for SqliteBackend {
                 opt_dt_to_str(mem.event_time),
                 mem.agent_id.map(|u| u.to_string()),
                 mem.user_id.map(|u| u.to_string()),
+                mem.superseded_by.map(|u| u.to_string()),
+                opt_dt_to_str(mem.invalid_at),
             ],
         )?;
 
@@ -997,7 +1031,7 @@ impl StorageTrait for SqliteBackend {
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           content_type, summary, embedding, context_intent, timestamp,
                           stability, retrievability, access_count, last_accessed, event_time,
-                          agent_id, user_id
+                          agent_id, user_id, superseded_by, invalid_at
                    FROM episodic_memories WHERE id = ?1",
                 params![id.to_string()],
                 row_to_episodic,
@@ -1016,8 +1050,8 @@ impl StorageTrait for SqliteBackend {
             r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                       content_type, summary, embedding, context_intent, timestamp,
                       stability, retrievability, access_count, last_accessed, event_time,
-                      agent_id, user_id
-               FROM episodic_memories WHERE about_entity = ?1
+                      agent_id, user_id, superseded_by, invalid_at
+               FROM episodic_memories WHERE about_entity = ?1 AND superseded_by IS NULL
                ORDER BY timestamp DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(
@@ -1080,8 +1114,8 @@ impl StorageTrait for SqliteBackend {
                 r"INSERT OR REPLACE INTO semantic_memories
                    (id, namespace_id, subject, predicate, object, content_type, object_entity,
                     confidence, valid_at, invalid_at, source_episodes, embedding, stability,
-                    retrievability, agent_id, user_id)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                    retrievability, agent_id, user_id, superseded_by)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     mem.id.to_string(),
                     mem.namespace_id.to_string(),
@@ -1099,6 +1133,7 @@ impl StorageTrait for SqliteBackend {
                     f64::from(mem.retrievability),
                     mem.agent_id.map(|u| u.to_string()),
                     mem.user_id.map(|u| u.to_string()),
+                    mem.superseded_by.map(|u| u.to_string()),
                 ],
             )?;
 
@@ -1135,7 +1170,7 @@ impl StorageTrait for SqliteBackend {
                 r"SELECT id, namespace_id, subject, predicate, object, content_type,
                           object_entity, confidence, valid_at, invalid_at,
                           source_episodes, embedding, stability, retrievability,
-                          agent_id, user_id
+                          agent_id, user_id, superseded_by
                    FROM semantic_memories WHERE id = ?1",
                 params![id.to_string()],
                 row_to_semantic,
@@ -1154,8 +1189,8 @@ impl StorageTrait for SqliteBackend {
             r"SELECT id, namespace_id, subject, predicate, object, content_type,
                       object_entity, confidence, valid_at, invalid_at,
                       source_episodes, embedding, stability, retrievability,
-                      agent_id, user_id
-               FROM semantic_memories WHERE subject = ?1
+                      agent_id, user_id, superseded_by
+               FROM semantic_memories WHERE subject = ?1 AND superseded_by IS NULL
                ORDER BY valid_at DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(
@@ -1182,9 +1217,9 @@ impl StorageTrait for SqliteBackend {
             r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                       content_type, summary, embedding, context_intent, timestamp,
                       stability, retrievability, access_count, last_accessed, event_time,
-                      agent_id, user_id
+                      agent_id, user_id, superseded_by, invalid_at
                FROM episodic_memories
-               WHERE namespace_id = ?1 AND episode_id = ?2
+               WHERE namespace_id = ?1 AND episode_id = ?2 AND superseded_by IS NULL
                ORDER BY COALESCE(event_time, timestamp) ASC",
         )?;
         let rows = stmt.query_map(
@@ -1227,8 +1262,8 @@ impl StorageTrait for SqliteBackend {
             r"INSERT OR REPLACE INTO procedural_memories
                (id, namespace_id, trigger_text, action, outcome, context, reliability,
                 trial_count, success_count, source_episodes, embedding, created_at, last_used,
-                agent_id, user_id)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                agent_id, user_id, superseded_by, invalid_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 mem.id.to_string(),
                 mem.namespace_id.to_string(),
@@ -1245,6 +1280,8 @@ impl StorageTrait for SqliteBackend {
                 last_used,
                 mem.agent_id.map(|u| u.to_string()),
                 mem.user_id.map(|u| u.to_string()),
+                mem.superseded_by.map(|u| u.to_string()),
+                opt_dt_to_str(mem.invalid_at),
             ],
         )?;
 
@@ -1269,7 +1306,7 @@ impl StorageTrait for SqliteBackend {
             .query_row(
                 r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
                           trial_count, success_count, source_episodes, embedding, created_at, last_used,
-                          agent_id, user_id
+                          agent_id, user_id, superseded_by, invalid_at
                    FROM procedural_memories WHERE id = ?1",
                 params![id.to_string()],
                 row_to_procedural,
@@ -1324,8 +1361,8 @@ impl StorageTrait for SqliteBackend {
                 r"INSERT OR REPLACE INTO observation_memories
                    (id, namespace_id, episode_id, entity_type, instance, action, quantity, unit,
                     content, embedding, confidence, event_time, created_at, stability, retrievability,
-                    agent_id, user_id)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                    agent_id, user_id, superseded_by, invalid_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                 params![
                     mem.id.to_string(),
                     mem.namespace_id.to_string(),
@@ -1344,6 +1381,8 @@ impl StorageTrait for SqliteBackend {
                     f64::from(mem.retrievability),
                     mem.agent_id.map(|u| u.to_string()),
                     mem.user_id.map(|u| u.to_string()),
+                    mem.superseded_by.map(|u| u.to_string()),
+                    opt_dt_to_str(mem.invalid_at),
                 ],
             )?;
             conn.execute(
@@ -1376,7 +1415,7 @@ impl StorageTrait for SqliteBackend {
             .query_row(
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
                           unit, content, embedding, confidence, event_time, created_at,
-                          stability, retrievability, agent_id, user_id
+                          stability, retrievability, agent_id, user_id, superseded_by, invalid_at
                    FROM observation_memories WHERE id = ?1",
                 params![id.to_string()],
                 row_to_observation,
@@ -1398,9 +1437,9 @@ impl StorageTrait for SqliteBackend {
         let sql = format!(
             "SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity, \
               unit, content, embedding, confidence, event_time, created_at, \
-              stability, retrievability, agent_id, user_id \
+              stability, retrievability, agent_id, user_id, superseded_by, invalid_at \
              FROM observation_memories \
-             WHERE episode_id IN ({placeholders}) \
+             WHERE episode_id IN ({placeholders}) AND superseded_by IS NULL \
              ORDER BY created_at ASC \
              LIMIT ?"
         );
@@ -1568,6 +1607,20 @@ impl StorageTrait for SqliteBackend {
             r"SELECT memory_id, memory_type FROM memory_fts
                WHERE memory_fts MATCH ?1 AND namespace_id = ?2
                  AND memory_type != 'observation'
+                 AND (
+                     (memory_type = 'episodic' AND EXISTS (
+                         SELECT 1 FROM episodic_memories e
+                         WHERE e.id = memory_id AND e.superseded_by IS NULL
+                     ))
+                     OR (memory_type = 'semantic' AND EXISTS (
+                         SELECT 1 FROM semantic_memories s
+                         WHERE s.id = memory_id AND s.superseded_by IS NULL
+                     ))
+                     OR (memory_type = 'procedural' AND EXISTS (
+                         SELECT 1 FROM procedural_memories p
+                         WHERE p.id = memory_id AND p.superseded_by IS NULL
+                     ))
+                 )
                LIMIT ?3",
         )?;
         let rows: Vec<(String, String)> = stmt
@@ -1593,7 +1646,7 @@ impl StorageTrait for SqliteBackend {
                             r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                                       content_type, summary, embedding, context_intent, timestamp,
                                       stability, retrievability, access_count, last_accessed, event_time,
-                                      agent_id, user_id
+                                      agent_id, user_id, superseded_by, invalid_at
                                FROM episodic_memories WHERE id = ?1",
                             params![id.to_string()],
                             row_to_episodic,
@@ -1609,7 +1662,7 @@ impl StorageTrait for SqliteBackend {
                             r"SELECT id, namespace_id, subject, predicate, object, content_type,
                                       object_entity, confidence, valid_at, invalid_at,
                                       source_episodes, embedding, stability, retrievability,
-                                      agent_id, user_id
+                                      agent_id, user_id, superseded_by
                                FROM semantic_memories WHERE id = ?1",
                             params![id.to_string()],
                             row_to_semantic,
@@ -1624,7 +1677,7 @@ impl StorageTrait for SqliteBackend {
                         .query_row(
                             r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
                                       trial_count, success_count, source_episodes, embedding, created_at, last_used,
-                                      agent_id, user_id
+                                      agent_id, user_id, superseded_by, invalid_at
                                FROM procedural_memories WHERE id = ?1",
                             params![id.to_string()],
                             row_to_procedural,
@@ -1673,6 +1726,7 @@ impl StorageTrait for SqliteBackend {
                      AND f.namespace_id = ?2
                      AND f.memory_type = 'semantic'
                      AND s.subject = ?3
+                     AND s.superseded_by IS NULL
                    LIMIT ?4",
             )?;
             let rows: Vec<String> = stmt
@@ -1691,7 +1745,7 @@ impl StorageTrait for SqliteBackend {
                         r"SELECT id, namespace_id, subject, predicate, object, content_type,
                                   object_entity, confidence, valid_at, invalid_at,
                                   source_episodes, embedding, stability, retrievability,
-                                  agent_id, user_id
+                                  agent_id, user_id, superseded_by
                            FROM semantic_memories WHERE id = ?1",
                         params![id.to_string()],
                         row_to_semantic,
@@ -1714,6 +1768,7 @@ impl StorageTrait for SqliteBackend {
                      AND f.namespace_id = ?2
                      AND f.memory_type = 'episodic'
                      AND (e.about_entity = ?3 OR e.source_entity = ?3)
+                     AND e.superseded_by IS NULL
                    LIMIT ?4",
             )?;
             let rows: Vec<String> = stmt
@@ -1732,7 +1787,7 @@ impl StorageTrait for SqliteBackend {
                         r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                                   content_type, summary, embedding, context_intent, timestamp,
                                   stability, retrievability, access_count, last_accessed, event_time,
-                                  agent_id, user_id
+                                  agent_id, user_id, superseded_by, invalid_at
                            FROM episodic_memories WHERE id = ?1",
                         params![id.to_string()],
                         row_to_episodic,
@@ -1754,68 +1809,47 @@ impl StorageTrait for SqliteBackend {
 
     fn get_all_memories_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Memory>> {
         let conn = lock_conn!(self);
-        let ns_str = namespace_id.to_string();
-        let mut memories = Vec::new();
+        load_memories_by_namespace(&conn, namespace_id, false)
+    }
 
-        // Episodic
-        {
-            let mut stmt = conn.prepare(
-                r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                          content_type, summary, embedding, context_intent, timestamp,
-                          stability, retrievability, access_count, last_accessed, event_time,
-                          agent_id, user_id
-                   FROM episodic_memories WHERE namespace_id = ?1",
+    fn get_all_memories_by_namespace_including_superseded(
+        &self,
+        namespace_id: Uuid,
+    ) -> StorageResult<Vec<Memory>> {
+        let conn = lock_conn!(self);
+        load_memories_by_namespace(&conn, namespace_id, true)
+    }
+
+    fn supersede_memory(
+        &self,
+        id: Uuid,
+        superseded_by: Uuid,
+        invalid_at: DateTime<Utc>,
+    ) -> StorageResult<bool> {
+        let conn = lock_conn!(self);
+        let id = id.to_string();
+        let superseded_by = superseded_by.to_string();
+        let invalid_at = invalid_at.to_rfc3339();
+
+        for table in [
+            "episodic_memories",
+            "semantic_memories",
+            "procedural_memories",
+            "observation_memories",
+        ] {
+            let updated = conn.execute(
+                &format!(
+                    "UPDATE {table} SET superseded_by = ?1, invalid_at = ?2 \
+                     WHERE id = ?3 AND superseded_by IS NULL"
+                ),
+                params![&superseded_by, &invalid_at, &id],
             )?;
-            let rows = stmt.query_map(params![&ns_str], row_to_episodic)?;
-            for row in rows {
-                memories.push(Memory::Episodic(row??));
+            if updated > 0 {
+                return Ok(true);
             }
         }
 
-        // Semantic
-        {
-            let mut stmt = conn.prepare(
-                r"SELECT id, namespace_id, subject, predicate, object, content_type,
-                          object_entity, confidence, valid_at, invalid_at,
-                          source_episodes, embedding, stability, retrievability,
-                          agent_id, user_id
-                   FROM semantic_memories WHERE namespace_id = ?1",
-            )?;
-            let rows = stmt.query_map(params![&ns_str], row_to_semantic)?;
-            for row in rows {
-                memories.push(Memory::Semantic(row??));
-            }
-        }
-
-        // Procedural
-        {
-            let mut stmt = conn.prepare(
-                r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
-                          trial_count, success_count, source_episodes, embedding, created_at, last_used,
-                          agent_id, user_id
-                   FROM procedural_memories WHERE namespace_id = ?1",
-            )?;
-            let rows = stmt.query_map(params![&ns_str], row_to_procedural)?;
-            for row in rows {
-                memories.push(Memory::Procedural(row??));
-            }
-        }
-
-        // Observation
-        {
-            let mut stmt = conn.prepare(
-                r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
-                          unit, content, embedding, confidence, event_time, created_at,
-                          stability, retrievability, agent_id, user_id
-                   FROM observation_memories WHERE namespace_id = ?1",
-            )?;
-            let rows = stmt.query_map(params![&ns_str], row_to_observation)?;
-            for row in rows {
-                memories.push(Memory::Observation(row??));
-            }
-        }
-
-        Ok(memories)
+        Ok(false)
     }
 
     // -----------------------------------------------------------------------
@@ -1920,14 +1954,18 @@ impl StorageTrait for SqliteBackend {
         };
 
         let where_sql: &'static str = match bind {
-            ScopeBind::NsOnly => "namespace_id = ?1",
-            ScopeBind::AgentOnly(_) => "namespace_id = ?1 AND agent_id = ?2",
-            ScopeBind::Both(_, _) => "namespace_id = ?1 AND agent_id = ?2 AND user_id = ?3",
+            ScopeBind::NsOnly => "namespace_id = ?1 AND superseded_by IS NULL",
+            ScopeBind::AgentOnly(_) => {
+                "namespace_id = ?1 AND agent_id = ?2 AND superseded_by IS NULL"
+            }
+            ScopeBind::Both(_, _) => {
+                "namespace_id = ?1 AND agent_id = ?2 AND user_id = ?3 AND superseded_by IS NULL"
+            }
             ScopeBind::AgentSetUserNull(_) => {
-                "namespace_id = ?1 AND agent_id = ?2 AND user_id IS NULL"
+                "namespace_id = ?1 AND agent_id = ?2 AND user_id IS NULL AND superseded_by IS NULL"
             }
             ScopeBind::UserSetAgentNull(_) => {
-                "namespace_id = ?1 AND agent_id IS NULL AND user_id = ?2"
+                "namespace_id = ?1 AND agent_id IS NULL AND user_id = ?2 AND superseded_by IS NULL"
             }
         };
 
@@ -1966,7 +2004,7 @@ impl StorageTrait for SqliteBackend {
             "SELECT id, namespace_id, episode_id, source_entity, about_entity, content, \
               content_type, summary, embedding, context_intent, timestamp, \
               stability, retrievability, access_count, last_accessed, event_time, \
-              agent_id, user_id \
+              agent_id, user_id, superseded_by, invalid_at \
              FROM episodic_memories",
             row_to_episodic,
             Memory::Episodic
@@ -1976,7 +2014,8 @@ impl StorageTrait for SqliteBackend {
         run_scoped!(
             "SELECT id, namespace_id, subject, predicate, object, content_type, \
               object_entity, confidence, valid_at, invalid_at, \
-              source_episodes, embedding, stability, retrievability, agent_id, user_id \
+              source_episodes, embedding, stability, retrievability, agent_id, user_id, \
+              superseded_by \
              FROM semantic_memories",
             row_to_semantic,
             Memory::Semantic
@@ -1986,7 +2025,7 @@ impl StorageTrait for SqliteBackend {
         run_scoped!(
             "SELECT id, namespace_id, trigger_text, action, outcome, context, reliability, \
               trial_count, success_count, source_episodes, embedding, created_at, last_used, \
-              agent_id, user_id \
+              agent_id, user_id, superseded_by, invalid_at \
              FROM procedural_memories",
             row_to_procedural,
             Memory::Procedural
@@ -1996,7 +2035,7 @@ impl StorageTrait for SqliteBackend {
         run_scoped!(
             "SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity, \
               unit, content, embedding, confidence, event_time, created_at, \
-              stability, retrievability, agent_id, user_id \
+              stability, retrievability, agent_id, user_id, superseded_by, invalid_at \
              FROM observation_memories",
             row_to_observation,
             Memory::Observation
@@ -2536,6 +2575,67 @@ impl StorageTrait for SqliteBackend {
 // Row mapping helpers (free functions to avoid borrowing issues)
 // ---------------------------------------------------------------------------
 
+fn load_memories_by_namespace(
+    conn: &Connection,
+    namespace_id: Uuid,
+    include_superseded: bool,
+) -> StorageResult<Vec<Memory>> {
+    let ns_str = namespace_id.to_string();
+    let mut memories = Vec::new();
+
+    let mut stmt = conn.prepare(
+        r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
+                  content_type, summary, embedding, context_intent, timestamp,
+                  stability, retrievability, access_count, last_accessed, event_time,
+                  agent_id, user_id, superseded_by, invalid_at
+           FROM episodic_memories
+           WHERE namespace_id = ?1 AND (?2 OR superseded_by IS NULL)",
+    )?;
+    let rows = stmt.query_map(params![&ns_str, include_superseded], row_to_episodic)?;
+    for row in rows {
+        memories.push(Memory::Episodic(row??));
+    }
+
+    let mut stmt = conn.prepare(
+        r"SELECT id, namespace_id, subject, predicate, object, content_type,
+                  object_entity, confidence, valid_at, invalid_at,
+                  source_episodes, embedding, stability, retrievability,
+                  agent_id, user_id, superseded_by
+           FROM semantic_memories
+           WHERE namespace_id = ?1 AND (?2 OR superseded_by IS NULL)",
+    )?;
+    let rows = stmt.query_map(params![&ns_str, include_superseded], row_to_semantic)?;
+    for row in rows {
+        memories.push(Memory::Semantic(row??));
+    }
+
+    let mut stmt = conn.prepare(
+        r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
+                  trial_count, success_count, source_episodes, embedding, created_at, last_used,
+                  agent_id, user_id, superseded_by, invalid_at
+           FROM procedural_memories
+           WHERE namespace_id = ?1 AND (?2 OR superseded_by IS NULL)",
+    )?;
+    let rows = stmt.query_map(params![&ns_str, include_superseded], row_to_procedural)?;
+    for row in rows {
+        memories.push(Memory::Procedural(row??));
+    }
+
+    let mut stmt = conn.prepare(
+        r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
+                  unit, content, embedding, confidence, event_time, created_at,
+                  stability, retrievability, agent_id, user_id, superseded_by, invalid_at
+           FROM observation_memories
+           WHERE namespace_id = ?1 AND (?2 OR superseded_by IS NULL)",
+    )?;
+    let rows = stmt.query_map(params![&ns_str, include_superseded], row_to_observation)?;
+    for row in rows {
+        memories.push(Memory::Observation(row??));
+    }
+
+    Ok(memories)
+}
+
 /// Parse a UUID string, returning `StorageError::Context` on failure.
 fn parse_uuid(s: &str) -> Result<Uuid, StorageError> {
     Uuid::parse_str(s).map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))
@@ -2563,6 +2663,8 @@ fn row_to_episodic(
     // G1: scope columns are nullable. Legacy v2.1 rows return NULL.
     let agent_id_str: Option<String> = row.get(16)?;
     let user_id_str: Option<String> = row.get(17)?;
+    let superseded_by_str: Option<String> = row.get(18)?;
+    let invalid_at_str: Option<String> = row.get(19)?;
 
     let id = match parse_uuid(&id_str) {
         Ok(v) => v,
@@ -2595,6 +2697,11 @@ fn row_to_episodic(
         Some(Err(e)) => return Ok(Err(e)),
         None => None,
     };
+    let superseded_by = match superseded_by_str.as_deref().map(parse_uuid) {
+        Some(Ok(v)) => Some(v),
+        Some(Err(e)) => return Ok(Err(e)),
+        None => None,
+    };
 
     Ok(Ok(EpisodicMemory {
         id,
@@ -2622,7 +2729,8 @@ fn row_to_episodic(
         // in v1.0.5 and earlier, see
         // pensyve-docs/research/benchmark-sprint/06-phase-v-verification.md.
         event_time: str_to_opt_dt(event_time_str.as_deref()),
-        superseded_by: None,
+        superseded_by,
+        invalid_at: str_to_opt_dt(invalid_at_str.as_deref()),
         agent_id,
         user_id,
     }))
@@ -2648,6 +2756,7 @@ fn row_to_semantic(
     // G1: scope columns are nullable. Legacy v2.1 rows return NULL.
     let agent_id_str: Option<String> = row.get(14)?;
     let user_id_str: Option<String> = row.get(15)?;
+    let superseded_by_str: Option<String> = row.get(16)?;
 
     let id = match parse_uuid(&id_str) {
         Ok(v) => v,
@@ -2672,6 +2781,11 @@ fn row_to_semantic(
         Some(Err(e)) => return Ok(Err(e)),
         None => None,
     };
+    let superseded_by = match superseded_by_str.as_deref().map(parse_uuid) {
+        Some(Ok(v)) => Some(v),
+        Some(Err(e)) => return Ok(Err(e)),
+        None => None,
+    };
 
     Ok(Ok(SemanticMemory {
         id,
@@ -2688,6 +2802,7 @@ fn row_to_semantic(
         confidence: confidence as f32,
         valid_at: str_to_dt(&valid_at_str),
         invalid_at: str_to_opt_dt(invalid_at_str.as_deref()),
+        superseded_by,
         source_episodes: json_to_uuids(&source_episodes_str),
         embedding: embedding_bytes
             .as_deref()
@@ -2719,6 +2834,8 @@ fn row_to_procedural(
     // G1: scope columns are nullable. Legacy v2.1 rows return NULL.
     let agent_id_str: Option<String> = row.get(13)?;
     let user_id_str: Option<String> = row.get(14)?;
+    let superseded_by_str: Option<String> = row.get(15)?;
+    let invalid_at_str: Option<String> = row.get(16)?;
 
     let context: HashMap<String, serde_json::Value> = match serde_json::from_str(&context_str) {
         Ok(v) => v,
@@ -2744,6 +2861,11 @@ fn row_to_procedural(
         Some(Err(e)) => return Ok(Err(e)),
         None => None,
     };
+    let superseded_by = match superseded_by_str.as_deref().map(parse_uuid) {
+        Some(Ok(v)) => Some(v),
+        Some(Err(e)) => return Ok(Err(e)),
+        None => None,
+    };
 
     Ok(Ok(ProceduralMemory {
         id,
@@ -2762,6 +2884,8 @@ fn row_to_procedural(
             .unwrap_or_default(),
         created_at: str_to_dt(&created_at_str),
         last_used: str_to_opt_dt(last_used_str.as_deref()),
+        superseded_by,
+        invalid_at: str_to_opt_dt(invalid_at_str.as_deref()),
         agent_id,
         user_id,
     }))
@@ -2788,6 +2912,8 @@ fn row_to_observation(
     // G1: scope columns are nullable. Legacy v2.1 rows return NULL.
     let agent_id_str: Option<String> = row.get(15)?;
     let user_id_str: Option<String> = row.get(16)?;
+    let superseded_by_str: Option<String> = row.get(17)?;
+    let invalid_at_str: Option<String> = row.get(18)?;
 
     let id = match parse_uuid(&id_str) {
         Ok(v) => v,
@@ -2807,6 +2933,11 @@ fn row_to_observation(
         None => None,
     };
     let user_id = match user_id_str.as_deref().map(parse_uuid) {
+        Some(Ok(v)) => Some(v),
+        Some(Err(e)) => return Ok(Err(e)),
+        None => None,
+    };
+    let superseded_by = match superseded_by_str.as_deref().map(parse_uuid) {
         Some(Ok(v)) => Some(v),
         Some(Err(e)) => return Ok(Err(e)),
         None => None,
@@ -2831,6 +2962,8 @@ fn row_to_observation(
         created_at: str_to_dt(&created_at_str),
         stability: stability as f32,
         retrievability: retrievability as f32,
+        superseded_by,
+        invalid_at: str_to_opt_dt(invalid_at_str.as_deref()),
         agent_id,
         user_id,
     }))
@@ -3750,12 +3883,12 @@ mod tests {
     #[test]
     fn migration_v3_upgrades_existing_pre_v3_store() {
         // Simulate a store that previously stopped at v2 (no kg_* tables)
-        // by removing the v3 row + tables, then re-running migrations
+        // by removing the v3+ registry rows and KG tables, then re-running migrations
         // and asserting the tables come back.
         let (_dir, db) = setup();
         {
             let conn = db.conn.lock().unwrap();
-            conn.execute("DELETE FROM schema_versions WHERE version = 3", [])
+            conn.execute("DELETE FROM schema_versions WHERE version IN (3, 4)", [])
                 .unwrap();
             conn.execute_batch(
                 "DROP TABLE IF EXISTS kg_passage_entities;
@@ -4020,5 +4153,86 @@ mod tests {
         assert_eq!(kg_entities_count_for_namespace(&db, ns_b.id), 2);
         assert_eq!(kg_triples_count_for_passage(&db, obs_b.id), 1);
         assert_eq!(kg_passage_entities_count_for_passage(&db, obs_b.id), 2);
+    }
+
+    #[test]
+    fn supersession_columns_round_trip_for_all_memory_kinds() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let successor = Uuid::new_v4();
+        let invalid_at = Utc::now();
+
+        let mut episodic = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "episodic",
+        );
+        episodic.superseded_by = Some(successor);
+        episodic.invalid_at = Some(invalid_at);
+        db.save_episodic(&episodic).unwrap();
+        let episodic_read = db.get_episodic(episodic.id).unwrap().unwrap();
+        assert_eq!(episodic_read.superseded_by, Some(successor));
+        assert_eq!(episodic_read.invalid_at, Some(invalid_at));
+
+        let mut semantic = SemanticMemory::new(ns.id, Uuid::new_v4(), "semantic", "memory", 0.9);
+        semantic.superseded_by = Some(successor);
+        semantic.invalid_at = Some(invalid_at);
+        db.save_semantic(&semantic).unwrap();
+        let semantic_read = db.get_semantic(semantic.id).unwrap().unwrap();
+        assert_eq!(semantic_read.superseded_by, Some(successor));
+        assert_eq!(semantic_read.invalid_at, Some(invalid_at));
+
+        let mut procedural =
+            ProceduralMemory::new(ns.id, "trigger", "action", Outcome::Success, HashMap::new());
+        procedural.superseded_by = Some(successor);
+        procedural.invalid_at = Some(invalid_at);
+        db.save_procedural(&procedural).unwrap();
+        let procedural_read = db.get_procedural(procedural.id).unwrap().unwrap();
+        assert_eq!(procedural_read.superseded_by, Some(successor));
+        assert_eq!(procedural_read.invalid_at, Some(invalid_at));
+
+        let mut observation = ObservationMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            "entity",
+            "instance",
+            "action",
+            "observation",
+        );
+        observation.superseded_by = Some(successor);
+        observation.invalid_at = Some(invalid_at);
+        db.save_observation(&observation).unwrap();
+        let observation_read = db.get_observation(observation.id).unwrap().unwrap();
+        assert_eq!(observation_read.superseded_by, Some(successor));
+        assert_eq!(observation_read.invalid_at, Some(invalid_at));
+    }
+
+    #[test]
+    fn superseded_rows_are_excluded_from_bulk_and_fts_but_available_for_audit() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let subject = Uuid::new_v4();
+        let old = SemanticMemory::new(ns.id, subject, "legacytoken", "value", 0.8);
+        let new = SemanticMemory::new(ns.id, subject, "currenttoken", "value", 0.9);
+        db.save_semantic(&old).unwrap();
+        db.save_semantic(&new).unwrap();
+        assert!(db.supersede_memory(old.id, new.id, Utc::now()).unwrap());
+
+        let live = db.get_all_memories_by_namespace(ns.id).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id(), new.id);
+
+        let history = db
+            .get_all_memories_by_namespace_including_superseded(ns.id)
+            .unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(history.iter().any(|memory| memory.id() == old.id));
+
+        assert!(db.search_fts("legacytoken", ns.id, 10).unwrap().is_empty());
+        let current_hits = db.search_fts("currenttoken", ns.id, 10).unwrap();
+        assert_eq!(current_hits.len(), 1);
+        assert_eq!(current_hits[0].id(), new.id);
     }
 }
