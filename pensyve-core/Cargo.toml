@@ -40,7 +40,7 @@ async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 sqlx-core = { version = "0.9.0", features = ["_rt-tokio", "_tls-rustls-aws-lc-rs", "json", "chrono", "uuid"], optional = true }
 sqlx-postgres = { version = "0.9.0", features = ["json", "chrono", "uuid"], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
 # `CancellationToken` for cooperative cancellation of long-running operators.
 # Plumbed through `ConsolidationEngine::run` and the LocalLLM extractors in
 # G1/P3-P4. Landed unconditionally (rather than feature-gated) so the same
@@ -54,16 +54,16 @@ futures = { version = "0.3", default-features = false, features = ["std", "async
 
 [features]
 default = []
-postgres = ["dep:sqlx-core", "dep:sqlx-postgres", "dep:tokio"]
+postgres = ["dep:sqlx-core", "dep:sqlx-postgres"]
 # Local-LLM-backed observation extractor (`LocalLLMExtractor`,
 # `BatchedLocalLLMExtractor`) + the tolerant JSON parser + cached-bulk
 # replay wrapper. Targets an OpenAI-compatible vLLM endpoint.
-observation-extraction = ["dep:reqwest", "dep:tokio", "dep:futures"]
+observation-extraction = ["dep:reqwest", "dep:futures"]
 
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.8", features = ["html_reports"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 wiremock = "0.6"
 
 [lints]
