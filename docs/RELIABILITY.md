@@ -81,7 +81,7 @@ Typical recall latency for a full pipeline (embed + retrieve + rerank):
 
 - **p50**: ~3 seconds (includes embedding generation, multi-signal retrieval, cross-encoder reranking)
 - Dominated by embedding and reranking; pure retrieval logic is sub-millisecond
-- Optional Redis cache (`PENSYVE_REDIS_URL`) reduces repeat queries to single-digit milliseconds
+- Optional Redis cache (`REDIS_URL`) reduces repeat queries to single-digit milliseconds
 
 ### Storage Efficiency
 
