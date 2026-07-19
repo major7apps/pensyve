@@ -53,6 +53,17 @@ fn fastembed_cache_dir() -> std::path::PathBuf {
 /// fastembed's `pull_from_hf` will short-circuit without any network
 /// I/O. Used by [`OnnxEmbedder::new_with_policy`] to decide whether the
 /// `NetworkPolicy` gate must fire.
+///
+/// This directory-naming scheme (`models--<org>--<name>/refs/`,
+/// `/snapshots/<rev>/`, `/blobs/<sha>`) is the standard `hf-hub` cache
+/// layout, not something fastembed itself defines. Issue #191
+/// re-investigated the fastembed 5.17.2 -> 5.17.3 pin (see the
+/// `fastembed` dependency comment in `pensyve-core/Cargo.toml`) and
+/// found no cache-layout change to migrate: the two versions' `.rs`
+/// source is byte-identical, `hf-hub` stayed at the same locked version
+/// across the bump, and this function's logic was verified unchanged
+/// against a real seeded cache under 5.17.3. No dual-layout fallback was
+/// added here because there is no second layout to fall back to.
 fn is_model_cached(hf_model_code: &str) -> bool {
     let cache_subdir = format!("models--{}", hf_model_code.replace('/', "--"));
     fastembed_cache_dir().join(cache_subdir).is_dir()

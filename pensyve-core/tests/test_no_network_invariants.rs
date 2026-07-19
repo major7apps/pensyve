@@ -84,11 +84,19 @@ use pensyve_core::reranker::Reranker;
 use rusqlite::Connection;
 use tempfile::TempDir;
 
-/// Process-wide mutex serializing the two tests that mutate
-/// `FASTEMBED_CACHE_DIR`. Without this, parallel test execution can
-/// race: one test sets the var to a tempdir, another reads it and gets
-/// the tempdir instead of the real cache. cargo's default test runner
-/// gives no ordering guarantee inside a single test binary.
+/// Process-wide mutex serializing every test in this file that either
+/// mutates `FASTEMBED_CACHE_DIR` or loads a model through fastembed (which
+/// reads that same process-global env var internally). Without this,
+/// parallel test execution can race: one test sets the var to a tempdir
+/// while another test — even one that never touches the var itself —
+/// concurrently loads a cached model and reads the tempdir instead of the
+/// real cache, producing a spurious `ModelLoad("Failed to retrieve
+/// model.onnx")`-style failure that looks like a cache-resolution
+/// regression but is actually this race. (This is suspected to be the
+/// real explanation for the once-reported 5.17.2 -> 5.17.3 "regression";
+/// see the comment on the `fastembed` dependency in
+/// `pensyve-core/Cargo.toml`.) cargo's default test runner gives no
+/// ordering guarantee inside a single test binary, hence the mutex.
 fn cache_env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -160,6 +168,17 @@ fn fastembed_cache_has(model_subdir: &str) -> bool {
 ///      point the no-op invariant is broken and an addendum is required.
 #[test]
 fn reranker_does_not_make_network_calls() {
+    // Acquire the same env-var lock the `Disabled`-policy tests use below.
+    // `FASTEMBED_CACHE_DIR` is process-global; without this, cargo's
+    // parallel test runner could interleave this test with one of the
+    // tests that temporarily points the var at an empty tempdir, causing
+    // this cache-hit call to spuriously read the wrong directory and fail
+    // with a `ModelLoad` error that looks like a real cache-resolution
+    // regression but is actually a test-harness race. This test itself
+    // never mutates the var — it only needs to not run *during* a window
+    // where another test has it pointed somewhere bogus.
+    let _serial = cache_env_lock().lock().expect("env lock poisoned");
+
     if !fastembed_cache_has(BGE_RERANKER_CACHE_DIR) {
         eprintln!(
             "skipping reranker_does_not_make_network_calls: \
@@ -223,6 +242,12 @@ fn reranker_does_not_make_network_calls() {
 ///   4. Import-hygiene guard at top of file applies.
 #[test]
 fn onnx_embedder_per_call_inference_makes_no_network_calls() {
+    // See the identical lock rationale in `reranker_does_not_make_network_calls`
+    // above: this test never mutates `FASTEMBED_CACHE_DIR` but must not run
+    // concurrently with a test that does, or a global-env-var race can make
+    // a cache-hit load spuriously fail.
+    let _serial = cache_env_lock().lock().expect("env lock poisoned");
+
     if !fastembed_cache_has(MINILM_CACHE_DIR) {
         eprintln!(
             "skipping onnx_embedder_per_call_inference_makes_no_network_calls: \
