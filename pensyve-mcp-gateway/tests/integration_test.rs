@@ -5,7 +5,7 @@ use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
-use pensyve_core::types::Namespace;
+use pensyve_core::types::{Namespace, ObservationMemory, Outcome, ProceduralMemory};
 use pensyve_core::vector::VectorIndex;
 use pensyve_mcp_tools::{PensyveMcpServer, PensyveState};
 use rmcp::transport::streamable_http_server::{
@@ -410,7 +410,7 @@ async fn test_mcp_invalid_method_returns_error() {
 async fn test_mcp_forget_and_inspect() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = create_test_state(&dir);
-    let (url, ct) = start_test_server(state).await;
+    let (url, ct) = start_test_server(state.clone()).await;
 
     let client = reqwest::Client::new();
 
@@ -522,6 +522,99 @@ async fn test_mcp_forget_and_inspect() {
     let content_text = json["result"]["content"][0]["text"].as_str().unwrap();
     let inspect_data: serde_json::Value = serde_json::from_str(content_text).unwrap();
     assert_eq!(inspect_data["memory_count"], 0);
+
+    let mut observation = ObservationMemory::new(
+        state.namespace.id,
+        uuid::Uuid::new_v4(),
+        "person",
+        "BOB",
+        "mentioned",
+        "Bob was mentioned",
+    );
+    observation.embedding = vec![0.1, 0.2];
+    state
+        .storage
+        .save_observation(&observation)
+        .expect("save observation");
+    let procedural = ProceduralMemory::new(
+        state.namespace.id,
+        "on timeout",
+        "retry",
+        Outcome::Success,
+        std::collections::HashMap::new(),
+    );
+    state
+        .storage
+        .save_procedural(&procedural)
+        .expect("save procedural");
+
+    // Entity mode includes instance-matched observations and excludes procedures.
+    let resp = client
+        .post(format!("{url}/mcp"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(json_rpc(
+            "tools/call",
+            serde_json::json!({
+                "name": "pensyve_inspect",
+                "arguments": { "entity": "bob", "memory_type": "observation" }
+            }),
+            13,
+        ))
+        .send()
+        .await
+        .expect("inspect observation filter");
+    let text = resp.text().await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).expect("parse");
+    let content_text = json["result"]["content"][0]["text"].as_str().unwrap();
+    let inspect_data: serde_json::Value = serde_json::from_str(content_text).unwrap();
+    assert_eq!(inspect_data["memory_count"], 1);
+    assert_eq!(inspect_data["memories"][0]["_type"], "observation");
+    assert!(inspect_data["memories"][0].get("embedding").is_none());
+
+    let resp = client
+        .post(format!("{url}/mcp"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(json_rpc(
+            "tools/call",
+            serde_json::json!({
+                "name": "pensyve_inspect",
+                "arguments": { "entity": "bob", "memory_type": "procedural" }
+            }),
+            14,
+        ))
+        .send()
+        .await
+        .expect("inspect entity procedural filter");
+    let text = resp.text().await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).expect("parse");
+    let content_text = json["result"]["content"][0]["text"].as_str().unwrap();
+    let inspect_data: serde_json::Value = serde_json::from_str(content_text).unwrap();
+    assert_eq!(inspect_data["memory_count"], 0);
+
+    // Empty entity is whole-namespace mode, where procedural is meaningful.
+    let resp = client
+        .post(format!("{url}/mcp"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(json_rpc(
+            "tools/call",
+            serde_json::json!({
+                "name": "pensyve_inspect",
+                "arguments": { "entity": "", "memory_type": "procedural" }
+            }),
+            15,
+        ))
+        .send()
+        .await
+        .expect("inspect namespace procedural filter");
+    let text = resp.text().await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).expect("parse");
+    let content_text = json["result"]["content"][0]["text"].as_str().unwrap();
+    let inspect_data: serde_json::Value = serde_json::from_str(content_text).unwrap();
+    assert_eq!(inspect_data["memory_count"], 1);
+    assert_eq!(inspect_data["memories"][0]["_type"], "procedural");
 
     ct.cancel();
 }

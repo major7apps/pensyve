@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Extension;
@@ -5,7 +6,10 @@ use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
-use pensyve_core::types::{Entity, EntityKind, Namespace, SemanticMemory};
+use pensyve_core::types::{
+    Entity, EntityKind, EpisodicMemory, Namespace, ObservationMemory, Outcome, ProceduralMemory,
+    SemanticMemory,
+};
 use pensyve_core::vector::VectorIndex;
 use pensyve_mcp_gateway::AppState;
 use pensyve_mcp_gateway::auth::{AuthContext, AuthValidator};
@@ -238,6 +242,133 @@ async fn inspect_by_entity_uuid_returns_memories() {
     assert_eq!(body["semantic"].as_array().map(Vec::len), Some(1));
     assert_eq!(body["semantic"][0]["predicate"], "likes");
     assert_eq!(body["semantic"][0]["object"], "tea");
+    cancellation.cancel();
+}
+
+#[tokio::test]
+async fn inspect_by_entity_returns_instance_matched_observations_and_no_procedural() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (url, state, cancellation) = start_test_server(&dir).await;
+    let client = reqwest::Client::new();
+    remember(&client, &url, "alice", "likes tea").await;
+
+    let pensyve_state = state
+        .tenant_mgr
+        .get_tenant_state(TEST_TENANT)
+        .expect("tenant state");
+    let mut matching = ObservationMemory::new(
+        pensyve_state.namespace.id,
+        Uuid::new_v4(),
+        "person",
+        "ALICE",
+        "mentioned",
+        "Alice was mentioned",
+    );
+    matching.embedding = vec![0.1, 0.2];
+    pensyve_state
+        .storage
+        .save_observation(&matching)
+        .expect("save matching observation");
+    let other = ObservationMemory::new(
+        pensyve_state.namespace.id,
+        Uuid::new_v4(),
+        "person",
+        "bob",
+        "mentioned",
+        "Bob was mentioned",
+    );
+    pensyve_state
+        .storage
+        .save_observation(&other)
+        .expect("save other observation");
+    let procedural = ProceduralMemory::new(
+        pensyve_state.namespace.id,
+        "on timeout",
+        "retry",
+        Outcome::Success,
+        HashMap::new(),
+    );
+    pensyve_state
+        .storage
+        .save_procedural(&procedural)
+        .expect("save procedural memory");
+
+    let response = inspect(&client, &url, "alice").await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.expect("inspect response JSON");
+    assert_eq!(body["observation"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["observation"][0]["id"], matching.id.to_string());
+    assert!(body["observation"][0].get("embedding").is_none());
+    assert_eq!(body["procedural"], json!([]));
+    cancellation.cancel();
+}
+
+#[tokio::test]
+async fn inspect_browse_mode_returns_all_memory_kinds_without_embeddings() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (url, state, cancellation) = start_test_server(&dir).await;
+    let client = reqwest::Client::new();
+    remember(&client, &url, "alice", "likes tea").await;
+
+    let pensyve_state = state
+        .tenant_mgr
+        .get_tenant_state(TEST_TENANT)
+        .expect("tenant state");
+    let alice_id = pensyve_state
+        .storage
+        .get_entity_by_name("alice", pensyve_state.namespace.id)
+        .expect("entity lookup")
+        .expect("alice exists")
+        .id;
+    let mut episodic = EpisodicMemory::new(
+        pensyve_state.namespace.id,
+        Uuid::new_v4(),
+        alice_id,
+        alice_id,
+        "Alice likes tea",
+    );
+    episodic.embedding = vec![0.1, 0.2];
+    pensyve_state
+        .storage
+        .save_episodic(&episodic)
+        .expect("save episodic memory");
+    let mut procedural = ProceduralMemory::new(
+        pensyve_state.namespace.id,
+        "when brewing tea",
+        "warm the pot",
+        Outcome::Success,
+        HashMap::new(),
+    );
+    procedural.embedding = vec![0.1, 0.2];
+    pensyve_state
+        .storage
+        .save_procedural(&procedural)
+        .expect("save procedural memory");
+    let mut observation = ObservationMemory::new(
+        pensyve_state.namespace.id,
+        Uuid::new_v4(),
+        "person",
+        "alice",
+        "mentioned",
+        "Alice was mentioned",
+    );
+    observation.embedding = vec![0.1, 0.2];
+    pensyve_state
+        .storage
+        .save_observation(&observation)
+        .expect("save observation memory");
+
+    let response = inspect(&client, &url, "").await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.expect("inspect response JSON");
+    for memory_type in ["episodic", "semantic", "procedural", "observation"] {
+        assert_eq!(
+            body[memory_type].as_array().map(Vec::len),
+            Some(1),
+            "browse should return one {memory_type} memory"
+        );
+        assert!(body[memory_type][0].get("embedding").is_none());
+    }
     cancellation.cancel();
 }
 

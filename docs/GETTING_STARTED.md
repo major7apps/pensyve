@@ -462,6 +462,14 @@ curl http://localhost:3000/v1/health
 | `GET`    | `/v1/health`          | Health check             |
 | `GET`    | `/metrics`            | Prometheus metrics       |
 
+### Procedural memories
+
+Core library callers create these with `types::ProceduralMemory::new` and persist them through
+`storage::StorageTrait::save_procedural`. There is no automatic creator in the `consolidation` or
+`observation` pipelines today; consolidation only updates reliability for procedures already
+stored. Procedural memories are namespace-scoped and have no entity linkage, so per-entity inspect
+returns none. There is deliberately no REST write path for procedural memories today.
+
 ### Authentication
 
 Set `PENSYVE_API_KEYS` env var (comma-separated) to enable auth. When unset, all endpoints are open (dev mode).

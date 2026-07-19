@@ -1138,12 +1138,27 @@ async fn inspect(
         }
     }
 
+    let remaining = limit.saturating_sub(episodic.len() + semantic.len());
+    let mut observation = Vec::new();
+    if remaining > 0
+        && let Ok(mems) = ps
+            .storage
+            .list_observations_by_entity_instance(ps.namespace.id, &entity.name)
+    {
+        for mem in mems.into_iter().take(remaining) {
+            let mut val = serde_json::to_value(&mem).unwrap_or_default();
+            strip_embedding(&mut val);
+            observation.push(val);
+        }
+    }
+
     Ok(Json(InspectResponse {
         entity: body.entity,
         episodic,
         semantic,
+        // Procedural memories are namespace-scoped and have no entity linkage.
         procedural: vec![],
-        observation: vec![],
+        observation,
     }))
 }
 

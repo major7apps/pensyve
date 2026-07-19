@@ -148,6 +148,12 @@ pub trait StorageTrait: Send + Sync {
         Ok(None)
     }
 
+    fn list_observations_by_entity_instance(
+        &self,
+        namespace_id: Uuid,
+        instance: &str,
+    ) -> StorageResult<Vec<ObservationMemory>>;
+
     /// Fetch all observations attached to any of the given episode IDs,
     /// bounded by `limit` (applied after fetch). Used by `recall_grouped` to
     /// attach observations to top-k session groups.

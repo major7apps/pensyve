@@ -1385,6 +1385,31 @@ impl StorageTrait for SqliteBackend {
         result.transpose()
     }
 
+    fn list_observations_by_entity_instance(
+        &self,
+        namespace_id: Uuid,
+        instance: &str,
+    ) -> StorageResult<Vec<ObservationMemory>> {
+        let conn = lock_conn!(self);
+        let mut stmt = conn.prepare(
+            r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
+                      unit, content, embedding, confidence, event_time, created_at,
+                      stability, retrievability, agent_id, user_id
+               FROM observation_memories
+               WHERE namespace_id = ?1 AND LOWER(instance) = LOWER(?2)
+               ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map(
+            params![namespace_id.to_string(), instance],
+            row_to_observation,
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row??);
+        }
+        Ok(out)
+    }
+
     fn list_observations_by_episode_ids(
         &self,
         episode_ids: &[Uuid],
@@ -3534,6 +3559,41 @@ mod tests {
         assert!(instances.contains("Elden Ring"));
         assert!(instances.contains("Dune"));
         assert!(!instances.contains("off-topic"));
+    }
+
+    #[test]
+    fn test_observations_list_by_entity_instance() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let other_ns = Namespace::new("other");
+        db.save_namespace(&other_ns).unwrap();
+
+        for (namespace_id, instance) in [
+            (ns.id, "Alice"),
+            (ns.id, "ALICE"),
+            (ns.id, "Bob"),
+            (other_ns.id, "alice"),
+        ] {
+            let obs = ObservationMemory::new(
+                namespace_id,
+                Uuid::new_v4(),
+                "person",
+                instance,
+                "mentioned",
+                instance,
+            );
+            db.save_observation(&obs).unwrap();
+        }
+
+        let fetched = db
+            .list_observations_by_entity_instance(ns.id, "alice")
+            .unwrap();
+        assert_eq!(fetched.len(), 2);
+        assert!(
+            fetched
+                .iter()
+                .all(|obs| obs.namespace_id == ns.id && obs.instance.eq_ignore_ascii_case("alice"))
+        );
     }
 
     #[test]

@@ -967,6 +967,30 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    fn list_observations_by_entity_instance(
+        &self,
+        namespace_id: Uuid,
+        instance: &str,
+    ) -> StorageResult<Vec<ObservationMemory>> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let rows: Vec<ObservationRow> = query_as::<Postgres, _>(
+                r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
+                          unit, content, embedding::text, confidence, event_time, created_at,
+                          stability, retrievability
+                   FROM observation_memories
+                   WHERE namespace_id = $1 AND LOWER(instance) = LOWER($2)
+                   ORDER BY created_at DESC",
+            )
+            .bind(namespace_id)
+            .bind(instance)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(rows.into_iter().map(row_to_observation).collect())
+        })
+    }
+
     fn list_observations_by_episode_ids(
         &self,
         episode_ids: &[Uuid],
