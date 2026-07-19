@@ -231,6 +231,37 @@ fn five_chain_summaries_surface_with_correct_format() {
     );
 }
 
+#[test]
+fn superseded_chain_summaries_are_excluded() {
+    let (_dir, db_path, backend) = open_backend();
+    let ns = Uuid::new_v4();
+    let conn = Connection::open(&db_path).unwrap();
+    insert_obs(
+        &conn,
+        &ns.to_string(),
+        Some("live chain summary"),
+        Some("2024-01-01T10:00:00Z"),
+    );
+    insert_obs(
+        &conn,
+        &ns.to_string(),
+        Some("obsolete chain summary"),
+        Some("2024-02-01T10:00:00Z"),
+    );
+    conn.execute(
+        "UPDATE observation_memories SET superseded_by = ?1 WHERE chain_summary = ?2",
+        rusqlite::params![Uuid::new_v4().to_string(), "obsolete chain summary"],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = SupersessionCard::new()
+        .build("q", backend.as_ref(), ns, None, None, None)
+        .expect("the live chain summary should remain visible");
+    assert!(out.contains("live chain summary"), "card was: {out}");
+    assert!(!out.contains("obsolete chain summary"), "card was: {out}");
+}
+
 /// Fixture #5: 12 chain_summary rows; default cap (= 8) keeps 8;
 /// `with_cap(3)` keeps 3.
 #[test]

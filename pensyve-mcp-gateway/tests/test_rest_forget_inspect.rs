@@ -403,7 +403,8 @@ async fn supersede_creates_live_replacement_and_excludes_old_from_retrieval_inde
     assert_eq!(new.object, "value");
     assert!(new.superseded_by.is_none());
     assert!(new.invalid_at.is_none());
-    assert!(new.source_episodes.contains(&old_id));
+    assert_eq!(new.source_episodes, old.source_episodes);
+    assert!(!new.source_episodes.contains(&old_id));
 
     let live = pensyve_state
         .storage

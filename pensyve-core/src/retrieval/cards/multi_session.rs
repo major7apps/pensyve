@@ -545,6 +545,7 @@ pub(crate) fn build_from_conn(
         "SELECT entity_type, instance, content, event_time \
          FROM observation_memories \
          WHERE {scope_clause} \
+           AND superseded_by IS NULL \
          ORDER BY event_time DESC NULLS LAST"
     );
     let mut stmt = conn.prepare(&sql).ok()?;

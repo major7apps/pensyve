@@ -2436,19 +2436,19 @@ impl StorageTrait for SqliteBackend {
         let ns = namespace_id.to_string();
 
         let episodic: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM episodic_memories WHERE namespace_id = ?1",
+            "SELECT COUNT(*) FROM episodic_memories WHERE namespace_id = ?1 AND superseded_by IS NULL",
             params![ns],
             |row| row.get(0),
         )?;
 
         let semantic: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM semantic_memories WHERE namespace_id = ?1 AND invalid_at IS NULL",
+            "SELECT COUNT(*) FROM semantic_memories WHERE namespace_id = ?1 AND invalid_at IS NULL AND superseded_by IS NULL",
             params![ns],
             |row| row.get(0),
         )?;
 
         let procedural: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM procedural_memories WHERE namespace_id = ?1",
+            "SELECT COUNT(*) FROM procedural_memories WHERE namespace_id = ?1 AND superseded_by IS NULL",
             params![ns],
             |row| row.get(0),
         )?;
@@ -4207,6 +4207,111 @@ mod tests {
         let observation_read = db.get_observation(observation.id).unwrap().unwrap();
         assert_eq!(observation_read.superseded_by, Some(successor));
         assert_eq!(observation_read.invalid_at, Some(invalid_at));
+    }
+
+    #[test]
+    fn active_counts_exclude_superseded_rows_for_all_memory_kinds() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+
+        let old_episodic = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "old episodic",
+        );
+        let new_episodic = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "new episodic",
+        );
+        db.save_episodic(&old_episodic).unwrap();
+        db.save_episodic(&new_episodic).unwrap();
+
+        let old_semantic = SemanticMemory::new(ns.id, Uuid::new_v4(), "old", "semantic", 0.8);
+        let new_semantic = SemanticMemory::new(ns.id, Uuid::new_v4(), "new", "semantic", 0.9);
+        db.save_semantic(&old_semantic).unwrap();
+        db.save_semantic(&new_semantic).unwrap();
+
+        let old_procedural = ProceduralMemory::new(
+            ns.id,
+            "old trigger",
+            "old action",
+            Outcome::Failure,
+            HashMap::new(),
+        );
+        let new_procedural = ProceduralMemory::new(
+            ns.id,
+            "new trigger",
+            "new action",
+            Outcome::Success,
+            HashMap::new(),
+        );
+        db.save_procedural(&old_procedural).unwrap();
+        db.save_procedural(&new_procedural).unwrap();
+
+        let old_observation = ObservationMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            "person",
+            "alice",
+            "stated",
+            "old observation",
+        );
+        let new_observation = ObservationMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            "person",
+            "alice",
+            "stated",
+            "new observation",
+        );
+        db.save_observation(&old_observation).unwrap();
+        db.save_observation(&new_observation).unwrap();
+
+        for (old_id, new_id) in [
+            (old_episodic.id, new_episodic.id),
+            (old_semantic.id, new_semantic.id),
+            (old_procedural.id, new_procedural.id),
+            (old_observation.id, new_observation.id),
+        ] {
+            assert!(db.supersede_memory(old_id, new_id, Utc::now()).unwrap());
+        }
+
+        assert_eq!(db.count_memories_by_namespace(ns.id).unwrap(), (1, 1, 1));
+
+        let active = db.get_all_memories_by_namespace(ns.id).unwrap();
+        assert_eq!(
+            active
+                .iter()
+                .filter(|memory| matches!(memory, Memory::Episodic(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            active
+                .iter()
+                .filter(|memory| matches!(memory, Memory::Semantic(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            active
+                .iter()
+                .filter(|memory| matches!(memory, Memory::Procedural(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            active
+                .iter()
+                .filter(|memory| matches!(memory, Memory::Observation(_)))
+                .count(),
+            1
+        );
     }
 
     #[test]

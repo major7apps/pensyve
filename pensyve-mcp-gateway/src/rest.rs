@@ -455,9 +455,6 @@ fn replacement_memory(
             new.embedding = embedding;
             new.stability = 1.0;
             new.retrievability = 1.0;
-            if !new.source_episodes.contains(&old.id) {
-                new.source_episodes.push(old.id);
-            }
             Memory::Semantic(new)
         }
         Memory::Procedural(old) => {
@@ -474,9 +471,6 @@ fn replacement_memory(
             new.last_used = None;
             new.superseded_by = None;
             new.invalid_at = None;
-            if !new.source_episodes.contains(&old.id) {
-                new.source_episodes.push(old.id);
-            }
             Memory::Procedural(new)
         }
         Memory::Observation(old) => {
@@ -500,7 +494,11 @@ fn save_memory(storage: &dyn StorageTrait, memory: &Memory) -> Result<(), RestEr
         Memory::Episodic(memory) => storage.save_episodic(memory),
         Memory::Semantic(memory) => storage.save_semantic(memory),
         Memory::Procedural(memory) => storage.save_procedural(memory),
-        Memory::Observation(memory) => storage.save_observation(memory),
+        Memory::Observation(memory) => {
+            // Supersession is content replacement, not a new ingest, so the G3
+            // typed-slot and chain hooks intentionally do not fire here.
+            storage.save_observation(memory)
+        }
     };
     result.map_err(|err| {
         RestError(
@@ -665,7 +663,11 @@ async fn perform_supersession(
             )
         })?;
     if !stamped {
-        let _ = ps.storage.delete_memory_by_id(new_id);
+        if let Err(err) = ps.storage.delete_memory_by_id(new_id) {
+            tracing::warn!(
+                "Supersession race rollback failed for old memory {memory_id} and replacement {new_id}: {err}"
+            );
+        }
         return Err(RestError(
             StatusCode::CONFLICT,
             format!("Memory {memory_id} has already been superseded"),

@@ -332,7 +332,7 @@ impl PostgresBackend {
 
             let rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                          summary, embedding::text, context_intent, timestamp, stability,
+                          summary, embedding::text AS embedding, context_intent, timestamp, stability,
                           retrievability, access_count, last_accessed, event_time,
                           superseded_by, invalid_at
                    FROM episodic_memories
@@ -379,7 +379,7 @@ impl PostgresBackend {
 
             let rows: Vec<ObservationRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
-                          unit, content, embedding::text, confidence, event_time, created_at,
+                          unit, content, embedding::text AS embedding, confidence, event_time, created_at,
                           stability, retrievability, superseded_by, invalid_at
                    FROM observation_memories
                    WHERE namespace_id = $1 AND ($2 OR superseded_by IS NULL)",
@@ -777,7 +777,7 @@ impl StorageTrait for PostgresBackend {
             let mut conn = self.maybe_scoped_conn().await?;
             let row: Option<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                          summary, embedding::text, context_intent, timestamp, stability, retrievability,
+                          summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
                           access_count, last_accessed, event_time, superseded_by, invalid_at
                    FROM episodic_memories WHERE id = $1",
             )
@@ -800,7 +800,7 @@ impl StorageTrait for PostgresBackend {
             let mut conn = self.maybe_scoped_conn().await?;
             let rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                          summary, embedding::text, context_intent, timestamp, stability, retrievability,
+                          summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
                           access_count, last_accessed, event_time, superseded_by, invalid_at
                    FROM episodic_memories WHERE about_entity = $1 AND superseded_by IS NULL
                    ORDER BY timestamp DESC LIMIT $2",
@@ -827,7 +827,7 @@ impl StorageTrait for PostgresBackend {
                 // encoding `timestamp`. Observation extraction relies on
                 // chronological order across the episode.
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                          summary, embedding::text, context_intent, timestamp, stability, retrievability,
+                          summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
                           access_count, last_accessed, event_time, superseded_by, invalid_at
                    FROM episodic_memories
                    WHERE namespace_id = $1 AND episode_id = $2 AND superseded_by IS NULL
@@ -1106,7 +1106,7 @@ impl StorageTrait for PostgresBackend {
             let mut conn = self.maybe_scoped_conn().await?;
             let row: Option<ObservationRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
-                          unit, content, embedding::text, confidence, event_time, created_at,
+                          unit, content, embedding::text AS embedding, confidence, event_time, created_at,
                           stability, retrievability, superseded_by, invalid_at
                    FROM observation_memories WHERE id = $1",
             )
@@ -1138,7 +1138,7 @@ impl StorageTrait for PostgresBackend {
             let mut conn = self.maybe_scoped_conn().await?;
             let sql = if namespace_filter.is_some() {
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
-                          unit, content, embedding::text, confidence, event_time, created_at,
+                          unit, content, embedding::text AS embedding, confidence, event_time, created_at,
                           stability, retrievability, superseded_by, invalid_at
                    FROM observation_memories
                    WHERE episode_id = ANY($1) AND namespace_id = $3
@@ -1147,7 +1147,7 @@ impl StorageTrait for PostgresBackend {
                    LIMIT $2"
             } else {
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
-                          unit, content, embedding::text, confidence, event_time, created_at,
+                          unit, content, embedding::text AS embedding, confidence, event_time, created_at,
                           stability, retrievability, superseded_by, invalid_at
                    FROM observation_memories
                    WHERE episode_id = ANY($1) AND superseded_by IS NULL
@@ -1217,7 +1217,7 @@ impl StorageTrait for PostgresBackend {
             // Search episodic memories
             let episodic_rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                          summary, embedding::text, context_intent, timestamp, stability, retrievability,
+                          summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
                           access_count, last_accessed, event_time, superseded_by, invalid_at
                    FROM episodic_memories
                    WHERE namespace_id = $1 AND superseded_by IS NULL
@@ -1328,7 +1328,7 @@ impl StorageTrait for PostgresBackend {
 
             let episodic_rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                          summary, embedding::text, context_intent, timestamp, stability, retrievability,
+                          summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
                           access_count, last_accessed, event_time, superseded_by, invalid_at
                    FROM episodic_memories
                    WHERE namespace_id = $1
@@ -1643,7 +1643,7 @@ impl StorageTrait for PostgresBackend {
             let mut conn = self.scoped_conn(namespace_id).await?;
 
             let (episodic,): (i64,) = query_as::<Postgres, _>(
-                "SELECT COUNT(*) FROM episodic_memories WHERE namespace_id = $1",
+                "SELECT COUNT(*) FROM episodic_memories WHERE namespace_id = $1 AND superseded_by IS NULL",
             )
             .bind(namespace_id)
             .fetch_one(&mut *conn)
@@ -1651,7 +1651,7 @@ impl StorageTrait for PostgresBackend {
             .map_err(sqlx_to_io)?;
 
             let (semantic,): (i64,) = query_as::<Postgres, _>(
-                "SELECT COUNT(*) FROM semantic_memories WHERE namespace_id = $1 AND invalid_at IS NULL",
+                "SELECT COUNT(*) FROM semantic_memories WHERE namespace_id = $1 AND invalid_at IS NULL AND superseded_by IS NULL",
             )
             .bind(namespace_id)
             .fetch_one(&mut *conn)
@@ -1659,7 +1659,7 @@ impl StorageTrait for PostgresBackend {
             .map_err(sqlx_to_io)?;
 
             let (procedural,): (i64,) = query_as::<Postgres, _>(
-                "SELECT COUNT(*) FROM procedural_memories WHERE namespace_id = $1",
+                "SELECT COUNT(*) FROM procedural_memories WHERE namespace_id = $1 AND superseded_by IS NULL",
             )
             .bind(namespace_id)
             .fetch_one(&mut *conn)
