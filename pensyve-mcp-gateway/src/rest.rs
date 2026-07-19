@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::auth::AuthContext;
 
 use pensyve_core::retrieval::RecallEngine;
+use pensyve_core::retrieval::contradictions::detect_contradictions;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::types::{
     ContentType, Entity, EntityKind, Episode, EpisodicMemory, Memory, Outcome, SemanticMemory,
@@ -377,34 +378,36 @@ fn filter_recall_results(
     result: &pensyve_core::retrieval::RecallResult,
     types: Option<&[String]>,
     min_confidence: Option<f64>,
-) -> Vec<RecallMemory> {
-    result
-        .memories
-        .iter()
-        .filter(|c| {
-            if let Some(types) = types {
-                let tn = memory_type_name(&c.memory);
-                if !types.iter().any(|t| t == tn) {
-                    return false;
-                }
+) -> (Vec<RecallMemory>, Vec<Memory>) {
+    let mut response_memories = Vec::new();
+    let mut returned_memories = Vec::new();
+
+    for candidate in &result.memories {
+        if let Some(types) = types {
+            let memory_type = memory_type_name(&candidate.memory);
+            if !types.iter().any(|requested| requested == memory_type) {
+                continue;
             }
-            if let Some(min_conf) = min_confidence
-                && f64::from(memory_confidence(&c.memory)) < min_conf
-            {
-                return false;
-            }
-            true
-        })
-        .map(|c| RecallMemory {
-            id: c.memory_id.to_string(),
-            content: memory_content(&c.memory),
-            memory_type: memory_type_name(&c.memory).to_string(),
-            confidence: memory_confidence(&c.memory),
-            stability: memory_stability(&c.memory),
-            score: c.final_score,
-            event_time: memory_event_time(&c.memory),
-        })
-        .collect()
+        }
+        if let Some(min_confidence) = min_confidence
+            && f64::from(memory_confidence(&candidate.memory)) < min_confidence
+        {
+            continue;
+        }
+
+        response_memories.push(RecallMemory {
+            id: candidate.memory_id.to_string(),
+            content: memory_content(&candidate.memory),
+            memory_type: memory_type_name(&candidate.memory).to_string(),
+            confidence: memory_confidence(&candidate.memory),
+            stability: memory_stability(&candidate.memory),
+            score: candidate.final_score,
+            event_time: memory_event_time(&candidate.memory),
+        });
+        returned_memories.push(candidate.memory.clone());
+    }
+
+    (response_memories, returned_memories)
 }
 
 fn strip_embedding(val: &mut serde_json::Value) {
@@ -491,6 +494,7 @@ async fn health() -> impl IntoResponse {
     }))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn recall(
     State(state): State<Arc<AppState>>,
     axum::Extension(auth_ctx): axum::Extension<AuthContext>,
@@ -580,7 +584,18 @@ async fn recall(
             })?
     };
 
-    let memories = filter_recall_results(&result, body.types.as_deref(), body.min_confidence);
+    let (memories, returned_memories) =
+        filter_recall_results(&result, body.types.as_deref(), body.min_confidence);
+    let contradictions = detect_contradictions(&returned_memories)
+        .into_iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| {
+            RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Error serializing contradictions: {err}"),
+            )
+        })?;
 
     let _ = ps.storage.log_activity(
         ps.namespace.id,
@@ -590,7 +605,7 @@ async fn recall(
 
     let response = RecallResponse {
         memories,
-        contradictions: vec![],
+        contradictions,
     };
 
     // Cache the result (60s TTL).

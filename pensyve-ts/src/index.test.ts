@@ -358,6 +358,34 @@ describe("recall()", () => {
     expect(result.cursor).toBe("page2-token");
   });
 
+  test("returns contradictions with camelCase keys", async () => {
+    const fetchFn = mock(async () =>
+      jsonResponse({
+        memories: [],
+        contradictions: [
+          {
+            subject: "alice",
+            predicate: "works_at",
+            memory_ids: ["mem-1", "mem-2"],
+            objects: ["Acme", "Globex"],
+          },
+        ],
+      })
+    );
+
+    const client = makeClient(fetchFn);
+    const result: RecallResult = await client.recall("employment");
+
+    expect(result.contradictions).toEqual([
+      {
+        subject: "alice",
+        predicate: "works_at",
+        memoryIds: ["mem-1", "mem-2"],
+        objects: ["Acme", "Globex"],
+      },
+    ]);
+  });
+
   test("handles bare array response (legacy)", async () => {
     const fetchFn = mock(async () =>
       jsonResponse([

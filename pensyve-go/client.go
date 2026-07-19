@@ -224,6 +224,19 @@ func (c *Client) Entity(ctx context.Context, name, kind string) (*Entity, error)
 
 // Recall searches for memories matching the given query.
 func (c *Client) Recall(ctx context.Context, query string, opts *RecallOptions) ([]Memory, error) {
+	result, err := c.RecallWithResult(ctx, query, opts)
+	if err != nil {
+		return nil, err
+	}
+	return result.Memories, nil
+}
+
+// RecallWithResult searches for memories and returns the full result, including contradictions.
+func (c *Client) RecallWithResult(
+	ctx context.Context,
+	query string,
+	opts *RecallOptions,
+) (*RecallResult, error) {
 	if query == "" {
 		return nil, fmt.Errorf("query must not be empty")
 	}
@@ -243,12 +256,12 @@ func (c *Client) Recall(ctx context.Context, query string, opts *RecallOptions) 
 		}
 	}
 
-	var resp recallResponse
-	err := c.do(ctx, "POST", "/v1/recall", req, &resp)
+	var result RecallResult
+	err := c.do(ctx, "POST", "/v1/recall", req, &result)
 	if err != nil {
 		return nil, err
 	}
-	return resp.Memories, nil
+	return &result, nil
 }
 
 // Remember stores a fact for the given entity with the specified confidence.

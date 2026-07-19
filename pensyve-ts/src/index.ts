@@ -133,6 +133,13 @@ export interface Memory {
   episodeId?: string;
 }
 
+export interface Contradiction {
+  subject: string;
+  predicate: string;
+  memoryIds: string[];
+  objects: string[];
+}
+
 export interface RecallOptions {
   entity?: string;
   limit?: number;
@@ -144,6 +151,7 @@ export interface RecallOptions {
 /** Result returned by recall(), including an optional pagination cursor. */
 export interface RecallResult {
   memories: Memory[];
+  contradictions?: Contradiction[];
   /** Opaque cursor for fetching the next page of results. */
   cursor?: string;
 }
@@ -411,13 +419,18 @@ export class Pensyve {
       "Recall",
     );
     const raw = await res.json();
-    const body = camelCaseKeys(raw) as { memories?: Memory[]; cursor?: string };
+    const body = camelCaseKeys(raw) as {
+      memories?: Memory[];
+      contradictions?: Contradiction[];
+      cursor?: string;
+    };
     // Handle both {memories: [...]} and bare array responses
     if (Array.isArray(body)) {
       return { memories: body as unknown as Memory[] };
     }
     return {
       memories: body.memories ?? [],
+      contradictions: body.contradictions,
       cursor: body.cursor,
     };
   }

@@ -29,6 +29,14 @@ type Memory struct {
 	EventTime  *time.Time `json:"event_time,omitempty"`
 }
 
+// Contradiction represents conflicting objects reported for a subject and predicate.
+type Contradiction struct {
+	Subject   string   `json:"subject"`
+	Predicate string   `json:"predicate"`
+	MemoryIDs []string `json:"memory_ids"`
+	Objects   []string `json:"objects"`
+}
+
 // RecallOptions configures a recall query.
 type RecallOptions struct {
 	Entity string
@@ -63,11 +71,11 @@ type recallRequest struct {
 	Types  []string `json:"types,omitempty"`
 }
 
-// recallResponse is the JSON body returned by POST /v1/recall.
-type recallResponse struct {
-	Memories      []Memory `json:"memories"`
-	Contradictions []Memory `json:"contradictions"`
-	Cursor        *string  `json:"cursor"`
+// RecallResult is the JSON body returned by POST /v1/recall.
+type RecallResult struct {
+	Memories       []Memory        `json:"memories"`
+	Contradictions []Contradiction `json:"contradictions"`
+	Cursor         *string         `json:"cursor"`
 }
 
 // rememberRequest is the JSON body for POST /v1/remember.
