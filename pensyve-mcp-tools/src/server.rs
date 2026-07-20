@@ -592,7 +592,7 @@ impl PensyveMcpServer {
     /// View all memories for an entity.
     #[tool(
         name = "pensyve_inspect",
-        description = "View all memories stored for an entity, optionally filtered by type. Returns an array of memory objects with stats."
+        description = "View memories stored for an entity, or the whole namespace when entity is empty, optionally filtered by type. Returns an array of memory objects with stats."
     )]
     async fn inspect(
         &self,
@@ -601,6 +601,43 @@ impl PensyveMcpServer {
         check_scope(&self.scope, "pensyve_inspect")?;
         let state = &self.state;
         let limit = params.limit.unwrap_or(20).clamp(1, 100) as usize;
+        let type_filter = params.memory_type.as_deref();
+
+        if params.entity.is_empty() {
+            let stored = state
+                .storage
+                .get_all_memories_by_namespace(state.namespace.id)
+                .map_err(|err| format!("Error listing memories: {err}"))?;
+            let mut memories = Vec::new();
+            for memory in stored {
+                let type_name = memory_type_name(&memory);
+                if type_filter.is_some_and(|filter| filter != type_name) {
+                    continue;
+                }
+                let mut val = match memory {
+                    Memory::Episodic(mem) => serde_json::to_value(mem),
+                    Memory::Semantic(mem) => serde_json::to_value(mem),
+                    Memory::Procedural(mem) => serde_json::to_value(mem),
+                    Memory::Observation(mem) => serde_json::to_value(mem),
+                }
+                .unwrap_or_default();
+                strip_embedding(&mut val);
+                if let serde_json::Value::Object(ref mut map) = val {
+                    map.insert("_type".to_string(), serde_json::json!(type_name));
+                }
+                memories.push(val);
+                if memories.len() == limit {
+                    break;
+                }
+            }
+
+            return serde_json::to_string(&serde_json::json!({
+                "entity": "",
+                "memory_count": memories.len(),
+                "memories": memories,
+            }))
+            .map_err(|e| format!("Serialization error: {e}"));
+        }
 
         let entity = match state
             .storage
@@ -618,7 +655,6 @@ impl PensyveMcpServer {
             Err(err) => return Err(format!("Error looking up entity: {err}")),
         };
 
-        let type_filter = params.memory_type.as_deref();
         let mut memories: Vec<serde_json::Value> = Vec::new();
         let mut remaining = limit;
 
@@ -652,6 +688,27 @@ impl PensyveMcpServer {
                     }
                 }
                 Err(err) => tracing::warn!("Failed to list semantic memories: {err}"),
+            }
+        }
+
+        let remaining = limit.saturating_sub(memories.len());
+        if remaining > 0 && (type_filter.is_none() || type_filter == Some("observation")) {
+            match state.storage.list_observations_by_entity_instance(
+                state.namespace.id,
+                &entity.name,
+                remaining,
+            ) {
+                Ok(observations) => {
+                    for mem in observations {
+                        let mut val = serde_json::to_value(&mem).unwrap_or_default();
+                        strip_embedding(&mut val);
+                        if let serde_json::Value::Object(ref mut map) = val {
+                            map.insert("_type".to_string(), serde_json::json!("observation"));
+                        }
+                        memories.push(val);
+                    }
+                }
+                Err(err) => tracing::warn!("Failed to list observation memories: {err}"),
             }
         }
 

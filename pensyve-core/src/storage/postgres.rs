@@ -406,6 +406,14 @@ impl PostgresBackend {
 
 const SCHEMA: &str = include_str!("postgres_schema.sql");
 
+const LIST_OBSERVATIONS_BY_ENTITY_INSTANCE_SQL: &str = r"SELECT id, namespace_id, episode_id, entity_type, instance, action,
+             quantity, unit, content, embedding::text AS embedding, confidence,
+             event_time, created_at, stability, retrievability, superseded_by,
+             invalid_at
+      FROM observation_memories
+      WHERE namespace_id = $1 AND instance = $2 AND superseded_by IS NULL
+      ORDER BY created_at DESC LIMIT $3";
+
 // ---------------------------------------------------------------------------
 // Error helpers
 // ---------------------------------------------------------------------------
@@ -1115,6 +1123,27 @@ impl StorageTrait for PostgresBackend {
             .await
             .map_err(sqlx_to_io)?;
             Ok(row.map(row_to_observation))
+        })
+    }
+
+    fn list_observations_by_entity_instance(
+        &self,
+        namespace_id: Uuid,
+        instance: &str,
+        limit: usize,
+    ) -> StorageResult<Vec<ObservationMemory>> {
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let rows: Vec<ObservationRow> =
+                query_as::<Postgres, _>(LIST_OBSERVATIONS_BY_ENTITY_INSTANCE_SQL)
+                    .bind(namespace_id)
+                    .bind(instance)
+                    .bind(limit_i64)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(sqlx_to_io)?;
+            Ok(rows.into_iter().map(row_to_observation).collect())
         })
     }
 
@@ -2092,5 +2121,65 @@ mod tests {
         });
         assert_eq!(observation.superseded_by, Some(successor));
         assert_eq!(observation.invalid_at, Some(now));
+    }
+
+    use rusqlite::{Connection, params};
+
+    fn run_observation_instance_query(
+        instances: &[&str],
+        requested: &str,
+        limit: usize,
+    ) -> Vec<String> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE observation_memories (
+                namespace_id TEXT NOT NULL,
+                instance TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                superseded_by TEXT
+            );",
+        )
+        .unwrap();
+
+        let namespace_id = Uuid::new_v4().to_string();
+        for (created_at, instance) in instances.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO observation_memories (namespace_id, instance, created_at)
+                 VALUES (?1, ?2, ?3)",
+                params![namespace_id, instance, i64::try_from(created_at).unwrap()],
+            )
+            .unwrap();
+        }
+
+        let query_tail = LIST_OBSERVATIONS_BY_ENTITY_INSTANCE_SQL
+            .split_once("FROM observation_memories")
+            .unwrap()
+            .1;
+        let sql = format!("SELECT instance FROM observation_memories {query_tail}");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        stmt.query_map(
+            params![namespace_id, requested, i64::try_from(limit).unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn list_observations_by_entity_instance_uses_exact_case_match() {
+        assert!(LIST_OBSERVATIONS_BY_ENTITY_INSTANCE_SQL.contains("instance = $2"));
+        assert!(!LIST_OBSERVATIONS_BY_ENTITY_INSTANCE_SQL.contains("LOWER(instance)"));
+        let instances = run_observation_instance_query(&["Alice", "alice"], "alice", 10);
+        assert_eq!(instances, ["alice"]);
+    }
+
+    #[test]
+    fn list_observations_by_entity_instance_pushes_limit_into_query() {
+        assert!(
+            LIST_OBSERVATIONS_BY_ENTITY_INSTANCE_SQL.contains("ORDER BY created_at DESC LIMIT $3")
+        );
+        let instances = run_observation_instance_query(&["alice", "alice", "alice"], "alice", 2);
+        assert_eq!(instances.len(), 2);
     }
 }

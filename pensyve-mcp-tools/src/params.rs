@@ -65,9 +65,9 @@ pub struct ForgetParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct InspectParams {
-    /// The entity to inspect.
+    /// The entity to inspect. Empty means the whole namespace.
     pub entity: String,
-    /// Memory type filter: "episodic", "semantic", or "procedural".
+    /// Memory type filter: "episodic", "semantic", "procedural", or "observation".
     pub memory_type: Option<String>,
     /// Maximum number of memories to return.
     pub limit: Option<u32>,
