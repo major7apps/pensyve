@@ -9,6 +9,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{Json, Router, routing};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -167,6 +168,8 @@ pub struct StatsResponse {
 pub struct InspectRequest {
     pub entity: String,
     pub limit: Option<usize>,
+    #[serde(default)]
+    pub include_superseded: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -185,6 +188,12 @@ pub struct UpdateMemoryRequest {
     pub confidence: Option<f64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SupersedeMemoryRequest {
+    pub content: String,
+    pub confidence: Option<f64>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct DeleteMemoryResponse {
     pub deleted: bool,
@@ -192,10 +201,12 @@ pub struct DeleteMemoryResponse {
 }
 
 #[derive(Debug, Serialize)]
-pub struct UpdateMemoryResponse {
+pub struct SupersedeMemoryResponse {
     pub id: String,
     pub content: String,
+    pub memory_type: String,
     pub confidence: f32,
+    pub superseded: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -361,6 +372,142 @@ fn memory_content(memory: &Memory) -> String {
     }
 }
 
+fn memory_superseded_by(memory: &Memory) -> Option<Uuid> {
+    match memory {
+        Memory::Episodic(m) => m.superseded_by,
+        Memory::Semantic(m) => m.superseded_by,
+        Memory::Procedural(m) => m.superseded_by,
+        Memory::Observation(m) => m.superseded_by,
+    }
+}
+
+fn load_memory(storage: &dyn StorageTrait, id: Uuid) -> Result<Option<Memory>, RestError> {
+    if let Some(memory) = storage
+        .get_episodic(id)
+        .map_err(|err| storage_fetch_error(&err))?
+    {
+        return Ok(Some(Memory::Episodic(memory)));
+    }
+    if let Some(memory) = storage
+        .get_semantic(id)
+        .map_err(|err| storage_fetch_error(&err))?
+    {
+        return Ok(Some(Memory::Semantic(memory)));
+    }
+    if let Some(memory) = storage
+        .get_procedural(id)
+        .map_err(|err| storage_fetch_error(&err))?
+    {
+        return Ok(Some(Memory::Procedural(memory)));
+    }
+    if let Some(memory) = storage
+        .get_observation(id)
+        .map_err(|err| storage_fetch_error(&err))?
+    {
+        return Ok(Some(Memory::Observation(memory)));
+    }
+    Ok(None)
+}
+
+fn storage_fetch_error(err: &pensyve_core::storage::StorageError) -> RestError {
+    RestError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("Error fetching memory: {err}"),
+    )
+}
+
+fn replacement_memory(
+    old: &Memory,
+    content: &str,
+    confidence: Option<f64>,
+    embedding: Vec<f32>,
+) -> Memory {
+    let now = Utc::now();
+    match old {
+        Memory::Episodic(old) => {
+            let mut new = old.clone();
+            new.id = Uuid::new_v4();
+            new.content = content.to_string();
+            new.embedding = embedding;
+            new.timestamp = now;
+            new.stability = 1.0;
+            new.retrievability = 1.0;
+            new.access_count = 0;
+            new.last_accessed = None;
+            new.storage_strength = 0.0;
+            new.superseded_by = None;
+            new.invalid_at = None;
+            Memory::Episodic(new)
+        }
+        Memory::Semantic(old) => {
+            let mut new = old.clone();
+            let (predicate, object) = content.split_once(' ').map_or_else(
+                || ("knows".to_string(), content.to_string()),
+                |(predicate, object)| (predicate.to_string(), object.to_string()),
+            );
+            new.id = Uuid::new_v4();
+            new.predicate = predicate;
+            new.object = object;
+            new.confidence = confidence.map_or(old.confidence, |value| value as f32);
+            new.valid_at = now;
+            new.invalid_at = None;
+            new.superseded_by = None;
+            new.embedding = embedding;
+            new.stability = 1.0;
+            new.retrievability = 1.0;
+            Memory::Semantic(new)
+        }
+        Memory::Procedural(old) => {
+            let mut new = old.clone();
+            let (trigger, action) = content
+                .split_once(" -> ")
+                .unwrap_or((old.trigger.as_str(), content));
+            new.id = Uuid::new_v4();
+            new.trigger = trigger.to_string();
+            new.action = action.to_string();
+            new.reliability = confidence.map_or(old.reliability, |value| value as f32);
+            new.embedding = embedding;
+            new.created_at = now;
+            new.last_used = None;
+            new.superseded_by = None;
+            new.invalid_at = None;
+            Memory::Procedural(new)
+        }
+        Memory::Observation(old) => {
+            let mut new = old.clone();
+            new.id = Uuid::new_v4();
+            new.content = content.to_string();
+            new.confidence = confidence.map_or(old.confidence, |value| value as f32);
+            new.embedding = embedding;
+            new.created_at = now;
+            new.stability = 1.0;
+            new.retrievability = 1.0;
+            new.superseded_by = None;
+            new.invalid_at = None;
+            Memory::Observation(new)
+        }
+    }
+}
+
+fn save_memory(storage: &dyn StorageTrait, memory: &Memory) -> Result<(), RestError> {
+    let result = match memory {
+        Memory::Episodic(memory) => storage.save_episodic(memory),
+        Memory::Semantic(memory) => storage.save_semantic(memory),
+        Memory::Procedural(memory) => storage.save_procedural(memory),
+        Memory::Observation(memory) => {
+            // Supersession is content replacement, not a new ingest, so the G3
+            // typed-slot and chain hooks intentionally do not fire here.
+            storage.save_observation(memory)
+        }
+    };
+    result.map_err(|err| {
+        RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Error saving superseding memory: {err}"),
+        )
+    })
+}
+
 /// Extract the optional `event_time` from a memory as an ISO 8601 string.
 /// Returns `None` for semantic / procedural memories (which have no event
 /// time concept) and for episodic memories that were ingested without an
@@ -450,6 +597,123 @@ fn get_pensyve_state(
     })
 }
 
+async fn perform_supersession(
+    state: &AppState,
+    ps: &PensyveState,
+    memory_id: Uuid,
+    requested_content: Option<String>,
+    confidence: Option<f64>,
+) -> Result<SupersedeMemoryResponse, RestError> {
+    let old = load_memory(ps.storage.as_ref(), memory_id)?.ok_or_else(|| {
+        RestError(
+            StatusCode::NOT_FOUND,
+            format!("Memory {memory_id} not found"),
+        )
+    })?;
+
+    let old_namespace = match &old {
+        Memory::Episodic(memory) => memory.namespace_id,
+        Memory::Semantic(memory) => memory.namespace_id,
+        Memory::Procedural(memory) => memory.namespace_id,
+        Memory::Observation(memory) => memory.namespace_id,
+    };
+    if old_namespace != ps.namespace.id {
+        return Err(RestError(
+            StatusCode::NOT_FOUND,
+            format!("Memory {memory_id} not found"),
+        ));
+    }
+    if memory_superseded_by(&old).is_some() {
+        return Err(RestError(
+            StatusCode::CONFLICT,
+            format!("Memory {memory_id} has already been superseded"),
+        ));
+    }
+
+    let content = requested_content.unwrap_or_else(|| memory_content(&old));
+    let embedder = ps.embedder.clone();
+    let text = content.clone();
+    let embedding = tokio::task::spawn_blocking(move || embedder.embed(&text))
+        .await
+        .map_err(|err| {
+            RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Embedding task failed: {err}"),
+            )
+        })?
+        .map_err(|err| {
+            RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Embedding failed: {err}"),
+            )
+        })?;
+
+    let new = replacement_memory(&old, &content, confidence, embedding);
+    let new_id = new.id();
+
+    // The replacement must exist before the old row can point to it.
+    save_memory(ps.storage.as_ref(), &new)?;
+    let stamped = ps
+        .storage
+        .supersede_memory(memory_id, new_id, Utc::now())
+        .map_err(|err| {
+            RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Error stamping superseded memory: {err}"),
+            )
+        })?;
+    if !stamped {
+        if let Err(err) = ps.storage.delete_memory_by_id(new_id) {
+            tracing::warn!(
+                "Supersession race rollback failed for old memory {memory_id} and replacement {new_id}: {err}"
+            );
+        }
+        return Err(RestError(
+            StatusCode::CONFLICT,
+            format!("Memory {memory_id} has already been superseded"),
+        ));
+    }
+
+    {
+        let mut vector_index = ps.vector_index.write().await;
+        let add_result = match &new {
+            Memory::Semantic(memory) => {
+                vector_index.add_with_entity(new_id, &memory.embedding, memory.subject)
+            }
+            Memory::Episodic(memory) => {
+                vector_index.add_with_entity(new_id, &memory.embedding, memory.about_entity)
+            }
+            Memory::Procedural(memory) => vector_index.add(new_id, &memory.embedding),
+            // Observations enrich grouped recall and never enter the RRF vector pool.
+            Memory::Observation(_) => Ok(()),
+        };
+        if let Err(err) = add_result {
+            tracing::warn!("Failed to add superseding memory to vector index: {err}");
+        }
+        let _ = vector_index.remove(memory_id);
+    }
+
+    let _ = ps.storage.log_activity(
+        ps.namespace.id,
+        "supersede",
+        &json!({"memory_id": memory_id, "new_memory_id": new_id}),
+    );
+
+    if let Some(ref redis) = state.redis {
+        let mut conn = redis.clone();
+        let prefix = crate::cache::namespace_prefix(&ps.namespace.id.to_string());
+        crate::cache::invalidate_prefix(&mut conn, &prefix).await;
+    }
+
+    Ok(SupersedeMemoryResponse {
+        id: new_id.to_string(),
+        content: memory_content(&new),
+        memory_type: memory_type_name(&new).to_string(),
+        confidence: memory_confidence(&new),
+        superseded: memory_id.to_string(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -466,6 +730,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route(
             "/v1/memories/{id}",
             routing::delete(delete_memory).patch(update_memory),
+        )
+        .route(
+            "/v1/memories/{id}/supersede",
+            routing::post(supersede_memory),
         )
         .route("/v1/stats", routing::get(stats))
         .route("/v1/usage", routing::get(usage_summary))
@@ -939,6 +1207,21 @@ async fn purge_all_memories(
     Ok(Json(serde_json::json!({ "deleted": deleted_count })))
 }
 
+async fn supersede_memory(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
+    Path(id): Path<String>,
+    Json(body): Json<SupersedeMemoryRequest>,
+) -> Result<impl IntoResponse, RestError> {
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
+    let memory_id = Uuid::parse_str(&id)
+        .map_err(|_| RestError(StatusCode::BAD_REQUEST, "Invalid memory ID".to_string()))?;
+    let response =
+        perform_supersession(&state, &ps, memory_id, Some(body.content), body.confidence).await?;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+/// Deprecated: retained for one release and delegated to supersession instead of mutation.
 async fn update_memory(
     State(state): State<Arc<AppState>>,
     axum::Extension(auth_ctx): axum::Extension<AuthContext>,
@@ -949,59 +1232,9 @@ async fn update_memory(
 
     let memory_id = Uuid::parse_str(&id)
         .map_err(|_| RestError(StatusCode::BAD_REQUEST, "Invalid memory ID".to_string()))?;
-
-    // Only semantic memories support content updates for now.
-    let mem = ps.storage.get_semantic(memory_id).map_err(|err| {
-        RestError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Error fetching memory: {err}"),
-        )
-    })?;
-
-    let mem = mem.ok_or_else(|| {
-        RestError(
-            StatusCode::NOT_FOUND,
-            format!("Semantic memory {id} not found"),
-        )
-    })?;
-
-    let content_changed = body.content.is_some();
-    let content = body
-        .content
-        .unwrap_or_else(|| format!("{} {}", mem.predicate, mem.object));
-    let confidence = body.confidence.map_or(mem.confidence, |c| c as f32);
-
-    let (predicate, object) = if let Some(pos) = content.find(' ') {
-        (content[..pos].to_string(), content[pos + 1..].to_string())
-    } else {
-        ("knows".to_string(), content.clone())
-    };
-
-    ps.storage
-        .update_semantic_content(memory_id, &predicate, &object, Some(confidence))
-        .map_err(|err| {
-            RestError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Error updating memory: {err}"),
-            )
-        })?;
-
-    // Re-embed if content changed — run ONNX on blocking thread pool.
-    if content_changed {
-        let embedder = ps.embedder.clone();
-        let text = content.clone();
-        if let Ok(Ok(embedding)) = tokio::task::spawn_blocking(move || embedder.embed(&text)).await
-        {
-            let mut vector_index = ps.vector_index.write().await;
-            let _ = vector_index.add_with_entity(memory_id, &embedding, mem.subject);
-        }
-    }
-
-    Ok(Json(UpdateMemoryResponse {
-        id,
-        content: format!("{predicate} {object}"),
-        confidence,
-    }))
+    let response =
+        perform_supersession(&state, &ps, memory_id, body.content, body.confidence).await?;
+    Ok(Json(response))
 }
 
 async fn stats(
@@ -1058,6 +1291,10 @@ async fn usage_summary(
     Ok(Json(summary))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the inspect handler keeps default and opt-in audit projections together so their response shape cannot drift"
+)]
 async fn inspect(
     State(state): State<Arc<AppState>>,
     axum::Extension(auth_ctx): axum::Extension<AuthContext>,
@@ -1073,7 +1310,13 @@ async fn inspect(
         let mut procedural = Vec::new();
         let mut observation = Vec::new();
 
-        if let Ok(memories) = ps.storage.get_all_memories_by_namespace(ps.namespace.id) {
+        let memories = if body.include_superseded {
+            ps.storage
+                .get_all_memories_by_namespace_including_superseded(ps.namespace.id)
+        } else {
+            ps.storage.get_all_memories_by_namespace(ps.namespace.id)
+        };
+        if let Ok(memories) = memories {
             for mem in memories.into_iter().take(limit) {
                 match mem {
                     pensyve_core::types::Memory::Episodic(m) => {
@@ -1116,6 +1359,41 @@ async fn inspect(
                 format!("Entity '{}' not found", body.entity),
             )
         })?;
+
+    if body.include_superseded {
+        let mut episodic = Vec::new();
+        let mut semantic = Vec::new();
+        if let Ok(memories) = ps
+            .storage
+            .get_all_memories_by_namespace_including_superseded(ps.namespace.id)
+        {
+            for memory in memories {
+                if episodic.len() + semantic.len() >= limit {
+                    break;
+                }
+                match memory {
+                    Memory::Episodic(memory) if memory.about_entity == entity.id => {
+                        let mut value = serde_json::to_value(&memory).unwrap_or_default();
+                        strip_embedding(&mut value);
+                        episodic.push(value);
+                    }
+                    Memory::Semantic(memory) if memory.subject == entity.id => {
+                        let mut value = serde_json::to_value(&memory).unwrap_or_default();
+                        strip_embedding(&mut value);
+                        semantic.push(value);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        return Ok(Json(InspectResponse {
+            entity: body.entity,
+            episodic,
+            semantic,
+            procedural: vec![],
+            observation: vec![],
+        }));
+    }
 
     let mut episodic = Vec::new();
     if let Ok(mems) = ps.storage.list_episodic_by_entity(entity.id, limit) {

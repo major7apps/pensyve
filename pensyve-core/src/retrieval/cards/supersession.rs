@@ -215,6 +215,7 @@ impl RetrievalCard for SupersessionCard {
 /// SELECT chain_summary
 /// FROM observation_memories
 /// WHERE chain_summary IS NOT NULL
+///   AND superseded_by IS NULL
 ///   AND <scope_clause>
 /// ORDER BY event_time DESC NULLS LAST, created_at DESC
 /// LIMIT ?
@@ -279,6 +280,7 @@ fn build_chain_only_from_conn(
         "SELECT chain_summary \
          FROM observation_memories \
          WHERE chain_summary IS NOT NULL \
+           AND superseded_by IS NULL \
            AND {scope_clause} \
          ORDER BY event_time DESC NULLS LAST, created_at DESC \
          LIMIT ?{}",
@@ -419,6 +421,7 @@ mod tests {
                 user_id TEXT,
                 chain_summary TEXT,
                 event_time TEXT,
+                superseded_by TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )",
             [],

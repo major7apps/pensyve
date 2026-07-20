@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS episodic_memories (
 -- this column — without it the extractor sees `[unknown]` dates and can't
 -- build temporal context.
 ALTER TABLE episodic_memories ADD COLUMN IF NOT EXISTS event_time TIMESTAMPTZ;
+ALTER TABLE episodic_memories ADD COLUMN IF NOT EXISTS superseded_by UUID;
+ALTER TABLE episodic_memories ADD COLUMN IF NOT EXISTS invalid_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_episodic_about_entity ON episodic_memories(about_entity);
 CREATE INDEX IF NOT EXISTS idx_episodic_namespace ON episodic_memories(namespace_id);
@@ -99,6 +101,8 @@ CREATE TABLE IF NOT EXISTS semantic_memories (
     fts_content     tsvector GENERATED ALWAYS AS (to_tsvector('english', predicate || ' ' || object)) STORED
 );
 
+ALTER TABLE semantic_memories ADD COLUMN IF NOT EXISTS superseded_by UUID;
+
 CREATE INDEX IF NOT EXISTS idx_semantic_subject ON semantic_memories(subject);
 CREATE INDEX IF NOT EXISTS idx_semantic_namespace ON semantic_memories(namespace_id);
 CREATE INDEX IF NOT EXISTS idx_semantic_fts ON semantic_memories USING GIN(fts_content);
@@ -123,6 +127,9 @@ CREATE TABLE IF NOT EXISTS procedural_memories (
     last_used       TIMESTAMPTZ,
     fts_content     tsvector GENERATED ALWAYS AS (to_tsvector('english', trigger_text || ' ' || action)) STORED
 );
+
+ALTER TABLE procedural_memories ADD COLUMN IF NOT EXISTS superseded_by UUID;
+ALTER TABLE procedural_memories ADD COLUMN IF NOT EXISTS invalid_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_procedural_namespace ON procedural_memories(namespace_id);
 CREATE INDEX IF NOT EXISTS idx_procedural_fts ON procedural_memories USING GIN(fts_content);
@@ -151,6 +158,9 @@ CREATE TABLE IF NOT EXISTS observation_memories (
     retrievability  REAL NOT NULL DEFAULT 1.0,
     fts_content     tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
 );
+
+ALTER TABLE observation_memories ADD COLUMN IF NOT EXISTS superseded_by UUID;
+ALTER TABLE observation_memories ADD COLUMN IF NOT EXISTS invalid_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_observation_episode ON observation_memories(episode_id);
 CREATE INDEX IF NOT EXISTS idx_observation_namespace ON observation_memories(namespace_id);

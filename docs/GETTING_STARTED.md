@@ -450,13 +450,15 @@ curl http://localhost:3000/v1/health
 
 ### Endpoints
 
-| Method   | Path                  | Description              |
-| -------- | --------------------- | ------------------------ |
-| `POST`   | `/v1/recall`          | Search memories          |
-| `POST`   | `/v1/remember`        | Store a memory           |
-| `POST`   | `/v1/inspect`         | View entity memories     |
-| `POST`   | `/v1/consolidate`     | Trigger consolidation    |
-| `POST`   | `/v1/entities`        | Create an entity         |
+| Method   | Path                          | Description              |
+| -------- | ----------------------------- | ------------------------ |
+| `POST`   | `/v1/recall`                  | Search memories          |
+| `POST`   | `/v1/remember`                | Store a memory           |
+| `POST`   | `/v1/inspect`                 | View entity memories (`include_superseded: true` includes history) |
+| `POST`   | `/v1/memories/{id}/supersede` | Replace a memory while preserving the old row for audit |
+| `PATCH`  | `/v1/memories/{id}`           | **Deprecated:** delegates to supersession for one release |
+| `POST`   | `/v1/consolidate`             | Trigger consolidation    |
+| `POST`   | `/v1/entities`                | Create an entity         |
 | `DELETE` | `/v1/entities/{name}` | Delete entity + memories (name or UUID; 404 if unknown) |
 | `GET`    | `/v1/stats`           | Memory statistics        |
 | `GET`    | `/v1/health`          | Health check             |

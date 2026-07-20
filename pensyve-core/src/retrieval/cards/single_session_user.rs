@@ -282,6 +282,7 @@ fn build_card_from_conn(
          FROM observation_memories \
          WHERE event_time IS NOT NULL \
            AND DATE(event_time) IS NOT NULL \
+           AND superseded_by IS NULL \
            AND {scope_clause} \
          ORDER BY day DESC \
          LIMIT ?{}",
@@ -325,6 +326,7 @@ fn build_card_from_conn(
         "SELECT action, instance, content, event_time \
          FROM observation_memories \
          WHERE {scope_clause} \
+           AND superseded_by IS NULL \
            AND DATE(event_time) IN ({day_in}) \
            AND LOWER(TRIM(action)) IN ({action_in}) \
          ORDER BY event_time DESC, created_at DESC",
@@ -529,6 +531,7 @@ mod tests {
                 entity_type TEXT,
                 content TEXT,
                 event_time TEXT,
+                superseded_by TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )",
             [],
