@@ -97,6 +97,8 @@ jobs:
   test-rust-no-network-invariants:
     name: Rust No-Network Invariants
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     # Unlike `test-rust-models` above, this job is NOT continue-on-error:
     # these tests are the regression gate for the cached-model-resolution
     # incident tracked in issue #191 (fastembed 5.17.2 -> 5.17.3 was
@@ -110,8 +112,13 @@ jobs:
       # workspace-absolute path so `actions/cache` and pensyve-core's
       # per-package test cwd both resolve the same directory.
       FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
+      # Keep the online pre-build and isolated execution on the same
+      # workspace-owned target directory across the sudo boundary.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Resolve fastembed version
         id: fastembed-version
@@ -129,19 +136,41 @@ jobs:
           # key, forcing a fresh, verified download instead of silently
           # reusing a stale/incompatible cache — the same failure mode the
           # original incident report worried about.
-          key: fastembed-models-${{ runner.os }}-fastembed${{ steps.fastembed-version.outputs.version }}-gte-base-en-v1.5+minilm-l6-v2+bge-reranker-base-v1
+          key: fastembed-models-${{ runner.os }}-fastembed${{ steps.fastembed-version.outputs.version }}-minilm-l6-v2+bge-reranker-base-v1
       - name: Seed model cache on miss (sequential, controlled download)
         if: steps.model-cache.outputs.cache-hit != 'true'
-        # Downloads exactly the three models the invariant tests below
+        # Downloads exactly the two models the invariant tests below
         # need to find cached, one at a time. Serial on purpose: concurrent
         # first-use downloads into a shared cache dir race on the same blob
         # files (see the identical rationale in `test-rust-models` above).
         run: |
           cargo test -p pensyve-core --release embedding::tests::test_real_embedding_dimensions -- --ignored --test-threads=1
-          cargo test -p pensyve-core --release embedding::tests::test_real_gte_embedding_dimensions -- --ignored --test-threads=1
           cargo test -p pensyve-core --release reranker::tests::test_reranker_real_bge -- --ignored --test-threads=1
-      - name: Run no-network invariant tests
-        run: cargo test -p pensyve-core --test test_no_network_invariants
+      - name: Pre-build no-network invariant tests with network available
+        # Populate Cargo's target directory before entering the isolated
+        # namespace so the test phase only executes already-built artifacts.
+        run: cargo test -p pensyve-core --test test_no_network_invariants --no-run
+      - name: Run no-network invariant tests with egress denied
+        # GitHub-hosted Ubuntu runners provide passwordless sudo. A root-created
+        # network namespace leaves the test process with no external interfaces;
+        # the proxy variables are a second fail-fast guard for proxy-aware clients.
+        env:
+          HTTP_PROXY: http://127.0.0.1:9
+          HTTPS_PROXY: http://127.0.0.1:9
+          http_proxy: http://127.0.0.1:9
+          https_proxy: http://127.0.0.1:9
+        run: |
+          sudo unshare --net -- sudo -u "$USER" -E env \
+            HOME="$HOME" \
+            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+            FASTEMBED_CACHE_DIR="$FASTEMBED_CACHE_DIR" \
+            PATH="$PATH" \
+            HTTP_PROXY="$HTTP_PROXY" \
+            HTTPS_PROXY="$HTTPS_PROXY" \
+            http_proxy="$http_proxy" \
+            https_proxy="$https_proxy" \
+            cargo test -p pensyve-core --test test_no_network_invariants
 
   test-python:
     name: Python Tests
@@ -209,4 +238,3 @@ jobs:
         run: cargo build -p pensyve-mcp-gateway
       - name: Run gateway tests
         run: cargo test -p pensyve-mcp-gateway -p pensyve-mcp-tools
-
