@@ -4,10 +4,12 @@ use std::future::Future;
 
 use chrono::{DateTime, Utc};
 use sqlx_core::executor::Executor;
+use sqlx_core::from_row::FromRow;
 use sqlx_core::query::query;
 use sqlx_core::query_as::query_as;
 use sqlx_core::raw_sql::raw_sql;
-use sqlx_postgres::{PgPool, PgPoolOptions, Postgres};
+use sqlx_core::row::Row;
+use sqlx_postgres::{PgPool, PgPoolOptions, PgRow, Postgres};
 use tokio::runtime::{Handle, Runtime};
 use uuid::Uuid;
 
@@ -23,23 +25,49 @@ use crate::graph::EdgeType;
 // Row type aliases (for complex tuple types used with query_as)
 // ---------------------------------------------------------------------------
 
-type EpisodicRow = (
-    Uuid,                  // id
-    Uuid,                  // namespace_id
-    Uuid,                  // episode_id
-    Uuid,                  // source_entity
-    Uuid,                  // about_entity
-    String,                // content
-    Option<String>,        // summary
-    Option<String>,        // embedding::text
-    Option<String>,        // context_intent
-    DateTime<Utc>,         // timestamp
-    f32,                   // stability
-    f32,                   // retrievability
-    i32,                   // access_count
-    Option<DateTime<Utc>>, // last_accessed
-    Option<DateTime<Utc>>, // event_time
-);
+struct EpisodicRow {
+    id: Uuid,
+    namespace_id: Uuid,
+    episode_id: Uuid,
+    source_entity: Uuid,
+    about_entity: Uuid,
+    content: String,
+    summary: Option<String>,
+    embedding_text: Option<String>,
+    context_intent: Option<String>,
+    timestamp: DateTime<Utc>,
+    stability: f32,
+    retrievability: f32,
+    access_count: i32,
+    last_accessed: Option<DateTime<Utc>>,
+    event_time: Option<DateTime<Utc>>,
+    superseded_by: Option<Uuid>,
+    invalid_at: Option<DateTime<Utc>>,
+}
+
+impl<'r> FromRow<'r, PgRow> for EpisodicRow {
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx_core::error::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            namespace_id: row.try_get("namespace_id")?,
+            episode_id: row.try_get("episode_id")?,
+            source_entity: row.try_get("source_entity")?,
+            about_entity: row.try_get("about_entity")?,
+            content: row.try_get("content")?,
+            summary: row.try_get("summary")?,
+            embedding_text: row.try_get("embedding")?,
+            context_intent: row.try_get("context_intent")?,
+            timestamp: row.try_get("timestamp")?,
+            stability: row.try_get("stability")?,
+            retrievability: row.try_get("retrievability")?,
+            access_count: row.try_get("access_count")?,
+            last_accessed: row.try_get("last_accessed")?,
+            event_time: row.try_get("event_time")?,
+            superseded_by: row.try_get("superseded_by")?,
+            invalid_at: row.try_get("invalid_at")?,
+        })
+    }
+}
 
 type SemanticRow = (
     Uuid,
@@ -55,6 +83,7 @@ type SemanticRow = (
     Option<String>,
     f32,
     f32,
+    Option<Uuid>,
 );
 
 type ProceduralRow = (
@@ -71,25 +100,53 @@ type ProceduralRow = (
     Option<String>,
     DateTime<Utc>,
     Option<DateTime<Utc>>,
+    Option<Uuid>,
+    Option<DateTime<Utc>>,
 );
 
-type ObservationRow = (
-    Uuid,                  // id
-    Uuid,                  // namespace_id
-    Uuid,                  // episode_id
-    String,                // entity_type
-    String,                // instance
-    String,                // action
-    Option<f64>,           // quantity
-    Option<String>,        // unit
-    String,                // content
-    Option<String>,        // embedding::text
-    f32,                   // confidence
-    Option<DateTime<Utc>>, // event_time
-    DateTime<Utc>,         // created_at
-    f32,                   // stability
-    f32,                   // retrievability
-);
+struct ObservationRow {
+    id: Uuid,
+    namespace_id: Uuid,
+    episode_id: Uuid,
+    entity_type: String,
+    instance: String,
+    action: String,
+    quantity: Option<f64>,
+    unit: Option<String>,
+    content: String,
+    embedding_text: Option<String>,
+    confidence: f32,
+    event_time: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    stability: f32,
+    retrievability: f32,
+    superseded_by: Option<Uuid>,
+    invalid_at: Option<DateTime<Utc>>,
+}
+
+impl<'r> FromRow<'r, PgRow> for ObservationRow {
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx_core::error::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            namespace_id: row.try_get("namespace_id")?,
+            episode_id: row.try_get("episode_id")?,
+            entity_type: row.try_get("entity_type")?,
+            instance: row.try_get("instance")?,
+            action: row.try_get("action")?,
+            quantity: row.try_get("quantity")?,
+            unit: row.try_get("unit")?,
+            content: row.try_get("content")?,
+            embedding_text: row.try_get("embedding")?,
+            confidence: row.try_get("confidence")?,
+            event_time: row.try_get("event_time")?,
+            created_at: row.try_get("created_at")?,
+            stability: row.try_get("stability")?,
+            retrievability: row.try_get("retrievability")?,
+            superseded_by: row.try_get("superseded_by")?,
+            invalid_at: row.try_get("invalid_at")?,
+        })
+    }
+}
 
 type EdgeRow = (
     Uuid,
@@ -263,6 +320,84 @@ impl PostgresBackend {
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
+
+    fn load_memories_by_namespace(
+        &self,
+        namespace_id: Uuid,
+        include_superseded: bool,
+    ) -> StorageResult<Vec<Memory>> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut memories = Vec::new();
+
+            let rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
+                r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
+                          summary, embedding::text AS embedding, context_intent, timestamp, stability,
+                          retrievability, access_count, last_accessed, event_time,
+                          superseded_by, invalid_at
+                   FROM episodic_memories
+                   WHERE namespace_id = $1 AND ($2 OR superseded_by IS NULL)",
+            )
+            .bind(namespace_id)
+            .bind(include_superseded)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            memories.extend(rows.into_iter().map(row_to_episodic).map(Memory::Episodic));
+
+            let rows: Vec<SemanticRow> = query_as::<Postgres, _>(
+                r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
+                          valid_at, invalid_at, source_episodes, embedding::text, stability,
+                          retrievability, superseded_by
+                   FROM semantic_memories
+                   WHERE namespace_id = $1 AND ($2 OR superseded_by IS NULL)",
+            )
+            .bind(namespace_id)
+            .bind(include_superseded)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            memories.extend(rows.into_iter().map(row_to_semantic).map(Memory::Semantic));
+
+            let rows: Vec<ProceduralRow> = query_as::<Postgres, _>(
+                r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
+                          trial_count, success_count, source_episodes, embedding::text, created_at,
+                          last_used, superseded_by, invalid_at
+                   FROM procedural_memories
+                   WHERE namespace_id = $1 AND ($2 OR superseded_by IS NULL)",
+            )
+            .bind(namespace_id)
+            .bind(include_superseded)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            memories.extend(
+                rows.into_iter()
+                    .map(row_to_procedural)
+                    .map(Memory::Procedural),
+            );
+
+            let rows: Vec<ObservationRow> = query_as::<Postgres, _>(
+                r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
+                          unit, content, embedding::text AS embedding, confidence, event_time, created_at,
+                          stability, retrievability, superseded_by, invalid_at
+                   FROM observation_memories
+                   WHERE namespace_id = $1 AND ($2 OR superseded_by IS NULL)",
+            )
+            .bind(namespace_id)
+            .bind(include_superseded)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            memories.extend(
+                rows.into_iter()
+                    .map(row_to_observation)
+                    .map(Memory::Observation),
+            );
+
+            Ok(memories)
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -272,10 +407,11 @@ impl PostgresBackend {
 const SCHEMA: &str = include_str!("postgres_schema.sql");
 
 const LIST_OBSERVATIONS_BY_ENTITY_INSTANCE_SQL: &str = r"SELECT id, namespace_id, episode_id, entity_type, instance, action,
-             quantity, unit, content, embedding::text, confidence, event_time,
-             created_at, stability, retrievability
+             quantity, unit, content, embedding::text AS embedding, confidence,
+             event_time, created_at, stability, retrievability, superseded_by,
+             invalid_at
       FROM observation_memories
-      WHERE namespace_id = $1 AND instance = $2
+      WHERE namespace_id = $1 AND instance = $2 AND superseded_by IS NULL
       ORDER BY created_at DESC LIMIT $3";
 
 // ---------------------------------------------------------------------------
@@ -612,12 +748,13 @@ impl StorageTrait for PostgresBackend {
                 r"INSERT INTO episodic_memories
                    (id, namespace_id, episode_id, source_entity, about_entity, content, summary,
                     embedding, context_intent, timestamp, stability, retrievability,
-                    access_count, last_accessed, event_time)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13, $14, $15)
+                    access_count, last_accessed, event_time, superseded_by, invalid_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13, $14, $15, $16, $17)
                    ON CONFLICT (id) DO UPDATE SET
                        content = $6, summary = $7, embedding = $8::vector, context_intent = $9,
                        stability = $11, retrievability = $12, access_count = $13,
-                       last_accessed = $14, event_time = $15",
+                       last_accessed = $14, event_time = $15, superseded_by = $16,
+                       invalid_at = $17",
             )
             .bind(mem.id)
             .bind(mem.namespace_id)
@@ -634,6 +771,8 @@ impl StorageTrait for PostgresBackend {
             .bind(i32::try_from(mem.access_count).unwrap_or(i32::MAX))
             .bind(mem.last_accessed)
             .bind(mem.event_time)
+            .bind(mem.superseded_by)
+            .bind(mem.invalid_at)
             .execute(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
@@ -646,8 +785,8 @@ impl StorageTrait for PostgresBackend {
             let mut conn = self.maybe_scoped_conn().await?;
             let row: Option<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                          summary, embedding::text, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed, event_time
+                          summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
+                          access_count, last_accessed, event_time, superseded_by, invalid_at
                    FROM episodic_memories WHERE id = $1",
             )
             .bind(id)
@@ -669,9 +808,9 @@ impl StorageTrait for PostgresBackend {
             let mut conn = self.maybe_scoped_conn().await?;
             let rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                          summary, embedding::text, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed, event_time
-                   FROM episodic_memories WHERE about_entity = $1
+                          summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
+                          access_count, last_accessed, event_time, superseded_by, invalid_at
+                   FROM episodic_memories WHERE about_entity = $1 AND superseded_by IS NULL
                    ORDER BY timestamp DESC LIMIT $2",
             )
             .bind(about_entity)
@@ -696,10 +835,10 @@ impl StorageTrait for PostgresBackend {
                 // encoding `timestamp`. Observation extraction relies on
                 // chronological order across the episode.
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                          summary, embedding::text, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed, event_time
+                          summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
+                          access_count, last_accessed, event_time, superseded_by, invalid_at
                    FROM episodic_memories
-                   WHERE namespace_id = $1 AND episode_id = $2
+                   WHERE namespace_id = $1 AND episode_id = $2 AND superseded_by IS NULL
                    ORDER BY COALESCE(event_time, timestamp) ASC",
             )
             .bind(namespace_id)
@@ -750,12 +889,13 @@ impl StorageTrait for PostgresBackend {
             query::<Postgres>(
                 r"INSERT INTO semantic_memories
                    (id, namespace_id, subject, predicate, object, object_entity, confidence,
-                    valid_at, invalid_at, source_episodes, embedding, stability, retrievability)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::vector, $12, $13)
+                    valid_at, invalid_at, source_episodes, embedding, stability, retrievability,
+                    superseded_by)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::vector, $12, $13, $14)
                    ON CONFLICT (id) DO UPDATE SET
                        predicate = $4, object = $5, object_entity = $6, confidence = $7,
                        invalid_at = $9, source_episodes = $10, embedding = $11::vector,
-                       stability = $12, retrievability = $13",
+                       stability = $12, retrievability = $13, superseded_by = $14",
             )
             .bind(mem.id)
             .bind(mem.namespace_id)
@@ -770,6 +910,7 @@ impl StorageTrait for PostgresBackend {
             .bind(&embedding_text)
             .bind(mem.stability)
             .bind(mem.retrievability)
+            .bind(mem.superseded_by)
             .execute(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
@@ -782,7 +923,8 @@ impl StorageTrait for PostgresBackend {
             let mut conn = self.maybe_scoped_conn().await?;
             let row: Option<SemanticRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
-                          valid_at, invalid_at, source_episodes, embedding::text, stability, retrievability
+                          valid_at, invalid_at, source_episodes, embedding::text, stability,
+                          retrievability, superseded_by
                    FROM semantic_memories WHERE id = $1",
             )
             .bind(id)
@@ -804,8 +946,9 @@ impl StorageTrait for PostgresBackend {
             let mut conn = self.maybe_scoped_conn().await?;
             let rows: Vec<SemanticRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
-                          valid_at, invalid_at, source_episodes, embedding::text, stability, retrievability
-                   FROM semantic_memories WHERE subject = $1
+                          valid_at, invalid_at, source_episodes, embedding::text, stability,
+                          retrievability, superseded_by
+                   FROM semantic_memories WHERE subject = $1 AND superseded_by IS NULL
                    ORDER BY valid_at DESC LIMIT $2",
             )
             .bind(subject)
@@ -846,12 +989,14 @@ impl StorageTrait for PostgresBackend {
             query::<Postgres>(
                 r"INSERT INTO procedural_memories
                    (id, namespace_id, trigger_text, action, outcome, context, reliability,
-                    trial_count, success_count, source_episodes, embedding, created_at, last_used)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::vector, $12, $13)
+                    trial_count, success_count, source_episodes, embedding, created_at, last_used,
+                    superseded_by, invalid_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::vector, $12, $13, $14, $15)
                    ON CONFLICT (id) DO UPDATE SET
                        trigger_text = $3, action = $4, outcome = $5, context = $6,
                        reliability = $7, trial_count = $8, success_count = $9,
-                       source_episodes = $10, embedding = $11::vector, last_used = $13",
+                       source_episodes = $10, embedding = $11::vector, last_used = $13,
+                       superseded_by = $14, invalid_at = $15",
             )
             .bind(mem.id)
             .bind(mem.namespace_id)
@@ -866,6 +1011,8 @@ impl StorageTrait for PostgresBackend {
             .bind(&embedding_text)
             .bind(mem.created_at)
             .bind(mem.last_used)
+            .bind(mem.superseded_by)
+            .bind(mem.invalid_at)
             .execute(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
@@ -878,7 +1025,8 @@ impl StorageTrait for PostgresBackend {
             let mut conn = self.maybe_scoped_conn().await?;
             let row: Option<ProceduralRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
-                          trial_count, success_count, source_episodes, embedding::text, created_at, last_used
+                          trial_count, success_count, source_episodes, embedding::text, created_at,
+                          last_used, superseded_by, invalid_at
                    FROM procedural_memories WHERE id = $1",
             )
             .bind(id)
@@ -928,12 +1076,14 @@ impl StorageTrait for PostgresBackend {
             query::<Postgres>(
                 r"INSERT INTO observation_memories
                    (id, namespace_id, episode_id, entity_type, instance, action, quantity, unit,
-                    content, embedding, confidence, event_time, created_at, stability, retrievability)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::vector, $11, $12, $13, $14, $15)
+                    content, embedding, confidence, event_time, created_at, stability, retrievability,
+                    superseded_by, invalid_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::vector, $11, $12, $13, $14, $15, $16, $17)
                    ON CONFLICT (id) DO UPDATE SET
                        entity_type = $4, instance = $5, action = $6, quantity = $7, unit = $8,
                        content = $9, embedding = $10::vector, confidence = $11,
-                       event_time = $12, stability = $14, retrievability = $15",
+                       event_time = $12, stability = $14, retrievability = $15,
+                       superseded_by = $16, invalid_at = $17",
             )
             .bind(mem.id)
             .bind(mem.namespace_id)
@@ -950,6 +1100,8 @@ impl StorageTrait for PostgresBackend {
             .bind(mem.created_at)
             .bind(mem.stability)
             .bind(mem.retrievability)
+            .bind(mem.superseded_by)
+            .bind(mem.invalid_at)
             .execute(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
@@ -962,8 +1114,8 @@ impl StorageTrait for PostgresBackend {
             let mut conn = self.maybe_scoped_conn().await?;
             let row: Option<ObservationRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
-                          unit, content, embedding::text, confidence, event_time, created_at,
-                          stability, retrievability
+                          unit, content, embedding::text AS embedding, confidence, event_time, created_at,
+                          stability, retrievability, superseded_by, invalid_at
                    FROM observation_memories WHERE id = $1",
             )
             .bind(id)
@@ -1015,18 +1167,19 @@ impl StorageTrait for PostgresBackend {
             let mut conn = self.maybe_scoped_conn().await?;
             let sql = if namespace_filter.is_some() {
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
-                          unit, content, embedding::text, confidence, event_time, created_at,
-                          stability, retrievability
+                          unit, content, embedding::text AS embedding, confidence, event_time, created_at,
+                          stability, retrievability, superseded_by, invalid_at
                    FROM observation_memories
                    WHERE episode_id = ANY($1) AND namespace_id = $3
+                     AND superseded_by IS NULL
                    ORDER BY created_at ASC
                    LIMIT $2"
             } else {
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
-                          unit, content, embedding::text, confidence, event_time, created_at,
-                          stability, retrievability
+                          unit, content, embedding::text AS embedding, confidence, event_time, created_at,
+                          stability, retrievability, superseded_by, invalid_at
                    FROM observation_memories
-                   WHERE episode_id = ANY($1)
+                   WHERE episode_id = ANY($1) AND superseded_by IS NULL
                    ORDER BY created_at ASC
                    LIMIT $2"
             };
@@ -1093,10 +1246,11 @@ impl StorageTrait for PostgresBackend {
             // Search episodic memories
             let episodic_rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                          summary, embedding::text, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed, event_time
+                          summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
+                          access_count, last_accessed, event_time, superseded_by, invalid_at
                    FROM episodic_memories
-                   WHERE namespace_id = $1 AND fts_content @@ plainto_tsquery('english', $2)
+                   WHERE namespace_id = $1 AND superseded_by IS NULL
+                     AND fts_content @@ plainto_tsquery('english', $2)
                    ORDER BY ts_rank(fts_content, plainto_tsquery('english', $2)) DESC
                    LIMIT $3",
             )
@@ -1115,8 +1269,10 @@ impl StorageTrait for PostgresBackend {
             let semantic_rows: Vec<SemanticRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
                           valid_at, invalid_at, source_episodes, embedding::text, stability, retrievability
+                          , superseded_by
                    FROM semantic_memories
-                   WHERE namespace_id = $1 AND fts_content @@ plainto_tsquery('english', $2)
+                   WHERE namespace_id = $1 AND superseded_by IS NULL
+                     AND fts_content @@ plainto_tsquery('english', $2)
                    ORDER BY ts_rank(fts_content, plainto_tsquery('english', $2)) DESC
                    LIMIT $3",
             )
@@ -1135,8 +1291,10 @@ impl StorageTrait for PostgresBackend {
             let procedural_rows: Vec<ProceduralRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
                           trial_count, success_count, source_episodes, embedding::text, created_at, last_used
+                          , superseded_by, invalid_at
                    FROM procedural_memories
-                   WHERE namespace_id = $1 AND fts_content @@ plainto_tsquery('english', $2)
+                   WHERE namespace_id = $1 AND superseded_by IS NULL
+                     AND fts_content @@ plainto_tsquery('english', $2)
                    ORDER BY ts_rank(fts_content, plainto_tsquery('english', $2)) DESC
                    LIMIT $3",
             )
@@ -1173,8 +1331,10 @@ impl StorageTrait for PostgresBackend {
             let semantic_rows: Vec<SemanticRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
                           valid_at, invalid_at, source_episodes, embedding::text, stability, retrievability
+                          , superseded_by
                    FROM semantic_memories
                    WHERE namespace_id = $1 AND subject = $2
+                     AND superseded_by IS NULL
                      AND fts_content @@ plainto_tsquery('english', $3)
                    ORDER BY ts_rank(fts_content, plainto_tsquery('english', $3)) DESC
                    LIMIT $4",
@@ -1197,11 +1357,12 @@ impl StorageTrait for PostgresBackend {
 
             let episodic_rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                          summary, embedding::text, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed, event_time
+                          summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
+                          access_count, last_accessed, event_time, superseded_by, invalid_at
                    FROM episodic_memories
                    WHERE namespace_id = $1
                      AND (about_entity = $2 OR source_entity = $2)
+                     AND superseded_by IS NULL
                      AND fts_content @@ plainto_tsquery('english', $3)
                    ORDER BY ts_rank(fts_content, plainto_tsquery('english', $3)) DESC
                    LIMIT $4",
@@ -1228,73 +1389,46 @@ impl StorageTrait for PostgresBackend {
     // -----------------------------------------------------------------------
 
     fn get_all_memories_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Memory>> {
+        self.load_memories_by_namespace(namespace_id, false)
+    }
+
+    fn get_all_memories_by_namespace_including_superseded(
+        &self,
+        namespace_id: Uuid,
+    ) -> StorageResult<Vec<Memory>> {
+        self.load_memories_by_namespace(namespace_id, true)
+    }
+
+    fn supersede_memory(
+        &self,
+        id: Uuid,
+        superseded_by: Uuid,
+        invalid_at: DateTime<Utc>,
+    ) -> StorageResult<bool> {
         self.block_on(async {
-            let mut conn = self.scoped_conn(namespace_id).await?;
-            let mut memories = Vec::new();
-
-            // Episodic
-            let episodic_rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
-                r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                          summary, embedding::text, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed, event_time
-                   FROM episodic_memories WHERE namespace_id = $1",
-            )
-            .bind(namespace_id)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
-
-            for row in episodic_rows {
-                memories.push(Memory::Episodic(row_to_episodic(row)));
+            let mut conn = self.maybe_scoped_conn().await?;
+            for sql in [
+                "UPDATE episodic_memories SET superseded_by = $1, invalid_at = $2 \
+                 WHERE id = $3 AND superseded_by IS NULL",
+                "UPDATE semantic_memories SET superseded_by = $1, invalid_at = $2 \
+                 WHERE id = $3 AND superseded_by IS NULL",
+                "UPDATE procedural_memories SET superseded_by = $1, invalid_at = $2 \
+                 WHERE id = $3 AND superseded_by IS NULL",
+                "UPDATE observation_memories SET superseded_by = $1, invalid_at = $2 \
+                 WHERE id = $3 AND superseded_by IS NULL",
+            ] {
+                let result = query::<Postgres>(sql)
+                    .bind(superseded_by)
+                    .bind(invalid_at)
+                    .bind(id)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(sqlx_to_io)?;
+                if result.rows_affected() > 0 {
+                    return Ok(true);
+                }
             }
-
-            // Semantic
-            let semantic_rows: Vec<SemanticRow> = query_as::<Postgres, _>(
-                r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
-                          valid_at, invalid_at, source_episodes, embedding::text, stability, retrievability
-                   FROM semantic_memories WHERE namespace_id = $1",
-            )
-            .bind(namespace_id)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
-
-            for row in semantic_rows {
-                memories.push(Memory::Semantic(row_to_semantic(row)));
-            }
-
-            // Procedural
-            let procedural_rows: Vec<ProceduralRow> = query_as::<Postgres, _>(
-                r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
-                          trial_count, success_count, source_episodes, embedding::text, created_at, last_used
-                   FROM procedural_memories WHERE namespace_id = $1",
-            )
-            .bind(namespace_id)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
-
-            for row in procedural_rows {
-                memories.push(Memory::Procedural(row_to_procedural(row)));
-            }
-
-            // Observation
-            let observation_rows: Vec<ObservationRow> = query_as::<Postgres, _>(
-                r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
-                          unit, content, embedding::text, confidence, event_time, created_at,
-                          stability, retrievability
-                   FROM observation_memories WHERE namespace_id = $1",
-            )
-            .bind(namespace_id)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
-
-            for row in observation_rows {
-                memories.push(Memory::Observation(row_to_observation(row)));
-            }
-
-            Ok(memories)
+            Ok(false)
         })
     }
 
@@ -1538,7 +1672,7 @@ impl StorageTrait for PostgresBackend {
             let mut conn = self.scoped_conn(namespace_id).await?;
 
             let (episodic,): (i64,) = query_as::<Postgres, _>(
-                "SELECT COUNT(*) FROM episodic_memories WHERE namespace_id = $1",
+                "SELECT COUNT(*) FROM episodic_memories WHERE namespace_id = $1 AND superseded_by IS NULL",
             )
             .bind(namespace_id)
             .fetch_one(&mut *conn)
@@ -1546,7 +1680,7 @@ impl StorageTrait for PostgresBackend {
             .map_err(sqlx_to_io)?;
 
             let (semantic,): (i64,) = query_as::<Postgres, _>(
-                "SELECT COUNT(*) FROM semantic_memories WHERE namespace_id = $1 AND invalid_at IS NULL",
+                "SELECT COUNT(*) FROM semantic_memories WHERE namespace_id = $1 AND invalid_at IS NULL AND superseded_by IS NULL",
             )
             .bind(namespace_id)
             .fetch_one(&mut *conn)
@@ -1554,7 +1688,7 @@ impl StorageTrait for PostgresBackend {
             .map_err(sqlx_to_io)?;
 
             let (procedural,): (i64,) = query_as::<Postgres, _>(
-                "SELECT COUNT(*) FROM procedural_memories WHERE namespace_id = $1",
+                "SELECT COUNT(*) FROM procedural_memories WHERE namespace_id = $1 AND superseded_by IS NULL",
             )
             .bind(namespace_id)
             .fetch_one(&mut *conn)
@@ -1699,7 +1833,7 @@ impl StorageTrait for PostgresBackend {
 // ---------------------------------------------------------------------------
 
 fn row_to_episodic(row: EpisodicRow) -> EpisodicMemory {
-    let (
+    let EpisodicRow {
         id,
         namespace_id,
         episode_id,
@@ -1715,7 +1849,9 @@ fn row_to_episodic(row: EpisodicRow) -> EpisodicMemory {
         access_count,
         last_accessed,
         event_time,
-    ) = row;
+        superseded_by,
+        invalid_at,
+    } = row;
     EpisodicMemory {
         id,
         namespace_id,
@@ -1735,7 +1871,8 @@ fn row_to_episodic(row: EpisodicRow) -> EpisodicMemory {
         salience: 0.5,
         storage_strength: 0.0,
         event_time,
-        superseded_by: None,
+        superseded_by,
+        invalid_at,
         // G1: postgres backend does not yet carry the multi-tenant scope
         // columns. The struct fields exist for trait/serde compatibility
         // but are always None on this backend until the postgres schema
@@ -1760,6 +1897,7 @@ fn row_to_semantic(row: SemanticRow) -> SemanticMemory {
         embedding_text,
         stability,
         retrievability,
+        superseded_by,
     ) = row;
     let source_episodes: Vec<Uuid> =
         serde_json::from_value(source_episodes_json).unwrap_or_default();
@@ -1774,6 +1912,7 @@ fn row_to_semantic(row: SemanticRow) -> SemanticMemory {
         confidence,
         valid_at,
         invalid_at,
+        superseded_by,
         source_episodes,
         embedding: pgtext_to_embedding(embedding_text.as_deref()),
         stability,
@@ -1799,6 +1938,8 @@ fn row_to_procedural(row: ProceduralRow) -> ProceduralMemory {
         embedding_text,
         created_at,
         last_used,
+        superseded_by,
+        invalid_at,
     ) = row;
     let context: HashMap<String, serde_json::Value> =
         serde_json::from_value(context_json).unwrap_or_default();
@@ -1818,6 +1959,8 @@ fn row_to_procedural(row: ProceduralRow) -> ProceduralMemory {
         embedding: pgtext_to_embedding(embedding_text.as_deref()),
         created_at,
         last_used,
+        superseded_by,
+        invalid_at,
         // G1: postgres backend does not yet carry the multi-tenant scope columns.
         agent_id: None,
         user_id: None,
@@ -1825,7 +1968,7 @@ fn row_to_procedural(row: ProceduralRow) -> ProceduralMemory {
 }
 
 fn row_to_observation(row: ObservationRow) -> ObservationMemory {
-    let (
+    let ObservationRow {
         id,
         namespace_id,
         episode_id,
@@ -1841,7 +1984,9 @@ fn row_to_observation(row: ObservationRow) -> ObservationMemory {
         created_at,
         stability,
         retrievability,
-    ) = row;
+        superseded_by,
+        invalid_at,
+    } = row;
     ObservationMemory {
         id,
         namespace_id,
@@ -1858,6 +2003,8 @@ fn row_to_observation(row: ObservationRow) -> ObservationMemory {
         created_at,
         stability,
         retrievability,
+        superseded_by,
+        invalid_at,
         // G1: postgres backend does not yet carry the multi-tenant scope columns.
         agent_id: None,
         user_id: None,
@@ -1866,10 +2013,117 @@ fn row_to_observation(row: ObservationRow) -> ObservationMemory {
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::{Connection, params};
-    use uuid::Uuid;
+    use super::*;
 
-    use super::LIST_OBSERVATIONS_BY_ENTITY_INSTANCE_SQL;
+    #[test]
+    fn postgres_schema_has_idempotent_supersession_alters() {
+        for statement in [
+            "ALTER TABLE episodic_memories ADD COLUMN IF NOT EXISTS superseded_by UUID;",
+            "ALTER TABLE episodic_memories ADD COLUMN IF NOT EXISTS invalid_at TIMESTAMPTZ;",
+            "ALTER TABLE semantic_memories ADD COLUMN IF NOT EXISTS superseded_by UUID;",
+            "ALTER TABLE procedural_memories ADD COLUMN IF NOT EXISTS superseded_by UUID;",
+            "ALTER TABLE procedural_memories ADD COLUMN IF NOT EXISTS invalid_at TIMESTAMPTZ;",
+            "ALTER TABLE observation_memories ADD COLUMN IF NOT EXISTS superseded_by UUID;",
+            "ALTER TABLE observation_memories ADD COLUMN IF NOT EXISTS invalid_at TIMESTAMPTZ;",
+        ] {
+            assert!(
+                SCHEMA.contains(statement),
+                "missing schema statement: {statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_row_mapping_round_trips_supersession_columns() {
+        let now = Utc::now();
+        let successor = Uuid::new_v4();
+        let namespace_id = Uuid::new_v4();
+
+        let episodic = row_to_episodic(EpisodicRow {
+            id: Uuid::new_v4(),
+            namespace_id,
+            episode_id: Uuid::new_v4(),
+            source_entity: Uuid::new_v4(),
+            about_entity: Uuid::new_v4(),
+            content: "episodic".to_string(),
+            summary: None,
+            embedding_text: None,
+            context_intent: None,
+            timestamp: now,
+            stability: 1.0,
+            retrievability: 1.0,
+            access_count: 0,
+            last_accessed: None,
+            event_time: None,
+            superseded_by: Some(successor),
+            invalid_at: Some(now),
+        });
+        assert_eq!(episodic.superseded_by, Some(successor));
+        assert_eq!(episodic.invalid_at, Some(now));
+
+        let semantic = row_to_semantic((
+            Uuid::new_v4(),
+            namespace_id,
+            Uuid::new_v4(),
+            "predicate".to_string(),
+            "object".to_string(),
+            None,
+            0.9,
+            now,
+            Some(now),
+            serde_json::json!([]),
+            None,
+            1.0,
+            1.0,
+            Some(successor),
+        ));
+        assert_eq!(semantic.superseded_by, Some(successor));
+        assert_eq!(semantic.invalid_at, Some(now));
+
+        let procedural = row_to_procedural((
+            Uuid::new_v4(),
+            namespace_id,
+            "trigger".to_string(),
+            "action".to_string(),
+            "Success".to_string(),
+            serde_json::json!({}),
+            0.9,
+            1,
+            1,
+            serde_json::json!([]),
+            None,
+            now,
+            None,
+            Some(successor),
+            Some(now),
+        ));
+        assert_eq!(procedural.superseded_by, Some(successor));
+        assert_eq!(procedural.invalid_at, Some(now));
+
+        let observation = row_to_observation(ObservationRow {
+            id: Uuid::new_v4(),
+            namespace_id,
+            episode_id: Uuid::new_v4(),
+            entity_type: "entity".to_string(),
+            instance: "instance".to_string(),
+            action: "action".to_string(),
+            quantity: None,
+            unit: None,
+            content: "observation".to_string(),
+            embedding_text: None,
+            confidence: 0.9,
+            event_time: None,
+            created_at: now,
+            stability: 1.0,
+            retrievability: 1.0,
+            superseded_by: Some(successor),
+            invalid_at: Some(now),
+        });
+        assert_eq!(observation.superseded_by, Some(successor));
+        assert_eq!(observation.invalid_at, Some(now));
+    }
+
+    use rusqlite::{Connection, params};
 
     fn run_observation_instance_query(
         instances: &[&str],
@@ -1881,7 +2135,8 @@ mod tests {
             "CREATE TABLE observation_memories (
                 namespace_id TEXT NOT NULL,
                 instance TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                superseded_by TEXT
             );",
         )
         .unwrap();

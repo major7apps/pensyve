@@ -118,7 +118,7 @@ async fn start_test_server(dir: &TempDir) -> (String, Arc<AppState>, Cancellatio
     (format!("http://{addr}"), state, cancellation)
 }
 
-async fn remember(client: &reqwest::Client, url: &str, entity: &str, fact: &str) {
+async fn remember(client: &reqwest::Client, url: &str, entity: &str, fact: &str) -> Uuid {
     let response = client
         .post(format!("{url}/v1/remember"))
         .json(&json!({
@@ -131,6 +131,8 @@ async fn remember(client: &reqwest::Client, url: &str, entity: &str, fact: &str)
         .expect("remember request");
 
     assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let body: Value = response.json().await.expect("remember response JSON");
+    Uuid::parse_str(body["id"].as_str().expect("remembered memory id")).expect("valid memory id")
 }
 
 async fn inspect(client: &reqwest::Client, url: &str, entity: &str) -> reqwest::Response {
@@ -140,6 +142,33 @@ async fn inspect(client: &reqwest::Client, url: &str, entity: &str) -> reqwest::
         .send()
         .await
         .expect("inspect request")
+}
+
+async fn inspect_with_history(
+    client: &reqwest::Client,
+    url: &str,
+    entity: &str,
+) -> reqwest::Response {
+    client
+        .post(format!("{url}/v1/inspect"))
+        .json(&json!({ "entity": entity, "include_superseded": true }))
+        .send()
+        .await
+        .expect("inspect history request")
+}
+
+async fn supersede(
+    client: &reqwest::Client,
+    url: &str,
+    id: Uuid,
+    content: &str,
+) -> reqwest::Response {
+    client
+        .post(format!("{url}/v1/memories/{id}/supersede"))
+        .json(&json!({ "content": content, "confidence": 0.95 }))
+        .send()
+        .await
+        .expect("supersede request")
 }
 
 async fn forget(client: &reqwest::Client, url: &str, entity: &str) -> reqwest::Response {
@@ -455,5 +484,173 @@ async fn stats_after_forget_reflect_decremented_memory_counts() {
     assert_eq!(after["semantic_memories"], 1);
     assert_eq!(after["episodic_memories"], 0);
     assert_eq!(after["procedural_memories"], 0);
+    cancellation.cancel();
+}
+
+#[tokio::test]
+async fn supersede_creates_live_replacement_and_excludes_old_from_retrieval_indexes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (url, state, cancellation) = start_test_server(&dir).await;
+    let client = reqwest::Client::new();
+    let old_id = remember(&client, &url, "alice", "legacytoken value").await;
+    let pensyve_state = state
+        .tenant_mgr
+        .get_tenant_state(TEST_TENANT)
+        .expect("tenant state");
+    assert!(
+        pensyve_state
+            .vector_index
+            .read()
+            .await
+            .get(old_id)
+            .is_some()
+    );
+
+    let response = supersede(&client, &url, old_id, "currenttoken value").await;
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let body: Value = response.json().await.expect("supersede response JSON");
+    let new_id =
+        Uuid::parse_str(body["id"].as_str().expect("new memory id")).expect("valid new memory id");
+    assert_ne!(new_id, old_id);
+    assert_eq!(body["superseded"], old_id.to_string());
+    assert_eq!(body["content"], "currenttoken value");
+
+    let old = pensyve_state
+        .storage
+        .get_semantic(old_id)
+        .expect("old lookup")
+        .expect("old row preserved");
+    assert_eq!(old.predicate, "legacytoken");
+    assert_eq!(old.object, "value");
+    assert_eq!(old.superseded_by, Some(new_id));
+    assert!(old.invalid_at.is_some());
+
+    let new = pensyve_state
+        .storage
+        .get_semantic(new_id)
+        .expect("new lookup")
+        .expect("new row exists before old pointer is visible");
+    assert_eq!(new.predicate, "currenttoken");
+    assert_eq!(new.object, "value");
+    assert!(new.superseded_by.is_none());
+    assert!(new.invalid_at.is_none());
+    assert_eq!(new.source_episodes, old.source_episodes);
+    assert!(!new.source_episodes.contains(&old_id));
+
+    let live = pensyve_state
+        .storage
+        .get_all_memories_by_namespace(pensyve_state.namespace.id)
+        .expect("live namespace memories");
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].id(), new_id);
+    assert!(
+        pensyve_state
+            .storage
+            .search_fts("legacytoken", pensyve_state.namespace.id, 10)
+            .expect("old FTS query")
+            .is_empty()
+    );
+    let new_hits = pensyve_state
+        .storage
+        .search_fts("currenttoken", pensyve_state.namespace.id, 10)
+        .expect("new FTS query");
+    assert_eq!(new_hits.len(), 1);
+    assert_eq!(new_hits[0].id(), new_id);
+
+    let vector_index = pensyve_state.vector_index.read().await;
+    assert!(vector_index.get(old_id).is_none());
+    assert!(vector_index.get(new_id).is_some());
+    drop(vector_index);
+    cancellation.cancel();
+}
+
+#[tokio::test]
+async fn superseding_an_already_superseded_memory_returns_conflict() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (url, _state, cancellation) = start_test_server(&dir).await;
+    let client = reqwest::Client::new();
+    let old_id = remember(&client, &url, "alice", "likes tea").await;
+
+    let first = supersede(&client, &url, old_id, "likes coffee").await;
+    assert_eq!(first.status(), reqwest::StatusCode::CREATED);
+    let second = supersede(&client, &url, old_id, "likes water").await;
+    assert_eq!(second.status(), reqwest::StatusCode::CONFLICT);
+    cancellation.cancel();
+}
+
+#[tokio::test]
+async fn patch_delegates_to_supersession_and_preserves_old_content() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (url, state, cancellation) = start_test_server(&dir).await;
+    let client = reqwest::Client::new();
+    let old_id = remember(&client, &url, "alice", "likes tea").await;
+
+    let response = client
+        .patch(format!("{url}/v1/memories/{old_id}"))
+        .json(&json!({ "content": "likes coffee", "confidence": 0.85 }))
+        .send()
+        .await
+        .expect("patch request");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.expect("patch response JSON");
+    let new_id =
+        Uuid::parse_str(body["id"].as_str().expect("new memory id")).expect("valid new memory id");
+    assert_ne!(new_id, old_id);
+    assert_eq!(body["superseded"], old_id.to_string());
+
+    let pensyve_state = state
+        .tenant_mgr
+        .get_tenant_state(TEST_TENANT)
+        .expect("tenant state");
+    let old = pensyve_state
+        .storage
+        .get_semantic(old_id)
+        .expect("old lookup")
+        .expect("old row preserved");
+    assert_eq!(old.object, "tea");
+    assert_eq!(old.superseded_by, Some(new_id));
+    let new = pensyve_state
+        .storage
+        .get_semantic(new_id)
+        .expect("new lookup")
+        .expect("new row");
+    assert_eq!(new.object, "coffee");
+    assert!((new.confidence - 0.85).abs() < f32::EPSILON);
+    cancellation.cancel();
+}
+
+#[tokio::test]
+async fn inspect_include_superseded_surfaces_history_while_default_hides_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (url, _state, cancellation) = start_test_server(&dir).await;
+    let client = reqwest::Client::new();
+    let old_id = remember(&client, &url, "alice", "likes tea").await;
+    let response = supersede(&client, &url, old_id, "likes coffee").await;
+    let response_body: Value = response.json().await.expect("supersede response JSON");
+    let new_id = response_body["id"].as_str().expect("new memory id");
+
+    let default_response = inspect(&client, &url, "alice").await;
+    let default_body: Value = default_response
+        .json()
+        .await
+        .expect("default inspect response");
+    assert_eq!(default_body["semantic"].as_array().map(Vec::len), Some(1));
+    assert_eq!(default_body["semantic"][0]["id"], new_id);
+
+    let history_response = inspect_with_history(&client, &url, "alice").await;
+    let history_body: Value = history_response
+        .json()
+        .await
+        .expect("history inspect response");
+    let memories = history_body["semantic"]
+        .as_array()
+        .expect("semantic history array");
+    assert_eq!(memories.len(), 2);
+    let old = memories
+        .iter()
+        .find(|memory| memory["id"] == old_id.to_string())
+        .expect("old memory in history");
+    assert_eq!(old["superseded_by"], new_id);
+    assert!(!old["invalid_at"].is_null());
     cancellation.cancel();
 }

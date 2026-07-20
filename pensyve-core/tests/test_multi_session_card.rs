@@ -269,6 +269,49 @@ fn returns_none_when_no_entity_crosses_sessions() {
     );
 }
 
+#[test]
+fn superseded_observations_do_not_create_cross_session_entities() {
+    let (_dir, db_path, backend) = open_backend();
+    let ns = Uuid::new_v4();
+    let ns_str = ns.to_string();
+    let seed = Connection::open(&db_path).unwrap();
+
+    insert_obs(
+        &seed,
+        &ns_str,
+        "person",
+        "obsolete-person",
+        "mentioned",
+        "obsolete first mention",
+        Some("2024-01-01T10:00:00Z"),
+        None,
+        None,
+    );
+    insert_obs(
+        &seed,
+        &ns_str,
+        "person",
+        "obsolete-person",
+        "mentioned",
+        "obsolete second mention",
+        Some("2024-02-01T10:00:00Z"),
+        None,
+        None,
+    );
+    seed.execute(
+        "UPDATE observation_memories SET superseded_by = ?1 WHERE instance = ?2",
+        rusqlite::params![Uuid::new_v4().to_string(), "obsolete-person"],
+    )
+    .unwrap();
+    drop(seed);
+
+    let out = MultiSessionCard::new().build("q", backend.as_ref(), ns, None, None, None);
+    assert!(
+        out.is_none(),
+        "superseded observations must not create a cross-session card: {out:?}"
+    );
+}
+
 /// **Single-session-only entities are excluded.** Mix of cross-session
 /// and single-session entities — only the cross-session ones surface.
 #[test]

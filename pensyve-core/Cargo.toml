@@ -24,9 +24,29 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 dirs = "6"
 regex = "1"
-# Pinned to 5.17.2: 5.17.3 breaks cached-model resolution for existing model
-# caches (offline-first regression); see the tracking issue for details.
-fastembed = "=5.17.2"
+# Previously exact-pinned to =5.17.2 after PR #190 attributed a 2/6
+# no-network-invariant-test failure to the 5.17.2 -> 5.17.3 bump. Issue #191
+# re-investigated: fastembed 5.17.2 and 5.17.3 ship byte-identical `.rs`
+# source (verified via `diff -rq` across both crate source trees on
+# crates.io); the only Cargo.toml change is candle-core/candle-nn
+# 0.10.2 -> 0.11.0, gated behind the `qwen3`/`nomic-v2-moe` features this
+# workspace never enables (candle does not appear in this repo's
+# Cargo.lock at all). `cargo update -p fastembed --precise 5.17.3` moves
+# only fastembed's own lockfile entry -- zero transitive dependencies
+# change version. 20+ repeated runs of
+# `cargo test -p pensyve-core --test test_no_network_invariants` against
+# a real seeded cache (default parallel threads, --test-threads=4, and
+# --test-threads=8) were 100% green at 5.17.3, including via the exact
+# Cargo.lock diff PR #173 originally introduced. The original 2/6 failure
+# was never reproduced and was most likely host-specific flakiness (see
+# the latent test race documented in
+# `tests/test_no_network_invariants.rs`) rather than a real fastembed
+# regression -- PR #190's own body already concluded no transitive
+# dependency change could explain it. Unpinned back to a normal caret
+# requirement now that CI runs `test_no_network_invariants` against a
+# seeded cache on every PR (see `.github/workflows/ci.yml`) and will fail
+# the build if cached-model resolution ever regresses again.
+fastembed = "5.17.3"
 petgraph = "0.8"
 # Phase 2B: compile-time predicate-verb lexicon for the shallow dependency
 # parser (`extraction::dep_parse`). `phf::Map` keys are interned at build
@@ -40,7 +60,9 @@ async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 sqlx-core = { version = "0.9.0", features = ["_rt-tokio", "_tls-rustls-aws-lc-rs", "json", "chrono", "uuid"], optional = true }
 sqlx-postgres = { version = "0.9.0", features = ["json", "chrono", "uuid"], optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"], optional = true }
+# Retry backoff is always compiled; its async callers already run inside the gateway's
+# Tokio runtime, so `tokio::time::sleep` cannot panic outside a runtime in production.
+tokio = { version = "1", features = ["time"] }
 # `CancellationToken` for cooperative cancellation of long-running operators.
 # Plumbed through `ConsolidationEngine::run` and the LocalLLM extractors in
 # G1/P3-P4. Landed unconditionally (rather than feature-gated) so the same
@@ -54,16 +76,16 @@ futures = { version = "0.3", default-features = false, features = ["std", "async
 
 [features]
 default = []
-postgres = ["dep:sqlx-core", "dep:sqlx-postgres", "dep:tokio"]
+postgres = ["dep:sqlx-core", "dep:sqlx-postgres", "tokio/rt-multi-thread"]
 # Local-LLM-backed observation extractor (`LocalLLMExtractor`,
 # `BatchedLocalLLMExtractor`) + the tolerant JSON parser + cached-bulk
 # replay wrapper. Targets an OpenAI-compatible vLLM endpoint.
-observation-extraction = ["dep:reqwest", "dep:tokio", "dep:futures"]
+observation-extraction = ["dep:reqwest", "dep:futures", "tokio/macros", "tokio/sync"]
 
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.8", features = ["html_reports"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
 wiremock = "0.6"
 
 [lints]

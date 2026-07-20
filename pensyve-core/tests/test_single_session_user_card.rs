@@ -324,6 +324,49 @@ fn fewer_sessions_than_n_returns_available_facts() {
     assert!(card.contains("session-2 standing fact"));
 }
 
+#[test]
+fn superseded_observations_do_not_displace_live_session_facts() {
+    let _guard = SsuEnvGuard::set("1");
+    let (_dir, db_path, backend) = make_backend();
+    let ns = Uuid::new_v4();
+    let ns_str = ns.to_string();
+
+    seed_row(
+        &db_path,
+        &ns_str,
+        None,
+        None,
+        "stated",
+        "live-fact",
+        "live older fact",
+        "2024-01-01T10:00:00Z",
+    );
+    seed_row(
+        &db_path,
+        &ns_str,
+        None,
+        None,
+        "stated",
+        "obsolete-fact",
+        "obsolete newer fact",
+        "2024-02-01T10:00:00Z",
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE observation_memories SET superseded_by = ?1 WHERE content = ?2",
+        rusqlite::params![Uuid::new_v4().to_string(), "obsolete newer fact"],
+    )
+    .unwrap();
+    drop(conn);
+
+    let card = SingleSessionUserCard::new()
+        .build("q", backend.as_ref(), ns, None, None, None)
+        .expect("the live session fact should remain visible");
+    assert!(card.contains("live older fact"), "card was: {card}");
+    assert!(!card.contains("obsolete newer fact"), "card was: {card}");
+}
+
 /// Empty store yields `None` (defer-on-failure path).
 #[test]
 fn empty_store_returns_none() {

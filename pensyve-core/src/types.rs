@@ -335,6 +335,9 @@ pub struct EpisodicMemory {
     /// If this memory was superseded by a newer one, its ID.
     #[serde(default)]
     pub superseded_by: Option<Uuid>,
+    /// When this memory stopped being valid because it was superseded.
+    #[serde(default)]
+    pub invalid_at: Option<DateTime<Utc>>,
     /// Multi-tenant agent scope (G1). NULL = legacy unscoped row.
     #[serde(default)]
     pub agent_id: Option<Uuid>,
@@ -375,6 +378,7 @@ impl EpisodicMemory {
             storage_strength: 0.0,
             event_time: None,
             superseded_by: None,
+            invalid_at: None,
             agent_id: None,
             user_id: None,
         }
@@ -400,6 +404,9 @@ pub struct SemanticMemory {
     pub confidence: f32,
     pub valid_at: DateTime<Utc>,
     pub invalid_at: Option<DateTime<Utc>>,
+    /// If this memory was superseded by a newer one, its ID.
+    #[serde(default)]
+    pub superseded_by: Option<Uuid>,
     pub source_episodes: Vec<Uuid>,
     pub embedding: Vec<f32>,
     pub stability: f32,
@@ -431,6 +438,7 @@ impl SemanticMemory {
             confidence,
             valid_at: Utc::now(),
             invalid_at: None,
+            superseded_by: None,
             source_episodes: Vec::new(),
             embedding: Vec::new(),
             stability: 1.0,
@@ -461,6 +469,12 @@ pub struct ProceduralMemory {
     pub embedding: Vec<f32>,
     pub created_at: DateTime<Utc>,
     pub last_used: Option<DateTime<Utc>>,
+    /// If this memory was superseded by a newer one, its ID.
+    #[serde(default)]
+    pub superseded_by: Option<Uuid>,
+    /// When this memory stopped being valid because it was superseded.
+    #[serde(default)]
+    pub invalid_at: Option<DateTime<Utc>>,
     /// Multi-tenant agent scope (G1). NULL = legacy unscoped row.
     #[serde(default)]
     pub agent_id: Option<Uuid>,
@@ -496,6 +510,8 @@ impl ProceduralMemory {
             embedding: Vec::new(),
             created_at: Utc::now(),
             last_used: None,
+            superseded_by: None,
+            invalid_at: None,
             agent_id: None,
             user_id: None,
         }
@@ -567,6 +583,14 @@ pub struct ObservationMemory {
     /// Retrievability in [0, 1]; starts at 1.0 and decays with disuse.
     pub retrievability: f32,
 
+    /// If this memory was superseded by a newer one, its ID.
+    #[serde(default)]
+    pub superseded_by: Option<Uuid>,
+
+    /// When this memory stopped being valid because it was superseded.
+    #[serde(default)]
+    pub invalid_at: Option<DateTime<Utc>>,
+
     /// Multi-tenant agent scope (G1). NULL = legacy unscoped row.
     #[serde(default)]
     pub agent_id: Option<Uuid>,
@@ -601,6 +625,8 @@ impl ObservationMemory {
             created_at: Utc::now(),
             stability: 1.0,
             retrievability: 1.0,
+            superseded_by: None,
+            invalid_at: None,
             agent_id: None,
             user_id: None,
         }

@@ -270,6 +270,22 @@ pub trait StorageTrait: Send + Sync {
     // Bulk
     fn get_all_memories_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Memory>>;
 
+    /// Fetch all memories, including superseded history, for audit/inspect paths.
+    fn get_all_memories_by_namespace_including_superseded(
+        &self,
+        namespace_id: Uuid,
+    ) -> StorageResult<Vec<Memory>> {
+        self.get_all_memories_by_namespace(namespace_id)
+    }
+
+    /// Mark a live memory as superseded. Returns `false` when no live row matched.
+    fn supersede_memory(
+        &self,
+        id: Uuid,
+        superseded_by: Uuid,
+        invalid_at: DateTime<Utc>,
+    ) -> StorageResult<bool>;
+
     // Deletion
     fn delete_memories_by_entity(&self, entity_id: Uuid) -> StorageResult<usize>;
 
