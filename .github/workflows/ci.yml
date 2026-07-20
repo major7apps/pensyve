@@ -155,10 +155,11 @@ jobs:
         # network namespace leaves the test process with no external interfaces;
         # the proxy variables are a second fail-fast guard for proxy-aware clients.
         env:
+          # actionlint rejects case-duplicate keys, so only the uppercase pair is
+          # declared here; the lowercase aliases most curl-family clients read are
+          # set on the inner `env` invocation below.
           HTTP_PROXY: http://127.0.0.1:9
           HTTPS_PROXY: http://127.0.0.1:9
-          http_proxy: http://127.0.0.1:9
-          https_proxy: http://127.0.0.1:9
         run: |
           sudo unshare --net -- sudo -u "$USER" -E env \
             HOME="$HOME" \
@@ -168,8 +169,8 @@ jobs:
             PATH="$PATH" \
             HTTP_PROXY="$HTTP_PROXY" \
             HTTPS_PROXY="$HTTPS_PROXY" \
-            http_proxy="$http_proxy" \
-            https_proxy="$https_proxy" \
+            http_proxy="$HTTP_PROXY" \
+            https_proxy="$HTTPS_PROXY" \
             cargo test -p pensyve-core --test test_no_network_invariants
 
   test-python:
