@@ -36,6 +36,12 @@ pub enum StorageError {
 
 pub type StorageResult<T> = Result<T, StorageError>;
 
+fn scoped_delete_not_implemented() -> StorageResult<bool> {
+    Err(StorageError::Context(
+        "storage backend does not implement atomic scoped deletion".to_string(),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // StorageTrait
 // ---------------------------------------------------------------------------
@@ -294,22 +300,15 @@ pub trait StorageTrait: Send + Sync {
 
     /// Delete a single memory only when it belongs to `namespace_id`.
     ///
-    /// Backends should override this with an atomic namespace-qualified delete.
-    /// The default preserves compatibility for third-party backends while still
-    /// preventing an obvious cross-namespace delete.
+    /// Backends must override this with an atomic namespace-qualified delete.
+    /// The default preserves source compatibility for third-party backends but
+    /// fails closed rather than falling back to an unscoped delete.
     fn delete_memory_by_id_in_namespace(
         &self,
-        id: Uuid,
-        namespace_id: Uuid,
+        _id: Uuid,
+        _namespace_id: Uuid,
     ) -> StorageResult<bool> {
-        let belongs_to_namespace = self
-            .get_all_memories_by_namespace(namespace_id)?
-            .iter()
-            .any(|memory| memory.id() == id);
-        if !belongs_to_namespace {
-            return Ok(false);
-        }
-        self.delete_memory_by_id(id)
+        scoped_delete_not_implemented()
     }
 
     /// Delete all memories in a namespace. Returns the count of deleted memories.
@@ -456,4 +455,17 @@ pub fn memory_matches_scope(
         None => row_user.is_none(),
     };
     agent_match && user_match
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoped_delete_not_implemented_fails_closed() {
+        let error = scoped_delete_not_implemented().unwrap_err();
+
+        assert!(matches!(error, StorageError::Context(_)));
+        assert!(error.to_string().contains("atomic scoped deletion"));
+    }
 }

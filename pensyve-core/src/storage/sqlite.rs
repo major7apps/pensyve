@@ -702,11 +702,12 @@ fn delete_memory_by_id_with_namespace(
     id: Uuid,
     namespace_id: Option<Uuid>,
 ) -> StorageResult<bool> {
+    let transaction = conn.unchecked_transaction()?;
     let id_str = id.to_string();
     let namespace_id = namespace_id.map(|namespace_id| namespace_id.to_string());
     let mut deleted = false;
 
-    let n = conn.execute(
+    let n = transaction.execute(
         "DELETE FROM episodic_memories
          WHERE id = ?1 AND (?2 IS NULL OR namespace_id = ?2)",
         params![&id_str, namespace_id.as_deref()],
@@ -715,7 +716,7 @@ fn delete_memory_by_id_with_namespace(
         deleted = true;
     }
 
-    let n = conn.execute(
+    let n = transaction.execute(
         "DELETE FROM semantic_memories
          WHERE id = ?1 AND (?2 IS NULL OR namespace_id = ?2)",
         params![&id_str, namespace_id.as_deref()],
@@ -724,7 +725,7 @@ fn delete_memory_by_id_with_namespace(
         deleted = true;
     }
 
-    let n = conn.execute(
+    let n = transaction.execute(
         "DELETE FROM procedural_memories
          WHERE id = ?1 AND (?2 IS NULL OR namespace_id = ?2)",
         params![&id_str, namespace_id.as_deref()],
@@ -733,7 +734,7 @@ fn delete_memory_by_id_with_namespace(
         deleted = true;
     }
 
-    let n = conn.execute(
+    let n = transaction.execute(
         "DELETE FROM observation_memories
          WHERE id = ?1 AND (?2 IS NULL OR namespace_id = ?2)",
         params![&id_str, namespace_id.as_deref()],
@@ -741,12 +742,12 @@ fn delete_memory_by_id_with_namespace(
     if n > 0 {
         deleted = true;
         // Observations are the only memory type represented in the KG tables.
-        conn.execute(
+        transaction.execute(
             "DELETE FROM kg_triples
              WHERE passage_id = ?1 AND (?2 IS NULL OR namespace_id = ?2)",
             params![&id_str, namespace_id.as_deref()],
         )?;
-        conn.execute(
+        transaction.execute(
             "DELETE FROM kg_passage_entities
              WHERE passage_id = ?1
                AND (
@@ -760,13 +761,14 @@ fn delete_memory_by_id_with_namespace(
     }
 
     if deleted {
-        conn.execute(
+        transaction.execute(
             "DELETE FROM memory_fts
              WHERE memory_id = ?1 AND (?2 IS NULL OR namespace_id = ?2)",
             params![&id_str, namespace_id.as_deref()],
         )?;
     }
 
+    transaction.commit()?;
     Ok(deleted)
 }
 
@@ -3949,6 +3951,45 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id(), shared_id);
+    }
+
+    #[test]
+    fn test_delete_memory_by_id_in_namespace_rolls_back_partial_delete() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let shared_id = Uuid::new_v4();
+
+        let mut episodic = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "must survive rollback",
+        );
+        episodic.id = shared_id;
+        db.save_episodic(&episodic).unwrap();
+
+        let mut semantic = SemanticMemory::new(ns.id, Uuid::new_v4(), "must", "also survive", 0.9);
+        semantic.id = shared_id;
+        db.save_semantic(&semantic).unwrap();
+
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_scoped_semantic_delete
+                 BEFORE DELETE ON semantic_memories
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced rollback');
+                 END;",
+            )
+            .unwrap();
+        }
+
+        let result = db.delete_memory_by_id_in_namespace(shared_id, ns.id);
+
+        assert!(result.is_err());
+        assert!(db.get_episodic(shared_id).unwrap().is_some());
+        assert!(db.get_semantic(shared_id).unwrap().is_some());
     }
 
     #[test]
