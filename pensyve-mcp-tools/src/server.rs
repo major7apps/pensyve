@@ -15,8 +15,7 @@ use pensyve_core::types::{
 
 use crate::params::{
     AccountParams, EpisodeEndParams, EpisodeStartParams, ForgetMemoryParams, ForgetParams,
-    InspectParams,
-    ObserveParams, RecallParams, RememberParams, StatusParams,
+    InspectParams, ObserveParams, RecallParams, RememberParams, StatusParams,
 };
 use crate::state::PensyveState;
 
@@ -532,7 +531,9 @@ impl PensyveMcpServer {
     /// Delete memories for an entity.
     #[tool(
         name = "pensyve_forget",
-        description = "PERMANENTLY delete ALL memories associated with an entity — entity-wide and irreversible. To retract a single memory, use pensyve_forget_memory instead. Returns the count of forgotten memories."
+        description = "PERMANENTLY delete ALL memories associated with an entity — entity-wide \
+                       and irreversible. To retract a single memory, use pensyve_forget_memory \
+                       instead. Returns the count of forgotten memories."
     )]
     async fn forget(&self, Parameters(params): Parameters<ForgetParams>) -> Result<String, String> {
         check_scope(&self.scope, "pensyve_forget")?;
@@ -593,7 +594,9 @@ impl PensyveMcpServer {
     /// Delete a single memory by id.
     #[tool(
         name = "pensyve_forget_memory",
-        description = "Permanently delete ONE memory by its id (as returned by pensyve_inspect or pensyve_recall). The safe, scoped alternative to pensyve_forget. Returns whether a memory was deleted."
+        description = "Permanently delete ONE memory by its id (as returned by pensyve_inspect or \
+                       pensyve_recall). The safe, scoped alternative to pensyve_forget. Returns \
+                       whether a memory was deleted."
     )]
     async fn forget_memory(
         &self,
@@ -607,7 +610,7 @@ impl PensyveMcpServer {
 
         let deleted = state
             .storage
-            .delete_memory_by_id(memory_id)
+            .delete_memory_by_id_in_namespace(memory_id, state.namespace.id)
             .map_err(|err| format!("Error deleting memory: {err}"))?;
 
         if deleted {

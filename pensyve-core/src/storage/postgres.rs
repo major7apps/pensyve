@@ -1510,6 +1510,67 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    fn delete_memory_by_id_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<bool> {
+        self.block_on(async {
+            let mut conn = self.maybe_scoped_conn().await?;
+            let mut deleted = false;
+
+            let result = query::<Postgres>(
+                "DELETE FROM episodic_memories WHERE id = $1 AND namespace_id = $2",
+            )
+            .bind(id)
+            .bind(namespace_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            if result.rows_affected() > 0 {
+                deleted = true;
+            }
+
+            let result = query::<Postgres>(
+                "DELETE FROM semantic_memories WHERE id = $1 AND namespace_id = $2",
+            )
+            .bind(id)
+            .bind(namespace_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            if result.rows_affected() > 0 {
+                deleted = true;
+            }
+
+            let result = query::<Postgres>(
+                "DELETE FROM procedural_memories WHERE id = $1 AND namespace_id = $2",
+            )
+            .bind(id)
+            .bind(namespace_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            if result.rows_affected() > 0 {
+                deleted = true;
+            }
+
+            let result = query::<Postgres>(
+                "DELETE FROM observation_memories WHERE id = $1 AND namespace_id = $2",
+            )
+            .bind(id)
+            .bind(namespace_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            if result.rows_affected() > 0 {
+                deleted = true;
+            }
+
+            Ok(deleted)
+        })
+    }
+
     fn update_semantic_content(
         &self,
         id: Uuid,

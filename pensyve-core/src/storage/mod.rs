@@ -292,6 +292,26 @@ pub trait StorageTrait: Send + Sync {
     /// Delete a single memory by its UUID (episodic, semantic, or procedural).
     fn delete_memory_by_id(&self, id: Uuid) -> StorageResult<bool>;
 
+    /// Delete a single memory only when it belongs to `namespace_id`.
+    ///
+    /// Backends should override this with an atomic namespace-qualified delete.
+    /// The default preserves compatibility for third-party backends while still
+    /// preventing an obvious cross-namespace delete.
+    fn delete_memory_by_id_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<bool> {
+        let belongs_to_namespace = self
+            .get_all_memories_by_namespace(namespace_id)?
+            .iter()
+            .any(|memory| memory.id() == id);
+        if !belongs_to_namespace {
+            return Ok(false);
+        }
+        self.delete_memory_by_id(id)
+    }
+
     /// Delete all memories in a namespace. Returns the count of deleted memories.
     fn purge_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
         // Default: fall back to loading + deleting one by one.

@@ -195,7 +195,7 @@ async fn test_mcp_tools_list() {
     let text = resp.text().await.unwrap();
     let json: serde_json::Value = serde_json::from_str(&text).expect("parse json");
     let tools = json["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 9, "Expected 9 tools");
+    assert_eq!(tools.len(), 10, "Expected 10 tools");
 
     // Verify all tool names.
     let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -204,10 +204,87 @@ async fn test_mcp_tools_list() {
     assert!(tool_names.contains(&"pensyve_episode_start"));
     assert!(tool_names.contains(&"pensyve_episode_end"));
     assert!(tool_names.contains(&"pensyve_forget"));
+    assert!(tool_names.contains(&"pensyve_forget_memory"));
     assert!(tool_names.contains(&"pensyve_inspect"));
     assert!(tool_names.contains(&"pensyve_status"));
     assert!(tool_names.contains(&"pensyve_account"));
     assert!(tool_names.contains(&"pensyve_observe"));
+
+    ct.cancel();
+}
+
+#[tokio::test]
+async fn test_mcp_forget_memory_rejects_foreign_namespace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = create_test_state(&dir);
+    let foreign_namespace = Namespace::new("foreign");
+    state
+        .storage
+        .save_namespace(&foreign_namespace)
+        .expect("save foreign namespace");
+    let foreign_memory = ObservationMemory::new(
+        foreign_namespace.id,
+        uuid::Uuid::new_v4(),
+        "thing",
+        "foreign",
+        "did",
+        "must survive",
+    );
+    state
+        .storage
+        .save_observation(&foreign_memory)
+        .expect("save foreign memory");
+
+    let (url, ct) = start_test_server(state.clone()).await;
+    let client = reqwest::Client::new();
+    client
+        .post(format!("{url}/mcp"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(json_rpc(
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "0.1.0" }
+            }),
+            1,
+        ))
+        .send()
+        .await
+        .expect("init");
+
+    let resp = client
+        .post(format!("{url}/mcp"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(json_rpc(
+            "tools/call",
+            serde_json::json!({
+                "name": "pensyve_forget_memory",
+                "arguments": { "memory_id": foreign_memory.id.to_string() }
+            }),
+            2,
+        ))
+        .send()
+        .await
+        .expect("forget foreign memory");
+
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).expect("parse json");
+    let result_text = json["result"]["content"][0]["text"]
+        .as_str()
+        .expect("result text");
+    let result: serde_json::Value = serde_json::from_str(result_text).expect("parse result");
+    assert_eq!(result["deleted"], false);
+    assert!(
+        state
+            .storage
+            .get_observation(foreign_memory.id)
+            .expect("load foreign memory")
+            .is_some()
+    );
 
     ct.cancel();
 }
