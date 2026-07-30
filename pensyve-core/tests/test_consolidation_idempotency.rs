@@ -136,6 +136,12 @@ fn guard_does_not_collapse_distinct_entities() {
 
 /// A genuinely new cluster still promotes after earlier runs have populated
 /// the namespace — the guard suppresses duplicates, not new knowledge.
+///
+/// The second cluster is deliberately filed under the *same* entity as the
+/// first. That pins the content half of the key: a guard keyed on
+/// `about_entity` alone would treat this entity as already promoted and skip
+/// it, so this case fails against an entity-only guard while
+/// `guard_does_not_collapse_distinct_entities` pins the entity half.
 #[test]
 fn new_clusters_still_promote_after_prior_runs() {
     let tmp = TempDir::new().unwrap();
@@ -158,10 +164,9 @@ fn new_clusters_still_promote_after_prior_runs() {
     assert_eq!(run_once(&storage, &embedder, ns.id), 1);
     assert_eq!(run_once(&storage, &embedder, ns.id), 0);
 
-    // New entity arrives after the namespace already holds a promotion.
-    let entity_b = Uuid::new_v4();
+    // A different fact arrives for an entity that already holds a promotion.
     for i in 0..2 {
-        let mut mem = EpisodicMemory::new(ns.id, episode.id, source_id, entity_b, "uses fish");
+        let mut mem = EpisodicMemory::new(ns.id, episode.id, source_id, entity_a, "uses fish");
         mem.embedding = embedder.embed(&mem.content).unwrap();
         mem.timestamp = Utc::now() - chrono::Duration::seconds(i);
         storage.save_episodic(&mem).unwrap();
