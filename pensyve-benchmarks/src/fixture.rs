@@ -129,4 +129,39 @@ mod tests {
         let entities: HashSet<&str> = corpus.memories.iter().map(|m| m.entity.as_str()).collect();
         assert_eq!(entities.len(), 5);
     }
+
+    #[test]
+    fn test_query_set_size_and_composition() {
+        let corpus = load_corpus();
+        assert!(
+            corpus.queries.len() >= 60,
+            "expected at least 60 queries, found {}",
+            corpus.queries.len()
+        );
+        let paraphrase_count = corpus
+            .queries
+            .iter()
+            .filter(|q| q.kind == "paraphrase")
+            .count();
+        assert!(
+            paraphrase_count >= 50,
+            "expected at least 50 paraphrase queries, found {paraphrase_count}"
+        );
+        let has_parquet_audit_query = corpus.queries.iter().any(|q| {
+            q.query == "arrow parquet reader benchmark speed"
+                && q.gold_keys == vec!["bob-parquet-bench".to_string()]
+        });
+        assert!(
+            has_parquet_audit_query,
+            "missing audit query 'arrow parquet reader benchmark speed' -> bob-parquet-bench"
+        );
+        let has_rollback_audit_query = corpus.queries.iter().any(|q| {
+            q.query == "rollback when p99 exceeds threshold"
+                && q.gold_keys == vec!["deploy-p99-rollback".to_string()]
+        });
+        assert!(
+            has_rollback_audit_query,
+            "missing audit query 'rollback when p99 exceeds threshold' -> deploy-p99-rollback"
+        );
+    }
 }

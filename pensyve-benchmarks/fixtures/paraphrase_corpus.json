@@ -1751,5 +1751,306 @@
       "confidence": 1.0
     }
   ],
-  "queries": []
+  "queries": [
+    {
+      "query": "how fast is bob's parquet reader",
+      "gold_keys": ["bob-parquet-bench"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "which async runtime setup does bob suggest for the data intake pipeline",
+      "gold_keys": ["bob-recommends-tokio-s-multi-03"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what did bob identify as the biggest slowdown once simultaneous writes climbed past two dozen",
+      "gold_keys": ["bob-measured-mutex-contention-becoming-04"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "which embedded database does bob favor when queries mostly scan large tables",
+      "gold_keys": ["bob-prefers-duckdb-over-sqlite-05"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what search parameter, when set too low, hurts bob's vector index accuracy",
+      "gold_keys": ["bob-discovered-hnsw-recall-drops-06"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "roughly how much traffic can the gateway handle before it maxes out, per bob's testing",
+      "gold_keys": ["bob-s-load-test-showed-12"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "why did bob move the caching system to a different tool that has built-in messaging",
+      "gold_keys": ["bob-switched-cache-layer-from-13"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how did bob get rid of garbage-collector pauses in the critical code path",
+      "gold_keys": ["bob-found-avoiding-heap-allocations-15"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "which data format does bob favor when schemas need to change across services over time",
+      "gold_keys": ["bob-recommends-protobuf-over-avro-20"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "where did bob trace an unexpected memory-usage bug back to",
+      "gold_keys": ["bob-discovered-memory-leak-traced-27"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "which trek does alice enjoy most near the reservoir and how long does it take",
+      "gold_keys": ["alice-s-favorite-hiking-trail-02"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "why did alice change her morning coffee brewing method to something less of a hassle to wash",
+      "gold_keys": ["alice-switched-from-french-press-03"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how long has alice been growing her own bread starter",
+      "gold_keys": ["alice-keeps-sourdough-starter-she-04"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how often does alice go jogging and which day does she take off",
+      "gold_keys": ["alice-runs-three-mornings-week-06"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "which plants thrive for alice outdoors and which one won't survive",
+      "gold_keys": ["alice-grows-basil-rosemary-her-09"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "why does alice pick a specific airplane seat for napping",
+      "gold_keys": ["alice-prefers-window-seats-flights-11"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what skill did alice pick up so she could repair her own keyboard",
+      "gold_keys": ["alice-learned-solder-so-she-13"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what display trick does alice use to curb compulsive phone checking",
+      "gold_keys": ["alice-keeps-her-phone-grayscale-15"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what equipment change did alice make at her desk after hurting her wrist",
+      "gold_keys": ["alice-s-desk-setup-uses-18"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how often and where does alice spend time volunteering with plants",
+      "gold_keys": ["alice-volunteers-community-garden-first-19"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how many sign-offs are needed before a payments-related change can ship",
+      "gold_keys": ["deploy-pipeline-requires-two-approvals-any-03"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what test coverage threshold prevents code from merging into the main branch",
+      "gold_keys": ["deploy-pipeline-blocks-merges-main-if-04"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what zero-downtime release strategy is used for the gateway service",
+      "gold_keys": ["deploy-pipeline-uses-blue-green-deployment-06"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "under what failure-rate condition does the system alert whoever is on duty",
+      "gold_keys": ["deploy-pipeline-pages-call-engineer-if-07"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "when during the week does the release process pause shipping changes",
+      "gold_keys": ["deploy-pipeline-freezes-deployments-during-last-09"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how was container build duration shortened",
+      "gold_keys": ["deploy-pipeline-caches-docker-layers-cut-12"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how does the team get notified whenever something ships to production",
+      "gold_keys": ["deploy-pipeline-sends-slack-notification-team-14"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how many prior working builds are kept on hand for quick reverting",
+      "gold_keys": ["deploy-pipeline-stores-last-five-successful-18"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how often is failure-injection testing done to confirm automatic recovery works",
+      "gold_keys": ["deploy-pipeline-runs-chaos-experiments-quarterly-26"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "where must credentials be sourced from instead of config files",
+      "gold_keys": ["deploy-pipeline-requires-all-secrets-be-30"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how long is acme's deal with its main cloud provider and when was it signed",
+      "gold_keys": ["acme-corp-signed-three-year-enterprise-01"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "by how much did the size of acme's engineering team increase last year",
+      "gold_keys": ["acme-corp-s-engineering-headcount-grew-02"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "why did acme downsize its main office space",
+      "gold_keys": ["acme-corp-moved-its-headquarters-smaller-03"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what company did acme buy to build its own reporting features",
+      "gold_keys": ["acme-corp-acquired-small-analytics-startup-05"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what was acme's yearly subscription income milestone recently",
+      "gold_keys": ["acme-corp-s-annual-recurring-revenue-07"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how did revamping the new-user setup affect customer cancellations at acme",
+      "gold_keys": ["acme-corp-s-churn-rate-dropped-10"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "which older self-hosted product is acme planning to retire",
+      "gold_keys": ["acme-corp-s-leadership-decided-sunset-11"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how quickly must customer records be deleted once an account closes",
+      "gold_keys": ["acme-corp-s-data-retention-policy-13"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how many bids does acme need before approving a large purchase",
+      "gold_keys": ["acme-corp-s-procurement-process-now-15"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what happened to acme's Texas office once its lease ran out",
+      "gold_keys": ["acme-corp-s-office-austin-closed-23"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "which retrieval approach wins for uncommon proper-noun lookups according to the study",
+      "gold_keys": ["research-notes-show-hybrid-search-outperforms-02"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what limitation undermines the credibility of the component-removal experiment",
+      "gold_keys": ["research-notes-flag-ablation-study-used-03"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what training technique is cited as boosting low-data classification performance",
+      "gold_keys": ["research-notes-cite-paper-showing-contrastive-05"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what statistical check should happen before claiming a performance gain",
+      "gold_keys": ["research-notes-recommend-running-significance-tests-07"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what measurement artifact appeared from grouping requests together while testing",
+      "gold_keys": ["research-notes-highlight-batching-queries-during-09"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how did adjusting the proportion of negative examples affect training stability",
+      "gold_keys": ["research-notes-track-increasing-negative-sampling-11"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what gain resulted from including difficult counterexamples during training",
+      "gold_keys": ["research-notes-document-adding-hard-negatives-21"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what unwanted tendency does the evaluator model have regarding answer length",
+      "gold_keys": ["research-notes-note-current-judge-model-22"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what contamination problem was found between evaluation and training sets",
+      "gold_keys": ["research-notes-flag-data-leakage-issue-29"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what tradeoff appears when limiting search to one entity versus searching across entities",
+      "gold_keys": ["research-notes-note-entity-scoped-search-33"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "arrow parquet reader benchmark speed",
+      "gold_keys": ["bob-parquet-bench"],
+      "kind": "lexical"
+    },
+    {
+      "query": "rollback when p99 exceeds threshold",
+      "gold_keys": ["deploy-p99-rollback"],
+      "kind": "lexical"
+    },
+    {
+      "query": "switching from JSON to rkyv cut p50 latency by 60%",
+      "gold_keys": ["bob-found-switching-from-json-02"],
+      "kind": "lexical"
+    },
+    {
+      "query": "Bob set up CI pipeline to run clippy with pedantic lint group enabled",
+      "gold_keys": ["bob-set-up-ci-pipeline-07"],
+      "kind": "lexical"
+    },
+    {
+      "query": "Alice's titanium card wallet survives being dropped without denting",
+      "gold_keys": ["alice-titanium-wallet"],
+      "kind": "lexical"
+    },
+    {
+      "query": "Acme Corp SOC 2 Type II certification after six-month audit",
+      "gold_keys": ["acme-soc2-cert"],
+      "kind": "lexical"
+    },
+    {
+      "query": "reranker model improves nDCG@10 by 8 points over base retriever",
+      "gold_keys": ["research-rrf-vs-linear"],
+      "kind": "lexical"
+    },
+    {
+      "query": "deploy pipeline runs integration tests against staging replica before production",
+      "gold_keys": ["deploy-pipeline-runs-integration-tests-against-02"],
+      "kind": "lexical"
+    },
+    {
+      "query": "Bob's flamegraph profiling showed 30% CPU time in serde_json parsing",
+      "gold_keys": ["bob-s-flamegraph-profiling-showed-08"],
+      "kind": "lexical"
+    },
+    {
+      "query": "Alice's cat Pixel only eats wet food, ignores dry kibble",
+      "gold_keys": ["alice-s-cat-pixel-only-07"],
+      "kind": "lexical"
+    }
+  ]
 }
