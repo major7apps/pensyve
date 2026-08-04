@@ -147,6 +147,23 @@ impl PensyveMcpServer {
             .ok()
             .and_then(Result::ok);
 
+        // Resolve the reranker off the runtime too, and before the read
+        // lock: first resolution synchronously loads a ~280MB ONNX model
+        // (or blocks on a failed network attempt), and
+        // `OnceLock::get_or_init` blocks every concurrent caller until it
+        // completes — see `PensyveState::reranker`'s docs. Running it on a
+        // tokio worker thread would stall the runtime; running it under the
+        // vector index lock would stall every other recall on this tenant.
+        let reranker_cell = state.reranker_cell.clone();
+        let reranker = tokio::task::spawn_blocking(move || {
+            PensyveState::resolve_reranker_cell(&reranker_cell)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("Reranker resolution task panicked ({e}); recall proceeding unreranked");
+            None
+        });
+
         // Hold the read lock only for the retrieval phase, not embedding or serialization.
         let result = {
             let vector_index = state.vector_index.read().await;
@@ -156,7 +173,6 @@ impl PensyveMcpServer {
                 &vector_index,
                 &state.retrieval_config,
             );
-            let reranker = state.reranker();
             if let Some(r) = reranker.as_deref() {
                 engine = engine.with_reranker(r);
             }

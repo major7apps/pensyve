@@ -827,6 +827,24 @@ async fn recall(
         .ok()
         .and_then(Result::ok);
 
+    // Resolve the reranker off the runtime too, and before the read lock:
+    // first resolution synchronously loads a ~280MB ONNX model (or blocks on
+    // a failed network attempt), and `OnceLock::get_or_init` blocks every
+    // concurrent caller until it completes — see `PensyveState::reranker`'s
+    // docs. Running it on a tokio worker thread would stall the runtime;
+    // running it under the vector index lock would stall every other recall
+    // on this tenant.
+    let reranker_cell = ps.reranker_cell.clone();
+    let reranker =
+        tokio::task::spawn_blocking(move || PensyveState::resolve_reranker_cell(&reranker_cell))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "Reranker resolution task panicked ({e}); recall proceeding unreranked"
+                );
+                None
+            });
+
     // Hold read lock only for retrieval — allows concurrent recalls.
     let result = {
         let vector_index = ps.vector_index.read().await;
@@ -836,7 +854,6 @@ async fn recall(
             &vector_index,
             &ps.retrieval_config,
         );
-        let reranker = ps.reranker();
         if let Some(r) = reranker.as_deref() {
             engine = engine.with_reranker(r);
         }
@@ -917,6 +934,19 @@ async fn recall_grouped(
         .ok()
         .and_then(Result::ok);
 
+    // Resolve the reranker off the runtime too, and before the read lock —
+    // see the identical rationale in `recall` above.
+    let reranker_cell = ps.reranker_cell.clone();
+    let reranker =
+        tokio::task::spawn_blocking(move || PensyveState::resolve_reranker_cell(&reranker_cell))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "Reranker resolution task panicked ({e}); recall proceeding unreranked"
+                );
+                None
+            });
+
     // Hold the read lock only for the actual retrieval call.
     let result = {
         let vector_index = ps.vector_index.read().await;
@@ -926,7 +956,6 @@ async fn recall_grouped(
             &vector_index,
             &ps.retrieval_config,
         );
-        let reranker = ps.reranker();
         if let Some(r) = reranker.as_deref() {
             engine = engine.with_reranker(r);
         }
@@ -2165,6 +2194,19 @@ async fn a2a_recall(
         .ok()
         .and_then(Result::ok);
 
+    // Resolve the reranker off the runtime too, and before the read lock —
+    // see the identical rationale in `recall` above.
+    let reranker_cell = ps.reranker_cell.clone();
+    let reranker =
+        tokio::task::spawn_blocking(move || PensyveState::resolve_reranker_cell(&reranker_cell))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "Reranker resolution task panicked ({e}); recall proceeding unreranked"
+                );
+                None
+            });
+
     let vector_index = ps.vector_index.read().await;
     let mut engine = RecallEngine::new(
         ps.storage.as_ref(),
@@ -2172,7 +2214,6 @@ async fn a2a_recall(
         &vector_index,
         &ps.retrieval_config,
     );
-    let reranker = ps.reranker();
     if let Some(r) = reranker.as_deref() {
         engine = engine.with_reranker(r);
     }

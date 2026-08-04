@@ -41,8 +41,31 @@ impl PensyveState {
     /// the cached result on every subsequent call. `None` means either
     /// `PENSYVE_RERANKER=0` was set or the model failed to load; either way
     /// callers should proceed with an unreranked `RecallEngine`.
+    ///
+    /// # Blocking
+    ///
+    /// First resolution synchronously loads a ~280MB ONNX model (or blocks
+    /// on a failed network attempt before giving up), and
+    /// `OnceLock::get_or_init` blocks every concurrent caller until it
+    /// completes. **Never call this directly from an async fn running on a
+    /// tokio worker thread** — use [`Self::resolve_reranker_cell`] inside
+    /// `tokio::task::spawn_blocking` instead (see
+    /// `pensyve-mcp-gateway/src/rest.rs`'s recall handlers and
+    /// `pensyve-mcp-tools/src/server.rs`'s `recall` tool for the pattern).
+    /// This method is fine to call from sync contexts (the CLI,
+    /// `paraphrase_eval`) where there is no runtime to stall.
     pub fn reranker(&self) -> Option<Arc<Reranker>> {
-        self.reranker_cell.get_or_init(resolve_reranker).clone()
+        Self::resolve_reranker_cell(&self.reranker_cell)
+    }
+
+    /// Same resolution as [`Self::reranker`], but takes the cell directly
+    /// rather than `&self` — for async callers that only have a
+    /// `&PensyveState` (not an owned `Arc<PensyveState>`) but still need to
+    /// move the (slow, blocking) resolution onto a blocking thread. Clone
+    /// `state.reranker_cell` (an `Arc`, cheap) and move the clone into a
+    /// `tokio::task::spawn_blocking` closure that calls this.
+    pub fn resolve_reranker_cell(cell: &OnceLock<Option<Arc<Reranker>>>) -> Option<Arc<Reranker>> {
+        cell.get_or_init(resolve_reranker).clone()
     }
 }
 
