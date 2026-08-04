@@ -7,10 +7,19 @@
 //!
 //! Usage:
 //!   `cargo run -p pensyve-benchmarks --bin paraphrase_eval --release`
+//!     Writes `results/paraphrase_latest.json`. Does NOT touch the committed
+//!     baseline.
 //!   `cargo run -p pensyve-benchmarks --bin paraphrase_eval --release -- --gate results/paraphrase_baseline.json`
-//!
-//! With `--gate <path>`, exits nonzero if `top3_hit_rate` drops more than
-//! 0.02 below the `top3_hit_rate` recorded in the gate file.
+//!     Reads and parses the gate file **before** writing any output, then
+//!     exits nonzero if `top3_hit_rate` drops more than 0.02 below the
+//!     `top3_hit_rate` recorded in the gate file. Still writes
+//!     `results/paraphrase_latest.json` (for post-mortem inspection), never
+//!     the committed baseline.
+//!   `cargo run -p pensyve-benchmarks --bin paraphrase_eval --release -- --write-baseline`
+//!     Explicitly overwrites the committed
+//!     `results/paraphrase_baseline.json` instead of the latest-run path.
+//!     This is the only way this binary touches the committed baseline —
+//!     never as a side effect of a plain or `--gate`-checked run.
 
 use std::collections::HashMap;
 
@@ -121,6 +130,24 @@ fn main() {
         .position(|a| a == "--gate")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    let write_baseline = args.iter().any(|a| a == "--write-baseline");
+
+    // Read and parse the gate file up front, before any recall work runs and
+    // long before any output file is written. This guarantees the gate
+    // check compares against what was on disk when the run *started*, never
+    // against a file this same run just wrote (see #186 review: reading the
+    // gate file after writing output made every `--gate
+    // results/paraphrase_baseline.json` run compare the baseline to itself).
+    let gate: Option<BaselineOutput> = gate_path.as_ref().map(|path| {
+        let raw = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("Failed to read gate file '{path}': {e}");
+            std::process::exit(1);
+        });
+        serde_json::from_str(&raw).unwrap_or_else(|e| {
+            eprintln!("Failed to parse gate file '{path}': {e}");
+            std::process::exit(1);
+        })
+    });
 
     println!("=== Paraphrase Recall Baseline (250 memories, 62 queries) ===");
     println!();
@@ -392,29 +419,35 @@ fn main() {
 
     let json = serde_json::to_string_pretty(&output).expect("Failed to serialize results");
     // Resolve relative to this crate's manifest dir (not the process cwd) so
-    // the file always lands at `pensyve-benchmarks/results/...` regardless
-    // of where `cargo run` is invoked from.
+    // the file always lands under `pensyve-benchmarks/results/...`
+    // regardless of where `cargo run` is invoked from.
     let results_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("results");
     std::fs::create_dir_all(&results_dir).ok();
-    let filepath = results_dir.join("paraphrase_baseline.json");
+    // Only `--write-baseline` touches the committed baseline file. Every
+    // other invocation — plain or `--gate`-checked — writes to a separate
+    // "latest run" path, so a gate-checked run can never silently clobber
+    // the committed baseline it may just have failed against.
+    let filename = if write_baseline {
+        "paraphrase_baseline.json"
+    } else {
+        "paraphrase_latest.json"
+    };
+    let filepath = results_dir.join(filename);
     std::fs::write(&filepath, &json).expect("Failed to write results");
     println!("\nResults written to {}", filepath.display());
+    if write_baseline {
+        println!("(--write-baseline: committed baseline file updated)");
+    }
 
     // Clean up temp dir
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
     // ---------- Gate check ----------
+    // `gate` was read and parsed at the very start of `main`, before any
+    // output was written, so this always compares against the pre-run
+    // on-disk state — never against a file this run itself produced.
 
-    if let Some(gate_path) = gate_path {
-        let gate_raw = std::fs::read_to_string(&gate_path).unwrap_or_else(|e| {
-            eprintln!("Failed to read gate file '{gate_path}': {e}");
-            std::process::exit(1);
-        });
-        let gate: BaselineOutput = serde_json::from_str(&gate_raw).unwrap_or_else(|e| {
-            eprintln!("Failed to parse gate file '{gate_path}': {e}");
-            std::process::exit(1);
-        });
-
+    if let Some(gate) = gate {
         let drop = gate.top3_hit_rate - top3_hit_rate;
         if drop > GATE_TOLERANCE {
             eprintln!(
