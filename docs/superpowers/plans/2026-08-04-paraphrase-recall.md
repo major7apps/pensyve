@@ -94,6 +94,23 @@ pub fn load_corpus() -> FixtureCorpus; // include_str! + serde_json, panics on m
 
 - [ ] **Step 3: Commit the baseline** — save output as `pensyve-benchmarks/results/paraphrase_baseline.json`; `git commit -m "feat(benchmarks): paraphrase_eval binary and pre-fix baseline (#186)"`
 
+### Task 3.5: Deterministic ranking (inserted 2026-08-04 after Task 3's discovery)
+
+**Why inserted:** Task 3 found `RecallEngine` returns different rankings for identical inputs run to run (top-3 hit rate swings 0.435 to 0.645). Root cause: the per-leg and final fusion sorts compare only f32 scores, over candidate lists collected from `HashMap` iteration whose order reseeds each call, so ties land in arbitrary order. The CI gate (Task 4) and the ablations (Task 8) cannot measure anything until rankings are reproducible, and nondeterministic recall is itself a #186-class defect (known items flicker in and out of top-3).
+
+**Files:**
+- Modify: `pensyve-core/src/retrieval/engine.rs` (the `sort_by` calls at ~724, 729, 751, 782, 798, 817 and the final fused-score sort)
+- Test: `pensyve-core/tests/` or the engine's test module
+- Modify: `pensyve-benchmarks/results/paraphrase_baseline.json` (regenerate once deterministic)
+
+**Interfaces:** no signature changes; ranking becomes a pure function of inputs.
+
+- [ ] **Step 1: Write the failing test**: build a small in-memory corpus (mock embedder fine), call the recall path twice with the same inputs in one process, assert the two ranked ID lists are identical. Run: FAILS (or flakes) today.
+- [ ] **Step 2: Add stable tiebreaks**: every ranking sort orders by score descending, then by memory UUID ascending as the tiebreak. Where candidate maps are iterated to build lists whose order feeds ranks, collect and sort deterministically first.
+- [ ] **Step 3: Test passes; run it 10 times** (`cargo test ... -- --test-threads=1` in a loop) to confirm stability; full core suite green.
+- [ ] **Step 4: Verify at the harness level**: run `paraphrase_eval` 3 times; assert identical JSON output (diff the files). Regenerate and commit the baseline with `--write-baseline`.
+- [ ] **Step 5: Commit** — `git commit -m "fix(recall): deterministic ranking via stable sort tiebreaks (#186)"`
+
 ### Task 4: CI regression gate
 
 **Files:**
