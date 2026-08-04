@@ -2005,12 +2005,12 @@
     {
       "query": "arrow parquet reader benchmark speed",
       "gold_keys": ["bob-parquet-bench"],
-      "kind": "lexical"
+      "kind": "paraphrase"
     },
     {
       "query": "rollback when p99 exceeds threshold",
       "gold_keys": ["deploy-p99-rollback"],
-      "kind": "lexical"
+      "kind": "paraphrase"
     },
     {
       "query": "switching from JSON to rkyv cut p50 latency by 60%",
@@ -2050,6 +2050,16 @@
     {
       "query": "Alice's cat Pixel only eats wet food, ignores dry kibble",
       "gold_keys": ["alice-s-cat-pixel-only-07"],
+      "kind": "lexical"
+    },
+    {
+      "query": "Alice's favorite museum in the city is the small photography gallery near the river",
+      "gold_keys": ["alice-s-favorite-museum-city-14"],
+      "kind": "lexical"
+    },
+    {
+      "query": "deploy pipeline tags every production release with git commit SHA and build timestamp",
+      "gold_keys": ["deploy-pipeline-tags-every-production-release-05"],
       "kind": "lexical"
     }
   ]
