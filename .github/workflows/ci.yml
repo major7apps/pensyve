@@ -93,6 +93,22 @@ jobs:
         # in a process; serializing avoids any residual races on the
         # WAL/index files fastembed maintains alongside `model.onnx`.
         run: cargo test --workspace -- --ignored --test-threads=1
+      - name: Paraphrase recall gate
+        # Fails if top3_hit_rate drops more than --gate-margin below the
+        # committed pensyve-benchmarks/results/paraphrase_baseline.json
+        # (#186). The default margin (0.02, engine.rs's
+        # DEFAULT_GATE_MARGIN) is tighter than the harness's residual
+        # run-to-run jitter: apply_reinforcement writes wall-clock
+        # last_accessed during eval, so score ties occasionally resolve
+        # differently between runs even with deterministic tiebreaks
+        # (Task 3.5). 15 local `--release` runs against the committed
+        # baseline (0.581) observed top3_hit_rate in {0.548, 0.565,
+        # 0.581, 0.597} — a 0.049 max spread, and one run failed the
+        # default 0.02 margin outright (0.581 -> 0.548, drop 0.032). 0.07
+        # comfortably clears that observed spread with headroom for
+        # tail risk beyond the sample, while remaining far below the
+        # scale of improvement Task 5+ fixes are expected to deliver.
+        run: cargo run -p pensyve-benchmarks --bin paraphrase_eval --release -- --gate pensyve-benchmarks/results/paraphrase_baseline.json --gate-margin 0.07
 
   test-rust-no-network-invariants:
     name: Rust No-Network Invariants

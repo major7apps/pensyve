@@ -11,10 +11,16 @@
 //!     baseline.
 //!   `cargo run -p pensyve-benchmarks --bin paraphrase_eval --release -- --gate results/paraphrase_baseline.json`
 //!     Reads and parses the gate file **before** writing any output, then
-//!     exits nonzero if `top3_hit_rate` drops more than 0.02 below the
-//!     `top3_hit_rate` recorded in the gate file. Still writes
-//!     `results/paraphrase_latest.json` (for post-mortem inspection), never
-//!     the committed baseline.
+//!     exits nonzero if `top3_hit_rate` drops more than `--gate-margin`
+//!     (default 0.02) below the `top3_hit_rate` recorded in the gate file.
+//!     Still writes `results/paraphrase_latest.json` (for post-mortem
+//!     inspection), never the committed baseline.
+//!   `... -- --gate results/paraphrase_baseline.json --gate-margin 0.07`
+//!     Same as above, but with an explicit tolerance instead of the 0.02
+//!     default. Widen this when run-to-run ranking jitter (see
+//!     `deterministic_id` below) makes the default too tight for a given
+//!     harness/fixture combination — see Task 4's 15-run local evidence in
+//!     the CI workflow comment for how the CI value was chosen.
 //!   `cargo run -p pensyve-benchmarks --bin paraphrase_eval --release -- --write-baseline`
 //!     Explicitly overwrites the committed
 //!     `results/paraphrase_baseline.json` instead of the latest-run path.
@@ -36,9 +42,10 @@ use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::{Entity, EntityKind, Episode, EpisodicMemory, Namespace, SemanticMemory};
 use pensyve_core::vector::VectorIndex;
 
-/// Regression gate tolerance: the current run's `top3_hit_rate` must not
-/// drop more than this far below the gate file's recorded value.
-const GATE_TOLERANCE: f64 = 0.02;
+/// Default regression gate tolerance: the current run's `top3_hit_rate`
+/// must not drop more than this far below the gate file's recorded value.
+/// Overridable via `--gate-margin <value>`.
+const DEFAULT_GATE_MARGIN: f64 = 0.02;
 
 /// Namespace UUID for this binary's deterministic `Uuid::new_v5` ids.
 /// Arbitrary but fixed — see `deterministic_id`.
@@ -159,6 +166,16 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .cloned();
     let write_baseline = args.iter().any(|a| a == "--write-baseline");
+    let gate_margin: f64 = args
+        .iter()
+        .position(|a| a == "--gate-margin")
+        .and_then(|i| args.get(i + 1))
+        .map_or(DEFAULT_GATE_MARGIN, |v| {
+            v.parse().unwrap_or_else(|e| {
+                eprintln!("Invalid --gate-margin value '{v}': {e}");
+                std::process::exit(1);
+            })
+        });
 
     // Read and parse the gate file up front, before any recall work runs and
     // long before any output file is written. This guarantees the gate
@@ -483,15 +500,15 @@ fn main() {
 
     if let Some(gate) = gate {
         let drop = gate.top3_hit_rate - top3_hit_rate;
-        if drop > GATE_TOLERANCE {
+        if drop > gate_margin {
             eprintln!(
-                "GATE FAILED: top3_hit_rate dropped by {drop:.3} (gate={:.3}, current={:.3}, tolerance={GATE_TOLERANCE:.3})",
+                "GATE FAILED: top3_hit_rate dropped by {drop:.3} (gate={:.3}, current={:.3}, tolerance={gate_margin:.3})",
                 gate.top3_hit_rate, top3_hit_rate
             );
             std::process::exit(1);
         }
         println!(
-            "Gate check passed: top3_hit_rate {:.3} vs gate {:.3} (tolerance {GATE_TOLERANCE:.3})",
+            "Gate check passed: top3_hit_rate {:.3} vs gate {:.3} (tolerance {gate_margin:.3})",
             top3_hit_rate, gate.top3_hit_rate
         );
     }
