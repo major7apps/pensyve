@@ -13,8 +13,12 @@
 //!     Reads and parses the gate file **before** writing any output, then
 //!     exits nonzero if `top3_hit_rate` drops more than `--gate-margin`
 //!     (default 0.02) below the `top3_hit_rate` recorded in the gate file.
-//!     Still writes `results/paraphrase_latest.json` (for post-mortem
-//!     inspection), never the committed baseline.
+//!     Also hard-fails immediately (before any recall work runs) if the gate
+//!     file's `reranked` mode doesn't match this run's `--rerank` flag —
+//!     reranked and unreranked `top3_hit_rate` live on different scales, so
+//!     a cross-mode comparison isn't a meaningful regression check. Still
+//!     writes `results/paraphrase_latest.json` (for post-mortem inspection),
+//!     never the committed baseline.
 //!   `... -- --gate results/paraphrase_baseline.json --gate-margin 0.07`
 //!     Same as above, but with an explicit tolerance instead of the 0.02
 //!     default. Widen this when run-to-run ranking jitter (see
@@ -38,8 +42,13 @@
 //!     passes `--rerank` to match. It's also far less noisy: 10 local
 //!     `--release` runs showed zero run-to-run spread in `top3_hit_rate`
 //!     vs. the unreranked pipeline's ~0.05 spread (see the CI workflow
-//!     comment). Omit `--rerank` to measure the unreranked fallback path
-//!     instead (what runs when the reranker fails to load).
+//!     comment) — mechanically, the gold docs for this fixture already sit
+//!     within the top-20 pre-rerank pool, so the `apply_reinforcement`
+//!     timestamp jitter that reshuffles ties *at* the pool boundary never
+//!     changes which candidates the cross-encoder sees, only their
+//!     pre-rerank order, which the cross-encoder discards. Omit `--rerank`
+//!     to measure the unreranked fallback path instead (what runs when the
+//!     reranker fails to load).
 
 use std::collections::HashMap;
 
@@ -147,6 +156,18 @@ struct BaselineOutput {
     n_queries: Option<usize>,
     #[serde(default)]
     per_kind: Vec<KindBreakdown>,
+    /// Whether this run had `--rerank` attached. `#[serde(default)]` so
+    /// baseline files written before this field existed still parse — they
+    /// deserialize as `false`, i.e. "unreranked", which was true of every
+    /// baseline committed before Task 8 (#186). The `--gate` path hard-errors
+    /// on a mismatch between this and the current run's mode (see `main`):
+    /// reranked and unreranked `top3_hit_rate` live on different scales
+    /// (0.774 vs 0.903 pre-fix-vs-post on this fixture), so comparing across
+    /// modes isn't a meaningful regression check — it would silently widen
+    /// the effective gate margin from the tuned value to the full gap
+    /// between modes.
+    #[serde(default)]
+    reranked: bool,
 }
 
 /// Number of candidates requested per query, matching the audit's usage.
@@ -229,6 +250,40 @@ fn main() {
             std::process::exit(1);
         })
     });
+
+    // Reranked and unreranked `top3_hit_rate` live on different scales (this
+    // fixture: ~0.774 unreranked vs ~0.903 reranked), so comparing a run in
+    // one mode against a gate file recorded in the other isn't a meaningful
+    // regression check — it would silently widen the effective gate margin
+    // from the tuned value to the full gap between modes, with no error or
+    // warning. Hard-fail on mode mismatch before doing any recall work.
+    if let Some(gate) = &gate
+        && gate.reranked != rerank
+    {
+        let gate_mode = if gate.reranked {
+            "--rerank"
+        } else {
+            "unreranked"
+        };
+        let run_mode = if rerank { "--rerank" } else { "unreranked" };
+        let rerun_hint = if gate.reranked {
+            "Re-run this eval with --rerank to match"
+        } else {
+            "Re-run this eval without --rerank to match"
+        };
+        let regen_hint = if rerank {
+            "--write-baseline --rerank"
+        } else {
+            "--write-baseline"
+        };
+        eprintln!(
+            "GATE FAILED: mode mismatch — gate file '{}' was recorded {gate_mode} but this \
+             run is {run_mode}. {rerun_hint}, or regenerate the gate file with \
+             `{regen_hint}` if {run_mode} is now the intended baseline mode.",
+            gate_path.as_deref().unwrap_or("<unknown>"),
+        );
+        std::process::exit(1);
+    }
 
     println!("=== Paraphrase Recall Baseline (250 memories, 62 queries) ===");
     println!();
@@ -511,6 +566,7 @@ fn main() {
         n_memories: Some(corpus.memories.len()),
         n_queries: Some(corpus.queries.len()),
         per_kind,
+        reranked: rerank,
     };
 
     let json = serde_json::to_string_pretty(&output).expect("Failed to serialize results");

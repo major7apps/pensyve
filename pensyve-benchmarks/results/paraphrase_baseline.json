@@ -1,6 +1,6 @@
 {
   "top3_hit_rate": 0.9032258064516129,
-  "mrr": 0.881989247311828,
+  "mrr": 0.8827956989247313,
   "per_query": [
     {
       "query": "how fast is bob's parquet reader",
@@ -125,7 +125,7 @@
     {
       "query": "when during the week does the release process pause shipping changes",
       "kind": "paraphrase",
-      "gold_rank": 5
+      "gold_rank": 4
     },
     {
       "query": "how was container build duration shortened",
@@ -313,7 +313,7 @@
       "gold_rank": 1
     }
   ],
-  "timestamp": "2026-08-04T20:17:11.452512002+00:00",
+  "timestamp": "2026-08-04T20:33:49.273613516+00:00",
   "n_memories": 250,
   "n_queries": 62,
   "per_kind": [
@@ -327,7 +327,8 @@
       "kind": "paraphrase",
       "n": 52,
       "top3_hit_rate": 0.8846153846153846,
-      "mrr": 0.8592948717948719
+      "mrr": 0.8602564102564104
     }
-  ]
+  ],
+  "reranked": true
 }

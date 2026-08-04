@@ -112,11 +112,20 @@ jobs:
         # range). The reranked pipeline doesn't have that failure mode:
         # 10 local `--release --rerank` runs against the new baseline
         # (0.903) all landed on exactly 0.903 — zero observed spread.
-        # 0.03 keeps meaningful headroom over that for CI-hardware
-        # variance and reranker-load fallback risk (a model-load
-        # failure degrades gracefully to unreranked per
-        # `resolve_reranker`, which would read as a real drop here) while
-        # being more than 2x tighter than the old margin.
+        # Mechanistically: this fixture's gold docs already sit within
+        # the top-20 pre-rerank pool, so the last_accessed jitter that
+        # reshuffles ties at the pool boundary never changes which
+        # candidates the cross-encoder sees, only their pre-rerank
+        # order, which reranking discards anyway. 0.03 keeps meaningful
+        # headroom over that for CI-hardware variance and reranker-load
+        # fallback risk (a model-load failure degrades gracefully to
+        # unreranked per `resolve_reranker`, which would read as a real
+        # drop here) while being more than 2x tighter than the old
+        # margin. paraphrase_eval also hard-errors if the committed
+        # baseline's recorded mode (reranked/unreranked) doesn't match
+        # --rerank below, so a future baseline write in the wrong mode
+        # can't silently widen this margin (see BaselineOutput::reranked
+        # in paraphrase_eval.rs).
         run: cargo run -p pensyve-benchmarks --bin paraphrase_eval --release -- --rerank --gate pensyve-benchmarks/results/paraphrase_baseline.json --gate-margin 0.03
 
   test-rust-no-network-invariants:
