@@ -1619,11 +1619,16 @@ impl StorageTrait for SqliteBackend {
     ) -> StorageResult<Vec<Memory>> {
         // Escape the query for FTS5: wrap each token in double quotes to prevent
         // special characters (?, [, ], *, etc.) from being interpreted as operators.
+        // Tokens are joined with OR (not implicit AND): with `ORDER BY
+        // bm25(memory_fts)` in place below, a match on more query terms still
+        // ranks above a match on fewer, so OR preserves precision while
+        // keeping paraphrase-style queries (which rarely share every token
+        // with a memory) from collapsing to zero recall.
         let escaped_query: String = query
             .split_whitespace()
             .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
             .collect::<Vec<_>>()
-            .join(" ");
+            .join(" OR ");
 
         if escaped_query.is_empty() {
             return Ok(Vec::new());
@@ -3508,6 +3513,45 @@ mod tests {
             high.id,
             "most relevant (highest term frequency) memory should rank first"
         );
+    }
+
+    #[test]
+    fn test_search_fts_paraphrase_query_uses_or_semantics() {
+        // Reproduces the paraphrase_eval "deploy-p99-rollback" audit query
+        // against its gold memory content (pensyve-benchmarks/fixtures/
+        // paraphrase_corpus.json). The query's "rollback" never matches the
+        // content's "rolls"/"back" tokens (FTS5 porter stemming doesn't
+        // decompose compounds), so implicit AND (requiring every query
+        // token to match) fails on that one token and returns nothing, even
+        // though "when", "p99", "exceeds"/"exceed", and "threshold" all
+        // match directly. With Task 5's `ORDER BY bm25(...)` in place,
+        // switching the token join to `OR` is safe: a match on more shared
+        // terms still ranks above a match on fewer, so recall stops
+        // collapsing to zero without sacrificing precision.
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+
+        let ep = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "The deploy pipeline automatically rolls back a release when p99 \
+             latency exceeds the alert threshold for five minutes",
+        );
+        db.save_episodic(&ep).unwrap();
+
+        let results = db
+            .search_fts("rollback when p99 exceeds threshold", ns.id, 10)
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "OR-joined query should still find the memory via its shared terms \
+             (when/p99/exceeds/threshold), even though \"rollback\" itself never \
+             matches \"rolls\"/\"back\""
+        );
+        assert_eq!(results[0].id(), ep.id);
     }
 
     // -----------------------------------------------------------------------
