@@ -30,9 +30,16 @@
 //!     Attaches the BGE cross-encoder reranker to the engine before running
 //!     (same lazy/infallible resolution as the gateway and CLI: a model-load
 //!     failure logs a warning and the run proceeds unreranked). Combine with
-//!     `--gate`/`--write-baseline` as needed. Omit `--rerank` to measure the
-//!     unreranked pipeline (the harness's default, and what the committed
-//!     baseline reflects).
+//!     `--gate`/`--write-baseline` as needed. `--rerank` is what the
+//!     committed baseline reflects as of Task 8 (#186) — the gateway/CLI
+//!     attach the reranker by default (`reranker=Some("BGERerankerBase")`
+//!     in `pensyve-python/src/lib.rs`), so a reranked baseline compares
+//!     like against like with production behavior, and the CI gate step
+//!     passes `--rerank` to match. It's also far less noisy: 10 local
+//!     `--release` runs showed zero run-to-run spread in `top3_hit_rate`
+//!     vs. the unreranked pipeline's ~0.05 spread (see the CI workflow
+//!     comment). Omit `--rerank` to measure the unreranked fallback path
+//!     instead (what runs when the reranker fails to load).
 
 use std::collections::HashMap;
 

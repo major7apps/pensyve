@@ -96,19 +96,28 @@ jobs:
       - name: Paraphrase recall gate
         # Fails if top3_hit_rate drops more than --gate-margin below the
         # committed pensyve-benchmarks/results/paraphrase_baseline.json
-        # (#186). The default margin (0.02, engine.rs's
-        # DEFAULT_GATE_MARGIN) is tighter than the harness's residual
-        # run-to-run jitter: apply_reinforcement writes wall-clock
-        # last_accessed during eval, so score ties occasionally resolve
-        # differently between runs even with deterministic tiebreaks
-        # (Task 3.5). 15 local `--release` runs against the committed
-        # baseline (0.581) observed top3_hit_rate in {0.548, 0.565,
-        # 0.581, 0.597} — a 0.049 max spread, and one run failed the
-        # default 0.02 margin outright (0.581 -> 0.548, drop 0.032). 0.07
-        # comfortably clears that observed spread with headroom for
-        # tail risk beyond the sample, while remaining far below the
-        # scale of improvement Task 5+ fixes are expected to deliver.
-        run: cargo run -p pensyve-benchmarks --bin paraphrase_eval --release -- --gate pensyve-benchmarks/results/paraphrase_baseline.json --gate-margin 0.07
+        # (#186). Task 8 rebaselined this gate on the RERANKED pipeline
+        # (`--rerank`) rather than the raw RRF pipeline the gate used
+        # through Task 7: the gateway/CLI attach the BGE reranker by
+        # default (`reranker=Some("BGERerankerBase")` in
+        # pensyve-python/src/lib.rs), so gating on unreranked output was
+        # comparing against a path production doesn't actually take. It
+        # also happens to be far less noisy — the unreranked pipeline's
+        # apply_reinforcement writes wall-clock last_accessed during
+        # eval, so score ties occasionally resolve differently between
+        # runs even with deterministic tiebreaks (Task 3.5), which is
+        # why the original unreranked gate needed a 0.07 margin (15
+        # local runs against the pre-fix 0.581 baseline spread
+        # top3_hit_rate over {0.548, 0.565, 0.581, 0.597}, a 0.049
+        # range). The reranked pipeline doesn't have that failure mode:
+        # 10 local `--release --rerank` runs against the new baseline
+        # (0.903) all landed on exactly 0.903 — zero observed spread.
+        # 0.03 keeps meaningful headroom over that for CI-hardware
+        # variance and reranker-load fallback risk (a model-load
+        # failure degrades gracefully to unreranked per
+        # `resolve_reranker`, which would read as a real drop here) while
+        # being more than 2x tighter than the old margin.
+        run: cargo run -p pensyve-benchmarks --bin paraphrase_eval --release -- --rerank --gate pensyve-benchmarks/results/paraphrase_baseline.json --gate-margin 0.03
 
   test-rust-no-network-invariants:
     name: Rust No-Network Invariants
