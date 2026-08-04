@@ -1,4 +1,5 @@
 pub mod corpus;
+pub mod fixture;
 pub mod judge;
 pub mod metrics;
 pub mod resilience;
