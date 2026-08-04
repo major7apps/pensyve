@@ -221,6 +221,7 @@ class PensyveCaptureCallbacks:
         try:
             return self._core.get_pending_review()
         except Exception:
+            logger.debug("pensyve capture: get_pending_review failed", exc_info=True)
             return []
 
     def clear_pending_review(self) -> None:
@@ -228,7 +229,7 @@ class PensyveCaptureCallbacks:
         try:
             self._core.clear_pending_review()
         except Exception:
-            pass
+            logger.debug("pensyve capture: clear_pending_review failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------

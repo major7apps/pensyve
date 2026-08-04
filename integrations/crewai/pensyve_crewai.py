@@ -32,7 +32,7 @@ _pensyve_mod: Any = None
 
 def _get_pensyve_module() -> Any:
     """Lazy-import the pensyve SDK. Returns the cached module."""
-    global _pensyve_mod  # noqa: PLW0603
+    global _pensyve_mod
     if _pensyve_mod is None:
         _pensyve_mod = importlib.import_module("pensyve")
     return _pensyve_mod

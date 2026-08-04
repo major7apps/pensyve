@@ -9,9 +9,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from pensyve_crewai import MemoryMatch, MemoryRecord, PensyveMemory
-from pensyve_crewai import _split_sentences
-
+from pensyve_crewai import MemoryMatch, MemoryRecord, PensyveMemory, _split_sentences
 
 # ---------------------------------------------------------------------------
 # Fixtures

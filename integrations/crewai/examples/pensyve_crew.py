@@ -20,7 +20,7 @@ Environment variables:
 import os
 from pathlib import Path
 
-from crewai import Agent, Task, Crew, Process
+from crewai import Agent, Crew, Process, Task
 from crewai_tools import MCPServerAdapter
 from langchain_anthropic import ChatAnthropic
 
