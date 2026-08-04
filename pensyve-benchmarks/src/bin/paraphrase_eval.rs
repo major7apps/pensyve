@@ -40,6 +40,34 @@ use pensyve_core::vector::VectorIndex;
 /// drop more than this far below the gate file's recorded value.
 const GATE_TOLERANCE: f64 = 0.02;
 
+/// Namespace UUID for this binary's deterministic `Uuid::new_v5` ids.
+/// Arbitrary but fixed — see `deterministic_id`.
+const ID_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x8c, 0x1e, 0x6b, 0x4a, 0x0a, 0x3f, 0x4b, 0x8e, 0x9c, 0x27, 0x6e, 0x2a, 0x1d, 0x5f, 0x0c, 0x3b,
+]);
+
+/// Derive a stable, content-addressed id for entities/episodes/memories
+/// instead of `Uuid::new_v4()`.
+///
+/// The eval harness recreates its entire corpus from scratch on every
+/// run (a fresh temp `SqliteBackend`, fresh entities, fresh memories).
+/// With random v4 ids, two separate `cargo run` invocations produce a
+/// structurally identical corpus whose records nonetheless carry
+/// different ids. `RecallEngine`'s ranking sorts are a pure function of
+/// (score, id) — deterministic given fixed inputs (verified by
+/// `pensyve-core`'s `test_recall_is_deterministic_across_repeated_calls`)
+/// — but score TIES are common (e.g. all-episodic confidence, or
+/// same-second activation), and the sort's tiebreak is ascending id.
+/// Random ids turn that deterministic tiebreak into an effectively
+/// random pick every run, which shows up as run-to-run drift in this
+/// binary's output even though the ranking algorithm itself is stable.
+/// Deriving every id from the fixture's own stable strings (entity
+/// name, memory `key`) removes that harness-only source of variance so
+/// repeated runs are directly comparable (see `--gate` / Task 3.5).
+fn deterministic_id(kind: &str, key: &str) -> Uuid {
+    Uuid::new_v5(&ID_NAMESPACE, format!("{kind}:{key}").as_bytes())
+}
+
 /// Result of evaluating a single fixture query against the recall engine.
 struct QueryOutcome {
     query: String,
@@ -193,6 +221,7 @@ fn main() {
     let mut entities: HashMap<String, Entity> = HashMap::new();
     for name in &entity_names {
         let mut entity = Entity::new(*name, EntityKind::User);
+        entity.id = deterministic_id("entity", name);
         entity.namespace_id = ns.id;
         storage.save_entity(&entity).expect("Failed to save entity");
         entities.insert((*name).to_string(), entity);
@@ -200,13 +229,15 @@ fn main() {
 
     // Source entity (the "narrator") for episodic memories
     let mut source_entity = Entity::new("narrator", EntityKind::Agent);
+    source_entity.id = deterministic_id("entity", "narrator");
     source_entity.namespace_id = ns.id;
     storage
         .save_entity(&source_entity)
         .expect("Failed to save source entity");
 
     // Episode for episodic memories
-    let episode = Episode::new(ns.id, vec![source_entity.id]);
+    let mut episode = Episode::new(ns.id, vec![source_entity.id]);
+    episode.id = deterministic_id("episode", "main");
     storage
         .save_episode(&episode)
         .expect("Failed to save episode");
@@ -238,7 +269,9 @@ fn main() {
                     about_entity.id,
                     mem.content.clone(),
                 );
+                emem.id = deterministic_id("memory", &mem.key);
                 emem.embedding.clone_from(embedding);
+                emem.timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
                 storage
                     .save_episodic(&emem)
                     .expect("Failed to save episodic memory");
@@ -252,6 +285,7 @@ fn main() {
                     mem.content.clone(),
                     mem.confidence,
                 );
+                smem.id = deterministic_id("memory", &mem.key);
                 smem.embedding.clone_from(embedding);
                 storage
                     .save_semantic(&smem)

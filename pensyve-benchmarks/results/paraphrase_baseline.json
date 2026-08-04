@@ -1,26 +1,26 @@
 {
-  "top3_hit_rate": 0.532258064516129,
-  "mrr": 0.4236303123399897,
+  "top3_hit_rate": 0.5806451612903226,
+  "mrr": 0.49014976958525336,
   "per_query": [
     {
       "query": "how fast is bob's parquet reader",
       "kind": "paraphrase",
-      "gold_rank": 3
+      "gold_rank": 1
     },
     {
       "query": "which async runtime setup does bob suggest for the data intake pipeline",
       "kind": "paraphrase",
-      "gold_rank": 6
+      "gold_rank": 7
     },
     {
       "query": "what did bob identify as the biggest slowdown once simultaneous writes climbed past two dozen",
       "kind": "paraphrase",
-      "gold_rank": 3
+      "gold_rank": 4
     },
     {
       "query": "which embedded database does bob favor when queries mostly scan large tables",
       "kind": "paraphrase",
-      "gold_rank": 9
+      "gold_rank": 6
     },
     {
       "query": "what search parameter, when set too low, hurts bob's vector index accuracy",
@@ -30,7 +30,7 @@
     {
       "query": "roughly how much traffic can the gateway handle before it maxes out, per bob's testing",
       "kind": "paraphrase",
-      "gold_rank": 4
+      "gold_rank": 2
     },
     {
       "query": "why did bob move the caching system to a different tool that has built-in messaging",
@@ -40,22 +40,22 @@
     {
       "query": "how did bob get rid of garbage-collector pauses in the critical code path",
       "kind": "paraphrase",
-      "gold_rank": 5
+      "gold_rank": 3
     },
     {
       "query": "which data format does bob favor when schemas need to change across services over time",
       "kind": "paraphrase",
-      "gold_rank": 5
+      "gold_rank": 3
     },
     {
       "query": "where did bob trace an unexpected memory-usage bug back to",
       "kind": "paraphrase",
-      "gold_rank": 4
+      "gold_rank": 7
     },
     {
       "query": "which trek does alice enjoy most near the reservoir and how long does it take",
       "kind": "paraphrase",
-      "gold_rank": 2
+      "gold_rank": 3
     },
     {
       "query": "why did alice change her morning coffee brewing method to something less of a hassle to wash",
@@ -70,32 +70,32 @@
     {
       "query": "how often does alice go jogging and which day does she take off",
       "kind": "paraphrase",
-      "gold_rank": 1
+      "gold_rank": 7
     },
     {
       "query": "which plants thrive for alice outdoors and which one won't survive",
       "kind": "paraphrase",
-      "gold_rank": 4
+      "gold_rank": 3
     },
     {
       "query": "why does alice pick a specific airplane seat for napping",
       "kind": "paraphrase",
-      "gold_rank": 2
+      "gold_rank": 8
     },
     {
       "query": "what skill did alice pick up so she could repair her own keyboard",
       "kind": "paraphrase",
-      "gold_rank": 4
+      "gold_rank": 8
     },
     {
       "query": "what display trick does alice use to curb compulsive phone checking",
       "kind": "paraphrase",
-      "gold_rank": 3
+      "gold_rank": 4
     },
     {
       "query": "what equipment change did alice make at her desk after hurting her wrist",
       "kind": "paraphrase",
-      "gold_rank": 3
+      "gold_rank": 1
     },
     {
       "query": "how often and where does alice spend time volunteering with plants",
@@ -105,7 +105,7 @@
     {
       "query": "how many sign-offs are needed before a payments-related change can ship",
       "kind": "paraphrase",
-      "gold_rank": 1
+      "gold_rank": 2
     },
     {
       "query": "what test coverage threshold prevents code from merging into the main branch",
@@ -115,17 +115,17 @@
     {
       "query": "what zero-downtime release strategy is used for the gateway service",
       "kind": "paraphrase",
-      "gold_rank": 2
+      "gold_rank": 1
     },
     {
       "query": "under what failure-rate condition does the system alert whoever is on duty",
       "kind": "paraphrase",
-      "gold_rank": 4
+      "gold_rank": 1
     },
     {
       "query": "when during the week does the release process pause shipping changes",
       "kind": "paraphrase",
-      "gold_rank": 1
+      "gold_rank": 2
     },
     {
       "query": "how was container build duration shortened",
@@ -135,22 +135,22 @@
     {
       "query": "how does the team get notified whenever something ships to production",
       "kind": "paraphrase",
-      "gold_rank": 4
+      "gold_rank": 3
     },
     {
       "query": "how many prior working builds are kept on hand for quick reverting",
       "kind": "paraphrase",
-      "gold_rank": 3
+      "gold_rank": 1
     },
     {
       "query": "how often is failure-injection testing done to confirm automatic recovery works",
       "kind": "paraphrase",
-      "gold_rank": 8
+      "gold_rank": 7
     },
     {
       "query": "where must credentials be sourced from instead of config files",
       "kind": "paraphrase",
-      "gold_rank": 3
+      "gold_rank": 5
     },
     {
       "query": "how long is acme's deal with its main cloud provider and when was it signed",
@@ -160,22 +160,22 @@
     {
       "query": "by how much did the size of acme's engineering team increase last year",
       "kind": "paraphrase",
-      "gold_rank": 1
+      "gold_rank": 2
     },
     {
       "query": "why did acme downsize its main office space",
       "kind": "paraphrase",
-      "gold_rank": 5
+      "gold_rank": 1
     },
     {
       "query": "what company did acme buy to build its own reporting features",
       "kind": "paraphrase",
-      "gold_rank": 9
+      "gold_rank": null
     },
     {
       "query": "what was acme's yearly subscription income milestone recently",
       "kind": "paraphrase",
-      "gold_rank": 4
+      "gold_rank": 10
     },
     {
       "query": "how did revamping the new-user setup affect customer cancellations at acme",
@@ -190,32 +190,32 @@
     {
       "query": "how quickly must customer records be deleted once an account closes",
       "kind": "paraphrase",
-      "gold_rank": 4
+      "gold_rank": 2
     },
     {
       "query": "how many bids does acme need before approving a large purchase",
       "kind": "paraphrase",
-      "gold_rank": 3
+      "gold_rank": 1
     },
     {
       "query": "what happened to acme's Texas office once its lease ran out",
       "kind": "paraphrase",
-      "gold_rank": 3
+      "gold_rank": 5
     },
     {
       "query": "which retrieval approach wins for uncommon proper-noun lookups according to the study",
       "kind": "paraphrase",
-      "gold_rank": 4
+      "gold_rank": 8
     },
     {
       "query": "what limitation undermines the credibility of the component-removal experiment",
       "kind": "paraphrase",
-      "gold_rank": 5
+      "gold_rank": 4
     },
     {
       "query": "what training technique is cited as boosting low-data classification performance",
       "kind": "paraphrase",
-      "gold_rank": 8
+      "gold_rank": 4
     },
     {
       "query": "what statistical check should happen before claiming a performance gain",
@@ -230,12 +230,12 @@
     {
       "query": "how did adjusting the proportion of negative examples affect training stability",
       "kind": "paraphrase",
-      "gold_rank": 7
+      "gold_rank": 1
     },
     {
       "query": "what gain resulted from including difficult counterexamples during training",
       "kind": "paraphrase",
-      "gold_rank": 3
+      "gold_rank": 1
     },
     {
       "query": "what unwanted tendency does the evaluator model have regarding answer length",
@@ -250,17 +250,17 @@
     {
       "query": "what tradeoff appears when limiting search to one entity versus searching across entities",
       "kind": "paraphrase",
-      "gold_rank": 4
+      "gold_rank": 2
     },
     {
       "query": "arrow parquet reader benchmark speed",
       "kind": "paraphrase",
-      "gold_rank": 4
+      "gold_rank": 1
     },
     {
       "query": "rollback when p99 exceeds threshold",
       "kind": "paraphrase",
-      "gold_rank": 3
+      "gold_rank": 5
     },
     {
       "query": "switching from JSON to rkyv cut p50 latency by 60%",
@@ -275,7 +275,7 @@
     {
       "query": "Alice's titanium card wallet survives being dropped without denting",
       "kind": "lexical",
-      "gold_rank": 3
+      "gold_rank": 7
     },
     {
       "query": "Acme Corp SOC 2 Type II certification after six-month audit",
@@ -313,21 +313,21 @@
       "gold_rank": 1
     }
   ],
-  "timestamp": "2026-08-04T16:49:20.396473440+00:00",
+  "timestamp": "2026-08-04T17:47:48.822518086+00:00",
   "n_memories": 250,
   "n_queries": 62,
   "per_kind": [
     {
       "kind": "lexical",
       "n": 10,
-      "top3_hit_rate": 1.0,
-      "mrr": 0.9333333333333333
+      "top3_hit_rate": 0.9,
+      "mrr": 0.9142857142857143
     },
     {
       "kind": "paraphrase",
       "n": 52,
-      "top3_hit_rate": 0.4423076923076923,
-      "mrr": 0.32561050061050056
+      "top3_hit_rate": 0.5192307692307693,
+      "mrr": 0.4085851648351647
     }
   ]
 }
