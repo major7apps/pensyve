@@ -1651,6 +1651,7 @@ impl StorageTrait for SqliteBackend {
                          WHERE p.id = memory_id AND p.superseded_by IS NULL
                      ))
                  )
+               ORDER BY bm25(memory_fts)
                LIMIT ?3",
         )?;
         let rows: Vec<(String, String)> = stmt
@@ -3462,6 +3463,51 @@ mod tests {
         let r3 = db.search_fts("kiwi", ns.id, 10).unwrap();
         assert_eq!(r3.len(), 1);
         assert!(matches!(&r3[0], Memory::Procedural(_)));
+    }
+
+    #[test]
+    fn test_search_fts_orders_by_bm25_relevance() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+
+        // Two low-relevance memories (single mention of "zephyr") are saved
+        // before the high-relevance one (multiple mentions), so relying on
+        // insertion order (today's behavior, no ORDER BY) would return a
+        // low-relevance memory first.
+        let low1 = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "the zephyr blew across the plains",
+        );
+        db.save_episodic(&low1).unwrap();
+
+        let low2 = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "a light zephyr passed through the valley",
+        );
+        db.save_episodic(&low2).unwrap();
+
+        let high = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "zephyr zephyr zephyr: the zephyr project is a real-time OS",
+        );
+        db.save_episodic(&high).unwrap();
+
+        let results = db.search_fts("zephyr", ns.id, 10).unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results[0].id(),
+            high.id,
+            "most relevant (highest term frequency) memory should rank first"
+        );
     }
 
     // -----------------------------------------------------------------------
