@@ -146,8 +146,17 @@ impl VectorIndex {
             .map(|(id, emb)| (*id, dot(&q, emb)))
             .collect();
 
-        // Sort descending by similarity score.
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort descending by similarity score, tiebreak ascending by id.
+        // Without the tiebreak, a tie straddling the `truncate(limit)`
+        // boundary makes the candidate SET returned (not just its order)
+        // nondeterministic across calls, since the pre-sort order comes
+        // from `HashMap` iteration whose hasher keys reseed on every
+        // fresh `HashMap::new()` (see #186 / Task 3.5).
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         scored.truncate(limit);
 
         Ok(scored)
@@ -185,8 +194,13 @@ impl VectorIndex {
             .map(|(id, emb)| (*id, dot(&q, emb)))
             .collect();
 
-        // Sort descending by similarity score.
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort descending by similarity score, tiebreak ascending by id
+        // (see the comment on the identical pattern in `search`, above).
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         scored.truncate(limit);
 
         Ok(scored)
@@ -317,6 +331,101 @@ mod tests {
         }
         let results = index.search(&[1.0, 0.0], 3).unwrap();
         assert_eq!(results.len(), 3);
+    }
+
+    /// Regression test for #186 / Task 3.5 (reviewer follow-up): a score
+    /// tie straddling `search`'s `truncate(limit)` boundary must not make
+    /// the returned candidate *set* nondeterministic. `entries` is a
+    /// `HashMap`, whose iteration order reseeds on every fresh
+    /// `HashMap::new()` — even within the same process/thread — so
+    /// without a tiebreak on the pre-truncate sort, which items survive
+    /// the cut (not just their order) could change from call to call.
+    ///
+    /// Builds a brand-new index each iteration (fresh `HashMap`, fresh
+    /// hasher keys) with 8 entries sharing an identical embedding (an
+    /// exact score tie against the query for all 8), searches with
+    /// `limit = 3` — well inside the tied group — and asserts every
+    /// rebuild returns the exact same 3 ids in the exact same order.
+    #[test]
+    fn test_search_truncation_boundary_tie_is_deterministic() {
+        const TIED_IDS: [Uuid; 8] = [
+            Uuid::from_bytes([1; 16]),
+            Uuid::from_bytes([2; 16]),
+            Uuid::from_bytes([3; 16]),
+            Uuid::from_bytes([4; 16]),
+            Uuid::from_bytes([5; 16]),
+            Uuid::from_bytes([6; 16]),
+            Uuid::from_bytes([7; 16]),
+            Uuid::from_bytes([8; 16]),
+        ];
+        const QUERY: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+        const LIMIT: usize = 3;
+
+        fn run_once() -> Vec<(Uuid, f32)> {
+            let mut index = VectorIndex::new(4, 16);
+            for id in TIED_IDS {
+                index.add(id, &QUERY).unwrap(); // identical embedding -> exact tie
+            }
+            index.search(&QUERY, LIMIT).unwrap()
+        }
+
+        let first = run_once();
+        assert_eq!(first.len(), LIMIT);
+        // Deterministic tiebreak is score desc then id asc, so the exact
+        // winners are predictable, not just "some 3 of the 8".
+        assert_eq!(
+            first.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            TIED_IDS[..LIMIT]
+        );
+
+        for i in 0..20 {
+            let repeat = run_once();
+            assert_eq!(
+                first, repeat,
+                "search() rebuild #{i} returned a different candidate set/order than \
+                 rebuild #0 for an identical tied index (nondeterministic truncation boundary)"
+            );
+        }
+    }
+
+    /// Sibling of the above for `filtered_search`, which has the same
+    /// sort-then-truncate shape.
+    #[test]
+    fn test_filtered_search_truncation_boundary_tie_is_deterministic() {
+        const TIED_IDS: [Uuid; 8] = [
+            Uuid::from_bytes([1; 16]),
+            Uuid::from_bytes([2; 16]),
+            Uuid::from_bytes([3; 16]),
+            Uuid::from_bytes([4; 16]),
+            Uuid::from_bytes([5; 16]),
+            Uuid::from_bytes([6; 16]),
+            Uuid::from_bytes([7; 16]),
+            Uuid::from_bytes([8; 16]),
+        ];
+        const QUERY: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+        const LIMIT: usize = 3;
+
+        fn run_once() -> Vec<(Uuid, f32)> {
+            let mut index = VectorIndex::new(4, 16);
+            for id in TIED_IDS {
+                index.add(id, &QUERY).unwrap();
+            }
+            index.filtered_search(&QUERY, LIMIT, |_| true).unwrap()
+        }
+
+        let first = run_once();
+        assert_eq!(
+            first.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            TIED_IDS[..LIMIT]
+        );
+        for i in 0..20 {
+            let repeat = run_once();
+            assert_eq!(
+                first, repeat,
+                "filtered_search() rebuild #{i} returned a different candidate set/order than \
+                 rebuild #0 for an identical tied index"
+            );
+        }
     }
 
     #[test]
