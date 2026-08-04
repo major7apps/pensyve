@@ -1,8 +1,9 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::Router;
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
+use pensyve_core::reranker::Reranker;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::{Namespace, ObservationMemory, Outcome, ProceduralMemory};
@@ -14,8 +15,33 @@ use rmcp::transport::streamable_http_server::{
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-/// Create a test server with a temporary database.
-fn create_test_state(dir: &tempfile::TempDir) -> Arc<PensyveState> {
+/// Prevents the lazily-resolved reranker (`PensyveState::reranker`) from
+/// attempting a real network model download when a test builds a state via
+/// [`create_test_state`] without pre-seeding `reranker_cell`. Tests that
+/// specifically exercise reranker behavior instead pre-seed the cell with
+/// `Reranker::new_mock()` (see [`create_test_state_with_reranker`]), which
+/// bypasses this env check entirely. Uses `Once` so the (unsafe, per Rust
+/// 2024 edition) env mutation happens exactly once, before any reader.
+#[allow(
+    unsafe_code,
+    reason = "test-only env-var guard; std::env::set_var is unsafe in Rust 2024 edition by language design but is safe here because it runs exactly once via std::sync::Once before any reader observes the environment"
+)]
+fn disable_reranker_for_tests() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // SAFETY: runs exactly once via `Once`, before any concurrent
+        // reader — no data race.
+        unsafe { std::env::set_var("PENSYVE_RERANKER", "0") };
+    });
+}
+
+/// Create a test server state, optionally with a reranker pre-attached
+/// (bypassing lazy resolution entirely — no network call either way).
+fn create_test_state_with_reranker(
+    dir: &tempfile::TempDir,
+    reranker: Option<Arc<Reranker>>,
+) -> Arc<PensyveState> {
+    disable_reranker_for_tests();
     let storage = SqliteBackend::open(dir.path()).expect("open test storage");
     let namespace = Namespace::new("test");
     storage.save_namespace(&namespace).expect("save namespace");
@@ -39,7 +65,13 @@ fn create_test_state(dir: &tempfile::TempDir) -> Arc<PensyveState> {
             max_depth: 4,
         },
         is_remote: false,
+        reranker_cell: Arc::new(OnceLock::from(reranker)),
     })
+}
+
+/// Create a test server with a temporary database and no reranker attached.
+fn create_test_state(dir: &tempfile::TempDir) -> Arc<PensyveState> {
+    create_test_state_with_reranker(dir, None)
 }
 
 /// Start a test server and return its address.
@@ -700,4 +732,124 @@ async fn test_mcp_get_method_not_allowed_in_stateless() {
     assert_eq!(resp.status(), 405);
 
     ct.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// Reranker wiring (#186 Task 7)
+// ---------------------------------------------------------------------------
+
+async fn remember_and_recall(url: &str, query: &str) -> Vec<serde_json::Value> {
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("{url}/mcp"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(json_rpc(
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "0.1.0" }
+            }),
+            1,
+        ))
+        .send()
+        .await
+        .expect("init");
+
+    client
+        .post(format!("{url}/mcp"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(json_rpc(
+            "tools/call",
+            serde_json::json!({
+                "name": "pensyve_remember",
+                "arguments": { "entity": "alice", "fact": query }
+            }),
+            2,
+        ))
+        .send()
+        .await
+        .expect("remember");
+
+    let resp = client
+        .post(format!("{url}/mcp"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(json_rpc(
+            "tools/call",
+            serde_json::json!({
+                "name": "pensyve_recall",
+                "arguments": { "query": query, "limit": 5 }
+            }),
+            3,
+        ))
+        .send()
+        .await
+        .expect("recall");
+
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).expect("parse json");
+    let content_text = json["result"]["content"][0]["text"]
+        .as_str()
+        .expect("content text");
+    serde_json::from_str(content_text).expect("parse recalled memories array")
+}
+
+/// Step 1 (part A): a mock reranker attached via `with_reranker` must not
+/// break the recall path — results still come back. Uses `Reranker::new_mock`
+/// (pre-seeded into `reranker_cell`, never touching the network) to exercise
+/// the same `RecallEngine::with_reranker` wiring `pensyve-mcp-tools::server`
+/// uses in production.
+#[tokio::test]
+async fn test_recall_with_mock_reranker_attached_returns_results() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let reranker = Some(Arc::new(Reranker::new_mock()));
+    let state = create_test_state_with_reranker(&dir, reranker);
+    let (url, ct) = start_test_server(state).await;
+
+    let memories = remember_and_recall(&url, "reranker attach test fact").await;
+    assert!(
+        !memories.is_empty(),
+        "expected at least one recalled memory with a mock reranker attached"
+    );
+
+    ct.cancel();
+}
+
+/// Step 1 (part B): an absent reranker (the default in this test binary —
+/// see `disable_reranker_for_tests`) must not break the recall path either.
+/// This is the graceful-fallback path a production gateway takes when
+/// `PENSYVE_RERANKER=0` is set, or when model resolution fails.
+#[tokio::test]
+async fn test_recall_without_reranker_falls_back_gracefully() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = create_test_state(&dir);
+    let (url, ct) = start_test_server(state).await;
+
+    let memories = remember_and_recall(&url, "no reranker fallback test fact").await;
+    assert!(
+        !memories.is_empty(),
+        "expected at least one recalled memory with no reranker attached"
+    );
+
+    ct.cancel();
+}
+
+/// Step 1 (part C): with `PENSYVE_RERANKER=0`, `PensyveState::reranker()`
+/// must resolve to `None` — i.e. the state holds no reranker. This binary
+/// sets the env var once via `disable_reranker_for_tests` (shared by every
+/// test above), so by the time this test runs the variable is already "0";
+/// asserting on `state.reranker()` here pins down the state-level contract
+/// the brief calls out explicitly, on top of the unit-level coverage in
+/// `pensyve_mcp_tools::state::tests`.
+#[tokio::test]
+async fn test_state_holds_no_reranker_when_disabled_via_env() {
+    disable_reranker_for_tests();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = create_test_state(&dir);
+    assert!(state.reranker().is_none());
 }

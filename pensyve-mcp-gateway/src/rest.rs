@@ -830,12 +830,16 @@ async fn recall(
     // Hold read lock only for retrieval — allows concurrent recalls.
     let result = {
         let vector_index = ps.vector_index.read().await;
-        let engine = RecallEngine::new(
+        let mut engine = RecallEngine::new(
             ps.storage.as_ref(),
             &ps.embedder,
             &vector_index,
             &ps.retrieval_config,
         );
+        let reranker = ps.reranker();
+        if let Some(r) = reranker.as_deref() {
+            engine = engine.with_reranker(r);
+        }
         engine
             .recall_with_embedding(
                 &body.query,
@@ -916,12 +920,16 @@ async fn recall_grouped(
     // Hold the read lock only for the actual retrieval call.
     let result = {
         let vector_index = ps.vector_index.read().await;
-        let engine = RecallEngine::new(
+        let mut engine = RecallEngine::new(
             ps.storage.as_ref(),
             &ps.embedder,
             &vector_index,
             &ps.retrieval_config,
         );
+        let reranker = ps.reranker();
+        if let Some(r) = reranker.as_deref() {
+            engine = engine.with_reranker(r);
+        }
         let flat = engine
             .recall_with_embedding(
                 &body.query,
@@ -2158,12 +2166,16 @@ async fn a2a_recall(
         .and_then(Result::ok);
 
     let vector_index = ps.vector_index.read().await;
-    let engine = RecallEngine::new(
+    let mut engine = RecallEngine::new(
         ps.storage.as_ref(),
         &ps.embedder,
         &vector_index,
         &ps.retrieval_config,
     );
+    let reranker = ps.reranker();
+    if let Some(r) = reranker.as_deref() {
+        engine = engine.with_reranker(r);
+    }
 
     match engine.recall_with_embedding(
         &query,

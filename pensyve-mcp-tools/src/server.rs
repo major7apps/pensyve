@@ -150,12 +150,16 @@ impl PensyveMcpServer {
         // Hold the read lock only for the retrieval phase, not embedding or serialization.
         let result = {
             let vector_index = state.vector_index.read().await;
-            let engine = RecallEngine::new(
+            let mut engine = RecallEngine::new(
                 state.storage.as_ref(),
                 &state.embedder,
                 &vector_index,
                 &state.retrieval_config,
             );
+            let reranker = state.reranker();
+            if let Some(r) = reranker.as_deref() {
+                engine = engine.with_reranker(r);
+            }
             engine
                 .recall_with_embedding(
                     &params.query,

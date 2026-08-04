@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use rmcp::ServiceExt;
@@ -314,6 +314,10 @@ async fn main() -> Result<()> {
         namespace,
         retrieval_config,
         is_remote: false,
+        // Same lazy/infallible resolution as the gateway (PENSYVE_RERANKER=0
+        // to disable; a model-load failure logs once and recall proceeds
+        // unreranked) — see `pensyve_mcp_tools::state::PensyveState::reranker`.
+        reranker_cell: Arc::new(OnceLock::new()),
     });
 
     let server = PensyveMcpServer::new(state);

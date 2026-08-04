@@ -26,6 +26,13 @@
 //!     `results/paraphrase_baseline.json` instead of the latest-run path.
 //!     This is the only way this binary touches the committed baseline —
 //!     never as a side effect of a plain or `--gate`-checked run.
+//!   `cargo run -p pensyve-benchmarks --bin paraphrase_eval --release -- --rerank`
+//!     Attaches the BGE cross-encoder reranker to the engine before running
+//!     (same lazy/infallible resolution as the gateway and CLI: a model-load
+//!     failure logs a warning and the run proceeds unreranked). Combine with
+//!     `--gate`/`--write-baseline` as needed. Omit `--rerank` to measure the
+//!     unreranked pipeline (the harness's default, and what the committed
+//!     baseline reflects).
 
 use std::collections::HashMap;
 
@@ -36,11 +43,32 @@ use pensyve_benchmarks::fixture::{self, FixtureQuery};
 use pensyve_benchmarks::metrics;
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
+use pensyve_core::reranker::Reranker;
 use pensyve_core::retrieval::RecallEngine;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::{Entity, EntityKind, Episode, EpisodicMemory, Namespace, SemanticMemory};
 use pensyve_core::vector::VectorIndex;
+
+/// Lazily resolve the cross-encoder reranker when `--rerank` is passed.
+/// Mirrors the gateway/CLI fallback: `PENSYVE_RERANKER=0` disables it, and a
+/// model-load failure logs one warning and the run proceeds unreranked
+/// rather than aborting.
+fn resolve_reranker() -> Option<std::sync::Arc<Reranker>> {
+    if std::env::var("PENSYVE_RERANKER").as_deref() == Ok("0") {
+        return None;
+    }
+    match Reranker::new_cached("BGERerankerBase") {
+        Ok(r) => Some(r),
+        Err(e) => {
+            eprintln!(
+                "Warning: reranker unavailable ({e}), continuing unreranked. \
+                 Set PENSYVE_RERANKER=0 to silence this warning."
+            );
+            None
+        }
+    }
+}
 
 /// Default regression gate tolerance: the current run's `top3_hit_rate`
 /// must not drop more than this far below the gate file's recorded value.
@@ -166,6 +194,7 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .cloned();
     let write_baseline = args.iter().any(|a| a == "--write-baseline");
+    let rerank = args.iter().any(|a| a == "--rerank");
     let gate_margin: f64 = args
         .iter()
         .position(|a| a == "--gate-margin")
@@ -335,7 +364,16 @@ fn main() {
         max_depth: 4,
     };
 
-    let engine = RecallEngine::new(&storage, &embedder, &vector_index, &retrieval_config);
+    let mut engine = RecallEngine::new(&storage, &embedder, &vector_index, &retrieval_config);
+    let reranker = if rerank { resolve_reranker() } else { None };
+    if let Some(r) = reranker.as_deref() {
+        println!("Reranker: BGERerankerBase (--rerank)");
+        engine = engine.with_reranker(r);
+    } else if rerank {
+        println!("Reranker: requested via --rerank but unavailable; running unreranked");
+    } else {
+        println!("Reranker: disabled (pass --rerank to enable)");
+    }
 
     // Embed queries and run recall
     println!("Embedding {} queries...", corpus.queries.len());
