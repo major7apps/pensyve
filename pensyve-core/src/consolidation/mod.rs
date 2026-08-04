@@ -48,7 +48,7 @@
 pub mod dmem;
 pub mod typed_slots;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -225,14 +225,23 @@ impl ConsolidationEngine {
         // Fetch all memories for this namespace to identify episodic ones.
         let all_memories = storage.get_all_memories_by_namespace(namespace_id)?;
 
-        // Partition episodic memories, grouped by about_entity.
+        // Partition episodic memories, grouped by about_entity. In the same
+        // sweep, record every promotion this namespace already holds so a
+        // re-run cannot mint a second copy of it.
         let mut episodic_by_entity: HashMap<Uuid, Vec<EpisodicMemory>> = HashMap::new();
+        let mut already_promoted: HashSet<(Uuid, String)> = HashSet::new();
         for mem in all_memories {
-            if let Memory::Episodic(em) = mem {
-                episodic_by_entity
-                    .entry(em.about_entity)
-                    .or_default()
-                    .push(em);
+            match mem {
+                Memory::Episodic(em) => {
+                    episodic_by_entity
+                        .entry(em.about_entity)
+                        .or_default()
+                        .push(em);
+                }
+                Memory::Semantic(sm) if sm.predicate == "mentioned" => {
+                    already_promoted.insert((sm.subject, sm.object));
+                }
+                _ => {}
             }
         }
 
@@ -310,6 +319,17 @@ impl ConsolidationEngine {
                 let most_recent = &memories[most_recent_idx];
                 let cluster_size = cluster.len();
                 let about_entity = most_recent.about_entity;
+
+                // Idempotency guard: this job re-derives clusters from scratch
+                // on every run, and the (entity, content) pair it would write
+                // is fully determined by that cluster. Without this check a
+                // stable cluster is re-promoted once per run — an episode_end
+                // hook firing per session turns that into unbounded duplicate
+                // growth in semantic memory.
+                if !already_promoted.insert((about_entity, most_recent.content.clone())) {
+                    continue;
+                }
+
                 let confidence = (cluster_size as f32 * 0.3).min(1.0);
                 let source_episodes: Vec<Uuid> = cluster
                     .iter()
