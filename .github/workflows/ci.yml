@@ -93,6 +93,40 @@ jobs:
         # in a process; serializing avoids any residual races on the
         # WAL/index files fastembed maintains alongside `model.onnx`.
         run: cargo test --workspace -- --ignored --test-threads=1
+  paraphrase-recall-gate:
+    name: Paraphrase Recall Gate
+    runs-on: ubuntu-latest
+    # Unlike `test-rust-models` above, this job is NOT continue-on-error:
+    # it exists to BLOCK merges that regress paraphrase recall (#186).
+    # It carries little of `test-rust-models`'s HuggingFace-flakiness
+    # risk because the model cache is shared with that job's key and is
+    # warm on any run after the first; on a cold cache the seed step
+    # below downloads serially in a single process, the same controlled
+    # pattern `test-rust-no-network-invariants` uses for its blocking
+    # job.
+    env:
+      # Same rationale as `test-rust-models`: pin fastembed's cache to a
+      # workspace-absolute path so `actions/cache` and the eval binary
+      # resolve the same directory.
+      FASTEMBED_CACHE_DIR: ${{ github.workspace }}/.fastembed_cache
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache fastembed ONNX models
+        id: model-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.fastembed_cache
+          # Shares `test-rust-models`'s key so both jobs reuse one
+          # accumulated cache (GTE embedder + BGE reranker included).
+          key: fastembed-models-${{ runner.os }}-v1
+      - name: Seed model cache on miss (single process, serial downloads)
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        # One ungated eval run downloads exactly the two models the gate
+        # needs (gte-base-en-v1.5 + bge-reranker-base) inside a single
+        # process, so there are no concurrent-download races. The gate
+        # run below then executes against a warm cache.
+        run: cargo run -p pensyve-benchmarks --bin paraphrase_eval --release -- --rerank
       - name: Paraphrase recall gate
         # Fails if top3_hit_rate drops more than --gate-margin below the
         # committed pensyve-benchmarks/results/paraphrase_baseline.json
