@@ -721,12 +721,20 @@ impl<'a> RecallEngine<'a> {
         // 1. Vector similarity ranking (already have scores from gather_candidates)
         let mut ranking_vec: Vec<(Uuid, f32)> =
             vector_map.iter().map(|(&id, &score)| (id, score)).collect();
-        ranking_vec.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranking_vec.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
 
         // 2. BM25 ranking (from FTS results — already gathered)
         let mut ranking_bm25: Vec<(Uuid, f32)> =
             bm25_map.iter().map(|(&id, &score)| (id, score)).collect();
-        ranking_bm25.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranking_bm25.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
 
         // 3. Activation ranking (ACT-R base-level activation)
         let mut ranking_activation: Vec<(Uuid, f32)> = candidates
@@ -747,8 +755,11 @@ impl<'a> RecallEngine<'a> {
                 (id, b)
             })
             .collect();
-        ranking_activation
-            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranking_activation.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
 
         // 4. Spreading activation / graph ranking
         let ranking_spread: Vec<(Uuid, f32)> = match (self.graph, target_entity) {
@@ -779,7 +790,11 @@ impl<'a> RecallEngine<'a> {
                 (id, score)
             })
             .collect();
-        ranking_intent.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranking_intent.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
 
         // 6. Confidence/reliability ranking
         let mut ranking_confidence: Vec<(Uuid, f32)> = candidates
@@ -794,8 +809,11 @@ impl<'a> RecallEngine<'a> {
                 (id, conf)
             })
             .collect();
-        ranking_confidence
-            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranking_confidence.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
 
         // 7. Entity-affinity ranking
         let mut ranking_entity: Vec<(Uuid, f32)> = if let Some(entity_id) = target_entity {
@@ -814,7 +832,11 @@ impl<'a> RecallEngine<'a> {
         } else {
             Vec::new()
         };
-        ranking_entity.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranking_entity.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
 
         // Phase 2A/2C SelRoute mask: when the env-gate fired and the
         // classification confidence cleared the 0.5 threshold,
@@ -1742,6 +1764,116 @@ mod tests {
             assert_ne!(
                 top_id, mem_b.id,
                 "Cooking memory should not be top result for quantum physics query"
+            );
+        }
+    }
+
+    /// Insert an episodic memory with an explicit (fixed) id, so repeated
+    /// fresh-corpus builds in a loop produce directly comparable id lists.
+    fn setup_episodic_with_id(
+        storage: &SqliteBackend,
+        embedder: &OnnxEmbedder,
+        ns: &Namespace,
+        id: Uuid,
+        content: &str,
+    ) -> EpisodicMemory {
+        let mut entity = Entity::new("agent", EntityKind::Agent);
+        entity.namespace_id = ns.id;
+        storage.save_entity(&entity).unwrap();
+
+        let episode = Episode::new(ns.id, vec![entity.id]);
+        storage.save_episode(&episode).unwrap();
+
+        let mut mem = EpisodicMemory::new(ns.id, episode.id, entity.id, entity.id, content);
+        mem.id = id;
+        // Pin `timestamp` to a fixed instant shared by every memory in the
+        // corpus (rather than each's real wall-clock creation time). The
+        // activation-ranking signal (`base_level_activation`) is built
+        // from `.timestamp()`, which truncates to whole seconds — six
+        // back-to-back real SQLite writes can, rarely, straddle a
+        // wall-clock second boundary, which would make that signal
+        // non-uniform (discriminative) for reasons unrelated to the
+        // tie-break bug under test and reintroduce flakiness here.
+        mem.timestamp = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        mem.embedding = embedder.embed(content).unwrap();
+        storage.save_episodic(&mem).unwrap();
+        mem
+    }
+
+    /// Build a fresh corpus with 4 identical-content memories (an exact
+    /// vector-score tie, and an exact FTS/bm25-score tie once matched) plus
+    /// 2 unrelated filler memories (keeping the vector ranking from being
+    /// entirely flat, which would make `has_discriminative_signal` drop it
+    /// from RRF and hide the bug), then run one `recall()` call and return
+    /// the ranked id list.
+    ///
+    /// Memory ids are fixed constants (not `Uuid::new_v4()`) so results
+    /// from independently-built corpora are directly comparable. Each
+    /// build uses a brand-new `SqliteBackend`/`VectorIndex`/`RecallEngine`
+    /// and issues exactly one `recall()` call, so retrieval-induced
+    /// reinforcement (which mutates `access_count`/`last_accessed` as a
+    /// side effect of a call) never carries over between iterations —
+    /// isolating the tie-break bug from that unrelated temporal effect.
+    fn run_tied_recall_once() -> Vec<Uuid> {
+        const TIED_CONTENT: &str = "the quick brown fox jumps over the lazy dog";
+        const TIED_IDS: [Uuid; 4] = [
+            Uuid::from_bytes([1; 16]),
+            Uuid::from_bytes([2; 16]),
+            Uuid::from_bytes([3; 16]),
+            Uuid::from_bytes([4; 16]),
+        ];
+        const FILLER_IDS: [Uuid; 2] = [Uuid::from_bytes([5; 16]), Uuid::from_bytes([6; 16])];
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteBackend::open(dir.path()).unwrap();
+        let embedder = OnnxEmbedder::new_mock(64);
+        let mut vector_index = VectorIndex::new(64, 16);
+        let config = test_config();
+
+        let ns = Namespace::new("determinism-ns");
+        storage.save_namespace(&ns).unwrap();
+
+        for id in TIED_IDS {
+            let mem = setup_episodic_with_id(&storage, &embedder, &ns, id, TIED_CONTENT);
+            vector_index.add(mem.id, &mem.embedding).unwrap();
+        }
+        for (id, content) in FILLER_IDS.into_iter().zip([
+            "completely unrelated filler alpha",
+            "completely unrelated filler beta",
+        ]) {
+            let mem = setup_episodic_with_id(&storage, &embedder, &ns, id, content);
+            vector_index.add(mem.id, &mem.embedding).unwrap();
+        }
+
+        let engine = RecallEngine::new(&storage, &embedder, &vector_index, &config);
+        let result = engine.recall(TIED_CONTENT, ns.id, 10).unwrap();
+        let ids: Vec<Uuid> = result.memories.iter().map(|c| c.memory_id).collect();
+
+        assert!(
+            TIED_IDS.iter().all(|id| ids.contains(id)),
+            "expected all 4 tied-content memories to be recalled"
+        );
+        ids
+    }
+
+    #[test]
+    fn test_recall_is_deterministic_across_repeated_calls() {
+        // Regression test for #186 / Task 3.5: `recall()` on identical
+        // inputs must return byte-for-byte identical rankings. Several
+        // per-signal rankings (`ranking_vec`, `ranking_bm25`, etc.) were
+        // built by collecting a `HashMap` into a `Vec` and sorting by
+        // score with no tiebreaker. `HashMap`'s default hasher reseeds
+        // its keys on every fresh `HashMap::new()` call — even within
+        // the same process/thread — so identical scores (ties) land in
+        // a different iteration order each call, and the unbroken sort
+        // let that arbitrary order leak into the final ranking.
+        let first = run_tied_recall_once();
+        for i in 0..20 {
+            let repeat = run_tied_recall_once();
+            assert_eq!(
+                first, repeat,
+                "recall() run #{i} returned a different ranking than run #0 for identical \
+                 inputs (nondeterministic tie-break in engine ranking sorts)"
             );
         }
     }

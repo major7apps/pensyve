@@ -1,0 +1,2066 @@
+{
+  "memories": [
+    {
+      "key": "bob-parquet-bench",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob benchmarked the Arrow-based Parquet reader at 2.1 GB/s on the m7i instance",
+      "confidence": 0.35
+    },
+    {
+      "key": "bob-found-switching-from-json-02",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob found that switching from JSON to rkyv zero-copy deserialization cut p50 latency by 60%",
+      "confidence": 0.35
+    },
+    {
+      "key": "bob-recommends-tokio-s-multi-03",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob recommends tokio's multi-threaded runtime over the current-thread runtime for the ingestion service",
+      "confidence": 0.36
+    },
+    {
+      "key": "bob-measured-mutex-contention-becoming-04",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob measured mutex contention becoming the dominant bottleneck above 24 concurrent writers",
+      "confidence": 0.36
+    },
+    {
+      "key": "bob-prefers-duckdb-over-sqlite-05",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob prefers DuckDB over SQLite for analytical scan-heavy workloads",
+      "confidence": 0.36
+    },
+    {
+      "key": "bob-discovered-hnsw-recall-drops-06",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob discovered that HNSW recall drops below 0.9 once ef_search is set under 40",
+      "confidence": 0.36
+    },
+    {
+      "key": "bob-set-up-ci-pipeline-07",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob set up the CI pipeline to run clippy with the pedantic lint group enabled",
+      "confidence": 0.37
+    },
+    {
+      "key": "bob-s-flamegraph-profiling-showed-08",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob's flamegraph profiling showed 30% of CPU time was spent in serde_json parsing",
+      "confidence": 0.37
+    },
+    {
+      "key": "bob-configured-criterion-run-each-09",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob configured criterion to run each benchmark for a minimum of 10 seconds for statistical stability",
+      "confidence": 0.37
+    },
+    {
+      "key": "bob-chose-grpc-over-rest-10",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob chose gRPC over REST for the internal service mesh because of lower serialization overhead",
+      "confidence": 0.37
+    },
+    {
+      "key": "bob-observed-connection-pooling-reduced-11",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob observed that connection pooling reduced Postgres connection setup latency from 40ms to 2ms",
+      "confidence": 0.38
+    },
+    {
+      "key": "bob-s-load-test-showed-12",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob's load test showed the API gateway saturates at roughly 8,000 requests per second",
+      "confidence": 0.38
+    },
+    {
+      "key": "bob-switched-cache-layer-from-13",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob switched the cache layer from Memcached to Redis to get built-in pub/sub support",
+      "confidence": 0.38
+    },
+    {
+      "key": "bob-reported-clickhouse-ingestion-job-14",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob reported that the ClickHouse ingestion job processes 1.2 million rows per minute",
+      "confidence": 0.38
+    },
+    {
+      "key": "bob-found-avoiding-heap-allocations-15",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob found that avoiding heap allocations in the hot loop cut GC pause time to near zero",
+      "confidence": 0.39
+    },
+    {
+      "key": "bob-s-analysis-showed-quic-16",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob's analysis showed QUIC reduces tail latency versus HTTP/2 on lossy mobile networks",
+      "confidence": 0.39
+    },
+    {
+      "key": "bob-set-connection-timeout-payments-17",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob set the connection timeout for the payments service to 3 seconds after a production incident",
+      "confidence": 0.39
+    },
+    {
+      "key": "bob-prefers-channels-over-shared-18",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob prefers channels over shared-state locking for the worker pool coordination logic",
+      "confidence": 0.39
+    },
+    {
+      "key": "bob-s-profiling-revealed-vector-19",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob's profiling revealed the vector index rebuild takes 45 seconds for 500k embeddings",
+      "confidence": 0.4
+    },
+    {
+      "key": "bob-recommends-protobuf-over-avro-20",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob recommends Protobuf over Avro for schema evolution across service boundaries",
+      "confidence": 0.4
+    },
+    {
+      "key": "bob-measured-batching-writes-groups-21",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob measured that batching writes in groups of 500 improved throughput by 3x over single-row inserts",
+      "confidence": 0.4
+    },
+    {
+      "key": "bob-s-team-adopted-trunk-22",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob's team adopted trunk-based development to reduce merge conflict overhead",
+      "confidence": 0.4
+    },
+    {
+      "key": "bob-configured-load-balancer-use-23",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob configured the load balancer to use least-connections routing instead of round-robin",
+      "confidence": 0.41
+    },
+    {
+      "key": "bob-found-enabling-tcp-nodelay-24",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob found that enabling TCP_NODELAY shaved 8ms off average request latency",
+      "confidence": 0.41
+    },
+    {
+      "key": "bob-s-benchmark-showed-columnar-25",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob's benchmark showed columnar storage outperforms row storage 4x for aggregate queries",
+      "confidence": 0.41
+    },
+    {
+      "key": "bob-recommends-pinning-worker-threads-26",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob recommends pinning worker threads to CPU cores for the low-latency matching engine",
+      "confidence": 0.42
+    },
+    {
+      "key": "bob-discovered-memory-leak-traced-27",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob discovered a memory leak traced to an unbounded channel buffer in the retry logic",
+      "confidence": 0.42
+    },
+    {
+      "key": "bob-s-team-standardized-opentelemetry-28",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob's team standardized on OpenTelemetry for distributed tracing across all services",
+      "confidence": 0.42
+    },
+    {
+      "key": "bob-prefers-explicit-error-types-29",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob prefers explicit error types over anyhow for library code, reserving anyhow for binaries",
+      "confidence": 0.42
+    },
+    {
+      "key": "bob-measured-cold-start-latency-30",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob measured the cold-start latency of the Lambda function at 340ms with the current bundle size",
+      "confidence": 0.43
+    },
+    {
+      "key": "bob-s-audit-found-retry-31",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob's audit found the retry policy was missing exponential backoff, causing thundering herd",
+      "confidence": 0.43
+    },
+    {
+      "key": "bob-configured-vector-index-use-32",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob configured the vector index to use product quantization to cut memory usage by 75%",
+      "confidence": 0.43
+    },
+    {
+      "key": "bob-recommends-wal-mode-sqlite-33",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob recommends WAL mode for SQLite when multiple readers need to coexist with a writer",
+      "confidence": 0.43
+    },
+    {
+      "key": "bob-s-team-migrated-build-34",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob's team migrated the build pipeline from Make to a Rust workspace with cargo xtask",
+      "confidence": 0.44
+    },
+    {
+      "key": "bob-found-increasing-shard-count-35",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob found that increasing the shard count from 4 to 16 improved write throughput linearly",
+      "confidence": 0.44
+    },
+    {
+      "key": "bob-prefers-structured-logging-tracing-36",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob prefers structured logging with tracing over println-style debugging in production code",
+      "confidence": 0.44
+    },
+    {
+      "key": "bob-s-benchmark-embedding-model-37",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob's benchmark of the embedding model showed 384 dimensions gives the best latency/quality tradeoff",
+      "confidence": 0.44
+    },
+    {
+      "key": "bob-discovered-deploy-script-missing-38",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob discovered the deploy script was missing a health check, causing traffic to hit unready pods",
+      "confidence": 0.45
+    },
+    {
+      "key": "bob-recommends-feature-flags-over-39",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob recommends feature flags over long-lived branches for gradual rollout of risky changes",
+      "confidence": 0.45
+    },
+    {
+      "key": "bob-s-team-adopted-shared-40",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob's team adopted a shared style guide after code review comments repeatedly flagged the same issues",
+      "confidence": 0.45
+    },
+    {
+      "key": "bob-m7i-instance-type-gives-41",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob said the m7i instance type gives the best price-performance for Parquet read benchmarks",
+      "confidence": 0.45
+    },
+    {
+      "key": "bob-c7g-instance-type-gives-42",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob later said the c7g instance type gives the best price-performance for Parquet read benchmarks",
+      "confidence": 0.46
+    },
+    {
+      "key": "bob-recommended-15-minute-canary-43",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob recommended a 15-minute canary window before promoting a build to full production",
+      "confidence": 0.46
+    },
+    {
+      "key": "bob-recommended-45-minute-canary-44",
+      "entity": "bob",
+      "kind": "semantic",
+      "content": "Bob later recommended a 45-minute canary window before promoting a build to full production",
+      "confidence": 0.46
+    },
+    {
+      "key": "bob-ep-during-retro-ingestion-project-01",
+      "entity": "bob",
+      "kind": "episodic",
+      "content": "During the retro on the ingestion project, Bob demoed the new batching logic and reported a 40% throughput improvement",
+      "confidence": 0.46
+    },
+    {
+      "key": "bob-ep-architecture-review-walked-team-02",
+      "entity": "bob",
+      "kind": "episodic",
+      "content": "In the architecture review, Bob walked the team through the tradeoffs between HNSW and IVF-PQ for the vector index",
+      "confidence": 0.47
+    },
+    {
+      "key": "bob-ep-postmortem-outage-explained-root-03",
+      "entity": "bob",
+      "kind": "episodic",
+      "content": "At the postmortem for the outage, Bob explained the root cause was an unbounded retry loop exhausting connections",
+      "confidence": 0.47
+    },
+    {
+      "key": "bob-ep-during-onboarding-showed-new-04",
+      "entity": "bob",
+      "kind": "episodic",
+      "content": "During onboarding, Bob showed the new hire how to profile a Rust binary with perf and flamegraph",
+      "confidence": 0.47
+    },
+    {
+      "key": "bob-ep-planning-meeting-proposed-migrating-05",
+      "entity": "bob",
+      "kind": "episodic",
+      "content": "In the planning meeting, Bob proposed migrating the cache layer to Redis Cluster for horizontal scaling",
+      "confidence": 0.48
+    },
+    {
+      "key": "bob-ep-benchmark-review-session-presented-06",
+      "entity": "bob",
+      "kind": "episodic",
+      "content": "At the benchmark review session, Bob presented results showing rkyv beats serde_json by 3x on deserialization",
+      "confidence": 0.48
+    },
+    {
+      "key": "alice-titanium-wallet",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice bought a titanium card wallet last month and says it survives being dropped without denting",
+      "confidence": 0.48
+    },
+    {
+      "key": "alice-s-favorite-hiking-trail-02",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's favorite hiking trail is the ridge loop above the reservoir, about 8 miles round trip",
+      "confidence": 0.48
+    },
+    {
+      "key": "alice-switched-from-french-press-03",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice switched from a French press to a pour-over setup because it's easier to clean",
+      "confidence": 0.49
+    },
+    {
+      "key": "alice-keeps-sourdough-starter-she-04",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice keeps a sourdough starter that she's maintained for over two years",
+      "confidence": 0.49
+    },
+    {
+      "key": "alice-s-apartment-gets-best-05",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's apartment gets the best afternoon light in the west-facing bedroom",
+      "confidence": 0.49
+    },
+    {
+      "key": "alice-runs-three-mornings-week-06",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice runs three mornings a week and treats Sunday as a rest day",
+      "confidence": 0.49
+    },
+    {
+      "key": "alice-s-cat-pixel-only-07",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's cat, Pixel, only eats wet food and ignores dry kibble entirely",
+      "confidence": 0.5
+    },
+    {
+      "key": "alice-reads-mostly-science-fiction-08",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice reads mostly science fiction but makes an exception for biographies",
+      "confidence": 0.5
+    },
+    {
+      "key": "alice-grows-basil-rosemary-her-09",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice grows basil and rosemary on her balcony but the mint keeps dying",
+      "confidence": 0.5
+    },
+    {
+      "key": "alice-s-commute-takes-25-10",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's commute takes 25 minutes by bike versus 40 minutes on the bus",
+      "confidence": 0.5
+    },
+    {
+      "key": "alice-prefers-window-seats-flights-11",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice prefers window seats on flights so she can lean against the wall to sleep",
+      "confidence": 0.51
+    },
+    {
+      "key": "alice-s-go-weeknight-dinner-12",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's go-to weeknight dinner is a stir-fry with whatever vegetables are about to go bad",
+      "confidence": 0.51
+    },
+    {
+      "key": "alice-learned-solder-so-she-13",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice learned to solder so she could fix her own mechanical keyboard",
+      "confidence": 0.51
+    },
+    {
+      "key": "alice-s-favorite-museum-city-14",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's favorite museum in the city is the small photography gallery near the river",
+      "confidence": 0.51
+    },
+    {
+      "key": "alice-keeps-her-phone-grayscale-15",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice keeps her phone on grayscale to reduce how often she checks it",
+      "confidence": 0.52
+    },
+    {
+      "key": "alice-s-family-recipe-chili-16",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's family recipe for chili always includes a square of dark chocolate",
+      "confidence": 0.52
+    },
+    {
+      "key": "alice-takes-stairs-instead-elevator-17",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice takes the stairs instead of the elevator whenever it's fewer than six flights",
+      "confidence": 0.52
+    },
+    {
+      "key": "alice-s-desk-setup-uses-18",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's desk setup uses a split ergonomic keyboard after wrist strain last year",
+      "confidence": 0.52
+    },
+    {
+      "key": "alice-volunteers-community-garden-first-19",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice volunteers at the community garden on the first Saturday of each month",
+      "confidence": 0.53
+    },
+    {
+      "key": "alice-s-favorite-season-autumn-20",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's favorite season is autumn because of the light and the cooler running weather",
+      "confidence": 0.53
+    },
+    {
+      "key": "alice-keeps-paper-notebook-ideas-21",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice keeps a paper notebook for ideas because typing feels too permanent for rough drafts",
+      "confidence": 0.53
+    },
+    {
+      "key": "alice-s-playlist-deep-work-22",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's playlist for deep work is almost entirely instrumental post-rock",
+      "confidence": 0.54
+    },
+    {
+      "key": "alice-learned-pottery-last-year-23",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice learned pottery last year and now makes most of her own mugs",
+      "confidence": 0.54
+    },
+    {
+      "key": "alice-s-rule-buying-gadgets-24",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's rule for buying gadgets is to wait 30 days before purchasing anything over $100",
+      "confidence": 0.54
+    },
+    {
+      "key": "alice-s-favorite-way-unwind-25",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's favorite way to unwind after a hard day is a long bath with a physical book",
+      "confidence": 0.54
+    },
+    {
+      "key": "alice-keeps-houseplants-every-room-26",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice keeps houseplants in every room except the kitchen, where the light is too low",
+      "confidence": 0.55
+    },
+    {
+      "key": "alice-s-ideal-vacation-involves-27",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's ideal vacation involves one big city and one quiet coastal town",
+      "confidence": 0.55
+    },
+    {
+      "key": "alice-bikes-farmers-market-every-28",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice bikes to the farmers market every Saturday morning regardless of weather",
+      "confidence": 0.55
+    },
+    {
+      "key": "alice-s-favorite-pen-fine-29",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's favorite pen is a fine-point rollerball that she buys in bulk",
+      "confidence": 0.55
+    },
+    {
+      "key": "alice-s-parents-taught-her-30",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's parents taught her to always tip generously, a habit she never broke",
+      "confidence": 0.56
+    },
+    {
+      "key": "alice-s-laptop-sticker-collection-31",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's laptop sticker collection is themed entirely around old video games",
+      "confidence": 0.56
+    },
+    {
+      "key": "alice-keeps-jar-loose-change-32",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice keeps a jar of loose change specifically for parking meters",
+      "confidence": 0.56
+    },
+    {
+      "key": "alice-s-favorite-comfort-food-33",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's favorite comfort food is her grandmother's version of chicken soup",
+      "confidence": 0.56
+    },
+    {
+      "key": "alice-s-closet-organized-by-34",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's closet is organized by color rather than by garment type",
+      "confidence": 0.57
+    },
+    {
+      "key": "alice-s-morning-routine-always-35",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's morning routine always starts with stretching before she checks her phone",
+      "confidence": 0.57
+    },
+    {
+      "key": "alice-s-go-conversation-starter-36",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's go-to conversation starter at parties is asking what people are reading",
+      "confidence": 0.57
+    },
+    {
+      "key": "alice-s-favorite-type-puzzle-37",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's favorite type of puzzle is a 1000-piece with almost no distinguishing pattern",
+      "confidence": 0.57
+    },
+    {
+      "key": "alice-s-spare-key-lives-38",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's spare key lives with her downstairs neighbor rather than under a mat",
+      "confidence": 0.58
+    },
+    {
+      "key": "alice-s-favorite-time-write-39",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice's favorite time to write is early morning before anyone else is awake",
+      "confidence": 0.58
+    },
+    {
+      "key": "alice-keeps-running-list-restaurants-40",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice keeps a running list of restaurants to try, sorted by how far she has to travel",
+      "confidence": 0.58
+    },
+    {
+      "key": "alice-she-prefers-python-scripting-41",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice said she prefers Python for scripting because of the ecosystem of libraries",
+      "confidence": 0.58
+    },
+    {
+      "key": "alice-she-prefers-typescript-scripting-42",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice later said she prefers TypeScript for scripting because of static typing",
+      "confidence": 0.59
+    },
+    {
+      "key": "alice-her-go-morning-drink-43",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice said her go-to morning drink is black coffee, no sugar",
+      "confidence": 0.59
+    },
+    {
+      "key": "alice-switched-green-tea-as-44",
+      "entity": "alice",
+      "kind": "semantic",
+      "content": "Alice later switched to green tea as her go-to morning drink",
+      "confidence": 0.59
+    },
+    {
+      "key": "alice-ep-last-weekend-hosted-dinner-01",
+      "entity": "alice",
+      "kind": "episodic",
+      "content": "Last weekend Alice hosted a dinner party and made the chili recipe with the dark chocolate twist",
+      "confidence": 0.6
+    },
+    {
+      "key": "alice-ep-hiking-trip-sunday-led-02",
+      "entity": "alice",
+      "kind": "episodic",
+      "content": "On the hiking trip Sunday, Alice led the group up the ridge loop and they saw a family of deer",
+      "confidence": 0.6
+    },
+    {
+      "key": "alice-ep-pottery-class-last-tuesday-03",
+      "entity": "alice",
+      "kind": "episodic",
+      "content": "At the pottery class last Tuesday, Alice finally got a mug to come out without a wobble",
+      "confidence": 0.6
+    },
+    {
+      "key": "alice-ep-during-move-last-month-04",
+      "entity": "alice",
+      "kind": "episodic",
+      "content": "During the move last month, Alice packed her entire book collection by genre instead of by size",
+      "confidence": 0.6
+    },
+    {
+      "key": "alice-ep-farmers-market-this-week-05",
+      "entity": "alice",
+      "kind": "episodic",
+      "content": "At the farmers market this week, Alice picked up a new sourdough starter as a backup",
+      "confidence": 0.61
+    },
+    {
+      "key": "alice-ep-her-flight-home-finished-06",
+      "entity": "alice",
+      "kind": "episodic",
+      "content": "On her flight home, Alice finished the biography she'd been reading for three weeks",
+      "confidence": 0.61
+    },
+    {
+      "key": "deploy-p99-rollback",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline automatically rolls back a release when p99 latency exceeds the alert threshold for five minutes",
+      "confidence": 0.61
+    },
+    {
+      "key": "deploy-pipeline-runs-integration-tests-against-02",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline runs integration tests against a staging replica before promoting to production",
+      "confidence": 0.61
+    },
+    {
+      "key": "deploy-pipeline-requires-two-approvals-any-03",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline requires two approvals for any change touching the payments service",
+      "confidence": 0.62
+    },
+    {
+      "key": "deploy-pipeline-blocks-merges-main-if-04",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline blocks merges to main if code coverage drops below 80 percent",
+      "confidence": 0.62
+    },
+    {
+      "key": "deploy-pipeline-tags-every-production-release-05",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline tags every production release with the git commit SHA and build timestamp",
+      "confidence": 0.62
+    },
+    {
+      "key": "deploy-pipeline-uses-blue-green-deployment-06",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline uses blue-green deployment for the API gateway to avoid downtime",
+      "confidence": 0.62
+    },
+    {
+      "key": "deploy-pipeline-pages-call-engineer-if-07",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline pages the on-call engineer if error rate exceeds 2 percent for three minutes",
+      "confidence": 0.63
+    },
+    {
+      "key": "deploy-pipeline-runs-smoke-test-suite-08",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline runs a smoke test suite immediately after every canary promotion",
+      "confidence": 0.63
+    },
+    {
+      "key": "deploy-pipeline-freezes-deployments-during-last-09",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline freezes deployments during the last two hours of the business day on Fridays",
+      "confidence": 0.63
+    },
+    {
+      "key": "deploy-pipeline-retries-failed-deployments-up-10",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline retries failed deployments up to three times before marking the release as failed",
+      "confidence": 0.63
+    },
+    {
+      "key": "deploy-pipeline-enforces-database-migrations-run-11",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline enforces that database migrations run in a separate step before application code deploys",
+      "confidence": 0.64
+    },
+    {
+      "key": "deploy-pipeline-caches-docker-layers-cut-12",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline caches Docker layers to cut build time from 12 minutes to 4 minutes",
+      "confidence": 0.64
+    },
+    {
+      "key": "deploy-pipeline-requires-passing-security-scan-13",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline requires a passing security scan before any container image can be pushed",
+      "confidence": 0.64
+    },
+    {
+      "key": "deploy-pipeline-sends-slack-notification-team-14",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline sends a Slack notification to the team channel for every production deploy",
+      "confidence": 0.64
+    },
+    {
+      "key": "deploy-pipeline-uses-feature-flags-decouple-15",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline uses feature flags to decouple deployment from feature release",
+      "confidence": 0.65
+    },
+    {
+      "key": "deploy-pipeline-runs-load-tests-nightly-16",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline runs load tests nightly against a scaled-down replica of production",
+      "confidence": 0.65
+    },
+    {
+      "key": "deploy-pipeline-automatically-scales-down-canary-17",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline automatically scales down canary traffic to zero if error budgets are exhausted",
+      "confidence": 0.65
+    },
+    {
+      "key": "deploy-pipeline-stores-last-five-successful-18",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline stores the last five successful release artifacts for fast rollback",
+      "confidence": 0.66
+    },
+    {
+      "key": "deploy-pipeline-requires-changelog-be-updated-19",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline requires the changelog to be updated before a release can be tagged",
+      "confidence": 0.66
+    },
+    {
+      "key": "deploy-pipeline-runs-dependency-vulnerability-scans-20",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline runs dependency vulnerability scans as part of every build",
+      "confidence": 0.66
+    },
+    {
+      "key": "deploy-pipeline-enforces-immutable-infrastructure-by-21",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline enforces immutable infrastructure by rebuilding rather than patching servers",
+      "confidence": 0.66
+    },
+    {
+      "key": "deploy-pipeline-uses-dedicated-queue-hotfix-22",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline uses a dedicated queue for hotfix deployments to bypass the normal review cadence",
+      "confidence": 0.67
+    },
+    {
+      "key": "deploy-pipeline-validates-configuration-files-against-23",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline validates configuration files against a schema before deployment",
+      "confidence": 0.67
+    },
+    {
+      "key": "deploy-pipeline-records-deployment-frequency-lead-24",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline records deployment frequency and lead time as core DORA metrics",
+      "confidence": 0.67
+    },
+    {
+      "key": "deploy-pipeline-requires-rollback-plan-documented-25",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline requires a rollback plan documented in every deployment ticket",
+      "confidence": 0.67
+    },
+    {
+      "key": "deploy-pipeline-runs-chaos-experiments-quarterly-26",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline runs chaos experiments quarterly to validate the rollback automation",
+      "confidence": 0.68
+    },
+    {
+      "key": "deploy-pipeline-uses-separate-credentials-staging-27",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline uses separate credentials for staging and production to limit blast radius",
+      "confidence": 0.68
+    },
+    {
+      "key": "deploy-pipeline-archives-build-logs-90-28",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline archives build logs for 90 days for audit purposes",
+      "confidence": 0.68
+    },
+    {
+      "key": "deploy-pipeline-automatically-closes-associated-ticket-29",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline automatically closes the associated ticket when a deployment succeeds",
+      "confidence": 0.68
+    },
+    {
+      "key": "deploy-pipeline-requires-all-secrets-be-30",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline requires all secrets to be pulled from the vault rather than environment files",
+      "confidence": 0.69
+    },
+    {
+      "key": "deploy-pipeline-supports-one-click-rollback-31",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline supports one-click rollback to any of the last ten releases",
+      "confidence": 0.69
+    },
+    {
+      "key": "deploy-pipeline-runs-database-backup-snapshot-32",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline runs a database backup snapshot immediately before any schema migration",
+      "confidence": 0.69
+    },
+    {
+      "key": "deploy-pipeline-throttles-concurrent-deployments-single-33",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline throttles concurrent deployments to a single service at a time",
+      "confidence": 0.69
+    },
+    {
+      "key": "deploy-pipeline-runs-contract-tests-between-34",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline runs contract tests between services before allowing a deploy to proceed",
+      "confidence": 0.7
+    },
+    {
+      "key": "deploy-pipeline-requires-release-notes-be-35",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline requires the release notes to be reviewed by a second engineer",
+      "confidence": 0.7
+    },
+    {
+      "key": "deploy-pipeline-exposes-status-dashboard-showing-36",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline exposes a status dashboard showing the health of the last ten deployments",
+      "confidence": 0.7
+    },
+    {
+      "key": "deploy-pipeline-uses-weighted-traffic-shift-37",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline uses a weighted traffic shift, starting canary at 5 percent of production traffic",
+      "confidence": 0.71
+    },
+    {
+      "key": "deploy-pipeline-configured-skip-canary-stage-38",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline is configured to skip the canary stage for documentation-only changes",
+      "confidence": 0.71
+    },
+    {
+      "key": "deploy-pipeline-emails-release-manager-summary-39",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline emails the release manager a summary at the end of each deploy window",
+      "confidence": 0.71
+    },
+    {
+      "key": "deploy-pipeline-requires-incident-ticket-be-40",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline requires an incident ticket to be linked before any emergency hotfix can merge",
+      "confidence": 0.71
+    },
+    {
+      "key": "deploy-pipeline-configured-start-canary-rollouts-41",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline was configured to start canary rollouts at 10 percent of production traffic",
+      "confidence": 0.72
+    },
+    {
+      "key": "deploy-pipeline-configuration-changed-start-canary-42",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline configuration was later changed to start canary rollouts at 25 percent of production traffic",
+      "confidence": 0.72
+    },
+    {
+      "key": "deploy-pipeline-enforces-deployment-freeze-24-43",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline enforces a deployment freeze for 24 hours before major holidays",
+      "confidence": 0.72
+    },
+    {
+      "key": "deploy-pipeline-freeze-window-before-major-44",
+      "entity": "deploy-pipeline",
+      "kind": "semantic",
+      "content": "The deploy pipeline freeze window before major holidays was later shortened to 12 hours",
+      "confidence": 0.72
+    },
+    {
+      "key": "deploy-pipeline-ep-during-last-week-s-01",
+      "entity": "deploy-pipeline",
+      "kind": "episodic",
+      "content": "During last week's incident, the deploy pipeline auto-rolled-back the checkout service within four minutes",
+      "confidence": 0.73
+    },
+    {
+      "key": "deploy-pipeline-ep-yesterday-s-release-window-02",
+      "entity": "deploy-pipeline",
+      "kind": "episodic",
+      "content": "In yesterday's release window, the deploy pipeline flagged a failed smoke test and blocked the promotion",
+      "confidence": 0.73
+    },
+    {
+      "key": "deploy-pipeline-ep-during-chaos-drill-s-03",
+      "entity": "deploy-pipeline",
+      "kind": "episodic",
+      "content": "During the chaos drill, the deploy pipeline's rollback automation restored service in under two minutes",
+      "confidence": 0.73
+    },
+    {
+      "key": "deploy-pipeline-ep-postmortem-meeting-team-traced-04",
+      "entity": "deploy-pipeline",
+      "kind": "episodic",
+      "content": "In the postmortem meeting, the team traced a bad deploy to a missing approval gate that was later added",
+      "confidence": 0.73
+    },
+    {
+      "key": "deploy-pipeline-ep-during-migration-cutover-paused-05",
+      "entity": "deploy-pipeline",
+      "kind": "episodic",
+      "content": "During the migration cutover, the deploy pipeline paused canary traffic after the error budget alarm fired",
+      "confidence": 0.74
+    },
+    {
+      "key": "deploy-pipeline-ep-last-month-s-audit-06",
+      "entity": "deploy-pipeline",
+      "kind": "episodic",
+      "content": "In last month's audit, the deploy pipeline logs showed 45 deployments with zero unplanned downtime",
+      "confidence": 0.74
+    },
+    {
+      "key": "acme-corp-signed-three-year-enterprise-01",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp signed a three-year enterprise contract with its primary cloud vendor in Q1",
+      "confidence": 0.74
+    },
+    {
+      "key": "acme-corp-s-engineering-headcount-grew-02",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's engineering headcount grew from 40 to 65 over the past fiscal year",
+      "confidence": 0.74
+    },
+    {
+      "key": "acme-corp-moved-its-headquarters-smaller-03",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp moved its headquarters to a smaller office after shifting to a hybrid work policy",
+      "confidence": 0.75
+    },
+    {
+      "key": "acme-corp-s-board-approved-budget-04",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's board approved a budget of $2.4 million for infrastructure modernization",
+      "confidence": 0.75
+    },
+    {
+      "key": "acme-corp-acquired-small-analytics-startup-05",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp acquired a small analytics startup to bring dashboarding capability in-house",
+      "confidence": 0.75
+    },
+    {
+      "key": "acme-corp-s-customer-support-team-06",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's customer support team switched from email-only to a ticketing system with SLAs",
+      "confidence": 0.75
+    },
+    {
+      "key": "acme-corp-s-annual-recurring-revenue-07",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's annual recurring revenue crossed $18 million last quarter",
+      "confidence": 0.76
+    },
+    {
+      "key": "acme-soc2-cert",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's security team achieved SOC 2 Type II certification after a six-month audit",
+      "confidence": 0.76
+    },
+    {
+      "key": "acme-corp-s-sales-team-restructured-09",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's sales team restructured into pods aligned by industry vertical",
+      "confidence": 0.76
+    },
+    {
+      "key": "acme-corp-s-churn-rate-dropped-10",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's churn rate dropped from 8 percent to 5 percent after the onboarding redesign",
+      "confidence": 0.77
+    },
+    {
+      "key": "acme-corp-s-leadership-decided-sunset-11",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's leadership decided to sunset the legacy on-premise product line by next year",
+      "confidence": 0.77
+    },
+    {
+      "key": "acme-corp-s-marketing-budget-reallocated-12",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's marketing budget was reallocated toward content and away from paid search",
+      "confidence": 0.77
+    },
+    {
+      "key": "acme-corp-s-data-retention-policy-13",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's data retention policy requires customer data to be purged 90 days after account closure",
+      "confidence": 0.77
+    },
+    {
+      "key": "acme-corp-s-engineering-team-adopted-14",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's engineering team adopted a four-day work week trial for the summer",
+      "confidence": 0.78
+    },
+    {
+      "key": "acme-corp-s-procurement-process-now-15",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's procurement process now requires three vendor quotes for purchases over $10,000",
+      "confidence": 0.78
+    },
+    {
+      "key": "acme-corp-s-compliance-team-added-16",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's compliance team added GDPR data processing addenda to all new contracts",
+      "confidence": 0.78
+    },
+    {
+      "key": "acme-corp-s-product-team-ships-17",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's product team ships a public changelog every two weeks",
+      "confidence": 0.78
+    },
+    {
+      "key": "acme-corp-s-finance-team-moved-18",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's finance team moved from quarterly to monthly close to improve forecasting accuracy",
+      "confidence": 0.79
+    },
+    {
+      "key": "acme-corp-s-customer-advisory-board-19",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's customer advisory board meets twice a year to prioritize the roadmap",
+      "confidence": 0.79
+    },
+    {
+      "key": "acme-corp-s-largest-customer-by-20",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's largest customer by revenue is a logistics company representing 12 percent of ARR",
+      "confidence": 0.79
+    },
+    {
+      "key": "acme-corp-s-hr-team-introduced-21",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's HR team introduced a formalized career ladder for engineering roles",
+      "confidence": 0.79
+    },
+    {
+      "key": "acme-corp-s-legal-team-standardized-22",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's legal team standardized on a single MSA template to speed up deal cycles",
+      "confidence": 0.8
+    },
+    {
+      "key": "acme-corp-s-office-austin-closed-23",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's office in Austin closed after the lease expired and staff went fully remote",
+      "confidence": 0.8
+    },
+    {
+      "key": "acme-corp-s-incident-response-policy-24",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's incident response policy requires a postmortem within 48 hours of any P1",
+      "confidence": 0.8
+    },
+    {
+      "key": "acme-corp-s-data-warehouse-migrated-25",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's data warehouse migrated from a legacy on-prem cluster to a managed cloud service",
+      "confidence": 0.8
+    },
+    {
+      "key": "acme-corp-s-benefits-package-added-26",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's benefits package added a $1,500 annual learning and development stipend",
+      "confidence": 0.81
+    },
+    {
+      "key": "acme-corp-s-founders-retained-majority-27",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's founders retained majority board control after the most recent funding round",
+      "confidence": 0.81
+    },
+    {
+      "key": "acme-corp-s-customer-success-team-28",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's customer success team owns renewal conversations for accounts under $50,000 ARR",
+      "confidence": 0.81
+    },
+    {
+      "key": "acme-corp-s-internal-tools-team-29",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's internal tools team built a self-service reporting dashboard for account managers",
+      "confidence": 0.81
+    },
+    {
+      "key": "acme-corp-s-brand-refresh-included-30",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's brand refresh included a new logo and a simplified color palette",
+      "confidence": 0.82
+    },
+    {
+      "key": "acme-corp-s-partnership-systems-integrator-31",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's partnership with a systems integrator drove 20 percent of new pipeline last quarter",
+      "confidence": 0.82
+    },
+    {
+      "key": "acme-corp-s-engineering-org-uses-32",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's engineering org uses a RFC process for any change affecting more than one team",
+      "confidence": 0.82
+    },
+    {
+      "key": "acme-corp-s-most-recent-employee-33",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's most recent employee survey showed a 12-point increase in engagement scores",
+      "confidence": 0.83
+    },
+    {
+      "key": "acme-corp-s-pricing-model-shifted-34",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's pricing model shifted from per-seat to usage-based for the enterprise tier",
+      "confidence": 0.83
+    },
+    {
+      "key": "acme-corp-s-data-privacy-officer-35",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's data privacy officer reports directly to the general counsel",
+      "confidence": 0.83
+    },
+    {
+      "key": "acme-corp-s-customer-onboarding-time-36",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's customer onboarding time dropped from six weeks to ten days after the redesign",
+      "confidence": 0.83
+    },
+    {
+      "key": "acme-corp-s-supply-chain-team-37",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's supply chain team diversified vendors after a single-source outage last winter",
+      "confidence": 0.84
+    },
+    {
+      "key": "acme-corp-s-executive-team-holds-38",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's executive team holds a public all-hands every first Monday of the month",
+      "confidence": 0.84
+    },
+    {
+      "key": "acme-corp-s-revenue-mix-now-39",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's revenue mix is now 70 percent subscription and 30 percent services",
+      "confidence": 0.84
+    },
+    {
+      "key": "acme-corp-s-engineering-team-runs-40",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's engineering team runs a quarterly hackathon that has produced two shipped features",
+      "confidence": 0.84
+    },
+    {
+      "key": "acme-corp-announced-it-relocating-its-41",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp announced it was relocating its headquarters to Denver",
+      "confidence": 0.85
+    },
+    {
+      "key": "acme-corp-announced-it-relocating-its-42",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp later announced it was relocating its headquarters to Austin instead of Denver",
+      "confidence": 0.85
+    },
+    {
+      "key": "acme-corp-s-enterprise-tier-priced-43",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's enterprise tier was priced at a flat annual rate regardless of usage",
+      "confidence": 0.85
+    },
+    {
+      "key": "acme-corp-s-enterprise-tier-pricing-44",
+      "entity": "acme-corp",
+      "kind": "semantic",
+      "content": "Acme Corp's enterprise tier pricing was later changed to scale with monthly active usage",
+      "confidence": 0.85
+    },
+    {
+      "key": "acme-corp-ep-last-quarter-s-all-01",
+      "entity": "acme-corp",
+      "kind": "episodic",
+      "content": "At last quarter's all-hands, Acme Corp's CEO announced the acquisition of the analytics startup",
+      "confidence": 0.86
+    },
+    {
+      "key": "acme-corp-ep-during-board-meeting-march-02",
+      "entity": "acme-corp",
+      "kind": "episodic",
+      "content": "During the board meeting in March, Acme Corp's leadership approved the infrastructure budget increase",
+      "confidence": 0.86
+    },
+    {
+      "key": "acme-corp-ep-customer-advisory-board-session-03",
+      "entity": "acme-corp",
+      "kind": "episodic",
+      "content": "At the customer advisory board session, Acme Corp's product team presented the usage-based pricing proposal",
+      "confidence": 0.86
+    },
+    {
+      "key": "acme-corp-ep-during-soc-2-audit-04",
+      "entity": "acme-corp",
+      "kind": "episodic",
+      "content": "During the SOC 2 audit kickoff, Acme Corp's security team walked auditors through the access control policy",
+      "confidence": 0.86
+    },
+    {
+      "key": "acme-corp-ep-q2-town-hall-s-05",
+      "entity": "acme-corp",
+      "kind": "episodic",
+      "content": "At the Q2 town hall, Acme Corp's finance lead explained the move to monthly financial close",
+      "confidence": 0.87
+    },
+    {
+      "key": "acme-corp-ep-during-office-consolidation-announcement-06",
+      "entity": "acme-corp",
+      "kind": "episodic",
+      "content": "During the office consolidation announcement, Acme Corp confirmed the Austin lease would not be renewed",
+      "confidence": 0.87
+    },
+    {
+      "key": "research-rrf-vs-linear",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes conclude that the reranker model improves nDCG@10 by 8 points over the base retriever",
+      "confidence": 0.87
+    },
+    {
+      "key": "research-notes-show-hybrid-search-outperforms-02",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes show that hybrid search outperforms pure vector search on queries with rare entity names",
+      "confidence": 0.87
+    },
+    {
+      "key": "research-notes-flag-ablation-study-used-03",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes flag that the ablation study used too small a held-out set to be conclusive",
+      "confidence": 0.88
+    },
+    {
+      "key": "research-notes-document-reducing-embedding-dimensionality-04",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes document that reducing embedding dimensionality from 768 to 384 barely hurt recall",
+      "confidence": 0.88
+    },
+    {
+      "key": "research-notes-cite-paper-showing-contrastive-05",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes cite a paper showing contrastive pretraining improves few-shot classification accuracy",
+      "confidence": 0.88
+    },
+    {
+      "key": "research-notes-describe-experiment-where-bm25-06",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes describe an experiment where BM25 alone matched dense retrieval on short queries",
+      "confidence": 0.89
+    },
+    {
+      "key": "research-notes-recommend-running-significance-tests-07",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes recommend running significance tests before reporting any benchmark improvement",
+      "confidence": 0.89
+    },
+    {
+      "key": "research-notes-summarize-survey-reranking-approaches-08",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes summarize a survey of reranking approaches used in production search systems",
+      "confidence": 0.89
+    },
+    {
+      "key": "research-notes-highlight-batching-queries-during-09",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes highlight that batching queries during evaluation introduced a subtle latency bias",
+      "confidence": 0.89
+    },
+    {
+      "key": "research-notes-propose-new-evaluation-metric-10",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes propose a new evaluation metric that penalizes stale or superseded retrieved facts",
+      "confidence": 0.9
+    },
+    {
+      "key": "research-notes-track-increasing-negative-sampling-11",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes track that increasing negative sampling ratio improved the contrastive loss convergence",
+      "confidence": 0.9
+    },
+    {
+      "key": "research-notes-report-fine-tuning-domain-12",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes report that fine-tuning on domain data closed most of the gap to the larger base model",
+      "confidence": 0.9
+    },
+    {
+      "key": "research-notes-note-annotation-guidelines-needed-13",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes note that the annotation guidelines needed revision after inter-rater agreement was low",
+      "confidence": 0.9
+    },
+    {
+      "key": "research-notes-reference-experiment-comparing-cosine-14",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes reference an experiment comparing cosine similarity to dot product for ranking stability",
+      "confidence": 0.91
+    },
+    {
+      "key": "research-notes-conclude-query-expansion-helps-15",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes conclude that query expansion helps recall but hurts precision on ambiguous queries",
+      "confidence": 0.91
+    },
+    {
+      "key": "research-notes-document-failure-mode-where-16",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes document a failure mode where paraphrased queries scored lower than verbatim queries",
+      "confidence": 0.91
+    },
+    {
+      "key": "research-notes-describe-pilot-where-human-17",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes describe a pilot where human evaluators preferred the reranked results 68 percent of the time",
+      "confidence": 0.91
+    },
+    {
+      "key": "research-notes-flag-training-data-had-18",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes flag that the training data had a skew toward short factual queries over conversational ones",
+      "confidence": 0.92
+    },
+    {
+      "key": "research-notes-recommend-held-out-temporal-19",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes recommend a held-out temporal split rather than a random split for recency-sensitive evaluation",
+      "confidence": 0.92
+    },
+    {
+      "key": "research-notes-summarize-findings-from-replicating-20",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes summarize findings from replicating a published retrieval benchmark on internal data",
+      "confidence": 0.92
+    },
+    {
+      "key": "research-notes-document-adding-hard-negatives-21",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes document that adding hard negatives during training improved top-1 accuracy by 5 points",
+      "confidence": 0.92
+    },
+    {
+      "key": "research-notes-note-current-judge-model-22",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes note that the current judge model shows a length bias favoring longer answers",
+      "confidence": 0.93
+    },
+    {
+      "key": "research-notes-track-experiment-where-multi-23",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes track an experiment where multi-vector representations improved recall for long documents",
+      "confidence": 0.93
+    },
+    {
+      "key": "research-notes-describe-calibration-study-comparing-24",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes describe a calibration study comparing predicted confidence to observed accuracy",
+      "confidence": 0.93
+    },
+    {
+      "key": "research-notes-conclude-combining-bm25-dense-25",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes conclude that combining BM25 and dense scores via reciprocal rank fusion is more robust than linear weighting",
+      "confidence": 0.93
+    },
+    {
+      "key": "research-notes-report-supersession-detection-reduced-26",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes report that supersession detection reduced contradictory answers by roughly a third",
+      "confidence": 0.94
+    },
+    {
+      "key": "research-notes-reference-follow-up-experiment-27",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes reference a follow-up experiment planned to test the effect of confidence decay over time",
+      "confidence": 0.94
+    },
+    {
+      "key": "research-notes-document-offline-eval-online-28",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes document that the offline eval and online A/B test disagreed on the winning variant",
+      "confidence": 0.94
+    },
+    {
+      "key": "research-notes-flag-data-leakage-issue-29",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes flag a data leakage issue where test queries overlapped with training memories",
+      "confidence": 0.95
+    },
+    {
+      "key": "research-notes-recommend-logging-raw-retrieval-30",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes recommend logging raw retrieval scores in addition to final ranked results for debugging",
+      "confidence": 0.95
+    },
+    {
+      "key": "research-notes-summarize-literature-review-catastrophic-31",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes summarize a literature review on catastrophic forgetting in continually updated memory systems",
+      "confidence": 0.95
+    },
+    {
+      "key": "research-notes-describe-experiment-measuring-latency-32",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes describe an experiment measuring the latency cost of adding a cross-encoder reranking stage",
+      "confidence": 0.95
+    },
+    {
+      "key": "research-notes-note-entity-scoped-search-33",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes note that entity-scoped search improved precision but reduced recall for cross-entity queries",
+      "confidence": 0.96
+    },
+    {
+      "key": "research-notes-track-increasing-candidate-pool-34",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes track that increasing the candidate pool size from 50 to 200 improved recall with modest latency cost",
+      "confidence": 0.96
+    },
+    {
+      "key": "research-notes-document-bug-where-duplicate-35",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes document a bug where duplicate memories inflated recall metrics until deduplication was added",
+      "confidence": 0.96
+    },
+    {
+      "key": "research-notes-conclude-current-judge-prompt-36",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes conclude the current judge prompt is more reliable for factual than for subjective queries",
+      "confidence": 0.96
+    },
+    {
+      "key": "research-notes-reference-plan-run-paraphrase-37",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes reference a plan to run the paraphrase robustness study on a held-out corpus",
+      "confidence": 0.97
+    },
+    {
+      "key": "research-notes-describe-how-synthetic-paraphrases-38",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes describe how synthetic paraphrases were generated using template substitution and back-translation",
+      "confidence": 0.97
+    },
+    {
+      "key": "research-notes-document-removing-stopwords-before-39",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes document that removing stopwords before BM25 scoring had negligible effect on ranking quality",
+      "confidence": 0.97
+    },
+    {
+      "key": "research-notes-recommend-re-running-paraphrase-40",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes recommend re-running the paraphrase study whenever the embedding model is upgraded",
+      "confidence": 0.97
+    },
+    {
+      "key": "research-notes-concluded-reciprocal-rank-fusion-41",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes concluded that reciprocal rank fusion outperforms linear weighted scoring for hybrid retrieval",
+      "confidence": 0.98
+    },
+    {
+      "key": "research-notes-revision-concluded-linear-weighted-42",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "A later revision of the research notes concluded that linear weighted scoring outperforms reciprocal rank fusion for hybrid retrieval",
+      "confidence": 0.98
+    },
+    {
+      "key": "research-notes-reported-384-dimensional-embeddings-43",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes reported that 384-dimensional embeddings matched 768-dimensional embeddings on the benchmark",
+      "confidence": 0.98
+    },
+    {
+      "key": "research-notes-corrected-report-768-dimensional-44",
+      "entity": "research-notes",
+      "kind": "semantic",
+      "content": "The research notes were later corrected to report that 768-dimensional embeddings outperformed 384-dimensional embeddings by a small margin",
+      "confidence": 0.98
+    },
+    {
+      "key": "research-notes-ep-yesterday-s-sync-team-01",
+      "entity": "research-notes",
+      "kind": "episodic",
+      "content": "In yesterday's research sync, the team reviewed the ablation study and flagged the small held-out set",
+      "confidence": 0.99
+    },
+    {
+      "key": "research-notes-ep-during-paper-reading-group-02",
+      "entity": "research-notes",
+      "kind": "episodic",
+      "content": "During the paper reading group, the team discussed the contrastive pretraining paper cited in the notes",
+      "confidence": 0.99
+    },
+    {
+      "key": "research-notes-ep-eval-review-meeting-team-03",
+      "entity": "research-notes",
+      "kind": "episodic",
+      "content": "At the eval review meeting, the team examined why the offline and online experiments disagreed",
+      "confidence": 0.99
+    },
+    {
+      "key": "research-notes-ep-during-annotation-calibration-session-04",
+      "entity": "research-notes",
+      "kind": "episodic",
+      "content": "During the annotation calibration session, the team revised the guidelines after low inter-rater agreement",
+      "confidence": 0.99
+    },
+    {
+      "key": "research-notes-ep-planning-meeting-paraphrase-study-05",
+      "entity": "research-notes",
+      "kind": "episodic",
+      "content": "In the planning meeting for the paraphrase study, the team decided to use template substitution for synthetic queries",
+      "confidence": 1.0
+    },
+    {
+      "key": "research-notes-ep-quarterly-review-team-presented-06",
+      "entity": "research-notes",
+      "kind": "episodic",
+      "content": "At the quarterly research review, the team presented the reranker's 8-point nDCG@10 improvement",
+      "confidence": 1.0
+    }
+  ],
+  "queries": [
+    {
+      "query": "how fast is bob's parquet reader",
+      "gold_keys": ["bob-parquet-bench"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "which async runtime setup does bob suggest for the data intake pipeline",
+      "gold_keys": ["bob-recommends-tokio-s-multi-03"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what did bob identify as the biggest slowdown once simultaneous writes climbed past two dozen",
+      "gold_keys": ["bob-measured-mutex-contention-becoming-04"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "which embedded database does bob favor when queries mostly scan large tables",
+      "gold_keys": ["bob-prefers-duckdb-over-sqlite-05"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what search parameter, when set too low, hurts bob's vector index accuracy",
+      "gold_keys": ["bob-discovered-hnsw-recall-drops-06"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "roughly how much traffic can the gateway handle before it maxes out, per bob's testing",
+      "gold_keys": ["bob-s-load-test-showed-12"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "why did bob move the caching system to a different tool that has built-in messaging",
+      "gold_keys": ["bob-switched-cache-layer-from-13"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how did bob get rid of garbage-collector pauses in the critical code path",
+      "gold_keys": ["bob-found-avoiding-heap-allocations-15"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "which data format does bob favor when schemas need to change across services over time",
+      "gold_keys": ["bob-recommends-protobuf-over-avro-20"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "where did bob trace an unexpected memory-usage bug back to",
+      "gold_keys": ["bob-discovered-memory-leak-traced-27"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "which trek does alice enjoy most near the reservoir and how long does it take",
+      "gold_keys": ["alice-s-favorite-hiking-trail-02"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "why did alice change her morning coffee brewing method to something less of a hassle to wash",
+      "gold_keys": ["alice-switched-from-french-press-03"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how long has alice been growing her own bread starter",
+      "gold_keys": ["alice-keeps-sourdough-starter-she-04"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how often does alice go jogging and which day does she take off",
+      "gold_keys": ["alice-runs-three-mornings-week-06"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "which plants thrive for alice outdoors and which one won't survive",
+      "gold_keys": ["alice-grows-basil-rosemary-her-09"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "why does alice pick a specific airplane seat for napping",
+      "gold_keys": ["alice-prefers-window-seats-flights-11"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what skill did alice pick up so she could repair her own keyboard",
+      "gold_keys": ["alice-learned-solder-so-she-13"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what display trick does alice use to curb compulsive phone checking",
+      "gold_keys": ["alice-keeps-her-phone-grayscale-15"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what equipment change did alice make at her desk after hurting her wrist",
+      "gold_keys": ["alice-s-desk-setup-uses-18"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how often and where does alice spend time volunteering with plants",
+      "gold_keys": ["alice-volunteers-community-garden-first-19"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how many sign-offs are needed before a payments-related change can ship",
+      "gold_keys": ["deploy-pipeline-requires-two-approvals-any-03"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what test coverage threshold prevents code from merging into the main branch",
+      "gold_keys": ["deploy-pipeline-blocks-merges-main-if-04"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what zero-downtime release strategy is used for the gateway service",
+      "gold_keys": ["deploy-pipeline-uses-blue-green-deployment-06"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "under what failure-rate condition does the system alert whoever is on duty",
+      "gold_keys": ["deploy-pipeline-pages-call-engineer-if-07"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "when during the week does the release process pause shipping changes",
+      "gold_keys": ["deploy-pipeline-freezes-deployments-during-last-09"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how was container build duration shortened",
+      "gold_keys": ["deploy-pipeline-caches-docker-layers-cut-12"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how does the team get notified whenever something ships to production",
+      "gold_keys": ["deploy-pipeline-sends-slack-notification-team-14"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how many prior working builds are kept on hand for quick reverting",
+      "gold_keys": ["deploy-pipeline-stores-last-five-successful-18"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how often is failure-injection testing done to confirm automatic recovery works",
+      "gold_keys": ["deploy-pipeline-runs-chaos-experiments-quarterly-26"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "where must credentials be sourced from instead of config files",
+      "gold_keys": ["deploy-pipeline-requires-all-secrets-be-30"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how long is acme's deal with its main cloud provider and when was it signed",
+      "gold_keys": ["acme-corp-signed-three-year-enterprise-01"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "by how much did the size of acme's engineering team increase last year",
+      "gold_keys": ["acme-corp-s-engineering-headcount-grew-02"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "why did acme downsize its main office space",
+      "gold_keys": ["acme-corp-moved-its-headquarters-smaller-03"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what company did acme buy to build its own reporting features",
+      "gold_keys": ["acme-corp-acquired-small-analytics-startup-05"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what was acme's yearly subscription income milestone recently",
+      "gold_keys": ["acme-corp-s-annual-recurring-revenue-07"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how did revamping the new-user setup affect customer cancellations at acme",
+      "gold_keys": ["acme-corp-s-churn-rate-dropped-10"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "which older self-hosted product is acme planning to retire",
+      "gold_keys": ["acme-corp-s-leadership-decided-sunset-11"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how quickly must customer records be deleted once an account closes",
+      "gold_keys": ["acme-corp-s-data-retention-policy-13"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how many bids does acme need before approving a large purchase",
+      "gold_keys": ["acme-corp-s-procurement-process-now-15"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what happened to acme's Texas office once its lease ran out",
+      "gold_keys": ["acme-corp-s-office-austin-closed-23"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "which retrieval approach wins for uncommon proper-noun lookups according to the study",
+      "gold_keys": ["research-notes-show-hybrid-search-outperforms-02"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what limitation undermines the credibility of the component-removal experiment",
+      "gold_keys": ["research-notes-flag-ablation-study-used-03"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what training technique is cited as boosting low-data classification performance",
+      "gold_keys": ["research-notes-cite-paper-showing-contrastive-05"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what statistical check should happen before claiming a performance gain",
+      "gold_keys": ["research-notes-recommend-running-significance-tests-07"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what measurement artifact appeared from grouping requests together while testing",
+      "gold_keys": ["research-notes-highlight-batching-queries-during-09"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "how did adjusting the proportion of negative examples affect training stability",
+      "gold_keys": ["research-notes-track-increasing-negative-sampling-11"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what gain resulted from including difficult counterexamples during training",
+      "gold_keys": ["research-notes-document-adding-hard-negatives-21"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what unwanted tendency does the evaluator model have regarding answer length",
+      "gold_keys": ["research-notes-note-current-judge-model-22"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what contamination problem was found between evaluation and training sets",
+      "gold_keys": ["research-notes-flag-data-leakage-issue-29"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "what tradeoff appears when limiting search to one entity versus searching across entities",
+      "gold_keys": ["research-notes-note-entity-scoped-search-33"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "arrow parquet reader benchmark speed",
+      "gold_keys": ["bob-parquet-bench"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "rollback when p99 exceeds threshold",
+      "gold_keys": ["deploy-p99-rollback"],
+      "kind": "paraphrase"
+    },
+    {
+      "query": "switching from JSON to rkyv cut p50 latency by 60%",
+      "gold_keys": ["bob-found-switching-from-json-02"],
+      "kind": "lexical"
+    },
+    {
+      "query": "Bob set up CI pipeline to run clippy with pedantic lint group enabled",
+      "gold_keys": ["bob-set-up-ci-pipeline-07"],
+      "kind": "lexical"
+    },
+    {
+      "query": "Alice's titanium card wallet survives being dropped without denting",
+      "gold_keys": ["alice-titanium-wallet"],
+      "kind": "lexical"
+    },
+    {
+      "query": "Acme Corp SOC 2 Type II certification after six-month audit",
+      "gold_keys": ["acme-soc2-cert"],
+      "kind": "lexical"
+    },
+    {
+      "query": "reranker model improves nDCG@10 by 8 points over base retriever",
+      "gold_keys": ["research-rrf-vs-linear"],
+      "kind": "lexical"
+    },
+    {
+      "query": "deploy pipeline runs integration tests against staging replica before production",
+      "gold_keys": ["deploy-pipeline-runs-integration-tests-against-02"],
+      "kind": "lexical"
+    },
+    {
+      "query": "Bob's flamegraph profiling showed 30% CPU time in serde_json parsing",
+      "gold_keys": ["bob-s-flamegraph-profiling-showed-08"],
+      "kind": "lexical"
+    },
+    {
+      "query": "Alice's cat Pixel only eats wet food, ignores dry kibble",
+      "gold_keys": ["alice-s-cat-pixel-only-07"],
+      "kind": "lexical"
+    },
+    {
+      "query": "Alice's favorite museum in the city is the small photography gallery near the river",
+      "gold_keys": ["alice-s-favorite-museum-city-14"],
+      "kind": "lexical"
+    },
+    {
+      "query": "deploy pipeline tags every production release with git commit SHA and build timestamp",
+      "gold_keys": ["deploy-pipeline-tags-every-production-release-05"],
+      "kind": "lexical"
+    }
+  ]
+}

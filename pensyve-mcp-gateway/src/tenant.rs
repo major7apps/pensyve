@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
+use pensyve_core::reranker::Reranker;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::types::Namespace;
 use pensyve_core::vector::VectorIndex;
@@ -26,6 +27,10 @@ pub struct TenantStateManager {
     default_state: Arc<PensyveState>,
     dimensions: usize,
     tenants: DashMap<String, Arc<PensyveState>>,
+    /// Shared across every tenant's `PensyveState` so the reranker model
+    /// resolves (or fails, with a single warning) at most once per gateway
+    /// process rather than once per tenant.
+    reranker_cell: Arc<OnceLock<Option<Arc<Reranker>>>>,
 }
 
 impl TenantStateManager {
@@ -37,6 +42,7 @@ impl TenantStateManager {
         default_vector_index: VectorIndex,
     ) -> Self {
         let dimensions = default_vector_index.dimensions();
+        let reranker_cell = Arc::new(OnceLock::new());
 
         let default_state = Arc::new(PensyveState {
             storage: storage.clone(),
@@ -45,6 +51,7 @@ impl TenantStateManager {
             namespace: default_namespace,
             retrieval_config: retrieval_config.clone(),
             is_remote: true,
+            reranker_cell: reranker_cell.clone(),
         });
 
         Self {
@@ -54,6 +61,7 @@ impl TenantStateManager {
             default_state,
             dimensions,
             tenants: DashMap::new(),
+            reranker_cell,
         }
     }
 
@@ -158,6 +166,7 @@ impl TenantStateManager {
             namespace,
             retrieval_config: self.retrieval_config.clone(),
             is_remote: true,
+            reranker_cell: self.reranker_cell.clone(),
         }))
     }
 }

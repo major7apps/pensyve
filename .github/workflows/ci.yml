@@ -93,6 +93,40 @@ jobs:
         # in a process; serializing avoids any residual races on the
         # WAL/index files fastembed maintains alongside `model.onnx`.
         run: cargo test --workspace -- --ignored --test-threads=1
+      - name: Paraphrase recall gate
+        # Fails if top3_hit_rate drops more than --gate-margin below the
+        # committed pensyve-benchmarks/results/paraphrase_baseline.json
+        # (#186). Task 8 rebaselined this gate on the RERANKED pipeline
+        # (`--rerank`) rather than the raw RRF pipeline the gate used
+        # through Task 7: the gateway/CLI attach the BGE reranker by
+        # default (`reranker=Some("BGERerankerBase")` in
+        # pensyve-python/src/lib.rs), so gating on unreranked output was
+        # comparing against a path production doesn't actually take. It
+        # also happens to be far less noisy — the unreranked pipeline's
+        # apply_reinforcement writes wall-clock last_accessed during
+        # eval, so score ties occasionally resolve differently between
+        # runs even with deterministic tiebreaks (Task 3.5), which is
+        # why the original unreranked gate needed a 0.07 margin (15
+        # local runs against the pre-fix 0.581 baseline spread
+        # top3_hit_rate over {0.548, 0.565, 0.581, 0.597}, a 0.049
+        # range). The reranked pipeline doesn't have that failure mode:
+        # 10 local `--release --rerank` runs against the new baseline
+        # (0.903) all landed on exactly 0.903 — zero observed spread.
+        # Mechanistically: this fixture's gold docs already sit within
+        # the top-20 pre-rerank pool, so the last_accessed jitter that
+        # reshuffles ties at the pool boundary never changes which
+        # candidates the cross-encoder sees, only their pre-rerank
+        # order, which reranking discards anyway. 0.03 keeps meaningful
+        # headroom over that for CI-hardware variance and reranker-load
+        # fallback risk (a model-load failure degrades gracefully to
+        # unreranked per `resolve_reranker`, which would read as a real
+        # drop here) while being more than 2x tighter than the old
+        # margin. paraphrase_eval also hard-errors if the committed
+        # baseline's recorded mode (reranked/unreranked) doesn't match
+        # --rerank below, so a future baseline write in the wrong mode
+        # can't silently widen this margin (see BaselineOutput::reranked
+        # in paraphrase_eval.rs).
+        run: cargo run -p pensyve-benchmarks --bin paraphrase_eval --release -- --rerank --gate pensyve-benchmarks/results/paraphrase_baseline.json --gate-margin 0.03
 
   test-rust-no-network-invariants:
     name: Rust No-Network Invariants

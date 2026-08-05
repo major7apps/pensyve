@@ -4,11 +4,33 @@ use clap::{Parser, Subcommand};
 use pensyve_core::{
     config::RetrievalConfig,
     embedding::OnnxEmbedder,
+    reranker::Reranker,
     retrieval::RecallEngine,
     storage::{StorageTrait, sqlite::SqliteBackend},
     types::{Entity, EntityKind, Memory, Namespace, SemanticMemory},
     vector::VectorIndex,
 };
+
+/// Lazily resolve the cross-encoder reranker for `recall`. Only called from
+/// `cmd_recall`, so other subcommands never pay the model-load cost.
+/// `PENSYVE_RERANKER=0` disables it outright; a model-load failure is
+/// logged once (to stderr) and recall proceeds unreranked rather than
+/// failing the command.
+fn resolve_reranker() -> Option<std::sync::Arc<Reranker>> {
+    if std::env::var("PENSYVE_RERANKER").as_deref() == Ok("0") {
+        return None;
+    }
+    match Reranker::new_cached("BGERerankerBase") {
+        Ok(r) => Some(r),
+        Err(e) => {
+            eprintln!(
+                "Warning: reranker unavailable ({e}), continuing unreranked. \
+                 Set PENSYVE_RERANKER=0 to silence this warning."
+            );
+            None
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -293,7 +315,11 @@ fn cmd_recall(
         max_depth: 4,
     };
 
-    let engine = RecallEngine::new(&storage, &embedder, &vector_index, &config);
+    let mut engine = RecallEngine::new(&storage, &embedder, &vector_index, &config);
+    let reranker = resolve_reranker();
+    if let Some(r) = reranker.as_deref() {
+        engine = engine.with_reranker(r);
+    }
     let result = engine.recall(query, ns.id, limit)?;
 
     // If an entity filter is provided, look up the entity UUID and filter.

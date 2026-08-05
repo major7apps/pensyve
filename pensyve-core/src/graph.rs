@@ -361,12 +361,22 @@ impl MemoryGraph {
             beam = next_beam;
         }
 
-        // Collect results: all visited nodes except start, sorted by score descending.
+        // Collect results: all visited nodes except start, sorted by score
+        // descending, tiebreak ascending by memory/entity UUID. `scores` is
+        // a `HashMap`, whose iteration order reseeds on every fresh
+        // `HashMap::new()` (even within the same process/thread) — without
+        // the tiebreak, score ties land in a different order each call and
+        // that arbitrary order feeds `ranking_spread` directly with no
+        // further sort downstream (see #186 / Task 3.5).
         let mut results: Vec<(Uuid, f32)> = scores
             .iter()
             .map(|(&node_idx, &score)| (self.graph[node_idx], score))
             .collect();
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         results
     }
 

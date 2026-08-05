@@ -50,7 +50,25 @@ fn gateway_config(dir: &TempDir) -> GatewayConfig {
     }
 }
 
+/// Prevents the lazily-resolved reranker (`PensyveState::reranker`) from
+/// attempting a real network model download the first time this suite's
+/// `/v1/recall` assertions run. Uses `Once` so the (unsafe, per Rust 2024
+/// edition) env mutation happens exactly once, before any reader.
+#[allow(
+    unsafe_code,
+    reason = "test-only env-var guard; std::env::set_var is unsafe in Rust 2024 edition by language design but is safe here because it runs exactly once via std::sync::Once before any reader observes the environment"
+)]
+fn disable_reranker_for_tests() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // SAFETY: runs exactly once via `Once`, before any concurrent
+        // reader — no data race.
+        unsafe { std::env::set_var("PENSYVE_RERANKER", "0") };
+    });
+}
+
 fn app_state(dir: &TempDir) -> Arc<AppState> {
+    disable_reranker_for_tests();
     let storage =
         Arc::new(SqliteBackend::open(dir.path()).expect("open storage")) as Arc<dyn StorageTrait>;
     let namespace = Namespace::new("default");
