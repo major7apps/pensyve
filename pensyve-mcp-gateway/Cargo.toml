@@ -37,7 +37,7 @@ hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 dashmap = "6"
 redis = { version = "1.2", features = ["tokio-comp", "connection-manager", "tokio-native-tls-comp"] }
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 dirs = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
