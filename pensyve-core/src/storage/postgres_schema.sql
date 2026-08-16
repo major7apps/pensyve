@@ -202,11 +202,28 @@ CREATE INDEX IF NOT EXISTS idx_activity_ns_date ON activity_events(namespace_id,
 
 -- ---------------------------------------------------------------------------
 -- Row-Level Security (Postgres only)
--- Namespace isolation: each connection must set pensyve.namespace_id via
---   SELECT set_config('pensyve.namespace_id', '<uuid>', true)
--- before executing queries.  The 'true' flag makes the setting local to
--- the current transaction.  missing_ok=true in current_setting means a NULL
--- is returned (no rows visible) when the GUC is not set.
+--
+-- Namespace isolation.  Each connection binds its namespace via
+--   SELECT set_config('pensyve.namespace_id', '<uuid>', false)
+-- before executing queries; PostgresBackend::conn_with_namespace does this on
+-- every acquisition.  The 'false' makes the setting session-scoped: a
+-- transaction-local setting issued as a standalone statement is discarded when
+-- that statement's implicit transaction commits, i.e. before the query it was
+-- meant to scope ever runs.
+--
+-- missing_ok=true in current_setting yields NULL when the GUC was never set,
+-- and the backend binds the empty string when a connection is not scoped to a
+-- namespace.  Namespaces are UUIDs, so both compare unequal to every row:
+-- an unscoped connection reads nothing and writes nothing.
+--
+-- ENABLE alone does not make these policies apply to the application.
+-- Postgres exempts a table's owner from its own policies, and the application
+-- connects as the role that owns the schema, so the policies below are inert
+-- in a default deployment.  Removing that exemption is a deliberate,
+-- operator-run step -- `postgres_rls_enforce.sql`, applied via
+-- `PostgresBackend::enforce_rls` -- because it fails closed: any query path
+-- that does not carry a namespace stops returning rows.  See docs/SECURITY.md
+-- for the role model, the preconditions, and the migration order.
 -- ---------------------------------------------------------------------------
 
 ALTER TABLE entities             ENABLE ROW LEVEL SECURITY;
@@ -216,32 +233,44 @@ ALTER TABLE semantic_memories    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE procedural_memories  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE observation_memories ENABLE ROW LEVEL SECURITY;
 
-DO $$ BEGIN
-  CREATE POLICY namespace_isolation_entities ON entities
-    USING (namespace_id::text = current_setting('pensyve.namespace_id', true));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+-- DROP + CREATE rather than "create if absent": this file is re-applied on
+-- every startup, so an existing database has to pick up a corrected policy.
+-- The whole schema is sent as one simple-query batch and therefore runs in a
+-- single implicit transaction — no window exists in which a table is
+-- unprotected.
+--
+-- WITH CHECK is spelled out even though Postgres would default it to the USING
+-- expression.  It is what stops a connection scoped to one namespace from
+-- INSERTing or UPDATEing a row into another, and a security control that
+-- important should not rest on an implicit default that a later edit to USING
+-- would silently change.
 
-DO $$ BEGIN
-  CREATE POLICY namespace_isolation_episodes ON episodes
-    USING (namespace_id::text = current_setting('pensyve.namespace_id', true));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DROP POLICY IF EXISTS namespace_isolation_entities ON entities;
+CREATE POLICY namespace_isolation_entities ON entities
+  USING (namespace_id::text = current_setting('pensyve.namespace_id', true))
+  WITH CHECK (namespace_id::text = current_setting('pensyve.namespace_id', true));
 
-DO $$ BEGIN
-  CREATE POLICY namespace_isolation_episodic ON episodic_memories
-    USING (namespace_id::text = current_setting('pensyve.namespace_id', true));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DROP POLICY IF EXISTS namespace_isolation_episodes ON episodes;
+CREATE POLICY namespace_isolation_episodes ON episodes
+  USING (namespace_id::text = current_setting('pensyve.namespace_id', true))
+  WITH CHECK (namespace_id::text = current_setting('pensyve.namespace_id', true));
 
-DO $$ BEGIN
-  CREATE POLICY namespace_isolation_semantic ON semantic_memories
-    USING (namespace_id::text = current_setting('pensyve.namespace_id', true));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DROP POLICY IF EXISTS namespace_isolation_episodic ON episodic_memories;
+CREATE POLICY namespace_isolation_episodic ON episodic_memories
+  USING (namespace_id::text = current_setting('pensyve.namespace_id', true))
+  WITH CHECK (namespace_id::text = current_setting('pensyve.namespace_id', true));
 
-DO $$ BEGIN
-  CREATE POLICY namespace_isolation_procedural ON procedural_memories
-    USING (namespace_id::text = current_setting('pensyve.namespace_id', true));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DROP POLICY IF EXISTS namespace_isolation_semantic ON semantic_memories;
+CREATE POLICY namespace_isolation_semantic ON semantic_memories
+  USING (namespace_id::text = current_setting('pensyve.namespace_id', true))
+  WITH CHECK (namespace_id::text = current_setting('pensyve.namespace_id', true));
 
-DO $$ BEGIN
-  CREATE POLICY namespace_isolation_observation ON observation_memories
-    USING (namespace_id::text = current_setting('pensyve.namespace_id', true));
-EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DROP POLICY IF EXISTS namespace_isolation_procedural ON procedural_memories;
+CREATE POLICY namespace_isolation_procedural ON procedural_memories
+  USING (namespace_id::text = current_setting('pensyve.namespace_id', true))
+  WITH CHECK (namespace_id::text = current_setting('pensyve.namespace_id', true));
+
+DROP POLICY IF EXISTS namespace_isolation_observation ON observation_memories;
+CREATE POLICY namespace_isolation_observation ON observation_memories
+  USING (namespace_id::text = current_setting('pensyve.namespace_id', true))
+  WITH CHECK (namespace_id::text = current_setting('pensyve.namespace_id', true));

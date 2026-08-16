@@ -165,6 +165,22 @@ type EdgeRow = (
 // PostgresBackend
 // ---------------------------------------------------------------------------
 
+/// Binds the namespace GUC that every `namespace_isolation_*` policy in
+/// `postgres_schema.sql` reads.
+///
+/// `false` makes the setting session-scoped rather than transaction-local.
+/// Transaction-local would be discarded before the scoped query ever ran — see
+/// [`PostgresBackend::conn_with_namespace`] for the full reasoning.
+const SET_NAMESPACE_GUC_SQL: &str = "SELECT set_config('pensyve.namespace_id', $1, false)";
+
+/// The namespace GUC value used for connections that are not scoped to any
+/// namespace.
+///
+/// Namespaces are UUIDs, so the empty string matches no row: under enforced
+/// RLS such a connection reads nothing and writes nothing. It fails closed
+/// instead of falling back to whatever the previous checkout left set.
+const UNSCOPED_NAMESPACE: &str = "";
+
 pub struct PostgresBackend {
     pool: PgPool,
     rt: Runtime,
@@ -249,6 +265,30 @@ impl PostgresBackend {
         })
     }
 
+    /// Subject the schema-owning role to its own row-level security policies.
+    ///
+    /// `postgres_schema.sql` enables RLS and declares the
+    /// `namespace_isolation_*` policies, but Postgres exempts a table's owner
+    /// from its own policies, so those policies do nothing for an application
+    /// that connects as the owner. This applies `FORCE ROW LEVEL SECURITY`,
+    /// which removes the exemption.
+    ///
+    /// Deliberately not called by [`Self::new`]: enforcement fails closed, so
+    /// a connection that has not bound a namespace stops seeing rows. Every
+    /// query path must carry a namespace before this is switched on. See
+    /// `postgres_rls_enforce.sql` and `docs/SECURITY.md`.
+    ///
+    /// Requires the connecting role to own the tables. Idempotent.
+    pub fn enforce_rls(&self) -> StorageResult<()> {
+        self.block_on(async {
+            self.pool
+                .execute(raw_sql(RLS_ENFORCE_SCHEMA))
+                .await
+                .map_err(sqlx_to_io)?;
+            Ok(())
+        })
+    }
+
     /// Execute an async future from a sync context.
     ///
     /// If we're already inside a tokio runtime (e.g. the MCP gateway), uses
@@ -266,34 +306,64 @@ impl PostgresBackend {
     /// Acquire a connection from the pool with the namespace GUC set for RLS
     /// enforcement.  All `StorageTrait` methods use this internally so that
     /// every query is scoped to the correct namespace.
-    ///
-    /// The `true` flag passed to `set_config` makes the GUC local to the
-    /// current transaction; outside a transaction it persists for the session
-    /// (i.e. until the connection is returned to the pool).
     async fn scoped_conn(
         &self,
         namespace_id: Uuid,
     ) -> StorageResult<sqlx_core::pool::PoolConnection<sqlx_postgres::Postgres>> {
-        let mut conn = self.pool.acquire().await.map_err(sqlx_to_io)?;
-        query("SELECT set_config('pensyve.namespace_id', $1, true)")
-            .bind(namespace_id.to_string())
-            .execute(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
-        Ok(conn)
+        self.conn_with_namespace(&namespace_id.to_string()).await
     }
 
     /// Acquire a connection, scoping it to `default_namespace` if one has been
     /// configured.  Used for `StorageTrait` methods whose signatures do not
     /// include a `namespace_id` parameter.
+    ///
+    /// With no default namespace configured this still sets the GUC — to
+    /// [`UNSCOPED_NAMESPACE`], which no row can match.  Such a connection
+    /// therefore reads nothing and writes nothing once RLS is enforced, rather
+    /// than inheriting whatever namespace the previous checkout left behind.
     async fn maybe_scoped_conn(
         &self,
     ) -> StorageResult<sqlx_core::pool::PoolConnection<sqlx_postgres::Postgres>> {
-        if let Some(ns) = self.default_namespace {
-            self.scoped_conn(ns).await
-        } else {
-            self.pool.acquire().await.map_err(sqlx_to_io)
+        match self.default_namespace {
+            Some(ns) => self.scoped_conn(ns).await,
+            None => self.conn_with_namespace(UNSCOPED_NAMESPACE).await,
         }
+    }
+
+    /// Acquire a pooled connection and bind the namespace GUC that the RLS
+    /// policies read (see [`SET_NAMESPACE_GUC_SQL`]) before handing it out.
+    ///
+    /// # Why the setting is session-scoped, and why that is safe
+    ///
+    /// The RLS policies read the GUC via `current_setting`, so it has to still
+    /// be in effect when the caller's query runs.  A transaction-local setting
+    /// (`set_config(..., true)`) issued as a standalone statement is discarded
+    /// the moment that statement's implicit transaction commits — i.e. before
+    /// the query it was meant to scope — which left every policy comparing
+    /// against NULL.
+    ///
+    /// A session-scoped setting outlives the checkout, so the risk moves to
+    /// the opposite end: a pooled connection carrying one namespace into the
+    /// next caller.  That is closed by setting the GUC here, on *acquisition*,
+    /// unconditionally and on every path — including the unscoped one.  A
+    /// stale value can never be read, because the first thing any checkout
+    /// does is overwrite it.
+    ///
+    /// The alternative, resetting on release via a pool hook, is strictly
+    /// weaker: release is a cleanup path that a panic, a cancelled future, or
+    /// a pool this backend did not build (see [`Self::from_pool`]) can skip,
+    /// whereas acquisition is on the path of every query by construction.
+    async fn conn_with_namespace(
+        &self,
+        namespace: &str,
+    ) -> StorageResult<sqlx_core::pool::PoolConnection<sqlx_postgres::Postgres>> {
+        let mut conn = self.pool.acquire().await.map_err(sqlx_to_io)?;
+        query(SET_NAMESPACE_GUC_SQL)
+            .bind(namespace)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+        Ok(conn)
     }
 
     /// Set the active namespace on a single Postgres connection so that the
@@ -301,14 +371,18 @@ impl PostgresBackend {
     /// rows to that namespace.
     ///
     /// This is the public API for external callers that manage their own
-    /// connections.  The `StorageTrait` methods use [`scoped_conn`] internally,
-    /// so you typically do not need to call this directly.
+    /// connections.  The `StorageTrait` methods scope their own connections
+    /// internally, so you typically do not need to call this directly.
+    ///
+    /// The setting is session-scoped: it stays in effect until this connection
+    /// is scoped again or closed.  A caller that returns the connection to a
+    /// shared pool is responsible for re-scoping it before reuse.
     pub async fn set_namespace_config(
         &self,
         conn: &mut sqlx_postgres::PgConnection,
         namespace_id: uuid::Uuid,
     ) -> StorageResult<()> {
-        query("SELECT set_config('pensyve.namespace_id', $1, true)")
+        query(SET_NAMESPACE_GUC_SQL)
             .bind(namespace_id.to_string())
             .execute(&mut *conn)
             .await
@@ -406,6 +480,9 @@ impl PostgresBackend {
 // ---------------------------------------------------------------------------
 
 const SCHEMA: &str = include_str!("postgres_schema.sql");
+
+/// Applied by [`PostgresBackend::enforce_rls`], not by [`PostgresBackend::new`].
+const RLS_ENFORCE_SCHEMA: &str = include_str!("postgres_rls_enforce.sql");
 
 const LIST_OBSERVATIONS_BY_ENTITY_INSTANCE_SQL: &str = r"SELECT id, namespace_id, episode_id, entity_type, instance, action,
              quantity, unit, content, embedding::text AS embedding, confidence,
