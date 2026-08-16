@@ -22,7 +22,7 @@
 -- Do not apply this until every `StorageTrait` call site in the deployment
 -- passes a namespace. `enforced_rls_fails_closed_for_unscoped_methods` in
 -- `postgres/live_rls.rs` enumerates the methods that still do not, and is the
--- gate on this file becoming the default.
+-- gate on this file becoming the default. Tracked by #254.
 --
 -- Rollback
 -- --------

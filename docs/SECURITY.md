@@ -89,9 +89,11 @@ the data.
 
 #### The dedicated application role, and why it is not available yet
 
-A role that does not own the tables is subject to their policies whether or not
+A role that does not own the tables is subject to their policies whether
 `FORCE` is set, so running the application as a non-owner role would be the
-more durable control. It is not possible today.
+more durable control. It is not possible today. Do not follow the SQL below as
+deployment instructions, because an application pointed at such a role will not
+start. Issue #254 tracks the change that makes it usable.
 
 `PostgresBackend::new` applies the schema on every startup, and the schema
 contains statements only a table's owner may run, including
@@ -103,16 +105,26 @@ the application from starting.
 
 Supporting a non-owner role needs a code change first, so that applying the
 schema is separate from serving traffic. Once that exists, the role should look
-like this, and `NOBYPASSRLS` is required because a role with `BYPASSRLS`, and
-any superuser, ignores every policy:
+like the target state below. `NOBYPASSRLS` is required because a role with
+`BYPASSRLS`, and any superuser, ignores every policy.
 
 ```sql
+-- Target state. Not usable until issue #254 lands.
 CREATE ROLE pensyve_app LOGIN PASSWORD '...' NOSUPERUSER NOBYPASSRLS;
 GRANT USAGE ON SCHEMA public TO pensyve_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pensyve_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
+
+-- Run this as the role that owns the tables, or name that role with FOR ROLE.
+-- ALTER DEFAULT PRIVILEGES only covers tables created later by the role it
+-- names, so running it as anyone else silently grants nothing on the tables
+-- the owner goes on to create.
+ALTER DEFAULT PRIVILEGES FOR ROLE pensyve_owner IN SCHEMA public
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO pensyve_app;
 ```
+
+`ALTER DEFAULT PRIVILEGES` never applies to tables that already exist, so the
+`GRANT ... ON ALL TABLES` above is what covers the current schema. Both
+statements are needed.
 
 #### What goes wrong
 

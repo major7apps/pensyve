@@ -759,8 +759,8 @@ fn namespace_scoping_end_to_end_under_enforced_rls() {
 /// error, but a success report with no effect — `delete_memories_by_entity`
 /// returns `Ok(0)` and a GDPR erase would report that it had erased something.
 ///
-/// Each assertion here is a work item. When a method starts carrying a
-/// namespace, its assertion flips and has to be moved into
+/// Each assertion here is a work item, tracked by #254. When a method starts
+/// carrying a namespace, its assertion flips and has to be moved into
 /// [`namespace_scoping_end_to_end_under_enforced_rls`]. When the list is
 /// empty, enforcement can become the default.
 #[test]
