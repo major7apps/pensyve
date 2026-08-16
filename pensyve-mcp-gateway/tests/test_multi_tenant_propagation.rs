@@ -101,6 +101,7 @@ fn make_mgr(dir: &tempfile::TempDir) -> Arc<TenantStateManager> {
         },
         ns,
         idx,
+        dir.path().join("snapshots"),
     ))
 }
 

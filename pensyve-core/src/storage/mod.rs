@@ -42,6 +42,14 @@ fn scoped_delete_not_implemented() -> StorageResult<bool> {
     ))
 }
 
+fn capturing_delete_not_implemented() -> StorageResult<Vec<Memory>> {
+    Err(StorageError::Context(
+        "storage backend does not implement capturing entity deletion, \
+         so an entity-wide delete cannot be snapshotted atomically"
+            .to_string(),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // StorageTrait
 // ---------------------------------------------------------------------------
@@ -324,6 +332,43 @@ pub trait StorageTrait: Send + Sync {
 
     // Deletion
     fn delete_memories_by_entity(&self, entity_id: Uuid) -> StorageResult<usize>;
+
+    /// Same deletion as [`StorageTrait::delete_memories_by_entity`], but the
+    /// deleted rows are handed to `persist` **before the delete commits** so
+    /// entity-wide forget is recoverable (#246).
+    ///
+    /// The rows passed to `persist` are captured with `DELETE ... RETURNING`,
+    /// so they *are* the rows the statement removed rather than the rows a
+    /// preceding `SELECT` predicted it would remove. That distinction is the
+    /// whole point: a snapshot taken by a separate query leaves a window in
+    /// which a concurrent writer can insert a matching row, which the delete
+    /// then destroys without it ever appearing in the snapshot — the exact
+    /// unrecoverable case this feature exists to prevent.
+    ///
+    /// Unlike [`StorageTrait::delete_memories_by_entity`], this is scoped to
+    /// `namespace_id`. Entity ids are not globally unique, so matching on the
+    /// entity alone reaches into other tenants — and here that is worse than a
+    /// stray delete, because the foreign rows also land in the caller's
+    /// snapshot artifact. The predicate must be explicit in the SQL rather than
+    /// left to row-level security: RLS is defence in depth, not the filter.
+    ///
+    /// Implementations must:
+    /// - restrict every statement, index and full-text cleanup included, to
+    ///   `namespace_id`;
+    /// - run the delete and the `persist` callback inside one transaction;
+    /// - roll back, deleting nothing, if `persist` returns `Err` (fail closed);
+    /// - call `persist` exactly once, even when nothing matched.
+    ///
+    /// The default fails closed: a backend that cannot capture atomically must
+    /// not have its entity-wide delete treated as recoverable.
+    fn delete_memories_by_entity_capturing(
+        &self,
+        _entity_id: Uuid,
+        _namespace_id: Uuid,
+        _persist: &mut dyn FnMut(&[Memory]) -> StorageResult<()>,
+    ) -> StorageResult<Vec<Memory>> {
+        capturing_delete_not_implemented()
+    }
 
     /// Delete a single memory by its UUID (episodic, semantic, or procedural).
     fn delete_memory_by_id(&self, id: Uuid) -> StorageResult<bool>;

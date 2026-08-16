@@ -560,12 +560,16 @@ impl PensyveMcpServer {
         serde_json::to_string(&val).map_err(|e| format!("Serialization error: {e}"))
     }
 
-    /// Delete memories for an entity.
+    /// Delete memories for an entity, after snapshotting everything the delete
+    /// will destroy (#246).
     #[tool(
         name = "pensyve_forget",
-        description = "PERMANENTLY delete ALL memories associated with an entity — entity-wide \
-                       and irreversible. To retract a single memory, use pensyve_forget_memory \
-                       instead. Returns the count of forgotten memories."
+        description = "PERMANENTLY delete ALL memories associated with an entity — entity-wide. \
+                       To retract a single memory, use pensyve_forget_memory instead. The delete \
+                       and a snapshot of everything it removes are committed together: if the \
+                       snapshot cannot be written, nothing is deleted. Returns the count of \
+                       forgotten memories plus a `snapshot` reference for recovering them — \
+                       omitted when nothing was deleted."
     )]
     async fn forget(&self, Parameters(params): Parameters<ForgetParams>) -> Result<String, String> {
         check_scope(&self.scope, "pensyve_forget")?;
@@ -587,40 +591,75 @@ impl PensyveMcpServer {
             Err(err) => return Err(format!("Error looking up entity: {err}")),
         };
 
-        // Collect memory IDs before deletion for vector index cleanup.
-        let mut memory_ids: Vec<uuid::Uuid> = Vec::new();
-        if let Ok(mems) = state.storage.list_episodic_by_entity(entity.id, usize::MAX) {
-            memory_ids.extend(mems.iter().map(|m| m.id));
-        }
-        if let Ok(mems) = state.storage.list_semantic_by_entity(entity.id, usize::MAX) {
-            memory_ids.extend(mems.iter().map(|m| m.id));
-        }
+        // Delete and snapshot atomically: the snapshot file is written inside
+        // the delete's transaction, so either both happen or neither does.
+        // #217 lost 1,528 memories with no way back — a delete we could not
+        // capture is exactly that situation again, so this fails closed.
+        let outcome = pensyve_core::snapshot::forget_entity(
+            state.storage.as_ref(),
+            entity.id,
+            Some(params.entity.as_str()),
+            state.namespace.id,
+            &state.snapshot_root,
+        )
+        .map_err(|err| {
+            format!("Aborted: pre-delete snapshot failed, nothing was deleted: {err}")
+        })?;
 
-        let forgotten_count = state
-            .storage
-            .delete_memories_by_entity(entity.id)
-            .map_err(|err| format!("Error deleting memories: {err}"))?;
+        let snapshot = &outcome.snapshot;
+        let forgotten_count = snapshot.memories.len();
 
-        // Remove deleted entries from vector index — O(1) per entry, not O(n) rebuild.
+        // The snapshot holds exactly the rows the delete removed, so it is also
+        // the authoritative list for vector-index cleanup — O(1) per entry,
+        // not an O(n) rebuild.
         if forgotten_count > 0 {
             let mut vi = state.vector_index.write().await;
-            for id in &memory_ids {
-                let _ = vi.remove(*id);
+            for id in snapshot.memory_ids() {
+                let _ = vi.remove(id);
             }
         }
+
+        let snapshot_path = outcome
+            .path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
 
         let _ = state.storage.log_activity(
             state.namespace.id,
             "forget",
-            &serde_json::json!({"entity": params.entity}),
+            &serde_json::json!({"entity": params.entity, "snapshot_path": snapshot_path}),
         );
 
-        serde_json::to_string(&serde_json::json!({
+        let mut response = serde_json::json!({
             "entity": params.entity,
             "entity_id": entity.id.to_string(),
             "forgotten_count": forgotten_count,
-        }))
-        .map_err(|e| format!("Serialization error: {e}"))
+        });
+
+        // The snapshot is referenced, not inlined: the #217 case was 1,528
+        // memories, and full rows carry their embeddings, so the payload runs
+        // to megabytes. A reference stays constant-size and still lets a caller
+        // recover on its own from the file. Absent when nothing was deleted —
+        // there is nothing to recover, and writing a file per call would let a
+        // caller fill the disk by looping on an already-empty entity.
+        if let Some(path) = snapshot_path {
+            let counts = snapshot.counts();
+            response["snapshot"] = serde_json::json!({
+                "snapshot_id": snapshot.snapshot_id.to_string(),
+                "path": path,
+                "format_version": snapshot.format_version,
+                "captured_at": snapshot.captured_at.to_rfc3339(),
+                // False on platforms where the file could not be restricted to
+                // its owner — the caller holding this reference is the one who
+                // needs to know the artifact is readable by others.
+                "owner_only": snapshot.owner_only,
+                "memory_count": counts.total,
+                "episodic_count": counts.episodic,
+                "semantic_count": counts.semantic,
+            });
+        }
+
+        serde_json::to_string(&response).map_err(|e| format!("Serialization error: {e}"))
     }
 
     /// Delete a single memory by id.
@@ -904,6 +943,222 @@ impl ServerHandler for PensyveMcpServer {
 mod tests {
     use super::*;
 
+    use std::path::PathBuf;
+
+    /// A server backed by a temp database, holding one entity ("subject") with
+    /// two memories: one where it is the `about_entity` of an episodic turn,
+    /// and one where it is only the `object_entity` of somebody else's fact.
+    /// The second is the shape the pre-#246 snapshot path dropped.
+    struct ForgetFixture {
+        server: PensyveMcpServer,
+        _dir: tempfile::TempDir,
+    }
+
+    fn forget_fixture(snapshot_root: PathBuf) -> ForgetFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteBackend::open(dir.path()).unwrap();
+
+        let namespace = Namespace::new("forget-test");
+        storage.save_namespace(&namespace).unwrap();
+
+        let mut subject = Entity::new("subject", EntityKind::User);
+        subject.namespace_id = namespace.id;
+        storage.save_entity(&subject).unwrap();
+
+        let mut other = Entity::new("other", EntityKind::User);
+        other.namespace_id = namespace.id;
+        storage.save_entity(&other).unwrap();
+
+        let episode = Episode::new(namespace.id, vec![subject.id, other.id]);
+        storage.save_episode(&episode).unwrap();
+
+        storage
+            .save_episodic(&EpisodicMemory::new(
+                namespace.id,
+                episode.id,
+                other.id,
+                subject.id,
+                "an episodic turn about the subject",
+            ))
+            .unwrap();
+
+        let mut object_side =
+            SemanticMemory::new(namespace.id, other.id, "manages", "subject", 0.9);
+        object_side.object_entity = Some(subject.id);
+        storage.save_semantic(&object_side).unwrap();
+
+        let embedder = OnnxEmbedder::new_mock(64);
+        let dimensions = embedder.dimensions();
+        let state = Arc::new(PensyveState {
+            storage: Arc::new(storage) as Arc<dyn StorageTrait>,
+            embedder: Arc::new(embedder),
+            vector_index: RwLock::new(VectorIndex::new(dimensions, 16)),
+            namespace,
+            retrieval_config: test_retrieval_config(),
+            is_remote: false,
+            reranker_cell: Arc::new(OnceLock::new()),
+            snapshot_root,
+        });
+
+        ForgetFixture {
+            server: PensyveMcpServer::new(state),
+            _dir: dir,
+        }
+    }
+
+    fn stored_memory_count(server: &PensyveMcpServer) -> usize {
+        server
+            .state
+            .storage
+            .get_all_memories_by_namespace_including_superseded(server.state.namespace.id)
+            .unwrap()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn forget_response_carries_a_recoverable_snapshot_reference() {
+        let snapshot_root = tempfile::tempdir().unwrap();
+        let fixture = forget_fixture(snapshot_root.path().join("snapshots"));
+
+        let raw = fixture
+            .server
+            .forget(Parameters(ForgetParams {
+                entity: "subject".to_string(),
+            }))
+            .await
+            .expect("forget should succeed");
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        // Existing fields are untouched.
+        assert_eq!(response["entity"], "subject");
+        assert!(response["entity_id"].is_string());
+        assert_eq!(response["forgotten_count"], 2);
+
+        // ...and the response now points at a snapshot holding both rows,
+        // including the object-side semantic one.
+        let path = PathBuf::from(response["snapshot"]["path"].as_str().unwrap());
+        assert_eq!(
+            path.parent().unwrap(),
+            pensyve_core::snapshot::namespace_dir(
+                &fixture.server.state.snapshot_root,
+                fixture.server.state.namespace.id
+            ),
+            "snapshot must land under its own namespace, not a shared directory"
+        );
+        let snapshot = pensyve_core::snapshot::read_file(&path).unwrap();
+        assert_eq!(snapshot.memories.len(), 2);
+        assert_eq!(response["snapshot"]["memory_count"], 2);
+        assert_eq!(
+            response["snapshot"]["snapshot_id"],
+            snapshot.snapshot_id.to_string()
+        );
+        assert_eq!(
+            response["snapshot"]["owner_only"],
+            pensyve_core::snapshot::OWNER_ONLY_SUPPORTED,
+            "the response must state whether the artifact is owner-only"
+        );
+
+        // The snapshot is a real recovery path, not just a receipt.
+        assert_eq!(stored_memory_count(&fixture.server), 0);
+        pensyve_core::snapshot::restore(fixture.server.state.storage.as_ref(), &snapshot).unwrap();
+        assert_eq!(stored_memory_count(&fixture.server), 2);
+    }
+
+    #[tokio::test]
+    async fn forget_aborts_the_delete_when_the_snapshot_cannot_be_written() {
+        let snapshot_root = tempfile::tempdir().unwrap();
+        // A regular file where the snapshot directory should be. `create_dir_all`
+        // fails for every user, root included, so this is deterministic in CI.
+        let blocked = snapshot_root.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let fixture = forget_fixture(blocked);
+
+        let error = fixture
+            .server
+            .forget(Parameters(ForgetParams {
+                entity: "subject".to_string(),
+            }))
+            .await
+            .expect_err("forget must fail closed when it cannot snapshot");
+
+        assert!(
+            error.contains("snapshot"),
+            "error should name the snapshot as the cause: {error}"
+        );
+        assert_eq!(
+            stored_memory_count(&fixture.server),
+            2,
+            "nothing may be deleted when the pre-delete snapshot failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_on_an_unknown_entity_writes_no_snapshot_and_deletes_nothing() {
+        let snapshot_root = tempfile::tempdir().unwrap();
+        let snapshot_dir = snapshot_root.path().join("snapshots");
+        let fixture = forget_fixture(snapshot_dir.clone());
+
+        let raw = fixture
+            .server
+            .forget(Parameters(ForgetParams {
+                entity: "nobody".to_string(),
+            }))
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(response["forgotten_count"], 0);
+        assert!(response.get("snapshot").is_none());
+        assert!(!snapshot_dir.exists());
+        assert_eq!(stored_memory_count(&fixture.server), 2);
+    }
+
+    /// A known entity whose memories are already gone must not keep minting
+    /// empty snapshot files — otherwise a caller can fill the disk by looping
+    /// on `pensyve_forget`.
+    #[tokio::test]
+    async fn forget_on_an_entity_with_no_memories_omits_the_snapshot_reference() {
+        let snapshot_root = tempfile::tempdir().unwrap();
+        let snapshot_dir = snapshot_root.path().join("snapshots");
+        let fixture = forget_fixture(snapshot_dir.clone());
+
+        let params = || {
+            Parameters(ForgetParams {
+                entity: "subject".to_string(),
+            })
+        };
+
+        // First call deletes both rows and writes one snapshot.
+        fixture.server.forget(params()).await.unwrap();
+        let files_after_first = std::fs::read_dir(pensyve_core::snapshot::namespace_dir(
+            &snapshot_dir,
+            fixture.server.state.namespace.id,
+        ))
+        .unwrap()
+        .count();
+        assert_eq!(files_after_first, 1);
+
+        // The entity still resolves, but has nothing left to forget.
+        let raw = fixture.server.forget(params()).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(response["forgotten_count"], 0);
+        assert!(
+            response.get("snapshot").is_none(),
+            "an empty forget must not advertise a snapshot: {response}"
+        );
+        let files_after_second = std::fs::read_dir(pensyve_core::snapshot::namespace_dir(
+            &snapshot_dir,
+            fixture.server.state.namespace.id,
+        ))
+        .unwrap()
+        .count();
+        assert_eq!(
+            files_after_second, 1,
+            "a no-op forget must not write another snapshot file"
+        );
+    }
+
     #[test]
     fn test_check_scope_mcp_allows_everything() {
         assert!(check_scope("mcp", "pensyve_recall").is_ok());
@@ -1001,6 +1256,7 @@ mod tests {
                 retrieval_config: test_retrieval_config(),
                 is_remote: true,
                 reranker_cell: reranker_cell.clone(),
+                snapshot_root: dir.path().join("snapshots"),
             })));
         }
         let victim = servers.pop().expect("victim server");

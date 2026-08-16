@@ -89,6 +89,7 @@ fn app_state(dir: &TempDir) -> Arc<AppState> {
         retrieval_config(),
         namespace,
         VectorIndex::new(768, 1024),
+        dir.path().join("snapshots"),
     );
 
     // Resolve the shared reranker cell up front with a mock, so nothing in

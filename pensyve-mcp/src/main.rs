@@ -318,6 +318,7 @@ async fn main() -> Result<()> {
         // to disable; a model-load failure logs once and recall proceeds
         // unreranked) — see `pensyve_mcp_tools::state::PensyveState::reranker`.
         reranker_cell: Arc::new(OnceLock::new()),
+        snapshot_root: PensyveState::snapshot_root_for(&storage_path),
     });
 
     let server = PensyveMcpServer::new(state);

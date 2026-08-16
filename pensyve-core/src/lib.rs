@@ -22,6 +22,7 @@ pub mod reranker;
 pub mod retrieval;
 pub mod rrf;
 pub mod salience;
+pub mod snapshot;
 pub mod storage;
 pub mod surprise;
 pub mod sync;

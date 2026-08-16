@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
@@ -31,6 +32,12 @@ pub struct TenantStateManager {
     /// resolves (or fails, with a single warning) at most once per gateway
     /// process rather than once per tenant.
     reranker_cell: Arc<OnceLock<Option<Arc<Reranker>>>>,
+    /// Root for `pensyve_forget` pre-delete snapshots, shared by every tenant.
+    /// Each tenant's snapshots land in their own `<root>/<namespace_id>/`
+    /// subdirectory, so full-fidelity memory dumps never co-mingle across
+    /// tenants. Derived from the gateway's own storage path so recovery
+    /// artifacts sit inside the directory operators actually back up.
+    snapshot_root: PathBuf,
 }
 
 impl TenantStateManager {
@@ -40,6 +47,7 @@ impl TenantStateManager {
         retrieval_config: RetrievalConfig,
         default_namespace: Namespace,
         default_vector_index: VectorIndex,
+        snapshot_root: PathBuf,
     ) -> Self {
         let dimensions = default_vector_index.dimensions();
         let reranker_cell = Arc::new(OnceLock::new());
@@ -52,6 +60,7 @@ impl TenantStateManager {
             retrieval_config: retrieval_config.clone(),
             is_remote: true,
             reranker_cell: reranker_cell.clone(),
+            snapshot_root: snapshot_root.clone(),
         });
 
         Self {
@@ -62,6 +71,7 @@ impl TenantStateManager {
             dimensions,
             tenants: DashMap::new(),
             reranker_cell,
+            snapshot_root,
         }
     }
 
@@ -167,6 +177,7 @@ impl TenantStateManager {
             retrieval_config: self.retrieval_config.clone(),
             is_remote: true,
             reranker_cell: self.reranker_cell.clone(),
+            snapshot_root: self.snapshot_root.clone(),
         }))
     }
 }
@@ -192,7 +203,14 @@ mod tests {
             beam_width: 10,
             max_depth: 4,
         };
-        TenantStateManager::new(storage, embedder, config, ns, index)
+        TenantStateManager::new(
+            storage,
+            embedder,
+            config,
+            ns,
+            index,
+            dir.path().join("snapshots"),
+        )
     }
 
     #[test]
