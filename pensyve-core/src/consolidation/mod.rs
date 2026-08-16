@@ -195,23 +195,27 @@ impl ConsolidationEngine {
     /// would risk committing a partial state. Cancel response time target
     /// is ≤500 ms (pre-reg §2 I5).
     ///
-    /// Runs are serialized per namespace by [`gate::with_namespace_lock`]:
-    /// the promotion pass derives its idempotency guard from a snapshot of
-    /// the namespace and only then writes, so two overlapping runs would each
-    /// see an unpromoted namespace and mint the same row twice (#226). The
-    /// lock is taken here rather than at the call sites so no trigger path —
-    /// the periodic sweep, either `episode_end` spawn, or the on-demand
-    /// `/consolidate` endpoint — can bypass it, and so a future one inherits
-    /// it by default. A run on a *different* namespace is unaffected and
-    /// proceeds in parallel.
+    /// At most one run per namespace is in flight at a time, enforced by
+    /// [`gate::dispatch`]: the promotion pass derives its idempotency guard
+    /// from a snapshot of the namespace and only then writes, so two
+    /// overlapping runs would each see an unpromoted namespace and mint the
+    /// same row twice (#226). Dispatch happens here rather than at the call
+    /// sites so no trigger path — the periodic sweep, either `episode_end`
+    /// spawn, or the on-demand `/consolidate` endpoint — can bypass it, and so
+    /// a future one inherits it by default. Runs on *different* namespaces are
+    /// unaffected and proceed in parallel.
     ///
-    /// This waits while another run for the same namespace is in flight, so
-    /// callers on an async runtime should dispatch through
-    /// `tokio::task::spawn_blocking`, as every gateway call site does. The
-    /// wait honors `cancel`: a caller signalled while queued returns
-    /// [`ConsolidationError::Cancelled`] rather than waiting out the run
-    /// ahead of it, which keeps the ≤500 ms I5 budget intact under
-    /// contention.
+    /// Triggers coalesce rather than queue. A call made while another run is
+    /// in flight for the namespace does no work and returns zeroed stats; the
+    /// run already going will run once more and cover it, so nothing is
+    /// dropped. See the [`gate`] module docs for why queueing was rejected and
+    /// why coalescing is lossless.
+    ///
+    /// A caller that does own the namespace may therefore perform several
+    /// consecutive runs, and the returned stats are the total across them.
+    /// The engine is CPU- and IO-bound either way, so callers on an async
+    /// runtime should dispatch through `tokio::task::spawn_blocking`, as every
+    /// gateway call site does.
     #[tracing::instrument(skip_all, fields(namespace_id = %namespace_id))]
     pub fn run(
         storage: &dyn StorageTrait,
@@ -221,17 +225,39 @@ impl ConsolidationEngine {
         policy: &NetworkPolicy,
         cancel: &CancellationToken,
     ) -> ConsolidationResult {
-        gate::with_namespace_lock(namespace_id, cancel, || {
-            Self::run_locked(storage, embedder, config, namespace_id, policy, cancel)
-        })
-        .unwrap_or_else(|| {
-            Err(ConsolidationError::Cancelled(
-                "cancelled while waiting for the namespace run slot".into(),
-            ))
-        })
+        let mut total = ConsolidationStats::default();
+        let outcome = gate::dispatch(
+            namespace_id,
+            || {
+                let result =
+                    Self::run_locked(storage, embedder, config, namespace_id, policy, cancel);
+                if let Ok(stats) = &result {
+                    total.promoted += stats.promoted;
+                    total.decayed += stats.decayed;
+                    total.archived += stats.archived;
+                }
+                result
+            },
+            // Decline a re-run once the namespace has stopped making progress:
+            // a failed run would only fail again, and a cancelled caller must
+            // not be drafted into further work. Declining still releases the
+            // namespace, so the next trigger runs rather than coalescing into
+            // nothing.
+            |result| result.is_ok() && !cancel.is_cancelled(),
+        );
+
+        match outcome {
+            // Zeroed rather than the in-flight run's stats: this call did no
+            // work, and reporting another run's promotions here would
+            // double-count them in `log_activity`.
+            gate::Dispatch::Coalesced => Ok(ConsolidationStats::default()),
+            gate::Dispatch::Ran(Ok(_)) => Ok(total),
+            gate::Dispatch::Ran(Err(err)) => Err(err),
+        }
     }
 
-    /// The body of [`Self::run`], executed with the namespace's run lock held.
+    /// The body of [`Self::run`], executed while this caller owns the
+    /// namespace.
     #[allow(
         clippy::too_many_arguments,
         reason = "mirrors the public `run` signature it is split out of"

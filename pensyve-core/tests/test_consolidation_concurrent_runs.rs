@@ -10,10 +10,14 @@
 //! Four call sites start a run: the periodic sweep in the gateway's `main.rs`,
 //! the fire-and-forget `episode_end` spawns in the gateway's `rest.rs` and the
 //! MCP tool server, and the on-demand `/consolidate` endpoint. Nothing
-//! serialized them, so any two could overlap on the same namespace.
+//! coordinated them, so any two could overlap on the same namespace.
+//!
+//! Overlapping triggers now coalesce: the second does no work and returns
+//! zeroed stats, and the run already in flight runs once more so the coalesced
+//! trigger's evidence is still consolidated.
 
 use std::sync::{Arc, Barrier};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use pensyve_core::config::{ConsolidationConfig, PensyveConfig};
@@ -47,27 +51,37 @@ fn mentioned_rows(storage: &SqliteBackend, ns: Uuid) -> Vec<(Uuid, String)> {
         .collect()
 }
 
-/// Seed `CLUSTERS` promotable clusters, each two identical episodes under its
-/// own entity. The mock embedder returns identical vectors for identical text,
-/// so each pair clusters (cosine > 0.8) and is worth exactly one promotion.
-fn seed_namespace(storage: &SqliteBackend, embedder: &OnnxEmbedder, name: &str) -> Uuid {
-    let ns = Namespace::new(name);
-    storage.save_namespace(&ns).unwrap();
-
-    for c in 0..CLUSTERS {
+/// Add one promotable cluster per index in `which`: two identical episodes
+/// under a fresh entity. The mock embedder returns identical vectors for
+/// identical text, so each pair clusters (cosine > 0.8) and is worth exactly
+/// one promotion.
+fn seed_clusters(
+    storage: &SqliteBackend,
+    embedder: &OnnxEmbedder,
+    ns: Uuid,
+    which: std::ops::Range<usize>,
+) {
+    for c in which {
         let entity_id = Uuid::new_v4();
         let source_id = Uuid::new_v4();
-        let episode = Episode::new(ns.id, vec![source_id, entity_id]);
+        let episode = Episode::new(ns, vec![source_id, entity_id]);
         storage.save_episode(&episode).unwrap();
         let content = format!("prefers configuration variant {c}");
         for i in 0..2 {
             let mut mem =
-                EpisodicMemory::new(ns.id, episode.id, source_id, entity_id, content.as_str());
+                EpisodicMemory::new(ns, episode.id, source_id, entity_id, content.as_str());
             mem.embedding = embedder.embed(&mem.content).unwrap();
             mem.timestamp = Utc::now() - chrono::Duration::seconds(i);
             storage.save_episodic(&mem).unwrap();
         }
     }
+}
+
+/// A namespace seeded with `CLUSTERS` promotable clusters.
+fn seed_namespace(storage: &SqliteBackend, embedder: &OnnxEmbedder, name: &str) -> Uuid {
+    let ns = Namespace::new(name);
+    storage.save_namespace(&ns).unwrap();
+    seed_clusters(storage, embedder, ns.id, 0..CLUSTERS);
     ns.id
 }
 
@@ -181,5 +195,93 @@ fn concurrent_runs_on_one_namespace_do_not_double_promote() {
         distinct.len(),
         rows.len(),
         "duplicate (entity, content) rows"
+    );
+}
+
+/// Evidence that lands *after* a run has already snapshotted the namespace,
+/// whose own trigger is then coalesced into that run, must still be
+/// consolidated.
+///
+/// This is the property that makes coalescing safe rather than lossy. The
+/// promotion pass snapshots at its start, so the run in flight cannot see the
+/// late clusters; only the re-run its pending flag schedules can. Were the
+/// second trigger simply dropped as redundant, those clusters would sit
+/// unpromoted until some later trigger or the six-hourly sweep.
+#[test]
+fn evidence_arriving_mid_run_is_not_dropped_by_coalescing() {
+    // One late cluster, and a namespace several times the usual size so the
+    // owner's run is long. Both serve the same end: the window between "the
+    // owner has provably started" and "the owner finishes" must dwarf the work
+    // this thread does inside it, even on a machine running the rest of the
+    // suite in parallel.
+    const SEEDED: usize = CLUSTERS * 4;
+    const LATE_CONTENT: &str = "late evidence the in-flight run cannot see";
+
+    let tmp = TempDir::new().unwrap();
+    let storage = Arc::new(SqliteBackend::open(tmp.path()).expect("open storage"));
+    let embedder = Arc::new(OnnxEmbedder::new_mock(64));
+    let namespace = Namespace::new("coalesced_coverage");
+    storage.save_namespace(&namespace).unwrap();
+    let ns = namespace.id;
+    seed_clusters(&storage, &embedder, ns, 0..SEEDED);
+
+    // Build the late cluster up front, everything except its two `save_episodic`
+    // calls. Embedding and episode creation are the slow parts, and doing them
+    // now keeps the critical section below to two writes — the less this thread
+    // has to do while the owner runs, the less there is to be descheduled in
+    // the middle of.
+    let late_entity = Uuid::new_v4();
+    let late_source = Uuid::new_v4();
+    let late_episode = Episode::new(ns, vec![late_source, late_entity]);
+    storage.save_episode(&late_episode).unwrap();
+    let late_memories: Vec<EpisodicMemory> = (0..2)
+        .map(|i| {
+            let mut mem =
+                EpisodicMemory::new(ns, late_episode.id, late_source, late_entity, LATE_CONTENT);
+            mem.embedding = embedder.embed(LATE_CONTENT).unwrap();
+            mem.timestamp = Utc::now() - chrono::Duration::seconds(i);
+            mem
+        })
+        .collect();
+
+    let owner = {
+        let storage = storage.clone();
+        let embedder = embedder.clone();
+        std::thread::spawn(move || run(&storage, &embedder, ns))
+    };
+
+    // Wait for proof that the owner has claimed the namespace and is past its
+    // snapshot, rather than guessing with a sleep: its first promoted row can
+    // only exist once both have happened. That row lands after roughly one
+    // cluster of a SEEDED-cluster run, so nearly the whole run is still ahead.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while mentioned_rows(&storage, ns).is_empty() {
+        assert!(Instant::now() < deadline, "owner never began promoting");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // Evidence the in-flight run cannot possibly have snapshotted, plus the
+    // trigger that announces it. That trigger coalesces.
+    for mem in &late_memories {
+        storage.save_episodic(mem).unwrap();
+    }
+    let coalesced_promoted = run(&storage, &embedder, ns);
+    let owner_promoted = owner.join().unwrap();
+
+    assert_eq!(
+        coalesced_promoted, 0,
+        "the second trigger ran instead of coalescing, so this test did not \
+         exercise coalescing at all"
+    );
+    assert_eq!(
+        mentioned_rows(&storage, ns).len(),
+        SEEDED + 1,
+        "coalescing dropped the late cluster that arrived mid-run (owner \
+         promoted {owner_promoted})"
+    );
+    assert_eq!(
+        owner_promoted,
+        SEEDED + 1,
+        "the owner's reported total should span both of its runs"
     );
 }

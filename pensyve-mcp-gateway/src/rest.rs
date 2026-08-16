@@ -1957,10 +1957,11 @@ async fn episode_end(
         let storage = ps.storage.clone();
         let embedder = ps.embedder.clone();
         let ns_id = ps.namespace.id;
-        // #226: `spawn_blocking`, not `spawn`. `ConsolidationEngine::run` is
-        // synchronous and now blocks while another run for this namespace is
-        // in flight, so running it on a runtime worker would park that worker
-        // for the duration of both.
+        // #226: `spawn_blocking`, not `spawn` — the engine is synchronous, so
+        // on a runtime worker it parks that worker for the whole run. The
+        // engine coalesces per namespace, so a burst of episode_end calls on
+        // one namespace does not pile up threads here: all but one return
+        // immediately, and the run in flight covers them.
         tokio::task::spawn_blocking(move || {
             let config = pensyve_core::config::ConsolidationConfig::default();
             // G1/P3a: pass Disabled + fresh CancellationToken; this is a
@@ -2056,10 +2057,10 @@ async fn consolidate(
 
     let config = pensyve_core::config::ConsolidationConfig::default();
     // #226: this on-demand endpoint is a fourth path into the engine, so it
-    // takes the same per-namespace run lock as the sweep and the `episode_end`
-    // spawns. Run it on the blocking pool: the engine is synchronous and may
-    // now wait on a run already in flight for this namespace, and a request
-    // handler must not park a runtime worker for that.
+    // coalesces per namespace like the sweep and the `episode_end` spawns. Run
+    // it on the blocking pool rather than parking a runtime worker for the
+    // duration. A call made while another run is in flight returns zeroed
+    // stats immediately — that run covers this trigger's evidence.
     let run_storage = ps.storage.clone();
     let run_embedder = ps.embedder.clone();
     let ns_id = ps.namespace.id;

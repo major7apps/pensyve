@@ -402,7 +402,7 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
     // served its purpose. This task is the only acquirer — it walks namespaces
     // sequentially and awaits each run before starting the next — so the
     // permit was uncontended by construction, while the `episode_end` spawns
-    // it was meant to exclude never acquired it at all. Serialization now
+    // it was meant to exclude never acquired it at all. The guarantee now
     // lives inside `ConsolidationEngine::run`, keyed on the namespace, which
     // is the granularity the hazard actually has and which no call site can
     // skip.
