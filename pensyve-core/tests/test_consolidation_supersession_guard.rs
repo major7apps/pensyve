@@ -357,11 +357,13 @@ fn new_evidence_reasserting_same_content_promotes_after_supersession() {
         0,
         "the re-asserted fact must not duplicate on the next run"
     );
+    let live = active_mentioned(&storage, ns.id);
     assert_eq!(
         live.iter()
             .filter(|(_, object)| object == "prefers dark mode")
             .count(),
-        1
+        1,
+        "exactly one live row may carry the re-asserted content, found: {live:?}"
     );
 }
 
