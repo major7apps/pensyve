@@ -973,9 +973,12 @@ fn every_rls_table_has_exactly_one_namespace_policy() {
     fixture.enforce_rls();
     let forced: Vec<(String, bool)> = fixture.rt.block_on(async {
         query_as::<Postgres, _>(
+            // Scoped to `public`: `relname` alone is not unique across schemas,
+            // so a same-named relation elsewhere could satisfy the assertion.
             "SELECT relname, relforcerowsecurity
                FROM pg_class
-              WHERE relname = ANY($1)",
+              WHERE relname = ANY($1)
+                AND relnamespace = 'public'::regnamespace",
         )
         .bind(RLS_POLICIES.iter().map(|(t, _)| *t).collect::<Vec<_>>())
         .fetch_all(fixture.backend.pool())
@@ -999,10 +1002,10 @@ fn every_rls_table_has_exactly_one_namespace_policy() {
 /// `PENSYVE_TEST_DATABASE_URL` unset.
 #[test]
 fn schema_declares_rls_for_every_expected_table() {
-    let normalized = super::SCHEMA
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    // Comments stripped, like the enforcement-file test: a rollback note or
+    // example quoting a CREATE POLICY would otherwise satisfy these assertions
+    // without the schema declaring anything.
+    let normalized = sql_statements_only(super::SCHEMA);
     let predicate = "namespace_id::text = current_setting('pensyve.namespace_id', true)";
     for (table, policy) in RLS_POLICIES {
         assert!(

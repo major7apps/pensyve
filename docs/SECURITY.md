@@ -82,9 +82,13 @@ every startup.
 
 Enforcement fails closed, and it fails without raising an error. A query path
 that does not carry a namespace returns no rows, and a delete on that path
-reports success after deleting nothing. Several `StorageTrait` methods still
-take no `namespace_id` and therefore run unscoped, including the ones behind
-recall candidate hydration, memory supersession, entity forget, and GDPR erase.
+deletes nothing while still returning `Ok`. It does not claim a deletion:
+`delete_memory_by_id` returns `Ok(false)` and `delete_memories_by_entity`
+returns `Ok(0)`. The hazard is that the call succeeds at all, so a caller that
+only checks for an error treats a no-op as a completed erase. Several
+`StorageTrait` methods still take no `namespace_id` and run unscoped, including
+the ones behind recall candidate hydration, memory supersession, entity forget,
+and GDPR erase.
 The test `enforced_rls_fails_closed_for_unscoped_methods` in
 `pensyve-core/src/storage/postgres/live_rls.rs` lists them, and the list must
 be empty before enforcement becomes the default.
@@ -144,11 +148,11 @@ the data.
 
 #### The dedicated application role, and why it is not available yet
 
-A role that does not own the tables is subject to their policies whether
-`FORCE` is set, so running the application as a non-owner role would be the
-more durable control. It is not possible today. Do not follow the SQL below as
-deployment instructions, because an application pointed at such a role will not
-start. Issue #254 tracks the change that makes it usable.
+A role that does not own the tables is subject to their policies regardless of
+whether `FORCE` is set, so running the application as a non-owner role would be
+the more durable control. It is not possible today. Do not follow the SQL below
+as deployment instructions, because an application pointed at such a role will
+not start. Issue #254 tracks the change that makes it usable.
 
 `PostgresBackend::new` applies the schema on every startup, and the schema
 contains statements only a table's owner may run, including
@@ -184,9 +188,17 @@ statements are needed.
 #### What goes wrong
 
 Enforcement applied while query paths are still unscoped produces empty reads
-and writes that do nothing, rather than a visible failure. A non-owner role
-without grants stops the application from starting. Check the unscoped-method
-list first, and roll back with `NO FORCE` if reads start coming back empty.
+and writes that do nothing, rather than a visible failure. Check the
+unscoped-method list first, and roll back with `NO FORCE` if reads start coming
+back empty.
+
+Pointing `DATABASE_URL` at a role that does not own the tables stops the
+application from starting, and adding privileges does not fix it. The blocker
+is ownership, not grants: the schema runs owner-restricted statements on every
+startup, and a non-owner role fails with `must be owner of table entities` even
+holding every table privilege and `CREATE` on the schema. The fix is to connect
+as the owning role until issue #254 separates schema application from serving
+traffic.
 
 ## Network Policy
 
