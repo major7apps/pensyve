@@ -33,10 +33,15 @@
 //! directory — tenants of a gateway must not accumulate each other's memory
 //! dumps in a single place. [`write_to_dir`] creates directories `0700` and
 //! files `0600` on unix, and fsyncs both the file and the directory entry
-//! before reporting success. On non-unix targets the owner-only mode and the
-//! directory fsync are unavailable without platform-specific APIs this crate
-//! does not depend on; CI is Linux-only, so that path is documented rather than
-//! claimed as covered.
+//! before reporting success.
+//!
+//! On non-unix targets neither is enforced: files inherit default ACLs and the
+//! directory entry is not fsynced. Implementing Windows ACLs without Windows CI
+//! would ship untested security code, which is a worse failure than a known gap
+//! because it looks like protection nobody can verify. The limitation is made
+//! observable rather than left to these docs — [`write_to_dir`] logs a warning
+//! on every write, and each snapshot records [`ForgetSnapshot::owner_only`] so
+//! the artifact is self-describing once it leaves the host that wrote it.
 //!
 //! This is deliberately **not** built on [`crate::gdpr::export_entity_data`].
 //! That function answers a GDPR Art. 15 access request: it is namespace-scoped,
@@ -73,10 +78,31 @@ pub struct ForgetSnapshot {
     /// own tenant rather than relying on where it happens to sit on disk.
     pub namespace_id: Uuid,
     pub captured_at: DateTime<Utc>,
+    /// Whether the snapshot *file* was created with owner-only permissions
+    /// (`0600`). True on unix; false on platforms where this crate cannot
+    /// restrict access, where the file inherits default ACLs instead.
+    ///
+    /// Recorded in the artifact so a snapshot is self-describing about its own
+    /// protection level — which matters once it is copied between hosts, where
+    /// the mode it was written with is no longer observable.
+    ///
+    /// `#[serde(default)]` makes this `false` when absent, so a snapshot
+    /// written before the field existed reads as "not known to be protected"
+    /// rather than silently claiming protection it never had.
+    #[serde(default)]
+    pub owner_only: bool,
     /// Full memory rows, embeddings included, so a restore is byte-faithful to
     /// what the storage layer can read back.
     pub memories: Vec<Memory>,
 }
+
+/// Whether this platform can restrict a snapshot file to its owner.
+///
+/// Unix sets `0600` on the file and `0700` on directories it creates. Elsewhere
+/// the file inherits default ACLs: implementing Windows ACLs without Windows CI
+/// would ship untested security code, which is a worse failure than a
+/// documented gap because it looks like protection nobody can verify.
+pub const OWNER_ONLY_SUPPORTED: bool = cfg!(unix);
 
 /// Per-kind row counts, for surfacing what a snapshot holds without loading it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +187,7 @@ pub fn forget_entity(
             entity_name: entity_name.map(str::to_string),
             namespace_id,
             captured_at: Utc::now(),
+            owner_only: OWNER_ONLY_SUPPORTED,
             memories: memories.to_vec(),
         };
 
@@ -221,6 +248,19 @@ fn write_to_dir_with(
     sync_dir: fn(&Path) -> std::io::Result<()>,
 ) -> StorageResult<PathBuf> {
     use std::io::Write;
+
+    // An operator should not have to read module docs to learn their recovery
+    // artifacts are world-readable. Entity-wide forget is rare, so warning per
+    // write is appropriately loud rather than noisy.
+    #[cfg(not(unix))]
+    tracing::warn!(
+        directory = %dir.display(),
+        "Snapshot files cannot be restricted to owner-only access on this platform: \
+         they inherit default ACLs and may be readable by other users, and the \
+         directory entry is not fsynced so a crash may lose a snapshot that reported \
+         success. Restrict the snapshot directory's permissions yourself, and treat \
+         its contents as sensitive — they contain verbatim memory content."
+    );
 
     create_snapshot_dir(dir)?;
 
@@ -406,6 +446,7 @@ mod tests {
             entity_name: Some("subject".to_string()),
             namespace_id: f.namespace.id,
             captured_at: Utc::now(),
+            owner_only: OWNER_ONLY_SUPPORTED,
             memories,
         }
     }
@@ -635,6 +676,60 @@ mod tests {
                 .contains("simulated directory fsync failure"),
             "directory sync failure must propagate, got: {error}"
         );
+    }
+
+    /// The artifact must state its own protection level, so a snapshot copied
+    /// to another host still says whether it was ever owner-only.
+    #[test]
+    fn snapshots_record_whether_owner_only_permissions_were_enforced() {
+        let f = fixture();
+        let snapshot = snapshot_of(&f, Vec::new());
+
+        let path = write_to_dir(&f.dir.path().join("snapshots"), &snapshot).unwrap();
+        let reloaded = read_file(&path).unwrap();
+
+        assert_eq!(reloaded.owner_only, cfg!(unix));
+        // On the platforms CI covers this is the enforced case; the assertion
+        // above is what would flip if that ever silently regressed.
+        #[cfg(unix)]
+        assert!(reloaded.owner_only);
+    }
+
+    /// `owner_only` was added after the first snapshots were written. It is
+    /// `#[serde(default)]` rather than a `FORMAT_VERSION` bump, because bumping
+    /// would make `read_file` reject those snapshots outright — refusing to
+    /// restore recoverable data over a field that does not affect the rows.
+    #[test]
+    fn a_snapshot_written_before_owner_only_existed_still_restores() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let outcome = forget_entity(
+            &f.storage,
+            f.entity.id,
+            None,
+            f.namespace.id,
+            &f.dir.path().join("snapshots"),
+        )
+        .unwrap();
+        let path = outcome.path.expect("a non-empty snapshot must be written");
+
+        // Strip the field, exactly as a snapshot written by the previous build
+        // would have been.
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        raw.as_object_mut().unwrap().remove("owner_only");
+        assert_eq!(raw["format_version"], FORMAT_VERSION);
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+        let reloaded = read_file(&path).expect("an older snapshot must still be readable");
+
+        assert!(
+            !reloaded.owner_only,
+            "an absent field must read as unprotected, never as protected"
+        );
+        assert_eq!(reloaded.memory_ids(), outcome.snapshot.memory_ids());
+        let restored = restore(&f.storage, &reloaded).unwrap();
+        assert_eq!(restored.restored, outcome.snapshot.memories.len());
     }
 
     /// Pins the real `sync_dir` that `write_to_dir` injects: it succeeds on a

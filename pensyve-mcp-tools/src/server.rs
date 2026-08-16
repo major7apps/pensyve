@@ -649,6 +649,10 @@ impl PensyveMcpServer {
                 "path": path,
                 "format_version": snapshot.format_version,
                 "captured_at": snapshot.captured_at.to_rfc3339(),
+                // False on platforms where the file could not be restricted to
+                // its owner — the caller holding this reference is the one who
+                // needs to know the artifact is readable by others.
+                "owner_only": snapshot.owner_only,
                 "memory_count": counts.total,
                 "episodic_count": counts.episodic,
                 "semantic_count": counts.semantic,
@@ -1047,6 +1051,11 @@ mod tests {
         assert_eq!(
             response["snapshot"]["snapshot_id"],
             snapshot.snapshot_id.to_string()
+        );
+        assert_eq!(
+            response["snapshot"]["owner_only"],
+            pensyve_core::snapshot::OWNER_ONLY_SUPPORTED,
+            "the response must state whether the artifact is owner-only"
         );
 
         // The snapshot is a real recovery path, not just a receipt.
