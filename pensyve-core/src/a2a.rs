@@ -134,7 +134,21 @@ impl AgentCard {
                     output_schema: serde_json::json!({
                         "type": "object",
                         "properties": {
-                            "forgotten_count": {"type": "integer"}
+                            "forgotten_count": {"type": "integer"},
+                            "snapshot": {
+                                "type": "object",
+                                "description": "Reference to the pre-delete snapshot the deleted rows can be recovered from. Absent when nothing was deleted.",
+                                "properties": {
+                                    "snapshot_id": {"type": "string"},
+                                    "path": {"type": "string"},
+                                    "format_version": {"type": "integer"},
+                                    "captured_at": {"type": "string"},
+                                    "owner_only": {"type": "boolean"},
+                                    "memory_count": {"type": "integer"},
+                                    "episodic_count": {"type": "integer"},
+                                    "semantic_count": {"type": "integer"}
+                                }
+                            }
                         }
                     }),
                 },

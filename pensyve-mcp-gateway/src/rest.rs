@@ -2394,8 +2394,13 @@ async fn a2a_forget(
         .unwrap_or("")
         .to_string();
 
-    let Ok(Some(entity)) = ps.storage.get_entity_by_name(&entity_name, ps.namespace.id) else {
-        return Ok(json!({"forgotten_count": 0}));
+    // A lookup failure is not a missing entity: reporting it as a completed
+    // zero-delete would tell the caller the forget succeeded when nothing was
+    // checked, so only `Ok(None)` gets the zero-count path.
+    let entity = match ps.storage.get_entity_by_name(&entity_name, ps.namespace.id) {
+        Ok(Some(entity)) => entity,
+        Ok(None) => return Ok(json!({"forgotten_count": 0})),
+        Err(err) => return Err(format!("Error looking up entity: {err}")),
     };
 
     // Same fail-closed contract as the REST route and the MCP tool: the

@@ -187,6 +187,22 @@ async fn a2a_forget(client: &reqwest::Client, url: &str, entity: &str) -> Value 
     response.json().await.expect("a2a forget response JSON")
 }
 
+/// Asserts every id is present in the vector index. Run before a forget so the
+/// absence checks afterward prove removal rather than never-indexed ids.
+async fn assert_indexed(state: &AppState, ids: &[Uuid]) {
+    let ps = state
+        .tenant_mgr
+        .get_tenant_state(TEST_TENANT)
+        .expect("tenant state");
+    let vector_index = ps.vector_index.read().await;
+    for id in ids {
+        assert!(
+            vector_index.get(*id).is_some(),
+            "memory {id} must be indexed before the forget"
+        );
+    }
+}
+
 /// Asserts the reference points at a real snapshot holding exactly `expected`
 /// and returns the parsed artifact.
 fn assert_reference_matches_file(
@@ -238,6 +254,7 @@ async fn rest_forget_writes_a_snapshot_and_returns_its_reference() {
     let client = reqwest::Client::new();
     let tea = remember(&client, &url, "alice", "likes tea").await;
     let rust = remember(&client, &url, "alice", "uses rust").await;
+    assert_indexed(&state, &[tea, rust]).await;
 
     let response = forget(&client, &url, "alice").await;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
@@ -316,6 +333,7 @@ async fn a2a_forget_writes_a_snapshot_and_returns_its_reference() {
     let client = reqwest::Client::new();
     let tea = remember(&client, &url, "alice", "likes tea").await;
     let rust = remember(&client, &url, "alice", "uses rust").await;
+    assert_indexed(&state, &[tea, rust]).await;
 
     let body = a2a_forget(&client, &url, "alice").await;
     assert_eq!(body["status"], "completed");
