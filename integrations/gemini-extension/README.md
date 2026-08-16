@@ -140,7 +140,7 @@ Gemini CLI has no hook/event surface, so the entire substrate is delivered throu
 | `pensyve_observe`       | `episode_id`, `content`, `source_entity`, `about_entity`, `content_type?` | Stored episodic memory object        |
 | `pensyve_episode_start` | `participants`                                                            | `episode_id`, `started_at`           |
 | `pensyve_episode_end`   | `episode_id`, `outcome?`                                                  | `memories_created` count             |
-| `pensyve_forget`        | `entity`, `hard_delete?`                                                  | `forgotten_count`                    |
+| `pensyve_forget`        | `entity`                                                                  | `forgotten_count`                    |
 | `pensyve_inspect`       | `entity`, `memory_type?`, `limit?`                                        | Array of memories with stats         |
 
 ## Opt-Out

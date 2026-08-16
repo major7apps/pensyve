@@ -55,12 +55,22 @@ pub struct ObserveParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+// Destructive call: reject unknown fields instead of silently dropping them,
+// so a caller passing e.g. `memory_id` (expecting to narrow the scope) gets a
+// hard error rather than an entity-wide delete. See issue #217.
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)] // Fields are read via Deserialize, not direct access
 pub struct ForgetParams {
-    /// The entity whose memories to remove.
+    /// The entity whose memories will ALL be permanently deleted.
     pub entity: String,
-    /// If true, permanently deletes rather than soft-deleting.
-    pub hard_delete: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // Fields are read via Deserialize, not direct access
+pub struct ForgetMemoryParams {
+    /// The id (UUID) of the single memory to permanently delete.
+    pub memory_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -81,3 +91,34 @@ pub struct StatusParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AccountParams {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #217: an unknown field on a destructive call must be a hard
+    /// error, not silently dropped (the incident caller passed `memory_id`
+    /// expecting to narrow an entity-wide delete to one memory).
+    #[test]
+    fn forget_params_rejects_unknown_fields() {
+        let err = serde_json::from_str::<ForgetParams>(
+            r#"{"entity": "design-tool", "memory_id": "96e8896e-0000-0000-0000-000000000000"}"#,
+        );
+        assert!(err.is_err(), "unknown field must fail deserialization");
+        assert!(err.unwrap_err().to_string().contains("memory_id"));
+    }
+
+    #[test]
+    fn forget_params_accepts_entity_only() {
+        let ok = serde_json::from_str::<ForgetParams>(r#"{"entity": "design-tool"}"#);
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn forget_memory_params_rejects_unknown_fields() {
+        let err = serde_json::from_str::<ForgetMemoryParams>(
+            r#"{"memory_id": "96e8896e-0000-0000-0000-000000000000", "entity": "design-tool"}"#,
+        );
+        assert!(err.is_err(), "unknown field must fail deserialization");
+    }
+}

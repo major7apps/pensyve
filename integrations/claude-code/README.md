@@ -241,7 +241,7 @@ The plugin wraps 7 MCP tools exposed by the `pensyve-mcp` binary:
 | `pensyve_observe`       | `episode_id`, `content`, `source_entity`, `about_entity`, `content_type?` | Stored observation object. Primary episodic-capture path used by in-flight memory-woven skills. `source_entity` and `about_entity` are required. |
 | `pensyve_episode_start` | `participants`                         | `episode_id`, `started_at`           |
 | `pensyve_episode_end`   | `episode_id`, `outcome?`               | `memories_created` count             |
-| `pensyve_forget`        | `entity`, `hard_delete?`               | `forgotten_count`                    |
+| `pensyve_forget`        | `entity`                               | `forgotten_count`. Entity-wide, irreversible hard delete; use `pensyve_forget_memory` to delete a single memory by id. |
 | `pensyve_inspect`       | `entity`, `memory_type?`, `limit?`     | Array of memories with stats         |
 
 All tools communicate over MCP. The Cloud server is at `https://mcp.pensyve.com/mcp`. The plugin never bypasses MCP to access storage directly.

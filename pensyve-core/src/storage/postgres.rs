@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::future::Future;
 
 use chrono::{DateTime, Utc};
+use sqlx_core::acquire::Acquire;
 use sqlx_core::executor::Executor;
 use sqlx_core::from_row::FromRow;
 use sqlx_core::query::query;
@@ -1506,6 +1507,69 @@ impl StorageTrait for PostgresBackend {
                 deleted = true;
             }
 
+            Ok(deleted)
+        })
+    }
+
+    fn delete_memory_by_id_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<bool> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            let mut deleted = false;
+
+            let result = query::<Postgres>(
+                "DELETE FROM episodic_memories WHERE id = $1 AND namespace_id = $2",
+            )
+            .bind(id)
+            .bind(namespace_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            if result.rows_affected() > 0 {
+                deleted = true;
+            }
+
+            let result = query::<Postgres>(
+                "DELETE FROM semantic_memories WHERE id = $1 AND namespace_id = $2",
+            )
+            .bind(id)
+            .bind(namespace_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            if result.rows_affected() > 0 {
+                deleted = true;
+            }
+
+            let result = query::<Postgres>(
+                "DELETE FROM procedural_memories WHERE id = $1 AND namespace_id = $2",
+            )
+            .bind(id)
+            .bind(namespace_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            if result.rows_affected() > 0 {
+                deleted = true;
+            }
+
+            let result = query::<Postgres>(
+                "DELETE FROM observation_memories WHERE id = $1 AND namespace_id = $2",
+            )
+            .bind(id)
+            .bind(namespace_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            if result.rows_affected() > 0 {
+                deleted = true;
+            }
+
+            transaction.commit().await.map_err(sqlx_to_io)?;
             Ok(deleted)
         })
     }

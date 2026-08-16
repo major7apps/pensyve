@@ -697,6 +697,81 @@ fn str_to_dt(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s).map_or_else(|_| Utc::now(), |d| d.with_timezone(&Utc))
 }
 
+fn delete_memory_by_id_with_namespace(
+    conn: &Connection,
+    id: Uuid,
+    namespace_id: Option<Uuid>,
+) -> StorageResult<bool> {
+    let transaction = conn.unchecked_transaction()?;
+    let id_str = id.to_string();
+    let namespace_id = namespace_id.map(|namespace_id| namespace_id.to_string());
+    let mut deleted = false;
+
+    let n = transaction.execute(
+        "DELETE FROM episodic_memories
+         WHERE id = ?1 AND (?2 IS NULL OR namespace_id = ?2)",
+        params![&id_str, namespace_id.as_deref()],
+    )?;
+    if n > 0 {
+        deleted = true;
+    }
+
+    let n = transaction.execute(
+        "DELETE FROM semantic_memories
+         WHERE id = ?1 AND (?2 IS NULL OR namespace_id = ?2)",
+        params![&id_str, namespace_id.as_deref()],
+    )?;
+    if n > 0 {
+        deleted = true;
+    }
+
+    let n = transaction.execute(
+        "DELETE FROM procedural_memories
+         WHERE id = ?1 AND (?2 IS NULL OR namespace_id = ?2)",
+        params![&id_str, namespace_id.as_deref()],
+    )?;
+    if n > 0 {
+        deleted = true;
+    }
+
+    let n = transaction.execute(
+        "DELETE FROM observation_memories
+         WHERE id = ?1 AND (?2 IS NULL OR namespace_id = ?2)",
+        params![&id_str, namespace_id.as_deref()],
+    )?;
+    if n > 0 {
+        deleted = true;
+        // Observations are the only memory type represented in the KG tables.
+        transaction.execute(
+            "DELETE FROM kg_triples
+             WHERE passage_id = ?1 AND (?2 IS NULL OR namespace_id = ?2)",
+            params![&id_str, namespace_id.as_deref()],
+        )?;
+        transaction.execute(
+            "DELETE FROM kg_passage_entities
+             WHERE passage_id = ?1
+               AND (
+                   ?2 IS NULL
+                   OR entity_id IN (
+                       SELECT id FROM kg_entities WHERE namespace_id = ?2
+                   )
+               )",
+            params![&id_str, namespace_id.as_deref()],
+        )?;
+    }
+
+    if deleted {
+        transaction.execute(
+            "DELETE FROM memory_fts
+             WHERE memory_id = ?1 AND (?2 IS NULL OR namespace_id = ?2)",
+            params![&id_str, namespace_id.as_deref()],
+        )?;
+    }
+
+    transaction.commit()?;
+    Ok(deleted)
+}
+
 // ---------------------------------------------------------------------------
 // StorageTrait implementation
 // ---------------------------------------------------------------------------
@@ -2149,65 +2224,16 @@ impl StorageTrait for SqliteBackend {
 
     fn delete_memory_by_id(&self, id: Uuid) -> StorageResult<bool> {
         let conn = lock_conn!(self);
-        let id_str = id.to_string();
+        delete_memory_by_id_with_namespace(&conn, id, None)
+    }
 
-        // Try deleting from each table in order.
-        let mut deleted = false;
-
-        let n = conn.execute(
-            "DELETE FROM episodic_memories WHERE id = ?1",
-            params![&id_str],
-        )?;
-        if n > 0 {
-            deleted = true;
-        }
-
-        let n = conn.execute(
-            "DELETE FROM semantic_memories WHERE id = ?1",
-            params![&id_str],
-        )?;
-        if n > 0 {
-            deleted = true;
-        }
-
-        let n = conn.execute(
-            "DELETE FROM procedural_memories WHERE id = ?1",
-            params![&id_str],
-        )?;
-        if n > 0 {
-            deleted = true;
-        }
-
-        let n = conn.execute(
-            "DELETE FROM observation_memories WHERE id = ?1",
-            params![&id_str],
-        )?;
-        if n > 0 {
-            deleted = true;
-            // Phase 2B cascade (CodeRabbit PR #115 round 2): if the
-            // departing row was an observation, drop its `kg_triples`
-            // and `kg_passage_entities` (both keyed by `passage_id ==
-            // observation.id`). Other memory types do not populate
-            // KG tables so the cascade is observation-only.
-            conn.execute(
-                "DELETE FROM kg_triples WHERE passage_id = ?1",
-                params![&id_str],
-            )?;
-            conn.execute(
-                "DELETE FROM kg_passage_entities WHERE passage_id = ?1",
-                params![&id_str],
-            )?;
-        }
-
-        // Remove from FTS index.
-        if deleted {
-            conn.execute(
-                "DELETE FROM memory_fts WHERE memory_id = ?1",
-                params![&id_str],
-            )?;
-        }
-
-        Ok(deleted)
+    fn delete_memory_by_id_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<bool> {
+        let conn = lock_conn!(self);
+        delete_memory_by_id_with_namespace(&conn, id, Some(namespace_id))
     }
 
     fn purge_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
@@ -3951,6 +3977,109 @@ mod tests {
         let deleted = db.delete_memory_by_id(obs_id).unwrap();
         assert!(deleted);
         assert!(db.get_observation(obs_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_delete_memory_by_id_in_namespace_rejects_foreign_namespace() {
+        let (_dir, db) = setup();
+        let owner_ns = make_namespace(&db);
+        let foreign_ns = Namespace::new("other");
+        db.save_namespace(&foreign_ns).unwrap();
+
+        let obs = ObservationMemory::new(owner_ns.id, Uuid::new_v4(), "x", "y", "z", "content");
+        db.save_observation(&obs).unwrap();
+
+        let deleted = db
+            .delete_memory_by_id_in_namespace(obs.id, foreign_ns.id)
+            .unwrap();
+
+        assert!(!deleted);
+        assert!(db.get_observation(obs.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_delete_memory_by_id_in_namespace_deletes_matching_namespace() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let obs = ObservationMemory::new(ns.id, Uuid::new_v4(), "x", "y", "z", "content");
+        db.save_observation(&obs).unwrap();
+
+        let deleted = db.delete_memory_by_id_in_namespace(obs.id, ns.id).unwrap();
+
+        assert!(deleted);
+        assert!(db.get_observation(obs.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_delete_memory_by_id_in_namespace_preserves_foreign_fts_entry() {
+        let (_dir, db) = setup();
+        let owner_ns = make_namespace(&db);
+        let foreign_ns = Namespace::new("other");
+        db.save_namespace(&foreign_ns).unwrap();
+        let shared_id = Uuid::new_v4();
+
+        let mut owner_memory =
+            SemanticMemory::new(owner_ns.id, Uuid::new_v4(), "owns", "local token", 0.9);
+        owner_memory.id = shared_id;
+        db.save_semantic(&owner_memory).unwrap();
+
+        let mut foreign_memory = EpisodicMemory::new(
+            foreign_ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "foreign unique token",
+        );
+        foreign_memory.id = shared_id;
+        db.save_episodic(&foreign_memory).unwrap();
+
+        db.delete_memory_by_id_in_namespace(shared_id, owner_ns.id)
+            .unwrap();
+
+        let hits = db
+            .search_fts("foreign unique token", foreign_ns.id, 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id(), shared_id);
+    }
+
+    #[test]
+    fn test_delete_memory_by_id_in_namespace_rolls_back_partial_delete() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let shared_id = Uuid::new_v4();
+
+        let mut episodic = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "must survive rollback",
+        );
+        episodic.id = shared_id;
+        db.save_episodic(&episodic).unwrap();
+
+        let mut semantic = SemanticMemory::new(ns.id, Uuid::new_v4(), "must", "also survive", 0.9);
+        semantic.id = shared_id;
+        db.save_semantic(&semantic).unwrap();
+
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_scoped_semantic_delete
+                 BEFORE DELETE ON semantic_memories
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced rollback');
+                 END;",
+            )
+            .unwrap();
+        }
+
+        let result = db.delete_memory_by_id_in_namespace(shared_id, ns.id);
+
+        assert!(result.is_err());
+        assert!(db.get_episodic(shared_id).unwrap().is_some());
+        assert!(db.get_semantic(shared_id).unwrap().is_some());
     }
 
     #[test]
