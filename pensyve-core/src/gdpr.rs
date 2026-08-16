@@ -46,9 +46,15 @@ pub struct ExportResult {
 /// 3. The entity record itself
 ///
 /// Returns an `ErasureResult` summarizing what was deleted.
+///
+/// `namespace_id` names the tenant the erasure belongs to, matching
+/// [`export_entity_data`]. Only the memory delete carries it today; the
+/// observation, edge and entity steps still match on `entity_id` alone and are
+/// tracked by #254 along with the rest of the unscoped `StorageTrait` surface.
 pub fn erase_entity(
     storage: &dyn StorageTrait,
     entity_id: Uuid,
+    namespace_id: Uuid,
 ) -> Result<ErasureResult, StorageError> {
     let mut result = ErasureResult::default();
 
@@ -64,7 +70,7 @@ pub fn erase_entity(
     }
 
     // Step 2: Delete all episodic / semantic memories about this entity.
-    match storage.delete_memories_by_entity(entity_id) {
+    match storage.delete_memories_by_entity(entity_id, namespace_id) {
         Ok(count) => result.memories_deleted = count,
         Err(e) => result.warnings.push(format!("Memory deletion error: {e}")),
     }
@@ -99,7 +105,7 @@ pub fn erase_namespace(
     let entities = storage.list_entities_by_namespace(namespace_id)?;
 
     for entity in &entities {
-        match erase_entity(storage, entity.id) {
+        match erase_entity(storage, entity.id, namespace_id) {
             Ok(entity_result) => {
                 result.memories_deleted += entity_result.memories_deleted;
                 result.observations_deleted += entity_result.observations_deleted;
@@ -219,7 +225,7 @@ mod tests {
         let storage = SqliteBackend::open(dir.path()).unwrap();
         let entity_id = Uuid::new_v4();
 
-        let result = erase_entity(&storage, entity_id).unwrap();
+        let result = erase_entity(&storage, entity_id, Uuid::new_v4()).unwrap();
         assert_eq!(result.memories_deleted, 0);
         assert!(result.complete);
     }
@@ -244,7 +250,7 @@ mod tests {
         mem.embedding = embedder.embed("test data").unwrap();
         storage.save_episodic(&mem).unwrap();
 
-        let result = erase_entity(&storage, entity.id).unwrap();
+        let result = erase_entity(&storage, entity.id, ns.id).unwrap();
         assert_eq!(result.memories_deleted, 1);
     }
 

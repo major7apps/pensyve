@@ -1152,7 +1152,7 @@ async fn forget_entity(
 
     let forgotten_count = ps
         .storage
-        .delete_memories_by_entity(entity.id)
+        .delete_memories_by_entity(entity.id, ps.namespace.id)
         .map_err(|err| {
             RestError(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2193,12 +2193,13 @@ async fn gdpr_erase(
         memory_ids.extend(mems.iter().map(|m| m.id));
     }
 
-    let result = pensyve_core::gdpr::erase_entity(ps.storage.as_ref(), entity.id).map_err(|e| {
-        RestError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("GDPR erasure error: {e}"),
-        )
-    })?;
+    let result = pensyve_core::gdpr::erase_entity(ps.storage.as_ref(), entity.id, ps.namespace.id)
+        .map_err(|e| {
+            RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("GDPR erasure error: {e}"),
+            )
+        })?;
 
     // Clean vector index.
     if result.memories_deleted > 0 {
@@ -2378,7 +2379,10 @@ async fn a2a_task(
 
             match ps.storage.get_entity_by_name(&entity_name, ps.namespace.id) {
                 Ok(Some(entity)) => {
-                    let count = ps.storage.delete_memories_by_entity(entity.id).unwrap_or(0);
+                    let count = ps
+                        .storage
+                        .delete_memories_by_entity(entity.id, ps.namespace.id)
+                        .unwrap_or(0);
                     json!({"forgotten_count": count})
                 }
                 _ => json!({"forgotten_count": 0}),
