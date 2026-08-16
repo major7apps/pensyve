@@ -46,6 +46,7 @@
 //!   contract.
 
 pub mod dmem;
+pub mod gate;
 pub mod typed_slots;
 
 use std::collections::HashMap;
@@ -193,8 +194,75 @@ impl ConsolidationEngine {
     /// when the future is dropped, but checking inside an open transaction
     /// would risk committing a partial state. Cancel response time target
     /// is ≤500 ms (pre-reg §2 I5).
+    ///
+    /// At most one run per namespace is in flight at a time, enforced by
+    /// [`gate::dispatch`]: the promotion pass derives its idempotency guard
+    /// from a snapshot of the namespace and only then writes, so two
+    /// overlapping runs would each see an unpromoted namespace and mint the
+    /// same row twice (#226). Dispatch happens here rather than at the call
+    /// sites so no trigger path — the periodic sweep, either `episode_end`
+    /// spawn, or the on-demand `/consolidate` endpoint — can bypass it, and so
+    /// a future one inherits it by default. Runs on *different* namespaces are
+    /// unaffected and proceed in parallel.
+    ///
+    /// Triggers coalesce rather than queue. A call made while another run is
+    /// in flight for the namespace does no work and returns zeroed stats; the
+    /// run already going will run once more and cover it, so nothing is
+    /// dropped. See the [`gate`] module docs for why queueing was rejected and
+    /// why coalescing is lossless.
+    ///
+    /// A caller that does own the namespace may therefore perform several
+    /// consecutive runs, and the returned stats are the total across them.
+    /// The engine is CPU- and IO-bound either way, so callers on an async
+    /// runtime should dispatch through `tokio::task::spawn_blocking`, as every
+    /// gateway call site does.
     #[tracing::instrument(skip_all, fields(namespace_id = %namespace_id))]
     pub fn run(
+        storage: &dyn StorageTrait,
+        embedder: &OnnxEmbedder,
+        config: &ConsolidationConfig,
+        namespace_id: Uuid,
+        policy: &NetworkPolicy,
+        cancel: &CancellationToken,
+    ) -> ConsolidationResult {
+        let mut total = ConsolidationStats::default();
+        let outcome = gate::dispatch(
+            namespace_id,
+            || {
+                let result =
+                    Self::run_locked(storage, embedder, config, namespace_id, policy, cancel);
+                if let Ok(stats) = &result {
+                    total.promoted += stats.promoted;
+                    total.decayed += stats.decayed;
+                    total.archived += stats.archived;
+                }
+                result
+            },
+            // Decline a re-run once the namespace has stopped making progress:
+            // a failed run would only fail again, and a cancelled caller must
+            // not be drafted into further work. Declining still releases the
+            // namespace, so the next trigger runs rather than coalescing into
+            // nothing.
+            |result| result.is_ok() && !cancel.is_cancelled(),
+        );
+
+        match outcome {
+            // Zeroed rather than the in-flight run's stats: this call did no
+            // work, and reporting another run's promotions here would
+            // double-count them in `log_activity`.
+            gate::Dispatch::Coalesced => Ok(ConsolidationStats::default()),
+            gate::Dispatch::Ran(Ok(_)) => Ok(total),
+            gate::Dispatch::Ran(Err(err)) => Err(err),
+        }
+    }
+
+    /// The body of [`Self::run`], executed while this caller owns the
+    /// namespace.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the public `run` signature it is split out of"
+    )]
+    fn run_locked(
         storage: &dyn StorageTrait,
         embedder: &OnnxEmbedder,
         config: &ConsolidationConfig,
