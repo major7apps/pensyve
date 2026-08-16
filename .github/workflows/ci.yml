@@ -49,6 +49,54 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+  test-rust-postgres:
+    name: Rust Tests (postgres)
+    runs-on: ubuntu-latest
+    # `pensyve-core`'s `postgres` feature is non-default. "Rust Tests" above
+    # compiles it (pensyve-mcp-gateway turns it on), but nothing has ever run
+    # it against a real server, so every Postgres-only behaviour — RLS
+    # policies, the namespace GUC, the handwritten SQL in
+    # `storage/postgres.rs` — was untested. That gap is what let the #218
+    # scoped-delete bug through: SQLite has no row-level security, so no
+    # existing test could observe it. Tracked by #225.
+    #
+    # Not a required check yet: promotion happens in repo settings once this
+    # job has a few green runs behind it.
+    services:
+      postgres:
+        # pgvector, not plain `postgres:16` — `postgres_schema.sql` opens with
+        # `CREATE EXTENSION IF NOT EXISTS vector` and the stock image has no
+        # such extension available.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # Deliberately not `DATABASE_URL`: the live tests create and drop their
+      # own databases and roles, so they demand a test-only variable rather
+      # than the one a real deployment reads. Tests skip themselves with an
+      # explicit message when it is unset.
+      #
+      # This points at the *admin* role. Each test provisions a throwaway
+      # database plus an unprivileged owner role from it and applies
+      # `postgres_schema.sql` there (via `PostgresBackend::from_pool`), so the
+      # schema needs no separate CI step and the `postgres` database stays
+      # empty.
+      PENSYVE_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run pensyve-core tests with the postgres feature
+        run: cargo test -p pensyve-core --features postgres
+
   test-rust-models:
     name: Rust Tests (with models)
     runs-on: ubuntu-latest
