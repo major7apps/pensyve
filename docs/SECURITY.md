@@ -51,27 +51,28 @@ per namespaced table. Each policy matches `namespace_id` against the
 `pensyve.namespace_id` setting, on both the read half (`USING`) and the write
 half (`WITH CHECK`), so a connection scoped to one namespace can neither read
 nor write another's rows. The backend binds that setting on every connection it
-takes from the pool; a connection that is not scoped to a namespace is bound to
+takes from the pool. A connection that is not scoped to a namespace is bound to
 a value no row can match, so it fails closed rather than inheriting the
 previous caller's namespace.
 
-**Layer 2 is not active by default.** Postgres exempts a table's owner from its
-own policies, and the application connects as the role that owns the schema, so
-the policies do not apply to it. Removing that exemption requires
-`FORCE ROW LEVEL SECURITY`, which ships as a separate, operator-applied file
-(`postgres_rls_enforce.sql`, also reachable as `PostgresBackend::enforce_rls`)
-rather than as part of the schema that runs on every startup.
+Layer 2 is not active by default. Postgres exempts a table's owner from its own
+policies, and the application connects as the role that owns the schema, so the
+policies do not apply to it. Removing that exemption requires
+`FORCE ROW LEVEL SECURITY`, which ships as a separate file that an operator
+applies (`postgres_rls_enforce.sql`, also reachable as
+`PostgresBackend::enforce_rls`) rather than as part of the schema that runs on
+every startup.
 
 #### Before enabling enforcement
 
-Enforcement fails closed, and it fails *silently*: a query path that does not
-carry a namespace does not error, it returns no rows. A delete returns "0 rows
-deleted" and reports success. Several `StorageTrait` methods still take no
-`namespace_id` and therefore run unscoped — among them the ones behind recall
-candidate hydration, memory supersession, entity forget, and GDPR erase. The
-test `enforced_rls_fails_closed_for_unscoped_methods` in
-`pensyve-core/src/storage/postgres/live_rls.rs` enumerates them and is the
-checklist that must reach zero before enforcement becomes the default.
+Enforcement fails closed, and it fails without raising an error. A query path
+that does not carry a namespace returns no rows, and a delete on that path
+reports success after deleting nothing. Several `StorageTrait` methods still
+take no `namespace_id` and therefore run unscoped, including the ones behind
+recall candidate hydration, memory supersession, entity forget, and GDPR erase.
+The test `enforced_rls_fails_closed_for_unscoped_methods` in
+`pensyve-core/src/storage/postgres/live_rls.rs` lists them, and the list must
+be empty before enforcement becomes the default.
 
 Do not apply enforcement to a deployment until those paths carry a namespace.
 
