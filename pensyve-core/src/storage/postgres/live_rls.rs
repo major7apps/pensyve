@@ -345,8 +345,9 @@ fn seed(fixture: &Fixture, ns_a: &Namespace, ns_b: &Namespace) -> EpisodicMemory
 /// can see, with no `WHERE` clause — so the count reflects RLS alone, not a
 /// query's own namespace predicate.
 ///
-/// Sets the GUC at session level (`is_local = false`) so it survives to the
-/// next statement, which is precisely what `scoped_conn` fails to do.
+/// Sets the GUC directly, at session level (`is_local = false`), rather than
+/// going through `scoped_conn`. Keeping the backend out of it is what makes
+/// this a test of the policies alone.
 fn rows_visible_to_namespace(fixture: &Fixture, namespace_id: Uuid) -> i64 {
     fixture.rt.block_on(async {
         let mut conn = fixture
@@ -446,8 +447,9 @@ fn namespace_scoping_end_to_end() {
 /// `pensyve.namespace_id`, they hide other namespaces' rows completely, with no
 /// help from any `WHERE namespace_id = ...` predicate.
 ///
-/// Pairs with [`scoped_conn_guc_is_discarded_before_the_next_statement`]: the
-/// policies work, the code that is supposed to feed them does not.
+/// Sets the GUC by hand rather than through the backend, so it isolates the
+/// policies themselves from the code that feeds them.
+/// [`scoped_conn_guc_is_visible_to_the_next_statement`] covers the feeding.
 #[test]
 fn rls_policies_isolate_namespaces_when_the_guc_is_set() {
     let Some(admin_opts) = skip_notice("rls_policies_isolate_namespaces_when_the_guc_is_set")
