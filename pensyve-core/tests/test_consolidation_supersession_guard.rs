@@ -71,17 +71,25 @@ fn run_once(storage: &SqliteBackend, embedder: &OnnxEmbedder, ns: Uuid) -> usize
     .promoted
 }
 
-/// The single `mentioned` row currently live for `entity`.
+/// The single `mentioned` row currently live in `ns`. Panics unless the
+/// namespace holds exactly one, so an unexpected extra row fails loudly here
+/// rather than silently steering a supersession onto the wrong row.
 fn active_mentioned_id(storage: &SqliteBackend, ns: Uuid) -> Uuid {
-    storage
+    let ids: Vec<Uuid> = storage
         .get_all_memories_by_namespace(ns)
         .unwrap()
         .into_iter()
-        .find_map(|m| match m {
+        .filter_map(|m| match m {
             Memory::Semantic(sm) if sm.predicate == "mentioned" => Some(sm.id),
             _ => None,
         })
-        .expect("promoted semantic row")
+        .collect();
+    assert_eq!(
+        ids.len(),
+        1,
+        "expected exactly one live `mentioned` row, found {ids:?}"
+    );
+    ids[0]
 }
 
 /// Save one episodic memory stamped at `at`. Returns its id.
