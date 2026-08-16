@@ -1,18 +1,18 @@
-//! Scope-parity test for the `pensyve_forget` pre-delete snapshot (#246).
+//! Scope and atomicity tests for the `pensyve_forget` pre-delete snapshot (#246).
 //!
 //! The snapshot exists so an entity-wide `pensyve_forget` is recoverable. That
 //! is only true if the snapshot's coverage is *exactly* the delete's coverage:
 //! a snapshot that silently omits destroyed rows is worse than no snapshot,
 //! because it looks complete.
 //!
-//! This test pins that invariant empirically. It seeds one row of every shape
-//! `delete_memories_by_entity` touches (plus controls it must not touch),
-//! captures the snapshot, runs the real delete, diffs the storage before/after,
-//! and asserts the set of rows that actually disappeared equals the set of rows
-//! the snapshot captured — in both directions.
+//! These tests pin that invariant empirically. The fixture seeds one row of
+//! every shape `delete_memories_by_entity` touches (plus controls it must not
+//! touch); the tests run the real forget path and diff storage across it.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
+use pensyve_core::snapshot;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::{
@@ -24,18 +24,32 @@ use uuid::Uuid;
 /// Everything the fixture seeds, tagged so failures name the missing shape
 /// instead of printing bare UUIDs.
 struct Fixture {
+    _dir: tempfile::TempDir,
+    db_path: PathBuf,
     storage: SqliteBackend,
     namespace: Namespace,
     target: Entity,
+    other: Entity,
     /// memory id -> human-readable description of the row shape.
     labels: HashMap<Uuid, &'static str>,
 }
 
+impl Fixture {
+    fn snapshot_root(&self) -> PathBuf {
+        self.db_path.join("snapshots")
+    }
+
+    /// A second, independent connection to the same database file — a stand-in
+    /// for another gateway request racing the forget.
+    fn second_connection(&self) -> SqliteBackend {
+        SqliteBackend::open(&self.db_path).unwrap()
+    }
+}
+
 fn seed() -> Fixture {
-    // Leaked so the `SqliteBackend` outlives the `TempDir` guard for the whole
-    // test; the OS reclaims the temp dir after the process exits.
-    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
-    let storage = SqliteBackend::open(dir.path()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().to_path_buf();
+    let storage = SqliteBackend::open(&db_path).unwrap();
 
     let namespace = Namespace::new("forget-snapshot-scope");
     storage.save_namespace(&namespace).unwrap();
@@ -132,14 +146,17 @@ fn seed() -> Fixture {
         "when asked about the target",
         "answer carefully",
         Outcome::Success,
-        HashMap::new(),
+        std::collections::HashMap::new(),
     );
     storage.save_procedural(&procedural).unwrap();
 
     Fixture {
+        _dir: dir,
+        db_path,
         storage,
         namespace,
         target,
+        other,
         labels,
     }
 }
@@ -175,12 +192,15 @@ fn snapshot_scope_equals_delete_scope() {
 
     let before = live_ids(storage, fixture.namespace.id);
 
-    let snapshot = pensyve_core::snapshot::capture(storage, fixture.target.id, None).unwrap();
-    let snapshot_ids: HashSet<Uuid> = snapshot.memory_ids().into_iter().collect();
-
-    storage
-        .delete_memories_by_entity(fixture.target.id)
-        .unwrap();
+    let outcome = snapshot::forget_entity(
+        storage,
+        fixture.target.id,
+        None,
+        fixture.namespace.id,
+        &fixture.snapshot_root(),
+    )
+    .unwrap();
+    let snapshot_ids: HashSet<Uuid> = outcome.snapshot.memory_ids().into_iter().collect();
 
     let after = live_ids(storage, fixture.namespace.id);
     let actually_deleted: HashSet<Uuid> = before.difference(&after).copied().collect();
@@ -220,25 +240,92 @@ fn snapshot_scope_equals_delete_scope() {
     );
 }
 
+/// The gap this closes: with a separate `SELECT` then `DELETE`, another writer
+/// could insert a matching row in between, and that row would be destroyed
+/// without ever reaching the snapshot.
+///
+/// What this proves, concretely: while the capturing delete's transaction is
+/// open — observed from inside the `persist` callback, which runs after the
+/// `DELETE ... RETURNING` and before the commit — an independent connection
+/// cannot commit a row matching the delete predicate. So there is no interval
+/// in which such a row can be created and then swept up by this delete. It
+/// then confirms the end state: nothing disappeared that the snapshot missed.
+#[test]
+fn a_concurrent_writer_cannot_land_a_row_in_the_deleted_but_uncaptured_gap() {
+    let fixture = seed();
+    let storage = &fixture.storage;
+    let intruder = fixture.second_connection();
+
+    let before = live_ids(storage, fixture.namespace.id);
+
+    // A row that matches the delete predicate (object-side), created by a
+    // different connection mid-transaction.
+    let mut racing_row = SemanticMemory::new(
+        fixture.namespace.id,
+        fixture.other.id,
+        "raced",
+        "target",
+        0.5,
+    );
+    racing_row.object_entity = Some(fixture.target.id);
+
+    let mut captured: Vec<Uuid> = Vec::new();
+    let mut intruder_result: Option<bool> = None;
+
+    storage
+        .delete_memories_by_entity_capturing(fixture.target.id, &mut |memories| {
+            captured = memories.iter().map(Memory::id).collect();
+            // The delete has already run in this transaction. A concurrent
+            // writer must not be able to commit a matching row now.
+            intruder_result = Some(intruder.save_semantic(&racing_row).is_ok());
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(
+        intruder_result,
+        Some(false),
+        "a second connection committed a matching row while the capturing \
+         delete held its transaction — that row could be deleted uncaptured"
+    );
+
+    let after = live_ids(storage, fixture.namespace.id);
+    let actually_deleted: HashSet<Uuid> = before.difference(&after).copied().collect();
+    let captured_ids: HashSet<Uuid> = captured.into_iter().collect();
+
+    assert_eq!(
+        actually_deleted, captured_ids,
+        "rows that disappeared did not match the rows the delete returned"
+    );
+    assert!(
+        !after.contains(&racing_row.id),
+        "the racing row must not exist: its write was rejected"
+    );
+
+    // Self-check: the intruder's write is rejected *because* the transaction
+    // was open, not because this write could never succeed. The identical call
+    // succeeds once the transaction has committed.
+    intruder.save_semantic(&racing_row).expect(
+        "the racing write must succeed outside the transaction, \
+         otherwise the assertion above proves nothing",
+    );
+}
+
 #[test]
 fn snapshot_round_trips_the_deleted_memories_back_into_storage() {
     let fixture = seed();
     let storage = &fixture.storage;
 
     let before = live_ids(storage, fixture.namespace.id);
-    let snapshot = pensyve_core::snapshot::capture(
+    let outcome = snapshot::forget_entity(
         storage,
         fixture.target.id,
-        Some(fixture.target.name.clone()),
+        Some(fixture.target.name.as_str()),
+        fixture.namespace.id,
+        &fixture.snapshot_root(),
     )
     .unwrap();
 
-    let snapshot_dir = tempfile::tempdir().unwrap();
-    let path = pensyve_core::snapshot::write_to_dir(snapshot_dir.path(), &snapshot).unwrap();
-
-    storage
-        .delete_memories_by_entity(fixture.target.id)
-        .unwrap();
     assert_ne!(
         live_ids(storage, fixture.namespace.id),
         before,
@@ -247,10 +334,11 @@ fn snapshot_round_trips_the_deleted_memories_back_into_storage() {
 
     // Recover from the persisted artifact alone, as a caller holding only the
     // path from the `pensyve_forget` response would.
-    let reloaded = pensyve_core::snapshot::read_file(&path).unwrap();
-    let outcome = pensyve_core::snapshot::restore(storage, &reloaded).unwrap();
+    let path = outcome.path.expect("a non-empty snapshot must be written");
+    let reloaded = snapshot::read_file(&path).unwrap();
+    let restored = snapshot::restore(storage, &reloaded).unwrap();
 
-    assert_eq!(outcome.restored, snapshot.memories.len());
+    assert_eq!(restored.restored, outcome.snapshot.memories.len());
     assert_eq!(
         live_ids(storage, fixture.namespace.id),
         before,
@@ -292,13 +380,17 @@ fn restore_is_idempotent() {
     let storage = &fixture.storage;
 
     let before = live_ids(storage, fixture.namespace.id);
-    let snapshot = pensyve_core::snapshot::capture(storage, fixture.target.id, None).unwrap();
-    storage
-        .delete_memories_by_entity(fixture.target.id)
-        .unwrap();
+    let outcome = snapshot::forget_entity(
+        storage,
+        fixture.target.id,
+        None,
+        fixture.namespace.id,
+        &fixture.snapshot_root(),
+    )
+    .unwrap();
 
-    pensyve_core::snapshot::restore(storage, &snapshot).unwrap();
-    pensyve_core::snapshot::restore(storage, &snapshot).unwrap();
+    snapshot::restore(storage, &outcome.snapshot).unwrap();
+    snapshot::restore(storage, &outcome.snapshot).unwrap();
 
     assert_eq!(live_ids(storage, fixture.namespace.id), before);
 }

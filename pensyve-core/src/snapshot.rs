@@ -3,28 +3,40 @@
 //! `pensyve_forget` destroys every memory attached to an entity in one call.
 //! Issue #217 recorded two production incidents where a caller who meant to
 //! retract a single memory invoked it instead and lost 1,528 and 79 memories
-//! with no server-side way back. This module is the recovery path: capture
-//! everything the delete is about to destroy, persist it durably, and only
-//! then let the delete run.
+//! with no server-side way back. [`forget_entity`] is the recovery path.
 //!
-//! # Scope parity is the whole point
+//! # The snapshot is the delete
 //!
-//! [`capture`] reads through
-//! [`StorageTrait::list_memories_by_entity_including_superseded`], which is
-//! specified as a predicate-for-predicate mirror of
-//! [`StorageTrait::delete_memories_by_entity`]. A snapshot that omits rows the
-//! delete destroys is *worse* than no snapshot, because it looks complete —
-//! `pensyve-core/tests/forget_snapshot_scope.rs` seeds one row of every shape
-//! the delete touches and fails the build if the two ever drift.
+//! The captured rows are not the result of a `SELECT` that predicts what the
+//! delete will remove — they are the rows the `DELETE` itself returned, via
+//! [`StorageTrait::delete_memories_by_entity_capturing`], with the write of the
+//! snapshot file happening inside the same transaction. So the snapshot cannot
+//! disagree with the delete, and there is no window in which a concurrent
+//! writer can add a row that gets destroyed without being captured.
+//!
+//! Two properties follow, and both are load-bearing:
+//!
+//! - **Fail closed.** If the snapshot cannot be written the transaction rolls
+//!   back and nothing is deleted. A crash between the file write and the commit
+//!   leaves an orphan snapshot file for data that still exists, which is the
+//!   harmless direction.
+//! - **Complete.** A snapshot that omits rows the delete destroyed would be
+//!   worse than no snapshot, because it looks complete.
+//!   `pensyve-core/tests/forget_snapshot_scope.rs` seeds one row of every shape
+//!   the delete touches and diffs storage across the call to prove the captured
+//!   set is exactly the set that disappeared.
 //!
 //! # Snapshots at rest
 //!
-//! A snapshot is verbatim memory content, so [`write_to_dir`] creates its
-//! directory `0700` and its files `0600` on unix, and fsyncs both the file and
-//! the directory entry before reporting success. On non-unix targets the
-//! owner-only mode and the directory fsync are unavailable without
-//! platform-specific APIs this crate does not depend on; CI is Linux-only, so
-//! that path is documented rather than claimed as covered.
+//! Snapshots hold verbatim memory content, so they are written under a
+//! per-namespace subdirectory (`<root>/<namespace_id>/`) rather than one shared
+//! directory — tenants of a gateway must not accumulate each other's memory
+//! dumps in a single place. [`write_to_dir`] creates directories `0700` and
+//! files `0600` on unix, and fsyncs both the file and the directory entry
+//! before reporting success. On non-unix targets the owner-only mode and the
+//! directory fsync are unavailable without platform-specific APIs this crate
+//! does not depend on; CI is Linux-only, so that path is documented rather than
+//! claimed as covered.
 //!
 //! This is deliberately **not** built on [`crate::gdpr::export_entity_data`].
 //! That function answers a GDPR Art. 15 access request: it is namespace-scoped,
@@ -57,6 +69,9 @@ pub struct ForgetSnapshot {
     pub entity_id: Uuid,
     /// Entity name as the caller referred to it, when known.
     pub entity_name: Option<String>,
+    /// Namespace the deleted rows belonged to, so the artifact identifies its
+    /// own tenant rather than relying on where it happens to sit on disk.
+    pub namespace_id: Uuid,
     pub captured_at: DateTime<Utc>,
     /// Full memory rows, embeddings included, so a restore is byte-faithful to
     /// what the storage layer can read back.
@@ -106,27 +121,75 @@ pub struct RestoreOutcome {
     pub restored: usize,
 }
 
-/// Capture everything [`StorageTrait::delete_memories_by_entity`] would destroy
-/// for `entity_id`.
+/// Result of a [`forget_entity`] call.
+#[derive(Debug, Clone)]
+pub struct ForgetOutcome {
+    /// The rows the delete removed. Empty when the entity had no memories.
+    pub snapshot: ForgetSnapshot,
+    /// Where the snapshot was written. `None` when nothing was deleted — an
+    /// empty snapshot has nothing to recover, and writing one per call would
+    /// let a caller fill the disk by invoking `pensyve_forget` in a loop.
+    pub path: Option<PathBuf>,
+}
+
+/// Delete every memory attached to `entity_id` and persist a snapshot of
+/// exactly those rows, atomically.
 ///
-/// Returns `Err` — never a partial result — when the backend cannot enumerate
-/// the delete scope. Callers must treat that as a hard stop and skip the
-/// delete: a row we could not capture is a row we must not destroy.
-pub fn capture(
+/// The snapshot file is written inside the delete's transaction, so either both
+/// happen or neither does. If the snapshot cannot be written, nothing is
+/// deleted and the error is returned.
+///
+/// `snapshot_root` is the root for all namespaces; the file lands under
+/// `<snapshot_root>/<namespace_id>/`.
+pub fn forget_entity(
     storage: &dyn StorageTrait,
     entity_id: Uuid,
-    entity_name: Option<String>,
-) -> StorageResult<ForgetSnapshot> {
-    let memories = storage.list_memories_by_entity_including_superseded(entity_id)?;
+    entity_name: Option<&str>,
+    namespace_id: Uuid,
+    snapshot_root: &Path,
+) -> StorageResult<ForgetOutcome> {
+    let dir = namespace_dir(snapshot_root, namespace_id);
 
-    Ok(ForgetSnapshot {
-        format_version: FORMAT_VERSION,
-        snapshot_id: Uuid::new_v4(),
-        entity_id,
-        entity_name,
-        captured_at: Utc::now(),
-        memories,
-    })
+    let mut captured: Option<ForgetSnapshot> = None;
+    let mut path: Option<PathBuf> = None;
+
+    let mut persist = |memories: &[Memory]| -> StorageResult<()> {
+        let snapshot = ForgetSnapshot {
+            format_version: FORMAT_VERSION,
+            snapshot_id: Uuid::new_v4(),
+            entity_id,
+            entity_name: entity_name.map(str::to_string),
+            namespace_id,
+            captured_at: Utc::now(),
+            memories: memories.to_vec(),
+        };
+
+        if !snapshot.is_empty() {
+            path = Some(write_to_dir(&dir, &snapshot)?);
+        }
+        captured = Some(snapshot);
+
+        Ok(())
+    };
+
+    storage.delete_memories_by_entity_capturing(entity_id, &mut persist)?;
+
+    // Enforces the trait contract that `persist` runs exactly once. A backend
+    // that deleted without calling it would have destroyed data uncaptured, so
+    // this is an error rather than a defaulted empty snapshot.
+    let snapshot = captured.ok_or_else(|| {
+        StorageError::Context(
+            "storage backend deleted without invoking the snapshot callback".to_string(),
+        )
+    })?;
+
+    Ok(ForgetOutcome { snapshot, path })
+}
+
+/// Per-namespace snapshot directory. Keeps one gateway tenant's memory dumps
+/// out of every other tenant's directory.
+pub fn namespace_dir(snapshot_root: &Path, namespace_id: Uuid) -> PathBuf {
+    snapshot_root.join(namespace_id.to_string())
 }
 
 /// Serialize `snapshot` into `dir`, creating the directory if needed, and
@@ -333,19 +396,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn capture_on_unknown_entity_yields_an_empty_snapshot() {
-        let f = fixture();
-
-        let snapshot = capture(&f.storage, Uuid::new_v4(), None).unwrap();
-
-        assert!(snapshot.is_empty());
-        assert_eq!(snapshot.format_version, FORMAT_VERSION);
+    /// A snapshot value for the tests below that exercise how bytes land on
+    /// disk rather than where the rows came from.
+    fn snapshot_of(f: &Fixture, memories: Vec<Memory>) -> ForgetSnapshot {
+        ForgetSnapshot {
+            format_version: FORMAT_VERSION,
+            snapshot_id: Uuid::new_v4(),
+            entity_id: f.entity.id,
+            entity_name: Some("subject".to_string()),
+            namespace_id: f.namespace.id,
+            captured_at: Utc::now(),
+            memories,
+        }
     }
 
-    #[test]
-    fn counts_break_down_by_memory_kind() {
-        let f = fixture();
+    fn seed_one_of_each(f: &Fixture) {
         let episode = Episode::new(f.namespace.id, vec![f.entity.id]);
         f.storage.save_episode(&episode).unwrap();
         f.storage
@@ -366,42 +431,125 @@ mod tests {
                 0.9,
             ))
             .unwrap();
+    }
 
-        let counts = capture(&f.storage, f.entity.id, None).unwrap().counts();
+    #[test]
+    fn forgetting_an_entity_with_no_memories_writes_no_file() {
+        let f = fixture();
+        let root = f.dir.path().join("snapshots");
 
+        let outcome =
+            forget_entity(&f.storage, Uuid::new_v4(), None, f.namespace.id, &root).unwrap();
+
+        assert!(outcome.snapshot.is_empty());
+        assert!(
+            outcome.path.is_none(),
+            "an empty snapshot must not be written to disk"
+        );
+        assert!(
+            !namespace_dir(&root, f.namespace.id).exists(),
+            "no directory should be created for an empty snapshot"
+        );
+    }
+
+    #[test]
+    fn counts_break_down_by_memory_kind() {
+        let f = fixture();
+        seed_one_of_each(&f);
+
+        let outcome = forget_entity(
+            &f.storage,
+            f.entity.id,
+            None,
+            f.namespace.id,
+            &f.dir.path().join("snapshots"),
+        )
+        .unwrap();
+
+        let counts = outcome.snapshot.counts();
         assert_eq!(counts.episodic, 1);
         assert_eq!(counts.semantic, 1);
         assert_eq!(counts.total, 2);
     }
 
+    /// Snapshots must land under their own namespace, not in one directory
+    /// shared by every tenant of a gateway.
+    #[test]
+    fn snapshots_are_written_under_a_per_namespace_directory() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let root = f.dir.path().join("snapshots");
+
+        let outcome = forget_entity(&f.storage, f.entity.id, None, f.namespace.id, &root).unwrap();
+
+        let path = outcome.path.expect("a non-empty snapshot must be written");
+        assert_eq!(
+            path.parent().unwrap(),
+            root.join(f.namespace.id.to_string()),
+            "snapshot did not land in its namespace's directory"
+        );
+    }
+
     #[test]
     fn snapshot_survives_a_write_read_round_trip() {
         let f = fixture();
-        f.storage
-            .save_semantic(&SemanticMemory::new(
-                f.namespace.id,
-                f.entity.id,
-                "likes",
-                "rust",
-                0.9,
-            ))
-            .unwrap();
-        let snapshot = capture(&f.storage, f.entity.id, Some("subject".to_string())).unwrap();
+        seed_one_of_each(&f);
 
-        let path = write_to_dir(f.dir.path().join("snapshots").as_path(), &snapshot).unwrap();
+        let outcome = forget_entity(
+            &f.storage,
+            f.entity.id,
+            Some("subject"),
+            f.namespace.id,
+            &f.dir.path().join("snapshots"),
+        )
+        .unwrap();
+
+        let path = outcome.path.expect("a non-empty snapshot must be written");
         let reloaded = read_file(&path).unwrap();
 
-        assert_eq!(reloaded.snapshot_id, snapshot.snapshot_id);
+        assert_eq!(reloaded.snapshot_id, outcome.snapshot.snapshot_id);
         assert_eq!(reloaded.entity_name.as_deref(), Some("subject"));
-        assert_eq!(reloaded.memory_ids(), snapshot.memory_ids());
+        assert_eq!(reloaded.namespace_id, f.namespace.id);
+        assert_eq!(reloaded.memory_ids(), outcome.snapshot.memory_ids());
         // Only the finished file is left behind — no `.partial` staging file.
         assert!(!path.with_extension("json.partial").exists());
+    }
+
+    /// The delete must not commit when the snapshot cannot be written. A
+    /// regular file where the namespace directory belongs makes `create_dir_all`
+    /// fail for every user, root included.
+    #[test]
+    fn forget_entity_rolls_back_the_delete_when_the_snapshot_cannot_be_written() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let before = f
+            .storage
+            .get_all_memories_by_namespace_including_superseded(f.namespace.id)
+            .unwrap()
+            .len();
+        assert_eq!(before, 2);
+
+        let root = f.dir.path().join("snapshots");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(namespace_dir(&root, f.namespace.id), b"not a directory").unwrap();
+
+        let error =
+            forget_entity(&f.storage, f.entity.id, None, f.namespace.id, &root).unwrap_err();
+
+        assert!(
+            f.storage
+                .get_all_memories_by_namespace_including_superseded(f.namespace.id)
+                .unwrap()
+                .len()
+                == before,
+            "delete must roll back when the snapshot write fails: {error}"
+        );
     }
 
     #[test]
     fn read_file_rejects_an_unknown_format_version() {
         let f = fixture();
-        let mut snapshot = capture(&f.storage, f.entity.id, None).unwrap();
+        let mut snapshot = snapshot_of(&f, Vec::new());
         snapshot.format_version = FORMAT_VERSION + 1;
         let path = write_to_dir(f.dir.path(), &snapshot).unwrap();
 
@@ -416,7 +564,7 @@ mod tests {
     #[test]
     fn write_to_dir_fails_when_the_directory_cannot_be_created() {
         let f = fixture();
-        let snapshot = capture(&f.storage, f.entity.id, None).unwrap();
+        let snapshot = snapshot_of(&f, Vec::new());
         // A regular file where the snapshot directory should be: `create_dir_all`
         // fails for every user, root included, so this is deterministic in CI.
         let blocked = f.dir.path().join("blocked");
@@ -435,7 +583,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let f = fixture();
-        let snapshot = capture(&f.storage, f.entity.id, None).unwrap();
+        let snapshot = snapshot_of(&f, Vec::new());
         let dir = f.dir.path().join("snapshots");
 
         let path = write_to_dir(&dir, &snapshot).unwrap();
@@ -455,7 +603,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let f = fixture();
-        let snapshot = capture(&f.storage, f.entity.id, None).unwrap();
+        let snapshot = snapshot_of(&f, Vec::new());
         let dir = f.dir.path().join("operator-owned");
         std::fs::create_dir(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
@@ -476,7 +624,7 @@ mod tests {
         }
 
         let f = fixture();
-        let snapshot = capture(&f.storage, f.entity.id, None).unwrap();
+        let snapshot = snapshot_of(&f, Vec::new());
         let dir = f.dir.path().join("snapshots");
 
         let error = write_to_dir_with(&dir, &snapshot, always_fails).unwrap_err();

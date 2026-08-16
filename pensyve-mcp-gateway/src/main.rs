@@ -18,7 +18,7 @@ use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::Namespace;
 use pensyve_core::vector::VectorIndex;
 
-use pensyve_mcp_tools::PensyveMcpServer;
+use pensyve_mcp_tools::{PensyveMcpServer, PensyveState};
 
 use pensyve_mcp_gateway::auth::{self, AuthContext, AuthLayer};
 use pensyve_mcp_gateway::cache;
@@ -212,6 +212,10 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         res.retrieval_config,
         res.namespace,
         res.vector_index,
+        // Derived from the gateway's own storage path, not a shared default:
+        // recovery artifacts belong inside the directory that backups and
+        // volume mounts already cover.
+        PensyveState::snapshot_root_for(&config.storage_path),
     );
 
     let ct = CancellationToken::new();

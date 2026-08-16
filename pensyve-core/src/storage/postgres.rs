@@ -1440,47 +1440,60 @@ impl StorageTrait for PostgresBackend {
     // Deletion
     // -----------------------------------------------------------------------
 
-    /// Mirror of [`Self::delete_memories_by_entity`]'s scope — same `WHERE`
-    /// clauses, same connection scoping (`maybe_scoped_conn`, not
-    /// `scoped_conn`, because the delete is not namespace-filtered either).
-    /// See the trait docs and `pensyve-core/tests/forget_snapshot_scope.rs`.
-    fn list_memories_by_entity_including_superseded(
+    /// Capturing variant of [`Self::delete_memories_by_entity`] — see the trait
+    /// docs. Same `WHERE` clauses and the same connection scoping
+    /// (`maybe_scoped_conn`, not `scoped_conn`, because the delete is not
+    /// namespace-filtered either), with `RETURNING` supplying the rows the
+    /// statement actually removed.
+    ///
+    /// Wrapping both deletes and `persist` in one transaction also removes any
+    /// isolation-level reasoning: `RETURNING` reports the rows this statement
+    /// deleted, so the captured set cannot disagree with the committed effect
+    /// no matter what other sessions do concurrently.
+    fn delete_memories_by_entity_capturing(
         &self,
         entity_id: Uuid,
+        persist: &mut dyn FnMut(&[Memory]) -> StorageResult<()>,
     ) -> StorageResult<Vec<Memory>> {
         self.block_on(async {
             let mut conn = self.maybe_scoped_conn().await?;
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
             let mut memories = Vec::new();
 
             let rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
-                r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                          summary, embedding::text AS embedding, context_intent, timestamp, stability,
-                          retrievability, access_count, last_accessed, event_time,
-                          superseded_by, invalid_at
-                   FROM episodic_memories
-                   WHERE about_entity = $1 OR source_entity = $1",
+                r"DELETE FROM episodic_memories
+                   WHERE about_entity = $1 OR source_entity = $1
+                   RETURNING id, namespace_id, episode_id, source_entity, about_entity, content,
+                             summary, embedding::text AS embedding, context_intent, timestamp,
+                             stability, retrievability, access_count, last_accessed, event_time,
+                             superseded_by, invalid_at",
             )
             .bind(entity_id)
-            .fetch_all(&mut *conn)
+            .fetch_all(&mut *tx)
             .await
             .map_err(sqlx_to_io)?;
             memories.extend(rows.into_iter().map(row_to_episodic).map(Memory::Episodic));
 
             let rows: Vec<SemanticRow> = query_as::<Postgres, _>(
-                r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
-                          valid_at, invalid_at, source_episodes, embedding::text, stability,
-                          retrievability, superseded_by
-                   FROM semantic_memories
-                   WHERE subject = $1 OR object_entity = $1",
+                r"DELETE FROM semantic_memories
+                   WHERE subject = $1 OR object_entity = $1
+                   RETURNING id, namespace_id, subject, predicate, object, object_entity,
+                             confidence, valid_at, invalid_at, source_episodes,
+                             embedding::text AS embedding, stability, retrievability,
+                             superseded_by",
             )
             .bind(entity_id)
-            .fetch_all(&mut *conn)
+            .fetch_all(&mut *tx)
             .await
             .map_err(sqlx_to_io)?;
             memories.extend(rows.into_iter().map(row_to_semantic).map(Memory::Semantic));
 
-            // Procedural and observation rows are intentionally absent: the
-            // delete below does not touch either table.
+            // Persist inside the transaction. On `Err` the `?` drops `tx`,
+            // which rolls back — nothing is deleted.
+            persist(&memories)?;
+
+            tx.commit().await.map_err(sqlx_to_io)?;
+
             Ok(memories)
         })
     }

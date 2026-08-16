@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use tokio::sync::RwLock;
@@ -35,32 +35,30 @@ pub struct PensyveState {
     /// disables it outright, and a model-load failure is logged once and
     /// leaves recall unreranked rather than failing startup or the request.
     pub reranker_cell: Arc<OnceLock<Option<Arc<Reranker>>>>,
-    /// Directory that `pensyve_forget` writes its pre-delete snapshots into
-    /// (#246). The tool refuses to delete anything it could not first write a
-    /// snapshot for, so this must point somewhere writable — see
-    /// [`PensyveState::default_snapshot_dir`] for the standard location.
-    pub snapshot_dir: PathBuf,
+    /// Root directory that `pensyve_forget` writes its pre-delete snapshots
+    /// into (#246). This is the root for *all* namespaces; each snapshot lands
+    /// under `<root>/<namespace_id>/`, so one gateway tenant's memory dumps
+    /// never sit in another's directory.
+    ///
+    /// `pensyve_forget` refuses to delete anything it could not first write a
+    /// snapshot for, so this must point somewhere writable and durable — see
+    /// [`PensyveState::snapshot_root_for`].
+    pub snapshot_root: PathBuf,
 }
 
 impl PensyveState {
-    /// Standard snapshot location: `<storage dir>/snapshots`, honouring
-    /// `PENSYVE_SNAPSHOT_DIR` first and then `PENSYVE_PATH`, matching how the
-    /// stdio server and CLI already resolve their storage directory.
-    pub fn default_snapshot_dir() -> PathBuf {
-        if let Ok(dir) = std::env::var("PENSYVE_SNAPSHOT_DIR") {
-            return PathBuf::from(dir);
-        }
-        std::env::var("PENSYVE_PATH")
-            .map_or_else(
-                |_| {
-                    dirs::home_dir()
-                        .unwrap_or_else(|| PathBuf::from("."))
-                        .join(".pensyve")
-                        .join("default")
-                },
-                PathBuf::from,
-            )
-            .join("snapshots")
+    /// Standard snapshot root for a server whose storage lives at
+    /// `storage_root`: `<storage_root>/snapshots`, overridable with
+    /// `PENSYVE_SNAPSHOT_DIR`.
+    ///
+    /// Callers pass their own resolved storage path rather than re-deriving one
+    /// here. The gateway and the stdio server do not share a default (the
+    /// gateway's is `~/.pensyve/gateway`), and guessing would put recovery
+    /// artifacts outside the storage root that backups and volume mounts
+    /// actually cover.
+    pub fn snapshot_root_for(storage_root: &Path) -> PathBuf {
+        std::env::var("PENSYVE_SNAPSHOT_DIR")
+            .map_or_else(|_| storage_root.join("snapshots"), PathBuf::from)
     }
 
     /// Resolve the reranker lazily (first call wins) and return a clone of

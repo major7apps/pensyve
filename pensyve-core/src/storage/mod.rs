@@ -42,10 +42,10 @@ fn scoped_delete_not_implemented() -> StorageResult<bool> {
     ))
 }
 
-fn entity_delete_scope_not_implemented() -> StorageResult<Vec<Memory>> {
+fn capturing_delete_not_implemented() -> StorageResult<Vec<Memory>> {
     Err(StorageError::Context(
-        "storage backend does not implement entity delete-scope enumeration, \
-         so an entity-wide delete cannot be snapshotted first"
+        "storage backend does not implement capturing entity deletion, \
+         so an entity-wide delete cannot be snapshotted atomically"
             .to_string(),
     ))
 }
@@ -333,25 +333,31 @@ pub trait StorageTrait: Send + Sync {
     // Deletion
     fn delete_memories_by_entity(&self, entity_id: Uuid) -> StorageResult<usize>;
 
-    /// Enumerate every memory row that [`StorageTrait::delete_memories_by_entity`]
-    /// would destroy for `entity_id` — the pre-delete snapshot scope (#246).
+    /// Same deletion as [`StorageTrait::delete_memories_by_entity`], but the
+    /// deleted rows are handed to `persist` **before the delete commits** so
+    /// entity-wide forget is recoverable (#246).
     ///
-    /// The two must stay predicate-for-predicate identical: episodic rows whose
-    /// `about_entity` **or** `source_entity` matches, semantic rows whose
-    /// `subject` **or** `object_entity` matches, superseded rows included, and
-    /// no namespace filter (the delete has none either). A snapshot that omits
-    /// rows the delete destroys is worse than no snapshot, because it looks
-    /// complete — `pensyve-core/tests/forget_snapshot_scope.rs` fails the build
-    /// if the two ever drift apart.
+    /// The rows passed to `persist` are captured with `DELETE ... RETURNING`,
+    /// so they *are* the rows the statement removed rather than the rows a
+    /// preceding `SELECT` predicted it would remove. That distinction is the
+    /// whole point: a snapshot taken by a separate query leaves a window in
+    /// which a concurrent writer can insert a matching row, which the delete
+    /// then destroys without it ever appearing in the snapshot — the exact
+    /// unrecoverable case this feature exists to prevent.
     ///
-    /// The default fails closed rather than returning a partial set: a backend
-    /// that cannot enumerate the scope must not have its entity-wide delete
-    /// treated as recoverable.
-    fn list_memories_by_entity_including_superseded(
+    /// Implementations must:
+    /// - run the delete and the `persist` callback inside one transaction;
+    /// - roll back, deleting nothing, if `persist` returns `Err` (fail closed);
+    /// - call `persist` exactly once, even when nothing matched.
+    ///
+    /// The default fails closed: a backend that cannot capture atomically must
+    /// not have its entity-wide delete treated as recoverable.
+    fn delete_memories_by_entity_capturing(
         &self,
         _entity_id: Uuid,
+        _persist: &mut dyn FnMut(&[Memory]) -> StorageResult<()>,
     ) -> StorageResult<Vec<Memory>> {
-        entity_delete_scope_not_implemented()
+        capturing_delete_not_implemented()
     }
 
     /// Delete a single memory by its UUID (episodic, semantic, or procedural).
