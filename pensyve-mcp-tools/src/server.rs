@@ -937,13 +937,6 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use pensyve_core::config::PensyveConfig;
-    use pensyve_core::embedding::OnnxEmbedder;
-    use pensyve_core::storage::sqlite::SqliteBackend;
-    use pensyve_core::types::Namespace;
-    use pensyve_core::vector::VectorIndex;
-    use tokio::sync::RwLock;
-
     /// A server backed by a temp database, holding one entity ("subject") with
     /// two memories: one where it is the `about_entity` of an episodic turn,
     /// and one where it is only the `object_entity` of somebody else's fact.
@@ -993,9 +986,9 @@ mod tests {
             embedder: Arc::new(embedder),
             vector_index: RwLock::new(VectorIndex::new(dimensions, 16)),
             namespace,
-            retrieval_config: PensyveConfig::default().retrieval,
+            retrieval_config: test_retrieval_config(),
             is_remote: false,
-            reranker_cell: Arc::new(std::sync::OnceLock::new()),
+            reranker_cell: Arc::new(OnceLock::new()),
             snapshot_dir,
         });
 
@@ -1195,6 +1188,7 @@ mod tests {
                 retrieval_config: test_retrieval_config(),
                 is_remote: true,
                 reranker_cell: reranker_cell.clone(),
+                snapshot_dir: dir.path().join("snapshots"),
             })));
         }
         let victim = servers.pop().expect("victim server");
