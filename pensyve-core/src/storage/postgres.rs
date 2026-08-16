@@ -2075,6 +2075,11 @@ fn row_to_observation(row: ObservationRow) -> ObservationMemory {
     }
 }
 
+/// Live-Postgres coverage (namespace scoping and RLS). Skips itself when
+/// `PENSYVE_TEST_DATABASE_URL` is unset; see the module docs.
+#[cfg(test)]
+mod live_rls;
+
 #[cfg(test)]
 mod tests {
     use super::*;
