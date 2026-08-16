@@ -222,8 +222,12 @@ impl ConsolidationEngine {
         _policy: &NetworkPolicy,
         cancel: &CancellationToken,
     ) -> Result<usize, ConsolidationError> {
-        // Fetch all memories for this namespace to identify episodic ones.
-        let all_memories = storage.get_all_memories_by_namespace(namespace_id)?;
+        // Fetch all memories for this namespace, superseded history included.
+        // The guard below needs the history: a superseded promotion is a fact
+        // the operator corrected, and re-deriving it from unchanged episodic
+        // evidence would silently undo that correction.
+        let all_memories =
+            storage.get_all_memories_by_namespace_including_superseded(namespace_id)?;
 
         // Partition episodic memories, grouped by about_entity. In the same
         // sweep, record every promotion this namespace already holds so a
@@ -232,12 +236,15 @@ impl ConsolidationEngine {
         let mut already_promoted: HashSet<(Uuid, String)> = HashSet::new();
         for mem in all_memories {
             match mem {
-                Memory::Episodic(em) => {
+                // Superseded episodes are retired evidence and must not seed
+                // new clusters; only live rows feed the clustering pass.
+                Memory::Episodic(em) if em.superseded_by.is_none() => {
                     episodic_by_entity
                         .entry(em.about_entity)
                         .or_default()
                         .push(em);
                 }
+                // Both live and superseded promotions seed the guard.
                 Memory::Semantic(sm) if sm.predicate == "mentioned" => {
                     already_promoted.insert((sm.subject, sm.object));
                 }
