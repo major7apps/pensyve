@@ -3731,6 +3731,122 @@ mod tests {
         assert_eq!(fts_sem.len(), 0);
     }
 
+    /// Count the `memory_fts` rows carrying `memory_id`, regardless of
+    /// namespace. Used by the delete tests to look at the search index
+    /// directly: every read path joins back to the base table, so an orphaned
+    /// index row is invisible through `search_fts` and only visible here.
+    fn fts_rows_for(db: &SqliteBackend, memory_id: Uuid) -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT count(*) FROM memory_fts WHERE memory_id = ?1",
+            params![memory_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A semantic fact in which the forgotten entity is the *object* must have
+    /// its search-index entry removed along with its row.
+    ///
+    /// The row delete matches `subject = ?1 OR object_entity = ?1`, but the
+    /// FTS id collection only ever selected `WHERE subject = ?1`. Object-side
+    /// rows were therefore deleted from `semantic_memories` while their
+    /// `memory_fts` entry — which holds the fact's text — stayed behind. A user
+    /// who retracts a fact through `pensyve_forget` is told it is gone while a
+    /// copy of its content is still sitting in the index.
+    #[test]
+    fn test_delete_memories_by_entity_removes_object_side_fts_entry() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let subject_id = Uuid::new_v4();
+        let object_id = Uuid::new_v4();
+
+        let mut fact = SemanticMemory::new(
+            ns.id,
+            subject_id,
+            "reports to",
+            "orphaned index token",
+            0.9,
+        );
+        fact.object_entity = Some(object_id);
+        db.save_semantic(&fact).unwrap();
+
+        assert_eq!(
+            db.search_fts("orphaned index token", ns.id, 10)
+                .unwrap()
+                .len(),
+            1,
+            "precondition: the fact must be findable before the forget"
+        );
+
+        db.delete_memories_by_entity(object_id).unwrap();
+
+        assert!(
+            db.get_semantic(fact.id).unwrap().is_none(),
+            "the object-side row itself is deleted"
+        );
+        assert_eq!(
+            fts_rows_for(&db, fact.id),
+            0,
+            "the retracted fact's text is still in memory_fts"
+        );
+        assert_eq!(
+            db.search_fts("orphaned index token", ns.id, 10)
+                .unwrap()
+                .len(),
+            0,
+            "the retracted fact must not be findable"
+        );
+    }
+
+    /// Forgetting an entity must not strip another namespace's search-index
+    /// entry that happens to share a memory id.
+    ///
+    /// `memory_fts` is keyed by `memory_id`, which is not unique across
+    /// namespaces — the same reason
+    /// `test_delete_memory_by_id_in_namespace_preserves_foreign_fts_entry`
+    /// exists. The entity-wide delete issued an unqualified
+    /// `DELETE FROM memory_fts WHERE memory_id = ?1`, so a colliding id took
+    /// the other tenant's row out of the index while leaving its base row in
+    /// place: findable content silently stops being findable.
+    #[test]
+    fn test_delete_memories_by_entity_preserves_foreign_fts_entry() {
+        let (_dir, db) = setup();
+        let owner_ns = make_namespace(&db);
+        let foreign_ns = Namespace::new("other");
+        db.save_namespace(&foreign_ns).unwrap();
+        let shared_id = Uuid::new_v4();
+        let entity_id = Uuid::new_v4();
+
+        let mut owner_memory =
+            SemanticMemory::new(owner_ns.id, entity_id, "owns", "local token", 0.9);
+        owner_memory.id = shared_id;
+        db.save_semantic(&owner_memory).unwrap();
+
+        // Different entity ids, so only the FTS cleanup can reach this row.
+        let mut foreign_memory = EpisodicMemory::new(
+            foreign_ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "foreign unique token",
+        );
+        foreign_memory.id = shared_id;
+        db.save_episodic(&foreign_memory).unwrap();
+
+        db.delete_memories_by_entity(entity_id).unwrap();
+
+        let hits = db
+            .search_fts("foreign unique token", foreign_ns.id, 10)
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the other namespace's memory must still be findable"
+        );
+        assert_eq!(hits[0].id(), shared_id);
+    }
+
     // -----------------------------------------------------------------------
     // Bulk retrieval
     // -----------------------------------------------------------------------
