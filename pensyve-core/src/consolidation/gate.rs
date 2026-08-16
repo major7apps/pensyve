@@ -109,11 +109,32 @@ fn lock_registry() -> MutexGuard<'static, HashMap<Uuid, bool>> {
 /// Removing again there would evict *that* owner and let a third run start
 /// alongside it, which is the concurrency #226 exists to prevent. `dispatch`
 /// disarms the lease on that path.
-struct Lease(Uuid);
+struct Lease {
+    namespace_id: Uuid,
+    armed: bool,
+}
+
+impl Lease {
+    fn new(namespace_id: Uuid) -> Self {
+        Self {
+            namespace_id,
+            armed: true,
+        }
+    }
+
+    /// Give up responsibility for releasing the namespace, because something
+    /// else already has under the registry lock. See the type docs for why
+    /// releasing twice is not harmless.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        lock_registry().remove(&self.0);
+        if self.armed {
+            lock_registry().remove(&self.namespace_id);
+        }
     }
 }
 
@@ -183,7 +204,7 @@ pub fn dispatch<T>(
     if !claim(namespace_id) {
         return Dispatch::Coalesced;
     }
-    let lease = Lease(namespace_id);
+    let mut lease = Lease::new(namespace_id);
 
     let mut out = f();
     while should_rerun(&out) {
@@ -192,8 +213,8 @@ pub fn dispatch<T>(
             // lock. That lock is dropped before `lease` would run, so a fresh
             // owner may hold this namespace by then — disarm, or we would
             // evict it and let a third run start alongside it (#226).
+            lease.disarm();
             reclaim_in_release_window(namespace_id);
-            std::mem::forget(lease);
             return Dispatch::Ran(out);
         }
         out = f();
