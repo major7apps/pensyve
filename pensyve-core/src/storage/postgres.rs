@@ -1791,6 +1791,62 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    /// Set-based purge, mirroring `SQLite`'s override rather than the trait
+    /// default.
+    ///
+    /// The default lists the namespace's memories and deletes them one id at a
+    /// time. Two things are wrong with that here. It is O(n) round trips for
+    /// what four statements express. And it is incomplete: it iterates
+    /// [`Self::get_all_memories_by_namespace`], which filters `superseded_by IS
+    /// NULL`, so a superseded row is neither deleted nor counted — a purge that
+    /// leaves tenant data behind and returns a total saying it did not.
+    ///
+    /// The count is every row removed from the four memory tables, superseded
+    /// rows included, which is exactly what `SQLite`'s `rows_affected` sum
+    /// reports. `purge_namespace_counts_superseded_rows_like_sqlite` pins that
+    /// equality.
+    ///
+    /// # What does not appear here, and why
+    ///
+    /// `SQLite`'s override also cascades the knowledge graph (`kg_triples`,
+    /// `kg_entities`, `kg_passage_entities`) and clears `memory_fts`. Neither
+    /// has an analogue in `postgres_schema.sql`: the KG tables are not part of
+    /// the Postgres schema at all, and full-text search is a generated
+    /// `tsvector` column on each memory table, so deleting the row takes its
+    /// index entry with it. `edges` is untouched on both backends — it carries
+    /// no `namespace_id`, so a namespace-scoped delete is not expressible
+    /// against it.
+    ///
+    /// Every statement names `namespace_id = $1` explicitly even though all
+    /// four run on a namespace-bound connection. That is the #254 convention:
+    /// the predicate is what confines the purge in a deployment as shipped
+    /// (the backend connects as the schema owner, so the policies are inert),
+    /// and RLS backs it up once an operator enforces it.
+    fn purge_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            let mut total = 0usize;
+
+            for sql in [
+                "DELETE FROM episodic_memories WHERE namespace_id = $1",
+                "DELETE FROM semantic_memories WHERE namespace_id = $1",
+                "DELETE FROM procedural_memories WHERE namespace_id = $1",
+                "DELETE FROM observation_memories WHERE namespace_id = $1",
+            ] {
+                let result = query::<Postgres>(sql)
+                    .bind(namespace_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(sqlx_to_io)?;
+                total += result.rows_affected() as usize;
+            }
+
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            Ok(total)
+        })
+    }
+
     fn update_semantic_content(
         &self,
         id: Uuid,
