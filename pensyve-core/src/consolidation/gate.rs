@@ -15,6 +15,15 @@
 //! coordinate, [`ConsolidationEngine::run`] dispatches through here, so the
 //! guarantee cannot be bypassed — including by call sites added later.
 //!
+//! That holds outside this crate only because the module is `pub(crate)`. It
+//! was `pub` through #258, which let any dependent claim a namespace here and
+//! starve the engine, making a guarantee stated as unbypassable bypassable by
+//! anyone who was not a call site (#260). Closing it costs the intra-doc
+//! links `run`'s public docs used to point readers here — restricting the
+//! module at all costs them, `#[doc(hidden)]` included, since rustdoc
+//! generates no page for a hidden item either — so those references are now
+//! plain code spans.
+//!
 //! [`ConsolidationEngine::run`]: super::ConsolidationEngine::run
 //!
 //! ## Coalescing, not queueing

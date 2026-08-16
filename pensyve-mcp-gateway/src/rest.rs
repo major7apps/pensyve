@@ -2040,7 +2040,25 @@ async fn episode_end(
                         }),
                     );
                 }
-                Err(e) => tracing::warn!("Post-episode consolidation failed: {e}"),
+                Err(e) => {
+                    // #260: a failed run may follow runs of the same call that
+                    // already committed. Record what they wrote rather than
+                    // lose it.
+                    if let Some(committed) = e.committed() {
+                        let _ = storage.log_activity(
+                            ns_id,
+                            "consolidate",
+                            &serde_json::json!({
+                                "promoted": committed.promoted,
+                                "decayed": committed.decayed,
+                                "archived": committed.archived,
+                                "trigger": "episode_end",
+                                "partial": true,
+                            }),
+                        );
+                    }
+                    tracing::warn!("Post-episode consolidation failed: {e}");
+                }
             }
         });
     }
@@ -2129,13 +2147,32 @@ async fn consolidate(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Consolidation task failed: {e}"),
         )
-    })?
-    .map_err(|e| {
-        RestError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Consolidation error: {e}"),
-        )
     })?;
+
+    let consolidation_result = match consolidation_result {
+        Ok(consolidated) => consolidated,
+        Err(e) => {
+            // #260: a failed run may follow runs of the same call that already
+            // committed. The request fails either way, but the activity record
+            // must not lose what was written.
+            if let Some(committed) = e.committed() {
+                let _ = ps.storage.log_activity(
+                    ps.namespace.id,
+                    "consolidate",
+                    &json!({
+                        "promoted": committed.promoted,
+                        "decayed": committed.decayed,
+                        "archived": committed.archived,
+                        "partial": true,
+                    }),
+                );
+            }
+            return Err(RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Consolidation error: {e}"),
+            ));
+        }
+    };
 
     let _ = ps.storage.log_activity(
         ps.namespace.id,
@@ -2151,6 +2188,9 @@ async fn consolidate(
         "promoted": consolidation_result.promoted,
         "decayed": consolidation_result.decayed,
         "archived": consolidation_result.archived,
+        // #260: zeroed counts alone cannot tell a request that coalesced into
+        // a run already in flight from one that ran and found nothing to do.
+        "coalesced": consolidation_result.coalesced,
     })))
 }
 
