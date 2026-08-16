@@ -322,6 +322,28 @@ pub trait StorageTrait: Send + Sync {
         self.get_all_memories_by_namespace(namespace_id)
     }
 
+    /// Fetch exactly the rows [`StorageTrait::delete_memories_by_entity`]
+    /// would delete for `(entity_id, namespace_id)`: episodic rows matching
+    /// `about_entity OR source_entity`, semantic rows matching
+    /// `subject OR object_entity`, superseded rows included, confined to
+    /// `namespace_id`.
+    ///
+    /// This exists so callers can collect the ids to strip from a vector index
+    /// before an entity-wide forget (#261). `list_episodic_by_entity` and
+    /// `list_semantic_by_entity` are not a substitute: they look at
+    /// `about_entity` and `subject` alone and skip superseded rows, so every
+    /// source-side episodic, object-side semantic and superseded row kept its
+    /// index entry after its base row was gone.
+    ///
+    /// Implementations must mirror the delete's predicates verbatim — the
+    /// namespace one included. Entity ids are not globally unique in this
+    /// schema, so an entity-only predicate reaches into other tenants.
+    fn list_memories_by_entity_including_superseded(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Vec<Memory>>;
+
     /// Mark a live memory as superseded. Returns `false` when no live row matched.
     fn supersede_memory(
         &self,

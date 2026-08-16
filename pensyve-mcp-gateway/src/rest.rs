@@ -2227,14 +2227,17 @@ async fn gdpr_erase(
         }
     };
 
-    // Collect memory IDs before deletion so we can remove them from vector index.
-    let mut memory_ids: Vec<Uuid> = Vec::new();
-    if let Ok(mems) = ps.storage.list_episodic_by_entity(entity.id, usize::MAX) {
-        memory_ids.extend(mems.iter().map(|m| m.id));
-    }
-    if let Ok(mems) = ps.storage.list_semantic_by_entity(entity.id, usize::MAX) {
-        memory_ids.extend(mems.iter().map(|m| m.id));
-    }
+    // Collect memory IDs before deletion so we can remove them from vector
+    // index. The accessor mirrors the erasure's own delete predicates
+    // (`about_entity OR source_entity`, `subject OR object_entity`, superseded
+    // rows included) — the per-type `list_*_by_entity` calls that used to stand
+    // in here saw only the about-side, the subject-side and live rows, so every
+    // other deleted row kept its index entry (#261).
+    let memory_ids: Vec<Uuid> = ps
+        .storage
+        .list_memories_by_entity_including_superseded(entity.id, ps.namespace.id)
+        .map(|mems| mems.iter().map(pensyve_core::types::Memory::id).collect())
+        .unwrap_or_default();
 
     let result = pensyve_core::gdpr::erase_entity(ps.storage.as_ref(), entity.id, ps.namespace.id)
         .map_err(|e| {
