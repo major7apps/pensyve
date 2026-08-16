@@ -22,6 +22,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
+use pensyve_core::reranker::Reranker;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::Namespace;
@@ -74,22 +75,7 @@ fn gateway_config(dir: &TempDir) -> GatewayConfig {
     }
 }
 
-/// Prevents the lazily-resolved reranker from attempting a real network
-/// model download when a recall assertion runs.
-#[allow(
-    unsafe_code,
-    reason = "test-only env-var guard; std::env::set_var is unsafe in Rust 2024 edition by language design but is safe here because it runs exactly once via std::sync::Once before any reader"
-)]
-fn disable_reranker_for_tests() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        // SAFETY: runs exactly once via `Once`, before any concurrent reader.
-        unsafe { std::env::set_var("PENSYVE_RERANKER", "0") };
-    });
-}
-
 fn app_state(dir: &TempDir) -> Arc<AppState> {
-    disable_reranker_for_tests();
     let storage =
         Arc::new(SqliteBackend::open(dir.path()).expect("open storage")) as Arc<dyn StorageTrait>;
     let namespace = Namespace::new("default");
@@ -104,6 +90,24 @@ fn app_state(dir: &TempDir) -> Arc<AppState> {
         namespace,
         VectorIndex::new(768, 1024),
     );
+
+    // Resolve the shared reranker cell up front with a mock, so nothing in
+    // this binary can trigger the real ~280MB model download. Every tenant
+    // state built by this manager clones the same `OnceLock`, so seeding it
+    // through the default state covers tenants created later too.
+    //
+    // This replaces a `PENSYVE_RERANKER=0` env mutation: `set_var` is process
+    // global, and serialising the write behind a `Once` does nothing about
+    // concurrent readers on other test threads.
+    assert!(
+        tenant_mgr
+            .default_state()
+            .reranker_cell
+            .set(Some(Arc::new(Reranker::new_mock())))
+            .is_ok(),
+        "reranker cell was already resolved before the test could seed it"
+    );
+
     let config = gateway_config(dir);
 
     Arc::new(AppState {
@@ -226,6 +230,32 @@ fn stored_episode(
         .get_episode_in_namespace(episode_id, ps.namespace.id)
         .expect("episode lookup")
         .expect("episode exists")
+}
+
+// ---------------------------------------------------------------------------
+// Harness invariant
+// ---------------------------------------------------------------------------
+
+/// The seeding in `app_state` only works because `TenantStateManager` clones
+/// one `OnceLock` into the default state and every tenant it later builds. If
+/// that ever stops holding, seeding silently covers nothing and the first test
+/// to reach a recall path attempts a real model download instead. `get()` does
+/// not initialise, so this observes the cell without resolving it.
+#[tokio::test]
+async fn tenant_states_share_the_seeded_reranker_cell() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = app_state(&dir);
+
+    for tenant in [TENANT_A, TENANT_B] {
+        let ps = state
+            .tenant_mgr
+            .get_tenant_state(tenant)
+            .expect("tenant state");
+        assert!(
+            ps.reranker_cell.get().is_some(),
+            "tenant {tenant} did not inherit the seeded reranker cell"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

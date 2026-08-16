@@ -949,6 +949,7 @@ mod tests {
 
     use pensyve_core::config::RetrievalConfig;
     use pensyve_core::embedding::OnnxEmbedder;
+    use pensyve_core::reranker::Reranker;
     use pensyve_core::storage::sqlite::SqliteBackend;
     use pensyve_core::types::{Episode, Namespace};
     use pensyve_core::vector::VectorIndex;
@@ -975,7 +976,18 @@ mod tests {
         let storage = Arc::new(SqliteBackend::open(dir.path()).expect("open storage"))
             as Arc<dyn StorageTrait>;
         let embedder = Arc::new(OnnxEmbedder::new_mock(768));
+
+        // Seed the shared reranker cell with a mock so no test in this binary
+        // can fall through to the real model download. Seeding the cell is the
+        // thread-safe alternative to setting `PENSYVE_RERANKER=0`, which is a
+        // process-global mutation racing every concurrent reader.
         let reranker_cell = Arc::new(OnceLock::new());
+        assert!(
+            reranker_cell
+                .set(Some(Arc::new(Reranker::new_mock())))
+                .is_ok(),
+            "freshly constructed reranker cell must be unset"
+        );
 
         let mut servers = Vec::new();
         for name in ["tenant-attacker", "tenant-victim"] {
