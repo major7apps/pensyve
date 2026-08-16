@@ -70,15 +70,29 @@ const TEST_DATABASE_URL_ENV: &str = "PENSYVE_TEST_DATABASE_URL";
 /// Password for the throwaway per-run application role.
 const APP_ROLE_PASSWORD: &str = "pensyve_rls_fixture";
 
-/// Tables carrying a `namespace_isolation_*` policy in `postgres_schema.sql`.
-const RLS_TABLES: &[&str] = &[
-    "entities",
-    "episodes",
-    "episodic_memories",
-    "semantic_memories",
-    "procedural_memories",
-    "observation_memories",
+/// Every `(table, policy)` pair `postgres_schema.sql` is expected to declare.
+///
+/// The policy names do not mechanically follow the table names, so they are
+/// spelled out rather than derived: a rename on either side has to be made
+/// deliberately here.
+const RLS_POLICIES: &[(&str, &str)] = &[
+    ("entities", "namespace_isolation_entities"),
+    ("episodes", "namespace_isolation_episodes"),
+    ("episodic_memories", "namespace_isolation_episodic"),
+    ("semantic_memories", "namespace_isolation_semantic"),
+    ("procedural_memories", "namespace_isolation_procedural"),
+    ("observation_memories", "namespace_isolation_observation"),
 ];
+
+/// How Postgres renders the expected `USING` clause back out of `pg_policies`.
+///
+/// The server normalises the schema's
+/// `namespace_id::text = current_setting('pensyve.namespace_id', true)` into
+/// this exact string, so an equality check is both precise and stable. It
+/// fails on a policy that was widened (`USING (true)`), pointed at a different
+/// GUC, or switched to a different column.
+const EXPECTED_POLICY_QUAL: &str =
+    "((namespace_id)::text = current_setting('pensyve.namespace_id'::text, true))";
 
 fn admin_connect_options() -> Option<PgConnectOptions> {
     let url = std::env::var(TEST_DATABASE_URL_ENV).ok()?;
@@ -213,7 +227,7 @@ impl Fixture {
             admin_connect_options().expect("admin options present during provisioning");
         with_admin_pool(&self.rt, &admin_opts, &self.database, |rt, pool| {
             rt.block_on(async {
-                for table in RLS_TABLES {
+                for (table, _) in RLS_POLICIES {
                     exec(
                         pool,
                         format!("ALTER TABLE {table} FORCE ROW LEVEL SECURITY"),
@@ -467,22 +481,90 @@ fn scoped_conn_guc_is_discarded_before_the_next_statement() {
     );
 }
 
-/// Keeps [`RLS_TABLES`] — the list the fixture forces RLS on — in sync with
-/// `postgres_schema.sql`. Runs without a database.
+/// Every table in [`RLS_POLICIES`] must carry exactly one policy, named as
+/// expected and qualified by the namespace GUC, as Postgres actually
+/// registered it.
+///
+/// [`rls_policies_isolate_namespaces_when_the_guc_is_set`] proves the
+/// behaviour on one table; proving it on all six by writing and reading rows
+/// per table would be six times the fixture for the same information. Reading
+/// `pg_policies` instead covers the whole set directly, and catches what a
+/// behavioural test on one table cannot: a policy dropped from another table,
+/// widened to `USING (true)`, or joined by a second permissive policy that
+/// ORs the isolation away.
 #[test]
-fn schema_enables_rls_on_every_fixture_table() {
+fn every_rls_table_has_exactly_one_namespace_policy() {
+    let Some(admin_opts) = skip_notice("every_rls_table_has_exactly_one_namespace_policy") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+
+    let registered: Vec<(String, String, String, String, Option<String>)> =
+        fixture.rt.block_on(async {
+            query_as::<Postgres, _>(
+                "SELECT tablename, policyname, permissive, cmd, qual
+                   FROM pg_policies
+                  WHERE schemaname = 'public'
+                  ORDER BY tablename, policyname",
+            )
+            .fetch_all(fixture.backend.pool())
+            .await
+            .expect("read pg_policies")
+        });
+
+    for (table, policy) in RLS_POLICIES {
+        let on_table: Vec<_> = registered.iter().filter(|row| row.0 == *table).collect();
+        assert_eq!(
+            on_table.len(),
+            1,
+            "{table} should carry exactly one policy; a second permissive policy would OR the \
+             namespace isolation away. Found: {:?}",
+            on_table
+                .iter()
+                .map(|row| (&row.1, &row.4))
+                .collect::<Vec<_>>()
+        );
+
+        let (_, policyname, permissive, cmd, qual) = on_table[0];
+        assert_eq!(policyname, policy, "unexpected policy name on {table}");
+        assert_eq!(
+            permissive, "PERMISSIVE",
+            "{policy} on {table} changed permissiveness"
+        );
+        assert_eq!(
+            cmd, "ALL",
+            "{policy} on {table} no longer covers all commands"
+        );
+        assert_eq!(
+            qual.as_deref(),
+            Some(EXPECTED_POLICY_QUAL),
+            "{policy} on {table} no longer isolates by namespace_id via the \
+             pensyve.namespace_id GUC"
+        );
+    }
+}
+
+/// Keeps [`RLS_POLICIES`] in sync with `postgres_schema.sql` without needing a
+/// database, so a schema edit that drops RLS is caught even on a checkout with
+/// `PENSYVE_TEST_DATABASE_URL` unset.
+#[test]
+fn schema_declares_rls_for_every_expected_table() {
     let normalized = super::SCHEMA
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    for table in RLS_TABLES {
+    for (table, policy) in RLS_POLICIES {
         assert!(
             normalized.contains(&format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;")),
             "postgres_schema.sql no longer enables RLS on {table}"
         );
+        assert!(
+            normalized.contains(&format!(
+                "CREATE POLICY {policy} ON {table} USING (namespace_id::text = \
+                 current_setting('pensyve.namespace_id', true));"
+            )),
+            "postgres_schema.sql no longer declares {policy} on {table} with the expected \
+             namespace_id predicate"
+        );
     }
-    assert!(
-        normalized.contains("current_setting('pensyve.namespace_id', true)"),
-        "namespace isolation policies must read the pensyve.namespace_id GUC"
-    );
 }
