@@ -50,10 +50,25 @@ layers:
 per namespaced table. Each policy matches `namespace_id` against the
 `pensyve.namespace_id` setting, on both the read half (`USING`) and the write
 half (`WITH CHECK`), so a connection scoped to one namespace can neither read
-nor write another's rows. The backend binds that setting on every connection it
-takes from the pool. A connection that is not scoped to a namespace is bound to
-a value no row can match, so it fails closed rather than inheriting the
-previous caller's namespace.
+nor write another's rows.
+
+The backend binds that setting on every connection its own storage methods take
+from the pool. A storage method that carries no namespace binds the empty
+string instead, which no UUID can match, so those paths fail closed rather than
+inheriting the previous caller's namespace.
+
+The guarantee stops at the backend's own storage methods. A few call sites
+deliberately take a connection with nothing bound, reached through
+`ScopedPool::unbound`, and one of them is the public `PostgresBackend::pool`
+accessor. A connection from there carries whatever namespace the previous
+checkout left set, because the setting is session-scoped and Postgres does not
+clear it. Anything querying a table that carries a `namespace_isolation_*`
+policy through such a connection must bind a namespace first, with
+`PostgresBackend::set_namespace_config`, or bind the empty string to fail
+closed on purpose. Without that, a query reads the previous caller's namespace
+once RLS is enforced, which is a cross-namespace read rather than an empty
+result. The internal uses are limited to DDL, which RLS does not apply to, and
+to `namespaces`, `edges`, and `activity_events`, none of which carry a policy.
 
 Layer 2 is not active by default. Postgres exempts a table's owner from its own
 policies, and the application connects as the role that owns the schema, so the
@@ -78,10 +93,50 @@ Do not apply enforcement to a deployment until those paths carry a namespace.
 
 #### Applying enforcement
 
-Apply `pensyve-core/src/storage/postgres_rls_enforce.sql`, or call
+First check that the application's role is not a superuser. Postgres exempts
+superusers from row-level security unconditionally, and `FORCE` does not change
+that, so enforcement applied to a superuser connection silently does nothing.
+The enforce script will still report success, which makes this easy to get
+wrong. Check with the query below, and expect `f`:
+
+```sql
+SELECT rolsuper FROM pg_roles WHERE rolname = current_user;
+```
+
+If it returns `t`, enforcement cannot work on that connection. Move the
+application to an ordinary role that owns the tables before going further.
+
+Then apply `pensyve-core/src/storage/postgres_rls_enforce.sql`, or call
 `PostgresBackend::enforce_rls`. Both run the same statements. The connecting
 role must own the tables, and the application already connects as the owner, so
 no new role is needed.
+
+Then verify enforcement actually took effect, because a successful run does not
+prove it. Every row below should report `t`:
+
+```sql
+SELECT relname, relrowsecurity, relforcerowsecurity
+  FROM pg_class
+ WHERE relname IN ('entities', 'episodes', 'episodic_memories',
+                   'semantic_memories', 'procedural_memories',
+                   'observation_memories');
+```
+
+All `t` proves the tables are forced. It does not prove the policies apply to
+the role the application connects as, and the difference matters. A superuser
+gets `t` on every row above and still reads every namespace, which is exactly
+how a broken deployment looks like a working one. The only check that settles
+it is behavioural. Run this as the application role against a database that
+holds data, using a namespace id that owns no rows:
+
+```sql
+SELECT set_config('pensyve.namespace_id', '00000000-0000-0000-0000-000000000000', false);
+SELECT count(*) FROM episodic_memories;
+```
+
+A count of 0 means the policies apply to this role. Anything above 0 means they
+do not, whatever the catalog says, and the usual cause is connecting as a
+superuser or as a role holding `BYPASSRLS`.
 
 To roll back, run `ALTER TABLE <table> NO FORCE ROW LEVEL SECURITY;` for each
 table. Rollback takes effect immediately and touches neither the policies nor
