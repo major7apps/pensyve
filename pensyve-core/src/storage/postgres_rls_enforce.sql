@@ -30,7 +30,7 @@
 -- for each table below. This is instant and restores the previous behaviour,
 -- because the policies and the data are untouched.
 --
--- Both statements are idempotent: re-running them is a no-op.
+-- Every statement below is idempotent, so re-running this file is a no-op.
 
 ALTER TABLE entities             FORCE ROW LEVEL SECURITY;
 ALTER TABLE episodes             FORCE ROW LEVEL SECURITY;
