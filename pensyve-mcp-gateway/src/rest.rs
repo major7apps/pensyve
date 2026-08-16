@@ -980,7 +980,11 @@ async fn recall_grouped(
         // REST, MCP, and SDK callers all see the same response shape — the
         // 89.2% benchmark number is reproducible only when observations are
         // surfaced here.
-        pensyve_core::recall_grouped::attach_observations_to_groups(ps.storage.as_ref(), groups)
+        pensyve_core::recall_grouped::attach_observations_to_groups(
+            ps.storage.as_ref(),
+            ps.namespace.id,
+            groups,
+        )
     };
 
     let _ = ps.storage.log_activity(
@@ -1190,12 +1194,19 @@ async fn delete_memory(
     let memory_id = Uuid::parse_str(&id)
         .map_err(|_| RestError(StatusCode::BAD_REQUEST, "Invalid memory ID".to_string()))?;
 
-    let deleted = ps.storage.delete_memory_by_id(memory_id).map_err(|err| {
-        RestError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Error deleting memory: {err}"),
-        )
-    })?;
+    // Scoped to the caller's namespace: `memory_id` comes straight off the
+    // request path, and one storage backend is shared by every tenant, so an
+    // unscoped delete would reach another tenant's row. A miss and a foreign
+    // row are both reported as 404 so the response is not an existence oracle.
+    let deleted = ps
+        .storage
+        .delete_memory_by_id_in_namespace(memory_id, ps.namespace.id)
+        .map_err(|err| {
+            RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Error deleting memory: {err}"),
+            )
+        })?;
 
     if !deleted {
         return Err(RestError(
@@ -1514,8 +1525,14 @@ async fn observe(
         )
     })?;
 
-    // Verify the episode exists.
-    match ps.storage.get_episode(episode_id) {
+    // Verify the episode exists *in the caller's namespace*. An episode owned
+    // by another tenant reports the same not-found as a missing one: attaching
+    // to a foreign episode would let this namespace's recall groups join
+    // against the owner's per-episode rows.
+    match ps
+        .storage
+        .get_episode_in_namespace(episode_id, ps.namespace.id)
+    {
         Ok(Some(_)) => {}
         Ok(None) => {
             return Err(RestError(
@@ -1799,8 +1816,11 @@ async fn episode_message(
         )
     })?;
 
-    // Verify the episode exists.
-    match ps.storage.get_episode(episode_id) {
+    // Verify the episode exists *in the caller's namespace* — see `observe`.
+    match ps
+        .storage
+        .get_episode_in_namespace(episode_id, ps.namespace.id)
+    {
         Ok(Some(_)) => {}
         Ok(None) => {
             return Err(RestError(
@@ -1896,7 +1916,13 @@ async fn episode_end(
         }
     };
 
-    let mut episode = match ps.storage.get_episode(episode_id) {
+    // Scoped load: `update_episode` writes back on `episode.namespace_id`, so
+    // an unscoped read here would let this caller stamp `ended_at`/`outcome`
+    // onto another tenant's episode.
+    let mut episode = match ps
+        .storage
+        .get_episode_in_namespace(episode_id, ps.namespace.id)
+    {
         Ok(Some(ep)) => ep,
         Ok(None) => {
             return Err(RestError(

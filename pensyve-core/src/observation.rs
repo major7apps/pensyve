@@ -4129,7 +4129,9 @@ mod tests {
         assert_eq!(persisted, 2);
 
         // Verify the observations landed with embeddings attached.
-        let stored = db.list_observations_by_episode_ids(&[ep], 100).unwrap();
+        let stored = db
+            .list_observations_by_episode_ids(ns.id, &[ep], 100)
+            .unwrap();
         assert_eq!(stored.len(), 2);
         for obs in &stored {
             assert_eq!(obs.namespace_id, ns.id);
@@ -4181,7 +4183,9 @@ mod tests {
         .await;
         assert_eq!(persisted, 0);
 
-        let stored = db.list_observations_by_episode_ids(&[ep], 100).unwrap();
+        let stored = db
+            .list_observations_by_episode_ids(ns.id, &[ep], 100)
+            .unwrap();
         assert!(stored.is_empty());
     }
 
@@ -4464,11 +4468,15 @@ mod tests {
         assert_eq!(persisted, 2);
 
         // Episode A got the AC Odyssey observation; B got sourdough.
-        let stored_a = db.list_observations_by_episode_ids(&[ep_a], 100).unwrap();
+        let stored_a = db
+            .list_observations_by_episode_ids(ns.id, &[ep_a], 100)
+            .unwrap();
         assert_eq!(stored_a.len(), 1);
         assert_eq!(stored_a[0].instance, "AC Odyssey");
 
-        let stored_b = db.list_observations_by_episode_ids(&[ep_b], 100).unwrap();
+        let stored_b = db
+            .list_observations_by_episode_ids(ns.id, &[ep_b], 100)
+            .unwrap();
         assert_eq!(stored_b.len(), 1);
         assert_eq!(stored_b[0].instance, "sourdough");
     }
@@ -4509,7 +4517,7 @@ mod tests {
         assert_eq!(persisted, 2);
         assert_eq!(extractor.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(
-            db.list_observations_by_episode_ids(&[ep_a, ep_b], 100)
+            db.list_observations_by_episode_ids(ns.id, &[ep_a, ep_b], 100)
                 .unwrap()
                 .len(),
             2
@@ -4535,7 +4543,7 @@ mod tests {
         assert_eq!(*extractor.batch_sizes.lock().unwrap(), [2, 2, 2, 1, 1]);
         for episode_id in [ep_a, ep_b] {
             let stored = db
-                .list_observations_by_episode_ids(&[episode_id], 100)
+                .list_observations_by_episode_ids(ns.id, &[episode_id], 100)
                 .unwrap();
             assert_eq!(stored.len(), 1);
             assert_eq!(stored[0].episode_id, episode_id);
@@ -4568,11 +4576,15 @@ mod tests {
             3
         );
 
-        let stored_a = db.list_observations_by_episode_ids(&[ep_a], 100).unwrap();
+        let stored_a = db
+            .list_observations_by_episode_ids(ns.id, &[ep_a], 100)
+            .unwrap();
         assert_eq!(stored_a.len(), 1);
         assert_eq!(stored_a[0].episode_id, ep_a);
 
-        let stored_b = db.list_observations_by_episode_ids(&[ep_b], 100).unwrap();
+        let stored_b = db
+            .list_observations_by_episode_ids(ns.id, &[ep_b], 100)
+            .unwrap();
         assert!(stored_b.is_empty());
     }
 
@@ -4630,7 +4642,7 @@ mod tests {
         assert_eq!(persisted, 0);
         assert_eq!(extractor.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
         assert!(
-            db.list_observations_by_episode_ids(&[ep_a, ep_b], 100)
+            db.list_observations_by_episode_ids(ns.id, &[ep_a, ep_b], 100)
                 .unwrap()
                 .is_empty()
         );
@@ -4667,8 +4679,12 @@ mod tests {
         assert_eq!(persisted, 0);
 
         // No observations landed for either episode.
-        let stored_a = db.list_observations_by_episode_ids(&[ep_a], 100).unwrap();
-        let stored_b = db.list_observations_by_episode_ids(&[ep_b], 100).unwrap();
+        let stored_a = db
+            .list_observations_by_episode_ids(ns.id, &[ep_a], 100)
+            .unwrap();
+        let stored_b = db
+            .list_observations_by_episode_ids(ns.id, &[ep_b], 100)
+            .unwrap();
         assert!(stored_a.is_empty());
         assert!(stored_b.is_empty());
     }
@@ -4697,7 +4713,9 @@ mod tests {
         .await;
         assert_eq!(persisted, 1);
 
-        let stored = db.list_observations_by_episode_ids(&[ep_a], 100).unwrap();
+        let stored = db
+            .list_observations_by_episode_ids(ns.id, &[ep_a], 100)
+            .unwrap();
         assert_eq!(stored.len(), 1);
     }
 }

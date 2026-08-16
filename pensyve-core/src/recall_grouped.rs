@@ -303,8 +303,14 @@ pub fn group_by_session(
 ///
 /// Returns the groups unchanged on storage error (observations are optional
 /// enrichment; a failed lookup should never break recall).
+///
+/// `namespace_id` is the caller's namespace and is mandatory: a group's
+/// `session_id` comes from an episodic memory's `episode_id`, which is a
+/// caller-supplied value rather than a tenant boundary, so the observation
+/// lookup must be constrained to the namespace doing the recall.
 pub fn attach_observations_to_groups(
     storage: &dyn crate::storage::StorageTrait,
+    namespace_id: Uuid,
     groups: Vec<SessionGroup>,
 ) -> Vec<SessionGroup> {
     // Collect unique episode IDs across all groups that carry one.
@@ -316,17 +322,18 @@ pub fn attach_observations_to_groups(
     // `limit` is set generously; at our expected 50-top-k workload the
     // per-group observation count is typically 2-5, so a few hundred is
     // well above ceiling. Future phase: configurable cap.
-    let observations = match storage.list_observations_by_episode_ids(&episode_ids, 1024) {
-        Ok(obs) => obs,
-        Err(e) => {
-            tracing::warn!(
-                target: "pensyve::observation",
-                error = %e,
-                "failed to load observations for session groups — returning groups unchanged"
-            );
-            return groups;
-        }
-    };
+    let observations =
+        match storage.list_observations_by_episode_ids(namespace_id, &episode_ids, 1024) {
+            Ok(obs) => obs,
+            Err(e) => {
+                tracing::warn!(
+                    target: "pensyve::observation",
+                    error = %e,
+                    "failed to load observations for session groups — returning groups unchanged"
+                );
+                return groups;
+            }
+        };
 
     if observations.is_empty() {
         return groups;
@@ -740,7 +747,7 @@ mod tests {
             scored(ep_at(ep, t(2026, 1, 2), "turn 2"), 0.8),
         ];
         let groups = group_by_session(candidates, OrderBy::Chronological, None);
-        let attached = attach_observations_to_groups(&db, groups);
+        let attached = attach_observations_to_groups(&db, ns.id, groups);
 
         assert_eq!(attached.len(), 1);
         let g = &attached[0];
@@ -778,7 +785,7 @@ mod tests {
             scored(ep_at(ep_b, t(2026, 1, 2), "b1"), 0.5),
         ];
         let groups = group_by_session(candidates, OrderBy::Chronological, None);
-        let attached = attach_observations_to_groups(&db, groups);
+        let attached = attach_observations_to_groups(&db, ns.id, groups);
 
         assert_eq!(attached.len(), 2);
         for g in &attached {
@@ -813,7 +820,7 @@ mod tests {
 
         let candidates = vec![scored(ep_at(topk_ep, t(2026, 1, 1), "x"), 0.5)];
         let groups = group_by_session(candidates, OrderBy::Chronological, None);
-        let attached = attach_observations_to_groups(&db, groups);
+        let attached = attach_observations_to_groups(&db, ns.id, groups);
 
         assert_eq!(attached.len(), 1);
         let leaked = attached[0].memories.iter().any(|m| match &m.memory {
@@ -834,7 +841,7 @@ mod tests {
 
         let candidates = vec![scored(ep_at(ep, t(2026, 1, 1), "x"), 0.5)];
         let groups = group_by_session(candidates, OrderBy::Chronological, None);
-        let attached = attach_observations_to_groups(&db, groups);
+        let attached = attach_observations_to_groups(&db, ns.id, groups);
 
         assert_eq!(attached.len(), 1);
         assert_eq!(attached[0].memories.len(), 1);
@@ -850,7 +857,7 @@ mod tests {
         let groups = group_by_session(candidates, OrderBy::Chronological, None);
         // Semantic memories don't have a session_id so the attach lookup
         // never runs for them.
-        let attached = attach_observations_to_groups(&db, groups);
+        let attached = attach_observations_to_groups(&db, ns.id, groups);
         assert_eq!(attached.len(), 1);
         assert_eq!(attached[0].session_id, None);
         assert_eq!(attached[0].memories.len(), 1);

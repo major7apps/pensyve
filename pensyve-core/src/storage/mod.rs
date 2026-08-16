@@ -74,7 +74,25 @@ pub trait StorageTrait: Send + Sync {
 
     // Episodes
     fn save_episode(&self, episode: &Episode) -> StorageResult<()>;
-    fn get_episode(&self, id: Uuid) -> StorageResult<Option<Episode>>;
+
+    /// Fetch an episode only when it belongs to `namespace_id`.
+    ///
+    /// There is deliberately no unscoped `get_episode`. One backend instance is
+    /// shared by every tenant of the gateway, so a lookup keyed on `id` alone
+    /// resolves across namespaces — and `Episode::namespace_id` then flows into
+    /// `update_episode`/`save_episode`, letting one tenant's write land on
+    /// another tenant's row. Requiring the namespace here makes that class of
+    /// mistake unrepresentable rather than relying on each caller to compare.
+    ///
+    /// Backends must implement this as a single `id AND namespace_id` query.
+    /// Callers should treat `Ok(None)` as "not found" without distinguishing
+    /// "owned by someone else", so the result is not an existence oracle.
+    fn get_episode_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<Episode>>;
+
     fn update_episode(&self, episode: &Episode) -> StorageResult<()>;
 
     // Episodic Memory
@@ -166,20 +184,32 @@ pub trait StorageTrait: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Fetch all observations attached to any of the given episode IDs,
-    /// bounded by `limit` (applied after fetch). Used by `recall_grouped` to
-    /// attach observations to top-k session groups.
+    /// Fetch all observations attached to any of the given episode IDs *within
+    /// `namespace_id`*, bounded by `limit` (applied after fetch). Used by
+    /// `recall_grouped` to attach observations to top-k session groups.
+    ///
+    /// `episode_id` is not a tenant boundary: an episodic memory in one
+    /// namespace may carry any UUID at all, so joining on `episode_id` alone
+    /// would surface another tenant's observation content. The namespace
+    /// predicate is therefore mandatory, not conditional on backend
+    /// configuration.
     fn list_observations_by_episode_ids(
         &self,
+        _namespace_id: Uuid,
         _episode_ids: &[Uuid],
         _limit: usize,
     ) -> StorageResult<Vec<ObservationMemory>> {
         Ok(Vec::new())
     }
 
-    /// Delete every observation tied to the given episode. Returns the row count.
-    /// Called as part of episode cascade-delete paths.
-    fn delete_observations_by_episode(&self, _episode_id: Uuid) -> StorageResult<usize> {
+    /// Delete every observation tied to the given episode *within
+    /// `namespace_id`*. Returns the row count. Called as part of episode
+    /// cascade-delete paths, whose `episode_id` is caller-supplied.
+    fn delete_observations_by_episode(
+        &self,
+        _namespace_id: Uuid,
+        _episode_id: Uuid,
+    ) -> StorageResult<usize> {
         Ok(0)
     }
 
