@@ -1130,18 +1130,16 @@ async fn create_entity(
     ))
 }
 
-/// Constant-size reference to a pre-delete snapshot, in the same shape the
-/// `pensyve_forget` MCP tool returns. The rows are referenced rather than
-/// inlined: they carry their embeddings, so a full payload runs to megabytes,
-/// while a reference still lets a caller recover from the file on its own.
-fn snapshot_reference(
-    snapshot: &pensyve_core::snapshot::ForgetSnapshot,
-    path: &str,
-) -> serde_json::Value {
+/// Constant-size reference to a pre-delete snapshot. The rows are referenced
+/// rather than inlined: they carry their embeddings, so a full payload runs to
+/// megabytes. Unlike the co-located MCP tool, REST and A2A callers are remote —
+/// a server-local filesystem path is useless to them and leaks the snapshot
+/// layout, so the reference is by id only; the path is recorded in the
+/// activity log for the operator who performs the restore.
+fn snapshot_reference(snapshot: &pensyve_core::snapshot::ForgetSnapshot) -> serde_json::Value {
     let counts = snapshot.counts();
     json!({
         "snapshot_id": snapshot.snapshot_id.to_string(),
-        "path": path,
         "format_version": snapshot.format_version,
         "captured_at": snapshot.captured_at.to_rfc3339(),
         // False on platforms where the file could not be restricted to its
@@ -1224,8 +1222,8 @@ async fn forget_entity(
     Ok(Json(ForgetResponse {
         forgotten_count,
         snapshot: snapshot_path
-            .as_deref()
-            .map(|path| snapshot_reference(snapshot, path)),
+            .is_some()
+            .then(|| snapshot_reference(snapshot)),
     }))
 }
 
@@ -2426,8 +2424,8 @@ async fn a2a_forget(
     }
 
     let mut output = json!({"forgotten_count": forgotten_count});
-    if let Some(path) = outcome.path.as_ref() {
-        output["snapshot"] = snapshot_reference(snapshot, &path.to_string_lossy());
+    if outcome.path.is_some() {
+        output["snapshot"] = snapshot_reference(snapshot);
     }
     Ok(output)
 }

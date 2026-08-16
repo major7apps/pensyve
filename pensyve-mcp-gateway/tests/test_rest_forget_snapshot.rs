@@ -211,18 +211,24 @@ fn assert_reference_matches_file(
     namespace_id: Uuid,
     expected: &[Uuid],
 ) -> pensyve_core::snapshot::ForgetSnapshot {
-    let path = PathBuf::from(
-        reference["path"]
-            .as_str()
-            .expect("snapshot reference carries a path"),
-    );
-    assert_eq!(
-        path.parent().expect("snapshot path has a parent"),
-        pensyve_core::snapshot::namespace_dir(snapshot_root, namespace_id),
-        "snapshot must land under its own namespace, not a shared directory"
+    // The reference is by id only: remote callers cannot use a server-local
+    // filesystem path, so exposing one would only leak the snapshot layout.
+    assert!(
+        reference.get("path").is_none(),
+        "the server-local snapshot path must stay out of remote responses"
     );
 
-    let snapshot = pensyve_core::snapshot::read_file(&path).expect("snapshot round-trips");
+    // The artifact must land under its own namespace, not a shared directory.
+    let dir = pensyve_core::snapshot::namespace_dir(snapshot_root, namespace_id);
+    let entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("namespace snapshot dir exists")
+        .map(|entry| entry.expect("dir entry").path())
+        .collect();
+    let [path] = entries.as_slice() else {
+        panic!("expected exactly one snapshot artifact, found {entries:?}");
+    };
+
+    let snapshot = pensyve_core::snapshot::read_file(path).expect("snapshot round-trips");
     let mut got = snapshot.memory_ids();
     got.sort();
     let mut want = expected.to_vec();
