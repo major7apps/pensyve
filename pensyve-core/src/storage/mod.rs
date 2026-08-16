@@ -338,11 +338,27 @@ pub trait StorageTrait: Send + Sync {
     /// Implementations must mirror the delete's predicates verbatim — the
     /// namespace one included. Entity ids are not globally unique in this
     /// schema, so an entity-only predicate reaches into other tenants.
+    ///
+    /// The default filters the namespace-wide listing in memory, so external
+    /// backends keep compiling; its fidelity follows the backend's
+    /// [`StorageTrait::get_all_memories_by_namespace_including_superseded`]
+    /// (whose own default degrades to live rows). Both built-in backends
+    /// override this with a single indexed query.
     fn list_memories_by_entity_including_superseded(
         &self,
         entity_id: Uuid,
         namespace_id: Uuid,
-    ) -> StorageResult<Vec<Memory>>;
+    ) -> StorageResult<Vec<Memory>> {
+        Ok(self
+            .get_all_memories_by_namespace_including_superseded(namespace_id)?
+            .into_iter()
+            .filter(|memory| match memory {
+                Memory::Episodic(e) => e.about_entity == entity_id || e.source_entity == entity_id,
+                Memory::Semantic(s) => s.subject == entity_id || s.object_entity == Some(entity_id),
+                _ => false,
+            })
+            .collect())
+    }
 
     /// Mark a live memory as superseded. Returns `false` when no live row matched.
     fn supersede_memory(

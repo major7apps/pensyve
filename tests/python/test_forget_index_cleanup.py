@@ -13,8 +13,8 @@ and stale index entries are invisible through `recall` — the retrieval engine
 hydrates every vector hit from storage and silently drops the misses. So this
 test pins the half Python can observe: every deletable row shape leaves storage
 and stops coming back from recall, and unrelated rows survive. The index half of
-#261 is pinned in Rust, by
-`pensyve-core/src/storage/sqlite.rs::test_list_memories_by_entity_including_superseded_matches_the_delete_scope`
+#261 is pinned in Rust, by the sqlite storage test
+`test_list_memories_by_entity_including_superseded_matches_the_delete_scope`
 and `pensyve-mcp-gateway/tests/test_rest_forget_index_cleanup.rs`.
 
 Object-side semantic and superseded rows are not reachable through the Python
