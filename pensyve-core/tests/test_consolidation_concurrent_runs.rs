@@ -104,18 +104,26 @@ fn run(storage: &SqliteBackend, embedder: &OnnxEmbedder, ns: Uuid) -> usize {
 /// between two barrier-released threads, which is a measurable property, not
 /// an assumption.
 ///
-/// This guards the measurement. Observed on the development host: a run over
-/// `CLUSTERS` clusters takes ~500 ms against a barrier-release skew of ~2-7 µs
-/// — a margin near 10^5. The floor asserted here is deliberately far below
-/// that; tripping it means consolidation got dramatically faster and
-/// `CLUSTERS` must rise to keep the window open, and it says so rather than
-/// letting the concurrency test quietly decay into a coin flip.
+/// This guards the measurement, as a *ratio* rather than a wall-clock floor.
+/// The quantity that matters is relative — how long a run lasts compared with
+/// how quickly the second thread gets going — so an absolute floor is not
+/// portable. An earlier version of this test asserted one and failed in CI,
+/// where a run of `CLUSTERS` clusters takes ~47 ms against this host's ~500 ms
+/// on slower storage. The window was never in danger there: the margin was
+/// still ~8,000x. The threshold was simply calibrated to one machine.
 ///
-/// Only the run duration is asserted. Scheduler skew can spike arbitrarily on
-/// a loaded machine, so asserting a *ratio* would be the flaky choice.
+/// Observed margins: ~8,000x in CI, ~10^5 on the development host, against the
+/// 200x asserted here. Tripping it means the window really has collapsed and
+/// `CLUSTERS` must rise, and it says so rather than letting the concurrency
+/// test quietly decay into a coin flip.
+///
+/// Skew is the *minimum* across several trials, not one sample, so a single
+/// descheduled thread cannot fail the assertion on a loaded machine — which is
+/// the flakiness a naive ratio would invite.
 #[test]
 fn race_window_stays_wide_enough_to_detect() {
-    const FLOOR_MS: u128 = 50;
+    const MIN_MARGIN: f64 = 200.0;
+    const SKEW_TRIALS: usize = 9;
 
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(SqliteBackend::open(tmp.path()).expect("open storage"));
@@ -127,27 +135,37 @@ fn race_window_stays_wide_enough_to_detect() {
     let elapsed = t0.elapsed();
     assert_eq!(promoted, CLUSTERS);
 
-    // Skew between two barrier-released threads reaching their first
-    // instruction after the barrier.
-    let barrier = Arc::new(Barrier::new(2));
-    let mut handles = Vec::new();
-    for _ in 0..2 {
-        let barrier = barrier.clone();
-        handles.push(std::thread::spawn(move || {
-            barrier.wait();
-            Instant::now()
-        }));
-    }
-    let times: Vec<Instant> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    let skew = times[1].max(times[0]) - times[1].min(times[0]);
+    // Best-case skew between two barrier-released threads reaching their first
+    // instruction after the barrier — the head start the concurrency test's
+    // second run gets before it takes its own snapshot.
+    let skew = (0..SKEW_TRIALS)
+        .map(|_| {
+            let barrier = Arc::new(Barrier::new(2));
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        Instant::now()
+                    })
+                })
+                .collect();
+            let times: Vec<Instant> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            times[1].max(times[0]) - times[1].min(times[0])
+        })
+        .min()
+        .expect("SKEW_TRIALS is non-zero");
 
+    let margin = elapsed.as_secs_f64() / skew.as_secs_f64().max(f64::EPSILON);
     println!("run duration for {CLUSTERS} clusters: {elapsed:?}");
-    println!("barrier release skew: {skew:?}");
+    println!("barrier release skew (min of {SKEW_TRIALS}): {skew:?}");
+    println!("margin: {margin:.0}x");
 
     assert!(
-        elapsed.as_millis() >= FLOOR_MS,
-        "a run over {CLUSTERS} clusters now takes {elapsed:?}, under the {FLOOR_MS}ms floor the \
-         concurrency test's detection window depends on — raise CLUSTERS"
+        margin >= MIN_MARGIN,
+        "a run over {CLUSTERS} clusters ({elapsed:?}) is only {margin:.0}x the thread-start skew \
+         ({skew:?}), under the {MIN_MARGIN}x the concurrency test's detection window depends on — \
+         raise CLUSTERS"
     );
 }
 
