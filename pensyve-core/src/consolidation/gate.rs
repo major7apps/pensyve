@@ -96,11 +96,19 @@ fn lock_registry() -> MutexGuard<'static, HashMap<Uuid, bool>> {
 
 /// Releases the namespace if the owner unwinds.
 ///
-/// On the normal path [`finish_or_rerun`] has already removed the entry and
-/// this is a no-op. On a panic it is the only thing that removes it, so one
-/// panicking run cannot leave a namespace permanently claimed — which would
-/// make every later trigger coalesce forever against an owner that no longer
-/// exists.
+/// This is the only removal on the paths that reach it: a panic in `f`, and a
+/// normal exit where `should_rerun` declined before [`finish_or_rerun`] ran.
+/// Both leave the entry continuously present, so removing here cannot evict
+/// anyone else's claim. Without it a panicking run would leave the namespace
+/// permanently claimed, and every later trigger would coalesce forever against
+/// an owner that no longer exists.
+///
+/// It must NOT fire on the path where [`finish_or_rerun`] already released the
+/// claim — that removal happens under the registry lock, the lock is dropped
+/// before this guard would run, and a fresh owner can claim in the gap.
+/// Removing again there would evict *that* owner and let a third run start
+/// alongside it, which is the concurrency #226 exists to prevent. `dispatch`
+/// disarms the lease on that path.
 struct Lease(Uuid);
 
 impl Drop for Lease {
@@ -175,14 +183,52 @@ pub fn dispatch<T>(
     if !claim(namespace_id) {
         return Dispatch::Coalesced;
     }
-    let _lease = Lease(namespace_id);
+    let lease = Lease(namespace_id);
 
     let mut out = f();
-    while should_rerun(&out) && finish_or_rerun(namespace_id) {
+    while should_rerun(&out) {
+        if !finish_or_rerun(namespace_id) {
+            // The claim is already released, atomically, under the registry
+            // lock. That lock is dropped before `lease` would run, so a fresh
+            // owner may hold this namespace by then — disarm, or we would
+            // evict it and let a third run start alongside it (#226).
+            reclaim_in_release_window(namespace_id);
+            std::mem::forget(lease);
+            return Dispatch::Ran(out);
+        }
         out = f();
     }
     Dispatch::Ran(out)
 }
+
+// Thread-local rather than global: the whole test suite shares one registry,
+// so a process-wide flag would inject claims into unrelated tests running in
+// parallel. `dispatch` is synchronous, so the arming thread is the one that
+// reaches the window.
+#[cfg(test)]
+thread_local! {
+    static RECLAIM_IN_RELEASE_WINDOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test seam for the window between [`finish_or_rerun`]'s release and the
+/// lease going out of scope. Compiled out of non-test builds.
+///
+/// The window is closed by construction in `dispatch`, so no caller-supplied
+/// code runs inside it and a black-box test cannot reach it. This lets the
+/// test place a fresh claim there deterministically instead of racing for it.
+#[cfg(test)]
+fn reclaim_in_release_window(namespace_id: Uuid) {
+    if RECLAIM_IN_RELEASE_WINDOW.with(std::cell::Cell::get) {
+        assert!(
+            claim(namespace_id),
+            "the namespace must be free once finish_or_rerun has released it"
+        );
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn reclaim_in_release_window(_namespace_id: Uuid) {}
 
 #[cfg(test)]
 mod tests {
@@ -379,5 +425,36 @@ mod tests {
         let ns = Uuid::new_v4();
         assert_eq!(dispatch(ns, || (), never), Dispatch::Ran(()));
         assert!(!is_claimed(ns), "a finished run left its entry behind");
+    }
+
+    /// `finish_or_rerun` releases under the registry lock and then drops it,
+    /// so a fresh owner can claim before the outgoing run's lease would run.
+    /// The outgoing run must not remove that owner's entry: doing so frees a
+    /// namespace someone is actively running in, and the next trigger starts a
+    /// second concurrent run — the #226 race this gate exists to close.
+    ///
+    /// No caller-supplied code executes inside that window, so the test seam
+    /// places the competing claim there rather than racing for it.
+    #[test]
+    fn a_claim_taken_in_the_release_window_is_not_evicted() {
+        let ns = Uuid::new_v4();
+
+        RECLAIM_IN_RELEASE_WINDOW.with(|f| f.set(true));
+        // `always` sends the run into `finish_or_rerun`; with no trigger
+        // pending it releases and returns false, which is the path that used
+        // to remove a second time.
+        let outcome = dispatch(ns, || (), always);
+        RECLAIM_IN_RELEASE_WINDOW.with(|f| f.set(false));
+
+        assert_eq!(outcome, Dispatch::Ran(()));
+        assert!(
+            is_claimed(ns),
+            "the outgoing run evicted a claim it did not own, leaving the \
+             namespace free while another run holds it"
+        );
+
+        // That simulated owner never runs, so release its claim by hand.
+        assert!(!finish_or_rerun(ns));
+        assert!(!is_claimed(ns));
     }
 }
