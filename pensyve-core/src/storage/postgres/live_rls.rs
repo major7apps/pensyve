@@ -826,6 +826,147 @@ fn capturing_delete_still_works_under_enforced_rls() {
     );
 }
 
+/// The plain entity-wide delete keeps working with RLS enforced, so it no
+/// longer belongs in [`enforced_rls_fails_closed_for_unscoped_methods`].
+///
+/// It took no `namespace_id` until #256 and therefore ran on an unscoped
+/// connection, which under enforcement matched nothing — `Ok(0)` reported as
+/// success, with a GDPR erase claiming to have erased something it had not.
+/// Now that the connection is bound, the delete takes effect in its own
+/// namespace and only there.
+///
+/// [`entity_delete_is_confined_to_its_namespace`] is the same contract with RLS
+/// inert, which is the configuration that ships.
+#[test]
+fn entity_delete_still_works_under_enforced_rls() {
+    let Some(admin_opts) = skip_notice("entity_delete_still_works_under_enforced_rls") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns_a = Namespace::new(format!("forget-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("forget-b-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns_a).expect("save namespace A");
+    backend.save_namespace(&ns_b).expect("save namespace B");
+
+    let entity_id = Uuid::new_v4();
+    let mine = EpisodicMemory::new(ns_a.id, Uuid::new_v4(), entity_id, entity_id, "tenant A");
+    backend.save_episodic(&mine).expect("save A's memory");
+    let theirs = EpisodicMemory::new(ns_b.id, Uuid::new_v4(), entity_id, entity_id, "tenant B");
+    backend.save_episodic(&theirs).expect("save B's memory");
+
+    fixture.enforce_rls();
+
+    assert_eq!(
+        backend
+            .delete_memories_by_entity(entity_id, ns_a.id)
+            .expect("delete_memories_by_entity must not error"),
+        1,
+        "the entity-wide delete must take effect in its own namespace under enforced RLS"
+    );
+    assert!(
+        backend
+            .get_all_memories_by_namespace(ns_a.id)
+            .expect("read namespace A")
+            .is_empty(),
+        "namespace A should be empty after the forget"
+    );
+    assert_eq!(
+        memory_ids(
+            &backend
+                .get_all_memories_by_namespace(ns_b.id)
+                .expect("read namespace B")
+        ),
+        vec![theirs.id],
+        "namespace B's row must survive"
+    );
+}
+
+/// The plain entity-wide delete behind the CLI, the REST `forget_entity`
+/// handler, the A2A `memory.forget` capability, the Python binding and
+/// `gdpr::erase_entity` must not reach across namespaces.
+///
+/// Same shape as [`capturing_delete_is_confined_to_its_namespace`], and the
+/// same reasoning: entity ids are not globally unique, and with RLS inert — the
+/// configuration every deployment runs today, because the backend connects as
+/// the schema owner — an entity-only predicate has nothing else filtering it.
+/// This variant reaches further than the capturing one, which is MCP-only.
+///
+/// Object-side semantic rows are seeded deliberately: the delete has always
+/// matched `subject OR object_entity`, so both must go, and both must stay out
+/// of the other tenant's namespace.
+#[test]
+fn entity_delete_is_confined_to_its_namespace() {
+    let Some(admin_opts) = skip_notice("entity_delete_is_confined_to_its_namespace") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns_a = Namespace::new(format!("forget-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("forget-b-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns_a).expect("save namespace A");
+    backend.save_namespace(&ns_b).expect("save namespace B");
+
+    // The same entity id in both namespaces — the collision the predicate has
+    // to disambiguate.
+    let entity_id = Uuid::new_v4();
+
+    let mine = EpisodicMemory::new(
+        ns_a.id,
+        Uuid::new_v4(),
+        entity_id,
+        entity_id,
+        "tenant A turn",
+    );
+    backend.save_episodic(&mine).expect("save A's memory");
+
+    let theirs = EpisodicMemory::new(
+        ns_b.id,
+        Uuid::new_v4(),
+        entity_id,
+        entity_id,
+        "tenant B turn",
+    );
+    backend.save_episodic(&theirs).expect("save B's memory");
+
+    // Object-side facts: the entity is the object, not the subject.
+    let mut mine_fact = SemanticMemory::new(ns_a.id, Uuid::new_v4(), "reports to", "a", 0.9);
+    mine_fact.object_entity = Some(entity_id);
+    backend.save_semantic(&mine_fact).expect("save A's fact");
+
+    let mut their_fact = SemanticMemory::new(ns_b.id, Uuid::new_v4(), "reports to", "b", 0.9);
+    their_fact.object_entity = Some(entity_id);
+    backend.save_semantic(&their_fact).expect("save B's fact");
+
+    let deleted = backend
+        .delete_memories_by_entity(entity_id, ns_a.id)
+        .expect("forget in namespace A");
+
+    assert_eq!(
+        deleted, 2,
+        "namespace A's own episodic and object-side semantic rows should have been deleted"
+    );
+
+    let surviving = memory_ids(
+        &backend
+            .get_all_memories_by_namespace(ns_b.id)
+            .expect("read namespace B"),
+    );
+    assert!(
+        surviving.contains(&theirs.id) && surviving.contains(&their_fact.id),
+        "namespace B's rows must survive a forget issued for namespace A; B now holds {surviving:?}"
+    );
+    assert!(
+        backend
+            .get_all_memories_by_namespace(ns_a.id)
+            .expect("read namespace A")
+            .is_empty(),
+        "namespace A should be empty after the forget"
+    );
+}
+
 /// Enforcement fails closed, and these `StorageTrait` methods take no
 /// `namespace_id`, so they run on an unscoped connection and quietly stop
 /// working when it is switched on.
@@ -833,8 +974,8 @@ fn capturing_delete_still_works_under_enforced_rls() {
 /// This is the reason `FORCE ROW LEVEL SECURITY` lives in
 /// `postgres_rls_enforce.sql` as an operator step instead of in
 /// `postgres_schema.sql`. The failure mode is the dangerous kind: not an
-/// error, but a success report with no effect — `delete_memories_by_entity`
-/// returns `Ok(0)` and a GDPR erase would report that it had erased something.
+/// error, but a success report with no effect — `delete_memory_by_id` returns
+/// `Ok(false)` while `purge_namespace`, which is built on it, reports a count.
 ///
 /// Each assertion here is a work item, tracked by #254. When a method starts
 /// carrying a namespace, its assertion flips and has to be moved into
@@ -871,15 +1012,10 @@ fn enforced_rls_fails_closed_for_unscoped_methods() {
         "supersede_memory now takes effect under enforced RLS"
     );
 
-    // Reached from DELETE /v1/entities/{name}, the A2A memory.forget
-    // capability, GDPR erase, the pensyve_forget MCP tool, and the CLI.
-    assert_eq!(
-        backend
-            .delete_memories_by_entity(memory.about_entity)
-            .expect("delete_memories_by_entity must not error"),
-        0,
-        "delete_memories_by_entity now deletes under enforced RLS"
-    );
+    // `delete_memories_by_entity` used to be on this list. It takes a
+    // `namespace_id` as of #256, so its connection is bound and it keeps
+    // working under enforcement — the assertion moved to
+    // [`entity_delete_still_works_under_enforced_rls`].
 
     // Reached from the default `purge_namespace` trait implementation, which
     // PostgresBackend does not override.

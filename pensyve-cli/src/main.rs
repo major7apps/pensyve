@@ -721,9 +721,9 @@ fn cmd_forget(
     };
 
     if hard {
-        pensyve_core::gdpr::erase_entity(&storage, entity.id)?;
+        pensyve_core::gdpr::erase_entity(&storage, entity.id, ns.id)?;
     } else {
-        storage.delete_memories_by_entity(entity.id)?;
+        storage.delete_memories_by_entity(entity.id, ns.id)?;
     }
 
     match format {

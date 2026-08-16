@@ -2274,9 +2274,14 @@ impl StorageTrait for SqliteBackend {
         }
     }
 
-    fn delete_memories_by_entity(&self, entity_id: Uuid) -> StorageResult<usize> {
+    fn delete_memories_by_entity(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<usize> {
         let conn = lock_conn!(self);
         let id_str = entity_id.to_string();
+        let ns_str = namespace_id.to_string();
 
         // Run the entire delete in a single transaction for atomicity and speed.
         conn.execute_batch("BEGIN")?;
@@ -2284,41 +2289,52 @@ impl StorageTrait for SqliteBackend {
         let result = (|| -> StorageResult<usize> {
             let mut total = 0usize;
 
-            // Collect IDs to remove from FTS.
+            // Collect the ids to remove from FTS. These `SELECT`s must match
+            // the `DELETE`s below predicate-for-predicate: the semantic one
+            // used to look at `subject` alone while the delete also removed
+            // `object_entity` rows, which left every object-side row's index
+            // entry — content included — behind after its base row was gone.
             let episodic_ids: Vec<String> = {
                 let mut stmt = conn.prepare(
-                    "SELECT id FROM episodic_memories WHERE about_entity = ?1 OR source_entity = ?1",
+                    "SELECT id FROM episodic_memories
+                      WHERE (about_entity = ?1 OR source_entity = ?1) AND namespace_id = ?2",
                 )?;
-                stmt.query_map(params![&id_str], |row| row.get(0))?
+                stmt.query_map(params![&id_str, &ns_str], |row| row.get(0))?
                     .collect::<Result<Vec<_>, _>>()?
             };
 
             let semantic_ids: Vec<String> = {
-                let mut stmt =
-                    conn.prepare("SELECT id FROM semantic_memories WHERE subject = ?1")?;
-                stmt.query_map(params![&id_str], |row| row.get(0))?
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM semantic_memories
+                      WHERE (subject = ?1 OR object_entity = ?1) AND namespace_id = ?2",
+                )?;
+                stmt.query_map(params![&id_str, &ns_str], |row| row.get(0))?
                     .collect::<Result<Vec<_>, _>>()?
             };
 
             // Delete episodic.
             let n = conn.execute(
-                "DELETE FROM episodic_memories WHERE about_entity = ?1 OR source_entity = ?1",
-                params![&id_str],
+                "DELETE FROM episodic_memories
+                  WHERE (about_entity = ?1 OR source_entity = ?1) AND namespace_id = ?2",
+                params![&id_str, &ns_str],
             )?;
             total += n;
 
             // Delete semantic (by subject or object_entity).
             let n = conn.execute(
-                "DELETE FROM semantic_memories WHERE subject = ?1 OR object_entity = ?1",
-                params![&id_str],
+                "DELETE FROM semantic_memories
+                  WHERE (subject = ?1 OR object_entity = ?1) AND namespace_id = ?2",
+                params![&id_str, &ns_str],
             )?;
             total += n;
 
-            // Remove from FTS in bulk.
+            // Remove from FTS in bulk, qualified by namespace — `memory_fts`
+            // is keyed by `memory_id`, which is not unique across namespaces,
+            // so an unqualified delete silently strips another tenant's entry.
             for fts_id in episodic_ids.iter().chain(semantic_ids.iter()) {
                 conn.execute(
-                    "DELETE FROM memory_fts WHERE memory_id = ?1",
-                    params![fts_id],
+                    "DELETE FROM memory_fts WHERE memory_id = ?1 AND namespace_id = ?2",
+                    params![fts_id, &ns_str],
                 )?;
             }
 
@@ -3716,7 +3732,7 @@ mod tests {
         db.save_episodic(&mem1).unwrap();
         db.save_semantic(&mem2).unwrap();
 
-        let deleted = db.delete_memories_by_entity(entity_id).unwrap();
+        let deleted = db.delete_memories_by_entity(entity_id, ns.id).unwrap();
         assert!(deleted > 0);
 
         // Verify gone from storage.
@@ -3761,13 +3777,8 @@ mod tests {
         let subject_id = Uuid::new_v4();
         let object_id = Uuid::new_v4();
 
-        let mut fact = SemanticMemory::new(
-            ns.id,
-            subject_id,
-            "reports to",
-            "orphaned index token",
-            0.9,
-        );
+        let mut fact =
+            SemanticMemory::new(ns.id, subject_id, "reports to", "orphaned index token", 0.9);
         fact.object_entity = Some(object_id);
         db.save_semantic(&fact).unwrap();
 
@@ -3779,7 +3790,7 @@ mod tests {
             "precondition: the fact must be findable before the forget"
         );
 
-        db.delete_memories_by_entity(object_id).unwrap();
+        db.delete_memories_by_entity(object_id, ns.id).unwrap();
 
         assert!(
             db.get_semantic(fact.id).unwrap().is_none(),
@@ -3834,7 +3845,8 @@ mod tests {
         foreign_memory.id = shared_id;
         db.save_episodic(&foreign_memory).unwrap();
 
-        db.delete_memories_by_entity(entity_id).unwrap();
+        db.delete_memories_by_entity(entity_id, owner_ns.id)
+            .unwrap();
 
         let hits = db
             .search_fts("foreign unique token", foreign_ns.id, 10)
@@ -3845,6 +3857,80 @@ mod tests {
             "the other namespace's memory must still be findable"
         );
         assert_eq!(hits[0].id(), shared_id);
+    }
+
+    /// Two namespaces holding rows keyed to the same entity id: a forget
+    /// issued for one must leave the other's rows alone.
+    ///
+    /// Entity ids are server-generated per namespace and callers resolve them
+    /// through the namespace-scoped `get_entity_by_name`, so this collision
+    /// does not arise on its own — nothing prevented it either, and import and
+    /// restore paths carry ids. This is the same footgun #247 and #248 removed
+    /// from their own delete paths.
+    #[test]
+    fn test_delete_memories_by_entity_is_confined_to_its_namespace() {
+        let (_dir, db) = setup();
+        let owner_ns = make_namespace(&db);
+        let foreign_ns = Namespace::new("other");
+        db.save_namespace(&foreign_ns).unwrap();
+        let entity_id = Uuid::new_v4();
+
+        let mine = EpisodicMemory::new(
+            owner_ns.id,
+            Uuid::new_v4(),
+            entity_id,
+            entity_id,
+            "tenant A turn",
+        );
+        db.save_episodic(&mine).unwrap();
+
+        let theirs = EpisodicMemory::new(
+            foreign_ns.id,
+            Uuid::new_v4(),
+            entity_id,
+            entity_id,
+            "tenant B turn",
+        );
+        db.save_episodic(&theirs).unwrap();
+
+        // Object-side facts, which the delete also matches.
+        let mut my_fact = SemanticMemory::new(owner_ns.id, Uuid::new_v4(), "reports to", "a", 0.9);
+        my_fact.object_entity = Some(entity_id);
+        db.save_semantic(&my_fact).unwrap();
+
+        let mut their_fact =
+            SemanticMemory::new(foreign_ns.id, Uuid::new_v4(), "reports to", "b", 0.9);
+        their_fact.object_entity = Some(entity_id);
+        db.save_semantic(&their_fact).unwrap();
+
+        let deleted = db
+            .delete_memories_by_entity(entity_id, owner_ns.id)
+            .unwrap();
+
+        assert_eq!(
+            deleted, 2,
+            "only the owning namespace's two rows are deleted"
+        );
+        assert!(db.get_episodic(mine.id).unwrap().is_none());
+        assert!(db.get_semantic(my_fact.id).unwrap().is_none());
+        assert!(
+            db.get_episodic(theirs.id).unwrap().is_some(),
+            "the other namespace's episodic row must survive"
+        );
+        assert!(
+            db.get_semantic(their_fact.id).unwrap().is_some(),
+            "the other namespace's object-side fact must survive"
+        );
+        assert_eq!(
+            fts_rows_for(&db, theirs.id),
+            1,
+            "the other namespace's index entry must survive"
+        );
+        assert_eq!(
+            fts_rows_for(&db, their_fact.id),
+            1,
+            "the other namespace's index entry must survive"
+        );
     }
 
     // -----------------------------------------------------------------------

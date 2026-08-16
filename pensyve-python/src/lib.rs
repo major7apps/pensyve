@@ -1913,7 +1913,7 @@ impl PyPensyve {
         let count = self
             .inner
             .storage
-            .delete_memories_by_entity(entity.uuid)
+            .delete_memories_by_entity(entity.uuid, self.inner.namespace.id)
             .map_err(|e| PyRuntimeError::new_err(format!("Forget failed: {e}")))?;
 
         let dict = PyDict::new(py);

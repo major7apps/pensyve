@@ -242,7 +242,7 @@ async fn test_forget_removes_all_memories_for_entity() {
     // forget: delete memories.
     let forgotten = state
         .storage
-        .delete_memories_by_entity(entity.id)
+        .delete_memories_by_entity(entity.id, state.namespace.id)
         .expect("delete memories");
     assert_eq!(forgotten, 2, "should have deleted exactly 2 memories");
 

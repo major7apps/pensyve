@@ -1607,16 +1607,35 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn delete_memories_by_entity(&self, entity_id: Uuid) -> StorageResult<usize> {
+    /// Entity-wide delete, confined to `namespace_id`.
+    ///
+    /// The `AND namespace_id = $2` predicates carry the isolation on their own.
+    /// Row-level security cannot: the application connects as the schema owner,
+    /// which Postgres exempts from its own policies, so an entity-only
+    /// predicate would delete across tenants in every deployment shipping
+    /// today. The connection is bound to the namespace as well, which is what
+    /// keeps the statements working once `postgres_rls_enforce.sql` is applied.
+    ///
+    /// There is no full-text cleanup here, unlike the `SQLite` backend: this
+    /// schema indexes through the `fts_content` generated column on each table,
+    /// so deleting the row deletes its index entry. The orphaning half of #256
+    /// is `SQLite`-only for that reason.
+    fn delete_memories_by_entity(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<usize> {
         self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             let mut total = 0usize;
 
             // Delete episodic memories.
             let result = query::<Postgres>(
-                "DELETE FROM episodic_memories WHERE about_entity = $1 OR source_entity = $1",
+                r"DELETE FROM episodic_memories
+                   WHERE (about_entity = $1 OR source_entity = $1) AND namespace_id = $2",
             )
             .bind(entity_id)
+            .bind(namespace_id)
             .execute(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
@@ -1624,9 +1643,11 @@ impl StorageTrait for PostgresBackend {
 
             // Delete semantic memories.
             let result = query::<Postgres>(
-                "DELETE FROM semantic_memories WHERE subject = $1 OR object_entity = $1",
+                r"DELETE FROM semantic_memories
+                   WHERE (subject = $1 OR object_entity = $1) AND namespace_id = $2",
             )
             .bind(entity_id)
+            .bind(namespace_id)
             .execute(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;

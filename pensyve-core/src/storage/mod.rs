@@ -331,7 +331,29 @@ pub trait StorageTrait: Send + Sync {
     ) -> StorageResult<bool>;
 
     // Deletion
-    fn delete_memories_by_entity(&self, entity_id: Uuid) -> StorageResult<usize>;
+
+    /// Delete every episodic and semantic memory attached to `entity_id`
+    /// *within `namespace_id`*, and return the row count.
+    ///
+    /// Episodic rows match on `about_entity` or `source_entity`; semantic rows
+    /// match on `subject` or `object_entity`. Any search-index cleanup must
+    /// cover **exactly** that set: a narrower collection leaves index entries
+    /// behind holding the text of memories the caller was told were deleted.
+    ///
+    /// `namespace_id` is required rather than inferred. Entity ids are not
+    /// globally unique in this schema, so an entity-only predicate reaches into
+    /// other tenants, and the index cleanup has the same problem one level down
+    /// — memory ids collide too, so an unqualified `memory_fts` delete strips a
+    /// foreign namespace's entry (see
+    /// `test_delete_memory_by_id_in_namespace_preserves_foreign_fts_entry`).
+    /// Both predicates must be explicit in the SQL rather than left to
+    /// row-level security, which is defence in depth and inert in every
+    /// deployment shipping today.
+    fn delete_memories_by_entity(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<usize>;
 
     /// Same deletion as [`StorageTrait::delete_memories_by_entity`], but the
     /// deleted rows are handed to `persist` **before the delete commits** so
@@ -345,7 +367,7 @@ pub trait StorageTrait: Send + Sync {
     /// then destroys without it ever appearing in the snapshot — the exact
     /// unrecoverable case this feature exists to prevent.
     ///
-    /// Unlike [`StorageTrait::delete_memories_by_entity`], this is scoped to
+    /// Like [`StorageTrait::delete_memories_by_entity`], this is scoped to
     /// `namespace_id`. Entity ids are not globally unique, so matching on the
     /// entity alone reaches into other tenants — and here that is worse than a
     /// stray delete, because the foreign rows also land in the caller's
