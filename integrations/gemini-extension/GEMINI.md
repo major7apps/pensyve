@@ -452,5 +452,5 @@ Medium-signal items that benefit from user confirmation:
 | `pensyve_observe`       | Record an observation within an active episode | `episode_id`, `content`, `source_entity`, `about_entity`, `content_type?` |
 | `pensyve_episode_start` | Begin tracking a conversation                  | `participants`                                                            |
 | `pensyve_episode_end`   | End episode with outcome summary               | `episode_id`, `outcome?`                                                  |
-| `pensyve_forget`        | Delete all memories for an entity              | `entity`, `hard_delete?`                                                  |
+| `pensyve_forget`        | Delete all memories for an entity (irreversible) | `entity`                                                                |
 | `pensyve_inspect`       | View all memories for an entity                | `entity`, `memory_type?`, `limit?`                                        |

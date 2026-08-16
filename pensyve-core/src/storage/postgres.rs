@@ -1517,7 +1517,7 @@ impl StorageTrait for PostgresBackend {
         namespace_id: Uuid,
     ) -> StorageResult<bool> {
         self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
             let mut deleted = false;
 

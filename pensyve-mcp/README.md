@@ -2,7 +2,7 @@
 
 Model Context Protocol (MCP) server for Pensyve — a universal memory runtime for AI agents.
 
-Exposes 6 memory tools over stdio so any MCP-compatible client (Claude Code, Cursor, Continue, etc.) can store, search, and manage memories backed by a local SQLite database with semantic search.
+Exposes 7 memory tools over stdio so any MCP-compatible client (Claude Code, Cursor, Continue, etc.) can store, search, and manage memories backed by a local SQLite database with semantic search.
 
 ---
 
@@ -244,14 +244,15 @@ Close an open episode and record its outcome. Returns the count of memories extr
 
 ### `pensyve_forget`
 
-Delete all memories associated with a named entity. If the entity does not exist, returns a zero count without error. By default this is a hard delete.
+Delete **all** memories associated with a named entity. This is entity-wide and irreversible (a permanent hard delete). To retract a single memory instead, use `pensyve_forget_memory`. If the entity does not exist, returns a zero count without error.
+
+Unknown parameters are rejected with an error rather than silently ignored.
 
 **Parameters**
 
 | Name          | Type    | Required | Default | Description                                 |
 | ------------- | ------- | -------- | ------- | ------------------------------------------- |
 | `entity`      | string  | yes      | —       | Name of the entity whose memories to remove |
-| `hard_delete` | boolean | no       | `true`  | If `true`, permanently deletes records      |
 
 **Example input**
 
@@ -280,6 +281,37 @@ If the entity is not found:
   "message": "Entity not found"
 }
 ```
+
+---
+
+### `pensyve_forget_memory`
+
+Permanently delete one memory by its id (as returned by `pensyve_recall` or `pensyve_inspect`). The safe, scoped alternative to `pensyve_forget`.
+
+**Parameters**
+
+| Name        | Type   | Required | Default | Description                                    |
+| ----------- | ------ | -------- | ------- | ---------------------------------------------- |
+| `memory_id` | string | yes      | —       | UUID of the single memory to permanently delete |
+
+**Example input**
+
+```json
+{
+  "memory_id": "96e8896e-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
+}
+```
+
+**Example output**
+
+```json
+{
+  "memory_id": "96e8896e-1c2d-4e5f-8a9b-0c1d2e3f4a5b",
+  "deleted": true
+}
+```
+
+`deleted` is `false` when no memory with that id exists in the active namespace.
 
 ---
 

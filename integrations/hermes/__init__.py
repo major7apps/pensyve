@@ -258,7 +258,6 @@ FORGET_SCHEMA = {
         "type": "object",
         "properties": {
             "entity": {"type": "string", "description": "Entity to forget."},
-            "hard_delete": {"type": "boolean", "description": "If true, permanently deletes rather than soft-deleting."},
         },
         "required": ["entity"],
     },
@@ -641,10 +640,7 @@ class PensyveMemoryProvider(MemoryProvider):
                 entity = args.get("entity", "")
                 if not entity:
                     return tool_error("Missing required parameter: entity")
-                result = mcp.call_tool("pensyve_forget", {
-                    "entity": entity,
-                    "hard_delete": args.get("hard_delete"),
-                })
+                result = mcp.call_tool("pensyve_forget", {"entity": entity})
                 self._record_success()
                 return json.dumps({"result": f"Memories for '{entity}' deleted.", "details": result})
 
