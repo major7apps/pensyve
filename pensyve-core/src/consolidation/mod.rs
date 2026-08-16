@@ -48,10 +48,10 @@
 pub mod dmem;
 pub mod typed_slots;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -124,6 +124,52 @@ pub struct ConsolidationStats {
 pub struct ConsolidationEngine;
 
 const SIMILARITY_THRESHOLD: f32 = 0.8;
+
+/// Live episodic evidence eligible for clustering, grouped by `about_entity`.
+type EpisodicByEntity = HashMap<Uuid, Vec<EpisodicMemory>>;
+
+/// Guards keyed on the `(about_entity, content)` pair a promotion would write.
+type PromotionGuards = HashMap<(Uuid, String), PromotionGuard>;
+
+/// What an `(about_entity, content)` key the namespace already holds implies
+/// for a cluster that would re-derive it.
+///
+/// The promotion pass is a pure function of the episodic set, so a stable
+/// cluster yields the same key on every run. Whether re-deriving it is a
+/// duplicate or a legitimate re-assertion depends on the fate of the rows
+/// already holding that key.
+#[derive(Clone, Copy)]
+enum PromotionGuard {
+    /// A live row holds this key. Re-deriving it would duplicate a fact that
+    /// is already current, so the key is closed regardless of the evidence.
+    Active,
+    /// Every row holding this key is superseded; the moment carried here is
+    /// the most recent supersession. A correction speaks to the evidence that
+    /// existed when it was made: re-deriving the key from episodes that all
+    /// predate it would undo the correction, but episodes recorded after it
+    /// are new testimony and may re-assert the fact (issue #227).
+    SupersededAt(DateTime<Utc>),
+}
+
+impl PromotionGuard {
+    /// Fold another row's verdict for the same key into this one. A live row
+    /// closes the key outright; between two supersessions the later one wins,
+    /// since it is the correction still standing.
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Active, _) | (_, Self::Active) => Self::Active,
+            (Self::SupersededAt(a), Self::SupersededAt(b)) => Self::SupersededAt(a.max(b)),
+        }
+    }
+
+    /// Whether a cluster with these episode timestamps may still promote.
+    fn admits(self, episode_times: impl IntoIterator<Item = DateTime<Utc>>) -> bool {
+        match self {
+            Self::Active => false,
+            Self::SupersededAt(at) => episode_times.into_iter().any(|t| t > at),
+        }
+    }
+}
 
 impl ConsolidationEngine {
     /// Run all consolidation jobs for a namespace.
@@ -201,6 +247,47 @@ impl ConsolidationEngine {
     // Job 1: Episodic → Semantic promotion
     // -----------------------------------------------------------------------
 
+    /// Split a namespace's memories into the live episodic evidence the
+    /// promotion pass may cluster, grouped by `about_entity`, and the guards
+    /// its existing `mentioned` rows impose on re-derivation.
+    ///
+    /// Superseded episodes are retired evidence and must not seed new
+    /// clusters, so only live rows feed the clustering pass. Both live and
+    /// superseded promotions seed the guard map, but they bind differently —
+    /// see [`PromotionGuard`].
+    fn partition_for_promotion(all_memories: Vec<Memory>) -> (EpisodicByEntity, PromotionGuards) {
+        let mut episodic_by_entity = EpisodicByEntity::new();
+        let mut already_promoted = PromotionGuards::new();
+
+        for mem in all_memories {
+            match mem {
+                Memory::Episodic(em) if em.superseded_by.is_none() => {
+                    episodic_by_entity
+                        .entry(em.about_entity)
+                        .or_default()
+                        .push(em);
+                }
+                Memory::Semantic(sm) if sm.predicate == "mentioned" => {
+                    let guard = match (sm.superseded_by, sm.invalid_at) {
+                        // Superseded with a stamped moment: the key reopens
+                        // for evidence recorded after it. Everything else —
+                        // a live row, or a supersession with no moment to
+                        // date evidence against — closes the key outright.
+                        (Some(_), Some(at)) => PromotionGuard::SupersededAt(at),
+                        _ => PromotionGuard::Active,
+                    };
+                    already_promoted
+                        .entry((sm.subject, sm.object))
+                        .and_modify(|existing| *existing = existing.merge(guard))
+                        .or_insert(guard);
+                }
+                _ => {}
+            }
+        }
+
+        (episodic_by_entity, already_promoted)
+    }
+
     /// Scan episodic memories for repeated facts about the same entity.
     /// When 2+ episodic memories for the same `about_entity` have cosine similarity
     /// > 0.8, promote them to a single `SemanticMemory`.
@@ -224,33 +311,13 @@ impl ConsolidationEngine {
     ) -> Result<usize, ConsolidationError> {
         // Fetch all memories for this namespace, superseded history included.
         // The guard below needs the history: a superseded promotion is a fact
-        // the operator corrected, and re-deriving it from unchanged episodic
-        // evidence would silently undo that correction.
+        // the operator corrected, and re-deriving it from the evidence that
+        // correction overrode would silently undo it.
         let all_memories =
             storage.get_all_memories_by_namespace_including_superseded(namespace_id)?;
 
-        // Partition episodic memories, grouped by about_entity. In the same
-        // sweep, record every promotion this namespace already holds so a
-        // re-run cannot mint a second copy of it.
-        let mut episodic_by_entity: HashMap<Uuid, Vec<EpisodicMemory>> = HashMap::new();
-        let mut already_promoted: HashSet<(Uuid, String)> = HashSet::new();
-        for mem in all_memories {
-            match mem {
-                // Superseded episodes are retired evidence and must not seed
-                // new clusters; only live rows feed the clustering pass.
-                Memory::Episodic(em) if em.superseded_by.is_none() => {
-                    episodic_by_entity
-                        .entry(em.about_entity)
-                        .or_default()
-                        .push(em);
-                }
-                // Both live and superseded promotions seed the guard.
-                Memory::Semantic(sm) if sm.predicate == "mentioned" => {
-                    already_promoted.insert((sm.subject, sm.object));
-                }
-                _ => {}
-            }
-        }
+        let (episodic_by_entity, mut already_promoted) =
+            Self::partition_for_promotion(all_memories);
 
         let mut promoted = 0usize;
 
@@ -333,9 +400,13 @@ impl ConsolidationEngine {
                 // stable cluster is re-promoted once per run — an episode_end
                 // hook firing per session turns that into unbounded duplicate
                 // growth in semantic memory.
-                if !already_promoted.insert((about_entity, most_recent.content.clone())) {
+                let key = (about_entity, most_recent.content.clone());
+                if let Some(guard) = already_promoted.get(&key)
+                    && !guard.admits(cluster.iter().map(|&idx| memories[idx].timestamp))
+                {
                     continue;
                 }
+                already_promoted.insert(key, PromotionGuard::Active);
 
                 let confidence = (cluster_size as f32 * 0.3).min(1.0);
                 let source_episodes: Vec<Uuid> = cluster
