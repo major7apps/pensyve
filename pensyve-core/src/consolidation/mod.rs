@@ -46,6 +46,7 @@
 //!   contract.
 
 pub mod dmem;
+pub mod gate;
 pub mod typed_slots;
 
 use std::collections::HashMap;
@@ -193,8 +194,49 @@ impl ConsolidationEngine {
     /// when the future is dropped, but checking inside an open transaction
     /// would risk committing a partial state. Cancel response time target
     /// is ≤500 ms (pre-reg §2 I5).
+    ///
+    /// Runs are serialized per namespace by [`gate::with_namespace_lock`]:
+    /// the promotion pass derives its idempotency guard from a snapshot of
+    /// the namespace and only then writes, so two overlapping runs would each
+    /// see an unpromoted namespace and mint the same row twice (#226). The
+    /// lock is taken here rather than at the call sites so no trigger path —
+    /// the periodic sweep, either `episode_end` spawn, or the on-demand
+    /// `/consolidate` endpoint — can bypass it, and so a future one inherits
+    /// it by default. A run on a *different* namespace is unaffected and
+    /// proceeds in parallel.
+    ///
+    /// This waits while another run for the same namespace is in flight, so
+    /// callers on an async runtime should dispatch through
+    /// `tokio::task::spawn_blocking`, as every gateway call site does. The
+    /// wait honors `cancel`: a caller signalled while queued returns
+    /// [`ConsolidationError::Cancelled`] rather than waiting out the run
+    /// ahead of it, which keeps the ≤500 ms I5 budget intact under
+    /// contention.
     #[tracing::instrument(skip_all, fields(namespace_id = %namespace_id))]
     pub fn run(
+        storage: &dyn StorageTrait,
+        embedder: &OnnxEmbedder,
+        config: &ConsolidationConfig,
+        namespace_id: Uuid,
+        policy: &NetworkPolicy,
+        cancel: &CancellationToken,
+    ) -> ConsolidationResult {
+        gate::with_namespace_lock(namespace_id, cancel, || {
+            Self::run_locked(storage, embedder, config, namespace_id, policy, cancel)
+        })
+        .unwrap_or_else(|| {
+            Err(ConsolidationError::Cancelled(
+                "cancelled while waiting for the namespace run slot".into(),
+            ))
+        })
+    }
+
+    /// The body of [`Self::run`], executed with the namespace's run lock held.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the public `run` signature it is split out of"
+    )]
+    fn run_locked(
         storage: &dyn StorageTrait,
         embedder: &OnnxEmbedder,
         config: &ConsolidationConfig,

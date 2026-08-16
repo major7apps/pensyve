@@ -1957,7 +1957,11 @@ async fn episode_end(
         let storage = ps.storage.clone();
         let embedder = ps.embedder.clone();
         let ns_id = ps.namespace.id;
-        tokio::spawn(async move {
+        // #226: `spawn_blocking`, not `spawn`. `ConsolidationEngine::run` is
+        // synchronous and now blocks while another run for this namespace is
+        // in flight, so running it on a runtime worker would park that worker
+        // for the duration of both.
+        tokio::task::spawn_blocking(move || {
             let config = pensyve_core::config::ConsolidationConfig::default();
             // G1/P3a: pass Disabled + fresh CancellationToken; this is a
             // fire-and-forget background spawn after episode_end with no
@@ -2051,16 +2055,33 @@ async fn consolidate(
     let ps = get_pensyve_state(&state, &auth_ctx)?;
 
     let config = pensyve_core::config::ConsolidationConfig::default();
-    // G1/P3a: pass Disabled + fresh CancellationToken. Synchronous REST
-    // path — no external cancel signal source today.
-    let consolidation_result = pensyve_core::consolidation::ConsolidationEngine::run(
-        ps.storage.as_ref(),
-        &ps.embedder,
-        &config,
-        ps.namespace.id,
-        &pensyve_core::network_policy::NetworkPolicy::Disabled,
-        &tokio_util::sync::CancellationToken::new(),
-    )
+    // #226: this on-demand endpoint is a fourth path into the engine, so it
+    // takes the same per-namespace run lock as the sweep and the `episode_end`
+    // spawns. Run it on the blocking pool: the engine is synchronous and may
+    // now wait on a run already in flight for this namespace, and a request
+    // handler must not park a runtime worker for that.
+    let run_storage = ps.storage.clone();
+    let run_embedder = ps.embedder.clone();
+    let ns_id = ps.namespace.id;
+    let consolidation_result = tokio::task::spawn_blocking(move || {
+        // G1/P3a: pass Disabled + fresh CancellationToken. Synchronous REST
+        // path — no external cancel signal source today.
+        pensyve_core::consolidation::ConsolidationEngine::run(
+            run_storage.as_ref(),
+            &run_embedder,
+            &config,
+            ns_id,
+            &pensyve_core::network_policy::NetworkPolicy::Disabled,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+    })
+    .await
+    .map_err(|e| {
+        RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Consolidation task failed: {e}"),
+        )
+    })?
     .map_err(|e| {
         RestError(
             StatusCode::INTERNAL_SERVER_ERROR,

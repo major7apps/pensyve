@@ -404,7 +404,11 @@ impl PensyveMcpServer {
             let storage = state.storage.clone();
             let embedder = state.embedder.clone();
             let ns_id = state.namespace.id;
-            tokio::spawn(async move {
+            // #226: `spawn_blocking`, not `spawn`. `ConsolidationEngine::run`
+            // is synchronous and now blocks while another run for this
+            // namespace is in flight, so running it on a runtime worker would
+            // park that worker for the duration of both.
+            tokio::task::spawn_blocking(move || {
                 let config = pensyve_core::config::ConsolidationConfig::default();
                 // G1/P3a: ConsolidationEngine::run gained `policy` + `cancel`.
                 // Engine performs no network calls today, so Disabled is the

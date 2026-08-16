@@ -397,11 +397,18 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
     spawn_runtime_stall_watchdog();
 
     // Background consolidation — runs every PENSYVE_CONSOLIDATION_INTERVAL_SECS (default 6h).
-    let consolidation_permits = Arc::new(tokio::sync::Semaphore::new(1));
+    //
+    // #226: this sweep used to hold a `Semaphore::new(1)` here. It never
+    // served its purpose. This task is the only acquirer — it walks namespaces
+    // sequentially and awaits each run before starting the next — so the
+    // permit was uncontended by construction, while the `episode_end` spawns
+    // it was meant to exclude never acquired it at all. Serialization now
+    // lives inside `ConsolidationEngine::run`, keyed on the namespace, which
+    // is the granularity the hazard actually has and which no call site can
+    // skip.
     let consolidation_cancel = ct.clone();
     tokio::spawn({
         let state = app_state;
-        let consolidation_permits = consolidation_permits.clone();
         async move {
             let interval_secs: u64 = std::env::var("PENSYVE_CONSOLIDATION_INTERVAL_SECS")
                 .ok()
@@ -426,11 +433,6 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                         let run_storage = storage.clone();
                         let run_embedder = embedder.clone();
                         let run_cancel = consolidation_cancel.clone();
-                        let Ok(_permit) = consolidation_permits.clone().acquire_owned().await
-                        else {
-                            tracing::warn!("Background consolidation semaphore closed");
-                            return;
-                        };
                         // G1/P3a: ConsolidationEngine::run gained `policy`
                         // + `cancel`. The engine performs no network calls
                         // today; pass Disabled (fail-closed) and the shared
