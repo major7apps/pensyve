@@ -1910,11 +1910,30 @@ impl PyPensyve {
             ));
         }
 
-        let count = self
+        // The capturing delete returns exactly the rows it removed, inside its
+        // own transaction — so the id set for index cleanup cannot race a
+        // concurrent writer the way a list-then-delete would, and it covers
+        // every deleted shape (`about_entity OR source_entity`, `subject OR
+        // object_entity`, superseded rows included) that the per-type
+        // `list_*_by_entity` accessors miss (#261).
+        let deleted = self
             .inner
             .storage
-            .delete_memories_by_entity(entity.uuid, self.inner.namespace.id)
+            .delete_memories_by_entity_capturing(entity.uuid, self.inner.namespace.id, &mut |_| {
+                Ok(())
+            })
             .map_err(|e| PyRuntimeError::new_err(format!("Forget failed: {e}")))?;
+        let count = deleted.len();
+
+        // Only after the delete commits — a failed delete must leave the index
+        // agreeing with storage. Rows that were never indexed (no embedding)
+        // return `NotFound`, which is not an error here.
+        {
+            let mut vi = self.inner.vector_index.lock().unwrap();
+            for memory in &deleted {
+                let _ = vi.remove(memory.id());
+            }
+        }
 
         let dict = PyDict::new(py);
         dict.set_item("forgotten_count", count)?;

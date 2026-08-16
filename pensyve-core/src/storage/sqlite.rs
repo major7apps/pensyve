@@ -1950,6 +1950,48 @@ impl StorageTrait for SqliteBackend {
         load_memories_by_namespace(&conn, namespace_id, true)
     }
 
+    /// Predicates are copied from [`Self::delete_memories_by_entity`] verbatim,
+    /// namespace included — see the trait docs for why that equality is the
+    /// contract rather than an implementation detail.
+    fn list_memories_by_entity_including_superseded(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Vec<Memory>> {
+        let conn = lock_conn!(self);
+        let id_str = entity_id.to_string();
+        let ns_str = namespace_id.to_string();
+        let mut memories = Vec::new();
+
+        let mut stmt = conn.prepare(
+            r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
+                      content_type, summary, embedding, context_intent, timestamp,
+                      stability, retrievability, access_count, last_accessed, event_time,
+                      agent_id, user_id, superseded_by, invalid_at
+               FROM episodic_memories
+               WHERE (about_entity = ?1 OR source_entity = ?1) AND namespace_id = ?2",
+        )?;
+        let rows = stmt.query_map(params![&id_str, &ns_str], row_to_episodic)?;
+        for row in rows {
+            memories.push(Memory::Episodic(row??));
+        }
+
+        let mut stmt = conn.prepare(
+            r"SELECT id, namespace_id, subject, predicate, object, content_type,
+                      object_entity, confidence, valid_at, invalid_at,
+                      source_episodes, embedding, stability, retrievability,
+                      agent_id, user_id, superseded_by
+               FROM semantic_memories
+               WHERE (subject = ?1 OR object_entity = ?1) AND namespace_id = ?2",
+        )?;
+        let rows = stmt.query_map(params![&id_str, &ns_str], row_to_semantic)?;
+        for row in rows {
+            memories.push(Memory::Semantic(row??));
+        }
+
+        Ok(memories)
+    }
+
     fn supersede_memory(
         &self,
         id: Uuid,
@@ -4005,6 +4047,110 @@ mod tests {
             1,
             "the other namespace's index entry must survive"
         );
+    }
+
+    /// The accessor callers use to collect vector-index ids before an
+    /// entity-wide forget must cover *exactly* what the delete removes (#261).
+    ///
+    /// Call sites used to assemble that set from `list_episodic_by_entity` and
+    /// `list_semantic_by_entity`, which look at `about_entity` and `subject`
+    /// alone and skip superseded rows. Every source-side episodic, object-side
+    /// semantic and superseded row therefore kept its index entry after its
+    /// base row was deleted.
+    #[test]
+    fn test_list_memories_by_entity_including_superseded_matches_the_delete_scope() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let foreign_ns = Namespace::new("other");
+        db.save_namespace(&foreign_ns).unwrap();
+        let entity_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+
+        // about-side episodic.
+        let about_side = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            other_id,
+            entity_id,
+            "about the target",
+        );
+        db.save_episodic(&about_side).unwrap();
+
+        // source-side episodic — the target spoke about someone else.
+        let source_side = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            entity_id,
+            other_id,
+            "sourced from the target",
+        );
+        db.save_episodic(&source_side).unwrap();
+
+        // subject-side semantic.
+        let subject_side = SemanticMemory::new(ns.id, entity_id, "likes", "rust", 0.9);
+        db.save_semantic(&subject_side).unwrap();
+
+        // object-side semantic — the target is the object of someone's fact.
+        let mut object_side = SemanticMemory::new(ns.id, other_id, "manages", "target", 0.9);
+        object_side.object_entity = Some(entity_id);
+        db.save_semantic(&object_side).unwrap();
+
+        // superseded — the delete ignores `superseded_by`, so this must too.
+        let superseded = SemanticMemory::new(ns.id, entity_id, "lived_in", "berlin", 0.5);
+        db.save_semantic(&superseded).unwrap();
+        db.supersede_memory(superseded.id, Uuid::new_v4(), Utc::now())
+            .unwrap();
+
+        // Decoys: a row for a different entity, and a same-entity row in a
+        // second namespace. Neither is in the delete's scope.
+        let other_entity =
+            EpisodicMemory::new(ns.id, Uuid::new_v4(), other_id, other_id, "no target");
+        db.save_episodic(&other_entity).unwrap();
+        let foreign = EpisodicMemory::new(
+            foreign_ns.id,
+            Uuid::new_v4(),
+            entity_id,
+            entity_id,
+            "another tenant's turn",
+        );
+        db.save_episodic(&foreign).unwrap();
+
+        let mut collected: Vec<Uuid> = db
+            .list_memories_by_entity_including_superseded(entity_id, ns.id)
+            .unwrap()
+            .iter()
+            .map(Memory::id)
+            .collect();
+        collected.sort();
+        let mut expected = vec![
+            about_side.id,
+            source_side.id,
+            subject_side.id,
+            object_side.id,
+            superseded.id,
+        ];
+        expected.sort();
+        assert_eq!(
+            collected, expected,
+            "the accessor must return every row the delete removes, and nothing else"
+        );
+
+        let deleted = db.delete_memories_by_entity(entity_id, ns.id).unwrap();
+        assert_eq!(
+            deleted,
+            collected.len(),
+            "the delete must remove exactly as many rows as the accessor reported"
+        );
+        assert!(
+            db.list_memories_by_entity_including_superseded(entity_id, ns.id)
+                .unwrap()
+                .is_empty(),
+            "nothing may remain in scope after the delete"
+        );
+
+        // Decoys survive.
+        assert!(db.get_episodic(other_entity.id).unwrap().is_some());
+        assert!(db.get_episodic(foreign.id).unwrap().is_some());
     }
 
     // -----------------------------------------------------------------------

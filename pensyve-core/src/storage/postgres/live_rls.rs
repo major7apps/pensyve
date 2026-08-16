@@ -352,6 +352,83 @@ fn seed(fixture: &Fixture, ns_a: &Namespace, ns_b: &Namespace) -> EpisodicMemory
     memory
 }
 
+/// What [`seed_entity_scope`] planted, split into the rows the entity-wide
+/// delete removes and the two controls it must leave alone.
+struct EntityScope {
+    entity_id: Uuid,
+    /// Every row `delete_memories_by_entity(entity_id, ns_a)` matches.
+    deletable: Vec<Uuid>,
+    /// A row in `ns_a` naming a different entity.
+    unrelated: Uuid,
+    /// A row in `ns_b` naming the *same* entity id — the collision the
+    /// namespace predicate has to disambiguate.
+    foreign: Uuid,
+}
+
+/// Seed one row of every shape `delete_memories_by_entity` matches into `ns_a`,
+/// plus the two controls. Both namespaces must already be saved.
+fn seed_entity_scope(backend: &PostgresBackend, ns_a: &Namespace, ns_b: &Namespace) -> EntityScope {
+    let entity_id = Uuid::new_v4();
+    let other_id = Uuid::new_v4();
+
+    let about_side = EpisodicMemory::new(ns_a.id, Uuid::new_v4(), other_id, entity_id, "about it");
+    backend.save_episodic(&about_side).expect("save about-side");
+
+    // The target spoke; the row is about someone else.
+    let source_side = EpisodicMemory::new(ns_a.id, Uuid::new_v4(), entity_id, other_id, "from it");
+    backend
+        .save_episodic(&source_side)
+        .expect("save source-side");
+
+    let subject_side = SemanticMemory::new(ns_a.id, entity_id, "likes", "rust", 0.9);
+    backend
+        .save_semantic(&subject_side)
+        .expect("save subject-side");
+
+    // The target is the *object* of someone else's fact.
+    let mut object_side = SemanticMemory::new(ns_a.id, other_id, "manages", "target", 0.9);
+    object_side.object_entity = Some(entity_id);
+    backend
+        .save_semantic(&object_side)
+        .expect("save object-side");
+
+    // The delete ignores `superseded_by`, so the listing must too.
+    let superseded = SemanticMemory::new(ns_a.id, entity_id, "lived_in", "berlin", 0.5);
+    backend.save_semantic(&superseded).expect("save superseded");
+    assert!(
+        backend
+            .supersede_memory(superseded.id, Uuid::new_v4(), Utc::now())
+            .expect("supersede must not error"),
+        "the superseded fixture row must actually be marked superseded"
+    );
+
+    let unrelated = EpisodicMemory::new(ns_a.id, Uuid::new_v4(), other_id, other_id, "no target");
+    backend
+        .save_episodic(&unrelated)
+        .expect("save unrelated row");
+    let foreign = EpisodicMemory::new(
+        ns_b.id,
+        Uuid::new_v4(),
+        entity_id,
+        entity_id,
+        "other tenant",
+    );
+    backend.save_episodic(&foreign).expect("save B's memory");
+
+    EntityScope {
+        entity_id,
+        deletable: vec![
+            about_side.id,
+            source_side.id,
+            subject_side.id,
+            object_side.id,
+            superseded.id,
+        ],
+        unrelated: unrelated.id,
+        foreign: foreign.id,
+    }
+}
+
 /// Count every `episodic_memories` row a connection scoped to `namespace_id`
 /// can see, with no `WHERE` clause — so the count reflects RLS alone, not a
 /// query's own namespace predicate.
@@ -964,6 +1041,80 @@ fn entity_delete_is_confined_to_its_namespace() {
             .expect("read namespace A")
             .is_empty(),
         "namespace A should be empty after the forget"
+    );
+}
+
+/// The accessor callers use to collect vector-index ids before an entity-wide
+/// forget must return exactly what [`entity_delete_is_confined_to_its_namespace`]
+/// deletes — every shape, superseded rows included, and only this namespace's
+/// (#261).
+///
+/// Postgres gets its own coverage because the two backends carry independent
+/// SQL for both halves. An accessor that under-collects here leaves stale
+/// vector-index entries; one that over-collects would hand a caller another
+/// tenant's memory ids.
+#[test]
+fn entity_scoped_listing_matches_the_delete_scope() {
+    let Some(admin_opts) = skip_notice("entity_scoped_listing_matches_the_delete_scope") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns_a = Namespace::new(format!("listing-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("listing-b-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns_a).expect("save namespace A");
+    backend.save_namespace(&ns_b).expect("save namespace B");
+    let seeded = seed_entity_scope(backend, &ns_a, &ns_b);
+    let entity_id = seeded.entity_id;
+
+    let mut collected = memory_ids(
+        &backend
+            .list_memories_by_entity_including_superseded(entity_id, ns_a.id)
+            .expect("entity-scoped listing must not error"),
+    );
+    collected.sort();
+    let mut expected = seeded.deletable.clone();
+    expected.sort();
+    assert_eq!(
+        collected, expected,
+        "the accessor must return every row the delete removes, and nothing else"
+    );
+
+    let deleted = backend
+        .delete_memories_by_entity(entity_id, ns_a.id)
+        .expect("forget in namespace A");
+    assert_eq!(
+        deleted,
+        collected.len(),
+        "the delete must remove exactly as many rows as the accessor reported"
+    );
+    assert!(
+        backend
+            .list_memories_by_entity_including_superseded(entity_id, ns_a.id)
+            .expect("re-listing must not error")
+            .is_empty(),
+        "nothing may remain in scope after the delete"
+    );
+
+    // Decoys survive.
+    assert_eq!(
+        memory_ids(
+            &backend
+                .get_all_memories_by_namespace(ns_a.id)
+                .expect("read namespace A")
+        ),
+        vec![seeded.unrelated],
+        "the unrelated row must survive"
+    );
+    assert_eq!(
+        memory_ids(
+            &backend
+                .get_all_memories_by_namespace(ns_b.id)
+                .expect("read namespace B")
+        ),
+        vec![seeded.foreign],
+        "namespace B's row must survive"
     );
 }
 
