@@ -70,6 +70,8 @@
 //! current deployment (policies present, not enforced), and a test that wants
 //! layer 2 calls [`Fixture::enforce_rls`] on top.
 
+use std::collections::HashMap;
+
 use chrono::Utc;
 use sqlx_core::query::query;
 use sqlx_core::query_as::query_as;
@@ -81,7 +83,9 @@ use uuid::Uuid;
 
 use super::PostgresBackend;
 use crate::storage::StorageTrait;
-use crate::types::{EpisodicMemory, Memory, Namespace, SemanticMemory};
+use crate::types::{
+    EpisodicMemory, Memory, Namespace, ObservationMemory, Outcome, ProceduralMemory, SemanticMemory,
+};
 
 /// Environment variable naming the admin connection string.
 ///
@@ -1126,6 +1130,207 @@ fn entity_scoped_listing_matches_the_delete_scope() {
         ),
         vec![seeded.foreign],
         "namespace B's row must survive"
+    );
+}
+
+/// Seed one live row of every memory kind into `namespace_id`, returning their
+/// ids. Both namespaces must already be saved.
+///
+/// All four kinds are planted deliberately: the purge is four separate
+/// `DELETE`s, so a test seeding only episodic rows would pass against an
+/// implementation that forgot three of them.
+fn seed_one_of_each_kind(backend: &PostgresBackend, namespace_id: Uuid, label: &str) -> Vec<Uuid> {
+    let episodic = EpisodicMemory::new(
+        namespace_id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        format!("{label} episodic"),
+    );
+    backend.save_episodic(&episodic).expect("save episodic");
+
+    let semantic = SemanticMemory::new(namespace_id, Uuid::new_v4(), "likes", label, 0.9);
+    backend.save_semantic(&semantic).expect("save semantic");
+
+    let procedural = ProceduralMemory::new(
+        namespace_id,
+        format!("{label} trigger"),
+        format!("{label} action"),
+        Outcome::Success,
+        HashMap::new(),
+    );
+    backend
+        .save_procedural(&procedural)
+        .expect("save procedural");
+
+    let observation = ObservationMemory::new(
+        namespace_id,
+        Uuid::new_v4(),
+        "kind",
+        label,
+        "did",
+        format!("{label} observation"),
+    );
+    backend
+        .save_observation(&observation)
+        .expect("save observation");
+
+    vec![episodic.id, semantic.id, procedural.id, observation.id]
+}
+
+/// Every id `namespace_id` still holds, superseded rows included, sorted.
+///
+/// Deliberately the *including-superseded* accessor: a purge is only complete
+/// if it leaves nothing at all behind, and the plain accessor filters
+/// `superseded_by IS NULL` — it cannot see the rows
+/// [`purge_namespace_counts_superseded_rows_like_sqlite`] is about.
+fn surviving_ids(backend: &PostgresBackend, namespace_id: Uuid) -> Vec<Uuid> {
+    let mut ids = memory_ids(
+        &backend
+            .get_all_memories_by_namespace_including_superseded(namespace_id)
+            .expect("read namespace including superseded"),
+    );
+    ids.sort();
+    ids
+}
+
+/// The namespace-wide purge behind the REST `purge_all_memories` handler must
+/// not reach across namespaces.
+///
+/// Same reasoning as [`entity_delete_is_confined_to_its_namespace`]: with RLS
+/// inert — the configuration every deployment runs today, because the backend
+/// connects as the schema owner — the explicit `namespace_id = $1` predicate in
+/// each `DELETE` is the only thing confining the purge.
+///
+/// All four memory kinds are seeded on both sides because the purge is four
+/// separate statements, and a single over-broad one would be invisible to a
+/// test that only planted episodic rows.
+#[test]
+fn purge_namespace_is_confined_to_its_namespace() {
+    let Some(admin_opts) = skip_notice("purge_namespace_is_confined_to_its_namespace") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns_a = Namespace::new(format!("purge-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("purge-b-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns_a).expect("save namespace A");
+    backend.save_namespace(&ns_b).expect("save namespace B");
+
+    let mine = seed_one_of_each_kind(backend, ns_a.id, "tenant-a");
+    let mut theirs = seed_one_of_each_kind(backend, ns_b.id, "tenant-b");
+    theirs.sort();
+
+    assert_eq!(
+        backend
+            .purge_namespace(ns_a.id)
+            .expect("purge namespace A must not error"),
+        mine.len(),
+        "the purge must report one deletion per memory row in its own namespace"
+    );
+
+    assert!(
+        surviving_ids(backend, ns_a.id).is_empty(),
+        "namespace A must hold nothing after its own purge"
+    );
+    assert_eq!(
+        surviving_ids(backend, ns_b.id),
+        theirs,
+        "namespace B's rows must survive a purge issued for namespace A"
+    );
+}
+
+/// The namespace-wide purge keeps working with RLS enforced.
+///
+/// [`purge_namespace_is_confined_to_its_namespace`] is the same contract with
+/// RLS inert, which is the configuration that ships. Both halves matter: the
+/// purge must still take effect in its own namespace once the policies apply
+/// (a purge that silently deletes nothing while returning `Ok(0)` is the
+/// failure mode #254 catalogued), and it must still stop at the boundary.
+#[test]
+fn purge_namespace_still_works_under_enforced_rls() {
+    let Some(admin_opts) = skip_notice("purge_namespace_still_works_under_enforced_rls") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns_a = Namespace::new(format!("purge-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("purge-b-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns_a).expect("save namespace A");
+    backend.save_namespace(&ns_b).expect("save namespace B");
+
+    let mine = seed_one_of_each_kind(backend, ns_a.id, "tenant-a");
+    let mut theirs = seed_one_of_each_kind(backend, ns_b.id, "tenant-b");
+    theirs.sort();
+
+    fixture.enforce_rls();
+
+    assert_eq!(
+        backend
+            .purge_namespace(ns_a.id)
+            .expect("purge namespace A must not error"),
+        mine.len(),
+        "the purge must take effect in its own namespace under enforced RLS"
+    );
+
+    assert!(
+        surviving_ids(backend, ns_a.id).is_empty(),
+        "namespace A must hold nothing after its own purge"
+    );
+    assert_eq!(
+        surviving_ids(backend, ns_b.id),
+        theirs,
+        "namespace B's rows must survive a purge issued for namespace A"
+    );
+}
+
+/// The purge must delete — and count — superseded rows, matching `SQLite`.
+///
+/// `SQLite`'s override (`sqlite.rs`) issues one `DELETE FROM <table> WHERE
+/// namespace_id = ?1` per memory table and sums `rows_affected`. Those
+/// statements carry no `superseded_by` filter, so the count is *every* row the
+/// namespace holds.
+///
+/// The trait default cannot match that. It purges by iterating
+/// `get_all_memories_by_namespace`, which filters `superseded_by IS NULL`, so
+/// a superseded row is neither counted nor deleted: the purge leaves tenant
+/// data behind and reports a total that says it did not. That makes this the
+/// test that distinguishes the backend override from the default — the other
+/// two pass either way.
+#[test]
+fn purge_namespace_counts_superseded_rows_like_sqlite() {
+    let Some(admin_opts) = skip_notice("purge_namespace_counts_superseded_rows_like_sqlite") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns = Namespace::new(format!("purge-superseded-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns).expect("save namespace");
+
+    let live = seed_one_of_each_kind(backend, ns.id, "live");
+
+    let superseded = SemanticMemory::new(ns.id, Uuid::new_v4(), "lived_in", "berlin", 0.5);
+    backend.save_semantic(&superseded).expect("save superseded");
+    assert!(
+        backend
+            .supersede_memory_in_namespace(superseded.id, ns.id, Uuid::new_v4(), Utc::now())
+            .expect("supersede must not error"),
+        "the superseded fixture row must actually be marked superseded"
+    );
+
+    assert_eq!(
+        backend
+            .purge_namespace(ns.id)
+            .expect("purge must not error"),
+        live.len() + 1,
+        "the purge must count the superseded row, as SQLite's set-based override does"
+    );
+    assert!(
+        surviving_ids(backend, ns.id).is_empty(),
+        "the purge must delete the superseded row, not just the live ones"
     );
 }
 
