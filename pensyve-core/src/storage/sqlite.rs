@@ -700,71 +700,60 @@ fn str_to_dt(s: &str) -> DateTime<Utc> {
 fn delete_memory_by_id_with_namespace(
     conn: &Connection,
     id: Uuid,
-    namespace_id: Option<Uuid>,
+    namespace_id: Uuid,
 ) -> StorageResult<bool> {
     let transaction = conn.unchecked_transaction()?;
     let id_str = id.to_string();
-    let namespace_id = namespace_id.map(|namespace_id| namespace_id.to_string());
+    let namespace_id = namespace_id.to_string();
     let mut deleted = false;
 
     let n = transaction.execute(
-        "DELETE FROM episodic_memories
-         WHERE id = ?1 AND (?2 IS NULL OR namespace_id = ?2)",
-        params![&id_str, namespace_id.as_deref()],
+        "DELETE FROM episodic_memories WHERE id = ?1 AND namespace_id = ?2",
+        params![&id_str, &namespace_id],
     )?;
     if n > 0 {
         deleted = true;
     }
 
     let n = transaction.execute(
-        "DELETE FROM semantic_memories
-         WHERE id = ?1 AND (?2 IS NULL OR namespace_id = ?2)",
-        params![&id_str, namespace_id.as_deref()],
+        "DELETE FROM semantic_memories WHERE id = ?1 AND namespace_id = ?2",
+        params![&id_str, &namespace_id],
     )?;
     if n > 0 {
         deleted = true;
     }
 
     let n = transaction.execute(
-        "DELETE FROM procedural_memories
-         WHERE id = ?1 AND (?2 IS NULL OR namespace_id = ?2)",
-        params![&id_str, namespace_id.as_deref()],
+        "DELETE FROM procedural_memories WHERE id = ?1 AND namespace_id = ?2",
+        params![&id_str, &namespace_id],
     )?;
     if n > 0 {
         deleted = true;
     }
 
     let n = transaction.execute(
-        "DELETE FROM observation_memories
-         WHERE id = ?1 AND (?2 IS NULL OR namespace_id = ?2)",
-        params![&id_str, namespace_id.as_deref()],
+        "DELETE FROM observation_memories WHERE id = ?1 AND namespace_id = ?2",
+        params![&id_str, &namespace_id],
     )?;
     if n > 0 {
         deleted = true;
         // Observations are the only memory type represented in the KG tables.
         transaction.execute(
-            "DELETE FROM kg_triples
-             WHERE passage_id = ?1 AND (?2 IS NULL OR namespace_id = ?2)",
-            params![&id_str, namespace_id.as_deref()],
+            "DELETE FROM kg_triples WHERE passage_id = ?1 AND namespace_id = ?2",
+            params![&id_str, &namespace_id],
         )?;
         transaction.execute(
             "DELETE FROM kg_passage_entities
              WHERE passage_id = ?1
-               AND (
-                   ?2 IS NULL
-                   OR entity_id IN (
-                       SELECT id FROM kg_entities WHERE namespace_id = ?2
-                   )
-               )",
-            params![&id_str, namespace_id.as_deref()],
+               AND entity_id IN (SELECT id FROM kg_entities WHERE namespace_id = ?2)",
+            params![&id_str, &namespace_id],
         )?;
     }
 
     if deleted {
         transaction.execute(
-            "DELETE FROM memory_fts
-             WHERE memory_id = ?1 AND (?2 IS NULL OR namespace_id = ?2)",
-            params![&id_str, namespace_id.as_deref()],
+            "DELETE FROM memory_fts WHERE memory_id = ?1 AND namespace_id = ?2",
+            params![&id_str, &namespace_id],
         )?;
     }
 
@@ -1104,7 +1093,11 @@ impl StorageTrait for SqliteBackend {
         Ok(())
     }
 
-    fn get_episodic(&self, id: Uuid) -> StorageResult<Option<EpisodicMemory>> {
+    fn get_episodic_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<EpisodicMemory>> {
         let conn = lock_conn!(self);
         let result = conn
             .query_row(
@@ -1112,8 +1105,8 @@ impl StorageTrait for SqliteBackend {
                           content_type, summary, embedding, context_intent, timestamp,
                           stability, retrievability, access_count, last_accessed, event_time,
                           agent_id, user_id, superseded_by, invalid_at
-                   FROM episodic_memories WHERE id = ?1",
-                params![id.to_string()],
+                   FROM episodic_memories WHERE id = ?1 AND namespace_id = ?2",
+                params![id.to_string(), namespace_id.to_string()],
                 row_to_episodic,
             )
             .optional()?;
@@ -1243,7 +1236,11 @@ impl StorageTrait for SqliteBackend {
         }
     }
 
-    fn get_semantic(&self, id: Uuid) -> StorageResult<Option<SemanticMemory>> {
+    fn get_semantic_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<SemanticMemory>> {
         let conn = lock_conn!(self);
         let result = conn
             .query_row(
@@ -1251,8 +1248,8 @@ impl StorageTrait for SqliteBackend {
                           object_entity, confidence, valid_at, invalid_at,
                           source_episodes, embedding, stability, retrievability,
                           agent_id, user_id, superseded_by
-                   FROM semantic_memories WHERE id = ?1",
-                params![id.to_string()],
+                   FROM semantic_memories WHERE id = ?1 AND namespace_id = ?2",
+                params![id.to_string(), namespace_id.to_string()],
                 row_to_semantic,
             )
             .optional()?;
@@ -1380,15 +1377,19 @@ impl StorageTrait for SqliteBackend {
         Ok(())
     }
 
-    fn get_procedural(&self, id: Uuid) -> StorageResult<Option<ProceduralMemory>> {
+    fn get_procedural_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<ProceduralMemory>> {
         let conn = lock_conn!(self);
         let result = conn
             .query_row(
                 r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
                           trial_count, success_count, source_episodes, embedding, created_at, last_used,
                           agent_id, user_id, superseded_by, invalid_at
-                   FROM procedural_memories WHERE id = ?1",
-                params![id.to_string()],
+                   FROM procedural_memories WHERE id = ?1 AND namespace_id = ?2",
+                params![id.to_string(), namespace_id.to_string()],
                 row_to_procedural,
             )
             .optional()?;
@@ -1489,15 +1490,19 @@ impl StorageTrait for SqliteBackend {
         }
     }
 
-    fn get_observation(&self, id: Uuid) -> StorageResult<Option<ObservationMemory>> {
+    fn get_observation_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<ObservationMemory>> {
         let conn = lock_conn!(self);
         let result = conn
             .query_row(
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
                           unit, content, embedding, confidence, event_time, created_at,
                           stability, retrievability, agent_id, user_id, superseded_by, invalid_at
-                   FROM observation_memories WHERE id = ?1",
-                params![id.to_string()],
+                   FROM observation_memories WHERE id = ?1 AND namespace_id = ?2",
+                params![id.to_string(), namespace_id.to_string()],
                 row_to_observation,
             )
             .optional()?;
@@ -1992,14 +1997,16 @@ impl StorageTrait for SqliteBackend {
         Ok(memories)
     }
 
-    fn supersede_memory(
+    fn supersede_memory_in_namespace(
         &self,
         id: Uuid,
+        namespace_id: Uuid,
         superseded_by: Uuid,
         invalid_at: DateTime<Utc>,
     ) -> StorageResult<bool> {
         let conn = lock_conn!(self);
         let id = id.to_string();
+        let namespace_id = namespace_id.to_string();
         let superseded_by = superseded_by.to_string();
         let invalid_at = invalid_at.to_rfc3339();
 
@@ -2012,9 +2019,9 @@ impl StorageTrait for SqliteBackend {
             let updated = conn.execute(
                 &format!(
                     "UPDATE {table} SET superseded_by = ?1, invalid_at = ?2 \
-                     WHERE id = ?3 AND superseded_by IS NULL"
+                     WHERE id = ?3 AND namespace_id = ?4 AND superseded_by IS NULL"
                 ),
-                params![&superseded_by, &invalid_at, &id],
+                params![&superseded_by, &invalid_at, &id, &namespace_id],
             )?;
             if updated > 0 {
                 return Ok(true);
@@ -2410,18 +2417,13 @@ impl StorageTrait for SqliteBackend {
         }
     }
 
-    fn delete_memory_by_id(&self, id: Uuid) -> StorageResult<bool> {
-        let conn = lock_conn!(self);
-        delete_memory_by_id_with_namespace(&conn, id, None)
-    }
-
     fn delete_memory_by_id_in_namespace(
         &self,
         id: Uuid,
         namespace_id: Uuid,
     ) -> StorageResult<bool> {
         let conn = lock_conn!(self);
-        delete_memory_by_id_with_namespace(&conn, id, Some(namespace_id))
+        delete_memory_by_id_with_namespace(&conn, id, namespace_id)
     }
 
     fn purge_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
@@ -3348,7 +3350,10 @@ mod tests {
         );
         db.save_episodic(&mem).unwrap();
 
-        let fetched = db.get_episodic(mem.id).unwrap().unwrap();
+        let fetched = db
+            .get_episodic_in_namespace(mem.id, ns.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.id, mem.id);
         assert_eq!(fetched.content, "the user prefers light theme");
         assert!((fetched.stability - 1.0).abs() < f32::EPSILON);
@@ -3421,7 +3426,10 @@ mod tests {
 
         db.update_episodic_access(mem.id, 0.8, 0.7).unwrap();
 
-        let fetched = db.get_episodic(mem.id).unwrap().unwrap();
+        let fetched = db
+            .get_episodic_in_namespace(mem.id, ns.id)
+            .unwrap()
+            .unwrap();
         assert!((fetched.stability - 0.8).abs() < 0.001);
         assert!((fetched.retrievability - 0.7).abs() < 0.001);
         assert_eq!(fetched.access_count, 1);
@@ -3456,11 +3464,14 @@ mod tests {
         mem.event_time = Some(when);
 
         db.save_episodic(&mem).unwrap();
-        let fetched = db.get_episodic(mem.id).unwrap().unwrap();
+        let fetched = db
+            .get_episodic_in_namespace(mem.id, ns.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             fetched.event_time,
             Some(when),
-            "event_time must round-trip through save_episodic/get_episodic"
+            "event_time must round-trip through save_episodic/get_episodic_in_namespace"
         );
     }
 
@@ -3484,7 +3495,10 @@ mod tests {
         );
 
         db.save_episodic(&mem).unwrap();
-        let fetched = db.get_episodic(mem.id).unwrap().unwrap();
+        let fetched = db
+            .get_episodic_in_namespace(mem.id, ns.id)
+            .unwrap()
+            .unwrap();
         assert!(
             fetched.event_time.is_none(),
             "event_time must stay None through save/get when not set at construction"
@@ -3494,7 +3508,7 @@ mod tests {
     #[test]
     fn test_list_episodic_by_entity_preserves_event_time() {
         // list_episodic_by_entity has its own SELECT statement separate
-        // from get_episodic — must also read event_time.
+        // from get_episodic_in_namespace — must also read event_time.
         let (_dir, db) = setup();
         let ns = make_namespace(&db);
         let about = Uuid::new_v4();
@@ -3534,7 +3548,10 @@ mod tests {
         let mem = SemanticMemory::new(ns.id, subject, "speaks", "Rust", 0.95);
         db.save_semantic(&mem).unwrap();
 
-        let fetched = db.get_semantic(mem.id).unwrap().unwrap();
+        let fetched = db
+            .get_semantic_in_namespace(mem.id, ns.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.id, mem.id);
         assert_eq!(fetched.predicate, "speaks");
         assert_eq!(fetched.object, "Rust");
@@ -3570,7 +3587,7 @@ mod tests {
         db.save_semantic(&mem).unwrap();
 
         assert!(
-            db.get_semantic(mem.id)
+            db.get_semantic_in_namespace(mem.id, ns.id)
                 .unwrap()
                 .unwrap()
                 .invalid_at
@@ -3578,7 +3595,7 @@ mod tests {
         );
         db.invalidate_semantic(mem.id).unwrap();
         assert!(
-            db.get_semantic(mem.id)
+            db.get_semantic_in_namespace(mem.id, ns.id)
                 .unwrap()
                 .unwrap()
                 .invalid_at
@@ -3604,7 +3621,10 @@ mod tests {
         );
         db.save_procedural(&mem).unwrap();
 
-        let fetched = db.get_procedural(mem.id).unwrap().unwrap();
+        let fetched = db
+            .get_procedural_in_namespace(mem.id, ns.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.id, mem.id);
         assert_eq!(fetched.trigger, "on_timeout");
         assert_eq!(fetched.action, "retry_with_backoff");
@@ -3630,7 +3650,10 @@ mod tests {
         db.update_procedural_reliability(mem.id, 0.75, 4, 3)
             .unwrap();
 
-        let fetched = db.get_procedural(mem.id).unwrap().unwrap();
+        let fetched = db
+            .get_procedural_in_namespace(mem.id, ns.id)
+            .unwrap()
+            .unwrap();
         assert!((fetched.reliability - 0.75).abs() < 0.001);
         assert_eq!(fetched.trial_count, 4);
         assert_eq!(fetched.success_count, 3);
@@ -3793,8 +3816,16 @@ mod tests {
         assert!(deleted > 0);
 
         // Verify gone from storage.
-        assert!(db.get_episodic(mem1.id).unwrap().is_none());
-        assert!(db.get_semantic(mem2.id).unwrap().is_none());
+        assert!(
+            db.get_episodic_in_namespace(mem1.id, ns.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_semantic_in_namespace(mem2.id, ns.id)
+                .unwrap()
+                .is_none()
+        );
 
         // Verify gone from FTS.
         let fts_ep = db.search_fts("delete me episodic", ns.id, 10).unwrap();
@@ -3850,7 +3881,9 @@ mod tests {
         db.delete_memories_by_entity(object_id, ns.id).unwrap();
 
         assert!(
-            db.get_semantic(fact.id).unwrap().is_none(),
+            db.get_semantic_in_namespace(fact.id, ns.id)
+                .unwrap()
+                .is_none(),
             "the object-side row itself is deleted"
         );
         assert_eq!(
@@ -3957,11 +3990,15 @@ mod tests {
         db.delete_memories_by_entity(entity_id, ns.id).unwrap();
 
         assert!(
-            db.get_episodic(shared_id).unwrap().is_none(),
+            db.get_episodic_in_namespace(shared_id, ns.id)
+                .unwrap()
+                .is_none(),
             "the forgotten episodic row is deleted"
         );
         assert!(
-            db.get_semantic(shared_id).unwrap().is_some(),
+            db.get_semantic_in_namespace(shared_id, ns.id)
+                .unwrap()
+                .is_some(),
             "the unrelated semantic row is not attached to the entity"
         );
         let hits = db
@@ -4027,14 +4064,26 @@ mod tests {
             deleted, 2,
             "only the owning namespace's two rows are deleted"
         );
-        assert!(db.get_episodic(mine.id).unwrap().is_none());
-        assert!(db.get_semantic(my_fact.id).unwrap().is_none());
         assert!(
-            db.get_episodic(theirs.id).unwrap().is_some(),
+            db.get_episodic_in_namespace(mine.id, owner_ns.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_semantic_in_namespace(my_fact.id, owner_ns.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_episodic_in_namespace(theirs.id, foreign_ns.id)
+                .unwrap()
+                .is_some(),
             "the other namespace's episodic row must survive"
         );
         assert!(
-            db.get_semantic(their_fact.id).unwrap().is_some(),
+            db.get_semantic_in_namespace(their_fact.id, foreign_ns.id)
+                .unwrap()
+                .is_some(),
             "the other namespace's object-side fact must survive"
         );
         assert_eq!(
@@ -4098,7 +4147,7 @@ mod tests {
         // superseded — the delete ignores `superseded_by`, so this must too.
         let superseded = SemanticMemory::new(ns.id, entity_id, "lived_in", "berlin", 0.5);
         db.save_semantic(&superseded).unwrap();
-        db.supersede_memory(superseded.id, Uuid::new_v4(), Utc::now())
+        db.supersede_memory_in_namespace(superseded.id, ns.id, Uuid::new_v4(), Utc::now())
             .unwrap();
 
         // Decoys: a row for a different entity, and a same-entity row in a
@@ -4149,8 +4198,16 @@ mod tests {
         );
 
         // Decoys survive.
-        assert!(db.get_episodic(other_entity.id).unwrap().is_some());
-        assert!(db.get_episodic(foreign.id).unwrap().is_some());
+        assert!(
+            db.get_episodic_in_namespace(other_entity.id, ns.id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.get_episodic_in_namespace(foreign.id, foreign_ns.id)
+                .unwrap()
+                .is_some()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4228,7 +4285,10 @@ mod tests {
         mem.content_type = ContentType::Code;
         db.save_episodic(&mem).unwrap();
 
-        let fetched = db.get_episodic(mem.id).unwrap().unwrap();
+        let fetched = db
+            .get_episodic_in_namespace(mem.id, ns.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.content_type, ContentType::Code);
     }
 
@@ -4241,7 +4301,10 @@ mod tests {
         mem.content_type = ContentType::Image;
         db.save_semantic(&mem).unwrap();
 
-        let fetched = db.get_semantic(mem.id).unwrap().unwrap();
+        let fetched = db
+            .get_semantic_in_namespace(mem.id, ns.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.content_type, ContentType::Image);
     }
 
@@ -4259,7 +4322,10 @@ mod tests {
         );
         db.save_episodic(&mem).unwrap();
 
-        let fetched = db.get_episodic(mem.id).unwrap().unwrap();
+        let fetched = db
+            .get_episodic_in_namespace(mem.id, ns.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.content_type, ContentType::Text);
     }
 
@@ -4301,7 +4367,10 @@ mod tests {
         obs.embedding = vec![0.1, 0.2, 0.3];
         db.save_observation(&obs).unwrap();
 
-        let fetched = db.get_observation(obs.id).unwrap().unwrap();
+        let fetched = db
+            .get_observation_in_namespace(obs.id, ns.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.id, obs.id);
         assert_eq!(fetched.episode_id, episode_id);
         assert_eq!(fetched.entity_type, "game_played");
@@ -4316,7 +4385,9 @@ mod tests {
     #[test]
     fn test_observation_missing_returns_none() {
         let (_dir, db) = setup();
-        let result = db.get_observation(Uuid::new_v4()).unwrap();
+        let result = db
+            .get_observation_in_namespace(Uuid::new_v4(), Uuid::new_v4())
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -4505,7 +4576,7 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_memory_by_id_handles_observation() {
+    fn test_delete_memory_by_id_in_namespace_handles_observation() {
         let (_dir, db) = setup();
         let ns = make_namespace(&db);
         let ep = Uuid::new_v4();
@@ -4514,9 +4585,13 @@ mod tests {
         db.save_observation(&obs).unwrap();
         let obs_id = obs.id;
 
-        let deleted = db.delete_memory_by_id(obs_id).unwrap();
+        let deleted = db.delete_memory_by_id_in_namespace(obs_id, ns.id).unwrap();
         assert!(deleted);
-        assert!(db.get_observation(obs_id).unwrap().is_none());
+        assert!(
+            db.get_observation_in_namespace(obs_id, ns.id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -4534,7 +4609,11 @@ mod tests {
             .unwrap();
 
         assert!(!deleted);
-        assert!(db.get_observation(obs.id).unwrap().is_some());
+        assert!(
+            db.get_observation_in_namespace(obs.id, owner_ns.id)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -4547,7 +4626,140 @@ mod tests {
         let deleted = db.delete_memory_by_id_in_namespace(obs.id, ns.id).unwrap();
 
         assert!(deleted);
-        assert!(db.get_observation(obs.id).unwrap().is_none());
+        assert!(
+            db.get_observation_in_namespace(obs.id, ns.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Every by-id read carries its namespace in the SQL, so one tenant's id
+    /// resolves to nothing for another (#254).
+    ///
+    /// Hosted `SQLite` puts every tenant in one file, so there is no second
+    /// layer here the way Postgres has row-level security: the predicate is
+    /// the whole of the isolation (#247). All four memory shapes are covered
+    /// because the REST `load_memory` helper and recall's candidate hydration
+    /// walk the same chain, and a single unscoped arm reopens the leak for
+    /// whichever shape it reads.
+    #[test]
+    fn test_memory_reads_are_confined_to_their_namespace() {
+        let (_dir, db) = setup();
+        let owner_ns = make_namespace(&db);
+        let foreign_ns = Namespace::new("other");
+        db.save_namespace(&foreign_ns).unwrap();
+
+        let episodic = EpisodicMemory::new(
+            owner_ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "tenant A turn",
+        );
+        db.save_episodic(&episodic).unwrap();
+        let semantic = SemanticMemory::new(owner_ns.id, Uuid::new_v4(), "likes", "rust", 0.9);
+        db.save_semantic(&semantic).unwrap();
+        let procedural = ProceduralMemory::new(
+            owner_ns.id,
+            "on_timeout",
+            "retry",
+            Outcome::Success,
+            HashMap::new(),
+        );
+        db.save_procedural(&procedural).unwrap();
+        let observation =
+            ObservationMemory::new(owner_ns.id, Uuid::new_v4(), "x", "y", "z", "content");
+        db.save_observation(&observation).unwrap();
+
+        assert!(
+            db.get_episodic_in_namespace(episodic.id, foreign_ns.id)
+                .unwrap()
+                .is_none(),
+            "an episodic row must not resolve through a foreign namespace"
+        );
+        assert!(
+            db.get_semantic_in_namespace(semantic.id, foreign_ns.id)
+                .unwrap()
+                .is_none(),
+            "a semantic row must not resolve through a foreign namespace"
+        );
+        assert!(
+            db.get_procedural_in_namespace(procedural.id, foreign_ns.id)
+                .unwrap()
+                .is_none(),
+            "a procedural row must not resolve through a foreign namespace"
+        );
+        assert!(
+            db.get_observation_in_namespace(observation.id, foreign_ns.id)
+                .unwrap()
+                .is_none(),
+            "an observation row must not resolve through a foreign namespace"
+        );
+
+        // The owning namespace still sees all four, so the predicate filters
+        // by namespace rather than matching nothing.
+        assert!(
+            db.get_episodic_in_namespace(episodic.id, owner_ns.id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.get_semantic_in_namespace(semantic.id, owner_ns.id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.get_procedural_in_namespace(procedural.id, owner_ns.id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.get_observation_in_namespace(observation.id, owner_ns.id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Supersession is a write, so an unscoped one is worse than a stray read:
+    /// it stamps another tenant's live row as invalid and hands the caller a
+    /// `true` that a REST client reads as its own edit landing (#254).
+    #[test]
+    fn test_supersede_memory_in_namespace_is_confined_to_its_namespace() {
+        let (_dir, db) = setup();
+        let owner_ns = make_namespace(&db);
+        let foreign_ns = Namespace::new("other");
+        db.save_namespace(&foreign_ns).unwrap();
+
+        let mem = SemanticMemory::new(owner_ns.id, Uuid::new_v4(), "drinks", "tea", 0.9);
+        db.save_semantic(&mem).unwrap();
+
+        assert!(
+            !db.supersede_memory_in_namespace(mem.id, foreign_ns.id, Uuid::new_v4(), Utc::now())
+                .unwrap(),
+            "a foreign namespace must not stamp another namespace's row"
+        );
+        assert!(
+            db.get_semantic_in_namespace(mem.id, owner_ns.id)
+                .unwrap()
+                .unwrap()
+                .superseded_by
+                .is_none(),
+            "the row must still be live after the cross-namespace attempt"
+        );
+
+        let successor = Uuid::new_v4();
+        assert!(
+            db.supersede_memory_in_namespace(mem.id, owner_ns.id, successor, Utc::now())
+                .unwrap(),
+            "the owning namespace must still be able to supersede"
+        );
+        assert_eq!(
+            db.get_semantic_in_namespace(mem.id, owner_ns.id)
+                .unwrap()
+                .unwrap()
+                .superseded_by,
+            Some(successor)
+        );
     }
 
     #[test]
@@ -4618,8 +4830,16 @@ mod tests {
         let result = db.delete_memory_by_id_in_namespace(shared_id, ns.id);
 
         assert!(result.is_err());
-        assert!(db.get_episodic(shared_id).unwrap().is_some());
-        assert!(db.get_semantic(shared_id).unwrap().is_some());
+        assert!(
+            db.get_episodic_in_namespace(shared_id, ns.id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.get_semantic_in_namespace(shared_id, ns.id)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -4771,7 +4991,7 @@ mod tests {
     // contract. The cascade paths we exercise are:
     //   - delete_observations_by_episode
     //   - delete_observations_by_entity
-    //   - delete_memory_by_id (observation case)
+    //   - delete_memory_by_id_in_namespace (observation case)
     //   - purge_namespace
     // -----------------------------------------------------------------------
 
@@ -4938,7 +5158,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_memory_by_id_cascades_kg_rows_for_observation() {
+    fn delete_memory_by_id_in_namespace_cascades_kg_rows_for_observation() {
         let (_dir, db) = setup();
         let ns = make_namespace(&db);
         let ep = Uuid::new_v4();
@@ -4950,18 +5170,18 @@ mod tests {
         let o = seed_kg_entity(&db, ns.id, "O");
         seed_kg_triple(&db, ns.id, obs.id, s, o);
 
-        let deleted = db.delete_memory_by_id(obs.id).unwrap();
+        let deleted = db.delete_memory_by_id_in_namespace(obs.id, ns.id).unwrap();
         assert!(deleted);
 
         assert_eq!(
             kg_triples_count_for_passage(&db, obs.id),
             0,
-            "kg_triples must cascade with delete_memory_by_id(observation)"
+            "kg_triples must cascade with delete_memory_by_id_in_namespace(observation)"
         );
         assert_eq!(
             kg_passage_entities_count_for_passage(&db, obs.id),
             0,
-            "kg_passage_entities must cascade with delete_memory_by_id(observation)"
+            "kg_passage_entities must cascade with delete_memory_by_id_in_namespace(observation)"
         );
         // Namespace-scoped entities survive.
         assert_eq!(kg_entities_count_for_namespace(&db, ns.id), 2);
@@ -5019,7 +5239,10 @@ mod tests {
         episodic.superseded_by = Some(successor);
         episodic.invalid_at = Some(invalid_at);
         db.save_episodic(&episodic).unwrap();
-        let episodic_read = db.get_episodic(episodic.id).unwrap().unwrap();
+        let episodic_read = db
+            .get_episodic_in_namespace(episodic.id, ns.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(episodic_read.superseded_by, Some(successor));
         assert_eq!(episodic_read.invalid_at, Some(invalid_at));
 
@@ -5027,7 +5250,10 @@ mod tests {
         semantic.superseded_by = Some(successor);
         semantic.invalid_at = Some(invalid_at);
         db.save_semantic(&semantic).unwrap();
-        let semantic_read = db.get_semantic(semantic.id).unwrap().unwrap();
+        let semantic_read = db
+            .get_semantic_in_namespace(semantic.id, ns.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(semantic_read.superseded_by, Some(successor));
         assert_eq!(semantic_read.invalid_at, Some(invalid_at));
 
@@ -5036,7 +5262,10 @@ mod tests {
         procedural.superseded_by = Some(successor);
         procedural.invalid_at = Some(invalid_at);
         db.save_procedural(&procedural).unwrap();
-        let procedural_read = db.get_procedural(procedural.id).unwrap().unwrap();
+        let procedural_read = db
+            .get_procedural_in_namespace(procedural.id, ns.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(procedural_read.superseded_by, Some(successor));
         assert_eq!(procedural_read.invalid_at, Some(invalid_at));
 
@@ -5051,7 +5280,10 @@ mod tests {
         observation.superseded_by = Some(successor);
         observation.invalid_at = Some(invalid_at);
         db.save_observation(&observation).unwrap();
-        let observation_read = db.get_observation(observation.id).unwrap().unwrap();
+        let observation_read = db
+            .get_observation_in_namespace(observation.id, ns.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(observation_read.superseded_by, Some(successor));
         assert_eq!(observation_read.invalid_at, Some(invalid_at));
     }
@@ -5125,7 +5357,10 @@ mod tests {
             (old_procedural.id, new_procedural.id),
             (old_observation.id, new_observation.id),
         ] {
-            assert!(db.supersede_memory(old_id, new_id, Utc::now()).unwrap());
+            assert!(
+                db.supersede_memory_in_namespace(old_id, ns.id, new_id, Utc::now())
+                    .unwrap()
+            );
         }
 
         assert_eq!(db.count_memories_by_namespace(ns.id).unwrap(), (1, 1, 1));
@@ -5170,7 +5405,10 @@ mod tests {
         let new = SemanticMemory::new(ns.id, subject, "currenttoken", "value", 0.9);
         db.save_semantic(&old).unwrap();
         db.save_semantic(&new).unwrap();
-        assert!(db.supersede_memory(old.id, new.id, Utc::now()).unwrap());
+        assert!(
+            db.supersede_memory_in_namespace(old.id, ns.id, new.id, Utc::now())
+                .unwrap()
+        );
 
         let live = db.get_all_memories_by_namespace(ns.id).unwrap();
         assert_eq!(live.len(), 1);

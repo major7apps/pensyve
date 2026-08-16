@@ -385,27 +385,38 @@ fn memory_superseded_by(memory: &Memory) -> Option<Uuid> {
     }
 }
 
-fn load_memory(storage: &dyn StorageTrait, id: Uuid) -> Result<Option<Memory>, RestError> {
+/// Resolve a memory by id within `namespace_id`, trying each memory table in
+/// turn.
+///
+/// Every lookup carries the namespace, so a memory owned by another tenant is
+/// simply not found. That is a property of the query rather than of a check the
+/// caller remembers to make, and it is what keeps this path working once
+/// Postgres row-level security is enforced (#254).
+fn load_memory(
+    storage: &dyn StorageTrait,
+    id: Uuid,
+    namespace_id: Uuid,
+) -> Result<Option<Memory>, RestError> {
     if let Some(memory) = storage
-        .get_episodic(id)
+        .get_episodic_in_namespace(id, namespace_id)
         .map_err(|err| storage_fetch_error(&err))?
     {
         return Ok(Some(Memory::Episodic(memory)));
     }
     if let Some(memory) = storage
-        .get_semantic(id)
+        .get_semantic_in_namespace(id, namespace_id)
         .map_err(|err| storage_fetch_error(&err))?
     {
         return Ok(Some(Memory::Semantic(memory)));
     }
     if let Some(memory) = storage
-        .get_procedural(id)
+        .get_procedural_in_namespace(id, namespace_id)
         .map_err(|err| storage_fetch_error(&err))?
     {
         return Ok(Some(Memory::Procedural(memory)));
     }
     if let Some(memory) = storage
-        .get_observation(id)
+        .get_observation_in_namespace(id, namespace_id)
         .map_err(|err| storage_fetch_error(&err))?
     {
         return Ok(Some(Memory::Observation(memory)));
@@ -608,25 +619,15 @@ async fn perform_supersession(
     requested_content: Option<String>,
     confidence: Option<f64>,
 ) -> Result<SupersedeMemoryResponse, RestError> {
-    let old = load_memory(ps.storage.as_ref(), memory_id)?.ok_or_else(|| {
+    // The lookup is namespace-scoped, so another tenant's memory is already a
+    // 404 here rather than something to compare after the fact.
+    let old = load_memory(ps.storage.as_ref(), memory_id, ps.namespace.id)?.ok_or_else(|| {
         RestError(
             StatusCode::NOT_FOUND,
             format!("Memory {memory_id} not found"),
         )
     })?;
 
-    let old_namespace = match &old {
-        Memory::Episodic(memory) => memory.namespace_id,
-        Memory::Semantic(memory) => memory.namespace_id,
-        Memory::Procedural(memory) => memory.namespace_id,
-        Memory::Observation(memory) => memory.namespace_id,
-    };
-    if old_namespace != ps.namespace.id {
-        return Err(RestError(
-            StatusCode::NOT_FOUND,
-            format!("Memory {memory_id} not found"),
-        ));
-    }
     if memory_superseded_by(&old).is_some() {
         return Err(RestError(
             StatusCode::CONFLICT,
@@ -659,7 +660,7 @@ async fn perform_supersession(
     save_memory(ps.storage.as_ref(), &new)?;
     let stamped = ps
         .storage
-        .supersede_memory(memory_id, new_id, Utc::now())
+        .supersede_memory_in_namespace(memory_id, ps.namespace.id, new_id, Utc::now())
         .map_err(|err| {
             RestError(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -667,7 +668,10 @@ async fn perform_supersession(
             )
         })?;
     if !stamped {
-        if let Err(err) = ps.storage.delete_memory_by_id(new_id) {
+        if let Err(err) = ps
+            .storage
+            .delete_memory_by_id_in_namespace(new_id, ps.namespace.id)
+        {
             tracing::warn!(
                 "Supersession race rollback failed for old memory {memory_id} and replacement {new_id}: {err}"
             );

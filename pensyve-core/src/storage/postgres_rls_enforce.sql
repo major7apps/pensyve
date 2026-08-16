@@ -20,9 +20,12 @@
 -- not will not error: it will silently read nothing and delete nothing.
 --
 -- Do not apply this until every `StorageTrait` call site in the deployment
--- passes a namespace. `enforced_rls_fails_closed_for_unscoped_methods` in
--- `postgres/live_rls.rs` enumerates the methods that still do not, and is the
--- gate on this file becoming the default. Tracked by #254.
+-- passes a namespace. The memory read, supersede and delete-by-id paths do as
+-- of #254 — `postgres/live_rls.rs` gates each of them under enforcement — but
+-- part of the surface still does not, and the application still connects as an
+-- owner role that a managed Postgres usually also grants `BYPASSRLS`, which
+-- exempts it from the policies regardless of FORCE. `docs/SECURITY.md`
+-- enumerates both. Tracked by #254.
 --
 -- Rollback
 -- --------

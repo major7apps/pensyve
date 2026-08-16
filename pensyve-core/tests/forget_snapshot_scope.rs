@@ -102,7 +102,12 @@ fn seed() -> Fixture {
     labels.insert(superseded_episodic.id, "episodic superseded");
     storage.save_episodic(&superseded_episodic).unwrap();
     storage
-        .supersede_memory(superseded_episodic.id, Uuid::new_v4(), chrono::Utc::now())
+        .supersede_memory_in_namespace(
+            superseded_episodic.id,
+            namespace.id,
+            Uuid::new_v4(),
+            chrono::Utc::now(),
+        )
         .unwrap();
 
     // --- in delete scope: semantic_memories WHERE subject OR object_entity
@@ -124,7 +129,12 @@ fn seed() -> Fixture {
     labels.insert(superseded_semantic.id, "semantic superseded");
     storage.save_semantic(&superseded_semantic).unwrap();
     storage
-        .supersede_memory(superseded_semantic.id, Uuid::new_v4(), chrono::Utc::now())
+        .supersede_memory_in_namespace(
+            superseded_semantic.id,
+            namespace.id,
+            Uuid::new_v4(),
+            chrono::Utc::now(),
+        )
         .unwrap();
 
     // --- controls: outside delete scope, must survive and must NOT be snapshotted

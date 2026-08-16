@@ -1187,11 +1187,15 @@ impl<'a> RecallEngine<'a> {
         }
         for (id, _) in &vector_hits {
             if !candidates.contains_key(id) {
-                if let Ok(Some(m)) = self.storage.get_episodic(*id) {
+                if let Ok(Some(m)) = self.storage.get_episodic_in_namespace(*id, namespace_id) {
                     candidates.insert(*id, Memory::Episodic(m));
-                } else if let Ok(Some(m)) = self.storage.get_semantic(*id) {
+                } else if let Ok(Some(m)) =
+                    self.storage.get_semantic_in_namespace(*id, namespace_id)
+                {
                     candidates.insert(*id, Memory::Semantic(m));
-                } else if let Ok(Some(m)) = self.storage.get_procedural(*id) {
+                } else if let Ok(Some(m)) =
+                    self.storage.get_procedural_in_namespace(*id, namespace_id)
+                {
                     candidates.insert(*id, Memory::Procedural(m));
                 }
             }
@@ -1255,11 +1259,15 @@ impl<'a> RecallEngine<'a> {
             // Hydrate vector hits into candidate map.
             for (id, _) in &entity_hits {
                 if !candidates.contains_key(id) {
-                    if let Ok(Some(m)) = self.storage.get_episodic(*id) {
+                    if let Ok(Some(m)) = self.storage.get_episodic_in_namespace(*id, namespace_id) {
                         candidates.insert(*id, Memory::Episodic(m));
-                    } else if let Ok(Some(m)) = self.storage.get_semantic(*id) {
+                    } else if let Ok(Some(m)) =
+                        self.storage.get_semantic_in_namespace(*id, namespace_id)
+                    {
                         candidates.insert(*id, Memory::Semantic(m));
-                    } else if let Ok(Some(m)) = self.storage.get_procedural(*id) {
+                    } else if let Ok(Some(m)) =
+                        self.storage.get_procedural_in_namespace(*id, namespace_id)
+                    {
                         candidates.insert(*id, Memory::Procedural(m));
                     }
                 }
@@ -1289,11 +1297,15 @@ impl<'a> RecallEngine<'a> {
         // Hydrate broad vector hits into candidate map.
         for (id, _) in &broad_vector_hits {
             if !candidates.contains_key(id) {
-                if let Ok(Some(m)) = self.storage.get_episodic(*id) {
+                if let Ok(Some(m)) = self.storage.get_episodic_in_namespace(*id, namespace_id) {
                     candidates.insert(*id, Memory::Episodic(m));
-                } else if let Ok(Some(m)) = self.storage.get_semantic(*id) {
+                } else if let Ok(Some(m)) =
+                    self.storage.get_semantic_in_namespace(*id, namespace_id)
+                {
                     candidates.insert(*id, Memory::Semantic(m));
-                } else if let Ok(Some(m)) = self.storage.get_procedural(*id) {
+                } else if let Ok(Some(m)) =
+                    self.storage.get_procedural_in_namespace(*id, namespace_id)
+                {
                     candidates.insert(*id, Memory::Procedural(m));
                 }
             }
@@ -1926,7 +1938,7 @@ mod tests {
         assert!(!result.memories.is_empty());
 
         // Fetch the memory again and check access_count increased.
-        let updated = storage.get_episodic(mem.id).unwrap();
+        let updated = storage.get_episodic_in_namespace(mem.id, ns.id).unwrap();
         let updated_access = updated.map(|m| m.access_count).unwrap_or(0);
         assert!(
             updated_access > initial_access,

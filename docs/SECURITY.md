@@ -82,19 +82,31 @@ every startup.
 
 Enforcement fails closed, and it fails without raising an error. A query path
 that does not carry a namespace returns no rows, and a delete on that path
-deletes nothing while still returning `Ok`. It does not claim a deletion:
-`delete_memory_by_id` returns `Ok(false)`. The hazard is that the call succeeds
-at all, so a caller that only checks for an error treats a no-op as a completed
-erase. Several `StorageTrait` methods still take no `namespace_id` and run
-unscoped, including the ones behind recall candidate hydration and memory
-supersession. Entity forget left that list in #256, when
-`delete_memories_by_entity` gained a `namespace_id`. GDPR erase is partly off
-it: #256 scoped its memory deletion only, and its observation, graph-edge and
-entity-record steps still match on the entity id alone. Those three are tracked
-by #254 with the rest of the unscoped surface.
-The test `enforced_rls_fails_closed_for_unscoped_methods` in
-`pensyve-core/src/storage/postgres/live_rls.rs` lists them, and the list must
-be empty before enforcement becomes the default.
+deletes nothing while still returning `Ok`. The hazard is that the call
+succeeds at all, so a caller that only checks for an error treats a no-op as a
+completed erase.
+
+The memory read, supersede and delete-by-id paths no longer have that problem.
+Recall candidate hydration, memory supersession and delete-by-id took no
+`namespace_id` until #254, which replaced each with an `_in_namespace` variant;
+entity forget left the same list in #256. `live_rls.rs` now gates each of them
+under enforcement directly, in
+`scoped_memory_reads_still_work_under_enforced_rls`,
+`supersede_still_works_under_enforced_rls`,
+`namespace_scoping_end_to_end_under_enforced_rls` and
+`entity_delete_still_works_under_enforced_rls`, so the old
+`enforced_rls_fails_closed_for_unscoped_methods` checklist is empty and gone.
+
+The rest of the storage surface still runs unscoped and would fail closed the
+same way. Every `StorageTrait` method that reaches a policied table without a
+`namespace_id` is: `get_entity`, `delete_entity`, `list_episodic_by_entity`,
+`list_semantic_by_entity`, `update_episodic_access`, `invalidate_semantic`,
+`update_semantic_content`, `update_procedural_reliability` and
+`delete_observations_by_entity`. One of those is still on the recall path:
+`update_episodic_access` writes the reinforcement stamp. GDPR erase
+reaches three: #256 scoped its memory deletion only, and its observation,
+graph-edge and entity-record steps still match on the entity id alone. All of
+it is tracked by #254.
 
 Do not apply enforcement to a deployment until those paths carry a namespace.
 

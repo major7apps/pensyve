@@ -179,7 +179,7 @@ fn superseded_promotion_is_not_reminted_from_unchanged_evidence() {
     storage.save_semantic(&correction).unwrap();
     assert!(
         storage
-            .supersede_memory(promoted_id, correction.id, corrected_at)
+            .supersede_memory_in_namespace(promoted_id, ns.id, correction.id, corrected_at)
             .unwrap(),
         "supersession must mark the promoted row"
     );
@@ -243,7 +243,7 @@ fn new_evidence_still_promotes_after_supersession() {
     storage.save_semantic(&correction).unwrap();
     assert!(
         storage
-            .supersede_memory(promoted_id, correction.id, corrected_at)
+            .supersede_memory_in_namespace(promoted_id, ns.id, correction.id, corrected_at)
             .unwrap()
     );
 
@@ -317,7 +317,7 @@ fn new_evidence_reasserting_same_content_promotes_after_supersession() {
     storage.save_semantic(&correction).unwrap();
     assert!(
         storage
-            .supersede_memory(promoted_id, correction.id, corrected_at)
+            .supersede_memory_in_namespace(promoted_id, ns.id, correction.id, corrected_at)
             .unwrap()
     );
     assert_eq!(
@@ -418,7 +418,7 @@ fn superseded_episodic_evidence_cannot_support_a_cluster() {
     );
     assert!(
         storage
-            .supersede_memory(first, replacement, Utc::now())
+            .supersede_memory_in_namespace(first, ns.id, replacement, Utc::now())
             .unwrap()
     );
 

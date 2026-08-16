@@ -883,16 +883,21 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn get_episodic(&self, id: Uuid) -> StorageResult<Option<EpisodicMemory>> {
+    fn get_episodic_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<EpisodicMemory>> {
         self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             let row: Option<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
                           access_count, last_accessed, event_time, superseded_by, invalid_at
-                   FROM episodic_memories WHERE id = $1",
+                   FROM episodic_memories WHERE id = $1 AND namespace_id = $2",
             )
             .bind(id)
+            .bind(namespace_id)
             .fetch_optional(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
@@ -1021,16 +1026,21 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn get_semantic(&self, id: Uuid) -> StorageResult<Option<SemanticMemory>> {
+    fn get_semantic_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<SemanticMemory>> {
         self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             let row: Option<SemanticRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
                           valid_at, invalid_at, source_episodes, embedding::text, stability,
                           retrievability, superseded_by
-                   FROM semantic_memories WHERE id = $1",
+                   FROM semantic_memories WHERE id = $1 AND namespace_id = $2",
             )
             .bind(id)
+            .bind(namespace_id)
             .fetch_optional(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
@@ -1123,16 +1133,21 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn get_procedural(&self, id: Uuid) -> StorageResult<Option<ProceduralMemory>> {
+    fn get_procedural_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<ProceduralMemory>> {
         self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             let row: Option<ProceduralRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
                           trial_count, success_count, source_episodes, embedding::text, created_at,
                           last_used, superseded_by, invalid_at
-                   FROM procedural_memories WHERE id = $1",
+                   FROM procedural_memories WHERE id = $1 AND namespace_id = $2",
             )
             .bind(id)
+            .bind(namespace_id)
             .fetch_optional(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
@@ -1212,16 +1227,21 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn get_observation(&self, id: Uuid) -> StorageResult<Option<ObservationMemory>> {
+    fn get_observation_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<ObservationMemory>> {
         self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             let row: Option<ObservationRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
                           unit, content, embedding::text AS embedding, confidence, event_time, created_at,
                           stability, retrievability, superseded_by, invalid_at
-                   FROM observation_memories WHERE id = $1",
+                   FROM observation_memories WHERE id = $1 AND namespace_id = $2",
             )
             .bind(id)
+            .bind(namespace_id)
             .fetch_optional(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
@@ -1546,28 +1566,30 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn supersede_memory(
+    fn supersede_memory_in_namespace(
         &self,
         id: Uuid,
+        namespace_id: Uuid,
         superseded_by: Uuid,
         invalid_at: DateTime<Utc>,
     ) -> StorageResult<bool> {
         self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             for sql in [
                 "UPDATE episodic_memories SET superseded_by = $1, invalid_at = $2 \
-                 WHERE id = $3 AND superseded_by IS NULL",
+                 WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
                 "UPDATE semantic_memories SET superseded_by = $1, invalid_at = $2 \
-                 WHERE id = $3 AND superseded_by IS NULL",
+                 WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
                 "UPDATE procedural_memories SET superseded_by = $1, invalid_at = $2 \
-                 WHERE id = $3 AND superseded_by IS NULL",
+                 WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
                 "UPDATE observation_memories SET superseded_by = $1, invalid_at = $2 \
-                 WHERE id = $3 AND superseded_by IS NULL",
+                 WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
             ] {
                 let result = query::<Postgres>(sql)
                     .bind(superseded_by)
                     .bind(invalid_at)
                     .bind(id)
+                    .bind(namespace_id)
                     .execute(&mut *conn)
                     .await
                     .map_err(sqlx_to_io)?;
@@ -1703,51 +1725,6 @@ impl StorageTrait for PostgresBackend {
             total += result.rows_affected() as usize;
 
             Ok(total)
-        })
-    }
-
-    fn delete_memory_by_id(&self, id: Uuid) -> StorageResult<bool> {
-        self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
-            let mut deleted = false;
-
-            let result = query::<Postgres>("DELETE FROM episodic_memories WHERE id = $1")
-                .bind(id)
-                .execute(&mut *conn)
-                .await
-                .map_err(sqlx_to_io)?;
-            if result.rows_affected() > 0 {
-                deleted = true;
-            }
-
-            let result = query::<Postgres>("DELETE FROM semantic_memories WHERE id = $1")
-                .bind(id)
-                .execute(&mut *conn)
-                .await
-                .map_err(sqlx_to_io)?;
-            if result.rows_affected() > 0 {
-                deleted = true;
-            }
-
-            let result = query::<Postgres>("DELETE FROM procedural_memories WHERE id = $1")
-                .bind(id)
-                .execute(&mut *conn)
-                .await
-                .map_err(sqlx_to_io)?;
-            if result.rows_affected() > 0 {
-                deleted = true;
-            }
-
-            let result = query::<Postgres>("DELETE FROM observation_memories WHERE id = $1")
-                .bind(id)
-                .execute(&mut *conn)
-                .await
-                .map_err(sqlx_to_io)?;
-            if result.rows_affected() > 0 {
-                deleted = true;
-            }
-
-            Ok(deleted)
         })
     }
 

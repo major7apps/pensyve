@@ -1482,7 +1482,7 @@ mod tests {
         );
 
         // The memory retrievability should have been updated in storage.
-        let updated = storage.get_episodic(mem.id).unwrap();
+        let updated = storage.get_episodic_in_namespace(mem.id, ns.id).unwrap();
         assert!(
             updated.is_some(),
             "Memory should still exist after decay pass"
