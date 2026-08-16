@@ -42,6 +42,14 @@ fn scoped_delete_not_implemented() -> StorageResult<bool> {
     ))
 }
 
+fn entity_delete_scope_not_implemented() -> StorageResult<Vec<Memory>> {
+    Err(StorageError::Context(
+        "storage backend does not implement entity delete-scope enumeration, \
+         so an entity-wide delete cannot be snapshotted first"
+            .to_string(),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // StorageTrait
 // ---------------------------------------------------------------------------
@@ -324,6 +332,27 @@ pub trait StorageTrait: Send + Sync {
 
     // Deletion
     fn delete_memories_by_entity(&self, entity_id: Uuid) -> StorageResult<usize>;
+
+    /// Enumerate every memory row that [`StorageTrait::delete_memories_by_entity`]
+    /// would destroy for `entity_id` — the pre-delete snapshot scope (#246).
+    ///
+    /// The two must stay predicate-for-predicate identical: episodic rows whose
+    /// `about_entity` **or** `source_entity` matches, semantic rows whose
+    /// `subject` **or** `object_entity` matches, superseded rows included, and
+    /// no namespace filter (the delete has none either). A snapshot that omits
+    /// rows the delete destroys is worse than no snapshot, because it looks
+    /// complete — `pensyve-core/tests/forget_snapshot_scope.rs` fails the build
+    /// if the two ever drift apart.
+    ///
+    /// The default fails closed rather than returning a partial set: a backend
+    /// that cannot enumerate the scope must not have its entity-wide delete
+    /// treated as recoverable.
+    fn list_memories_by_entity_including_superseded(
+        &self,
+        _entity_id: Uuid,
+    ) -> StorageResult<Vec<Memory>> {
+        entity_delete_scope_not_implemented()
+    }
 
     /// Delete a single memory by its UUID (episodic, semantic, or procedural).
     fn delete_memory_by_id(&self, id: Uuid) -> StorageResult<bool>;

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use tokio::sync::RwLock;
@@ -34,9 +35,34 @@ pub struct PensyveState {
     /// disables it outright, and a model-load failure is logged once and
     /// leaves recall unreranked rather than failing startup or the request.
     pub reranker_cell: Arc<OnceLock<Option<Arc<Reranker>>>>,
+    /// Directory that `pensyve_forget` writes its pre-delete snapshots into
+    /// (#246). The tool refuses to delete anything it could not first write a
+    /// snapshot for, so this must point somewhere writable — see
+    /// [`PensyveState::default_snapshot_dir`] for the standard location.
+    pub snapshot_dir: PathBuf,
 }
 
 impl PensyveState {
+    /// Standard snapshot location: `<storage dir>/snapshots`, honouring
+    /// `PENSYVE_SNAPSHOT_DIR` first and then `PENSYVE_PATH`, matching how the
+    /// stdio server and CLI already resolve their storage directory.
+    pub fn default_snapshot_dir() -> PathBuf {
+        if let Ok(dir) = std::env::var("PENSYVE_SNAPSHOT_DIR") {
+            return PathBuf::from(dir);
+        }
+        std::env::var("PENSYVE_PATH")
+            .map_or_else(
+                |_| {
+                    dirs::home_dir()
+                        .unwrap_or_else(|| PathBuf::from("."))
+                        .join(".pensyve")
+                        .join("default")
+                },
+                PathBuf::from,
+            )
+            .join("snapshots")
+    }
+
     /// Resolve the reranker lazily (first call wins) and return a clone of
     /// the cached result on every subsequent call. `None` means either
     /// `PENSYVE_RERANKER=0` was set or the model failed to load; either way

@@ -52,6 +52,7 @@ impl TenantStateManager {
             retrieval_config: retrieval_config.clone(),
             is_remote: true,
             reranker_cell: reranker_cell.clone(),
+            snapshot_dir: PensyveState::default_snapshot_dir(),
         });
 
         Self {
@@ -167,6 +168,7 @@ impl TenantStateManager {
             retrieval_config: self.retrieval_config.clone(),
             is_remote: true,
             reranker_cell: self.reranker_cell.clone(),
+            snapshot_dir: PensyveState::default_snapshot_dir(),
         }))
     }
 }

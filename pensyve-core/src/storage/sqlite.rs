@@ -2178,6 +2178,47 @@ impl StorageTrait for SqliteBackend {
     // Deletion
     // -----------------------------------------------------------------------
 
+    /// Mirror of [`Self::delete_memories_by_entity`]'s scope. The `WHERE`
+    /// clauses below are copied verbatim from the two `DELETE`s underneath —
+    /// keep them that way (see the trait docs and
+    /// `pensyve-core/tests/forget_snapshot_scope.rs`).
+    fn list_memories_by_entity_including_superseded(
+        &self,
+        entity_id: Uuid,
+    ) -> StorageResult<Vec<Memory>> {
+        let conn = lock_conn!(self);
+        let id_str = entity_id.to_string();
+        let mut memories = Vec::new();
+
+        let mut stmt = conn.prepare(
+            r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
+                      content_type, summary, embedding, context_intent, timestamp,
+                      stability, retrievability, access_count, last_accessed, event_time,
+                      agent_id, user_id, superseded_by, invalid_at
+               FROM episodic_memories WHERE about_entity = ?1 OR source_entity = ?1",
+        )?;
+        let rows = stmt.query_map(params![&id_str], row_to_episodic)?;
+        for row in rows {
+            memories.push(Memory::Episodic(row??));
+        }
+
+        let mut stmt = conn.prepare(
+            r"SELECT id, namespace_id, subject, predicate, object, content_type,
+                      object_entity, confidence, valid_at, invalid_at,
+                      source_episodes, embedding, stability, retrievability,
+                      agent_id, user_id, superseded_by
+               FROM semantic_memories WHERE subject = ?1 OR object_entity = ?1",
+        )?;
+        let rows = stmt.query_map(params![&id_str], row_to_semantic)?;
+        for row in rows {
+            memories.push(Memory::Semantic(row??));
+        }
+
+        // Procedural and observation rows are intentionally absent: the delete
+        // below does not touch either table.
+        Ok(memories)
+    }
+
     fn delete_memories_by_entity(&self, entity_id: Uuid) -> StorageResult<usize> {
         let conn = lock_conn!(self);
         let id_str = entity_id.to_string();

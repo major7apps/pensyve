@@ -66,6 +66,7 @@ fn create_test_state_with_reranker(
         },
         is_remote: false,
         reranker_cell: Arc::new(OnceLock::from(reranker)),
+        snapshot_dir: dir.path().join("snapshots"),
     })
 }
 

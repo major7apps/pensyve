@@ -1440,6 +1440,51 @@ impl StorageTrait for PostgresBackend {
     // Deletion
     // -----------------------------------------------------------------------
 
+    /// Mirror of [`Self::delete_memories_by_entity`]'s scope — same `WHERE`
+    /// clauses, same connection scoping (`maybe_scoped_conn`, not
+    /// `scoped_conn`, because the delete is not namespace-filtered either).
+    /// See the trait docs and `pensyve-core/tests/forget_snapshot_scope.rs`.
+    fn list_memories_by_entity_including_superseded(
+        &self,
+        entity_id: Uuid,
+    ) -> StorageResult<Vec<Memory>> {
+        self.block_on(async {
+            let mut conn = self.maybe_scoped_conn().await?;
+            let mut memories = Vec::new();
+
+            let rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
+                r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
+                          summary, embedding::text AS embedding, context_intent, timestamp, stability,
+                          retrievability, access_count, last_accessed, event_time,
+                          superseded_by, invalid_at
+                   FROM episodic_memories
+                   WHERE about_entity = $1 OR source_entity = $1",
+            )
+            .bind(entity_id)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            memories.extend(rows.into_iter().map(row_to_episodic).map(Memory::Episodic));
+
+            let rows: Vec<SemanticRow> = query_as::<Postgres, _>(
+                r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
+                          valid_at, invalid_at, source_episodes, embedding::text, stability,
+                          retrievability, superseded_by
+                   FROM semantic_memories
+                   WHERE subject = $1 OR object_entity = $1",
+            )
+            .bind(entity_id)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            memories.extend(rows.into_iter().map(row_to_semantic).map(Memory::Semantic));
+
+            // Procedural and observation rows are intentionally absent: the
+            // delete below does not touch either table.
+            Ok(memories)
+        })
+    }
+
     fn delete_memories_by_entity(&self, entity_id: Uuid) -> StorageResult<usize> {
         self.block_on(async {
             let mut conn = self.maybe_scoped_conn().await?;
