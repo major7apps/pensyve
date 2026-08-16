@@ -44,13 +44,26 @@
 //! storage method's own SQL with the `namespace_id` predicate *deleted* and
 //! shows RLS still blocks the cross-namespace access.
 //!
-//! **Still open — enforcement is not yet the default.** It fails closed, and
-//! several `StorageTrait` methods take no `namespace_id` at all, so they run
-//! on an unscoped connection. Under enforcement they silently read and delete
-//! nothing rather than erroring.
-//! [`enforced_rls_fails_closed_for_unscoped_methods`] pins exactly which ones,
-//! and is the checklist that has to reach zero before `FORCE` can move into
-//! `postgres_schema.sql`. Until then the enforcement file is an explicit
+//! **Fixed — every method this file pinned now carries a namespace.** The
+//! checklist `enforced_rls_fails_closed_for_unscoped_methods` used to assert
+//! that `get_episodic`, `supersede_memory` and `delete_memory_by_id` read and
+//! deleted nothing under enforcement while still reporting success. #254
+//! replaced all three with `_in_namespace` variants, so each assertion flipped
+//! and moved into the enforced test for its own method:
+//! [`scoped_memory_reads_still_work_under_enforced_rls`],
+//! [`supersede_still_works_under_enforced_rls`] and, for the scoped delete,
+//! [`namespace_scoping_end_to_end_under_enforced_rls`]. The checklist is empty
+//! and therefore gone; the per-method tests are the standing gate in its place.
+//!
+//! **Still open — enforcement is not yet the default.** Two things remain.
+//! The rest of the storage surface still runs unscoped and fails closed the
+//! same way; `docs/SECURITY.md` enumerates it. And the role matters:
+//! `PostgresBackend::new` applies the schema on every startup, which is
+//! owner-only DDL, so the application has to connect as the table owner — and
+//! a managed-Postgres owner role typically also carries `BYPASSRLS`, which
+//! exempts it from the policies whether or not `FORCE` is set. Separating
+//! schema application from serving traffic is the other #254 work item. Until
+//! both land, `FORCE` stays in `postgres_rls_enforce.sql` as an explicit
 //! operator step — see `docs/SECURITY.md`.
 //!
 //! Tests therefore come in two flavours: [`Fixture::provision`] mirrors a
@@ -397,7 +410,7 @@ fn seed_entity_scope(backend: &PostgresBackend, ns_a: &Namespace, ns_b: &Namespa
     backend.save_semantic(&superseded).expect("save superseded");
     assert!(
         backend
-            .supersede_memory(superseded.id, Uuid::new_v4(), Utc::now())
+            .supersede_memory_in_namespace(superseded.id, ns_a.id, Uuid::new_v4(), Utc::now())
             .expect("supersede must not error"),
         "the superseded fixture row must actually be marked superseded"
     );
@@ -837,8 +850,7 @@ fn namespace_scoping_end_to_end_under_enforced_rls() {
     );
 }
 
-/// The capturing delete keeps working with RLS enforced, so it does *not*
-/// belong in [`enforced_rls_fails_closed_for_unscoped_methods`].
+/// The capturing delete keeps working with RLS enforced.
 ///
 /// It takes a `namespace_id`, so its connection is bound to that namespace
 /// rather than left unscoped. Both halves are worth pinning: it still deletes
@@ -903,8 +915,7 @@ fn capturing_delete_still_works_under_enforced_rls() {
     );
 }
 
-/// The plain entity-wide delete keeps working with RLS enforced, so it no
-/// longer belongs in [`enforced_rls_fails_closed_for_unscoped_methods`].
+/// The plain entity-wide delete keeps working with RLS enforced.
 ///
 /// It took no `namespace_id` until #256 and therefore ran on an unscoped
 /// connection, which under enforcement matched nothing — `Ok(0)` reported as
@@ -1118,23 +1129,77 @@ fn entity_scoped_listing_matches_the_delete_scope() {
     );
 }
 
-/// Enforcement fails closed, and these `StorageTrait` methods take no
-/// `namespace_id`, so they run on an unscoped connection and quietly stop
-/// working when it is switched on.
+/// Recall's candidate hydration keeps working with RLS enforced.
 ///
-/// This is the reason `FORCE ROW LEVEL SECURITY` lives in
-/// `postgres_rls_enforce.sql` as an operator step instead of in
-/// `postgres_schema.sql`. The failure mode is the dangerous kind: not an
-/// error, but a success report with no effect — `delete_memory_by_id` returns
-/// `Ok(false)` while `purge_namespace`, which is built on it, reports a count.
+/// `get_episodic` took no `namespace_id` and therefore ran on an unscoped
+/// connection, which under enforcement matched nothing. That is the failure
+/// the issue called out as the most invisible: `retrieval::engine` hydrates
+/// every vector-only candidate through this accessor, so recall would have
+/// returned an empty result set and reported success. `get_semantic` and
+/// `get_procedural` sit in the same `else if` chain and are pinned with it.
 ///
-/// Each assertion here is a work item, tracked by #254. When a method starts
-/// carrying a namespace, its assertion flips and has to be moved into
-/// [`namespace_scoping_end_to_end_under_enforced_rls`]. When the list is
-/// empty, enforcement can become the default.
+/// The foreign-namespace half matters as much as the own-namespace half: the
+/// vector index is not partitioned by namespace, so a hydration keyed on `id`
+/// alone is a cross-namespace read whenever RLS is *not* enforced, which is
+/// every deployment shipping today.
 #[test]
-fn enforced_rls_fails_closed_for_unscoped_methods() {
-    let Some(admin_opts) = skip_notice("enforced_rls_fails_closed_for_unscoped_methods") else {
+fn scoped_memory_reads_still_work_under_enforced_rls() {
+    let Some(admin_opts) = skip_notice("scoped_memory_reads_still_work_under_enforced_rls") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+    let ns_a = Namespace::new(format!("rls-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("rls-b-{}", Uuid::new_v4().simple()));
+    let memory = seed(&fixture, &ns_a, &ns_b);
+    let fact = SemanticMemory::new(ns_a.id, Uuid::new_v4(), "likes", "rust", 0.9);
+    backend.save_semantic(&fact).expect("save A's fact");
+    fixture.enforce_rls();
+
+    assert_eq!(
+        backend
+            .get_episodic_in_namespace(memory.id, ns_a.id)
+            .expect("read A's episodic memory")
+            .map(|m| m.id),
+        Some(memory.id),
+        "hydration must still resolve a namespace's own row under enforced RLS"
+    );
+    assert!(
+        backend
+            .get_episodic_in_namespace(memory.id, ns_b.id)
+            .expect("read A's episodic memory through B")
+            .is_none(),
+        "hydration must not resolve another namespace's row"
+    );
+
+    assert_eq!(
+        backend
+            .get_semantic_in_namespace(fact.id, ns_a.id)
+            .expect("read A's fact")
+            .map(|m| m.id),
+        Some(fact.id),
+        "the semantic arm of the hydration chain must resolve its own row"
+    );
+    assert!(
+        backend
+            .get_semantic_in_namespace(fact.id, ns_b.id)
+            .expect("read A's fact through B")
+            .is_none(),
+        "the semantic arm must not resolve another namespace's row"
+    );
+}
+
+/// Supersession keeps working with RLS enforced.
+///
+/// `supersede_memory` took no `namespace_id`, so under enforcement it stamped
+/// nothing and returned `Ok(false)` — which `perform_supersession` in the REST
+/// gateway reads as "someone else superseded this first" and turns into a 409,
+/// after having already written the replacement row. Both halves are pinned:
+/// the stamp lands in its own namespace, and a foreign namespace cannot stamp
+/// a row it does not own.
+#[test]
+fn supersede_still_works_under_enforced_rls() {
+    let Some(admin_opts) = skip_notice("supersede_still_works_under_enforced_rls") else {
         return;
     };
     let fixture = Fixture::provision(&admin_opts);
@@ -1144,40 +1209,12 @@ fn enforced_rls_fails_closed_for_unscoped_methods() {
     let memory = seed(&fixture, &ns_a, &ns_b);
     fixture.enforce_rls();
 
-    // Reached from the recall path (retrieval::engine hydrating candidates)
-    // and from the supersede/update-memory REST handlers.
-    assert!(
-        backend
-            .get_episodic(memory.id)
-            .expect("get_episodic must not error")
-            .is_none(),
-        "get_episodic still resolves under enforced RLS — it now carries a \
-         namespace, so move this into the enforced end-to-end test"
-    );
-
-    // Reached from POST /v1/memories/{id}/supersede and PATCH /v1/memories/{id}.
     assert!(
         !backend
-            .supersede_memory(memory.id, Uuid::new_v4(), Utc::now())
-            .expect("supersede_memory must not error"),
-        "supersede_memory now takes effect under enforced RLS"
+            .supersede_memory_in_namespace(memory.id, ns_b.id, Uuid::new_v4(), Utc::now())
+            .expect("supersede through namespace B"),
+        "a foreign namespace must not stamp another namespace's row"
     );
-
-    // `delete_memories_by_entity` used to be on this list. It takes a
-    // `namespace_id` as of #256, so its connection is bound and it keeps
-    // working under enforcement — the assertion moved to
-    // [`entity_delete_still_works_under_enforced_rls`].
-
-    // Reached from the default `purge_namespace` trait implementation, which
-    // PostgresBackend does not override.
-    assert!(
-        !backend
-            .delete_memory_by_id(memory.id)
-            .expect("delete_memory_by_id must not error"),
-        "delete_memory_by_id now deletes under enforced RLS"
-    );
-
-    // The row is untouched by all of the above.
     assert_eq!(
         memory_ids(
             &backend
@@ -1185,7 +1222,23 @@ fn enforced_rls_fails_closed_for_unscoped_methods() {
                 .expect("read namespace A")
         ),
         vec![memory.id],
-        "the unscoped methods should have been no-ops, not partial writes"
+        "a cross-namespace supersede must leave the row live"
+    );
+
+    let successor = Uuid::new_v4();
+    assert!(
+        backend
+            .supersede_memory_in_namespace(memory.id, ns_a.id, successor, Utc::now())
+            .expect("supersede through namespace A"),
+        "the scoped supersede must still take effect in its own namespace"
+    );
+    assert_eq!(
+        backend
+            .get_episodic_in_namespace(memory.id, ns_a.id)
+            .expect("re-read the superseded row")
+            .and_then(|m| m.superseded_by),
+        Some(successor),
+        "the stamp must be the one this namespace wrote"
     );
 }
 
@@ -1515,7 +1568,7 @@ fn enforcement_file_forces_every_policied_table_and_only_those() {
         !sql_statements_only(super::SCHEMA).contains("FORCE ROW LEVEL SECURITY"),
         "FORCE moved into postgres_schema.sql, which runs on every startup. Enforcement \
          fails closed, so this would silently break every query path that does not carry \
-         a namespace — see enforced_rls_fails_closed_for_unscoped_methods for the list \
-         that must be empty first."
+         a namespace — see the module docs and docs/SECURITY.md for the paths that still \
+         do not, and for the role the application has to stop connecting as."
     );
 }

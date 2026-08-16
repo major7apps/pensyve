@@ -195,7 +195,12 @@ async fn seed(state: &AppState) -> Seeded {
         .save_semantic(&superseded)
         .expect("save superseded semantic");
     ps.storage
-        .supersede_memory(superseded.id, Uuid::new_v4(), chrono::Utc::now())
+        .supersede_memory_in_namespace(
+            superseded.id,
+            namespace_id,
+            Uuid::new_v4(),
+            chrono::Utc::now(),
+        )
         .expect("supersede");
 
     // Control: nothing to do with the target.

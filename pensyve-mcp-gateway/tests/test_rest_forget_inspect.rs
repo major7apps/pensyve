@@ -445,7 +445,7 @@ async fn foreign_namespace_entity_uuid_returns_not_found_without_deleting_memori
     assert!(
         foreign_state
             .storage
-            .get_semantic(foreign_memory.id)
+            .get_semantic_in_namespace(foreign_memory.id, foreign_state.namespace.id)
             .expect("foreign memory lookup after forget")
             .is_some()
     );
@@ -455,7 +455,7 @@ async fn foreign_namespace_entity_uuid_returns_not_found_without_deleting_memori
     assert!(
         foreign_state
             .storage
-            .get_semantic(foreign_memory.id)
+            .get_semantic_in_namespace(foreign_memory.id, foreign_state.namespace.id)
             .expect("foreign memory lookup after inspect")
             .is_some()
     );
@@ -518,7 +518,7 @@ async fn supersede_creates_live_replacement_and_excludes_old_from_retrieval_inde
 
     let old = pensyve_state
         .storage
-        .get_semantic(old_id)
+        .get_semantic_in_namespace(old_id, pensyve_state.namespace.id)
         .expect("old lookup")
         .expect("old row preserved");
     assert_eq!(old.predicate, "legacytoken");
@@ -528,7 +528,7 @@ async fn supersede_creates_live_replacement_and_excludes_old_from_retrieval_inde
 
     let new = pensyve_state
         .storage
-        .get_semantic(new_id)
+        .get_semantic_in_namespace(new_id, pensyve_state.namespace.id)
         .expect("new lookup")
         .expect("new row exists before old pointer is visible");
     assert_eq!(new.predicate, "currenttoken");
@@ -605,14 +605,14 @@ async fn patch_delegates_to_supersession_and_preserves_old_content() {
         .expect("tenant state");
     let old = pensyve_state
         .storage
-        .get_semantic(old_id)
+        .get_semantic_in_namespace(old_id, pensyve_state.namespace.id)
         .expect("old lookup")
         .expect("old row preserved");
     assert_eq!(old.object, "tea");
     assert_eq!(old.superseded_by, Some(new_id));
     let new = pensyve_state
         .storage
-        .get_semantic(new_id)
+        .get_semantic_in_namespace(new_id, pensyve_state.namespace.id)
         .expect("new lookup")
         .expect("new row");
     assert_eq!(new.object, "coffee");

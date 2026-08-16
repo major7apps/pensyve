@@ -314,7 +314,7 @@ async fn test_mcp_forget_memory_rejects_foreign_namespace() {
     assert!(
         state
             .storage
-            .get_observation(foreign_memory.id)
+            .get_observation_in_namespace(foreign_memory.id, foreign_namespace.id)
             .expect("load foreign memory")
             .is_some()
     );

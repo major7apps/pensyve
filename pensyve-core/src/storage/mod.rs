@@ -36,12 +36,6 @@ pub enum StorageError {
 
 pub type StorageResult<T> = Result<T, StorageError>;
 
-fn scoped_delete_not_implemented() -> StorageResult<bool> {
-    Err(StorageError::Context(
-        "storage backend does not implement atomic scoped deletion".to_string(),
-    ))
-}
-
 fn capturing_delete_not_implemented() -> StorageResult<Vec<Memory>> {
     Err(StorageError::Context(
         "storage backend does not implement capturing entity deletion, \
@@ -105,7 +99,26 @@ pub trait StorageTrait: Send + Sync {
 
     // Episodic Memory
     fn save_episodic(&self, mem: &EpisodicMemory) -> StorageResult<()>;
-    fn get_episodic(&self, id: Uuid) -> StorageResult<Option<EpisodicMemory>>;
+
+    /// Fetch an episodic memory only when it belongs to `namespace_id`.
+    ///
+    /// There is deliberately no unscoped `get_episodic`. One backend instance
+    /// is shared by every tenant of the gateway, so a lookup keyed on `id`
+    /// alone resolves across namespaces — and under enforced row-level security
+    /// it resolves to nothing at all, because the connection carrying no
+    /// namespace matches no row (#254). Requiring the namespace here is what
+    /// lets recall hydration and the REST memory reads work the same way in
+    /// both configurations.
+    ///
+    /// Backends must implement this as a single `id AND namespace_id` query.
+    /// Callers should treat `Ok(None)` as "not found" without distinguishing
+    /// "owned by someone else", so the result is not an existence oracle.
+    fn get_episodic_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<EpisodicMemory>>;
+
     fn list_episodic_by_entity(
         &self,
         about_entity: Uuid,
@@ -145,7 +158,16 @@ pub trait StorageTrait: Send + Sync {
 
     // Semantic Memory
     fn save_semantic(&self, mem: &SemanticMemory) -> StorageResult<()>;
-    fn get_semantic(&self, id: Uuid) -> StorageResult<Option<SemanticMemory>>;
+
+    /// Fetch a semantic memory only when it belongs to `namespace_id`. Same
+    /// contract as [`StorageTrait::get_episodic_in_namespace`], including the
+    /// "not an existence oracle" caveat.
+    fn get_semantic_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<SemanticMemory>>;
+
     fn list_semantic_by_entity(
         &self,
         subject: Uuid,
@@ -155,7 +177,16 @@ pub trait StorageTrait: Send + Sync {
 
     // Procedural Memory
     fn save_procedural(&self, mem: &ProceduralMemory) -> StorageResult<()>;
-    fn get_procedural(&self, id: Uuid) -> StorageResult<Option<ProceduralMemory>>;
+
+    /// Fetch a procedural memory only when it belongs to `namespace_id`. Same
+    /// contract as [`StorageTrait::get_episodic_in_namespace`], including the
+    /// "not an existence oracle" caveat.
+    fn get_procedural_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<ProceduralMemory>>;
+
     fn update_procedural_reliability(
         &self,
         id: Uuid,
@@ -176,7 +207,14 @@ pub trait StorageTrait: Send + Sync {
         ))
     }
 
-    fn get_observation(&self, _id: Uuid) -> StorageResult<Option<ObservationMemory>> {
+    /// Fetch an observation only when it belongs to `namespace_id`. Same
+    /// contract as [`StorageTrait::get_episodic_in_namespace`], including the
+    /// "not an existence oracle" caveat.
+    fn get_observation_in_namespace(
+        &self,
+        _id: Uuid,
+        _namespace_id: Uuid,
+    ) -> StorageResult<Option<ObservationMemory>> {
         Ok(None)
     }
 
@@ -360,10 +398,23 @@ pub trait StorageTrait: Send + Sync {
             .collect())
     }
 
-    /// Mark a live memory as superseded. Returns `false` when no live row matched.
-    fn supersede_memory(
+    /// Mark a live memory as superseded, but only when it belongs to
+    /// `namespace_id`. Returns `false` when no live row in that namespace
+    /// matched.
+    ///
+    /// There is deliberately no unscoped `supersede_memory`. Memory ids are not
+    /// globally unique in this schema, so an id-only `UPDATE` stamps whichever
+    /// tenant's row happens to carry the id — and under enforced row-level
+    /// security it stamps nothing while still reporting `Ok(false)`, which a
+    /// caller cannot tell from a genuine supersession race (#254).
+    ///
+    /// Backends must put both predicates in the SQL rather than leave the
+    /// namespace to row-level security, which is defence in depth and inert in
+    /// every deployment shipping today.
+    fn supersede_memory_in_namespace(
         &self,
         id: Uuid,
+        namespace_id: Uuid,
         superseded_by: Uuid,
         invalid_at: DateTime<Utc>,
     ) -> StorageResult<bool>;
@@ -430,21 +481,20 @@ pub trait StorageTrait: Send + Sync {
         capturing_delete_not_implemented()
     }
 
-    /// Delete a single memory by its UUID (episodic, semantic, or procedural).
-    fn delete_memory_by_id(&self, id: Uuid) -> StorageResult<bool>;
-
-    /// Delete a single memory only when it belongs to `namespace_id`.
+    /// Delete a single memory (episodic, semantic, procedural or observation)
+    /// only when it belongs to `namespace_id`.
     ///
-    /// Backends must override this with an atomic namespace-qualified delete.
-    /// The default preserves source compatibility for third-party backends but
-    /// fails closed rather than falling back to an unscoped delete.
-    fn delete_memory_by_id_in_namespace(
-        &self,
-        _id: Uuid,
-        _namespace_id: Uuid,
-    ) -> StorageResult<bool> {
-        scoped_delete_not_implemented()
-    }
+    /// There is deliberately no unscoped `delete_memory_by_id`. Memory ids
+    /// repeat across namespaces, so an id-only `DELETE` destroys whichever
+    /// tenant's row carries the id, and under enforced row-level security it
+    /// destroys nothing while returning `Ok(false)` — a no-op reported as a
+    /// completed erase (#254).
+    ///
+    /// Backends must implement this as an atomic namespace-qualified delete,
+    /// search-index cleanup included: `memory_fts` is keyed by memory id alone,
+    /// so an unqualified cleanup strips a foreign namespace's entry.
+    fn delete_memory_by_id_in_namespace(&self, id: Uuid, namespace_id: Uuid)
+    -> StorageResult<bool>;
 
     /// Delete all memories in a namespace. Returns the count of deleted memories.
     fn purge_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
@@ -452,7 +502,10 @@ pub trait StorageTrait: Send + Sync {
         let memories = self.get_all_memories_by_namespace(namespace_id)?;
         let mut count = 0;
         for mem in &memories {
-            if self.delete_memory_by_id(mem.id()).unwrap_or(false) {
+            if self
+                .delete_memory_by_id_in_namespace(mem.id(), namespace_id)
+                .unwrap_or(false)
+            {
                 count += 1;
             }
         }
@@ -596,11 +649,15 @@ pub fn memory_matches_scope(
 mod tests {
     use super::*;
 
+    /// The one remaining fail-closed default: a backend that cannot capture
+    /// atomically must error rather than let an entity-wide delete be treated
+    /// as recoverable. (Its sibling `scoped_delete_not_implemented` went away
+    /// in #254, when `delete_memory_by_id_in_namespace` became required.)
     #[test]
-    fn scoped_delete_not_implemented_fails_closed() {
-        let error = scoped_delete_not_implemented().unwrap_err();
+    fn capturing_delete_not_implemented_fails_closed() {
+        let error = capturing_delete_not_implemented().unwrap_err();
 
         assert!(matches!(error, StorageError::Context(_)));
-        assert!(error.to_string().contains("atomic scoped deletion"));
+        assert!(error.to_string().contains("capturing entity deletion"));
     }
 }
