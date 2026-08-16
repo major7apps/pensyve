@@ -2239,9 +2239,11 @@ impl StorageTrait for SqliteBackend {
             }
 
             // Strip the FTS rows for exactly what we just deleted, qualified by
-            // each row's own namespace — `memory_fts` is keyed by `memory_id`,
-            // which is not unique across namespaces, so an unqualified delete
-            // would silently strip another tenant's search index entry.
+            // each row's own namespace and type — `memory_fts` is keyed by
+            // `memory_id`, which identifies nothing on its own. Ids repeat
+            // across namespaces, and within one namespace the same id can name
+            // both an episodic and a semantic row, so an under-qualified delete
+            // strips an index entry whose base row is still live.
             for memory in &memories {
                 let row_namespace = match memory {
                     Memory::Episodic(m) => m.namespace_id,
@@ -2250,8 +2252,13 @@ impl StorageTrait for SqliteBackend {
                     Memory::Observation(m) => m.namespace_id,
                 };
                 conn.execute(
-                    "DELETE FROM memory_fts WHERE memory_id = ?1 AND namespace_id = ?2",
-                    params![memory.id().to_string(), row_namespace.to_string()],
+                    "DELETE FROM memory_fts
+                      WHERE memory_id = ?1 AND namespace_id = ?2 AND memory_type = ?3",
+                    params![
+                        memory.id().to_string(),
+                        row_namespace.to_string(),
+                        memory.type_name()
+                    ],
                 )?;
             }
 
@@ -2328,13 +2335,21 @@ impl StorageTrait for SqliteBackend {
             )?;
             total += n;
 
-            // Remove from FTS in bulk, qualified by namespace — `memory_fts`
-            // is keyed by `memory_id`, which is not unique across namespaces,
-            // so an unqualified delete silently strips another tenant's entry.
-            for fts_id in episodic_ids.iter().chain(semantic_ids.iter()) {
+            // Remove from FTS in bulk. `memory_fts` is keyed by `memory_id`
+            // alone, which identifies nothing on its own: ids repeat across
+            // namespaces, and within one namespace the same id can name both an
+            // episodic and a semantic row. Both halves of the key are therefore
+            // pinned, or the cleanup strips an index entry whose base row is
+            // still live and leaves that memory unsearchable.
+            for (fts_id, memory_type) in episodic_ids
+                .iter()
+                .map(|id| (id, "episodic"))
+                .chain(semantic_ids.iter().map(|id| (id, "semantic")))
+            {
                 conn.execute(
-                    "DELETE FROM memory_fts WHERE memory_id = ?1 AND namespace_id = ?2",
-                    params![fts_id, &ns_str],
+                    "DELETE FROM memory_fts
+                      WHERE memory_id = ?1 AND namespace_id = ?2 AND memory_type = ?3",
+                    params![fts_id, &ns_str, memory_type],
                 )?;
             }
 
@@ -3855,6 +3870,65 @@ mod tests {
             hits.len(),
             1,
             "the other namespace's memory must still be findable"
+        );
+        assert_eq!(hits[0].id(), shared_id);
+    }
+
+    /// The other axis of the same key problem: one namespace holding an
+    /// episodic and a semantic row that share a memory id.
+    ///
+    /// `memory_fts` is keyed by `memory_id` alone, so namespace-qualifying the
+    /// cleanup is only half the fix — within a namespace the id still names two
+    /// rows. Forgetting the entity behind the episodic one must not take the
+    /// unrelated semantic row's index entry with it and leave live content
+    /// unsearchable. (`test_delete_memory_by_id_in_namespace_rolls_back_partial_delete`
+    /// builds the same shared-id shape.)
+    #[test]
+    fn test_delete_memories_by_entity_preserves_other_memory_type_fts_entry() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let shared_id = Uuid::new_v4();
+        let entity_id = Uuid::new_v4();
+
+        let mut episodic = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            entity_id,
+            entity_id,
+            "episodic to forget",
+        );
+        episodic.id = shared_id;
+        db.save_episodic(&episodic).unwrap();
+
+        // Same id, same namespace, unrelated entity — only the FTS cleanup can
+        // reach it.
+        let mut semantic = SemanticMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            "keeps",
+            "unrelated survivor token",
+            0.9,
+        );
+        semantic.id = shared_id;
+        db.save_semantic(&semantic).unwrap();
+
+        db.delete_memories_by_entity(entity_id, ns.id).unwrap();
+
+        assert!(
+            db.get_episodic(shared_id).unwrap().is_none(),
+            "the forgotten episodic row is deleted"
+        );
+        assert!(
+            db.get_semantic(shared_id).unwrap().is_some(),
+            "the unrelated semantic row is not attached to the entity"
+        );
+        let hits = db
+            .search_fts("unrelated survivor token", ns.id, 10)
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the surviving semantic row must still be findable"
         );
         assert_eq!(hits[0].id(), shared_id);
     }

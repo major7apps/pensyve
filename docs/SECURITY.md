@@ -89,8 +89,9 @@ erase. Several `StorageTrait` methods still take no `namespace_id` and run
 unscoped, including the ones behind recall candidate hydration and memory
 supersession. Entity forget left that list in #256, when
 `delete_memories_by_entity` gained a `namespace_id`. GDPR erase is partly off
-it: its memory deletion is scoped, while its observation, graph-edge and
-entity-record steps still match on the entity id alone.
+it: #256 scoped its memory deletion only, and its observation, graph-edge and
+entity-record steps still match on the entity id alone. Those three are tracked
+by #254 with the rest of the unscoped surface.
 The test `enforced_rls_fails_closed_for_unscoped_methods` in
 `pensyve-core/src/storage/postgres/live_rls.rs` lists them, and the list must
 be empty before enforcement becomes the default.
