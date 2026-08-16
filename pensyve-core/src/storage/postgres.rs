@@ -165,13 +165,9 @@ type EdgeRow = (
 // PostgresBackend
 // ---------------------------------------------------------------------------
 
-/// Binds the namespace GUC that every `namespace_isolation_*` policy in
-/// `postgres_schema.sql` reads.
-///
-/// `false` makes the setting session-scoped rather than transaction-local.
-/// Transaction-local would be discarded before the scoped query ever ran — see
-/// [`PostgresBackend::conn_with_namespace`] for the full reasoning.
-const SET_NAMESPACE_GUC_SQL: &str = "SELECT set_config('pensyve.namespace_id', $1, false)";
+mod scoped_pool;
+
+use scoped_pool::ScopedPool;
 
 /// The namespace GUC value used for connections that are not scoped to any
 /// namespace.
@@ -182,7 +178,13 @@ const SET_NAMESPACE_GUC_SQL: &str = "SELECT set_config('pensyve.namespace_id', $
 const UNSCOPED_NAMESPACE: &str = "";
 
 pub struct PostgresBackend {
-    pool: PgPool,
+    /// Wrapped so that the only ways to obtain a connection are
+    /// [`ScopedPool::acquire_bound`], which binds the namespace the RLS
+    /// policies read, and [`ScopedPool::unbound`], which is named to be
+    /// conspicuous. `sqlx` implements `Executor` and `Acquire` for `&PgPool`,
+    /// so holding a bare `PgPool` here would let any `fetch(&self.pool)` or
+    /// `self.pool.begin()` check out an unbound connection.
+    pool: ScopedPool,
     rt: Runtime,
     /// Optional default namespace for RLS scoping on get-by-id methods
     /// where the trait signature does not provide a `namespace_id`.
@@ -227,7 +229,7 @@ impl PostgresBackend {
         };
 
         let backend = Self {
-            pool,
+            pool: ScopedPool::new(pool),
             rt,
             default_namespace: None,
         };
@@ -239,7 +241,7 @@ impl PostgresBackend {
     pub fn from_pool(pool: PgPool) -> StorageResult<Self> {
         let rt = Runtime::new().map_err(io_err)?;
         let backend = Self {
-            pool,
+            pool: ScopedPool::new(pool),
             rt,
             default_namespace: None,
         };
@@ -258,6 +260,7 @@ impl PostgresBackend {
     fn run_schema(&self) -> StorageResult<()> {
         self.block_on(async {
             self.pool
+                .unbound()
                 .execute(raw_sql(SCHEMA))
                 .await
                 .map_err(sqlx_to_io)?;
@@ -282,6 +285,7 @@ impl PostgresBackend {
     pub fn enforce_rls(&self) -> StorageResult<()> {
         self.block_on(async {
             self.pool
+                .unbound()
                 .execute(raw_sql(RLS_ENFORCE_SCHEMA))
                 .await
                 .map_err(sqlx_to_io)?;
@@ -357,13 +361,7 @@ impl PostgresBackend {
         &self,
         namespace: &str,
     ) -> StorageResult<sqlx_core::pool::PoolConnection<sqlx_postgres::Postgres>> {
-        let mut conn = self.pool.acquire().await.map_err(sqlx_to_io)?;
-        query(SET_NAMESPACE_GUC_SQL)
-            .bind(namespace)
-            .execute(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
-        Ok(conn)
+        self.pool.acquire_bound(namespace).await.map_err(sqlx_to_io)
     }
 
     /// Set the active namespace on a single Postgres connection so that the
@@ -374,15 +372,28 @@ impl PostgresBackend {
     /// connections.  The `StorageTrait` methods scope their own connections
     /// internally, so you typically do not need to call this directly.
     ///
-    /// The setting is session-scoped: it stays in effect until this connection
-    /// is scoped again or closed.  A caller that returns the connection to a
-    /// shared pool is responsible for re-scoping it before reuse.
+    /// # Behaviour change
+    ///
+    /// This used to set the value with `is_local = true`, which scoped it to
+    /// the current transaction.  Issued outside a transaction, as a standalone
+    /// statement, Postgres discarded it before the next statement ran, so the
+    /// helper reliably did nothing.  It is now session-scoped, which is what
+    /// makes it work.
+    ///
+    /// # Responsibility this places on the caller
+    ///
+    /// The setting now outlives the enclosing transaction and stays in effect
+    /// until the connection is scoped again or closed.  If you return this
+    /// connection to a pool, the next borrower inherits this namespace, and
+    /// under enforced RLS it will read this namespace's rows.  Postgres no
+    /// longer clears the value for you.  A pooling caller must therefore
+    /// re-scope every connection on checkout, exactly as this backend does.
     pub async fn set_namespace_config(
         &self,
         conn: &mut sqlx_postgres::PgConnection,
         namespace_id: uuid::Uuid,
     ) -> StorageResult<()> {
-        query(SET_NAMESPACE_GUC_SQL)
+        query(scoped_pool::SET_NAMESPACE_GUC_SQL)
             .bind(namespace_id.to_string())
             .execute(&mut *conn)
             .await
@@ -391,9 +402,13 @@ impl PostgresBackend {
     }
 
     /// Expose the underlying pool so callers can acquire explicit connections
-    /// for namespace-scoped RLS sessions (see [`set_namespace_config`]).
+    /// for namespace-scoped RLS sessions (see [`Self::set_namespace_config`]).
+    ///
+    /// Connections taken from here carry no namespace, so a caller that
+    /// queries a table with a `namespace_isolation_*` policy must scope them
+    /// itself. See [`Self::set_namespace_config`] for the contract.
     pub fn pool(&self) -> &PgPool {
-        &self.pool
+        self.pool.unbound()
     }
 
     fn load_memories_by_namespace(
@@ -629,15 +644,17 @@ impl StorageTrait for PostgresBackend {
     fn get_namespace_by_name(&self, name: &str) -> StorageResult<Option<Namespace>> {
         let name = name.to_string();
         self.block_on(async {
-            // Namespace-by-name lookup: RLS on namespaces table may not filter
-            // by pensyve.namespace_id (it applies to memory tables). Use pool
-            // directly — namespaces are not tenant-scoped via RLS.
+            // Namespace-by-name lookup. The `namespaces` table carries no
+            // `namespace_isolation_*` policy, and this lookup is how a caller
+            // discovers the namespace id it would scope by, so there is
+            // nothing to bind yet. Safe on an unbound connection for as long
+            // as `namespaces` stays unpolicied.
             let row: Option<(Uuid, String, DateTime<Utc>, serde_json::Value)> =
                 query_as::<Postgres, _>(
                     "SELECT id, name, created_at, metadata FROM namespaces WHERE name = $1",
                 )
                 .bind(&name)
-                .fetch_optional(&self.pool)
+                .fetch_optional(self.pool.unbound())
                 .await
                 .map_err(sqlx_to_io)?;
 

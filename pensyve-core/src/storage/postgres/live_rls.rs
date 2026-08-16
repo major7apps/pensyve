@@ -300,6 +300,17 @@ fn with_admin_pool<T>(
     out
 }
 
+/// Strip `//` comments, so assertions about what Rust source *does* are not
+/// tripped by what it *documents*. The doc comments in `postgres.rs` name the
+/// very patterns [`only_bound_connections_reach_policied_tables`] forbids.
+fn rust_code_only(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Strip `--` comments and collapse whitespace, so assertions about what a
 /// schema file *does* are not satisfied by what it merely *documents*.
 fn sql_statements_only(sql: &str) -> String {
@@ -1064,31 +1075,56 @@ fn capturing_delete_is_confined_to_its_namespace() {
     );
 }
 
-/// Every pooled connection must be handed out by `conn_with_namespace`, which
-/// is the single place that binds the namespace GUC.
+/// Only known-safe call sites may take a connection that carries no namespace.
 ///
-/// This is the one assumption the acquisition-time design rests on. Because
-/// the GUC is session-scoped it outlives a checkout, so a connection taken
-/// straight from the pool would run its query under whatever namespace the
-/// previous caller happened to leave set. Binding on acquisition closes that,
-/// but only for as long as every acquisition goes through the one helper.
+/// The compiler does most of this job. `PostgresBackend` holds a
+/// [`super::scoped_pool::ScopedPool`] whose inner `PgPool` is private to that
+/// module, so `postgres.rs` cannot reach the pool directly at all. That closes
+/// the whole family of unbound checkouts, not just the obvious one: `sqlx`
+/// implements `Executor` for `&PgPool` and `Acquire` for `&PgPool`, so
+/// `query(..).fetch_one(&pool)` and `pool.begin()` each take a connection
+/// without ever spelling `acquire`.
 ///
-/// Deliberately a source-level check: the leak it guards against is invisible
-/// until RLS is enforced, by which point the wrong rows have already been
-/// read. `get_namespace_by_name` is unaffected and not counted here — it runs
-/// on the pool directly, but only against `namespaces`, which carries no RLS
-/// policy.
+/// What is left is `ScopedPool::unbound`, the deliberate escape hatch. A
+/// connection from it inherits whatever namespace the previous checkout left
+/// set, so under enforced RLS a query against a policied table would read
+/// another namespace's rows. That is a cross-namespace read rather than a
+/// fail-closed no-op, so the escape hatch is pinned to an allowlist here.
+///
+/// Each entry is safe for a specific reason, and a new one is only safe if it
+/// has the same kind of reason:
+///
+/// * `run_schema` and `enforce_rls` run DDL, which RLS does not apply to.
+/// * `get_namespace_by_name` reads `namespaces`, which carries no policy, and
+///   is how a caller learns the namespace id it would scope by.
+/// * `pool` hands the pool to external callers, who own the scoping contract
+///   documented on `set_namespace_config`.
 #[test]
-fn only_one_place_acquires_a_pooled_connection() {
-    let source = include_str!("../postgres.rs");
-    let acquisitions = source.matches("self.pool.acquire()").count();
+fn only_bound_connections_reach_policied_tables() {
+    const ALLOWED_UNBOUND_USES: usize = 4;
+
+    let source = rust_code_only(include_str!("../postgres.rs"));
+    let unbound = source.matches(".unbound()").count();
     assert_eq!(
-        acquisitions, 1,
-        "expected exactly one `self.pool.acquire()` in postgres.rs (the one inside \
-         `conn_with_namespace`), found {acquisitions}. A connection acquired anywhere else \
-         inherits the previous checkout's namespace GUC; route it through \
-         `scoped_conn` or `maybe_scoped_conn` instead."
+        unbound, ALLOWED_UNBOUND_USES,
+        "postgres.rs has {unbound} uses of `ScopedPool::unbound()`, expected \
+         {ALLOWED_UNBOUND_USES}. An unbound connection carries the previous checkout's \
+         namespace, so a query on a table with a namespace_isolation_* policy would read \
+         another namespace's rows once RLS is enforced. Use `scoped_conn` or \
+         `maybe_scoped_conn` unless the statement is DDL or targets an unpolicied table \
+         (namespaces, edges, activity_events), and update this count if it is."
     );
+
+    // The wrapper is only worth having if the raw pool is genuinely out of
+    // reach, so check that nothing rebuilt a direct path to it.
+    for forbidden in ["self.pool.acquire(", "self.pool.begin(", "&self.pool)"] {
+        assert!(
+            !source.contains(forbidden),
+            "postgres.rs contains `{forbidden}`, which takes a connection without binding a \
+             namespace. Go through `scoped_conn`, `maybe_scoped_conn`, or an allowlisted \
+             `unbound()` call."
+        );
+    }
 }
 
 /// `FORCE ROW LEVEL SECURITY` must cover exactly the tables that carry a
