@@ -18,6 +18,7 @@ benchmarks/results/*.json
 .cargo/
 node_modules/
 pensyve-ts/dist/
+.claude/
 
 # --- Secrets & credentials ---
 *.pem
