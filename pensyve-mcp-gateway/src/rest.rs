@@ -151,6 +151,10 @@ pub struct EntityResponse {
 #[derive(Debug, Serialize)]
 pub struct ForgetResponse {
     pub forgotten_count: usize,
+    /// Reference to the pre-delete snapshot the caller can recover from.
+    /// Absent when nothing was deleted — there is no file to point at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1126,6 +1130,28 @@ async fn create_entity(
     ))
 }
 
+/// Constant-size reference to a pre-delete snapshot. The rows are referenced
+/// rather than inlined: they carry their embeddings, so a full payload runs to
+/// megabytes. Unlike the co-located MCP tool, REST and A2A callers are remote —
+/// a server-local filesystem path is useless to them and leaks the snapshot
+/// layout, so the reference is by id only; the path is recorded in the
+/// activity log for the operator who performs the restore.
+fn snapshot_reference(snapshot: &pensyve_core::snapshot::ForgetSnapshot) -> serde_json::Value {
+    let counts = snapshot.counts();
+    json!({
+        "snapshot_id": snapshot.snapshot_id.to_string(),
+        "format_version": snapshot.format_version,
+        "captured_at": snapshot.captured_at.to_rfc3339(),
+        // False on platforms where the file could not be restricted to its
+        // owner — the caller holding this reference is the one who needs to
+        // know the artifact is readable by others.
+        "owner_only": snapshot.owner_only,
+        "memory_count": counts.total,
+        "episodic_count": counts.episodic,
+        "semantic_count": counts.semantic,
+    })
+}
+
 async fn forget_entity(
     State(state): State<Arc<AppState>>,
     axum::Extension(auth_ctx): axum::Extension<AuthContext>,
@@ -1141,37 +1167,49 @@ async fn forget_entity(
             )
         })?;
 
-    // Collect memory IDs before deletion so we can remove them from the vector index.
-    let mut memory_ids: Vec<Uuid> = Vec::new();
-    if let Ok(mems) = ps.storage.list_episodic_by_entity(entity.id, usize::MAX) {
-        memory_ids.extend(mems.iter().map(|m| m.id));
-    }
-    if let Ok(mems) = ps.storage.list_semantic_by_entity(entity.id, usize::MAX) {
-        memory_ids.extend(mems.iter().map(|m| m.id));
-    }
+    // Delete and snapshot atomically: the snapshot file is written inside the
+    // delete's transaction, so either both happen or neither does. #217 lost
+    // 1,528 memories with no way back — a delete we could not capture is
+    // exactly that situation again, so this fails closed.
+    let outcome = pensyve_core::snapshot::forget_entity(
+        ps.storage.as_ref(),
+        entity.id,
+        Some(entity.name.as_str()),
+        ps.namespace.id,
+        &ps.snapshot_root,
+    )
+    .map_err(|err| {
+        RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Aborted: pre-delete snapshot failed, nothing was deleted: {err}"),
+        )
+    })?;
 
-    let forgotten_count = ps
-        .storage
-        .delete_memories_by_entity(entity.id, ps.namespace.id)
-        .map_err(|err| {
-            RestError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Error deleting memories: {err}"),
-            )
-        })?;
+    let snapshot = &outcome.snapshot;
+    let forgotten_count = snapshot.memories.len();
 
-    // Remove deleted entries from vector index — O(1) per entry, not O(n) rebuild.
+    // The snapshot holds exactly the rows the delete removed, so it is also the
+    // authoritative list for vector-index cleanup — O(1) per entry, not O(n) rebuild.
     if forgotten_count > 0 {
         let mut vi = ps.vector_index.write().await;
-        for id in &memory_ids {
-            let _ = vi.remove(*id);
+        for id in snapshot.memory_ids() {
+            let _ = vi.remove(id);
         }
     }
+
+    let snapshot_path = outcome
+        .path
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
 
     let _ = ps.storage.log_activity(
         ps.namespace.id,
         "forget",
-        &json!({"entity": entity_name, "forgotten_count": forgotten_count}),
+        &json!({
+            "entity": entity_name,
+            "forgotten_count": forgotten_count,
+            "snapshot_path": snapshot_path,
+        }),
     );
 
     // Invalidate recall cache for this namespace.
@@ -1181,7 +1219,12 @@ async fn forget_entity(
         crate::cache::invalidate_prefix(&mut conn, &prefix).await;
     }
 
-    Ok(Json(ForgetResponse { forgotten_count }))
+    Ok(Json(ForgetResponse {
+        forgotten_count,
+        snapshot: snapshot_path
+            .is_some()
+            .then(|| snapshot_reference(snapshot)),
+    }))
 }
 
 async fn delete_memory(
@@ -2338,6 +2381,55 @@ fn a2a_remember(
     Ok(json!({"memory_id": mem.id.to_string()}))
 }
 
+/// Handle the `memory.forget` capability for A2A task requests.
+async fn a2a_forget(
+    ps: &PensyveState,
+    input: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let entity_name = input
+        .get("entity")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // A lookup failure is not a missing entity: reporting it as a completed
+    // zero-delete would tell the caller the forget succeeded when nothing was
+    // checked, so only `Ok(None)` gets the zero-count path.
+    let entity = match ps.storage.get_entity_by_name(&entity_name, ps.namespace.id) {
+        Ok(Some(entity)) => entity,
+        Ok(None) => return Ok(json!({"forgotten_count": 0})),
+        Err(err) => return Err(format!("Error looking up entity: {err}")),
+    };
+
+    // Same fail-closed contract as the REST route and the MCP tool: the
+    // snapshot is written inside the delete's transaction, so a snapshot that
+    // cannot be written aborts the delete instead of losing rows silently.
+    let outcome = pensyve_core::snapshot::forget_entity(
+        ps.storage.as_ref(),
+        entity.id,
+        Some(entity.name.as_str()),
+        ps.namespace.id,
+        &ps.snapshot_root,
+    )
+    .map_err(|err| format!("Aborted: pre-delete snapshot failed, nothing was deleted: {err}"))?;
+
+    let snapshot = &outcome.snapshot;
+    let forgotten_count = snapshot.memories.len();
+
+    if forgotten_count > 0 {
+        let mut vi = ps.vector_index.write().await;
+        for id in snapshot.memory_ids() {
+            let _ = vi.remove(id);
+        }
+    }
+
+    let mut output = json!({"forgotten_count": forgotten_count});
+    if outcome.path.is_some() {
+        output["snapshot"] = snapshot_reference(snapshot);
+    }
+    Ok(output)
+}
+
 async fn a2a_agent_card() -> impl IntoResponse {
     let endpoint = std::env::var("PENSYVE_GATEWAY_URL")
         .unwrap_or_else(|_| "http://localhost:8000".to_string());
@@ -2370,24 +2462,20 @@ async fn a2a_task(
             }
         },
         "memory.remember" => a2a_remember(&ps, &input)?,
-        "memory.forget" => {
-            let entity_name = input
-                .get("entity")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            match ps.storage.get_entity_by_name(&entity_name, ps.namespace.id) {
-                Ok(Some(entity)) => {
-                    let count = ps
-                        .storage
-                        .delete_memories_by_entity(entity.id, ps.namespace.id)
-                        .unwrap_or(0);
-                    json!({"forgotten_count": count})
-                }
-                _ => json!({"forgotten_count": 0}),
+        "memory.forget" => match a2a_forget(&ps, &input).await {
+            Ok(val) => val,
+            Err(e) => {
+                return Ok(Json(
+                    serde_json::to_value(pensyve_core::a2a::A2ATaskResponse {
+                        task_id: body.task_id,
+                        status: "failed".to_string(),
+                        output: json!({}),
+                        error: Some(e),
+                    })
+                    .unwrap_or_default(),
+                ));
             }
-        }
+        },
         other => {
             return Ok(Json(
                 serde_json::to_value(pensyve_core::a2a::A2ATaskResponse {
