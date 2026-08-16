@@ -364,7 +364,14 @@ impl PensyveMcpServer {
             }
         };
 
-        let mut episode = match state.storage.get_episode(episode_id) {
+        // Scoped load: `update_episode` writes back on `episode.namespace_id`,
+        // so an unscoped read would let this caller stamp `ended_at`/`outcome`
+        // onto another tenant's episode. A foreign episode reports the same
+        // not-found as a missing one.
+        let mut episode = match state
+            .storage
+            .get_episode_in_namespace(episode_id, state.namespace.id)
+        {
             Ok(Some(ep)) => ep,
             Ok(None) => return Err(format!("Episode not found: {episode_id}")),
             Err(e) => return Err(format!("Error loading episode: {e}")),
@@ -469,8 +476,13 @@ impl PensyveMcpServer {
             .parse::<Uuid>()
             .map_err(|_| format!("Invalid episode_id: '{}'", params.episode_id))?;
 
-        // Verify the episode exists.
-        match state.storage.get_episode(episode_id) {
+        // Verify the episode exists *in the caller's namespace*. Attaching to a
+        // foreign episode would let this namespace's recall groups join against
+        // the owning tenant's per-episode rows.
+        match state
+            .storage
+            .get_episode_in_namespace(episode_id, state.namespace.id)
+        {
             Ok(Some(_)) => {}
             Ok(None) => return Err(format!("Episode not found: {episode_id}")),
             Err(e) => return Err(format!("Error loading episode: {e}")),
@@ -925,5 +937,129 @@ mod tests {
     fn test_check_scope_write_denies_read_tools() {
         assert!(check_scope("mcp:write", "pensyve_recall").is_err());
         assert!(check_scope("mcp:write", "pensyve_inspect").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-tenant isolation
+    //
+    // The gateway hands every tenant a `PensyveState` over one shared storage
+    // backend; only `state.namespace` differs. A tool that resolves a row from
+    // a caller-supplied UUID alone therefore reaches across tenants.
+    // -----------------------------------------------------------------------
+
+    use pensyve_core::config::RetrievalConfig;
+    use pensyve_core::embedding::OnnxEmbedder;
+    use pensyve_core::reranker::Reranker;
+    use pensyve_core::storage::sqlite::SqliteBackend;
+    use pensyve_core::types::{Episode, Namespace};
+    use pensyve_core::vector::VectorIndex;
+    use std::sync::OnceLock;
+    use tokio::sync::RwLock;
+
+    fn test_retrieval_config() -> RetrievalConfig {
+        RetrievalConfig {
+            default_limit: 5,
+            max_candidates: 100,
+            weights: [0.30, 0.15, 0.20, 0.10, 0.10, 0.05, 0.05, 0.05],
+            recall_timeout_secs: 5,
+            rrf_k: 60,
+            rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.0],
+            beam_width: 10,
+            max_depth: 4,
+        }
+    }
+
+    /// Two tenant states over one shared backend, as the gateway builds them.
+    fn two_tenant_servers(
+        dir: &tempfile::TempDir,
+    ) -> (PensyveMcpServer, PensyveMcpServer, Arc<dyn StorageTrait>) {
+        let storage = Arc::new(SqliteBackend::open(dir.path()).expect("open storage"))
+            as Arc<dyn StorageTrait>;
+        let embedder = Arc::new(OnnxEmbedder::new_mock(768));
+
+        // Seed the shared reranker cell with a mock so no test in this binary
+        // can fall through to the real model download. Seeding the cell is the
+        // thread-safe alternative to setting `PENSYVE_RERANKER=0`, which is a
+        // process-global mutation racing every concurrent reader.
+        let reranker_cell = Arc::new(OnceLock::new());
+        assert!(
+            reranker_cell
+                .set(Some(Arc::new(Reranker::new_mock())))
+                .is_ok(),
+            "freshly constructed reranker cell must be unset"
+        );
+
+        let mut servers = Vec::new();
+        for name in ["tenant-attacker", "tenant-victim"] {
+            let namespace = Namespace::new(name);
+            storage.save_namespace(&namespace).expect("save namespace");
+            servers.push(PensyveMcpServer::new(Arc::new(PensyveState {
+                storage: storage.clone(),
+                embedder: embedder.clone(),
+                vector_index: RwLock::new(VectorIndex::new(768, 1024)),
+                namespace,
+                retrieval_config: test_retrieval_config(),
+                is_remote: true,
+                reranker_cell: reranker_cell.clone(),
+            })));
+        }
+        let victim = servers.pop().expect("victim server");
+        let attacker = servers.pop().expect("attacker server");
+        (attacker, victim, storage)
+    }
+
+    #[tokio::test]
+    async fn episode_end_cannot_close_an_episode_in_another_namespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (attacker, victim, storage) = two_tenant_servers(&dir);
+
+        let episode = Episode::new(victim.state.namespace.id, vec![Uuid::new_v4()]);
+        storage.save_episode(&episode).expect("save episode");
+
+        let result = attacker
+            .episode_end(Parameters(EpisodeEndParams {
+                episode_id: episode.id.to_string(),
+                outcome: Some("failure".to_string()),
+            }))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "attacker closed the victim's episode: {result:?}"
+        );
+
+        let after = storage
+            .get_episode_in_namespace(episode.id, victim.state.namespace.id)
+            .expect("episode lookup")
+            .expect("victim episode still exists");
+        assert!(
+            after.ended_at.is_none(),
+            "attacker stamped ended_at={:?} on the victim's episode",
+            after.ended_at
+        );
+        assert!(after.outcome.is_none());
+    }
+
+    #[tokio::test]
+    async fn episode_end_still_works_within_the_owning_namespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_attacker, victim, storage) = two_tenant_servers(&dir);
+
+        let episode = Episode::new(victim.state.namespace.id, vec![Uuid::new_v4()]);
+        storage.save_episode(&episode).expect("save episode");
+
+        victim
+            .episode_end(Parameters(EpisodeEndParams {
+                episode_id: episode.id.to_string(),
+                outcome: Some("success".to_string()),
+            }))
+            .await
+            .expect("owner may close their own episode");
+
+        let after = storage
+            .get_episode_in_namespace(episode.id, victim.state.namespace.id)
+            .expect("episode lookup")
+            .expect("episode exists");
+        assert!(after.ended_at.is_some());
     }
 }

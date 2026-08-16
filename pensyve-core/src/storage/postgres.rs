@@ -691,9 +691,13 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn get_episode(&self, id: Uuid) -> StorageResult<Option<Episode>> {
-        self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
+    fn get_episode_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<Episode>> {
+        self.block_on(async move {
+            let mut conn = self.scoped_conn(namespace_id).await?;
             #[allow(clippy::type_complexity)]
             let row: Option<(
                 Uuid,
@@ -704,28 +708,32 @@ impl StorageTrait for PostgresBackend {
                 Option<String>,
                 serde_json::Value,
             )> = query_as::<Postgres, _>(
-                "SELECT id, namespace_id, participants, started_at, ended_at, outcome, metadata FROM episodes WHERE id = $1",
+                "SELECT id, namespace_id, participants, started_at, ended_at, outcome, metadata \
+                 FROM episodes WHERE id = $1 AND namespace_id = $2",
             )
             .bind(id)
+            .bind(namespace_id)
             .fetch_optional(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
 
-            Ok(row.map(|(id, namespace_id, participants, started_at, ended_at, outcome, metadata)| {
-                let participants: Vec<Uuid> =
-                    serde_json::from_value(participants).unwrap_or_default();
-                let metadata: HashMap<String, serde_json::Value> =
-                    serde_json::from_value(metadata).unwrap_or_default();
-                Episode {
-                    id,
-                    namespace_id,
-                    participants,
-                    started_at,
-                    ended_at,
-                    outcome: outcome.as_deref().map(str_to_outcome),
-                    metadata,
-                }
-            }))
+            Ok(row.map(
+                |(id, namespace_id, participants, started_at, ended_at, outcome, metadata)| {
+                    let participants: Vec<Uuid> =
+                        serde_json::from_value(participants).unwrap_or_default();
+                    let metadata: HashMap<String, serde_json::Value> =
+                        serde_json::from_value(metadata).unwrap_or_default();
+                    Episode {
+                        id,
+                        namespace_id,
+                        participants,
+                        started_at,
+                        ended_at,
+                        outcome: outcome.as_deref().map(str_to_outcome),
+                        metadata,
+                    }
+                },
+            ))
         })
     }
 
@@ -1150,6 +1158,7 @@ impl StorageTrait for PostgresBackend {
 
     fn list_observations_by_episode_ids(
         &self,
+        namespace_id: Uuid,
         episode_ids: &[Uuid],
         limit: usize,
     ) -> StorageResult<Vec<ObservationMemory>> {
@@ -1157,53 +1166,47 @@ impl StorageTrait for PostgresBackend {
             return Ok(Vec::new());
         }
         let ids = episode_ids.to_vec();
-        // Defensive: if the backend has a `default_namespace` configured,
-        // add an explicit `namespace_id` filter to the query as a second
-        // line of defence beyond RLS. Callers without a default namespace
-        // (test fixtures, one-off scripts) still work via RLS alone —
-        // production deployments should always set the namespace either
-        // via `with_default_namespace` or by using `scoped_conn` upstream.
-        let namespace_filter = self.default_namespace;
+        // The `namespace_id` predicate is unconditional. RLS is a second line
+        // of defence, not the first: `episode_id` is caller-supplied and is
+        // not a tenant boundary, so joining on it alone reaches other
+        // namespaces whenever the session GUC is not in force.
         self.block_on(async move {
-            let mut conn = self.maybe_scoped_conn().await?;
-            let sql = if namespace_filter.is_some() {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let rows: Vec<ObservationRow> = query_as::<Postgres, ObservationRow>(
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
                           unit, content, embedding::text AS embedding, confidence, event_time, created_at,
                           stability, retrievability, superseded_by, invalid_at
                    FROM observation_memories
-                   WHERE episode_id = ANY($1) AND namespace_id = $3
+                   WHERE episode_id = ANY($1) AND namespace_id = $2
                      AND superseded_by IS NULL
                    ORDER BY created_at ASC
-                   LIMIT $2"
-            } else {
-                r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
-                          unit, content, embedding::text AS embedding, confidence, event_time, created_at,
-                          stability, retrievability, superseded_by, invalid_at
-                   FROM observation_memories
-                   WHERE episode_id = ANY($1) AND superseded_by IS NULL
-                   ORDER BY created_at ASC
-                   LIMIT $2"
-            };
-            let mut q = query_as::<Postgres, ObservationRow>(sql)
-                .bind(&ids)
-                .bind(i64::try_from(limit).unwrap_or(i64::MAX));
-            if let Some(ns) = namespace_filter {
-                q = q.bind(ns);
-            }
-            let rows: Vec<ObservationRow> = q.fetch_all(&mut *conn).await.map_err(sqlx_to_io)?;
+                   LIMIT $3",
+            )
+            .bind(&ids)
+            .bind(namespace_id)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
             Ok(rows.into_iter().map(row_to_observation).collect())
         })
     }
 
-    fn delete_observations_by_episode(&self, episode_id: Uuid) -> StorageResult<usize> {
-        self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
-            let result =
-                query::<Postgres>("DELETE FROM observation_memories WHERE episode_id = $1")
-                    .bind(episode_id)
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(sqlx_to_io)?;
+    fn delete_observations_by_episode(
+        &self,
+        namespace_id: Uuid,
+        episode_id: Uuid,
+    ) -> StorageResult<usize> {
+        self.block_on(async move {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let result = query::<Postgres>(
+                "DELETE FROM observation_memories WHERE episode_id = $1 AND namespace_id = $2",
+            )
+            .bind(episode_id)
+            .bind(namespace_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
             Ok(usize::try_from(result.rows_affected()).unwrap_or(0))
         })
     }

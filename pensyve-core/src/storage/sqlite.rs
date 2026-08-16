@@ -993,12 +993,17 @@ impl StorageTrait for SqliteBackend {
         Ok(())
     }
 
-    fn get_episode(&self, id: Uuid) -> StorageResult<Option<Episode>> {
+    fn get_episode_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<Episode>> {
         let conn = lock_conn!(self);
         let result = conn
             .query_row(
-                "SELECT id, namespace_id, participants, started_at, ended_at, outcome, metadata FROM episodes WHERE id = ?1",
-                params![id.to_string()],
+                "SELECT id, namespace_id, participants, started_at, ended_at, outcome, metadata \
+                 FROM episodes WHERE id = ?1 AND namespace_id = ?2",
+                params![id.to_string(), namespace_id.to_string()],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -1531,6 +1536,7 @@ impl StorageTrait for SqliteBackend {
 
     fn list_observations_by_episode_ids(
         &self,
+        namespace_id: Uuid,
         episode_ids: &[Uuid],
         limit: usize,
     ) -> StorageResult<Vec<ObservationMemory>> {
@@ -1544,7 +1550,8 @@ impl StorageTrait for SqliteBackend {
               unit, content, embedding, confidence, event_time, created_at, \
               stability, retrievability, agent_id, user_id, superseded_by, invalid_at \
              FROM observation_memories \
-             WHERE episode_id IN ({placeholders}) AND superseded_by IS NULL \
+             WHERE episode_id IN ({placeholders}) AND namespace_id = ? \
+               AND superseded_by IS NULL \
              ORDER BY created_at ASC \
              LIMIT ?"
         );
@@ -1554,6 +1561,7 @@ impl StorageTrait for SqliteBackend {
             .iter()
             .map(|u| Box::new(u.to_string()) as Box<dyn rusqlite::ToSql>)
             .collect();
+        params_vec.push(Box::new(namespace_id.to_string()));
         params_vec.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
         let param_refs: Vec<&dyn rusqlite::ToSql> =
             params_vec.iter().map(std::convert::AsRef::as_ref).collect();
@@ -1638,9 +1646,14 @@ impl StorageTrait for SqliteBackend {
         }
     }
 
-    fn delete_observations_by_episode(&self, episode_id: Uuid) -> StorageResult<usize> {
+    fn delete_observations_by_episode(
+        &self,
+        namespace_id: Uuid,
+        episode_id: Uuid,
+    ) -> StorageResult<usize> {
         let conn = lock_conn!(self);
         let ep_str = episode_id.to_string();
+        let ns_str = namespace_id.to_string();
         conn.execute_batch("BEGIN")?;
         let result = (|| -> StorageResult<usize> {
             // Phase 2B cascade (CodeRabbit PR #115 round 2): drop
@@ -1648,25 +1661,31 @@ impl StorageTrait for SqliteBackend {
             // departing observation IDs before the owning rows are
             // gone. `kg_entities` are namespace-scoped and may still
             // be referenced by surviving observations; leave them.
+            //
+            // Every sub-select repeats the `namespace_id` predicate: the
+            // caller-supplied `episode_id` alone selects rows across tenants.
             conn.execute(
                 "DELETE FROM kg_triples \
-                 WHERE passage_id IN (SELECT id FROM observation_memories WHERE episode_id = ?1)",
-                params![&ep_str],
+                 WHERE passage_id IN (SELECT id FROM observation_memories \
+                                       WHERE episode_id = ?1 AND namespace_id = ?2)",
+                params![&ep_str, &ns_str],
             )?;
             conn.execute(
                 "DELETE FROM kg_passage_entities \
-                 WHERE passage_id IN (SELECT id FROM observation_memories WHERE episode_id = ?1)",
-                params![&ep_str],
+                 WHERE passage_id IN (SELECT id FROM observation_memories \
+                                       WHERE episode_id = ?1 AND namespace_id = ?2)",
+                params![&ep_str, &ns_str],
             )?;
             conn.execute(
                 "DELETE FROM memory_fts \
                  WHERE memory_type = 'observation' \
-                   AND memory_id IN (SELECT id FROM observation_memories WHERE episode_id = ?1)",
-                params![&ep_str],
+                   AND memory_id IN (SELECT id FROM observation_memories \
+                                      WHERE episode_id = ?1 AND namespace_id = ?2)",
+                params![&ep_str, &ns_str],
             )?;
             let deleted = conn.execute(
-                "DELETE FROM observation_memories WHERE episode_id = ?1",
-                params![&ep_str],
+                "DELETE FROM observation_memories WHERE episode_id = ?1 AND namespace_id = ?2",
+                params![&ep_str, &ns_str],
             )?;
             Ok(deleted)
         })();
@@ -3804,7 +3823,7 @@ mod tests {
 
         // Fetch ep_a + ep_b only
         let fetched = db
-            .list_observations_by_episode_ids(&[ep_a, ep_b], 100)
+            .list_observations_by_episode_ids(ns.id, &[ep_a, ep_b], 100)
             .unwrap();
         assert_eq!(fetched.len(), 3);
         let instances: std::collections::HashSet<_> =
@@ -3885,20 +3904,23 @@ mod tests {
             db.save_observation(&obs).unwrap();
         }
 
-        let fetched = db.list_observations_by_episode_ids(&[ep], 3).unwrap();
+        let fetched = db
+            .list_observations_by_episode_ids(ns.id, &[ep], 3)
+            .unwrap();
         assert_eq!(fetched.len(), 3);
     }
 
     #[test]
     fn test_observations_list_empty_inputs() {
         let (_dir, db) = setup();
+        let ns = make_namespace(&db);
         assert!(
-            db.list_observations_by_episode_ids(&[], 10)
+            db.list_observations_by_episode_ids(ns.id, &[], 10)
                 .unwrap()
                 .is_empty()
         );
         assert!(
-            db.list_observations_by_episode_ids(&[Uuid::new_v4()], 0)
+            db.list_observations_by_episode_ids(ns.id, &[Uuid::new_v4()], 0)
                 .unwrap()
                 .is_empty()
         );
@@ -3916,11 +3938,11 @@ mod tests {
             db.save_observation(&obs).unwrap();
         }
 
-        let deleted = db.delete_observations_by_episode(ep_a).unwrap();
+        let deleted = db.delete_observations_by_episode(ns.id, ep_a).unwrap();
         assert_eq!(deleted, 2);
 
         let remaining = db
-            .list_observations_by_episode_ids(&[ep_a, ep_b], 100)
+            .list_observations_by_episode_ids(ns.id, &[ep_a, ep_b], 100)
             .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].instance, "b1");
@@ -4327,7 +4349,7 @@ mod tests {
         assert_eq!(kg_triples_count_for_passage(&db, obs.id), 1);
         assert_eq!(kg_passage_entities_count_for_passage(&db, obs.id), 2);
 
-        db.delete_observations_by_episode(ep).unwrap();
+        db.delete_observations_by_episode(ns.id, ep).unwrap();
 
         assert_eq!(
             kg_triples_count_for_passage(&db, obs.id),

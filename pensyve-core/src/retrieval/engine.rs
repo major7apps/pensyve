@@ -533,6 +533,7 @@ impl<'a> RecallEngine<'a> {
         // candidate selection, only enrich the sessions that already won.
         Ok(crate::recall_grouped::attach_observations_to_groups(
             self.storage,
+            namespace_id,
             groups,
         ))
     }
