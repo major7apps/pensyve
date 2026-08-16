@@ -122,7 +122,7 @@ async fn start_test_server(mgr: Arc<TenantStateManager>) -> (String, Cancellatio
             Arc::default(),
             {
                 let mut cfg = StreamableHttpServerConfig::default();
-                cfg.stateful_mode = false;
+                cfg.legacy_session_mode = false;
                 cfg.json_response = true;
                 cfg.sse_keep_alive = None;
                 cfg.cancellation_token = ct.child_token();
