@@ -57,7 +57,7 @@ use uuid::Uuid;
 
 use super::PostgresBackend;
 use crate::storage::StorageTrait;
-use crate::types::{EpisodicMemory, Memory, Namespace};
+use crate::types::{EpisodicMemory, Memory, Namespace, SemanticMemory};
 
 /// Environment variable naming the admin connection string.
 ///
@@ -567,4 +567,118 @@ fn schema_declares_rls_for_every_expected_table() {
              namespace_id predicate"
         );
     }
+}
+
+/// The capturing delete behind `pensyve_forget` must not reach across
+/// namespaces — neither in what it destroys nor in what it writes into the
+/// recovery artifact.
+///
+/// Entity ids are not globally unique in this schema, and nothing stops two
+/// tenants from holding rows keyed to the same id. Without an explicit
+/// `namespace_id` predicate the delete matches on entity id alone: RLS is the
+/// only other filter, and it is inert here (the backend connects as the schema
+/// owner, and `scoped_conn` discards its GUC — see the module docs). The
+/// foreign tenant's rows are then deleted *and* handed to the snapshot
+/// callback, which writes them into this tenant's snapshot file — a
+/// cross-tenant leak into the very artifact that per-namespace directories
+/// exist to prevent.
+///
+/// `SQLite` cannot observe this: `forget_snapshot_scope.rs` covers scope parity
+/// there, but only live Postgres exercises the RLS-plus-pool path.
+#[test]
+fn capturing_delete_is_confined_to_its_namespace() {
+    let Some(admin_opts) = skip_notice("capturing_delete_is_confined_to_its_namespace") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns_a = Namespace::new(format!("forget-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("forget-b-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns_a).expect("save namespace A");
+    backend.save_namespace(&ns_b).expect("save namespace B");
+
+    // The same entity id in both namespaces — the collision the predicate has
+    // to disambiguate.
+    let entity_id = Uuid::new_v4();
+
+    let mine = EpisodicMemory::new(
+        ns_a.id,
+        Uuid::new_v4(),
+        entity_id,
+        entity_id,
+        "tenant A turn",
+    );
+    backend.save_episodic(&mine).expect("save A's memory");
+
+    let theirs = EpisodicMemory::new(
+        ns_b.id,
+        Uuid::new_v4(),
+        entity_id,
+        entity_id,
+        "tenant B turn",
+    );
+    backend.save_episodic(&theirs).expect("save B's memory");
+
+    let mut mine_fact = SemanticMemory::new(ns_a.id, entity_id, "likes", "a", 0.9);
+    mine_fact.object_entity = Some(entity_id);
+    backend.save_semantic(&mine_fact).expect("save A's fact");
+
+    let mut their_fact = SemanticMemory::new(ns_b.id, entity_id, "likes", "b", 0.9);
+    their_fact.object_entity = Some(entity_id);
+    backend.save_semantic(&their_fact).expect("save B's fact");
+
+    let snapshot_root = tempfile::tempdir().expect("snapshot tempdir");
+    let outcome = crate::snapshot::forget_entity(
+        backend,
+        entity_id,
+        Some("shared-entity"),
+        ns_a.id,
+        snapshot_root.path(),
+    )
+    .expect("forget in namespace A");
+
+    // 1. The other tenant's rows survive.
+    let surviving = memory_ids(
+        &backend
+            .get_all_memories_by_namespace(ns_b.id)
+            .expect("read namespace B"),
+    );
+    assert!(
+        surviving.contains(&theirs.id) && surviving.contains(&their_fact.id),
+        "namespace B's rows must survive a forget issued for namespace A; B now holds {surviving:?}"
+    );
+
+    // 2. And they never entered the artifact.
+    let captured = outcome.snapshot.memory_ids();
+    assert!(
+        !captured.contains(&theirs.id) && !captured.contains(&their_fact.id),
+        "namespace B's rows leaked into namespace A's snapshot: {captured:?}"
+    );
+
+    // 3. The forget still did its job for its own namespace.
+    assert_eq!(
+        captured.len(),
+        2,
+        "namespace A's own rows should have been captured, got {captured:?}"
+    );
+    assert!(
+        backend
+            .get_all_memories_by_namespace(ns_a.id)
+            .expect("read namespace A")
+            .is_empty(),
+        "namespace A should be empty after the forget"
+    );
+
+    // 4. The file on disk agrees, under A's directory.
+    let path = outcome.path.expect("a non-empty snapshot must be written");
+    assert_eq!(
+        path.parent().expect("snapshot parent"),
+        crate::snapshot::namespace_dir(snapshot_root.path(), ns_a.id)
+    );
+    let reloaded = crate::snapshot::read_file(&path).expect("reload snapshot");
+    assert!(
+        !reloaded.memory_ids().contains(&theirs.id),
+        "namespace B's row leaked into the snapshot file on disk"
+    );
 }

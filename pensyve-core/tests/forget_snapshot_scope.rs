@@ -273,13 +273,17 @@ fn a_concurrent_writer_cannot_land_a_row_in_the_deleted_but_uncaptured_gap() {
     let mut intruder_result: Option<bool> = None;
 
     storage
-        .delete_memories_by_entity_capturing(fixture.target.id, &mut |memories| {
-            captured = memories.iter().map(Memory::id).collect();
-            // The delete has already run in this transaction. A concurrent
-            // writer must not be able to commit a matching row now.
-            intruder_result = Some(intruder.save_semantic(&racing_row).is_ok());
-            Ok(())
-        })
+        .delete_memories_by_entity_capturing(
+            fixture.target.id,
+            fixture.namespace.id,
+            &mut |memories: &[Memory]| {
+                captured = memories.iter().map(Memory::id).collect();
+                // The delete has already run in this transaction. A concurrent
+                // writer must not be able to commit a matching row now.
+                intruder_result = Some(intruder.save_semantic(&racing_row).is_ok());
+                Ok(())
+            },
+        )
         .unwrap();
 
     assert_eq!(

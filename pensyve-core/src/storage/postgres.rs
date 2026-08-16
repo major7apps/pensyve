@@ -1441,18 +1441,25 @@ impl StorageTrait for PostgresBackend {
     // -----------------------------------------------------------------------
 
     /// Capturing variant of [`Self::delete_memories_by_entity`] — see the trait
-    /// docs. Same `WHERE` clauses and the same connection scoping
-    /// (`maybe_scoped_conn`, not `scoped_conn`, because the delete is not
-    /// namespace-filtered either), with `RETURNING` supplying the rows the
-    /// statement actually removed.
+    /// docs. `RETURNING` supplies the rows the statement actually removed, and
+    /// both deletes plus `persist` run in one transaction, so the captured set
+    /// cannot disagree with the committed effect no matter what other sessions
+    /// do concurrently.
     ///
-    /// Wrapping both deletes and `persist` in one transaction also removes any
-    /// isolation-level reasoning: `RETURNING` reports the rows this statement
-    /// deleted, so the captured set cannot disagree with the committed effect
-    /// no matter what other sessions do concurrently.
+    /// The `namespace_id = $2` predicate is explicit and load-bearing, not
+    /// belt-and-braces on top of row-level security. RLS cannot be relied on
+    /// here in either direction: the application connects as the schema owner,
+    /// which Postgres exempts from its own policies (so RLS filters nothing and
+    /// an entity-only predicate would delete across tenants), and if the
+    /// namespace GUC is ever missing where policies *do* apply, `current_setting`
+    /// returns NULL and RLS filters everything (so the delete would silently
+    /// capture and remove nothing while reporting success). The explicit
+    /// predicate is correct under both, and under the GUC-binding change in
+    /// flight in #253. See `storage/postgres/live_rls.rs` for the live coverage.
     fn delete_memories_by_entity_capturing(
         &self,
         entity_id: Uuid,
+        namespace_id: Uuid,
         persist: &mut dyn FnMut(&[Memory]) -> StorageResult<()>,
     ) -> StorageResult<Vec<Memory>> {
         self.block_on(async {
@@ -1462,13 +1469,14 @@ impl StorageTrait for PostgresBackend {
 
             let rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
                 r"DELETE FROM episodic_memories
-                   WHERE about_entity = $1 OR source_entity = $1
+                   WHERE (about_entity = $1 OR source_entity = $1) AND namespace_id = $2
                    RETURNING id, namespace_id, episode_id, source_entity, about_entity, content,
                              summary, embedding::text AS embedding, context_intent, timestamp,
                              stability, retrievability, access_count, last_accessed, event_time,
                              superseded_by, invalid_at",
             )
             .bind(entity_id)
+            .bind(namespace_id)
             .fetch_all(&mut *tx)
             .await
             .map_err(sqlx_to_io)?;
@@ -1476,13 +1484,14 @@ impl StorageTrait for PostgresBackend {
 
             let rows: Vec<SemanticRow> = query_as::<Postgres, _>(
                 r"DELETE FROM semantic_memories
-                   WHERE subject = $1 OR object_entity = $1
+                   WHERE (subject = $1 OR object_entity = $1) AND namespace_id = $2
                    RETURNING id, namespace_id, subject, predicate, object, object_entity,
                              confidence, valid_at, invalid_at, source_episodes,
                              embedding::text AS embedding, stability, retrievability,
                              superseded_by",
             )
             .bind(entity_id)
+            .bind(namespace_id)
             .fetch_all(&mut *tx)
             .await
             .map_err(sqlx_to_io)?;

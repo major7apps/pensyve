@@ -2179,10 +2179,14 @@ impl StorageTrait for SqliteBackend {
     // -----------------------------------------------------------------------
 
     /// Capturing variant of [`Self::delete_memories_by_entity`] — see the trait
-    /// docs. The `WHERE` clauses are identical to the plain delete's; the only
-    /// difference is `RETURNING`, which hands back the rows the statement
-    /// actually removed so no concurrent insert can slip into the gap between
-    /// capturing and deleting.
+    /// docs. `RETURNING` hands back the rows the statement actually removed, so
+    /// no concurrent insert can slip into a gap between capturing and deleting.
+    ///
+    /// Every statement is qualified by `namespace_id`. Unlike the plain delete
+    /// this cannot lean on the entity id alone: ids collide across namespaces
+    /// in this schema (see `test_delete_memory_by_id_in_namespace_preserves_foreign_fts_entry`),
+    /// and a row matched from the wrong namespace would be both destroyed and
+    /// written into another tenant's snapshot.
     ///
     /// The `RETURNING` column lists match the `SELECT`s that `row_to_episodic`
     /// and `row_to_semantic` decode positionally, and every returned row is
@@ -2192,10 +2196,12 @@ impl StorageTrait for SqliteBackend {
     fn delete_memories_by_entity_capturing(
         &self,
         entity_id: Uuid,
+        namespace_id: Uuid,
         persist: &mut dyn FnMut(&[Memory]) -> StorageResult<()>,
     ) -> StorageResult<Vec<Memory>> {
         let conn = lock_conn!(self);
         let id_str = entity_id.to_string();
+        let ns_str = namespace_id.to_string();
 
         conn.execute_batch("BEGIN")?;
 
@@ -2203,38 +2209,49 @@ impl StorageTrait for SqliteBackend {
             let mut memories = Vec::new();
 
             let mut stmt = conn.prepare(
-                r"DELETE FROM episodic_memories WHERE about_entity = ?1 OR source_entity = ?1
+                r"DELETE FROM episodic_memories
+                   WHERE (about_entity = ?1 OR source_entity = ?1) AND namespace_id = ?2
                    RETURNING id, namespace_id, episode_id, source_entity, about_entity, content,
                              content_type, summary, embedding, context_intent, timestamp,
                              stability, retrievability, access_count, last_accessed, event_time,
                              agent_id, user_id, superseded_by, invalid_at",
             )?;
             let rows = stmt
-                .query_map(params![&id_str], row_to_episodic)?
+                .query_map(params![&id_str, &ns_str], row_to_episodic)?
                 .collect::<Result<Vec<_>, _>>()?;
             for row in rows {
                 memories.push(Memory::Episodic(row?));
             }
 
             let mut stmt = conn.prepare(
-                r"DELETE FROM semantic_memories WHERE subject = ?1 OR object_entity = ?1
+                r"DELETE FROM semantic_memories
+                   WHERE (subject = ?1 OR object_entity = ?1) AND namespace_id = ?2
                    RETURNING id, namespace_id, subject, predicate, object, content_type,
                              object_entity, confidence, valid_at, invalid_at,
                              source_episodes, embedding, stability, retrievability,
                              agent_id, user_id, superseded_by",
             )?;
             let rows = stmt
-                .query_map(params![&id_str], row_to_semantic)?
+                .query_map(params![&id_str, &ns_str], row_to_semantic)?
                 .collect::<Result<Vec<_>, _>>()?;
             for row in rows {
                 memories.push(Memory::Semantic(row?));
             }
 
-            // Strip the FTS rows for exactly what we just deleted.
+            // Strip the FTS rows for exactly what we just deleted, qualified by
+            // each row's own namespace — `memory_fts` is keyed by `memory_id`,
+            // which is not unique across namespaces, so an unqualified delete
+            // would silently strip another tenant's search index entry.
             for memory in &memories {
+                let row_namespace = match memory {
+                    Memory::Episodic(m) => m.namespace_id,
+                    Memory::Semantic(m) => m.namespace_id,
+                    Memory::Procedural(m) => m.namespace_id,
+                    Memory::Observation(m) => m.namespace_id,
+                };
                 conn.execute(
-                    "DELETE FROM memory_fts WHERE memory_id = ?1",
-                    params![memory.id().to_string()],
+                    "DELETE FROM memory_fts WHERE memory_id = ?1 AND namespace_id = ?2",
+                    params![memory.id().to_string(), row_namespace.to_string()],
                 )?;
             }
 

@@ -180,6 +180,23 @@ pub fn forget_entity(
     let mut path: Option<PathBuf> = None;
 
     let mut persist = |memories: &[Memory]| -> StorageResult<()> {
+        // The artifact is per-namespace, so a row from another namespace would
+        // be a cross-tenant leak into it. The backends' `namespace_id`
+        // predicates are what prevent that; this verifies it at the point the
+        // file is written rather than trusting the SQL, and returning `Err`
+        // rolls the delete back — so a scoping regression fails closed instead
+        // of quietly writing one tenant's memories into another's directory.
+        if let Some(foreign) = memories
+            .iter()
+            .find(|m| memory_namespace(m) != namespace_id)
+        {
+            return Err(StorageError::Context(format!(
+                "refusing to snapshot: memory {} belongs to namespace {}, not {namespace_id}",
+                foreign.id(),
+                memory_namespace(foreign)
+            )));
+        }
+
         let snapshot = ForgetSnapshot {
             format_version: FORMAT_VERSION,
             snapshot_id: Uuid::new_v4(),
@@ -199,7 +216,7 @@ pub fn forget_entity(
         Ok(())
     };
 
-    storage.delete_memories_by_entity_capturing(entity_id, &mut persist)?;
+    storage.delete_memories_by_entity_capturing(entity_id, namespace_id, &mut persist)?;
 
     // Enforces the trait contract that `persist` runs exactly once. A backend
     // that deleted without calling it would have destroyed data uncaptured, so
@@ -217,6 +234,15 @@ pub fn forget_entity(
 /// out of every other tenant's directory.
 pub fn namespace_dir(snapshot_root: &Path, namespace_id: Uuid) -> PathBuf {
     snapshot_root.join(namespace_id.to_string())
+}
+
+fn memory_namespace(memory: &Memory) -> Uuid {
+    match memory {
+        Memory::Episodic(m) => m.namespace_id,
+        Memory::Semantic(m) => m.namespace_id,
+        Memory::Procedural(m) => m.namespace_id,
+        Memory::Observation(m) => m.namespace_id,
+    }
 }
 
 /// Serialize `snapshot` into `dir`, creating the directory if needed, and
