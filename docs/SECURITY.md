@@ -77,37 +77,48 @@ Do not apply enforcement to a deployment until those paths carry a namespace.
 
 #### Applying enforcement
 
-Two changes, in this order. Both are reversible.
-
-1. **Run a dedicated application role that does not own the tables.** A
-   non-owner role is subject to RLS whether or not `FORCE` is set, so this is
-   the durable half of the control:
-
-   ```sql
-   CREATE ROLE pensyve_app LOGIN PASSWORD '...' NOSUPERUSER NOBYPASSRLS;
-   GRANT USAGE ON SCHEMA public TO pensyve_app;
-   GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pensyve_app;
-   ALTER DEFAULT PRIVILEGES IN SCHEMA public
-     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO pensyve_app;
-   ```
-
-   `NOBYPASSRLS` matters: a role with `BYPASSRLS`, and any superuser, ignores
-   every policy. Point `DATABASE_URL` at this role. Keep the owning role for
-   migrations only — the schema is applied on startup, so the owner must still
-   be able to run DDL.
-
-2. **Force the policies onto the owner** by applying
-   `pensyve-core/src/storage/postgres_rls_enforce.sql`. This closes the gap for
-   deployments where the application still connects as the owner.
+Apply `pensyve-core/src/storage/postgres_rls_enforce.sql`, or call
+`PostgresBackend::enforce_rls`. Both run the same statements. The connecting
+role must own the tables, and the application already connects as the owner, so
+no new role is needed.
 
 To roll back, run `ALTER TABLE <table> NO FORCE ROW LEVEL SECURITY;` for each
-table. It takes effect immediately and touches neither the policies nor the
-data.
+table. Rollback takes effect immediately and touches neither the policies nor
+the data.
 
-Getting the order wrong locks the application out of its own tables: an
-application role with no `GRANT`s, or enforcement applied while query paths are
-still unscoped, produces empty reads and silent no-op writes rather than a
-visible failure.
+#### The dedicated application role, and why it is not available yet
+
+A role that does not own the tables is subject to their policies whether or not
+`FORCE` is set, so running the application as a non-owner role would be the
+more durable control. It is not possible today.
+
+`PostgresBackend::new` applies the schema on every startup, and the schema
+contains statements only a table's owner may run, including
+`ALTER TABLE ... ADD COLUMN`, `CREATE INDEX`, `ALTER TABLE ... ENABLE ROW LEVEL
+SECURITY`, and `CREATE POLICY`. A non-owner role fails at startup with
+`must be owner of table entities`, even when it holds every table privilege and
+`CREATE` on the schema. Pointing `DATABASE_URL` at a non-owner role today stops
+the application from starting.
+
+Supporting a non-owner role needs a code change first, so that applying the
+schema is separate from serving traffic. Once that exists, the role should look
+like this, and `NOBYPASSRLS` is required because a role with `BYPASSRLS`, and
+any superuser, ignores every policy:
+
+```sql
+CREATE ROLE pensyve_app LOGIN PASSWORD '...' NOSUPERUSER NOBYPASSRLS;
+GRANT USAGE ON SCHEMA public TO pensyve_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pensyve_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO pensyve_app;
+```
+
+#### What goes wrong
+
+Enforcement applied while query paths are still unscoped produces empty reads
+and writes that do nothing, rather than a visible failure. A non-owner role
+without grants stops the application from starting. Check the unscoped-method
+list first, and roll back with `NO FORCE` if reads start coming back empty.
 
 ## Network Policy
 
