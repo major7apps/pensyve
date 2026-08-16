@@ -1557,7 +1557,13 @@ impl StorageTrait for PostgresBackend {
         persist: &mut dyn FnMut(&[Memory]) -> StorageResult<()>,
     ) -> StorageResult<Vec<Memory>> {
         self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
+            // Bound to the namespace being forgotten, not left unscoped: this
+            // method knows its namespace, and an unscoped connection would
+            // match nothing once RLS is enforced. The explicit
+            // `AND namespace_id = $2` predicates below stay regardless — they
+            // are what confines the delete while RLS is inert, which is every
+            // deployment today.
+            let mut conn = self.scoped_conn(namespace_id).await?;
             let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
             let mut memories = Vec::new();
 

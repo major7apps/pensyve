@@ -760,6 +760,72 @@ fn namespace_scoping_end_to_end_under_enforced_rls() {
     );
 }
 
+/// The capturing delete keeps working with RLS enforced, so it does *not*
+/// belong in [`enforced_rls_fails_closed_for_unscoped_methods`].
+///
+/// It takes a `namespace_id`, so its connection is bound to that namespace
+/// rather than left unscoped. Both halves are worth pinning: it still deletes
+/// and captures its own namespace's rows, and its `WITH CHECK`-constrained
+/// transaction still commits.
+///
+/// [`capturing_delete_is_confined_to_its_namespace`] is the same contract with
+/// RLS inert, which is the configuration that ships. Together they show the
+/// explicit `namespace_id` predicates hold in both modes, which is why they
+/// stay even though the GUC now binds correctly.
+#[test]
+fn capturing_delete_still_works_under_enforced_rls() {
+    let Some(admin_opts) = skip_notice("capturing_delete_still_works_under_enforced_rls") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns_a = Namespace::new(format!("forget-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("forget-b-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns_a).expect("save namespace A");
+    backend.save_namespace(&ns_b).expect("save namespace B");
+
+    let entity_id = Uuid::new_v4();
+    let mine = EpisodicMemory::new(ns_a.id, Uuid::new_v4(), entity_id, entity_id, "tenant A");
+    backend.save_episodic(&mine).expect("save A's memory");
+    let theirs = EpisodicMemory::new(ns_b.id, Uuid::new_v4(), entity_id, entity_id, "tenant B");
+    backend.save_episodic(&theirs).expect("save B's memory");
+
+    fixture.enforce_rls();
+
+    let snapshot_root = tempfile::tempdir().expect("snapshot tempdir");
+    let outcome = crate::snapshot::forget_entity(
+        backend,
+        entity_id,
+        Some("shared-entity"),
+        ns_a.id,
+        snapshot_root.path(),
+    )
+    .expect("forget in namespace A must still succeed under enforced RLS");
+
+    assert_eq!(
+        outcome.snapshot.memory_ids(),
+        vec![mine.id],
+        "the capturing delete must still capture its own namespace's row under enforced RLS"
+    );
+    assert!(
+        backend
+            .get_all_memories_by_namespace(ns_a.id)
+            .expect("read namespace A")
+            .is_empty(),
+        "namespace A should be empty after the forget"
+    );
+    assert_eq!(
+        memory_ids(
+            &backend
+                .get_all_memories_by_namespace(ns_b.id)
+                .expect("read namespace B")
+        ),
+        vec![theirs.id],
+        "namespace B's row must survive"
+    );
+}
+
 /// Enforcement fails closed, and these `StorageTrait` methods take no
 /// `namespace_id`, so they run on an unscoped connection and quietly stop
 /// working when it is switched on.
@@ -967,13 +1033,17 @@ fn schema_declares_rls_for_every_expected_table() {
 ///
 /// Entity ids are not globally unique in this schema, and nothing stops two
 /// tenants from holding rows keyed to the same id. Without an explicit
-/// `namespace_id` predicate the delete matches on entity id alone: RLS is the
-/// only other filter, and it is inert here (the backend connects as the schema
-/// owner, and `scoped_conn` discards its GUC — see the module docs). The
-/// foreign tenant's rows are then deleted *and* handed to the snapshot
-/// callback, which writes them into this tenant's snapshot file — a
-/// cross-tenant leak into the very artifact that per-namespace directories
-/// exist to prevent.
+/// `namespace_id` predicate the delete matches on entity id alone, leaving RLS
+/// as the only other filter — and RLS is inert in every deployment today,
+/// because the backend connects as the schema owner and nothing has applied
+/// `postgres_rls_enforce.sql`. The foreign tenant's rows are then deleted
+/// *and* handed to the snapshot callback, which writes them into this tenant's
+/// snapshot file — a cross-tenant leak into the very artifact that
+/// per-namespace directories exist to prevent.
+///
+/// So the predicates stay whether or not RLS is enforced. This test runs with
+/// it inert, which is the configuration that actually ships, and therefore
+/// gates the predicates rather than the policies.
 ///
 /// `SQLite` cannot observe this: `forget_snapshot_scope.rs` covers scope parity
 /// there, but only live Postgres exercises the RLS-plus-pool path.
