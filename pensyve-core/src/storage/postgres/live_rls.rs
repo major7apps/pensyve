@@ -1829,7 +1829,8 @@ fn fts_or_semantics_survive_paraphrase_queries() {
     // tokens lead, so the capped query still finds the row.
     let mut huge = String::from(query);
     for i in 0..70_000 {
-        huge.push_str(&format!(" filler{i}"));
+        use std::fmt::Write as _;
+        let _ = write!(huge, " filler{i}");
     }
     let capped = backend
         .search_fts(&huge, ns.id, 10)
