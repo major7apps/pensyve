@@ -619,56 +619,79 @@ impl PensyveMcpServer {
         // #217 lost 1,528 memories with no way back — a delete we could not
         // capture is exactly that situation again, so this fails closed.
         //
-        // #251: `spawn_blocking`, not the runtime worker — the call is
-        // synchronous throughout: a rusqlite delete behind a mutex, a
-        // serialize that runs to megabytes at #217's scale, and two
-        // `sync_all`s. A panicked or cancelled task takes the same fail-closed
-        // path as a snapshot failure: nothing about the delete can be
-        // confirmed, and a panic must not be reported as a successful forget.
-        let storage = state.storage.clone();
-        let snapshot_root = state.snapshot_root.clone();
-        let namespace_id = state.namespace.id;
+        // #251: the call is synchronous throughout — a rusqlite delete behind
+        // a mutex, a serialize that runs to megabytes at #217's scale, and two
+        // `sync_all`s — so it goes to the blocking pool rather than parking a
+        // runtime worker. The delete and its bookkeeping (index cleanup, the
+        // activity record) share one spawned task the handler only observes:
+        // a dropped request future cannot abandon the cleanup after the delete
+        // commits. A panicked or cancelled blocking task takes the same
+        // fail-closed path as a snapshot failure — nothing about the delete
+        // can be confirmed, and a panic must not be reported as a successful
+        // forget.
+        let task_state = state.clone();
         let entity_id = entity.id;
         let entity_name = params.entity.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            pensyve_core::snapshot::forget_entity(
-                storage.as_ref(),
-                entity_id,
-                Some(entity_name.as_str()),
-                namespace_id,
-                &snapshot_root,
-            )
-        })
-        .await
-        .map_err(|err| err.to_string())
-        .and_then(|outcome| outcome.map_err(|err| err.to_string()))
-        .map_err(|err| {
-            format!("Aborted: pre-delete snapshot failed, nothing was deleted: {err}")
-        })?;
+        let task = tokio::spawn(async move {
+            let storage = task_state.storage.clone();
+            let snapshot_root = task_state.snapshot_root.clone();
+            let namespace_id = task_state.namespace.id;
+            let blocking_name = entity_name.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                pensyve_core::snapshot::forget_entity(
+                    storage.as_ref(),
+                    entity_id,
+                    Some(blocking_name.as_str()),
+                    namespace_id,
+                    &snapshot_root,
+                )
+            })
+            .await
+            .map_err(|err| err.to_string())
+            .and_then(|outcome| outcome.map_err(|err| err.to_string()))
+            .map_err(|err| {
+                format!("Aborted: pre-delete snapshot failed, nothing was deleted: {err}")
+            })?;
+
+            let snapshot = &outcome.snapshot;
+
+            // The snapshot holds exactly the rows the delete removed, so it is
+            // also the authoritative list for vector-index cleanup — O(1) per
+            // entry, not an O(n) rebuild.
+            if !snapshot.memories.is_empty() {
+                let mut vi = task_state.vector_index.write().await;
+                for id in snapshot.memory_ids() {
+                    let _ = vi.remove(id);
+                }
+            }
+
+            let snapshot_path = outcome
+                .path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned());
+
+            let _ = task_state.storage.log_activity(
+                task_state.namespace.id,
+                "forget",
+                &serde_json::json!({"entity": entity_name, "snapshot_path": snapshot_path}),
+            );
+
+            Ok::<_, String>(outcome)
+        });
+
+        // A panicked task cannot claim "nothing was deleted" — the delete may
+        // have committed before the bookkeeping panicked — so this message
+        // stays neutral.
+        let outcome = task
+            .await
+            .map_err(|err| format!("forget task failed: {err}"))??;
 
         let snapshot = &outcome.snapshot;
         let forgotten_count = snapshot.memories.len();
-
-        // The snapshot holds exactly the rows the delete removed, so it is also
-        // the authoritative list for vector-index cleanup — O(1) per entry,
-        // not an O(n) rebuild.
-        if forgotten_count > 0 {
-            let mut vi = state.vector_index.write().await;
-            for id in snapshot.memory_ids() {
-                let _ = vi.remove(id);
-            }
-        }
-
         let snapshot_path = outcome
             .path
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned());
-
-        let _ = state.storage.log_activity(
-            state.namespace.id,
-            "forget",
-            &serde_json::json!({"entity": params.entity, "snapshot_path": snapshot_path}),
-        );
 
         let mut response = serde_json::json!({
             "entity": params.entity,

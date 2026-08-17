@@ -415,10 +415,14 @@ async fn a2a_forget_fails_the_task_when_the_snapshot_cannot_be_written() {
 /// The router is driven in-process on a single-threaded runtime and its
 /// response future is polled by hand exactly once. Everything ahead of the
 /// forget is synchronous — routing, the `Extension` and `Path` extractors, the
-/// tenant lookup, the entity lookup — so nothing else can park that first
-/// poll. `Pending` therefore means the handler handed the worker back instead
-/// of running the delete inline; before the fix the whole delete ran in that
-/// one poll and the future came back `Ready`.
+/// tenant lookup, the entity lookup — and the handler then `tokio::spawn`s the
+/// delete-plus-bookkeeping task and awaits its `JoinHandle`. On a
+/// current-thread runtime a spawned task cannot run until the polling task
+/// yields, so that first poll is `Pending` unconditionally — no race against a
+/// fast delete, unlike awaiting `spawn_blocking` directly, whose closure
+/// starts on the blocking pool immediately and can finish before the first
+/// `JoinHandle` poll. Before the fix the whole delete ran in that one poll and
+/// the future came back `Ready`.
 ///
 /// What this does not prove: nothing here observes which thread the delete ran
 /// on, only that the handler yielded before finishing it. A rewrite that parks
