@@ -1782,6 +1782,7 @@ impl PyPensyve {
         dict.set_item("promoted", stats.promoted)?;
         dict.set_item("decayed", stats.decayed)?;
         dict.set_item("archived", stats.archived)?;
+        dict.set_item("coalesced", stats.coalesced)?;
         Ok(dict)
     }
 

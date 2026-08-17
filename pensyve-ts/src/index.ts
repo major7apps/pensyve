@@ -218,6 +218,12 @@ export interface ConsolidateResult {
   promoted: number;
   decayed: number;
   archived: number;
+  /**
+   * True when the request did no work of its own because a run was already
+   * in flight for the namespace; the counts are zero in that case, as they
+   * are for a run that found nothing to do.
+   */
+  coalesced: boolean;
 }
 
 export interface HealthResult {

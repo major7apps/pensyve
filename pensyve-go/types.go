@@ -49,6 +49,10 @@ type ConsolidateResult struct {
 	Promoted int `json:"promoted"`
 	Decayed  int `json:"decayed"`
 	Archived int `json:"archived"`
+	// Coalesced is true when the request did no work of its own because a
+	// run was already in flight for the namespace; the counts are zero in
+	// that case, as they are for a run that found nothing to do.
+	Coalesced bool `json:"coalesced"`
 }
 
 // HealthResult contains the API health check response.
