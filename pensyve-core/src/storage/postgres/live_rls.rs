@@ -1905,6 +1905,10 @@ fn fts_candidates_match_sqlite_for_multi_token_queries() {
                 .search_fts(query, ns.id, 100)
                 .expect("sqlite search_fts"),
         );
+        // Every query in the list was written to match at least one corpus
+        // row, so an empty set means FTS broke — without this, both backends
+        // breaking at once would satisfy the equality vacuously.
+        assert!(!pg_ids.is_empty(), "no candidates at all for {query:?}");
         assert_eq!(
             pg_ids, sq_ids,
             "search_fts candidate sets diverge for {query:?}"
@@ -1924,4 +1928,18 @@ fn fts_candidates_match_sqlite_for_multi_token_queries() {
             "search_fts_scoped candidate sets diverge for {query:?}"
         );
     }
+
+    // Documented divergence, deliberately outside the parity loop: Postgres's
+    // 'english' configuration strips stop words at index and query time, so a
+    // stop-word-only query matches nothing there, while SQLite's FTS5
+    // tokenizer keeps stop words and can match. This predates the OR port —
+    // plainto_tsquery dropped the same tokens under the AND form — and closing
+    // it would mean reindexing one side's corpus with the other's tokenizer.
+    let pg_stopwords = pg
+        .search_fts("the and of", ns.id, 100)
+        .expect("pg stop-word query");
+    assert!(
+        pg_stopwords.is_empty(),
+        "a stop-word-only query normalises to the empty tsquery on Postgres"
+    );
 }

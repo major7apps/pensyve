@@ -528,7 +528,11 @@ fn sqlx_to_io(e: sqlx_core::error::Error) -> super::StorageError {
 /// interpolated, which is why the built string is `AssertSqlSafe` at the call
 /// sites. `||` is the tsquery OR operator, and a token that normalises to the
 /// empty tsquery (stop words, bare punctuation) is the OR identity, so it
-/// drops out exactly as it does from `SQLite`'s quoted-token OR join.
+/// drops out. That is what `plainto_tsquery` already did to such tokens under
+/// the AND form — per-token normalisation is unchanged. It is NOT what
+/// `SQLite` does: FTS5's tokenizer keeps stop words, so a stop-word-only
+/// query matches rows there and nothing here. That divergence predates the
+/// OR port and is pinned in `fts_candidates_match_sqlite_for_multi_token_queries`.
 fn or_tsquery_fragment(first_param: usize, token_count: usize) -> String {
     let parts: Vec<String> = (0..token_count)
         .map(|i| format!("plainto_tsquery('english', ${})", first_param + i))
