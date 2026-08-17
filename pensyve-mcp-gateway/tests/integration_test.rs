@@ -15,33 +15,19 @@ use rmcp::transport::streamable_http_server::{
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-/// Prevents the lazily-resolved reranker (`PensyveState::reranker`) from
-/// attempting a real network model download when a test builds a state via
-/// [`create_test_state`] without pre-seeding `reranker_cell`. Tests that
-/// specifically exercise reranker behavior instead pre-seed the cell with
-/// `Reranker::new_mock()` (see [`create_test_state_with_reranker`]), which
-/// bypasses this env check entirely. Uses `Once` so the (unsafe, per Rust
-/// 2024 edition) env mutation happens exactly once, before any reader.
-#[allow(
-    unsafe_code,
-    reason = "test-only env-var guard; std::env::set_var is unsafe in Rust 2024 edition by language design but is safe here because it runs exactly once via std::sync::Once before any reader observes the environment"
-)]
-fn disable_reranker_for_tests() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        // SAFETY: runs exactly once via `Once`, before any concurrent
-        // reader — no data race.
-        unsafe { std::env::set_var("PENSYVE_RERANKER", "0") };
-    });
-}
-
 /// Create a test server state, optionally with a reranker pre-attached
 /// (bypassing lazy resolution entirely — no network call either way).
+///
+/// The `reranker_cell` is constructed already resolved (`OnceLock::from`,
+/// below), so the lazy `PENSYVE_RERANKER` env check never runs in this
+/// binary — with `None` the state simply has no reranker. The former
+/// `set_var("PENSYVE_RERANKER", "0")` guard here was vestigial for exactly
+/// that reason, and `set_var` is process-global and unsafe in edition 2024
+/// besides (#250).
 fn create_test_state_with_reranker(
     dir: &tempfile::TempDir,
     reranker: Option<Arc<Reranker>>,
 ) -> Arc<PensyveState> {
-    disable_reranker_for_tests();
     let storage = SqliteBackend::open(dir.path()).expect("open test storage");
     let namespace = Namespace::new("test");
     storage.save_namespace(&namespace).expect("save namespace");
@@ -917,16 +903,14 @@ async fn test_recall_without_reranker_falls_back_gracefully() {
     ct.cancel();
 }
 
-/// Step 1 (part C): with `PENSYVE_RERANKER=0`, `PensyveState::reranker()`
-/// must resolve to `None` — i.e. the state holds no reranker. This binary
-/// sets the env var once via `disable_reranker_for_tests` (shared by every
-/// test above), so by the time this test runs the variable is already "0";
-/// asserting on `state.reranker()` here pins down the state-level contract
-/// the brief calls out explicitly, on top of the unit-level coverage in
-/// `pensyve_mcp_tools::state::tests`.
+/// Step 1 (part C): a state whose `reranker_cell` is resolved to `None` must
+/// report no reranker from `PensyveState::reranker()`. This binary resolves
+/// the cell at construction (see `create_test_state_with_reranker`), so the
+/// lazy `PENSYVE_RERANKER` env check never runs here; the env-var half of the
+/// contract is pinned at unit level in `pensyve_mcp_tools::state::tests`
+/// (#250 removed this binary's process-global `set_var` guard).
 #[tokio::test]
-async fn test_state_holds_no_reranker_when_disabled_via_env() {
-    disable_reranker_for_tests();
+async fn test_state_holds_no_reranker_when_cell_resolved_to_none() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = create_test_state(&dir);
     assert!(state.reranker().is_none());
