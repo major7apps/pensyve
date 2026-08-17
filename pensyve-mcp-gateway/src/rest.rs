@@ -1156,6 +1156,45 @@ fn snapshot_reference(snapshot: &pensyve_core::snapshot::ForgetSnapshot) -> serd
     })
 }
 
+/// Entity-wide delete plus its pre-delete snapshot, run off the async runtime.
+///
+/// Delete and snapshot are atomic: the snapshot file is written inside the
+/// delete's transaction, so either both happen or neither does. #217 lost
+/// 1,528 memories with no way back — a delete we could not capture is exactly
+/// that situation again, so this fails closed.
+///
+/// #251: the whole call is synchronous — a rusqlite delete behind a mutex, a
+/// serialize that runs to megabytes at #217's scale, and two `sync_all`s — so
+/// it goes to the blocking pool rather than parking a runtime worker for the
+/// duration. A panicked or cancelled task takes the same fail-closed path as a
+/// snapshot failure: nothing about the delete can be confirmed, and a panic
+/// must not be reported as a successful forget.
+///
+/// The `Err` is the caller-facing message; both REST and A2A return it as-is.
+async fn forget_entity_blocking(
+    ps: &PensyveState,
+    entity_id: Uuid,
+    entity_name: String,
+) -> Result<pensyve_core::snapshot::ForgetOutcome, String> {
+    let storage = ps.storage.clone();
+    let snapshot_root = ps.snapshot_root.clone();
+    let namespace_id = ps.namespace.id;
+
+    tokio::task::spawn_blocking(move || {
+        pensyve_core::snapshot::forget_entity(
+            storage.as_ref(),
+            entity_id,
+            Some(entity_name.as_str()),
+            namespace_id,
+            &snapshot_root,
+        )
+    })
+    .await
+    .map_err(|err| err.to_string())
+    .and_then(|outcome| outcome.map_err(|err| err.to_string()))
+    .map_err(|err| format!("Aborted: pre-delete snapshot failed, nothing was deleted: {err}"))
+}
+
 async fn forget_entity(
     State(state): State<Arc<AppState>>,
     axum::Extension(auth_ctx): axum::Extension<AuthContext>,
@@ -1171,63 +1210,73 @@ async fn forget_entity(
             )
         })?;
 
-    // Delete and snapshot atomically: the snapshot file is written inside the
-    // delete's transaction, so either both happen or neither does. #217 lost
-    // 1,528 memories with no way back — a delete we could not capture is
-    // exactly that situation again, so this fails closed.
-    let outcome = pensyve_core::snapshot::forget_entity(
-        ps.storage.as_ref(),
-        entity.id,
-        Some(entity.name.as_str()),
-        ps.namespace.id,
-        &ps.snapshot_root,
-    )
-    .map_err(|err| {
-        RestError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Aborted: pre-delete snapshot failed, nothing was deleted: {err}"),
-        )
-    })?;
+    // The delete and everything downstream of it — vector-index cleanup, the
+    // activity record, the recall-cache invalidation — run on a spawned task
+    // the handler only observes. axum drops handler futures when the client
+    // disconnects, and a drop between the committed delete and its bookkeeping
+    // would leave forgotten memories visible in the recall cache and stale
+    // entries in the index; a spawned task is detached from the request, so
+    // once the delete starts, its bookkeeping runs to completion regardless.
+    let ps_task = ps.clone();
+    let redis = state.redis.clone();
+    let logged_name = entity_name.clone();
+    let entity_id = entity.id;
+    let owned_name = entity.name;
+    let task = tokio::spawn(async move {
+        let outcome = forget_entity_blocking(&ps_task, entity_id, owned_name).await?;
+        let snapshot = &outcome.snapshot;
+        let forgotten_count = snapshot.memories.len();
+
+        // The snapshot holds exactly the rows the delete removed, so it is
+        // also the authoritative list for vector-index cleanup — O(1) per
+        // entry, not O(n) rebuild.
+        if forgotten_count > 0 {
+            let mut vi = ps_task.vector_index.write().await;
+            for id in snapshot.memory_ids() {
+                let _ = vi.remove(id);
+            }
+        }
+
+        let snapshot_path = outcome
+            .path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+
+        let _ = ps_task.storage.log_activity(
+            ps_task.namespace.id,
+            "forget",
+            &json!({
+                "entity": logged_name,
+                "forgotten_count": forgotten_count,
+                "snapshot_path": snapshot_path,
+            }),
+        );
+
+        // Invalidate recall cache for this namespace.
+        if let Some(mut conn) = redis {
+            let prefix = crate::cache::namespace_prefix(&ps_task.namespace.id.to_string());
+            crate::cache::invalidate_prefix(&mut conn, &prefix).await;
+        }
+
+        Ok::<_, String>(outcome)
+    });
+
+    // A panicked task cannot claim "nothing was deleted" — the delete may have
+    // committed before the bookkeeping panicked — so the message stays neutral.
+    let outcome = task
+        .await
+        .map_err(|err| {
+            RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("forget task failed: {err}"),
+            )
+        })?
+        .map_err(|err| RestError(StatusCode::INTERNAL_SERVER_ERROR, err))?;
 
     let snapshot = &outcome.snapshot;
-    let forgotten_count = snapshot.memories.len();
-
-    // The snapshot holds exactly the rows the delete removed, so it is also the
-    // authoritative list for vector-index cleanup — O(1) per entry, not O(n) rebuild.
-    if forgotten_count > 0 {
-        let mut vi = ps.vector_index.write().await;
-        for id in snapshot.memory_ids() {
-            let _ = vi.remove(id);
-        }
-    }
-
-    let snapshot_path = outcome
-        .path
-        .as_ref()
-        .map(|p| p.to_string_lossy().into_owned());
-
-    let _ = ps.storage.log_activity(
-        ps.namespace.id,
-        "forget",
-        &json!({
-            "entity": entity_name,
-            "forgotten_count": forgotten_count,
-            "snapshot_path": snapshot_path,
-        }),
-    );
-
-    // Invalidate recall cache for this namespace.
-    if let Some(ref redis) = state.redis {
-        let mut conn = redis.clone();
-        let prefix = crate::cache::namespace_prefix(&ps.namespace.id.to_string());
-        crate::cache::invalidate_prefix(&mut conn, &prefix).await;
-    }
-
     Ok(Json(ForgetResponse {
-        forgotten_count,
-        snapshot: snapshot_path
-            .is_some()
-            .then(|| snapshot_reference(snapshot)),
+        forgotten_count: snapshot.memories.len(),
+        snapshot: outcome.path.is_some().then(|| snapshot_reference(snapshot)),
     }))
 }
 
@@ -2430,7 +2479,7 @@ fn a2a_remember(
 
 /// Handle the `memory.forget` capability for A2A task requests.
 async fn a2a_forget(
-    ps: &PensyveState,
+    ps: Arc<PensyveState>,
     input: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let entity_name = input
@@ -2451,26 +2500,30 @@ async fn a2a_forget(
     // Same fail-closed contract as the REST route and the MCP tool: the
     // snapshot is written inside the delete's transaction, so a snapshot that
     // cannot be written aborts the delete instead of losing rows silently.
-    let outcome = pensyve_core::snapshot::forget_entity(
-        ps.storage.as_ref(),
-        entity.id,
-        Some(entity.name.as_str()),
-        ps.namespace.id,
-        &ps.snapshot_root,
-    )
-    .map_err(|err| format!("Aborted: pre-delete snapshot failed, nothing was deleted: {err}"))?;
+    // Delete plus index cleanup run on a spawned task so a dropped request
+    // cannot abandon the cleanup after the delete commits — same reasoning as
+    // the REST handler above.
+    let entity_id = entity.id;
+    let owned_name = entity.name;
+    let task = tokio::spawn(async move {
+        let outcome = forget_entity_blocking(&ps, entity_id, owned_name).await?;
+        let snapshot = &outcome.snapshot;
+
+        if !snapshot.memories.is_empty() {
+            let mut vi = ps.vector_index.write().await;
+            for id in snapshot.memory_ids() {
+                let _ = vi.remove(id);
+            }
+        }
+
+        Ok::<_, String>(outcome)
+    });
+    let outcome = task
+        .await
+        .map_err(|err| format!("forget task failed: {err}"))??;
 
     let snapshot = &outcome.snapshot;
-    let forgotten_count = snapshot.memories.len();
-
-    if forgotten_count > 0 {
-        let mut vi = ps.vector_index.write().await;
-        for id in snapshot.memory_ids() {
-            let _ = vi.remove(id);
-        }
-    }
-
-    let mut output = json!({"forgotten_count": forgotten_count});
+    let mut output = json!({"forgotten_count": snapshot.memories.len()});
     if outcome.path.is_some() {
         output["snapshot"] = snapshot_reference(snapshot);
     }
@@ -2509,7 +2562,7 @@ async fn a2a_task(
             }
         },
         "memory.remember" => a2a_remember(&ps, &input)?,
-        "memory.forget" => match a2a_forget(&ps, &input).await {
+        "memory.forget" => match a2a_forget(ps.clone(), &input).await {
             Ok(val) => val,
             Err(e) => {
                 return Ok(Json(
