@@ -439,7 +439,25 @@ impl PensyveMcpServer {
                             }),
                         );
                     }
-                    Err(e) => tracing::warn!("Post-episode consolidation failed: {e}"),
+                    Err(e) => {
+                        // #260: a failed run may follow runs of the same call
+                        // that already committed. Record what they wrote
+                        // rather than lose it.
+                        if let Some(committed) = e.committed() {
+                            let _ = storage.log_activity(
+                                ns_id,
+                                "consolidate",
+                                &serde_json::json!({
+                                    "promoted": committed.promoted,
+                                    "decayed": committed.decayed,
+                                    "archived": committed.archived,
+                                    "trigger": "episode_end",
+                                    "partial": true,
+                                }),
+                            );
+                        }
+                        tracing::warn!("Post-episode consolidation failed: {e}");
+                    }
                 }
             });
         }

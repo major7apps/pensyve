@@ -737,7 +737,7 @@ describe("forget()", () => {
 describe("consolidate()", () => {
   test("returns camelCase consolidation stats", async () => {
     const fetchFn = mock(async () =>
-      jsonResponse({ promoted: 2, decayed: 5, archived: 1 })
+      jsonResponse({ promoted: 2, decayed: 5, archived: 1, coalesced: true })
     );
 
     const client = makeClient(fetchFn);
@@ -746,6 +746,7 @@ describe("consolidate()", () => {
     expect(result.promoted).toBe(2);
     expect(result.decayed).toBe(5);
     expect(result.archived).toBe(1);
+    expect(result.coalesced).toBe(true);
   });
 
   test("sends POST to /v1/consolidate", async () => {

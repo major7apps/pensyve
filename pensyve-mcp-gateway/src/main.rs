@@ -470,6 +470,21 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                                 );
                             }
                             Ok(Err(e)) => {
+                                // #260: a failed run may follow runs of the
+                                // same call that already committed. Record
+                                // what they wrote rather than lose it.
+                                if let Some(committed) = e.committed() {
+                                    let _ = storage.log_activity(
+                                        ns_id,
+                                        "consolidate",
+                                        &serde_json::json!({
+                                            "promoted": committed.promoted,
+                                            "decayed": committed.decayed,
+                                            "archived": committed.archived,
+                                            "partial": true,
+                                        }),
+                                    );
+                                }
                                 tracing::warn!(
                                     namespace_id = %ns_id,
                                     error = %e,

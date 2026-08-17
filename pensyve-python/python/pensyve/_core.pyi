@@ -352,11 +352,13 @@ class Pensyve:
         """
         ...
 
-    def consolidate(self) -> dict[str, int]:
+    def consolidate(self) -> dict[str, int | bool]:
         """Run consolidation (episodic->semantic promotion, FSRS decay, archival).
 
         Returns:
-            Dict with keys: promoted, decayed, archived (counts).
+            Dict with keys: promoted, decayed, archived (counts), and
+            coalesced (True when the request did no work because a run was
+            already in flight for the namespace).
         """
         ...
 

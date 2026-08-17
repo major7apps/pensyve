@@ -476,9 +476,10 @@ func TestConsolidate(t *testing.T) {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(ConsolidateResult{
-			Promoted: 5,
-			Decayed:  3,
-			Archived: 1,
+			Promoted:  5,
+			Decayed:   3,
+			Archived:  1,
+			Coalesced: true,
 		})
 	}))
 	defer server.Close()
@@ -491,7 +492,7 @@ func TestConsolidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Promoted != 5 || result.Decayed != 3 || result.Archived != 1 {
+	if result.Promoted != 5 || result.Decayed != 3 || result.Archived != 1 || !result.Coalesced {
 		t.Errorf("unexpected result: %+v", result)
 	}
 }

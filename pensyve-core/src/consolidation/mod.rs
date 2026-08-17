@@ -46,7 +46,13 @@
 //!   contract.
 
 pub mod dmem;
-pub mod gate;
+// Crate-private, or the "cannot be bypassed" guarantee its docs claim would
+// hold only inside this crate: a `pub` gate lets a dependent claim a
+// namespace directly and starve `ConsolidationEngine::run` (#260). The cost
+// is that `run`'s docs can no longer link here — restricting the module at
+// all costs that, `#[doc(hidden)]` included, since rustdoc emits no page for
+// a hidden item either — so those references are plain code spans.
+pub(crate) mod gate;
 pub mod typed_slots;
 
 use std::collections::HashMap;
@@ -94,6 +100,56 @@ pub enum ConsolidationError {
     /// shape for `ConsolidationEngine::run` policy violations.
     #[error("Network call denied by policy: {0}")]
     Network(String),
+    /// A run failed after an earlier run of the same [`ConsolidationEngine::run`]
+    /// call had already committed its work.
+    ///
+    /// One call may run several times — a trigger that coalesced while this
+    /// caller owned the namespace schedules a re-run (see the `gate` module
+    /// docs). Each run commits as it goes, so a failure in a later one does
+    /// not undo what the earlier ones wrote. This variant carries that
+    /// committed total alongside the failure, so a caller recording activity
+    /// from the return value does not under-report work that happened.
+    ///
+    /// `run` produces it only when there is committed work to carry: a failure
+    /// with nothing committed behind it propagates as the underlying variant
+    /// unchanged, so the common single-run case keeps its original shape.
+    #[error(
+        "{source} (already committed: {} promoted, {} decayed, {} archived)",
+        .partial.promoted, .partial.decayed, .partial.archived
+    )]
+    Partial {
+        /// Stats for the runs that completed before the failing one. Already
+        /// written to storage — the error does not roll them back.
+        partial: ConsolidationStats,
+        /// The failure that ended the final run.
+        #[source]
+        source: Box<ConsolidationError>,
+    },
+}
+
+impl ConsolidationError {
+    /// The work this failure left committed, if any — see
+    /// [`ConsolidationError::Partial`]. Callers that record activity from a
+    /// run's stats should record this too, or they under-report it.
+    pub fn committed(&self) -> Option<&ConsolidationStats> {
+        match self {
+            Self::Partial { partial, .. } => Some(partial),
+            _ => None,
+        }
+    }
+
+    /// Wrap `source` so it carries the work `committed` before it, unless
+    /// there is nothing to carry — see [`ConsolidationError::Partial`].
+    fn with_committed(committed: ConsolidationStats, source: Self) -> Self {
+        if committed.is_empty() {
+            source
+        } else {
+            Self::Partial {
+                partial: committed,
+                source: Box::new(source),
+            }
+        }
+    }
 }
 
 impl From<NetworkRequiredError> for ConsolidationError {
@@ -116,6 +172,19 @@ pub struct ConsolidationStats {
     pub decayed: usize,
     /// Number of memories archived (retrievability below threshold).
     pub archived: usize,
+    /// True when this call did no work of its own because a run was already
+    /// in flight for the namespace, which will cover its trigger (see the
+    /// `gate` module docs). The counts are zero in that case — as they are
+    /// for a run that found nothing to do, which is why the two situations
+    /// need this flag to be told apart.
+    pub coalesced: bool,
+}
+
+impl ConsolidationStats {
+    /// No work recorded — every counter is zero.
+    fn is_empty(&self) -> bool {
+        self.promoted == 0 && self.decayed == 0 && self.archived == 0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +241,67 @@ impl PromotionGuard {
     }
 }
 
+// Test seam state for `injected_run_failure`. Thread-local rather than
+// global, for the same reason as the `gate` module's release-window seam: the
+// whole test suite shares one process, so a process-wide flag would inject
+// failures into unrelated tests running in parallel. `run` is synchronous, so
+// the arming thread is the one that reaches the seam.
+#[cfg(test)]
+thread_local! {
+    static INJECT_RERUN_FAILURE: std::cell::Cell<RerunFailure> =
+        const { std::cell::Cell::new(RerunFailure::Disarmed) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RerunFailure {
+    Disarmed,
+    /// Schedule a re-run at the next run's start, and fail that re-run.
+    Armed,
+    /// The scheduled re-run: fail it.
+    FailThisRun,
+}
+
+/// Test seam: let one run commit, then fail the re-run that follows it.
+/// Compiled out of non-test builds.
+///
+/// The state it needs — a re-run scheduled while this caller still owns the
+/// namespace — is not reachable from a test thread. `run` is synchronous, so
+/// by the time a test could mark the namespace pending, the run it wanted the
+/// failure to follow has already returned. The seam marks it from inside the
+/// run instead, with the same `gate::dispatch` call a coalescing trigger
+/// makes, and fails the run that mark schedules.
+#[cfg(test)]
+fn injected_run_failure(namespace_id: Uuid) -> Option<ConsolidationError> {
+    INJECT_RERUN_FAILURE.with(|state| match state.get() {
+        RerunFailure::Disarmed => None,
+        RerunFailure::Armed => {
+            state.set(RerunFailure::FailThisRun);
+            // Claimed by this very caller, so this coalesces and sets the
+            // pending flag — exactly what a concurrent trigger would do.
+            let dispatch = gate::dispatch(namespace_id, || (), |()| false);
+            assert_eq!(
+                dispatch,
+                gate::Dispatch::Coalesced,
+                "the seam must coalesce into the run it is arming, not start one"
+            );
+            None
+        }
+        RerunFailure::FailThisRun => {
+            state.set(RerunFailure::Disarmed);
+            Some(ConsolidationError::Storage(StorageError::Context(
+                "injected re-run failure".to_string(),
+            )))
+        }
+    })
+}
+
+#[cfg(not(test))]
+#[inline]
+fn injected_run_failure(_namespace_id: Uuid) -> Option<ConsolidationError> {
+    None
+}
+
 impl ConsolidationEngine {
     /// Run all consolidation jobs for a namespace.
     ///
@@ -196,7 +326,7 @@ impl ConsolidationEngine {
     /// is ≤500 ms (pre-reg §2 I5).
     ///
     /// At most one run per namespace is in flight at a time, enforced by
-    /// [`gate::dispatch`]: the promotion pass derives its idempotency guard
+    /// `gate::dispatch`: the promotion pass derives its idempotency guard
     /// from a snapshot of the namespace and only then writes, so two
     /// overlapping runs would each see an unpromoted namespace and mint the
     /// same row twice (#226). Dispatch happens here rather than at the call
@@ -206,10 +336,10 @@ impl ConsolidationEngine {
     /// unaffected and proceed in parallel.
     ///
     /// Triggers coalesce rather than queue. A call made while another run is
-    /// in flight for the namespace does no work and returns zeroed stats; the
-    /// run already going will run once more and cover it, so nothing is
-    /// dropped. See the [`gate`] module docs for why queueing was rejected and
-    /// why coalescing is lossless.
+    /// in flight for the namespace does no work and returns zeroed stats with
+    /// [`ConsolidationStats::coalesced`] set; the run already going will run
+    /// once more and cover it, so nothing is dropped. See the `gate` module
+    /// docs for why queueing was rejected and why coalescing is lossless.
     ///
     /// A caller that does own the namespace may therefore perform several
     /// consecutive runs, and the returned stats are the total across them.
@@ -229,8 +359,12 @@ impl ConsolidationEngine {
         let outcome = gate::dispatch(
             namespace_id,
             || {
-                let result =
-                    Self::run_locked(storage, embedder, config, namespace_id, policy, cancel);
+                let result = match injected_run_failure(namespace_id) {
+                    Some(err) => Err(err),
+                    None => {
+                        Self::run_locked(storage, embedder, config, namespace_id, policy, cancel)
+                    }
+                };
                 if let Ok(stats) = &result {
                     total.promoted += stats.promoted;
                     total.decayed += stats.decayed;
@@ -249,19 +383,22 @@ impl ConsolidationEngine {
         match outcome {
             // Zeroed rather than the in-flight run's stats: this call did no
             // work, and reporting another run's promotions here would
-            // double-count them in `log_activity`.
-            gate::Dispatch::Coalesced => Ok(ConsolidationStats::default()),
+            // double-count them in `log_activity`. The flag is what keeps that
+            // distinguishable from a run that found nothing to do.
+            gate::Dispatch::Coalesced => Ok(ConsolidationStats {
+                coalesced: true,
+                ..ConsolidationStats::default()
+            }),
             gate::Dispatch::Ran(Ok(_)) => Ok(total),
-            gate::Dispatch::Ran(Err(err)) => Err(err),
+            // Whatever the failing run itself wrote is unknowable, but every
+            // run before it committed. Carry that total with the error rather
+            // than discard it — see [`ConsolidationError::Partial`].
+            gate::Dispatch::Ran(Err(err)) => Err(ConsolidationError::with_committed(total, err)),
         }
     }
 
     /// The body of [`Self::run`], executed while this caller owns the
     /// namespace.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "mirrors the public `run` signature it is split out of"
-    )]
     fn run_locked(
         storage: &dyn StorageTrait,
         embedder: &OnnxEmbedder,
@@ -364,10 +501,6 @@ impl ConsolidationEngine {
     /// network-capable summarizer here, per pre-reg §1.2). Today the body
     /// performs only local ONNX inference and `SQLite` writes, so the
     /// policy is unused at the call sites.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "G1 plumbing: policy + cancel parameters threaded through the engine surface; refactoring into a struct is deferred to G3 when the summarizer attaches"
-    )]
     fn promote_episodic_to_semantic(
         storage: &dyn StorageTrait,
         embedder: &OnnxEmbedder,
@@ -1641,6 +1774,97 @@ mod tests {
         assert_eq!(stats.promoted, 0);
         assert_eq!(stats.decayed, 0);
         assert_eq!(stats.archived, 0);
+    }
+
+    /// A run that fails after an earlier run of the same call committed its
+    /// promotions must report them. The promotions are already in storage —
+    /// dropping them from the return value understates work that happened,
+    /// and every caller that records activity from it under-reports (#260).
+    #[test]
+    fn rerun_failure_carries_the_stats_already_committed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = make_storage(tmp.path().to_str().unwrap());
+        let embedder = OnnxEmbedder::new_mock(64);
+        let (ns, entity_id, source_id) = setup_namespace(&storage);
+
+        // One promotable cluster: identical content clusters under the mock
+        // embedder (cosine 1.0), so the first run promotes exactly once.
+        for i in 0..3 {
+            let episode = Episode::new(ns.id, vec![source_id, entity_id]);
+            storage.save_episode(&episode).unwrap();
+            insert_episodic(
+                &storage,
+                &embedder,
+                &ns,
+                episode.id,
+                source_id,
+                entity_id,
+                "prefers dark mode",
+                i as i64,
+            );
+        }
+
+        INJECT_RERUN_FAILURE.with(|state| state.set(RerunFailure::Armed));
+        let err = ConsolidationEngine::run(
+            &storage,
+            &embedder,
+            &make_config(),
+            ns.id,
+            &NetworkPolicy::Disabled,
+            &CancellationToken::new(),
+        )
+        .expect_err("the seam fails the re-run");
+
+        let ConsolidationError::Partial { partial, source } = err else {
+            panic!("expected the error to carry the committed stats, got {err:?}");
+        };
+        assert_eq!(
+            partial.promoted, 1,
+            "the first run's promotion is committed and must be reported"
+        );
+        assert!(
+            matches!(*source, ConsolidationError::Storage(_)),
+            "the underlying failure must survive the wrap, got {source:?}"
+        );
+
+        let promoted_rows = storage
+            .get_all_memories_by_namespace(ns.id)
+            .unwrap()
+            .into_iter()
+            .filter(|m| matches!(m, Memory::Semantic(sm) if sm.predicate == "mentioned"))
+            .count();
+        assert_eq!(
+            promoted_rows, partial.promoted,
+            "the reported total must match what is actually in storage"
+        );
+    }
+
+    /// A failure with nothing committed behind it keeps its own shape, so the
+    /// common single-run case stays matchable on the underlying variant.
+    #[test]
+    fn failure_with_nothing_committed_propagates_unwrapped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = make_storage(tmp.path().to_str().unwrap());
+        let embedder = OnnxEmbedder::new_mock(64);
+        let ns = Namespace::new("nothing-committed");
+        storage.save_namespace(&ns).unwrap();
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = ConsolidationEngine::run(
+            &storage,
+            &embedder,
+            &make_config(),
+            ns.id,
+            &NetworkPolicy::Disabled,
+            &cancel,
+        )
+        .expect_err("a pre-cancelled token fails the first run");
+
+        assert!(
+            matches!(err, ConsolidationError::Cancelled(_)),
+            "expected the bare cancellation, got {err:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
