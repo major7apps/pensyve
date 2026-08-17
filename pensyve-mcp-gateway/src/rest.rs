@@ -1156,6 +1156,45 @@ fn snapshot_reference(snapshot: &pensyve_core::snapshot::ForgetSnapshot) -> serd
     })
 }
 
+/// Entity-wide delete plus its pre-delete snapshot, run off the async runtime.
+///
+/// Delete and snapshot are atomic: the snapshot file is written inside the
+/// delete's transaction, so either both happen or neither does. #217 lost
+/// 1,528 memories with no way back — a delete we could not capture is exactly
+/// that situation again, so this fails closed.
+///
+/// #251: the whole call is synchronous — a rusqlite delete behind a mutex, a
+/// serialize that runs to megabytes at #217's scale, and two `sync_all`s — so
+/// it goes to the blocking pool rather than parking a runtime worker for the
+/// duration. A panicked or cancelled task takes the same fail-closed path as a
+/// snapshot failure: nothing about the delete can be confirmed, and a panic
+/// must not be reported as a successful forget.
+///
+/// The `Err` is the caller-facing message; both REST and A2A return it as-is.
+async fn forget_entity_blocking(
+    ps: &PensyveState,
+    entity_id: Uuid,
+    entity_name: String,
+) -> Result<pensyve_core::snapshot::ForgetOutcome, String> {
+    let storage = ps.storage.clone();
+    let snapshot_root = ps.snapshot_root.clone();
+    let namespace_id = ps.namespace.id;
+
+    tokio::task::spawn_blocking(move || {
+        pensyve_core::snapshot::forget_entity(
+            storage.as_ref(),
+            entity_id,
+            Some(entity_name.as_str()),
+            namespace_id,
+            &snapshot_root,
+        )
+    })
+    .await
+    .map_err(|err| err.to_string())
+    .and_then(|outcome| outcome.map_err(|err| err.to_string()))
+    .map_err(|err| format!("Aborted: pre-delete snapshot failed, nothing was deleted: {err}"))
+}
+
 async fn forget_entity(
     State(state): State<Arc<AppState>>,
     axum::Extension(auth_ctx): axum::Extension<AuthContext>,
@@ -1171,23 +1210,9 @@ async fn forget_entity(
             )
         })?;
 
-    // Delete and snapshot atomically: the snapshot file is written inside the
-    // delete's transaction, so either both happen or neither does. #217 lost
-    // 1,528 memories with no way back — a delete we could not capture is
-    // exactly that situation again, so this fails closed.
-    let outcome = pensyve_core::snapshot::forget_entity(
-        ps.storage.as_ref(),
-        entity.id,
-        Some(entity.name.as_str()),
-        ps.namespace.id,
-        &ps.snapshot_root,
-    )
-    .map_err(|err| {
-        RestError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Aborted: pre-delete snapshot failed, nothing was deleted: {err}"),
-        )
-    })?;
+    let outcome = forget_entity_blocking(&ps, entity.id, entity.name)
+        .await
+        .map_err(|err| RestError(StatusCode::INTERNAL_SERVER_ERROR, err))?;
 
     let snapshot = &outcome.snapshot;
     let forgotten_count = snapshot.memories.len();
@@ -2451,14 +2476,7 @@ async fn a2a_forget(
     // Same fail-closed contract as the REST route and the MCP tool: the
     // snapshot is written inside the delete's transaction, so a snapshot that
     // cannot be written aborts the delete instead of losing rows silently.
-    let outcome = pensyve_core::snapshot::forget_entity(
-        ps.storage.as_ref(),
-        entity.id,
-        Some(entity.name.as_str()),
-        ps.namespace.id,
-        &ps.snapshot_root,
-    )
-    .map_err(|err| format!("Aborted: pre-delete snapshot failed, nothing was deleted: {err}"))?;
+    let outcome = forget_entity_blocking(ps, entity.id, entity.name).await?;
 
     let snapshot = &outcome.snapshot;
     let forgotten_count = snapshot.memories.len();

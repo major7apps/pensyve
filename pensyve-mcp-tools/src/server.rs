@@ -618,13 +618,30 @@ impl PensyveMcpServer {
         // the delete's transaction, so either both happen or neither does.
         // #217 lost 1,528 memories with no way back — a delete we could not
         // capture is exactly that situation again, so this fails closed.
-        let outcome = pensyve_core::snapshot::forget_entity(
-            state.storage.as_ref(),
-            entity.id,
-            Some(params.entity.as_str()),
-            state.namespace.id,
-            &state.snapshot_root,
-        )
+        //
+        // #251: `spawn_blocking`, not the runtime worker — the call is
+        // synchronous throughout: a rusqlite delete behind a mutex, a
+        // serialize that runs to megabytes at #217's scale, and two
+        // `sync_all`s. A panicked or cancelled task takes the same fail-closed
+        // path as a snapshot failure: nothing about the delete can be
+        // confirmed, and a panic must not be reported as a successful forget.
+        let storage = state.storage.clone();
+        let snapshot_root = state.snapshot_root.clone();
+        let namespace_id = state.namespace.id;
+        let entity_id = entity.id;
+        let entity_name = params.entity.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            pensyve_core::snapshot::forget_entity(
+                storage.as_ref(),
+                entity_id,
+                Some(entity_name.as_str()),
+                namespace_id,
+                &snapshot_root,
+            )
+        })
+        .await
+        .map_err(|err| err.to_string())
+        .and_then(|outcome| outcome.map_err(|err| err.to_string()))
         .map_err(|err| {
             format!("Aborted: pre-delete snapshot failed, nothing was deleted: {err}")
         })?;

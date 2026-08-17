@@ -6,6 +6,7 @@
 //! is written inside the delete's transaction, and a snapshot that cannot be
 //! written aborts the delete rather than losing rows silently.
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -27,6 +28,7 @@ use pensyve_mcp_gateway::usage_counter::UsageCounter;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
+use tower::ServiceExt;
 use uuid::Uuid;
 
 const TEST_TENANT: &str = "test-rest-tenant";
@@ -402,6 +404,62 @@ async fn a2a_forget_fails_the_task_when_the_snapshot_cannot_be_written() {
         2,
         "nothing may be deleted when the pre-delete snapshot failed"
     );
+    cancellation.cancel();
+}
+
+/// #251: the capturing delete and the snapshot it writes are one synchronous
+/// unit of work — a rusqlite delete behind a mutex, a serialize that runs to
+/// megabytes at #217's scale, and two `sync_all`s — so it must not run on a
+/// runtime worker.
+///
+/// The router is driven in-process on a single-threaded runtime and its
+/// response future is polled by hand exactly once. Everything ahead of the
+/// forget is synchronous — routing, the `Extension` and `Path` extractors, the
+/// tenant lookup, the entity lookup — so nothing else can park that first
+/// poll. `Pending` therefore means the handler handed the worker back instead
+/// of running the delete inline; before the fix the whole delete ran in that
+/// one poll and the future came back `Ready`.
+///
+/// What this does not prove: nothing here observes which thread the delete ran
+/// on, only that the handler yielded before finishing it. A rewrite that parks
+/// the first poll for some other reason and still blocks the worker afterwards
+/// would pass.
+#[tokio::test(flavor = "current_thread")]
+async fn rest_forget_hands_the_worker_back_instead_of_deleting_inline() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let snapshot_root = dir.path().join("snapshots");
+    let state = app_state(&dir, snapshot_root.clone());
+    let (url, cancellation) = start_test_server(state.clone()).await;
+    let client = reqwest::Client::new();
+    remember(&client, &url, "alice", "likes tea").await;
+
+    let app = rest::router()
+        .layer(Extension(auth_context()))
+        .with_state(state.clone());
+    let request = axum::http::Request::builder()
+        .method(axum::http::Method::DELETE)
+        .uri("/v1/entities/alice")
+        .body(axum::body::Body::empty())
+        .expect("forget request");
+    let mut forget = std::pin::pin!(app.oneshot(request));
+
+    let first_poll =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(forget.as_mut().poll(cx))).await;
+    assert!(
+        first_poll.is_pending(),
+        "the forget must hand the runtime worker back, not run the delete inline"
+    );
+
+    // And it still forgets: moving the call off the worker changes scheduling
+    // only, so the fail-closed snapshot and the delete are unaffected.
+    let response = forget.await.expect("forget response");
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("forget response body");
+    let body: Value = serde_json::from_slice(&bytes).expect("forget response JSON");
+    assert_eq!(body["forgotten_count"], 1);
+    assert_eq!(stored_memory_count(&state), 0);
     cancellation.cancel();
 }
 
