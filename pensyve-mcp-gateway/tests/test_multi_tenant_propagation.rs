@@ -17,6 +17,7 @@ use std::sync::Arc;
 use axum::{Router, extract::State, middleware::Next, response::Response};
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
+use pensyve_core::reranker::Reranker;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::Namespace;
@@ -61,32 +62,14 @@ async fn tenant_middleware(
     CURRENT_TENANT.scope(tenant_id, next.run(req)).await
 }
 
-/// Prevents the lazily-resolved reranker (`PensyveState::reranker`) from
-/// attempting a real network model download the first time this suite's
-/// recall assertions run. Uses `Once` so the (unsafe, per Rust 2024
-/// edition) env mutation happens exactly once, before any reader.
-#[allow(
-    unsafe_code,
-    reason = "test-only env-var guard; std::env::set_var is unsafe in Rust 2024 edition by language design but is safe here because it runs exactly once via std::sync::Once before any reader observes the environment"
-)]
-fn disable_reranker_for_tests() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        // SAFETY: runs exactly once via `Once`, before any concurrent
-        // reader — no data race.
-        unsafe { std::env::set_var("PENSYVE_RERANKER", "0") };
-    });
-}
-
 fn make_mgr(dir: &tempfile::TempDir) -> Arc<TenantStateManager> {
-    disable_reranker_for_tests();
     let storage =
         Arc::new(SqliteBackend::open(dir.path()).expect("open storage")) as Arc<dyn StorageTrait>;
     let ns = Namespace::new("default");
     storage.save_namespace(&ns).expect("save default ns");
     let embedder = Arc::new(OnnxEmbedder::new_mock(768));
     let idx = VectorIndex::new(768, 1024);
-    Arc::new(TenantStateManager::new(
+    let mgr = Arc::new(TenantStateManager::new(
         storage,
         embedder,
         RetrievalConfig {
@@ -102,7 +85,25 @@ fn make_mgr(dir: &tempfile::TempDir) -> Arc<TenantStateManager> {
         ns,
         idx,
         dir.path().join("snapshots"),
-    ))
+    ));
+
+    // Resolve the shared reranker cell up front with a mock, so nothing in
+    // this binary can trigger the real ~280MB model download. Every tenant
+    // state built by this manager clones the same `OnceLock`, so seeding it
+    // through the default state covers tenants created later too.
+    //
+    // This replaces a `PENSYVE_RERANKER=0` env mutation (#250): `set_var` is
+    // process global, and serialising the write behind a `Once` does nothing
+    // about concurrent readers on other test threads.
+    assert!(
+        mgr.default_state()
+            .reranker_cell
+            .set(Some(Arc::new(Reranker::new_mock())))
+            .is_ok(),
+        "reranker cell was already resolved before the test could seed it"
+    );
+
+    mgr
 }
 
 async fn start_test_server(mgr: Arc<TenantStateManager>) -> (String, CancellationToken) {
