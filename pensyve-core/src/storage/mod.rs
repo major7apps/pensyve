@@ -44,6 +44,17 @@ fn capturing_delete_not_implemented() -> StorageResult<Vec<Memory>> {
     ))
 }
 
+/// Maximum whitespace-delimited tokens an FTS query contributes to the search
+/// expression; both backends truncate identically so their candidate sets stay
+/// comparable (#225).
+///
+/// The bound exists because Postgres builds one bind parameter per token and
+/// the extended query protocol caps a statement at 65,535 parameters — an
+/// unbounded query (the REST recall body does not limit length) would turn
+/// into a protocol error instead of results. 256 OR-joined tokens is already
+/// far past the point where additional terms change the ranked outcome.
+pub(crate) const MAX_FTS_QUERY_TOKENS: usize = 256;
+
 // ---------------------------------------------------------------------------
 // StorageTrait
 // ---------------------------------------------------------------------------

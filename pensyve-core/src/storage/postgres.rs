@@ -1378,7 +1378,11 @@ impl StorageTrait for PostgresBackend {
         // through `plainto_tsquery`, so per-token normalisation (stop words,
         // punctuation, stemming) is exactly what the AND form used — only the
         // join between tokens changes.
-        let tokens: Vec<String> = query_str.split_whitespace().map(str::to_string).collect();
+        let tokens: Vec<String> = query_str
+            .split_whitespace()
+            .take(super::MAX_FTS_QUERY_TOKENS)
+            .map(str::to_string)
+            .collect();
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
@@ -1471,7 +1475,11 @@ impl StorageTrait for PostgresBackend {
     ) -> StorageResult<Vec<Memory>> {
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         // OR-joined per token, same rationale as `search_fts` (#225).
-        let tokens: Vec<String> = query_str.split_whitespace().map(str::to_string).collect();
+        let tokens: Vec<String> = query_str
+            .split_whitespace()
+            .take(super::MAX_FTS_QUERY_TOKENS)
+            .map(str::to_string)
+            .collect();
         if tokens.is_empty() {
             return Ok(Vec::new());
         }

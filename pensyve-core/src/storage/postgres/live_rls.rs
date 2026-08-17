@@ -1822,6 +1822,24 @@ fn fts_or_semantics_survive_paraphrase_queries() {
         .expect("search_fts_scoped");
     assert_eq!(scoped.len(), 1, "the entity-scoped path must OR-join too");
     assert_eq!(scoped[0].id(), ep.id);
+
+    // Pathological token counts must degrade to truncation, not to a protocol
+    // error: one bind per token would blow the 65,535-parameter statement cap,
+    // and the REST recall body does not bound query length. The matching
+    // tokens lead, so the capped query still finds the row.
+    let mut huge = String::from(query);
+    for i in 0..70_000 {
+        huge.push_str(&format!(" filler{i}"));
+    }
+    let capped = backend
+        .search_fts(&huge, ns.id, 10)
+        .expect("a 70k-token query must truncate, not error");
+    assert_eq!(
+        capped.len(),
+        1,
+        "the leading tokens still match after the cap"
+    );
+    assert_eq!(capped[0].id(), ep.id);
 }
 
 /// Both backends must produce the same FTS candidate *sets* for multi-token

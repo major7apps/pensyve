@@ -1730,6 +1730,7 @@ impl StorageTrait for SqliteBackend {
         // with a memory) from collapsing to zero recall.
         let escaped_query: String = query
             .split_whitespace()
+            .take(super::MAX_FTS_QUERY_TOKENS)
             .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" OR ");
@@ -1852,6 +1853,7 @@ impl StorageTrait for SqliteBackend {
         // keeping paraphrase-style queries from collapsing to zero recall.
         let escaped_query: String = query
             .split_whitespace()
+            .take(super::MAX_FTS_QUERY_TOKENS)
             .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" OR ");
