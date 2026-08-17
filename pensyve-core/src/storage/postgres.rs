@@ -10,6 +10,7 @@ use sqlx_core::query::query;
 use sqlx_core::query_as::query_as;
 use sqlx_core::raw_sql::raw_sql;
 use sqlx_core::row::Row;
+use sqlx_core::sql_str::AssertSqlSafe;
 use sqlx_postgres::{PgPool, PgPoolOptions, PgRow, Postgres};
 use tokio::runtime::{Handle, Runtime};
 use uuid::Uuid;
@@ -518,6 +519,25 @@ fn io_err(e: impl std::fmt::Display) -> super::StorageError {
 #[allow(clippy::needless_pass_by_value)]
 fn sqlx_to_io(e: sqlx_core::error::Error) -> super::StorageError {
     super::StorageError::Io(std::io::Error::other(e.to_string()))
+}
+
+/// SQL fragment OR-combining one `plainto_tsquery` per query token, with
+/// numbered placeholders starting at `first_param` (#225).
+///
+/// Only the placeholder *count* is dynamic — every token is bound, never
+/// interpolated, which is why the built string is `AssertSqlSafe` at the call
+/// sites. `||` is the tsquery OR operator, and a token that normalises to the
+/// empty tsquery (stop words, bare punctuation) is the OR identity, so it
+/// drops out. That is what `plainto_tsquery` already did to such tokens under
+/// the AND form — per-token normalisation is unchanged. It is NOT what
+/// `SQLite` does: FTS5's tokenizer keeps stop words, so a stop-word-only
+/// query matches rows there and nothing here. That divergence predates the
+/// OR port and is pinned in `fts_candidates_match_sqlite_for_multi_token_queries`.
+fn or_tsquery_fragment(first_param: usize, token_count: usize) -> String {
+    let parts: Vec<String> = (0..token_count)
+        .map(|i| format!("plainto_tsquery('english', ${})", first_param + i))
+        .collect();
+    format!("({})", parts.join(" || "))
 }
 
 // ---------------------------------------------------------------------------
@@ -1354,74 +1374,93 @@ impl StorageTrait for PostgresBackend {
         limit: usize,
     ) -> StorageResult<Vec<Memory>> {
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        // Use plainto_tsquery which handles stop words and punctuation gracefully.
-        let tsquery = query_str.to_string();
+        // Tokens are OR-joined, mirroring `SQLite`'s #223 fix (#225): with the
+        // `ts_rank` ordering below, a match on more query terms still ranks
+        // above a match on fewer, so OR preserves precision while keeping
+        // paraphrase-style queries (which rarely share every token with a
+        // memory) from collapsing to zero recall. Each token still goes
+        // through `plainto_tsquery`, so per-token normalisation (stop words,
+        // punctuation, stemming) is exactly what the AND form used — only the
+        // join between tokens changes.
+        let tokens: Vec<String> = query_str
+            .split_whitespace()
+            .take(super::MAX_FTS_QUERY_TOKENS)
+            .map(str::to_string)
+            .collect();
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tsquery = or_tsquery_fragment(3, tokens.len());
 
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut memories = Vec::new();
 
             // Search episodic memories
-            let episodic_rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
-                r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                          summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed, event_time, superseded_by, invalid_at
+            let sql = format!(
+                "SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
+                        summary, embedding::text AS embedding, context_intent, timestamp,
+                        stability, retrievability, access_count, last_accessed, event_time,
+                        superseded_by, invalid_at
                    FROM episodic_memories
                    WHERE namespace_id = $1 AND superseded_by IS NULL
-                     AND fts_content @@ plainto_tsquery('english', $2)
-                   ORDER BY ts_rank(fts_content, plainto_tsquery('english', $2)) DESC
-                   LIMIT $3",
-            )
-            .bind(namespace_id)
-            .bind(&tsquery)
-            .bind(limit_i64)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
+                     AND fts_content @@ {tsquery}
+                   ORDER BY ts_rank(fts_content, {tsquery}) DESC
+                   LIMIT $2"
+            );
+            let mut q = query_as::<Postgres, EpisodicRow>(AssertSqlSafe(sql))
+                .bind(namespace_id)
+                .bind(limit_i64);
+            for token in &tokens {
+                q = q.bind(token.as_str());
+            }
+            let episodic_rows = q.fetch_all(&mut *conn).await.map_err(sqlx_to_io)?;
 
             for row in episodic_rows {
                 memories.push(Memory::Episodic(row_to_episodic(row)));
             }
 
             // Search semantic memories
-            let semantic_rows: Vec<SemanticRow> = query_as::<Postgres, _>(
-                r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
-                          valid_at, invalid_at, source_episodes, embedding::text, stability, retrievability
-                          , superseded_by
+            let sql = format!(
+                "SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
+                        valid_at, invalid_at, source_episodes, embedding::text, stability,
+                        retrievability, superseded_by
                    FROM semantic_memories
                    WHERE namespace_id = $1 AND superseded_by IS NULL
-                     AND fts_content @@ plainto_tsquery('english', $2)
-                   ORDER BY ts_rank(fts_content, plainto_tsquery('english', $2)) DESC
-                   LIMIT $3",
-            )
-            .bind(namespace_id)
-            .bind(&tsquery)
-            .bind(limit_i64)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
+                     AND fts_content @@ {tsquery}
+                   ORDER BY ts_rank(fts_content, {tsquery}) DESC
+                   LIMIT $2"
+            );
+            let mut q = query_as::<Postgres, SemanticRow>(AssertSqlSafe(sql))
+                .bind(namespace_id)
+                .bind(limit_i64);
+            for token in &tokens {
+                q = q.bind(token.as_str());
+            }
+            let semantic_rows = q.fetch_all(&mut *conn).await.map_err(sqlx_to_io)?;
 
             for row in semantic_rows {
                 memories.push(Memory::Semantic(row_to_semantic(row)));
             }
 
             // Search procedural memories
-            let procedural_rows: Vec<ProceduralRow> = query_as::<Postgres, _>(
-                r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
-                          trial_count, success_count, source_episodes, embedding::text, created_at, last_used
-                          , superseded_by, invalid_at
+            let sql = format!(
+                "SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
+                        trial_count, success_count, source_episodes, embedding::text, created_at,
+                        last_used, superseded_by, invalid_at
                    FROM procedural_memories
                    WHERE namespace_id = $1 AND superseded_by IS NULL
-                     AND fts_content @@ plainto_tsquery('english', $2)
-                   ORDER BY ts_rank(fts_content, plainto_tsquery('english', $2)) DESC
-                   LIMIT $3",
-            )
-            .bind(namespace_id)
-            .bind(&tsquery)
-            .bind(limit_i64)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
+                     AND fts_content @@ {tsquery}
+                   ORDER BY ts_rank(fts_content, {tsquery}) DESC
+                   LIMIT $2"
+            );
+            let mut q = query_as::<Postgres, ProceduralRow>(AssertSqlSafe(sql))
+                .bind(namespace_id)
+                .bind(limit_i64);
+            for token in &tokens {
+                q = q.bind(token.as_str());
+            }
+            let procedural_rows = q.fetch_all(&mut *conn).await.map_err(sqlx_to_io)?;
 
             for row in procedural_rows {
                 memories.push(Memory::Procedural(row_to_procedural(row)));
@@ -1439,31 +1478,41 @@ impl StorageTrait for PostgresBackend {
         limit: usize,
     ) -> StorageResult<Vec<Memory>> {
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        let tsquery = query_str.to_string();
+        // OR-joined per token, same rationale as `search_fts` (#225).
+        let tokens: Vec<String> = query_str
+            .split_whitespace()
+            .take(super::MAX_FTS_QUERY_TOKENS)
+            .map(str::to_string)
+            .collect();
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tsquery = or_tsquery_fragment(4, tokens.len());
 
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut memories = Vec::new();
 
             // Semantic memories: subject = entity_id
-            let semantic_rows: Vec<SemanticRow> = query_as::<Postgres, _>(
-                r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
-                          valid_at, invalid_at, source_episodes, embedding::text, stability, retrievability
-                          , superseded_by
+            let sql = format!(
+                "SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
+                        valid_at, invalid_at, source_episodes, embedding::text, stability,
+                        retrievability, superseded_by
                    FROM semantic_memories
                    WHERE namespace_id = $1 AND subject = $2
                      AND superseded_by IS NULL
-                     AND fts_content @@ plainto_tsquery('english', $3)
-                   ORDER BY ts_rank(fts_content, plainto_tsquery('english', $3)) DESC
-                   LIMIT $4",
-            )
-            .bind(namespace_id)
-            .bind(entity_id)
-            .bind(&tsquery)
-            .bind(limit_i64)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
+                     AND fts_content @@ {tsquery}
+                   ORDER BY ts_rank(fts_content, {tsquery}) DESC
+                   LIMIT $3"
+            );
+            let mut q = query_as::<Postgres, SemanticRow>(AssertSqlSafe(sql))
+                .bind(namespace_id)
+                .bind(entity_id)
+                .bind(limit_i64);
+            for token in &tokens {
+                q = q.bind(token.as_str());
+            }
+            let semantic_rows = q.fetch_all(&mut *conn).await.map_err(sqlx_to_io)?;
 
             for row in semantic_rows {
                 memories.push(Memory::Semantic(row_to_semantic(row)));
@@ -1473,25 +1522,27 @@ impl StorageTrait for PostgresBackend {
             let remaining = limit.saturating_sub(memories.len());
             let remaining_i64 = i64::try_from(remaining).unwrap_or(i64::MAX);
 
-            let episodic_rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
-                r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
-                          summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed, event_time, superseded_by, invalid_at
+            let sql = format!(
+                "SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
+                        summary, embedding::text AS embedding, context_intent, timestamp,
+                        stability, retrievability, access_count, last_accessed, event_time,
+                        superseded_by, invalid_at
                    FROM episodic_memories
                    WHERE namespace_id = $1
                      AND (about_entity = $2 OR source_entity = $2)
                      AND superseded_by IS NULL
-                     AND fts_content @@ plainto_tsquery('english', $3)
-                   ORDER BY ts_rank(fts_content, plainto_tsquery('english', $3)) DESC
-                   LIMIT $4",
-            )
-            .bind(namespace_id)
-            .bind(entity_id)
-            .bind(&tsquery)
-            .bind(remaining_i64)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
+                     AND fts_content @@ {tsquery}
+                   ORDER BY ts_rank(fts_content, {tsquery}) DESC
+                   LIMIT $3"
+            );
+            let mut q = query_as::<Postgres, EpisodicRow>(AssertSqlSafe(sql))
+                .bind(namespace_id)
+                .bind(entity_id)
+                .bind(remaining_i64);
+            for token in &tokens {
+                q = q.bind(token.as_str());
+            }
+            let episodic_rows = q.fetch_all(&mut *conn).await.map_err(sqlx_to_io)?;
 
             for row in episodic_rows {
                 memories.push(Memory::Episodic(row_to_episodic(row)));

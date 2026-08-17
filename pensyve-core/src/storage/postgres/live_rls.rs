@@ -1777,3 +1777,169 @@ fn enforcement_file_forces_every_policied_table_and_only_those() {
          do not, and for the role the application has to stop connecting as."
     );
 }
+
+/// FTS must OR-join query tokens on Postgres exactly as `SQLite` does after
+/// #223: `plainto_tsquery` joins lexemes with implicit AND, so a paraphrase
+/// query that shares most-but-not-all tokens with a memory collapsed to zero
+/// recall on hosted (Postgres-backed) tenants (#225). Reuses the
+/// "deploy-p99-rollback" case from the `SQLite` regression test: "rollback"
+/// never matches "rolls"/"back", while the other four tokens all match.
+#[test]
+fn fts_or_semantics_survive_paraphrase_queries() {
+    let Some(admin_opts) = skip_notice("fts_or_semantics_survive_paraphrase_queries") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns = Namespace::new(format!("fts-or-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns).expect("save namespace");
+    let alice = Uuid::new_v4();
+
+    let ep = EpisodicMemory::new(
+        ns.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        alice,
+        "The deploy pipeline automatically rolls back a release when p99 \
+         latency exceeds the alert threshold for five minutes",
+    );
+    backend.save_episodic(&ep).expect("save episodic");
+
+    let query = "rollback when p99 exceeds threshold";
+
+    let unscoped = backend.search_fts(query, ns.id, 10).expect("search_fts");
+    assert_eq!(
+        unscoped.len(),
+        1,
+        "search_fts must OR-join tokens: the shared terms match even though \
+         \"rollback\" never matches \"rolls\"/\"back\""
+    );
+    assert_eq!(unscoped[0].id(), ep.id);
+
+    let scoped = backend
+        .search_fts_scoped(query, ns.id, alice, 10)
+        .expect("search_fts_scoped");
+    assert_eq!(scoped.len(), 1, "the entity-scoped path must OR-join too");
+    assert_eq!(scoped[0].id(), ep.id);
+
+    // Pathological token counts must degrade to truncation, not to a protocol
+    // error: one bind per token would blow the 65,535-parameter statement cap,
+    // and the REST recall body does not bound query length. The matching
+    // tokens lead, so the capped query still finds the row.
+    let mut huge = String::from(query);
+    for i in 0..70_000 {
+        use std::fmt::Write as _;
+        let _ = write!(huge, " filler{i}");
+    }
+    let capped = backend
+        .search_fts(&huge, ns.id, 10)
+        .expect("a 70k-token query must truncate, not error");
+    assert_eq!(
+        capped.len(),
+        1,
+        "the leading tokens still match after the cap"
+    );
+    assert_eq!(capped[0].id(), ep.id);
+}
+
+/// Both backends must produce the same FTS candidate *sets* for multi-token
+/// queries (#225). Rank order is allowed to differ — bm25 and `ts_rank` are
+/// different functions — so the limit is set high enough that no candidate is
+/// truncated and set equality is well-defined.
+#[test]
+fn fts_candidates_match_sqlite_for_multi_token_queries() {
+    let Some(admin_opts) = skip_notice("fts_candidates_match_sqlite_for_multi_token_queries")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let pg = &fixture.backend;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sqlite = crate::storage::sqlite::SqliteBackend::open(dir.path()).expect("open sqlite");
+
+    let ns = Namespace::new(format!("fts-parity-{}", Uuid::new_v4().simple()));
+    let alice = Uuid::new_v4();
+
+    // Identical corpus on both backends: full overlap, partial overlap,
+    // single-token overlap, no overlap, and an entity-scoped subset.
+    let contents = [
+        "the deploy pipeline rolls back a release when p99 latency exceeds the threshold",
+        "p99 latency alerts page the on-call rotation",
+        "the rollback runbook lives in the operations wiki",
+        "the espresso machine descaling schedule",
+    ];
+
+    let backends: [&dyn StorageTrait; 2] = [pg, &sqlite];
+    for backend in backends {
+        backend.save_namespace(&ns).expect("save namespace");
+        for (i, content) in contents.iter().enumerate() {
+            // Rows 0 and 1 belong to alice; 2 and 3 to someone else.
+            let about = if i < 2 { alice } else { Uuid::new_v4() };
+            let mut ep =
+                EpisodicMemory::new(ns.id, Uuid::new_v4(), Uuid::new_v4(), about, *content);
+            // Same row ids on both backends, so the sets are comparable.
+            ep.id = Uuid::new_v5(&ns.id, content.as_bytes());
+            backend.save_episodic(&ep).expect("save episodic");
+        }
+    }
+
+    let queries = [
+        "rollback when p99 exceeds threshold",
+        "p99 latency",
+        "rollback runbook",
+        "descaling schedule espresso",
+    ];
+
+    let id_set = |memories: Vec<Memory>| {
+        let mut ids: Vec<Uuid> = memories.iter().map(Memory::id).collect();
+        ids.sort();
+        ids
+    };
+
+    for query in queries {
+        let pg_ids = id_set(pg.search_fts(query, ns.id, 100).expect("pg search_fts"));
+        let sq_ids = id_set(
+            sqlite
+                .search_fts(query, ns.id, 100)
+                .expect("sqlite search_fts"),
+        );
+        // Every query in the list was written to match at least one corpus
+        // row, so an empty set means FTS broke — without this, both backends
+        // breaking at once would satisfy the equality vacuously.
+        assert!(!pg_ids.is_empty(), "no candidates at all for {query:?}");
+        assert_eq!(
+            pg_ids, sq_ids,
+            "search_fts candidate sets diverge for {query:?}"
+        );
+
+        let pg_scoped = id_set(
+            pg.search_fts_scoped(query, ns.id, alice, 100)
+                .expect("pg search_fts_scoped"),
+        );
+        let sq_scoped = id_set(
+            sqlite
+                .search_fts_scoped(query, ns.id, alice, 100)
+                .expect("sqlite search_fts_scoped"),
+        );
+        assert_eq!(
+            pg_scoped, sq_scoped,
+            "search_fts_scoped candidate sets diverge for {query:?}"
+        );
+    }
+
+    // Documented divergence, deliberately outside the parity loop: Postgres's
+    // 'english' configuration strips stop words at index and query time, so a
+    // stop-word-only query matches nothing there, while SQLite's FTS5
+    // tokenizer keeps stop words and can match. This predates the OR port —
+    // plainto_tsquery dropped the same tokens under the AND form — and closing
+    // it would mean reindexing one side's corpus with the other's tokenizer.
+    let pg_stopwords = pg
+        .search_fts("the and of", ns.id, 100)
+        .expect("pg stop-word query");
+    assert!(
+        pg_stopwords.is_empty(),
+        "a stop-word-only query normalises to the empty tsquery on Postgres"
+    );
+}
