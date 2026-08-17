@@ -1,6 +1,6 @@
 [package]
 name = "pensyve-wasm"
-version = "2.6.1"
+version = "3.0.0"
 edition = "2024"
 
 [workspace]
