@@ -31,7 +31,7 @@ Most AI agents lose all context between sessions. Pensyve gives them durable, in
 ```bash
 pip install pensyve          # Python (PyPI)
 npm install pensyve          # TypeScript (npm)
-go get github.com/major7apps/pensyve/pensyve-go@latest  # Go
+go get github.com/major7apps/pensyve/pensyve-go/v3@latest  # Go
 ```
 
 Or use the MCP server directly with Claude Code, Cursor, or any MCP client — see [MCP Setup](https://pensyve.com/docs/getting-started/mcp-setup).
@@ -188,7 +188,7 @@ const memories = await p.recall("programming", { entity: "seth" });
 Context-aware HTTP client with structured errors.
 
 ```go
-import pensyve "github.com/major7apps/pensyve/pensyve-go"
+import pensyve "github.com/major7apps/pensyve/pensyve-go/v3"
 
 client := pensyve.NewClient(pensyve.Config{BaseURL: "http://localhost:3000"})
 ctx := context.Background()

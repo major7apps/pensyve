@@ -5,6 +5,44 @@ All notable changes to Pensyve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-08-16
+
+Major release. The version jump is driven by deliberate breaks in the `pensyve-core` public API: a class of storage methods that resolved rows by id alone could not be called safely in a multi-tenant deployment, and per the API-break ruling recorded in `AGENTS.md` (#262) they were replaced outright rather than deprecated — a deprecation cycle would have shipped the defect with a compiler warning as its only mitigation. Everything else in the release is the 2026-08-16 hardening sweep: tenant-isolation fixes across the hosted gateway, a recoverable `forget`, Postgres full-text-search parity with SQLite, and a run of correctness fixes in consolidation, purge, and index maintenance. A coordinated security advisory covering the isolation fixes will be published separately.
+
+### Breaking
+
+- **`StorageTrait` lookups, supersede, and delete-by-id now require a namespace.** `get_episode` → `get_episode_in_namespace` (#247); `get_episodic` / `get_semantic` / `get_procedural` / `get_observation` → `*_in_namespace`, `supersede_memory` → `supersede_memory_in_namespace`, and `delete_memory_by_id` is removed with `delete_memory_by_id_in_namespace` now required (#269). Backends must put the namespace predicate in the SQL; both built-in backends do. Callers that already know their namespace (every production call site did) pass it; there is no unscoped escape hatch.
+- **Gateway forget/snapshot responses no longer expose the server-local snapshot `path`** — the reference is by `snapshot_id` only; the path is recorded in the activity log for operators (#263 review; the MCP tool's response is tracked separately in #266).
+- **Go SDK module path is now `github.com/major7apps/pensyve/pensyve-go/v3`** per Go semantic import versioning.
+
+### Security
+
+- Namespace scoping enforced across the hosted gateway's storage access: episode and observation access (#247), entity-wide forget and its FTS rows (#259), the REST/A2A forget routes (#263), and the remaining namespace-less storage methods (#269). Explicit SQL predicates enforce isolation in every deployment shape; Postgres row-level security backs them as defence in depth now that the session GUC binds correctly (#253). `FORCE ROW LEVEL SECURITY` ships as an explicit operator step (`postgres_rls_enforce.sql`) — see `docs/SECURITY.md` for the preconditions, including the application-role requirement.
+- Entity-wide `pensyve_forget` is recoverable: a fail-closed pre-delete snapshot is captured inside the delete's transaction — if the snapshot cannot be written, nothing is deleted (#248), and the REST and A2A routes carry the same guarantee (#263). Snapshot restore is `pensyve_core::snapshot::restore`.
+
+### Added
+
+- **Supersession primitive** — correct a memory without deleting history; superseded rows leave recall but remain for audit (#200).
+- **Recall contradictions** — `/v1/recall` reports live semantic disagreements alongside results (#196).
+- **`coalesced` on consolidation results** — distinguishes "another run covered this request" from "ran with nothing to do"; propagated through the REST response and the Go/TS/Python SDKs (#271).
+- **Live-Postgres CI job** with RLS scoping smoke tests; the postgres feature is no longer untested (#245).
+- `delete_memories_by_entity_capturing` (atomic capture-and-delete, #248) and `list_memories_by_entity_including_superseded` (mirrors the entity delete's scope, with a compatible trait default, #267).
+
+### Fixed
+
+- **Consolidation**: superseded facts are no longer re-promoted from unchanged episodic sources (#244); runs are serialized per namespace, so overlapping triggers cannot double-promote (#258); episodic→semantic promotion is idempotent (#219); a rerun failure now reports the stats earlier runs already committed instead of discarding them (#271).
+- **Postgres FTS parity** (#274): all five search sites OR-join query tokens (bound per-token `plainto_tsquery`, identical tokenization to before), matching SQLite's paraphrase-recall behavior — hosted tenants now get the #223 recall improvements. SQLite's entity-scoped legs OR-join and rank by bm25 before truncating. Both backends cap queries at 256 tokens (an unbounded query overflowed Postgres's bind-parameter limit). Cross-backend candidate-set parity is pinned by a live-Postgres test.
+- **Purge**: `PostgresBackend` gains a set-based `purge_namespace`; the trait default it replaced skipped superseded rows — leaving tenant data behind while reporting success (#270).
+- **Vector-index hygiene**: forget's cleanup scope now equals the delete's scope everywhere (source-side, object-side, and superseded rows included); the Python binding cleans its index at all (#267).
+- **Forget latency**: the capturing snapshot delete runs on the blocking pool, and the delete plus its bookkeeping survive request cancellation (#272).
+- **Recall**: paraphrase recall eval harness, determinism, and retrieval fixes; OR-semantics for SQLite FTS (#223), with the paraphrase gate promoted to a blocking CI job (#228). Corpus-wide top-3 stands at 0.903.
+- **Gateway**: entity resolution by name or UUID with a 404 on unknown instead of a silent no-op (#195); entity-scoped observation inspect with MCP parity (#197); bounded extraction retry with backoff (#199); lazy ONNX embedder loading for the stdio server (#162); env-configurable extractor timeout (#168).
+- `pensyve_forget` parameter-schema hardening after the #217 incident (#218); gateway test suites no longer mutate process-global env (#273).
+
+### Changed
+
+- rmcp 1.7 → 3.1 (`stateful_mode` renamed `legacy_session_mode`, #243), sqlx 0.9, plus the combined dependabot refresh across Rust/Python/TypeScript/CI ecosystems (#242 and the July run).
+
 ## [2.6.1] - 2026-07-12
 
 Patch release: CI/release-pipeline fixes and a full dependency refresh. No functional changes to the memory runtime.
