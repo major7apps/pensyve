@@ -1710,6 +1710,11 @@ impl StorageTrait for SqliteBackend {
     // Full-text search
     // -----------------------------------------------------------------------
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one FTS candidate query plus three per-type hydration arms; splitting the arms \
+                  apart would hide that they share the candidate list"
+    )]
     fn search_fts(
         &self,
         query: &str,
@@ -1744,15 +1749,18 @@ impl StorageTrait for SqliteBackend {
                  AND (
                      (memory_type = 'episodic' AND EXISTS (
                          SELECT 1 FROM episodic_memories e
-                         WHERE e.id = memory_id AND e.superseded_by IS NULL
+                         WHERE e.id = memory_id AND e.namespace_id = ?2
+                           AND e.superseded_by IS NULL
                      ))
                      OR (memory_type = 'semantic' AND EXISTS (
                          SELECT 1 FROM semantic_memories s
-                         WHERE s.id = memory_id AND s.superseded_by IS NULL
+                         WHERE s.id = memory_id AND s.namespace_id = ?2
+                           AND s.superseded_by IS NULL
                      ))
                      OR (memory_type = 'procedural' AND EXISTS (
                          SELECT 1 FROM procedural_memories p
-                         WHERE p.id = memory_id AND p.superseded_by IS NULL
+                         WHERE p.id = memory_id AND p.namespace_id = ?2
+                           AND p.superseded_by IS NULL
                      ))
                  )
                ORDER BY bm25(memory_fts)
@@ -1782,8 +1790,9 @@ impl StorageTrait for SqliteBackend {
                                       content_type, summary, embedding, context_intent, timestamp,
                                       stability, retrievability, access_count, last_accessed, event_time,
                                       agent_id, user_id, superseded_by, invalid_at
-                               FROM episodic_memories WHERE id = ?1",
-                            params![id.to_string()],
+                               FROM episodic_memories
+                               WHERE id = ?1 AND namespace_id = ?2",
+                            params![id.to_string(), namespace_id.to_string()],
                             row_to_episodic,
                         )
                         .optional()?;
@@ -1798,8 +1807,9 @@ impl StorageTrait for SqliteBackend {
                                       object_entity, confidence, valid_at, invalid_at,
                                       source_episodes, embedding, stability, retrievability,
                                       agent_id, user_id, superseded_by
-                               FROM semantic_memories WHERE id = ?1",
-                            params![id.to_string()],
+                               FROM semantic_memories
+                               WHERE id = ?1 AND namespace_id = ?2",
+                            params![id.to_string(), namespace_id.to_string()],
                             row_to_semantic,
                         )
                         .optional()?;
@@ -1813,8 +1823,9 @@ impl StorageTrait for SqliteBackend {
                             r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
                                       trial_count, success_count, source_episodes, embedding, created_at, last_used,
                                       agent_id, user_id, superseded_by, invalid_at
-                               FROM procedural_memories WHERE id = ?1",
-                            params![id.to_string()],
+                               FROM procedural_memories
+                               WHERE id = ?1 AND namespace_id = ?2",
+                            params![id.to_string(), namespace_id.to_string()],
                             row_to_procedural,
                         )
                         .optional()?;
@@ -1835,12 +1846,15 @@ impl StorageTrait for SqliteBackend {
         entity_id: Uuid,
         limit: usize,
     ) -> StorageResult<Vec<Memory>> {
-        // Escape the query for FTS5 (same as search_fts).
+        // Escape and OR-join the query for FTS5, exactly as `search_fts` does
+        // (#225): with `ORDER BY bm25` below, a match on more query terms
+        // still ranks above a match on fewer, so OR preserves precision while
+        // keeping paraphrase-style queries from collapsing to zero recall.
         let escaped_query: String = query
             .split_whitespace()
             .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
             .collect::<Vec<_>>()
-            .join(" ");
+            .join(" OR ");
 
         if escaped_query.is_empty() {
             return Ok(Vec::new());
@@ -1861,7 +1875,9 @@ impl StorageTrait for SqliteBackend {
                      AND f.namespace_id = ?2
                      AND f.memory_type = 'semantic'
                      AND s.subject = ?3
+                     AND s.namespace_id = ?2
                      AND s.superseded_by IS NULL
+                   ORDER BY bm25(f.memory_fts)
                    LIMIT ?4",
             )?;
             let rows: Vec<String> = stmt
@@ -1881,8 +1897,9 @@ impl StorageTrait for SqliteBackend {
                                   object_entity, confidence, valid_at, invalid_at,
                                   source_episodes, embedding, stability, retrievability,
                                   agent_id, user_id, superseded_by
-                           FROM semantic_memories WHERE id = ?1",
-                        params![id.to_string()],
+                           FROM semantic_memories
+                           WHERE id = ?1 AND namespace_id = ?2",
+                        params![id.to_string(), &ns_str],
                         row_to_semantic,
                     )
                     .optional()?;
@@ -1903,7 +1920,9 @@ impl StorageTrait for SqliteBackend {
                      AND f.namespace_id = ?2
                      AND f.memory_type = 'episodic'
                      AND (e.about_entity = ?3 OR e.source_entity = ?3)
+                     AND e.namespace_id = ?2
                      AND e.superseded_by IS NULL
+                   ORDER BY bm25(f.memory_fts)
                    LIMIT ?4",
             )?;
             let rows: Vec<String> = stmt
@@ -1923,8 +1942,9 @@ impl StorageTrait for SqliteBackend {
                                   content_type, summary, embedding, context_intent, timestamp,
                                   stability, retrievability, access_count, last_accessed, event_time,
                                   agent_id, user_id, superseded_by, invalid_at
-                           FROM episodic_memories WHERE id = ?1",
-                        params![id.to_string()],
+                           FROM episodic_memories
+                           WHERE id = ?1 AND namespace_id = ?2",
+                        params![id.to_string(), &ns_str],
                         row_to_episodic,
                     )
                     .optional()?;
@@ -3789,6 +3809,86 @@ mod tests {
              matches \"rolls\"/\"back\""
         );
         assert_eq!(results[0].id(), ep.id);
+    }
+
+    #[test]
+    fn test_search_fts_scoped_paraphrase_query_uses_or_semantics() {
+        // The scoped sibling of the case above (#225): the entity-scoped legs
+        // still joined tokens with implicit AND after #223 fixed the unscoped
+        // path, so the same paraphrase query collapsed to zero recall when the
+        // caller narrowed to an entity.
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let alice = Uuid::new_v4();
+
+        let ep = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            alice,
+            "The deploy pipeline automatically rolls back a release when p99 \
+             latency exceeds the alert threshold for five minutes",
+        );
+        db.save_episodic(&ep).unwrap();
+
+        let results = db
+            .search_fts_scoped("rollback when p99 exceeds threshold", ns.id, alice, 10)
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "the scoped path must OR-join tokens like the unscoped path: the \
+             shared terms (when/p99/exceeds/threshold) match even though \
+             \"rollback\" never matches \"rolls\"/\"back\""
+        );
+        assert_eq!(results[0].id(), ep.id);
+    }
+
+    #[test]
+    fn test_search_fts_scoped_orders_by_bm25_before_truncating() {
+        // The scoped legs applied their per-branch LIMIT without any ORDER BY,
+        // so which rows survived truncation depended on insertion order
+        // (#225). The low-relevance rows are saved first, so relying on
+        // insertion order would keep them and drop the best match.
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let alice = Uuid::new_v4();
+
+        let low1 = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            alice,
+            "the zephyr blew across the plains",
+        );
+        db.save_episodic(&low1).unwrap();
+
+        let low2 = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            alice,
+            "a light zephyr passed through the valley",
+        );
+        db.save_episodic(&low2).unwrap();
+
+        let high = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            alice,
+            "zephyr zephyr zephyr: the zephyr project is a real-time OS",
+        );
+        db.save_episodic(&high).unwrap();
+
+        let results = db.search_fts_scoped("zephyr", ns.id, alice, 2).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].id(),
+            high.id,
+            "the per-branch LIMIT must truncate by bm25 relevance, not by \
+             insertion order"
+        );
     }
 
     // -----------------------------------------------------------------------
