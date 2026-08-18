@@ -216,6 +216,10 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         // recovery artifacts belong inside the directory that backups and
         // volume mounts already cover.
         PensyveState::snapshot_root_for(&config.storage_path),
+        // Bounds what that directory accumulates: every non-empty forget
+        // writes a full copy of what it destroyed, so an unbounded snapshot
+        // volume is one `remember`/`forget` loop away from filling (#265).
+        PensyveState::snapshot_retention_from_env(),
     );
 
     let ct = CancellationToken::new();

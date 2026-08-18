@@ -6,6 +6,7 @@ use tokio::sync::RwLock;
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::reranker::Reranker;
+use pensyve_core::snapshot::RetentionPolicy;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::types::Namespace;
 use pensyve_core::vector::VectorIndex;
@@ -13,6 +14,37 @@ use pensyve_core::vector::VectorIndex;
 /// Model name used for the lazily-resolved cross-encoder reranker. Matches
 /// the default in `pensyve-python`'s `Pensyve(reranker="BGERerankerBase")`.
 const RERANKER_MODEL: &str = "BGERerankerBase";
+
+/// Default snapshot retention window. Long enough that a forget noticed a
+/// fortnight later is still recoverable, short enough to bound the volume.
+const DEFAULT_SNAPSHOT_RETENTION_DAYS: u32 = 30;
+
+/// Default per-namespace snapshot count cap. A tenant deleting entities at a
+/// normal rate never reaches it; one looping `remember` → `forget` stops here.
+const DEFAULT_SNAPSHOT_MAX_PER_NAMESPACE: u32 = 50;
+
+/// One retention bound, from its raw environment value.
+///
+/// Takes the value rather than reading the variable so it is testable without
+/// mutating process-global state (#273). `0` disables the bound; anything
+/// unparseable keeps the default and says so — silently disabling a bound
+/// because someone wrote `30d` would be the one outcome nobody asked for.
+fn retention_bound(var: &str, raw: Option<&str>, default: u32) -> Option<u32> {
+    let value = match raw {
+        None => default,
+        Some(raw) => match raw.trim().parse::<u32>() {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                tracing::warn!(
+                    "{var}={raw:?} is not a whole number ({err}); using the default of {default}"
+                );
+                default
+            }
+        },
+    };
+
+    (value > 0).then_some(value)
+}
 
 /// Shared state for the Pensyve MCP server.
 ///
@@ -44,6 +76,12 @@ pub struct PensyveState {
     /// snapshot for, so this must point somewhere writable and durable — see
     /// [`PensyveState::snapshot_root_for`].
     pub snapshot_root: PathBuf,
+    /// How much snapshot history each namespace directory keeps (#265). Every
+    /// non-empty forget writes a full copy of what it destroyed, so without a
+    /// bound a caller looping `remember` → `forget` grows the snapshot volume
+    /// without bound while the live database stays small. See
+    /// [`PensyveState::snapshot_retention_from_env`].
+    pub snapshot_retention: RetentionPolicy,
 }
 
 impl PensyveState {
@@ -59,6 +97,33 @@ impl PensyveState {
     pub fn snapshot_root_for(storage_root: &Path) -> PathBuf {
         std::env::var("PENSYVE_SNAPSHOT_DIR")
             .map_or_else(|_| storage_root.join("snapshots"), PathBuf::from)
+    }
+
+    /// Snapshot retention bounds from the environment:
+    /// `PENSYVE_SNAPSHOT_RETENTION_DAYS` (default 30) and
+    /// `PENSYVE_SNAPSHOT_MAX_PER_NAMESPACE` (default 50). `0` disables that
+    /// bound; both at `0` restores the unbounded behaviour from before #265.
+    ///
+    /// Read here rather than inside `pensyve-core`: the core takes its
+    /// configuration as arguments, the same way `snapshot_root` is threaded in
+    /// rather than resolved from `PENSYVE_SNAPSHOT_DIR` down there.
+    pub fn snapshot_retention_from_env() -> RetentionPolicy {
+        RetentionPolicy {
+            max_age_days: retention_bound(
+                "PENSYVE_SNAPSHOT_RETENTION_DAYS",
+                std::env::var("PENSYVE_SNAPSHOT_RETENTION_DAYS")
+                    .ok()
+                    .as_deref(),
+                DEFAULT_SNAPSHOT_RETENTION_DAYS,
+            ),
+            max_count: retention_bound(
+                "PENSYVE_SNAPSHOT_MAX_PER_NAMESPACE",
+                std::env::var("PENSYVE_SNAPSHOT_MAX_PER_NAMESPACE")
+                    .ok()
+                    .as_deref(),
+                DEFAULT_SNAPSHOT_MAX_PER_NAMESPACE,
+            ),
+        }
     }
 
     /// Resolve the reranker lazily (first call wins) and return a clone of
@@ -130,6 +195,45 @@ mod tests {
             // reader observes the environment — no data race.
             unsafe { std::env::set_var("PENSYVE_RERANKER", "0") };
         });
+    }
+
+    #[test]
+    fn retention_bound_falls_back_to_the_default_when_unset() {
+        assert_eq!(retention_bound("VAR", None, 30), Some(30));
+    }
+
+    #[test]
+    fn retention_bound_reads_an_explicit_value() {
+        assert_eq!(retention_bound("VAR", Some("7"), 30), Some(7));
+        assert_eq!(retention_bound("VAR", Some(" 7 "), 30), Some(7));
+    }
+
+    /// The documented way to turn a bound off — and the only value that may
+    /// produce `None`, since a policy of "keep zero snapshots" would evict the
+    /// one the current forget just wrote.
+    #[test]
+    fn retention_bound_treats_zero_as_disabled() {
+        assert_eq!(retention_bound("VAR", Some("0"), 30), None);
+    }
+
+    /// A typo must not silently disable the bound it was trying to set.
+    #[test]
+    fn retention_bound_keeps_the_default_for_an_unparseable_value() {
+        assert_eq!(retention_bound("VAR", Some("30d"), 30), Some(30));
+        assert_eq!(retention_bound("VAR", Some("-1"), 30), Some(30));
+        assert_eq!(retention_bound("VAR", Some(""), 30), Some(30));
+    }
+
+    #[test]
+    fn the_shipped_defaults_bound_both_dimensions() {
+        assert_eq!(
+            retention_bound("VAR", None, DEFAULT_SNAPSHOT_RETENTION_DAYS),
+            Some(30)
+        );
+        assert_eq!(
+            retention_bound("VAR", None, DEFAULT_SNAPSHOT_MAX_PER_NAMESPACE),
+            Some(50)
+        );
     }
 
     #[test]

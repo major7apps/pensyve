@@ -53,6 +53,7 @@ fn create_test_state_with_reranker(
         is_remote: false,
         reranker_cell: Arc::new(OnceLock::from(reranker)),
         snapshot_root: dir.path().join("snapshots"),
+        snapshot_retention: pensyve_core::snapshot::RetentionPolicy::UNBOUNDED,
     })
 }
 

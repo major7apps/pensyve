@@ -1178,6 +1178,7 @@ async fn forget_entity_blocking(
 ) -> Result<pensyve_core::snapshot::ForgetOutcome, String> {
     let storage = ps.storage.clone();
     let snapshot_root = ps.snapshot_root.clone();
+    let retention = ps.snapshot_retention;
     let namespace_id = ps.namespace.id;
 
     tokio::task::spawn_blocking(move || {
@@ -1187,7 +1188,7 @@ async fn forget_entity_blocking(
             Some(entity_name.as_str()),
             namespace_id,
             &snapshot_root,
-            pensyve_core::snapshot::RetentionPolicy::UNBOUNDED,
+            retention,
         )
     })
     .await
