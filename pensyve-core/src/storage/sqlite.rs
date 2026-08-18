@@ -2430,125 +2430,28 @@ impl StorageTrait for SqliteBackend {
         conn.execute_batch("BEGIN")?;
 
         let result = (|| -> StorageResult<ErasedRows> {
-            let mut erased = ErasedRows::default();
-
             // Leg 1 — observations. MUST precede the episodic delete: the only
             // link from an observation back to the entity runs through
             // `episodic_memories.about_entity / source_entity`, and once those
             // rows are gone the association cannot be reconstructed.
-            let mut stmt = conn.prepare(
-                r"DELETE FROM observation_memories
-                   WHERE namespace_id = ?2
-                     AND episode_id IN (
-                       SELECT DISTINCT episode_id FROM episodic_memories
-                        WHERE (about_entity = ?1 OR source_entity = ?1)
-                          AND namespace_id = ?2
-                     )
-                   RETURNING id, namespace_id, episode_id, entity_type, instance, action,
-                             quantity, unit, content, embedding, confidence, event_time,
-                             created_at, stability, retrievability, agent_id, user_id,
-                             superseded_by, invalid_at",
-            )?;
-            let rows = stmt
-                .query_map(params![&id_str, &ns_str], row_to_observation)?
-                .collect::<Result<Vec<_>, _>>()?;
-            for row in rows {
-                erased.observations.push(row?);
-            }
-
-            // Phase 2B cascade: `kg_triples` / `kg_passage_entities` are keyed
-            // by the observation's id (== `passage_id`). Driving the cleanup off
-            // the captured ids rather than off a repeat of the subquery keeps it
-            // exactly as wide as the delete was. `kg_entities` stay: they are
-            // namespace-scoped rather than passage-scoped and other passages'
-            // triples still reference them.
-            for observation in &erased.observations {
-                let passage = observation.id.to_string();
-                conn.execute(
-                    "DELETE FROM kg_triples WHERE passage_id = ?1 AND namespace_id = ?2",
-                    params![&passage, &ns_str],
-                )?;
-                conn.execute(
-                    "DELETE FROM kg_passage_entities WHERE passage_id = ?1",
-                    params![&passage],
-                )?;
-                conn.execute(
-                    "DELETE FROM memory_fts
-                      WHERE memory_id = ?1 AND namespace_id = ?2 AND memory_type = 'observation'",
-                    params![&passage, &ns_str],
-                )?;
-            }
-
+            let observations = erase_observations_for_entity(&conn, &id_str, &ns_str)?;
             // Leg 2 — episodic and semantic memories, superseded rows included.
-            // Predicates match `delete_memories_by_entity` verbatim.
-            let mut stmt = conn.prepare(
-                r"DELETE FROM episodic_memories
-                   WHERE (about_entity = ?1 OR source_entity = ?1) AND namespace_id = ?2
-                   RETURNING id, namespace_id, episode_id, source_entity, about_entity, content,
-                             content_type, summary, embedding, context_intent, timestamp,
-                             stability, retrievability, access_count, last_accessed, event_time,
-                             agent_id, user_id, superseded_by, invalid_at",
-            )?;
-            let rows = stmt
-                .query_map(params![&id_str, &ns_str], row_to_episodic)?
-                .collect::<Result<Vec<_>, _>>()?;
-            for row in rows {
-                erased.memories.push(Memory::Episodic(row?));
-            }
-
-            let mut stmt = conn.prepare(
-                r"DELETE FROM semantic_memories
-                   WHERE (subject = ?1 OR object_entity = ?1) AND namespace_id = ?2
-                   RETURNING id, namespace_id, subject, predicate, object, content_type,
-                             object_entity, confidence, valid_at, invalid_at,
-                             source_episodes, embedding, stability, retrievability,
-                             agent_id, user_id, superseded_by",
-            )?;
-            let rows = stmt
-                .query_map(params![&id_str, &ns_str], row_to_semantic)?
-                .collect::<Result<Vec<_>, _>>()?;
-            for row in rows {
-                erased.memories.push(Memory::Semantic(row?));
-            }
-
-            // `memory_fts` is keyed by `memory_id`, which identifies nothing on
-            // its own: ids repeat across namespaces, and within one namespace
-            // the same id can name both an episodic and a semantic row. Both
-            // halves of the key are pinned, or the cleanup strips an index entry
-            // whose base row is still live.
-            for memory in &erased.memories {
-                conn.execute(
-                    "DELETE FROM memory_fts
-                      WHERE memory_id = ?1 AND namespace_id = ?2 AND memory_type = ?3",
-                    params![memory.id().to_string(), &ns_str, memory.type_name()],
-                )?;
-            }
-
-            // Leg 3 — graph edges. Same-namespace edges only, by construction:
-            // an edge belongs to its source entity's namespace, so an edge from
-            // another tenant pointing at this entity is not visible here and
-            // survives. See the trait docs.
-            let mut stmt = conn.prepare(&format!(
-                "DELETE FROM edges
-                  WHERE (source = ?1 OR target = ?1) AND namespace_id = ?2
-                  RETURNING {EDGE_COLUMNS}",
-            ))?;
-            let rows = stmt
-                .query_map(params![&id_str, &ns_str], edge_columns)?
-                .collect::<Result<Vec<_>, _>>()?;
-            for row in rows {
-                erased.edges.push(columns_to_edge(row)?);
-            }
-
+            let memories = erase_memories_for_entity(&conn, &id_str, &ns_str)?;
+            // Leg 3 — graph edges.
+            let edges = erase_edges_for_entity(&conn, &id_str, &ns_str)?;
             // Leg 4 — the entity record. Absence is not an error: the caller may
             // be erasing data for an entity whose record was already removed.
             let deleted = conn.execute(
                 "DELETE FROM entities WHERE id = ?1 AND namespace_id = ?2",
                 params![&id_str, &ns_str],
             )?;
-            erased.entity_deleted = deleted > 0;
 
-            Ok(erased)
+            Ok(ErasedRows {
+                observations,
+                memories,
+                edges,
+                entity_deleted: deleted > 0,
+            })
         })();
 
         match result {
@@ -3104,6 +3007,141 @@ fn load_memories_by_namespace(
 /// Parse a UUID string, returning `StorageError::Context` on failure.
 fn parse_uuid(s: &str) -> Result<Uuid, StorageError> {
     Uuid::parse_str(s).map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))
+}
+
+/// Leg 1 of [`SqliteBackend::erase_entity_capturing`]: capture and delete the
+/// observations derived from episodes the entity took part in, and cascade the
+/// rows keyed by each observation's id.
+///
+/// Must run before the episodic delete — the join that finds these observations
+/// goes through `episodic_memories.about_entity / source_entity`.
+fn erase_observations_for_entity(
+    conn: &Connection,
+    id_str: &str,
+    ns_str: &str,
+) -> StorageResult<Vec<ObservationMemory>> {
+    let mut stmt = conn.prepare(
+        r"DELETE FROM observation_memories
+           WHERE namespace_id = ?2
+             AND episode_id IN (
+               SELECT DISTINCT episode_id FROM episodic_memories
+                WHERE (about_entity = ?1 OR source_entity = ?1)
+                  AND namespace_id = ?2
+             )
+           RETURNING id, namespace_id, episode_id, entity_type, instance, action,
+                     quantity, unit, content, embedding, confidence, event_time,
+                     created_at, stability, retrievability, agent_id, user_id,
+                     superseded_by, invalid_at",
+    )?;
+    let rows = stmt
+        .query_map(params![id_str, ns_str], row_to_observation)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let observations = rows
+        .into_iter()
+        .collect::<Result<Vec<ObservationMemory>, _>>()?;
+
+    // Phase 2B cascade: `kg_triples` / `kg_passage_entities` are keyed by the
+    // observation's id (== `passage_id`). Driving the cleanup off the captured
+    // ids rather than off a repeat of the subquery keeps it exactly as wide as
+    // the delete was. `kg_entities` stay: they are namespace-scoped rather than
+    // passage-scoped and other passages' triples still reference them.
+    for observation in &observations {
+        let passage = observation.id.to_string();
+        conn.execute(
+            "DELETE FROM kg_triples WHERE passage_id = ?1 AND namespace_id = ?2",
+            params![&passage, ns_str],
+        )?;
+        conn.execute(
+            "DELETE FROM kg_passage_entities WHERE passage_id = ?1",
+            params![&passage],
+        )?;
+        conn.execute(
+            "DELETE FROM memory_fts
+              WHERE memory_id = ?1 AND namespace_id = ?2 AND memory_type = 'observation'",
+            params![&passage, ns_str],
+        )?;
+    }
+
+    Ok(observations)
+}
+
+/// Leg 2 of [`SqliteBackend::erase_entity_capturing`]: capture and delete the
+/// entity's episodic and semantic rows, superseded ones included, and strip
+/// their search-index entries.
+///
+/// Predicates match [`SqliteBackend::delete_memories_by_entity`] verbatim.
+fn erase_memories_for_entity(
+    conn: &Connection,
+    id_str: &str,
+    ns_str: &str,
+) -> StorageResult<Vec<Memory>> {
+    let mut memories = Vec::new();
+
+    let mut stmt = conn.prepare(
+        r"DELETE FROM episodic_memories
+           WHERE (about_entity = ?1 OR source_entity = ?1) AND namespace_id = ?2
+           RETURNING id, namespace_id, episode_id, source_entity, about_entity, content,
+                     content_type, summary, embedding, context_intent, timestamp,
+                     stability, retrievability, access_count, last_accessed, event_time,
+                     agent_id, user_id, superseded_by, invalid_at",
+    )?;
+    let rows = stmt
+        .query_map(params![id_str, ns_str], row_to_episodic)?
+        .collect::<Result<Vec<_>, _>>()?;
+    for row in rows {
+        memories.push(Memory::Episodic(row?));
+    }
+
+    let mut stmt = conn.prepare(
+        r"DELETE FROM semantic_memories
+           WHERE (subject = ?1 OR object_entity = ?1) AND namespace_id = ?2
+           RETURNING id, namespace_id, subject, predicate, object, content_type,
+                     object_entity, confidence, valid_at, invalid_at,
+                     source_episodes, embedding, stability, retrievability,
+                     agent_id, user_id, superseded_by",
+    )?;
+    let rows = stmt
+        .query_map(params![id_str, ns_str], row_to_semantic)?
+        .collect::<Result<Vec<_>, _>>()?;
+    for row in rows {
+        memories.push(Memory::Semantic(row?));
+    }
+
+    // `memory_fts` is keyed by `memory_id`, which identifies nothing on its own:
+    // ids repeat across namespaces, and within one namespace the same id can
+    // name both an episodic and a semantic row. Both halves of the key are
+    // pinned, or the cleanup strips an index entry whose base row is still live.
+    for memory in &memories {
+        conn.execute(
+            "DELETE FROM memory_fts
+              WHERE memory_id = ?1 AND namespace_id = ?2 AND memory_type = ?3",
+            params![memory.id().to_string(), ns_str, memory.type_name()],
+        )?;
+    }
+
+    Ok(memories)
+}
+
+/// Leg 3 of [`SqliteBackend::erase_entity_capturing`]: capture and delete the
+/// entity's graph edges.
+///
+/// Same-namespace edges only, by construction: an edge belongs to its source
+/// entity's namespace, so an edge from another tenant pointing at this entity is
+/// not visible here and survives. See the trait docs.
+fn erase_edges_for_entity(
+    conn: &Connection,
+    id_str: &str,
+    ns_str: &str,
+) -> StorageResult<Vec<Edge>> {
+    let mut stmt = conn.prepare(&format!(
+        "DELETE FROM edges
+          WHERE (source = ?1 OR target = ?1) AND namespace_id = ?2
+          RETURNING {EDGE_COLUMNS}",
+    ))?;
+    let rows = stmt
+        .query_map(params![id_str, ns_str], edge_columns)?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter().map(columns_to_edge).collect()
 }
 
 /// The `edges` columns [`columns_to_edge`] decodes, positionally.

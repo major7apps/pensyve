@@ -1159,6 +1159,138 @@ fn edges_are_confined_to_their_namespace_under_enforced_rls() {
     );
 }
 
+/// The capturing GDPR erase must work under enforced RLS, and must stay inside
+/// its own namespace on all four legs.
+///
+/// This is the test #253's incident asks for: the transaction runs on a
+/// namespace-*bound* connection, so an accidental rebase onto `unbound()` — or
+/// onto the empty-namespace GUC — turns into a visible failure here rather than
+/// into a delete against whatever namespace the previous checkout left set. The
+/// erase and the read-back both go through the backend, so a fail-closed
+/// connection shows up as "namespace A was not erased".
+///
+/// The observation and entity-record legs are the ones that used to match on the
+/// entity id alone (#264); with the same entity id seeded in both namespaces,
+/// that predicate would take namespace B's rows too.
+#[test]
+fn capturing_erase_is_confined_to_its_namespace_under_enforced_rls() {
+    let Some(admin_opts) =
+        skip_notice("capturing_erase_is_confined_to_its_namespace_under_enforced_rls")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns_a = Namespace::new(format!("erase-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("erase-b-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns_a).expect("save namespace A");
+    backend.save_namespace(&ns_b).expect("save namespace B");
+    fixture.enforce_rls();
+
+    // The `entities` row can only exist once — `id` is the primary key — so it
+    // is seeded in A. Everything else collides deliberately.
+    let mut entity = Entity::new("alice", EntityKind::User);
+    entity.namespace_id = ns_a.id;
+    backend.save_entity(&entity).expect("save entity in A");
+    let entity_id = entity.id;
+
+    let mut seeded = Vec::new();
+    for ns in [&ns_a, &ns_b] {
+        let episode_id = Uuid::new_v4();
+        let episodic = EpisodicMemory::new(ns.id, episode_id, entity_id, entity_id, "a turn");
+        backend.save_episodic(&episodic).expect("save episodic");
+
+        let mut fact = SemanticMemory::new(ns.id, Uuid::new_v4(), "reports to", "alice", 0.9);
+        fact.object_entity = Some(entity_id);
+        backend.save_semantic(&fact).expect("save object-side fact");
+
+        let observation = ObservationMemory::new(ns.id, episode_id, "x", "y", "z", "an obs");
+        backend
+            .save_observation(&observation)
+            .expect("save observation");
+
+        let edge = Edge::new(entity_id, Uuid::new_v4(), "knows");
+        backend.save_edge(&edge, ns.id).expect("save edge");
+
+        seeded.push((episodic.id, fact.id, observation.id, edge.id));
+    }
+
+    let erased = backend
+        .erase_entity_capturing(entity_id, ns_a.id)
+        .expect("capturing erase must succeed under enforced RLS");
+
+    let (a_episodic, a_fact, a_observation, _) = seeded[0];
+    assert_eq!(
+        erased.observations.iter().map(|o| o.id).collect::<Vec<_>>(),
+        vec![a_observation],
+        "only namespace A's observation may be captured"
+    );
+    let mut captured = memory_ids(&erased.memories);
+    captured.sort();
+    let mut expected = vec![a_episodic, a_fact];
+    expected.sort();
+    assert_eq!(
+        captured, expected,
+        "only namespace A's episodic and object-side semantic rows may be captured"
+    );
+    assert_eq!(
+        erased.edges.len(),
+        1,
+        "only namespace A's edge may be captured"
+    );
+    assert!(
+        erased.entity_deleted,
+        "the entity record lives in namespace A and must be removed"
+    );
+
+    // Namespace A really is empty — the erase committed rather than fail-closed
+    // no-op'ing on a connection bound to nothing.
+    assert!(
+        backend
+            .get_all_memories_by_namespace(ns_a.id)
+            .expect("read namespace A")
+            .is_empty(),
+        "namespace A must be empty after its own erase"
+    );
+    assert!(
+        backend
+            .get_edges_for_entity_in_namespace(entity_id, ns_a.id)
+            .expect("read namespace A's edges")
+            .is_empty(),
+        "an erase that reports deleted edges must leave none behind"
+    );
+
+    // …and namespace B is untouched.
+    let (b_episodic, b_fact, b_observation, b_edge) = seeded[1];
+    let surviving = memory_ids(
+        &backend
+            .get_all_memories_by_namespace(ns_b.id)
+            .expect("read namespace B"),
+    );
+    for (label, id) in [
+        ("episodic", b_episodic),
+        ("semantic", b_fact),
+        ("observation", b_observation),
+    ] {
+        assert!(
+            surviving.contains(&id),
+            "namespace B's {label} row must survive an erase issued for namespace A; \
+             B now holds {surviving:?}"
+        );
+    }
+    assert_eq!(
+        backend
+            .get_edges_for_entity_in_namespace(entity_id, ns_b.id)
+            .expect("read namespace B's edges")
+            .iter()
+            .map(|edge| edge.id)
+            .collect::<Vec<_>>(),
+        vec![b_edge],
+        "namespace B's edge must survive"
+    );
+}
+
 /// The schema runs on every startup, so it has to migrate a database that
 /// predates `edges.namespace_id` as cleanly as it creates a fresh one.
 ///

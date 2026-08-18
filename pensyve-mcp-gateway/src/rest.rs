@@ -2320,31 +2320,25 @@ async fn gdpr_erase(
         }
     };
 
-    // Collect memory IDs before deletion so we can remove them from vector
-    // index. The accessor mirrors the erasure's own delete predicates
-    // (`about_entity OR source_entity`, `subject OR object_entity`, superseded
-    // rows included) — the per-type `list_*_by_entity` calls that used to stand
-    // in here saw only the about-side, the subject-side and live rows, so every
-    // other deleted row kept its index entry (#261).
-    let memory_ids: Vec<Uuid> = ps
-        .storage
-        .list_memories_by_entity_including_superseded(entity.id, ps.namespace.id)
-        .map(|mems| mems.iter().map(pensyve_core::types::Memory::id).collect())
-        .unwrap_or_default();
-
-    let result = pensyve_core::gdpr::erase_entity(ps.storage.as_ref(), entity.id, ps.namespace.id)
-        .map_err(|e| {
-            RestError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("GDPR erasure error: {e}"),
-            )
-        })?;
+    // The erasure hands back the rows it deleted, and the index cleanup is
+    // driven from those. Listing the ids first — which this handler used to do —
+    // leaves a window in which a concurrent writer inserts a matching row: the
+    // erase deletes it, the pre-list never saw it, and its index entry survives
+    // the request that was supposed to destroy its content (#268).
+    let (result, erased) =
+        pensyve_core::gdpr::erase_entity_captured(ps.storage.as_ref(), entity.id, ps.namespace.id)
+            .map_err(|e| {
+                RestError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("GDPR erasure error: {e}"),
+                )
+            })?;
 
     // Clean vector index.
-    if result.memories_deleted > 0 {
+    if !erased.memories.is_empty() {
         let mut vi = ps.vector_index.write().await;
-        for id in &memory_ids {
-            let _ = vi.remove(*id);
+        for memory in &erased.memories {
+            let _ = vi.remove(memory.id());
         }
     }
 

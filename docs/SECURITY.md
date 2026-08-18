@@ -103,10 +103,11 @@ same way. Every `StorageTrait` method that reaches a policied table without a
 `list_semantic_by_entity`, `update_episodic_access`, `invalidate_semantic`,
 `update_semantic_content`, `update_procedural_reliability` and
 `delete_observations_by_entity`. One of those is still on the recall path:
-`update_episodic_access` writes the reinforcement stamp. GDPR erase
-reaches two: #256 scoped its memory deletion and the edge accessor is scoped
-now, but its observation and entity-record steps still match on the entity id
-alone. All of it is tracked by #254.
+`update_episodic_access` writes the reinforcement stamp. GDPR erase no longer
+reaches any of them: `erase_entity_capturing` replaced the four independent
+calls with one transaction whose every leg — observations and the entity record
+included — carries a `namespace_id` predicate and runs on a namespace-bound
+connection (#264). The rest is tracked by #254.
 
 Do not apply enforcement to a deployment until those paths carry a namespace.
 
@@ -115,7 +116,10 @@ edge belongs to the namespace of its source entity — plus a
 `namespace_isolation_edges` policy and a `FORCE` line in the enforcement file.
 `save_edge` and `get_edges_for_entity_in_namespace` both take a namespace and
 bind it on their connection, so the graph is covered by both layers rather than
-by neither. Erasing edges rather than only counting them is #264.
+by neither. A GDPR erase now really deletes them: the edge leg of
+`erase_entity_capturing` is a `DELETE … WHERE (source = ? OR target = ?) AND
+namespace_id = ?`, where the erase used to run a `SELECT` and report its row
+count as `edges_deleted` while every edge stayed in the table (#264).
 
 Source-namespace ownership has one consequence worth stating plainly: an edge
 whose source is in namespace A and whose target is in namespace B is stored in
@@ -123,7 +127,7 @@ A, so B cannot see it at all — not even on the `target` leg, where B would
 otherwise expect to find an edge pointing at its own entity. An erase running
 in B therefore does not see and does not delete A's edge into B. That is the
 intended trade (the edge is A's data, and B must not be handed a read into A),
-and #264 owns what the erase side does about it.
+and it is the one residue a GDPR erase deliberately leaves behind.
 
 Databases provisioned before the column existed are migrated in place: the
 column is backfilled from `entities.namespace_id` via `edges.source`, and edges

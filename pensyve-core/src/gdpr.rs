@@ -12,7 +12,8 @@ use crate::types::Memory;
 /// Result of a GDPR erasure operation.
 #[derive(Debug, Clone, Default)]
 pub struct ErasureResult {
-    /// Number of memories deleted (episodic + semantic + procedural).
+    /// Number of memories deleted (episodic + semantic). Procedural memories
+    /// are not attached to an entity and are not part of an entity erasure.
     pub memories_deleted: usize,
     /// Number of observation memories deleted (derived from episodes the
     /// entity participated in).

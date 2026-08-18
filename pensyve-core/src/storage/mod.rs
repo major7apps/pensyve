@@ -424,7 +424,13 @@ pub trait StorageTrait: Send + Sync {
     /// `namespace_id`.
     ///
     /// This exists so callers can collect the ids to strip from a vector index
-    /// before an entity-wide forget (#261). `list_episodic_by_entity` and
+    /// before an entity-wide forget (#261). It is a read, not a capture, so it
+    /// must not be used to drive cleanup for a delete: the rows can change
+    /// between the listing and the delete. Both paths that used to do that now
+    /// take their ids from what the delete returned —
+    /// [`StorageTrait::delete_memories_by_entity_capturing`] for forget and
+    /// [`StorageTrait::erase_entity_capturing`] for GDPR erase (#268).
+    /// `list_episodic_by_entity` and
     /// `list_semantic_by_entity` are not a substitute: they look at
     /// `about_entity` and `subject` alone and skip superseded rows, so every
     /// source-side episodic, object-side semantic and superseded row kept its
