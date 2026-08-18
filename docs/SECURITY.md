@@ -289,18 +289,39 @@ pensyve_schema_state` rather than skipping the DDL.
 
 #### What goes wrong
 
-Enforcement applied while query paths are still unscoped produces empty reads
-and writes that do nothing, rather than a visible failure. Check the
-unscoped-method list first, and roll back with `NO FORCE` if reads start coming
-back empty.
+**Reads come back empty after applying enforcement.** Enforcement fails closed
+without raising, so an unscoped query path returns nothing and an unscoped
+delete deletes nothing while still returning `Ok`. Every `StorageTrait` method
+carries a namespace now, so the usual cause is not the application: check the
+connection. A path that reached the database without going through a storage
+method — the `PostgresBackend::pool` accessor, or a tool holding its own
+connection — has to bind `pensyve.namespace_id` itself. Roll back with
+`NO FORCE` while you find it; rollback is immediate and touches neither the
+policies nor the data.
 
-Pointing `DATABASE_URL` at a role that does not own the tables stops the
-application from starting, and adding privileges does not fix it. The blocker
-is ownership, not grants: the schema runs owner-restricted statements on every
-startup, and a non-owner role fails with `must be owner of table entities` even
-holding every table privilege and `CREATE` on the schema. The fix is to connect
-as the owning role until issue #254 separates schema application from serving
-traffic.
+**Enforcement appears to do nothing: rows from every namespace still come
+back.** Look at the startup log. The backend warns on every start when
+`current_user` holds `rolsuper` or `rolbypassrls`, because both survive
+`FORCE` — the catalog will report the tables as forced and the policies will
+still not apply. Move the application to a `NOSUPERUSER NOBYPASSRLS` role. The
+behavioural check above (`set_config` to a namespace that owns no rows, then
+count) is what settles it either way.
+
+**Startup fails with `must be owner of table entities`.** The serving role has
+been asked to apply the schema, which is owner-only DDL. It is only asked to
+when the schema is not already at this build's version, so this means the
+database is behind: apply the new build's schema once as the owning role — start
+the new build as the owner, or run
+`pensyve-core/src/storage/postgres_schema.sql` by hand as the owner — and then
+start the serving role again. A build whose schema text is unchanged skips the
+DDL entirely and needs none of this. The error the application raises says the
+same thing; the bare Postgres message is not what you will see.
+
+**Startup fails with `permission denied for table pensyve_schema_state`.** The
+serving role cannot read the applied-schema marker, so it cannot establish that
+the DDL is safe to skip. Grant it `SELECT` — the
+`GRANT ... ON ALL TABLES IN SCHEMA public` in the role setup above covers it, so
+this usually means that grant was run before the table existed. Re-run it.
 
 ## Network Policy
 

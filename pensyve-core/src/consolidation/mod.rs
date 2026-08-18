@@ -683,7 +683,8 @@ impl ConsolidationEngine {
                     if retrievability < threshold {
                         // Mark as archived by setting retrievability to near-zero and
                         // generating a summary stub if none exists. We store the updated
-                        // stability/retrievability back via update_episodic_access.
+                        // stability/retrievability back via
+                        // `update_episodic_access_in_namespace`.
                         storage.update_episodic_access_in_namespace(
                             em.id,
                             namespace_id,

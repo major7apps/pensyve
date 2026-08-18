@@ -184,7 +184,8 @@ fn i5_pre_cancelled_token_returns_cancelled_immediately() {
 /// Test design (per the brief's option (b)): inject a synthetic large
 /// input — 5 000 episodic memories under one entity — and rely on the
 /// per-row work in both passes (cosine-similarity loop + per-row
-/// `update_episodic_access` `SQLite` writes) to provide enough wall-clock
+/// `update_episodic_access_in_namespace` `SQLite` writes) to provide
+/// enough wall-clock
 /// for the cancel signal to interpose between iteration boundaries.
 ///
 /// The cancel checks land BETWEEN `SQLite` transactions, so the integrity
@@ -292,8 +293,8 @@ async fn i5_long_running_consolidation_cancels_within_budget() {
     // I5 integrity guarantee: no partial-write corruption. The only writes
     // either pass performs are (a) `save_semantic` in promotion (a brand-new
     // row — never observable as "partial" since SQLite commits atomically)
-    // and (b) `update_episodic_access` in decay (an UPDATE on an existing
-    // row, atomic per statement). Either pass's in-flight transaction at
+    // and (b) `update_episodic_access_in_namespace` in decay (an UPDATE on an
+    // existing row, atomic per statement). Either pass's in-flight transaction at
     // cancel time committed or rolled back atomically; no row count change
     // beyond legitimate full-transaction effects is possible. We assert the
     // weaker, easier-to-state property: the original 5 000 episodic rows

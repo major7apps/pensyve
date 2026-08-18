@@ -2951,9 +2951,11 @@ fn only_bound_connections_reach_policied_tables() {
         "postgres.rs has {unbound} uses of `ScopedPool::unbound()`, expected \
          {ALLOWED_UNBOUND_USES}. An unbound connection carries the previous checkout's \
          namespace, so a query on a table with a namespace_isolation_* policy would read \
-         another namespace's rows once RLS is enforced. Use `scoped_conn` or \
-         `maybe_scoped_conn` unless the statement is DDL or targets an unpolicied table \
-         (namespaces, activity_events), and update this count if it is."
+         another namespace's rows once RLS is enforced. Use `scoped_conn`, or \
+         `conn_with_namespace(UNSCOPED_NAMESPACE)` for a statement that genuinely has no \
+         namespace, unless the statement is DDL or targets an unpolicied table \
+         (namespaces, activity_events, pensyve_schema_state), and update this count if \
+         it is."
     );
 
     // The wrapper is only worth having if the raw pool is genuinely out of
@@ -2962,8 +2964,8 @@ fn only_bound_connections_reach_policied_tables() {
         assert!(
             !source.contains(forbidden),
             "postgres.rs contains `{forbidden}`, which takes a connection without binding a \
-             namespace. Go through `scoped_conn`, `maybe_scoped_conn`, or an allowlisted \
-             `unbound()` call."
+             namespace. Go through `scoped_conn`, `conn_with_namespace`, or an \
+             allowlisted `unbound()` call."
         );
     }
 }

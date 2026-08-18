@@ -3782,8 +3782,8 @@ mod tests {
 
     #[test]
     fn test_list_episodic_by_entity_preserves_event_time() {
-        // list_episodic_by_entity has its own SELECT statement separate
-        // from get_episodic_in_namespace — must also read event_time.
+        // list_episodic_by_entity_in_namespace has its own SELECT statement
+        // separate from get_episodic_in_namespace — must also read event_time.
         let (_dir, db) = setup();
         let ns = make_namespace(&db);
         let about = Uuid::new_v4();
