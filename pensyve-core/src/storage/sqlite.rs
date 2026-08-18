@@ -3042,9 +3042,19 @@ fn erase_observations_for_entity(
 
     // Phase 2B cascade: `kg_triples` / `kg_passage_entities` are keyed by the
     // observation's id (== `passage_id`). Driving the cleanup off the captured
-    // ids rather than off a repeat of the subquery keeps it exactly as wide as
-    // the delete was. `kg_entities` stay: they are namespace-scoped rather than
-    // passage-scoped and other passages' triples still reference them.
+    // ids rather than off a repeat of the subquery keeps it aimed at exactly
+    // the passages this delete removed. `kg_entities` stay: they are
+    // namespace-scoped rather than passage-scoped and other passages' triples
+    // still reference them.
+    //
+    // Each statement still needs the namespace on top of the passage id, and
+    // the two tables supply it differently. `kg_triples` has a `namespace_id`
+    // column. `kg_passage_entities` does not — its key is
+    // `(passage_id, entity_id)` — so the only thing that attributes one of its
+    // rows to a tenant is the `kg_entities` row it points at, and matching on
+    // `passage_id` alone deletes every tenant that shares the id. The join
+    // below is the same one `delete_memory_by_id_with_namespace` uses for the
+    // single-memory path; the two have to agree.
     for observation in &observations {
         let passage = observation.id.to_string();
         conn.execute(
@@ -3052,8 +3062,10 @@ fn erase_observations_for_entity(
             params![&passage, ns_str],
         )?;
         conn.execute(
-            "DELETE FROM kg_passage_entities WHERE passage_id = ?1",
-            params![&passage],
+            "DELETE FROM kg_passage_entities
+              WHERE passage_id = ?1
+                AND entity_id IN (SELECT id FROM kg_entities WHERE namespace_id = ?2)",
+            params![&passage, ns_str],
         )?;
         conn.execute(
             "DELETE FROM memory_fts
@@ -5454,6 +5466,29 @@ mod tests {
         .unwrap()
     }
 
+    /// `kg_passage_entities` rows for `passage_id` whose entity belongs to
+    /// `namespace_id`.
+    ///
+    /// The table carries no `namespace_id` of its own — its key is
+    /// `(passage_id, entity_id)` — so the only way to attribute a row to a
+    /// tenant is through `kg_entities`, which is what the cleanup has to do
+    /// too.
+    fn kg_passage_entities_count_in_namespace(
+        db: &SqliteBackend,
+        passage_id: Uuid,
+        namespace_id: Uuid,
+    ) -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM kg_passage_entities \
+              WHERE passage_id = ?1 \
+                AND entity_id IN (SELECT id FROM kg_entities WHERE namespace_id = ?2)",
+            params![passage_id.to_string(), namespace_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
     fn kg_entities_count_for_namespace(db: &SqliteBackend, namespace_id: Uuid) -> i64 {
         let conn = db.conn.lock().unwrap();
         conn.query_row(
@@ -5993,6 +6028,95 @@ mod tests {
         assert!(erased.memories.is_empty());
         assert!(erased.edges.is_empty());
         assert!(!erased.entity_deleted);
+    }
+
+    /// The knowledge-graph cascade must stay inside the erasing namespace.
+    ///
+    /// `kg_passage_entities` has no `namespace_id` column — its key is
+    /// `(passage_id, entity_id)` — so a delete matching `passage_id` alone
+    /// reaches every tenant that happens to share the id. Passage ids are
+    /// observation ids, and this schema does not treat ids as globally unique
+    /// anywhere else; the sibling single-memory path
+    /// (`delete_memory_by_id_with_namespace`) already joins through
+    /// `kg_entities` to attribute the row, and the erase has to match it.
+    ///
+    /// `kg_triples` carries its own `namespace_id` and is seeded here as the
+    /// control: it was already qualified, so it must survive on B's side too
+    /// and its survival is not what this test is about.
+    #[test]
+    fn erase_entity_capturing_kg_cascade_is_confined_to_its_namespace() {
+        let (_dir, db) = setup();
+        let ns_a = make_namespace(&db);
+        let ns_b = Namespace::new("other-ns");
+        db.save_namespace(&ns_b).unwrap();
+
+        let mut entity = Entity::new("subject", EntityKind::User);
+        entity.namespace_id = ns_a.id;
+        db.save_entity(&entity).unwrap();
+
+        let episode = Episode::new(ns_a.id, vec![entity.id]);
+        db.save_episode(&episode).unwrap();
+        let episodic = EpisodicMemory::new(ns_a.id, episode.id, entity.id, entity.id, "a turn");
+        db.save_episodic(&episodic).unwrap();
+
+        let observation =
+            ObservationMemory::new(ns_a.id, episode.id, "x", "y", "z", "an observation");
+        db.save_observation(&observation).unwrap();
+
+        // A's knowledge-graph rows for that passage.
+        let a_subject = seed_kg_entity(&db, ns_a.id, "S-A");
+        let a_object = seed_kg_entity(&db, ns_a.id, "O-A");
+        seed_kg_triple(&db, ns_a.id, observation.id, a_subject, a_object);
+
+        // B's knowledge-graph rows for the SAME passage id, wired to B's own
+        // `kg_entities`. Nothing in the schema prevents this: the passage id is
+        // not a foreign key, and `kg_passage_entities` cannot tell the two
+        // tenants apart on its own.
+        let b_subject = seed_kg_entity(&db, ns_b.id, "S-B");
+        let b_object = seed_kg_entity(&db, ns_b.id, "O-B");
+        seed_kg_triple(&db, ns_b.id, observation.id, b_subject, b_object);
+
+        assert_eq!(
+            kg_passage_entities_count_in_namespace(&db, observation.id, ns_a.id),
+            2
+        );
+        assert_eq!(
+            kg_passage_entities_count_in_namespace(&db, observation.id, ns_b.id),
+            2,
+            "B's rows must exist before the erase, or their absence afterwards proves nothing"
+        );
+
+        let erased = db.erase_entity_capturing(entity.id, ns_a.id).unwrap();
+        assert_eq!(
+            erased.observations.iter().map(|o| o.id).collect::<Vec<_>>(),
+            vec![observation.id],
+            "the erase must have captured the observation whose cascade is under test"
+        );
+
+        assert_eq!(
+            kg_passage_entities_count_in_namespace(&db, observation.id, ns_a.id),
+            0,
+            "namespace A's own passage-entity rows must cascade with its observation"
+        );
+        assert_eq!(
+            kg_passage_entities_count_in_namespace(&db, observation.id, ns_b.id),
+            2,
+            "namespace B's passage-entity rows were deleted by an erase issued for \
+             namespace A: the cleanup matched `passage_id` alone, and that column \
+             names nothing on its own"
+        );
+
+        // Control: the already-qualified legs behave.
+        assert_eq!(
+            kg_entities_count_for_namespace(&db, ns_b.id),
+            2,
+            "namespace B's kg_entities must survive"
+        );
+        assert_eq!(
+            kg_triples_count_for_passage(&db, observation.id),
+            1,
+            "only namespace A's triple may go; `kg_triples` was already namespace-qualified"
+        );
     }
 
     /// Superseded rows are erased too, and appear in the capture.

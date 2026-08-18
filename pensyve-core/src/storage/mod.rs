@@ -60,15 +60,6 @@ fn capturing_delete_not_implemented() -> StorageResult<Vec<Memory>> {
     ))
 }
 
-fn capturing_erase_not_implemented() -> StorageResult<ErasedRows> {
-    Err(StorageError::Context(
-        "storage backend does not implement capturing entity erasure, \
-         so a GDPR erase cannot delete observations, memories, edges and the \
-         entity record in one atomic transaction"
-            .to_string(),
-    ))
-}
-
 /// Everything one [`StorageTrait::erase_entity_capturing`] transaction removed.
 ///
 /// These are the rows the committed `DELETE`s actually returned, not the rows a
@@ -572,15 +563,16 @@ pub trait StorageTrait: Send + Sync {
     /// the `save_edge` / `get_edges_for_entity_in_namespace` comment below for
     /// why that ownership rule is the one being kept.
     ///
-    /// The default fails closed: a backend that cannot erase atomically must not
-    /// have a partial erase reported as a completed one.
+    /// Required rather than defaulted. A default that errors at runtime would
+    /// let a backend which cannot erase atomically compile, ship, and only then
+    /// fail the one request that had to work — turning a build failure into a
+    /// production one. An implementor that cannot satisfy the contract above
+    /// should find that out from the compiler.
     fn erase_entity_capturing(
         &self,
-        _entity_id: Uuid,
-        _namespace_id: Uuid,
-    ) -> StorageResult<ErasedRows> {
-        capturing_erase_not_implemented()
-    }
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<ErasedRows>;
 
     /// Delete a single memory (episodic, semantic, procedural or observation)
     /// only when it belongs to `namespace_id`.
@@ -778,16 +770,5 @@ mod tests {
 
         assert!(matches!(error, StorageError::Context(_)));
         assert!(error.to_string().contains("capturing entity deletion"));
-    }
-
-    /// Same rule one level up: a backend that cannot run the four erase legs in
-    /// one transaction must error rather than let a partial GDPR erase be
-    /// reported as a completed one.
-    #[test]
-    fn capturing_erase_not_implemented_fails_closed() {
-        let error = capturing_erase_not_implemented().unwrap_err();
-
-        assert!(matches!(error, StorageError::Context(_)));
-        assert!(error.to_string().contains("capturing entity erasure"));
     }
 }
