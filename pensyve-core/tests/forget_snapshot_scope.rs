@@ -208,6 +208,7 @@ fn snapshot_scope_equals_delete_scope() {
         None,
         fixture.namespace.id,
         &fixture.snapshot_root(),
+        snapshot::RetentionPolicy::UNBOUNDED,
     )
     .unwrap();
     let snapshot_ids: HashSet<Uuid> = outcome.snapshot.memory_ids().into_iter().collect();
@@ -337,6 +338,7 @@ fn snapshot_round_trips_the_deleted_memories_back_into_storage() {
         Some(fixture.target.name.as_str()),
         fixture.namespace.id,
         &fixture.snapshot_root(),
+        snapshot::RetentionPolicy::UNBOUNDED,
     )
     .unwrap();
 
@@ -400,6 +402,7 @@ fn restore_is_idempotent() {
         None,
         fixture.namespace.id,
         &fixture.snapshot_root(),
+        snapshot::RetentionPolicy::UNBOUNDED,
     )
     .unwrap();
 

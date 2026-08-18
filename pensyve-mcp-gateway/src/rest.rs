@@ -1187,6 +1187,7 @@ async fn forget_entity_blocking(
             Some(entity_name.as_str()),
             namespace_id,
             &snapshot_root,
+            pensyve_core::snapshot::RetentionPolicy::UNBOUNDED,
         )
     })
     .await

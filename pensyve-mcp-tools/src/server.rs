@@ -644,6 +644,7 @@ impl PensyveMcpServer {
                     Some(blocking_name.as_str()),
                     namespace_id,
                     &snapshot_root,
+                    pensyve_core::snapshot::RetentionPolicy::UNBOUNDED,
                 )
             })
             .await

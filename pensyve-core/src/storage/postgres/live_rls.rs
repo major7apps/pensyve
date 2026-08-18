@@ -895,6 +895,7 @@ fn capturing_delete_still_works_under_enforced_rls() {
         Some("shared-entity"),
         ns_a.id,
         snapshot_root.path(),
+        crate::snapshot::RetentionPolicy::UNBOUNDED,
     )
     .expect("forget in namespace A must still succeed under enforced RLS");
 
@@ -2332,6 +2333,7 @@ fn capturing_delete_is_confined_to_its_namespace() {
         Some("shared-entity"),
         ns_a.id,
         snapshot_root.path(),
+        crate::snapshot::RetentionPolicy::UNBOUNDED,
     )
     .expect("forget in namespace A");
 
