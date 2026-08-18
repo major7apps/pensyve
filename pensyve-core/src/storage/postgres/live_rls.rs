@@ -55,6 +55,16 @@
 //! [`namespace_scoping_end_to_end_under_enforced_rls`]. The checklist is empty
 //! and therefore gone; the per-method tests are the standing gate in its place.
 //!
+//! **Fixed — the whole storage surface now carries a namespace.** The last
+//! nine unscoped methods were replaced with `_in_namespace` variants or, where
+//! nothing called them any more, removed outright (#254). Each replacement has
+//! its own enforced-mode test here:
+//! [`entity_lookup_by_id_still_works_under_enforced_rls`],
+//! [`entity_scoped_memory_listings_still_work_under_enforced_rls`],
+//! [`reinforcement_stamp_still_lands_under_enforced_rls`] and
+//! [`procedural_reliability_update_still_lands_under_enforced_rls`].
+//! `docs/SECURITY.md` no longer enumerates anything.
+//!
 //! **Fixed — the role can now be an unprivileged one.**
 //! `PostgresBackend::new` used to apply the schema unconditionally on every
 //! startup, which is owner-only DDL, so the application had to connect as the
@@ -70,11 +80,10 @@
 //! [`startup_reports_whether_the_role_is_exempt_from_rls`] — because a
 //! `BYPASSRLS` role makes `FORCE` enforce nothing with no other symptom.
 //!
-//! **Still open — enforcement is not yet the default.** The rest of the
-//! storage surface still runs unscoped and fails closed the same way;
-//! `docs/SECURITY.md` enumerates it. Until that lands, `FORCE` stays in
-//! `postgres_rls_enforce.sql` as an explicit operator step — see
-//! `docs/SECURITY.md`.
+//! **Still open — enforcement is not yet the default.** What is left is the
+//! flip itself: moving `FORCE` out of `postgres_rls_enforce.sql` and into
+//! `postgres_schema.sql`. Until that lands it stays an explicit operator step
+//! — see `docs/SECURITY.md`.
 //!
 //! Tests therefore come in two flavours: [`Fixture::provision`] mirrors a
 //! current deployment (policies present, not enforced), and a test that wants
@@ -294,6 +303,7 @@ impl Fixture {
             .enforce_rls()
             .expect("force row level security");
     }
+
     /// Create — once — an unprivileged role that can read and write every
     /// table but owns none of them, and return its name.
     ///
@@ -750,11 +760,12 @@ fn scoped_namespace_does_not_leak_into_the_next_checkout() {
             };
 
             // The scoped connection is now back in the pool. Take it again
-            // through the *unscoped* path, which is what every `StorageTrait`
-            // method lacking a namespace parameter uses.
+            // through the *unscoped* path — the one schema application and the
+            // `namespaces` read use, and the one a checkout would inherit a
+            // stale namespace through if acquisition did not rebind the GUC.
             let mut conn = fixture
                 .backend
-                .maybe_scoped_conn()
+                .conn_with_namespace(super::UNSCOPED_NAMESPACE)
                 .await
                 .expect("acquire unscoped connection");
             let (second_pid,): (i32,) = query_as::<Postgres, _>("SELECT pg_backend_pid()")
@@ -2224,6 +2235,253 @@ fn supersede_still_works_under_enforced_rls() {
         Some(successor),
         "the stamp must be the one this namespace wrote"
     );
+}
+
+/// Resolving an entity by id keeps working with RLS enforced, and only inside
+/// its own namespace.
+///
+/// `get_entity` took no `namespace_id`, so the REST identifier resolver read
+/// whichever tenant's row carried the id and compared `entity.namespace_id`
+/// afterwards. Under enforcement the read returned nothing at all and the
+/// resolver reported "no such entity" for an entity the caller owns.
+#[test]
+fn entity_lookup_by_id_still_works_under_enforced_rls() {
+    let Some(admin_opts) = skip_notice("entity_lookup_by_id_still_works_under_enforced_rls") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns_a = Namespace::new(format!("rls-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("rls-b-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns_a).expect("save namespace A");
+    backend.save_namespace(&ns_b).expect("save namespace B");
+
+    let mut entity = Entity::new("alice", EntityKind::User);
+    entity.namespace_id = ns_a.id;
+    backend.save_entity(&entity).expect("save A's entity");
+
+    fixture.enforce_rls();
+
+    assert_eq!(
+        backend
+            .get_entity_in_namespace(entity.id, ns_a.id)
+            .expect("read A's entity")
+            .map(|e| e.id),
+        Some(entity.id),
+        "the scoped lookup must still resolve its own namespace's entity"
+    );
+    assert!(
+        backend
+            .get_entity_in_namespace(entity.id, ns_b.id)
+            .expect("read A's entity through B")
+            .is_none(),
+        "a foreign namespace must not resolve another namespace's entity"
+    );
+}
+
+/// The entity-scoped memory listings behind `pensyve_inspect`, the REST
+/// inspect handler, the CLI and the graph build keep working with RLS
+/// enforced, and neither of them reaches across namespaces.
+///
+/// Both took an entity id and a limit and nothing else. Entity ids are not
+/// globally unique, so with RLS inert they enumerated every tenant's rows for
+/// that id, and with RLS enforced they enumerated none — `Ok(vec![])`, which a
+/// caller cannot tell from an entity that simply has no memories.
+#[test]
+fn entity_scoped_memory_listings_still_work_under_enforced_rls() {
+    let Some(admin_opts) =
+        skip_notice("entity_scoped_memory_listings_still_work_under_enforced_rls")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns_a = Namespace::new(format!("rls-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("rls-b-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns_a).expect("save namespace A");
+    backend.save_namespace(&ns_b).expect("save namespace B");
+
+    // The same entity id on both sides — the collision the predicate has to
+    // disambiguate.
+    let entity_id = Uuid::new_v4();
+    let mine = EpisodicMemory::new(
+        ns_a.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        entity_id,
+        "A's turn",
+    );
+    backend.save_episodic(&mine).expect("save A's memory");
+    let theirs = EpisodicMemory::new(
+        ns_b.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        entity_id,
+        "B's turn",
+    );
+    backend.save_episodic(&theirs).expect("save B's memory");
+
+    let my_fact = SemanticMemory::new(ns_a.id, entity_id, "likes", "rust", 0.9);
+    backend.save_semantic(&my_fact).expect("save A's fact");
+    let their_fact = SemanticMemory::new(ns_b.id, entity_id, "likes", "go", 0.9);
+    backend.save_semantic(&their_fact).expect("save B's fact");
+
+    fixture.enforce_rls();
+
+    assert_eq!(
+        backend
+            .list_episodic_by_entity_in_namespace(entity_id, ns_a.id, 10)
+            .expect("list A's episodic")
+            .iter()
+            .map(|m| m.id)
+            .collect::<Vec<_>>(),
+        vec![mine.id],
+        "the episodic listing must return its own namespace's row, and only that"
+    );
+    assert_eq!(
+        backend
+            .list_semantic_by_entity_in_namespace(entity_id, ns_a.id, 10)
+            .expect("list A's semantic")
+            .iter()
+            .map(|m| m.id)
+            .collect::<Vec<_>>(),
+        vec![my_fact.id],
+        "the semantic listing must return its own namespace's row, and only that"
+    );
+
+    // And B still sees exactly its own, which is what keeps the assertions
+    // above from passing on a query that simply never matches anything.
+    assert_eq!(
+        backend
+            .list_episodic_by_entity_in_namespace(entity_id, ns_b.id, 10)
+            .expect("list B's episodic")
+            .iter()
+            .map(|m| m.id)
+            .collect::<Vec<_>>(),
+        vec![theirs.id]
+    );
+    assert_eq!(
+        backend
+            .list_semantic_by_entity_in_namespace(entity_id, ns_b.id, 10)
+            .expect("list B's semantic")
+            .iter()
+            .map(|m| m.id)
+            .collect::<Vec<_>>(),
+        vec![their_fact.id]
+    );
+}
+
+/// The reinforcement stamp on the recall path keeps landing with RLS enforced,
+/// and only on its own namespace's row.
+///
+/// This is the highest-traffic write in the system — the retrieval engine
+/// calls it for every episodic result of every recall — and the one that fails
+/// most quietly. `update_episodic_access` took no `namespace_id`, so under
+/// enforcement the `UPDATE` matched nothing, affected nothing, and returned
+/// `Ok(())`: spaced-repetition decay would have silently stopped tracking
+/// access on every enforced deployment.
+#[test]
+fn reinforcement_stamp_still_lands_under_enforced_rls() {
+    let Some(admin_opts) = skip_notice("reinforcement_stamp_still_lands_under_enforced_rls") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+    let ns_a = Namespace::new(format!("rls-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("rls-b-{}", Uuid::new_v4().simple()));
+    let memory = seed(&fixture, &ns_a, &ns_b);
+    fixture.enforce_rls();
+
+    backend
+        .update_episodic_access_in_namespace(memory.id, ns_b.id, 0.1, 0.1)
+        .expect("stamp through namespace B must not error");
+    assert_eq!(
+        backend
+            .get_episodic_in_namespace(memory.id, ns_a.id)
+            .expect("re-read the row")
+            .expect("the row is still there")
+            .access_count,
+        0,
+        "a foreign namespace must not stamp another namespace's row"
+    );
+
+    backend
+        .update_episodic_access_in_namespace(memory.id, ns_a.id, 0.8, 0.7)
+        .expect("stamp through namespace A");
+    let stamped = backend
+        .get_episodic_in_namespace(memory.id, ns_a.id)
+        .expect("re-read the stamped row")
+        .expect("the row is still there");
+    assert_eq!(
+        stamped.access_count, 1,
+        "the scoped stamp must still take effect in its own namespace"
+    );
+    assert!((stamped.stability - 0.8).abs() < 0.001);
+    assert!((stamped.retrievability - 0.7).abs() < 0.001);
+    assert!(stamped.last_accessed.is_some());
+}
+
+/// The consolidation engine's procedural-reliability write keeps landing with
+/// RLS enforced, and only on its own namespace's row. Same silent-no-op
+/// failure mode as [`reinforcement_stamp_still_lands_under_enforced_rls`].
+#[test]
+fn procedural_reliability_update_still_lands_under_enforced_rls() {
+    let Some(admin_opts) =
+        skip_notice("procedural_reliability_update_still_lands_under_enforced_rls")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns_a = Namespace::new(format!("rls-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("rls-b-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns_a).expect("save namespace A");
+    backend.save_namespace(&ns_b).expect("save namespace B");
+
+    let procedural = ProceduralMemory::new(
+        ns_a.id,
+        "on_error",
+        "log_and_retry",
+        Outcome::Failure,
+        HashMap::new(),
+    );
+    backend
+        .save_procedural(&procedural)
+        .expect("save A's procedural memory");
+
+    fixture.enforce_rls();
+
+    backend
+        .update_procedural_reliability_in_namespace(procedural.id, ns_b.id, 0.01, 99, 99)
+        .expect("update through namespace B must not error");
+    let untouched = backend
+        .get_procedural_in_namespace(procedural.id, ns_a.id)
+        .expect("re-read the row")
+        .expect("the row is still there");
+    assert_eq!(
+        (untouched.trial_count, untouched.success_count),
+        (procedural.trial_count, procedural.success_count),
+        "a foreign namespace must not rewrite another namespace's row"
+    );
+    assert!(
+        (untouched.reliability - procedural.reliability).abs() < 0.001,
+        "nor its reliability"
+    );
+
+    backend
+        .update_procedural_reliability_in_namespace(procedural.id, ns_a.id, 0.75, 4, 3)
+        .expect("update through namespace A");
+    let updated = backend
+        .get_procedural_in_namespace(procedural.id, ns_a.id)
+        .expect("re-read the updated row")
+        .expect("the row is still there");
+    assert_eq!(updated.trial_count, 4);
+    assert_eq!(updated.success_count, 3);
+    assert!((updated.reliability - 0.75).abs() < 0.001);
+    assert!(updated.last_used.is_some());
 }
 
 /// Startup must be able to say whether the connected role is exempt from RLS

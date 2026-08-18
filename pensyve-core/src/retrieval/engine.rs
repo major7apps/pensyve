@@ -1130,7 +1130,7 @@ impl<'a> RecallEngine<'a> {
         scored.truncate(limit);
 
         // Step 9: Retrieval-induced reinforcement.
-        self.apply_reinforcement(&scored);
+        self.apply_reinforcement(&scored, namespace_id);
 
         info!(
             event = "recall_decision",
@@ -1360,14 +1360,23 @@ impl<'a> RecallEngine<'a> {
     }
 
     /// Apply retrieval-induced reinforcement to all returned episodic memories.
-    fn apply_reinforcement(&self, scored: &[ScoredCandidate]) {
+    ///
+    /// `namespace_id` is the namespace the recall ran in, threaded through
+    /// rather than read off each candidate row: the stamp must land in the
+    /// namespace the caller asked about, not in whatever namespace a row
+    /// claims to belong to. It is also what keeps this working under enforced
+    /// row-level security — an unscoped `UPDATE` there matches no row and
+    /// returns success, so reinforcement stops happening with nothing to
+    /// notice (#254).
+    fn apply_reinforcement(&self, scored: &[ScoredCandidate], namespace_id: Uuid) {
         for candidate in scored {
             if let Memory::Episodic(e) = &candidate.memory {
                 let new_stability = decay::reinforce(e.stability, candidate.recency_score, 5);
                 let new_retrievability = decay::retrievability(new_stability, 0.0);
                 // Best-effort; ignore errors during reinforcement.
-                let _ = self.storage.update_episodic_access(
+                let _ = self.storage.update_episodic_access_in_namespace(
                     candidate.memory_id,
+                    namespace_id,
                     new_stability,
                     new_retrievability,
                 );

@@ -263,9 +263,6 @@ pub struct PostgresBackend {
     /// `self.pool.begin()` check out an unbound connection.
     pool: ScopedPool,
     rt: Runtime,
-    /// Optional default namespace for RLS scoping on get-by-id methods
-    /// where the trait signature does not provide a `namespace_id`.
-    default_namespace: Option<Uuid>,
 }
 
 impl PostgresBackend {
@@ -308,7 +305,6 @@ impl PostgresBackend {
         let backend = Self {
             pool: ScopedPool::new(pool),
             rt,
-            default_namespace: None,
         };
         backend.start()?;
         Ok(backend)
@@ -320,7 +316,6 @@ impl PostgresBackend {
         let backend = Self {
             pool: ScopedPool::new(pool),
             rt,
-            default_namespace: None,
         };
         backend.start()?;
         Ok(backend)
@@ -335,13 +330,12 @@ impl PostgresBackend {
         Ok(())
     }
 
-    /// Set the default namespace used to scope RLS on get-by-id queries
-    /// where the `StorageTrait` signature does not provide a `namespace_id`.
-    #[must_use]
-    pub fn with_default_namespace(mut self, namespace_id: Uuid) -> Self {
-        self.default_namespace = Some(namespace_id);
-        self
-    }
+    // `with_default_namespace` is gone. It existed so the `StorageTrait`
+    // methods whose signatures carried no `namespace_id` could still bind
+    // *something* on their connection. Every one of those methods now takes the
+    // namespace explicitly (#254), so a backend-wide default would only be a
+    // way to make a query look scoped while reading a namespace the caller
+    // never asked for.
 
     /// Bring the database schema up to the version this build ships, or
     /// establish that it is already there and do nothing.
@@ -568,23 +562,6 @@ impl PostgresBackend {
         namespace_id: Uuid,
     ) -> StorageResult<sqlx_core::pool::PoolConnection<sqlx_postgres::Postgres>> {
         self.conn_with_namespace(&namespace_id.to_string()).await
-    }
-
-    /// Acquire a connection, scoping it to `default_namespace` if one has been
-    /// configured.  Used for `StorageTrait` methods whose signatures do not
-    /// include a `namespace_id` parameter.
-    ///
-    /// With no default namespace configured this still sets the GUC — to
-    /// [`UNSCOPED_NAMESPACE`], which no row can match.  Such a connection
-    /// therefore reads nothing and writes nothing once RLS is enforced, rather
-    /// than inheriting whatever namespace the previous checkout left behind.
-    async fn maybe_scoped_conn(
-        &self,
-    ) -> StorageResult<sqlx_core::pool::PoolConnection<sqlx_postgres::Postgres>> {
-        match self.default_namespace {
-            Some(ns) => self.scoped_conn(ns).await,
-            None => self.conn_with_namespace(UNSCOPED_NAMESPACE).await,
-        }
     }
 
     /// Acquire a pooled connection and bind the namespace GUC that the RLS
@@ -970,31 +947,38 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn get_entity(&self, id: Uuid) -> StorageResult<Option<Entity>> {
+    fn get_entity_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<Entity>> {
         self.block_on(async {
-            // Trait provides only entity id; use default_namespace for RLS if set.
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             let row: Option<(Uuid, Uuid, String, String, serde_json::Value, DateTime<Utc>)> =
                 query_as::<Postgres, _>(
-                    "SELECT id, namespace_id, name, kind, metadata, created_at FROM entities WHERE id = $1",
+                    "SELECT id, namespace_id, name, kind, metadata, created_at FROM entities \
+                      WHERE id = $1 AND namespace_id = $2",
                 )
                 .bind(id)
+                .bind(namespace_id)
                 .fetch_optional(&mut *conn)
                 .await
                 .map_err(sqlx_to_io)?;
 
-            Ok(row.map(|(id, namespace_id, name, kind_str, metadata, created_at)| {
-                let metadata: HashMap<String, serde_json::Value> =
-                    serde_json::from_value(metadata).unwrap_or_default();
-                Entity {
-                    id,
-                    namespace_id,
-                    name,
-                    kind: str_to_entity_kind(&kind_str),
-                    metadata,
-                    created_at,
-                }
-            }))
+            Ok(
+                row.map(|(id, namespace_id, name, kind_str, metadata, created_at)| {
+                    let metadata: HashMap<String, serde_json::Value> =
+                        serde_json::from_value(metadata).unwrap_or_default();
+                    Entity {
+                        id,
+                        namespace_id,
+                        name,
+                        kind: str_to_entity_kind(&kind_str),
+                        metadata,
+                        created_at,
+                    }
+                }),
+            )
         })
     }
 
@@ -1178,22 +1162,25 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn list_episodic_by_entity(
+    fn list_episodic_by_entity_in_namespace(
         &self,
         about_entity: Uuid,
+        namespace_id: Uuid,
         limit: usize,
     ) -> StorageResult<Vec<EpisodicMemory>> {
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             let rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
                           access_count, last_accessed, event_time, superseded_by, invalid_at
-                   FROM episodic_memories WHERE about_entity = $1 AND superseded_by IS NULL
-                   ORDER BY timestamp DESC LIMIT $2",
+                   FROM episodic_memories
+                   WHERE about_entity = $1 AND namespace_id = $2 AND superseded_by IS NULL
+                   ORDER BY timestamp DESC LIMIT $3",
             )
             .bind(about_entity)
+            .bind(namespace_id)
             .bind(limit_i64)
             .fetch_all(&mut *conn)
             .await
@@ -1230,26 +1217,28 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn update_episodic_access(
+    fn update_episodic_access_in_namespace(
         &self,
         id: Uuid,
+        namespace_id: Uuid,
         stability: f32,
         retrievability: f32,
     ) -> StorageResult<()> {
         let now = Utc::now();
         self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             query::<Postgres>(
                 r"UPDATE episodic_memories
                    SET stability = $1, retrievability = $2,
                        access_count = access_count + 1,
                        last_accessed = $3
-                   WHERE id = $4",
+                   WHERE id = $4 AND namespace_id = $5",
             )
             .bind(stability)
             .bind(retrievability)
             .bind(now)
             .bind(id)
+            .bind(namespace_id)
             .execute(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
@@ -1321,42 +1310,31 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn list_semantic_by_entity(
+    fn list_semantic_by_entity_in_namespace(
         &self,
         subject: Uuid,
+        namespace_id: Uuid,
         limit: usize,
     ) -> StorageResult<Vec<SemanticMemory>> {
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             let rows: Vec<SemanticRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
                           valid_at, invalid_at, source_episodes, embedding::text, stability,
                           retrievability, superseded_by
-                   FROM semantic_memories WHERE subject = $1 AND superseded_by IS NULL
-                   ORDER BY valid_at DESC LIMIT $2",
+                   FROM semantic_memories
+                   WHERE subject = $1 AND namespace_id = $2 AND superseded_by IS NULL
+                   ORDER BY valid_at DESC LIMIT $3",
             )
             .bind(subject)
+            .bind(namespace_id)
             .bind(limit_i64)
             .fetch_all(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
 
             Ok(rows.into_iter().map(row_to_semantic).collect())
-        })
-    }
-
-    fn invalidate_semantic(&self, id: Uuid) -> StorageResult<()> {
-        let now = Utc::now();
-        self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
-            query::<Postgres>("UPDATE semantic_memories SET invalid_at = $1 WHERE id = $2")
-                .bind(now)
-                .bind(id)
-                .execute(&mut *conn)
-                .await
-                .map_err(sqlx_to_io)?;
-            Ok(())
         })
     }
 
@@ -1428,26 +1406,28 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn update_procedural_reliability(
+    fn update_procedural_reliability_in_namespace(
         &self,
         id: Uuid,
+        namespace_id: Uuid,
         reliability: f32,
         trial_count: u32,
         success_count: u32,
     ) -> StorageResult<()> {
         let now = Utc::now();
         self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             query::<Postgres>(
                 r"UPDATE procedural_memories
                    SET reliability = $1, trial_count = $2, success_count = $3, last_used = $4
-                   WHERE id = $5",
+                   WHERE id = $5 AND namespace_id = $6",
             )
             .bind(reliability)
             .bind(i32::try_from(trial_count).unwrap_or(i32::MAX))
             .bind(i32::try_from(success_count).unwrap_or(i32::MAX))
             .bind(now)
             .bind(id)
+            .bind(namespace_id)
             .execute(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
@@ -1590,24 +1570,6 @@ impl StorageTrait for PostgresBackend {
             )
             .bind(episode_id)
             .bind(namespace_id)
-            .execute(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
-            Ok(usize::try_from(result.rows_affected()).unwrap_or(0))
-        })
-    }
-
-    fn delete_observations_by_entity(&self, entity_id: Uuid) -> StorageResult<usize> {
-        self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
-            let result = query::<Postgres>(
-                "DELETE FROM observation_memories \
-                 WHERE episode_id IN (\
-                   SELECT DISTINCT episode_id FROM episodic_memories \
-                    WHERE about_entity = $1 OR source_entity = $1\
-                 )",
-            )
-            .bind(entity_id)
             .execute(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
@@ -2276,43 +2238,6 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn update_semantic_content(
-        &self,
-        id: Uuid,
-        predicate: &str,
-        object: &str,
-        confidence: Option<f32>,
-    ) -> StorageResult<()> {
-        self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
-
-            if let Some(conf) = confidence {
-                query::<Postgres>(
-                    "UPDATE semantic_memories SET predicate = $1, object = $2, confidence = $3 WHERE id = $4",
-                )
-                .bind(predicate)
-                .bind(object)
-                .bind(conf)
-                .bind(id)
-                .execute(&mut *conn)
-                .await
-                .map_err(sqlx_to_io)?;
-            } else {
-                query::<Postgres>(
-                    "UPDATE semantic_memories SET predicate = $1, object = $2 WHERE id = $3",
-                )
-                .bind(predicate)
-                .bind(object)
-                .bind(id)
-                .execute(&mut *conn)
-                .await
-                .map_err(sqlx_to_io)?;
-            }
-
-            Ok(())
-        })
-    }
-
     // -----------------------------------------------------------------------
     // Entities (bulk)
     // -----------------------------------------------------------------------
@@ -2344,18 +2269,6 @@ impl StorageTrait for PostgresBackend {
                     }
                 })
                 .collect())
-        })
-    }
-
-    fn delete_entity(&self, id: Uuid) -> StorageResult<bool> {
-        self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
-            let result = query::<Postgres>("DELETE FROM entities WHERE id = $1")
-                .bind(id)
-                .execute(&mut *conn)
-                .await
-                .map_err(sqlx_to_io)?;
-            Ok(result.rows_affected() > 0)
         })
     }
 

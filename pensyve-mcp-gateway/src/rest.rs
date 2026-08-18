@@ -335,9 +335,8 @@ fn resolve_entity_identifier(
         return Ok(None);
     };
 
-    match storage.get_entity(entity_id) {
-        Ok(Some(entity)) if entity.namespace_id == namespace_id => Ok(Some(entity)),
-        Ok(_) => Ok(None),
+    match storage.get_entity_in_namespace(entity_id, namespace_id) {
+        Ok(entity) => Ok(entity),
         Err(err) => Err(RestError(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Error looking up entity '{identifier}': {err}"),
@@ -1540,7 +1539,10 @@ async fn inspect(
     }
 
     let mut episodic = Vec::new();
-    if let Ok(mems) = ps.storage.list_episodic_by_entity(entity.id, limit) {
+    if let Ok(mems) =
+        ps.storage
+            .list_episodic_by_entity_in_namespace(entity.id, ps.namespace.id, limit)
+    {
         for mem in mems {
             let mut val = serde_json::to_value(&mem).unwrap_or_default();
             strip_embedding(&mut val);
@@ -1551,7 +1553,9 @@ async fn inspect(
     let remaining = limit.saturating_sub(episodic.len());
     let mut semantic = Vec::new();
     if remaining > 0
-        && let Ok(mems) = ps.storage.list_semantic_by_entity(entity.id, remaining)
+        && let Ok(mems) =
+            ps.storage
+                .list_semantic_by_entity_in_namespace(entity.id, ps.namespace.id, remaining)
     {
         for mem in mems {
             let mut val = serde_json::to_value(&mem).unwrap_or_default();

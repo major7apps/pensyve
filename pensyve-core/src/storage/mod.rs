@@ -119,7 +119,25 @@ pub trait StorageTrait: Send + Sync {
 
     // Entities
     fn save_entity(&self, entity: &Entity) -> StorageResult<()>;
-    fn get_entity(&self, id: Uuid) -> StorageResult<Option<Entity>>;
+    /// Fetch an entity only when it belongs to `namespace_id`.
+    ///
+    /// There is deliberately no unscoped `get_entity`. Entity ids are not
+    /// globally unique in this schema, so a lookup keyed on `id` alone resolves
+    /// whichever tenant's row carries the id — and under enforced row-level
+    /// security it resolves nothing at all, because a connection carrying no
+    /// namespace matches no row (#254). Requiring the namespace here is what
+    /// makes the REST identifier resolver behave the same in both
+    /// configurations, instead of reading the foreign row and then comparing
+    /// `entity.namespace_id` after the fact.
+    ///
+    /// Backends must implement this as a single `id AND namespace_id` query.
+    /// Callers should treat `Ok(None)` as "not found" without distinguishing
+    /// "owned by someone else", so the result is not an existence oracle.
+    fn get_entity_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<Entity>>;
     fn get_entity_by_name(&self, name: &str, namespace_id: Uuid) -> StorageResult<Option<Entity>>;
 
     // Episodes
@@ -167,9 +185,19 @@ pub trait StorageTrait: Send + Sync {
         namespace_id: Uuid,
     ) -> StorageResult<Option<EpisodicMemory>>;
 
-    fn list_episodic_by_entity(
+    /// List the live episodic memories about `about_entity` *within
+    /// `namespace_id`*, most recent first, bounded by `limit`.
+    ///
+    /// `namespace_id` is required rather than inferred, for the same reason it
+    /// is on [`StorageTrait::delete_memories_by_entity`]: entity ids repeat
+    /// across namespaces, so an entity-only predicate reads another tenant's
+    /// turns — and under enforced row-level security it reads nothing at all
+    /// while still reporting `Ok(vec![])`, which a caller cannot tell from an
+    /// entity that simply has no memories (#254).
+    fn list_episodic_by_entity_in_namespace(
         &self,
         about_entity: Uuid,
+        namespace_id: Uuid,
         limit: usize,
     ) -> StorageResult<Vec<EpisodicMemory>>;
 
@@ -197,9 +225,23 @@ pub trait StorageTrait: Send + Sync {
         Ok(out)
     }
 
-    fn update_episodic_access(
+    /// Stamp retrieval-induced reinforcement onto an episodic memory, but only
+    /// when it belongs to `namespace_id`.
+    ///
+    /// This is the highest-traffic write in the system: the retrieval engine
+    /// calls it for every episodic result of every recall. Unscoped it was also
+    /// the most dangerous one under enforced row-level security — the `UPDATE`
+    /// matched no row, affected nothing, and returned `Ok(())`, so recall
+    /// silently stopped reinforcing anything at all with no error anywhere to
+    /// notice (#254).
+    ///
+    /// Backends must put both predicates in the SQL. A no-match is not an
+    /// error: the row may have been superseded or forgotten between the read
+    /// and the stamp, and reinforcement is best-effort by design.
+    fn update_episodic_access_in_namespace(
         &self,
         id: Uuid,
+        namespace_id: Uuid,
         stability: f32,
         retrievability: f32,
     ) -> StorageResult<()>;
@@ -216,12 +258,16 @@ pub trait StorageTrait: Send + Sync {
         namespace_id: Uuid,
     ) -> StorageResult<Option<SemanticMemory>>;
 
-    fn list_semantic_by_entity(
+    /// List the live semantic memories whose subject is `subject` *within
+    /// `namespace_id`*, newest first, bounded by `limit`. Same contract — and
+    /// the same reason for the namespace parameter — as
+    /// [`StorageTrait::list_episodic_by_entity_in_namespace`].
+    fn list_semantic_by_entity_in_namespace(
         &self,
         subject: Uuid,
+        namespace_id: Uuid,
         limit: usize,
     ) -> StorageResult<Vec<SemanticMemory>>;
-    fn invalidate_semantic(&self, id: Uuid) -> StorageResult<()>;
 
     // Procedural Memory
     fn save_procedural(&self, mem: &ProceduralMemory) -> StorageResult<()>;
@@ -235,9 +281,14 @@ pub trait StorageTrait: Send + Sync {
         namespace_id: Uuid,
     ) -> StorageResult<Option<ProceduralMemory>>;
 
-    fn update_procedural_reliability(
+    /// Record a procedural memory's updated reliability and trial counts, but
+    /// only when it belongs to `namespace_id`. Same contract — and the same
+    /// silent-no-op failure mode when unscoped — as
+    /// [`StorageTrait::update_episodic_access_in_namespace`].
+    fn update_procedural_reliability_in_namespace(
         &self,
         id: Uuid,
+        namespace_id: Uuid,
         reliability: f32,
         trial_count: u32,
         success_count: u32,
@@ -307,15 +358,13 @@ pub trait StorageTrait: Send + Sync {
         Ok(0)
     }
 
-    /// Delete every observation whose source episode is associated with the
-    /// given entity (either as `source_entity` or `about_entity` on an
-    /// episodic memory). Used by GDPR cascade-delete paths — called BEFORE
-    /// `delete_memories_by_entity` so the episodic→entity join still exists.
-    ///
-    /// Returns the row count of deleted observations.
-    fn delete_observations_by_entity(&self, _entity_id: Uuid) -> StorageResult<usize> {
-        Ok(0)
-    }
+    // There is deliberately no `delete_observations_by_entity`. It was the
+    // observation leg of the old multi-call GDPR erase, took no `namespace_id`,
+    // and lost its last caller when [`StorageTrait::erase_entity_capturing`]
+    // absorbed that leg into one scoped transaction (#264). Rather than scope a
+    // method nothing calls, it was removed: an entity-wide observation delete
+    // only ever makes sense inside the erase transaction, where the ordering
+    // against the episodic delete is load-bearing.
 
     // Full-text search (BM25)
     fn search_fts(
@@ -421,11 +470,21 @@ pub trait StorageTrait: Send + Sync {
     /// take their ids from what the delete returned —
     /// [`StorageTrait::delete_memories_by_entity_capturing`] for forget and
     /// [`StorageTrait::erase_entity_capturing`] for GDPR erase (#268).
-    /// `list_episodic_by_entity` and
-    /// `list_semantic_by_entity` are not a substitute: they look at
+    /// `list_episodic_by_entity_in_namespace` and
+    /// `list_semantic_by_entity_in_namespace` are not a substitute: they look at
     /// `about_entity` and `subject` alone and skip superseded rows, so every
     /// source-side episodic, object-side semantic and superseded row kept its
     /// index entry after its base row was gone.
+    ///
+    /// With both cleanup paths now driven by what their `DELETE` returned, this
+    /// accessor has no production caller left. It is kept rather than removed
+    /// because it is the cross-backend oracle that pins the delete's predicate
+    /// set: `entity_scoped_listing_matches_the_delete_scope` (live Postgres) and
+    /// its `SQLite` twin assert that this listing and
+    /// [`StorageTrait::delete_memories_by_entity`] agree row for row. Deleting
+    /// it would mean re-spelling those predicates in test-local SQL per backend,
+    /// which is the thing the oracle exists to catch. It already carries a
+    /// `namespace_id`, so it is not one of the paths blocking enforcement.
     ///
     /// Implementations must mirror the delete's predicates verbatim — the
     /// namespace one included. Entity ids are not globally unique in this
@@ -605,17 +664,16 @@ pub trait StorageTrait: Send + Sync {
         Ok(count)
     }
 
-    /// Update a semantic memory's content and/or confidence.
-    fn update_semantic_content(
-        &self,
-        id: Uuid,
-        predicate: &str,
-        object: &str,
-        confidence: Option<f32>,
-    ) -> StorageResult<()>;
-
-    /// Delete an entity record by its UUID. Returns true if the entity was found and deleted.
-    fn delete_entity(&self, id: Uuid) -> StorageResult<bool>;
+    // There is deliberately no `update_semantic_content`, no
+    // `invalidate_semantic` and no `delete_entity`. All three keyed on a memory
+    // or entity id alone, all three reached a policied table, and none of them
+    // had a production caller left: supersession replaced in-place semantic
+    // edits, and the entity record is deleted by leg 4 of
+    // [`StorageTrait::erase_entity_capturing`], inside the same transaction as
+    // the rows that reference it. Scoping a method nothing calls would add SQL
+    // no path exercises and tests that gate nothing, so they were removed
+    // instead (#254). Reintroducing any of them means adding the `namespace_id`
+    // parameter and the predicate at the same time.
 
     // Entities (bulk)
     fn list_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Entity>>;

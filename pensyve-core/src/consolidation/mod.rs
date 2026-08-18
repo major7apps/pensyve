@@ -664,7 +664,8 @@ impl ConsolidationEngine {
                 break;
             }
             // Per-row cancel check — sits between the previous row's
-            // `update_episodic_access` / `update_procedural_reliability`
+            // `update_episodic_access_in_namespace` /
+            // `update_procedural_reliability_in_namespace`
             // (each a single-statement SQLite transaction) and the next
             // row. Per pre-reg §5.5 (I5), partial-write corruption is
             // prevented by checking BETWEEN transactions, not within.
@@ -683,15 +684,21 @@ impl ConsolidationEngine {
                         // Mark as archived by setting retrievability to near-zero and
                         // generating a summary stub if none exists. We store the updated
                         // stability/retrievability back via update_episodic_access.
-                        storage.update_episodic_access(
+                        storage.update_episodic_access_in_namespace(
                             em.id,
+                            namespace_id,
                             em.stability * 0.5,
                             retrievability,
                         )?;
                         archived += 1;
                     } else {
                         // Just record updated retrievability.
-                        storage.update_episodic_access(em.id, em.stability, retrievability)?;
+                        storage.update_episodic_access_in_namespace(
+                            em.id,
+                            namespace_id,
+                            em.stability,
+                            retrievability,
+                        )?;
                     }
                     decayed += 1;
                 }
@@ -703,8 +710,8 @@ impl ConsolidationEngine {
                     if retrievability < threshold {
                         // Semantic memories: flag for review by invalidating (not deleting).
                         // We don't archive semantic memories — just note the retrievability.
-                        // For now we track archived count but do not call invalidate_semantic,
-                        // as that would permanently mark the fact as invalid. Instead we
+                        // For now we track archived count but do not invalidate the
+                        // fact, as that would permanently mark it invalid. Instead we
                         // simply note it in stats.
                         archived += 1;
                     }
@@ -720,8 +727,9 @@ impl ConsolidationEngine {
                     if retrievability < threshold && pm.reliability < 0.1 {
                         // Archive: reduce reliability and increment archived count.
                         let new_reliability = pm.reliability * 0.5;
-                        storage.update_procedural_reliability(
+                        storage.update_procedural_reliability_in_namespace(
                             pm.id,
+                            namespace_id,
                             new_reliability,
                             pm.trial_count,
                             pm.success_count,
@@ -1507,7 +1515,9 @@ mod tests {
         );
 
         // Verify a semantic memory was actually saved for this entity.
-        let semantics = storage.list_semantic_by_entity(entity_id, 10).unwrap();
+        let semantics = storage
+            .list_semantic_by_entity_in_namespace(entity_id, ns.id, 10)
+            .unwrap();
         assert!(
             !semantics.is_empty(),
             "Expected at least one semantic memory for entity"

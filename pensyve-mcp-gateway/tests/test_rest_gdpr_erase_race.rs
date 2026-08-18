@@ -127,8 +127,12 @@ impl StorageTrait for RacingStorage {
     fn save_entity(&self, entity: &Entity) -> StorageResult<()> {
         self.inner.save_entity(entity)
     }
-    fn get_entity(&self, id: Uuid) -> StorageResult<Option<Entity>> {
-        self.inner.get_entity(id)
+    fn get_entity_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<Entity>> {
+        self.inner.get_entity_in_namespace(id, namespace_id)
     }
     fn get_entity_by_name(&self, name: &str, namespace_id: Uuid) -> StorageResult<Option<Entity>> {
         self.inner.get_entity_by_name(name, namespace_id)
@@ -156,12 +160,14 @@ impl StorageTrait for RacingStorage {
     ) -> StorageResult<Option<EpisodicMemory>> {
         self.inner.get_episodic_in_namespace(id, namespace_id)
     }
-    fn list_episodic_by_entity(
+    fn list_episodic_by_entity_in_namespace(
         &self,
         about_entity: Uuid,
+        namespace_id: Uuid,
         limit: usize,
     ) -> StorageResult<Vec<EpisodicMemory>> {
-        self.inner.list_episodic_by_entity(about_entity, limit)
+        self.inner
+            .list_episodic_by_entity_in_namespace(about_entity, namespace_id, limit)
     }
     fn list_episodic_by_episode(
         &self,
@@ -171,14 +177,15 @@ impl StorageTrait for RacingStorage {
         self.inner
             .list_episodic_by_episode(namespace_id, episode_id)
     }
-    fn update_episodic_access(
+    fn update_episodic_access_in_namespace(
         &self,
         id: Uuid,
+        namespace_id: Uuid,
         stability: f32,
         retrievability: f32,
     ) -> StorageResult<()> {
         self.inner
-            .update_episodic_access(id, stability, retrievability)
+            .update_episodic_access_in_namespace(id, namespace_id, stability, retrievability)
     }
     fn save_semantic(&self, mem: &SemanticMemory) -> StorageResult<()> {
         self.inner.save_semantic(mem)
@@ -190,15 +197,14 @@ impl StorageTrait for RacingStorage {
     ) -> StorageResult<Option<SemanticMemory>> {
         self.inner.get_semantic_in_namespace(id, namespace_id)
     }
-    fn list_semantic_by_entity(
+    fn list_semantic_by_entity_in_namespace(
         &self,
         subject: Uuid,
+        namespace_id: Uuid,
         limit: usize,
     ) -> StorageResult<Vec<SemanticMemory>> {
-        self.inner.list_semantic_by_entity(subject, limit)
-    }
-    fn invalidate_semantic(&self, id: Uuid) -> StorageResult<()> {
-        self.inner.invalidate_semantic(id)
+        self.inner
+            .list_semantic_by_entity_in_namespace(subject, namespace_id, limit)
     }
     fn save_procedural(&self, mem: &ProceduralMemory) -> StorageResult<()> {
         self.inner.save_procedural(mem)
@@ -210,15 +216,21 @@ impl StorageTrait for RacingStorage {
     ) -> StorageResult<Option<ProceduralMemory>> {
         self.inner.get_procedural_in_namespace(id, namespace_id)
     }
-    fn update_procedural_reliability(
+    fn update_procedural_reliability_in_namespace(
         &self,
         id: Uuid,
+        namespace_id: Uuid,
         reliability: f32,
         trial_count: u32,
         success_count: u32,
     ) -> StorageResult<()> {
-        self.inner
-            .update_procedural_reliability(id, reliability, trial_count, success_count)
+        self.inner.update_procedural_reliability_in_namespace(
+            id,
+            namespace_id,
+            reliability,
+            trial_count,
+            success_count,
+        )
     }
     fn save_observation(&self, mem: &ObservationMemory) -> StorageResult<()> {
         self.inner.save_observation(mem)
@@ -255,9 +267,6 @@ impl StorageTrait for RacingStorage {
     ) -> StorageResult<usize> {
         self.inner
             .delete_observations_by_episode(namespace_id, episode_id)
-    }
-    fn delete_observations_by_entity(&self, entity_id: Uuid) -> StorageResult<usize> {
-        self.inner.delete_observations_by_entity(entity_id)
     }
     fn search_fts(
         &self,
@@ -364,19 +373,6 @@ impl StorageTrait for RacingStorage {
     }
     fn purge_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
         self.inner.purge_namespace(namespace_id)
-    }
-    fn update_semantic_content(
-        &self,
-        id: Uuid,
-        predicate: &str,
-        object: &str,
-        confidence: Option<f32>,
-    ) -> StorageResult<()> {
-        self.inner
-            .update_semantic_content(id, predicate, object, confidence)
-    }
-    fn delete_entity(&self, id: Uuid) -> StorageResult<bool> {
-        self.inner.delete_entity(id)
     }
     fn list_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Entity>> {
         self.inner.list_entities_by_namespace(namespace_id)

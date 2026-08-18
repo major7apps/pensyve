@@ -560,7 +560,7 @@ fn cmd_inspect(
     let mut memories: Vec<serde_json::Value> = Vec::new();
 
     if want_episodic {
-        let episodic = storage.list_episodic_by_entity(entity.id, 100)?;
+        let episodic = storage.list_episodic_by_entity_in_namespace(entity.id, ns.id, 100)?;
         for m in episodic {
             memories.push(serde_json::json!({
                 "id": m.id.to_string(),
@@ -575,7 +575,7 @@ fn cmd_inspect(
     }
 
     if want_semantic {
-        let semantic = storage.list_semantic_by_entity(entity.id, 100)?;
+        let semantic = storage.list_semantic_by_entity_in_namespace(entity.id, ns.id, 100)?;
         for m in semantic {
             memories.push(serde_json::json!({
                 "id": m.id.to_string(),

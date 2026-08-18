@@ -942,12 +942,17 @@ impl StorageTrait for SqliteBackend {
         Ok(())
     }
 
-    fn get_entity(&self, id: Uuid) -> StorageResult<Option<Entity>> {
+    fn get_entity_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<Entity>> {
         let conn = lock_conn!(self);
         let result = conn
             .query_row(
-                "SELECT id, namespace_id, name, kind, metadata, created_at FROM entities WHERE id = ?1",
-                params![id.to_string()],
+                "SELECT id, namespace_id, name, kind, metadata, created_at FROM entities \
+                  WHERE id = ?1 AND namespace_id = ?2",
+                params![id.to_string(), namespace_id.to_string()],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -1170,9 +1175,10 @@ impl StorageTrait for SqliteBackend {
         result.transpose()
     }
 
-    fn list_episodic_by_entity(
+    fn list_episodic_by_entity_in_namespace(
         &self,
         about_entity: Uuid,
+        namespace_id: Uuid,
         limit: usize,
     ) -> StorageResult<Vec<EpisodicMemory>> {
         let conn = lock_conn!(self);
@@ -1181,12 +1187,14 @@ impl StorageTrait for SqliteBackend {
                       content_type, summary, embedding, context_intent, timestamp,
                       stability, retrievability, access_count, last_accessed, event_time,
                       agent_id, user_id, superseded_by, invalid_at
-               FROM episodic_memories WHERE about_entity = ?1 AND superseded_by IS NULL
-               ORDER BY timestamp DESC LIMIT ?2",
+               FROM episodic_memories
+               WHERE about_entity = ?1 AND namespace_id = ?2 AND superseded_by IS NULL
+               ORDER BY timestamp DESC LIMIT ?3",
         )?;
         let rows = stmt.query_map(
             params![
                 about_entity.to_string(),
+                namespace_id.to_string(),
                 i64::try_from(limit).unwrap_or(i64::MAX)
             ],
             row_to_episodic,
@@ -1198,9 +1206,10 @@ impl StorageTrait for SqliteBackend {
         Ok(out)
     }
 
-    fn update_episodic_access(
+    fn update_episodic_access_in_namespace(
         &self,
         id: Uuid,
+        namespace_id: Uuid,
         stability: f32,
         retrievability: f32,
     ) -> StorageResult<()> {
@@ -1210,12 +1219,13 @@ impl StorageTrait for SqliteBackend {
                SET stability = ?1, retrievability = ?2,
                    access_count = access_count + 1,
                    last_accessed = ?3
-               WHERE id = ?4",
+               WHERE id = ?4 AND namespace_id = ?5",
             params![
                 f64::from(stability),
                 f64::from(retrievability),
                 Utc::now().to_rfc3339(),
                 id.to_string(),
+                namespace_id.to_string(),
             ],
         )?;
         Ok(())
@@ -1313,9 +1323,10 @@ impl StorageTrait for SqliteBackend {
         result.transpose()
     }
 
-    fn list_semantic_by_entity(
+    fn list_semantic_by_entity_in_namespace(
         &self,
         subject: Uuid,
+        namespace_id: Uuid,
         limit: usize,
     ) -> StorageResult<Vec<SemanticMemory>> {
         let conn = lock_conn!(self);
@@ -1324,12 +1335,14 @@ impl StorageTrait for SqliteBackend {
                       object_entity, confidence, valid_at, invalid_at,
                       source_episodes, embedding, stability, retrievability,
                       agent_id, user_id, superseded_by
-               FROM semantic_memories WHERE subject = ?1 AND superseded_by IS NULL
-               ORDER BY valid_at DESC LIMIT ?2",
+               FROM semantic_memories
+               WHERE subject = ?1 AND namespace_id = ?2 AND superseded_by IS NULL
+               ORDER BY valid_at DESC LIMIT ?3",
         )?;
         let rows = stmt.query_map(
             params![
                 subject.to_string(),
+                namespace_id.to_string(),
                 i64::try_from(limit).unwrap_or(i64::MAX)
             ],
             row_to_semantic,
@@ -1365,15 +1378,6 @@ impl StorageTrait for SqliteBackend {
             out.push(row??);
         }
         Ok(out)
-    }
-
-    fn invalidate_semantic(&self, id: Uuid) -> StorageResult<()> {
-        let conn = lock_conn!(self);
-        conn.execute(
-            "UPDATE semantic_memories SET invalid_at = ?1 WHERE id = ?2",
-            params![Utc::now().to_rfc3339(), id.to_string()],
-        )?;
-        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1453,9 +1457,10 @@ impl StorageTrait for SqliteBackend {
         result.transpose()
     }
 
-    fn update_procedural_reliability(
+    fn update_procedural_reliability_in_namespace(
         &self,
         id: Uuid,
+        namespace_id: Uuid,
         reliability: f32,
         trial_count: u32,
         success_count: u32,
@@ -1465,13 +1470,14 @@ impl StorageTrait for SqliteBackend {
             r"UPDATE procedural_memories
                SET reliability = ?1, trial_count = ?2, success_count = ?3,
                    last_used = ?4
-               WHERE id = ?5",
+               WHERE id = ?5 AND namespace_id = ?6",
             params![
                 f64::from(reliability),
                 trial_count,
                 success_count,
                 Utc::now().to_rfc3339(),
                 id.to_string(),
+                namespace_id.to_string(),
             ],
         )?;
         Ok(())
@@ -1634,78 +1640,6 @@ impl StorageTrait for SqliteBackend {
             out.push(row??);
         }
         Ok(out)
-    }
-
-    fn delete_observations_by_entity(&self, entity_id: Uuid) -> StorageResult<usize> {
-        let conn = lock_conn!(self);
-        let id_str = entity_id.to_string();
-        conn.execute_batch("BEGIN")?;
-        let result = (|| -> StorageResult<usize> {
-            // Phase 2B cascade (CodeRabbit PR #115 round 2): the
-            // observations slated for delete may have populated
-            // `kg_triples` / `kg_passage_entities` rows keyed by their
-            // `id` (== `passage_id`). Remove those BEFORE deleting the
-            // owning observation rows so the cleanup matches the
-            // observation set being deleted; `kg_entities` are kept
-            // (they're namespace-scoped, not passage-scoped, and may
-            // be referenced by other observations' triples — they
-            // only get purged in `purge_namespace`).
-            conn.execute(
-                "DELETE FROM kg_triples \
-                 WHERE passage_id IN (\
-                   SELECT id FROM observation_memories \
-                    WHERE episode_id IN (\
-                      SELECT DISTINCT episode_id FROM episodic_memories \
-                       WHERE about_entity = ?1 OR source_entity = ?1\
-                    )\
-                 )",
-                params![&id_str],
-            )?;
-            conn.execute(
-                "DELETE FROM kg_passage_entities \
-                 WHERE passage_id IN (\
-                   SELECT id FROM observation_memories \
-                    WHERE episode_id IN (\
-                      SELECT DISTINCT episode_id FROM episodic_memories \
-                       WHERE about_entity = ?1 OR source_entity = ?1\
-                    )\
-                 )",
-                params![&id_str],
-            )?;
-            // Strip FTS entries first — we need the observation IDs before
-            // the rows are gone.
-            conn.execute(
-                "DELETE FROM memory_fts \
-                 WHERE memory_type = 'observation' \
-                   AND memory_id IN (\
-                     SELECT id FROM observation_memories \
-                      WHERE episode_id IN (\
-                        SELECT DISTINCT episode_id FROM episodic_memories \
-                         WHERE about_entity = ?1 OR source_entity = ?1\
-                      )\
-                   )",
-                params![&id_str],
-            )?;
-            let deleted = conn.execute(
-                "DELETE FROM observation_memories \
-                 WHERE episode_id IN (\
-                   SELECT DISTINCT episode_id FROM episodic_memories \
-                    WHERE about_entity = ?1 OR source_entity = ?1\
-                 )",
-                params![&id_str],
-            )?;
-            Ok(deleted)
-        })();
-        match result {
-            Ok(n) => {
-                conn.execute_batch("COMMIT")?;
-                Ok(n)
-            }
-            Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
     }
 
     fn delete_observations_by_episode(
@@ -2415,9 +2349,11 @@ impl StorageTrait for SqliteBackend {
     /// `SELECT` predicted it would remove.
     ///
     /// Every leg is qualified by `namespace_id`, the observation join included.
-    /// The unscoped `delete_observations_by_entity` this replaces on the erase
+    /// The unscoped `delete_observations_by_entity` this replaced on the erase
     /// path matched on the entity id alone, and entity ids are not globally
-    /// unique in this schema, so that predicate reached into other tenants.
+    /// unique in this schema, so that predicate reached into other tenants. It
+    /// had no caller left afterwards and was removed rather than scoped (#254),
+    /// so this leg is now the only entity-wide observation delete there is.
     fn erase_entity_capturing(
         &self,
         entity_id: Uuid,
@@ -2635,38 +2571,6 @@ impl StorageTrait for SqliteBackend {
         }
     }
 
-    fn update_semantic_content(
-        &self,
-        id: Uuid,
-        predicate: &str,
-        object: &str,
-        confidence: Option<f32>,
-    ) -> StorageResult<()> {
-        let conn = lock_conn!(self);
-        let id_str = id.to_string();
-
-        if let Some(conf) = confidence {
-            conn.execute(
-                "UPDATE semantic_memories SET predicate = ?1, object = ?2, confidence = ?3 WHERE id = ?4",
-                params![predicate, object, conf, &id_str],
-            )?;
-        } else {
-            conn.execute(
-                "UPDATE semantic_memories SET predicate = ?1, object = ?2 WHERE id = ?3",
-                params![predicate, object, &id_str],
-            )?;
-        }
-
-        // Update FTS index content.
-        let content = format!("{predicate} {object}");
-        conn.execute(
-            "UPDATE memory_fts SET content = ?1 WHERE memory_id = ?2",
-            params![&content, &id_str],
-        )?;
-
-        Ok(())
-    }
-
     // -----------------------------------------------------------------------
     // Entities (bulk)
     // -----------------------------------------------------------------------
@@ -2713,13 +2617,6 @@ impl StorageTrait for SqliteBackend {
             });
         }
         Ok(entities)
-    }
-
-    fn delete_entity(&self, id: Uuid) -> StorageResult<bool> {
-        let conn = lock_conn!(self);
-        let id_str = id.to_string();
-        let rows = conn.execute("DELETE FROM entities WHERE id = ?1", params![&id_str])?;
-        Ok(rows > 0)
     }
 
     // -----------------------------------------------------------------------
@@ -3614,11 +3511,25 @@ mod tests {
         entity.namespace_id = ns.id;
         db.save_entity(&entity).unwrap();
 
-        let fetched = db.get_entity(entity.id).unwrap().unwrap();
+        let fetched = db
+            .get_entity_in_namespace(entity.id, ns.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.id, entity.id);
         assert_eq!(fetched.name, "alice");
         assert!(matches!(fetched.kind, EntityKind::User));
         assert_eq!(fetched.namespace_id, ns.id);
+
+        // Entity ids are not globally unique, so the lookup has to be a
+        // namespace-qualified query rather than a read followed by a check.
+        let foreign = Namespace::new("foreign-entity-read");
+        db.save_namespace(&foreign).unwrap();
+        assert!(
+            db.get_entity_in_namespace(entity.id, foreign.id)
+                .unwrap()
+                .is_none(),
+            "another namespace must not resolve this entity"
+        );
     }
 
     #[test]
@@ -3726,11 +3637,37 @@ mod tests {
         );
         db.save_episodic(&other).unwrap();
 
-        let results = db.list_episodic_by_entity(about, 10).unwrap();
+        // The same entity id in a second namespace — the collision the
+        // namespace predicate has to disambiguate.
+        let foreign_ns = Namespace::new("foreign-episodic-listing");
+        db.save_namespace(&foreign_ns).unwrap();
+        let foreign = EpisodicMemory::new(
+            foreign_ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            about,
+            "another tenant's turn",
+        );
+        db.save_episodic(&foreign).unwrap();
+
+        let results = db
+            .list_episodic_by_entity_in_namespace(about, ns.id, 10)
+            .unwrap();
         assert_eq!(results.len(), 2);
         let contents: Vec<&str> = results.iter().map(|m| m.content.as_str()).collect();
         assert!(contents.contains(&"first event"));
         assert!(contents.contains(&"second event"));
+        assert!(
+            !contents.contains(&"another tenant's turn"),
+            "the listing must not reach into another namespace's rows"
+        );
+        assert_eq!(
+            db.list_episodic_by_entity_in_namespace(about, foreign_ns.id, 10)
+                .unwrap()
+                .len(),
+            1,
+            "and each namespace must still see its own"
+        );
     }
 
     #[test]
@@ -3747,7 +3684,22 @@ mod tests {
         );
         db.save_episodic(&mem).unwrap();
 
-        db.update_episodic_access(mem.id, 0.8, 0.7).unwrap();
+        // A foreign namespace must not be able to stamp this row.
+        let foreign = Namespace::new("foreign-reinforcement");
+        db.save_namespace(&foreign).unwrap();
+        db.update_episodic_access_in_namespace(mem.id, foreign.id, 0.1, 0.1)
+            .unwrap();
+        let untouched = db
+            .get_episodic_in_namespace(mem.id, ns.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            untouched.access_count, 0,
+            "a cross-namespace reinforcement stamp must land on nothing"
+        );
+
+        db.update_episodic_access_in_namespace(mem.id, ns.id, 0.8, 0.7)
+            .unwrap();
 
         let fetched = db
             .get_episodic_in_namespace(mem.id, ns.id)
@@ -3849,12 +3801,14 @@ mod tests {
         mem.event_time = Some(when);
         db.save_episodic(&mem).unwrap();
 
-        let results = db.list_episodic_by_entity(about, 10).unwrap();
+        let results = db
+            .list_episodic_by_entity_in_namespace(about, ns.id, 10)
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0].event_time,
             Some(when),
-            "list_episodic_by_entity must read event_time from the DB"
+            "list_episodic_by_entity_in_namespace must read event_time from the DB"
         );
     }
 
@@ -3897,32 +3851,26 @@ mod tests {
         let other = SemanticMemory::new(ns.id, Uuid::new_v4(), "likes", "coffee", 0.7);
         db.save_semantic(&other).unwrap();
 
-        let results = db.list_semantic_by_entity(subject, 10).unwrap();
+        // The same subject id in a second namespace.
+        let foreign_ns = Namespace::new("foreign-semantic-listing");
+        db.save_namespace(&foreign_ns).unwrap();
+        let foreign = SemanticMemory::new(foreign_ns.id, subject, "knows", "Go", 0.8);
+        db.save_semantic(&foreign).unwrap();
+
+        let results = db
+            .list_semantic_by_entity_in_namespace(subject, ns.id, 10)
+            .unwrap();
         assert_eq!(results.len(), 2);
-    }
-
-    #[test]
-    fn test_invalidate_semantic() {
-        let (_dir, db) = setup();
-        let ns = make_namespace(&db);
-
-        let mem = SemanticMemory::new(ns.id, Uuid::new_v4(), "works_at", "OldCo", 0.9);
-        db.save_semantic(&mem).unwrap();
-
         assert!(
-            db.get_semantic_in_namespace(mem.id, ns.id)
-                .unwrap()
-                .unwrap()
-                .invalid_at
-                .is_none()
+            !results.iter().any(|m| m.id == foreign.id),
+            "the listing must not reach into another namespace's rows"
         );
-        db.invalidate_semantic(mem.id).unwrap();
-        assert!(
-            db.get_semantic_in_namespace(mem.id, ns.id)
+        assert_eq!(
+            db.list_semantic_by_entity_in_namespace(subject, foreign_ns.id, 10)
                 .unwrap()
-                .unwrap()
-                .invalid_at
-                .is_some()
+                .len(),
+            1,
+            "and each namespace must still see its own"
         );
     }
 
@@ -3970,7 +3918,22 @@ mod tests {
         );
         db.save_procedural(&mem).unwrap();
 
-        db.update_procedural_reliability(mem.id, 0.75, 4, 3)
+        // A foreign namespace must not be able to rewrite this row.
+        let foreign = Namespace::new("foreign-procedural-update");
+        db.save_namespace(&foreign).unwrap();
+        db.update_procedural_reliability_in_namespace(mem.id, foreign.id, 0.01, 99, 99)
+            .unwrap();
+        let untouched = db
+            .get_procedural_in_namespace(mem.id, ns.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (untouched.trial_count, untouched.success_count),
+            (mem.trial_count, mem.success_count),
+            "a cross-namespace reliability update must land on nothing"
+        );
+
+        db.update_procedural_reliability_in_namespace(mem.id, ns.id, 0.75, 4, 3)
             .unwrap();
 
         let fetched = db
@@ -5395,7 +5358,9 @@ mod tests {
     // assertions stay independent of the dep-parse hook's extraction
     // contract. The cascade paths we exercise are:
     //   - delete_observations_by_episode
-    //   - delete_observations_by_entity
+    //   - erase_entity_capturing's observation leg (the entity-wide case;
+    //     covered by `erase_entity_capturing_removes_every_leg_and_returns_
+    //     what_it_removed` alongside the rest of the erase)
     //   - delete_memory_by_id_in_namespace (observation case)
     //   - purge_namespace
     // -----------------------------------------------------------------------
@@ -5534,54 +5499,6 @@ mod tests {
             kg_entities_count_for_namespace(&db, ns.id),
             2,
             "kg_entities are namespace-scoped and must NOT cascade with an episode delete"
-        );
-    }
-
-    #[test]
-    fn delete_observations_by_entity_cascades_kg_rows() {
-        let (_dir, db) = setup();
-        let ns = make_namespace(&db);
-
-        // To exercise the cascade we need an episodic memory that
-        // references the entity to delete, plus an observation tied
-        // to that episode. The episodic.about_entity / source_entity
-        // columns drive the cascade JOIN.
-        let about = Uuid::new_v4();
-        let ep = Uuid::new_v4();
-        let episode = Episode::new(ns.id, vec![about]);
-        let ep_id = episode.id;
-        db.save_episode(&episode).unwrap();
-
-        let mut episodic = EpisodicMemory::new(ns.id, ep_id, about, Uuid::new_v4(), "msg");
-        episodic.episode_id = ep;
-        db.save_episodic(&episodic).unwrap();
-
-        let obs = ObservationMemory::new(ns.id, ep, "x", "y", "z", "c");
-        db.save_observation(&obs).unwrap();
-
-        let s = seed_kg_entity(&db, ns.id, "S");
-        let o = seed_kg_entity(&db, ns.id, "O");
-        seed_kg_triple(&db, ns.id, obs.id, s, o);
-
-        assert_eq!(kg_triples_count_for_passage(&db, obs.id), 1);
-        assert_eq!(kg_passage_entities_count_for_passage(&db, obs.id), 2);
-
-        db.delete_observations_by_entity(about).unwrap();
-
-        assert_eq!(
-            kg_triples_count_for_passage(&db, obs.id),
-            0,
-            "kg_triples must cascade with delete_observations_by_entity"
-        );
-        assert_eq!(
-            kg_passage_entities_count_for_passage(&db, obs.id),
-            0,
-            "kg_passage_entities must cascade with delete_observations_by_entity"
-        );
-        assert_eq!(
-            kg_entities_count_for_namespace(&db, ns.id),
-            2,
-            "kg_entities are namespace-scoped and must NOT cascade with entity-scoped observation delete"
         );
     }
 
@@ -5931,7 +5848,11 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(db.get_entity(subject.id).unwrap().is_none());
+        assert!(
+            db.get_entity_in_namespace(subject.id, ns.id)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(fts_rows_for(&db, episodic.id), 0);
         assert_eq!(fts_rows_for(&db, semantic.id), 0);
         assert_eq!(fts_rows_for(&db, observation.id), 0);

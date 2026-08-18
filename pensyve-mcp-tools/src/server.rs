@@ -845,7 +845,11 @@ impl PensyveMcpServer {
         let mut remaining = limit;
 
         if remaining > 0 && (type_filter.is_none() || type_filter == Some("episodic")) {
-            match state.storage.list_episodic_by_entity(entity.id, remaining) {
+            match state.storage.list_episodic_by_entity_in_namespace(
+                entity.id,
+                state.namespace.id,
+                remaining,
+            ) {
                 Ok(episodics) => {
                     for mem in episodics {
                         let mut val = serde_json::to_value(&mem).unwrap_or_default();
@@ -862,7 +866,11 @@ impl PensyveMcpServer {
         }
 
         if remaining > 0 && (type_filter.is_none() || type_filter == Some("semantic")) {
-            match state.storage.list_semantic_by_entity(entity.id, remaining) {
+            match state.storage.list_semantic_by_entity_in_namespace(
+                entity.id,
+                state.namespace.id,
+                remaining,
+            ) {
                 Ok(semantics) => {
                     for mem in semantics {
                         let mut val = serde_json::to_value(&mem).unwrap_or_default();
@@ -926,10 +934,18 @@ impl PensyveMcpServer {
             // Stats for a specific entity
             if let Ok(Some(entity)) = state.storage.get_entity_by_name(entity_name, ns.id) {
                 entity_count = 1;
-                if let Ok(mems) = state.storage.list_semantic_by_entity(entity.id, usize::MAX) {
+                if let Ok(mems) =
+                    state
+                        .storage
+                        .list_semantic_by_entity_in_namespace(entity.id, ns.id, usize::MAX)
+                {
                     semantic_count = mems.len();
                 }
-                if let Ok(mems) = state.storage.list_episodic_by_entity(entity.id, usize::MAX) {
+                if let Ok(mems) =
+                    state
+                        .storage
+                        .list_episodic_by_entity_in_namespace(entity.id, ns.id, usize::MAX)
+                {
                     episodic_count = mems.len();
                 }
             }
