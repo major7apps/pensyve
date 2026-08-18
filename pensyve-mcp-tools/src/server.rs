@@ -707,9 +707,8 @@ impl PensyveMcpServer {
         // caller fill the disk by looping on an already-empty entity.
         if let Some(path) = snapshot_path {
             let counts = snapshot.counts();
-            response["snapshot"] = serde_json::json!({
+            let mut reference = serde_json::json!({
                 "snapshot_id": snapshot.snapshot_id.to_string(),
-                "path": path,
                 "format_version": snapshot.format_version,
                 "captured_at": snapshot.captured_at.to_rfc3339(),
                 // False on platforms where the file could not be restricted to
@@ -720,6 +719,17 @@ impl PensyveMcpServer {
                 "episodic_count": counts.episodic,
                 "semantic_count": counts.semantic,
             });
+
+            // #266: the path is a detail of the server's filesystem. A local
+            // stdio caller owns that filesystem and needs the pointer to
+            // recover on its own; a hosted tenant does not, and handing it one
+            // leaks the server's layout. The activity log above records the
+            // path either way, so the operator's recovery pointer is intact.
+            if !state.is_remote {
+                reference["path"] = serde_json::Value::String(path);
+            }
+
+            response["snapshot"] = reference;
         }
 
         serde_json::to_string(&response).map_err(|e| format!("Serialization error: {e}"))
@@ -1017,7 +1027,7 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
-    fn forget_fixture(snapshot_root: PathBuf) -> ForgetFixture {
+    fn forget_fixture(snapshot_root: PathBuf, is_remote: bool) -> ForgetFixture {
         let dir = tempfile::tempdir().unwrap();
         let storage = SqliteBackend::open(dir.path()).unwrap();
 
@@ -1058,7 +1068,7 @@ mod tests {
             vector_index: RwLock::new(VectorIndex::new(dimensions, 16)),
             namespace,
             retrieval_config: test_retrieval_config(),
-            is_remote: false,
+            is_remote,
             reranker_cell: Arc::new(OnceLock::new()),
             snapshot_root,
         });
@@ -1081,7 +1091,7 @@ mod tests {
     #[tokio::test]
     async fn forget_response_carries_a_recoverable_snapshot_reference() {
         let snapshot_root = tempfile::tempdir().unwrap();
-        let fixture = forget_fixture(snapshot_root.path().join("snapshots"));
+        let fixture = forget_fixture(snapshot_root.path().join("snapshots"), false);
 
         let raw = fixture
             .server
@@ -1127,6 +1137,83 @@ mod tests {
         assert_eq!(stored_memory_count(&fixture.server), 2);
     }
 
+    /// #266: a hosted tenant does not own the server's filesystem, so the
+    /// snapshot reference must not hand it a server-local path. Everything
+    /// else in the reference — what identifies the artifact and what it holds
+    /// — stays, and the snapshot itself is still written.
+    #[tokio::test]
+    async fn forget_response_omits_the_snapshot_path_for_remote_callers() {
+        let snapshot_root = tempfile::tempdir().unwrap();
+        let snapshot_dir = snapshot_root.path().join("snapshots");
+        let fixture = forget_fixture(snapshot_dir.clone(), true);
+
+        let raw = fixture
+            .server
+            .forget(Parameters(ForgetParams {
+                entity: "subject".to_string(),
+            }))
+            .await
+            .expect("forget should succeed");
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        let reference = &response["snapshot"];
+        assert!(
+            reference.get("path").is_none(),
+            "a remote caller must not see the server's snapshot path: {response}"
+        );
+
+        // The rest of the reference is unchanged.
+        assert!(reference["snapshot_id"].is_string());
+        assert!(reference["captured_at"].is_string());
+        assert!(reference["format_version"].is_number());
+        assert_eq!(
+            reference["owner_only"],
+            pensyve_core::snapshot::OWNER_ONLY_SUPPORTED
+        );
+        assert_eq!(reference["memory_count"], 2);
+        assert_eq!(reference["episodic_count"], 1);
+        assert_eq!(reference["semantic_count"], 1);
+
+        // Withholding the path does not withhold the snapshot: the operator's
+        // recovery artifact is still on disk.
+        let files = std::fs::read_dir(pensyve_core::snapshot::namespace_dir(
+            &snapshot_dir,
+            fixture.server.state.namespace.id,
+        ))
+        .unwrap()
+        .count();
+        assert_eq!(files, 1, "the snapshot file must still be written");
+        assert_eq!(stored_memory_count(&fixture.server), 0);
+    }
+
+    /// The local stdio caller owns the filesystem the snapshot was written to,
+    /// so it keeps the path — that is its recovery pointer (#266).
+    #[tokio::test]
+    async fn forget_response_includes_the_snapshot_path_for_local_callers() {
+        let snapshot_root = tempfile::tempdir().unwrap();
+        let fixture = forget_fixture(snapshot_root.path().join("snapshots"), false);
+
+        let raw = fixture
+            .server
+            .forget(Parameters(ForgetParams {
+                entity: "subject".to_string(),
+            }))
+            .await
+            .expect("forget should succeed");
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        let path = PathBuf::from(
+            response["snapshot"]["path"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a local caller keeps the snapshot path: {response}")),
+        );
+        assert!(
+            path.is_file(),
+            "the path must point at the written snapshot: {}",
+            path.display()
+        );
+    }
+
     #[tokio::test]
     async fn forget_aborts_the_delete_when_the_snapshot_cannot_be_written() {
         let snapshot_root = tempfile::tempdir().unwrap();
@@ -1134,7 +1221,7 @@ mod tests {
         // fails for every user, root included, so this is deterministic in CI.
         let blocked = snapshot_root.path().join("blocked");
         std::fs::write(&blocked, b"not a directory").unwrap();
-        let fixture = forget_fixture(blocked);
+        let fixture = forget_fixture(blocked, false);
 
         let error = fixture
             .server
@@ -1159,7 +1246,7 @@ mod tests {
     async fn forget_on_an_unknown_entity_writes_no_snapshot_and_deletes_nothing() {
         let snapshot_root = tempfile::tempdir().unwrap();
         let snapshot_dir = snapshot_root.path().join("snapshots");
-        let fixture = forget_fixture(snapshot_dir.clone());
+        let fixture = forget_fixture(snapshot_dir.clone(), false);
 
         let raw = fixture
             .server
@@ -1183,7 +1270,7 @@ mod tests {
     async fn forget_on_an_entity_with_no_memories_omits_the_snapshot_reference() {
         let snapshot_root = tempfile::tempdir().unwrap();
         let snapshot_dir = snapshot_root.path().join("snapshots");
-        let fixture = forget_fixture(snapshot_dir.clone());
+        let fixture = forget_fixture(snapshot_dir.clone(), false);
 
         let params = || {
             Parameters(ForgetParams {
