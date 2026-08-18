@@ -461,3 +461,50 @@ fn save_edge_still_upserts_within_its_own_namespace() {
     t.db.save_edge(&edge, t.ns_a)
         .expect("an idempotent re-save must not be mistaken for a collision");
 }
+
+/// A same-namespace re-save must move the edge's endpoints and its validity
+/// stamp, not just its label — and it must do so identically on both backends.
+///
+/// The two `save_edge` implementations write their own SQL, so their conflict
+/// handlers can drift apart silently: a re-save that repoints an edge would
+/// take effect on one backend and be dropped on the other, both returning Ok.
+/// `save_edge_repoints_an_edge_on_a_same_namespace_resave` in
+/// `postgres/live_rls.rs` is this same contract on Postgres.
+#[test]
+fn save_edge_repoints_an_edge_on_a_same_namespace_resave() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let t = two_tenants(&dir);
+
+    let original_source = Uuid::new_v4();
+    let mut edge = Edge::new(original_source, Uuid::new_v4(), "reports_to");
+    t.db.save_edge(&edge, t.ns_a).expect("save the edge");
+
+    let new_source = Uuid::new_v4();
+    let new_target = Uuid::new_v4();
+    let new_valid_at = "2020-01-02T03:04:05Z"
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .expect("parse fixed timestamp");
+    edge.source = new_source;
+    edge.target = new_target;
+    edge.valid_at = new_valid_at;
+    t.db.save_edge(&edge, t.ns_a).expect("re-save the edge");
+
+    let stored =
+        t.db.get_edges_for_entity_in_namespace(new_source, t.ns_a)
+            .expect("edge lookup");
+    assert_eq!(stored.len(), 1, "expected exactly one edge, got {stored:?}");
+    assert_eq!(stored[0].id, edge.id);
+    assert_eq!(stored[0].source, new_source, "`source` was not updated");
+    assert_eq!(stored[0].target, new_target, "`target` was not updated");
+    assert_eq!(
+        stored[0].valid_at, new_valid_at,
+        "`valid_at` was not updated"
+    );
+
+    assert!(
+        t.db.get_edges_for_entity_in_namespace(original_source, t.ns_a)
+            .expect("edge lookup")
+            .is_empty(),
+        "the edge still resolves from the endpoint it was moved off"
+    );
+}

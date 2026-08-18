@@ -68,7 +68,7 @@ impl ScopedPool {
     ///
     /// A connection from here carries whatever namespace the previous checkout
     /// left set, so it must never run a statement against a table that carries
-    /// a `namespace_isolation_*` policy. Two uses are legitimate:
+    /// a `namespace_isolation_*` policy. Three uses are legitimate:
     ///
     /// * DDL, which RLS does not apply to.
     /// * Queries against `namespaces` and `activity_events`, neither of which

@@ -333,7 +333,7 @@ impl SqliteBackend {
         // The added column is NULLABLE, matching every prior column addition
         // here (v1's `agent_id` / `user_id`, v2's typed slots, v4's
         // supersession columns): `SQLite` cannot add a NOT NULL column without
-        // a default, and tightening one afterwards means rebuilding the table.
+        // a default, and tightening one afterward means rebuilding the table.
         // Fresh stores get `namespace_id TEXT NOT NULL` from `SCHEMA` above,
         // and both backends' `save_edge` always writes it.
         if max_applied < 5 {

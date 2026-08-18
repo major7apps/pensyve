@@ -1386,6 +1386,62 @@ fn save_edge_still_upserts_within_its_own_namespace() {
         .expect("an idempotent re-save must not be mistaken for a collision");
 }
 
+/// A same-namespace re-save must move the edge's endpoints and its validity
+/// stamp, not just its label.
+///
+/// The two backends write their own `save_edge` SQL, so their conflict
+/// handlers can drift apart silently: Postgres' `DO UPDATE` set list omitted
+/// `source`, `target` and `valid_at`, so a re-save that repointed an edge took
+/// effect on `SQLite` and was dropped here, both reporting Ok. This is the
+/// parity gate; `save_edge_repoints_an_edge_on_a_same_namespace_resave` in
+/// `tests/test_namespace_scoping.rs` is the same contract on `SQLite`.
+#[test]
+fn save_edge_repoints_an_edge_on_a_same_namespace_resave() {
+    let Some(admin_opts) = skip_notice("save_edge_repoints_an_edge_on_a_same_namespace_resave")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns = Namespace::new(format!("edge-repoint-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns).expect("save namespace");
+
+    let original_source = Uuid::new_v4();
+    let mut edge = Edge::new(original_source, Uuid::new_v4(), "reports_to");
+    backend.save_edge(&edge, ns.id).expect("save the edge");
+
+    let new_source = Uuid::new_v4();
+    let new_target = Uuid::new_v4();
+    let new_valid_at = "2020-01-02T03:04:05Z"
+        .parse::<chrono::DateTime<Utc>>()
+        .expect("parse fixed timestamp");
+    edge.source = new_source;
+    edge.target = new_target;
+    edge.valid_at = new_valid_at;
+    backend.save_edge(&edge, ns.id).expect("re-save the edge");
+
+    let stored = backend
+        .get_edges_for_entity_in_namespace(new_source, ns.id)
+        .expect("read the edge back");
+    assert_eq!(stored.len(), 1, "expected exactly one edge, got {stored:?}");
+    assert_eq!(stored[0].id, edge.id);
+    assert_eq!(stored[0].source, new_source, "`source` was not updated");
+    assert_eq!(stored[0].target, new_target, "`target` was not updated");
+    assert_eq!(
+        stored[0].valid_at, new_valid_at,
+        "`valid_at` was not updated"
+    );
+
+    assert!(
+        backend
+            .get_edges_for_entity_in_namespace(original_source, ns.id)
+            .expect("read the edge back")
+            .is_empty(),
+        "the edge still resolves from the endpoint it was moved off"
+    );
+}
+
 /// The edges migration must never delete a row on the strength of a read that
 /// RLS may have blinded.
 ///

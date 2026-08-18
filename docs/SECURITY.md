@@ -143,7 +143,7 @@ this if `edges` actually holds rows; an empty `edges` table migrates cleanly
 under enforcement, and so does a database that has already been migrated. To
 clear the refusal, apply the schema once as a role the policies do not apply
 to, or `ALTER TABLE entities NO FORCE ROW LEVEL SECURITY` for the duration of
-the upgrade and restore it afterwards.
+the upgrade and restore it afterward.
 
 #### Applying enforcement
 

@@ -234,28 +234,38 @@ BEGIN
         RETURN;
     END IF;
 
-    IF EXISTS (SELECT 1 FROM edges WHERE namespace_id IS NULL) THEN
-        UPDATE edges
-           SET namespace_id = entities.namespace_id
-          FROM entities
-         WHERE entities.id = edges.source
-           AND edges.namespace_id IS NULL;
+    -- Only the reads can be blinded, so only the reads are wrapped. The
+    -- handler explains one specific failure, and a handler that spans more
+    -- than the statements it explains turns every other 42501 in range into
+    -- that same wrong answer — `ALTER TABLE` raises 42501 for want of table
+    -- ownership, which this advice would send an operator chasing RLS over.
+    BEGIN
+        IF EXISTS (SELECT 1 FROM edges WHERE namespace_id IS NULL) THEN
+            UPDATE edges
+               SET namespace_id = entities.namespace_id
+              FROM entities
+             WHERE entities.id = edges.source
+               AND edges.namespace_id IS NULL;
 
-        DELETE FROM edges WHERE namespace_id IS NULL;
-        GET DIAGNOSTICS orphaned = ROW_COUNT;
-        IF orphaned > 0 THEN
-            RAISE NOTICE 'pensyve: deleted % orphan edge row(s) whose source entity no longer exists', orphaned;
+            DELETE FROM edges WHERE namespace_id IS NULL;
+            GET DIAGNOSTICS orphaned = ROW_COUNT;
+            IF orphaned > 0 THEN
+                RAISE NOTICE 'pensyve: deleted % orphan edge row(s) whose source entity no longer exists', orphaned;
+            END IF;
         END IF;
-    END IF;
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE EXCEPTION 'pensyve: refusing to migrate edges.namespace_id (%)', SQLERRM
+            USING HINT = 'Row-level security hid a table this migration has to read, so it '
+                         'cannot tell an orphan edge from one it simply cannot see, and it '
+                         'will not delete on that basis. Re-run the schema as a role the '
+                         'policies do not apply to, or lift enforcement on entities for the '
+                         'duration of the upgrade. See docs/SECURITY.md.';
+    END;
 
+    -- Outside the handler on purpose: this is DDL, RLS does not apply to it,
+    -- and its own error ("must be owner of table edges", "column contains null
+    -- values") is already the most useful thing an operator can be told.
     ALTER TABLE edges ALTER COLUMN namespace_id SET NOT NULL;
-EXCEPTION WHEN insufficient_privilege THEN
-    RAISE EXCEPTION 'pensyve: refusing to migrate edges.namespace_id (%)', SQLERRM
-        USING HINT = 'Row-level security hid a table this migration has to read, so it '
-                     'cannot tell an orphan edge from one it simply cannot see, and it '
-                     'will not delete on that basis. Re-run the schema as a role the '
-                     'policies do not apply to, or lift enforcement on entities for the '
-                     'duration of the upgrade. See docs/SECURITY.md.';
 END $$;
 
 RESET row_security;

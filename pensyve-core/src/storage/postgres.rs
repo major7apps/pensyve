@@ -1999,6 +1999,13 @@ impl StorageTrait for PostgresBackend {
             // schema owner, which is exempt from its own policies, so RLS is
             // inert and the predicate below is the only thing standing there.
             //
+            // The SET list restates every column the insert supplies, matching
+            // `SqliteBackend::save_edge`. Omitting `source`, `target` or
+            // `valid_at` would make a re-save that repoints an edge take effect
+            // on one backend and vanish on the other, both returning Ok;
+            // `save_edge_repoints_an_edge_on_a_same_namespace_resave` exists on
+            // both sides to keep the two set lists honest.
+            //
             // `RETURNING id` is how the outcome is observed. When the `WHERE`
             // fails the statement affects no row and returns none, which is
             // rejected rather than skipped: a colliding id is a caller bug or
@@ -2008,7 +2015,8 @@ impl StorageTrait for PostgresBackend {
                 r"INSERT INTO edges (id, namespace_id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata)
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                    ON CONFLICT (id) DO UPDATE SET
-                       relation = $5, weight = $6, invalid_at = $8, superseded_by = $9, metadata = $10
+                       source = $3, target = $4, relation = $5, weight = $6, valid_at = $7,
+                       invalid_at = $8, superseded_by = $9, metadata = $10
                      WHERE edges.namespace_id = EXCLUDED.namespace_id
                    RETURNING id",
             )
