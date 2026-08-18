@@ -404,8 +404,17 @@ impl PostgresBackend {
             // `to_regclass` yields NULL instead of raising for an absent
             // relation, so this cannot poison the connection on a fresh
             // database.
+            //
+            // Deliberately unqualified. `CREATE TABLE pensyve_schema_state` in
+            // the schema file and the `SELECT` below both resolve through
+            // `search_path`, so the probe has to resolve the same way or it
+            // asks about a different relation than the one it gates. Qualified
+            // as `public.`, a deployment with a non-default `search_path` would
+            // create the marker elsewhere, read NULL here forever, and never
+            // stop re-applying the schema — which fails safe for an owner and
+            // makes a non-owner permanently unstartable.
             let (present,): (Option<String>,) =
-                query_as::<Postgres, _>("SELECT to_regclass('public.pensyve_schema_state')::text")
+                query_as::<Postgres, _>("SELECT to_regclass('pensyve_schema_state')::text")
                     .fetch_one(&mut *conn)
                     .await
                     .map_err(sqlx_to_io)?;

@@ -2670,6 +2670,91 @@ fn the_schema_skip_follows_the_schema_text() {
     );
 }
 
+/// The applied-schema probe must resolve the marker the same way the
+/// statements it gates do.
+///
+/// `CREATE TABLE pensyve_schema_state` in the schema file, the `SELECT` that
+/// reads the digest and the `INSERT` that stamps it all resolve through
+/// `search_path`. A probe qualified as `public.pensyve_schema_state` would
+/// therefore ask about a different relation than the one it gates on any
+/// deployment whose role carries a non-default `search_path`: the marker lands
+/// wherever `search_path` puts it, `to_regclass` returns NULL forever, and the
+/// DDL batch is re-applied on every startup — harmless for an owner, and
+/// permanently unstartable for the non-owner serving role this whole mechanism
+/// exists to support. Silently, with no error to notice.
+///
+/// So this stages exactly that: the marker moved out of `public`, and the role
+/// pointed at the schema holding it. Startup must still skip.
+#[test]
+fn the_schema_probe_resolves_the_marker_through_search_path() {
+    let Some(admin_opts) = skip_notice("the_schema_probe_resolves_the_marker_through_search_path")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let alt = format!("alt_{}", Uuid::new_v4().simple());
+
+    // Move the marker out of `public` and point the role's `search_path` at
+    // where it now lives. `ALTER TABLE ... SET SCHEMA` needs ownership, which
+    // the fixture role has, but `CREATE SCHEMA` and `ALTER ROLE` need the
+    // admin.
+    let role = fixture.role.clone();
+    let database = fixture.database.clone();
+    with_admin_pool(&fixture.rt, &admin_opts, &database, |rt, pool| {
+        rt.block_on(async {
+            exec(
+                pool,
+                format!("CREATE SCHEMA \"{alt}\" AUTHORIZATION \"{role}\""),
+            )
+            .await;
+            exec(
+                pool,
+                format!(
+                    "ALTER ROLE \"{role}\" IN DATABASE \"{database}\" \
+                     SET search_path = \"{alt}\", public"
+                ),
+            )
+            .await;
+        });
+    });
+    fixture.rt.block_on(async {
+        exec(
+            fixture.backend.pool(),
+            format!("ALTER TABLE public.pensyve_schema_state SET SCHEMA \"{alt}\""),
+        )
+        .await;
+    });
+
+    let applied_at = |label: &str| -> DateTime<Utc> {
+        with_admin_pool(&fixture.rt, &admin_opts, &database, |rt, pool| {
+            rt.block_on(async {
+                // Identifier is a hex-only name generated in this module, so
+                // `AssertSqlSafe` is sound — same rule as `exec`.
+                let (at,): (DateTime<Utc>,) = query_as::<Postgres, _>(AssertSqlSafe(format!(
+                    "SELECT applied_at FROM \"{alt}\".pensyve_schema_state WHERE id = 1"
+                )))
+                .fetch_one(pool)
+                .await
+                .unwrap_or_else(|e| panic!("read relocated schema state ({label}): {e}"));
+                at
+            })
+        })
+    };
+    let before = applied_at("after relocating the marker");
+
+    let restarted = PostgresBackend::from_pool(fixture.pool_for(&admin_opts, &role))
+        .expect("restart against a marker outside `public`");
+    drop(restarted);
+
+    assert_eq!(
+        applied_at("after restarting"),
+        before,
+        "startup re-applied the schema even though the marker names this build's digest, \
+         so the probe resolved a different relation than the statements it gates. A \
+         non-owner serving role would never be able to start on this deployment."
+    );
+}
+
 /// Every table in [`RLS_POLICIES`] must carry exactly one policy, named as
 /// expected and qualified by the namespace GUC, as Postgres actually
 /// registered it.
