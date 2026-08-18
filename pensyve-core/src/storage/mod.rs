@@ -545,6 +545,13 @@ pub trait StorageTrait: Send + Sync {
     // globally unique, so before the parameter existed the read matched on
     // entity id alone and crossed tenants, and the write left the row
     // attributed to nobody.
+    //
+    // Consequence of source-namespace ownership: an edge whose source is in A
+    // and whose target is in B is stored in A and is therefore invisible from
+    // B, including on B's `target` leg — so an erase running in B will not see
+    // it and cannot delete it (pinned by
+    // `an_edge_belongs_to_its_source_entitys_namespace_only`; #264 owns the
+    // erase-side consequence).
     fn save_edge(&self, edge: &Edge, namespace_id: Uuid) -> StorageResult<()>;
     fn get_edges_for_entity_in_namespace(
         &self,

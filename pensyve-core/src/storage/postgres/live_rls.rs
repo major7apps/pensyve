@@ -1247,6 +1247,125 @@ fn schema_migrates_a_database_that_predates_the_edges_namespace() {
     );
 }
 
+/// The edges migration must never delete a row on the strength of a read that
+/// RLS may have blinded.
+///
+/// `run_schema` sends the whole schema through `ScopedPool::unbound`, a
+/// connection with no `pensyve.namespace_id` bound. On a deployment that has
+/// applied `postgres_rls_enforce.sql`, `entities` is forced, so it reads back
+/// *empty* on that connection. The backfill then matches nothing, and the
+/// `DELETE FROM edges WHERE namespace_id IS NULL` that follows sees every edge
+/// as an orphan — on a table the operator's older on-disk enforce file never
+/// forced, so nothing stops it. The batch commits and the graph is gone.
+///
+/// This test stages exactly that deployment: `entities` enforced,
+/// `edges` back in its pre-migration shape and un-enforced, both an
+/// attributable edge and a real orphan present. The migration has to refuse
+/// rather than guess, so the attributable edge survives.
+///
+/// [`schema_migrates_a_database_that_predates_the_edges_namespace`] is the
+/// same migration on an un-enforced database, which is every deployment
+/// today; that one must still backfill and delete.
+#[test]
+fn schema_migration_refuses_rather_than_deleting_edges_it_cannot_attribute() {
+    let Some(admin_opts) =
+        skip_notice("schema_migration_refuses_rather_than_deleting_edges_it_cannot_attribute")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns = Namespace::new(format!("edges-blinded-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns).expect("save namespace");
+    let mut entity = Entity::new("alice", EntityKind::User);
+    entity.namespace_id = ns.id;
+    backend.save_entity(&entity).expect("save source entity");
+
+    fixture.enforce_rls();
+
+    // Stage the pre-migration deployment: `edges` as it was before it carried
+    // a namespace, and — like the operator's older enforce file — not FORCEd,
+    // while `entities` stays enforced. That asymmetry is the whole hazard:
+    // the read is blinded, the delete is not.
+    fixture.rt.block_on(async {
+        for statement in [
+            "DROP POLICY IF EXISTS namespace_isolation_edges ON edges",
+            "ALTER TABLE edges NO FORCE ROW LEVEL SECURITY",
+            "ALTER TABLE edges DISABLE ROW LEVEL SECURITY",
+            "DROP INDEX IF EXISTS idx_edges_namespace",
+            "ALTER TABLE edges DROP COLUMN namespace_id",
+        ] {
+            exec(backend.pool(), statement).await;
+        }
+    });
+
+    let attributable = Uuid::new_v4();
+    let orphan = Uuid::new_v4();
+    fixture.rt.block_on(async {
+        for (id, source) in [(attributable, entity.id), (orphan, Uuid::new_v4())] {
+            exec(
+                backend.pool(),
+                format!(
+                    "INSERT INTO edges (id, source, target, relation)
+                     VALUES ('{id}', '{source}', '{}', 'reports_to')",
+                    Uuid::new_v4()
+                ),
+            )
+            .await;
+        }
+    });
+
+    // Clear the namespace GUC first. `PostgresBackend::new` builds its pool and
+    // immediately runs the schema, so `run_schema` gets a connection that has
+    // never bound one. This fixture's pool is deliberately single-connection,
+    // so without this the schema would inherit whatever the last `save_entity`
+    // left set and read `entities` through *that* namespace — which is a
+    // different, luckier bug than the one being pinned.
+    fixture.rt.block_on(async {
+        exec(
+            backend.pool(),
+            "SELECT set_config('pensyve.namespace_id', '', false)",
+        )
+        .await;
+    });
+
+    // Re-apply the schema exactly as a startup would.
+    let outcome = fixture
+        .rt
+        .block_on(async { raw_sql(super::SCHEMA).execute(backend.pool()).await });
+
+    let surviving: Vec<(Uuid,)> = fixture.rt.block_on(async {
+        query_as::<Postgres, _>("SELECT id FROM edges ORDER BY id")
+            .fetch_all(backend.pool())
+            .await
+            .expect("read edges after the schema apply")
+    });
+    let surviving: Vec<Uuid> = surviving.into_iter().map(|(id,)| id).collect();
+    assert!(
+        surviving.contains(&attributable),
+        "the migration destroyed edge {attributable}, whose source entity exists, because \
+         RLS hid `entities` from the connection the schema runs on. Edges left: {surviving:?}"
+    );
+    assert!(
+        surviving.contains(&orphan),
+        "the migration deleted edge {orphan} as an orphan on the strength of a blinded \
+         read. It may well be an orphan, but this connection cannot know that. \
+         Edges left: {surviving:?}"
+    );
+
+    let error = outcome.expect_err(
+        "the schema must fail loudly when it cannot read `entities` truthfully; \
+         succeeding means it decided something about edges it had no basis to decide",
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("row-level security"),
+        "the refusal should name row-level security as the reason, so an operator knows \
+         what to do about it; got: {message}"
+    );
+}
+
 /// The accessor callers use to collect vector-index ids before an entity-wide
 /// forget must return exactly what [`entity_delete_is_confined_to_its_namespace`]
 /// deletes — every shape, superseded rows included, and only this namespace's
@@ -1930,6 +2049,65 @@ fn only_bound_connections_reach_policied_tables() {
              namespace. Go through `scoped_conn`, `maybe_scoped_conn`, or an allowlisted \
              `unbound()` call."
         );
+    }
+}
+
+/// The other half of the `unbound()` rule: what the SQL it executes may do.
+///
+/// [`only_bound_connections_reach_policied_tables`] counts *call sites*, so it
+/// cannot see DML being added to `postgres_schema.sql` — the file `run_schema`
+/// puts through an unbound connection. DML there against a policied table
+/// reads through whatever namespace the previous checkout left set, or through
+/// none at all and sees nothing, and neither is an error the statement can
+/// notice.
+///
+/// So the rule for this file is: no DML against a policied table except under
+/// `SET row_security = off`, which turns a blinded read into a raised error
+/// instead of a wrong answer. The edges backfill is the only DML the schema
+/// has; before the guard it read an empty `entities` on an enforced deployment
+/// and deleted every edge as an orphan.
+#[test]
+fn schema_dml_on_policied_tables_cannot_be_silently_blinded() {
+    const GUARD: &str = "SET row_security = off;";
+    // Comments stripped: this file explains the guard at length, and prose
+    // must not be able to satisfy an assertion about what it executes.
+    let normalized = sql_statements_only(super::SCHEMA);
+
+    assert_eq!(
+        normalized.matches(GUARD).count(),
+        1,
+        "postgres_schema.sql should turn `row_security` off exactly once, around the \
+         migrations that have to read a policied table"
+    );
+    assert!(
+        normalized.contains("RESET row_security;"),
+        "postgres_schema.sql turns `row_security` off without turning it back on. The \
+         setting is rolled back when the batch aborts, but on the committing path it \
+         would ride the pooled connection into the next checkout"
+    );
+
+    let guard_at = normalized
+        .find(GUARD)
+        .expect("the guard is present, asserted above");
+    let reset_at = normalized
+        .find("RESET row_security;")
+        .expect("the reset is present, asserted above");
+    assert!(
+        guard_at < reset_at,
+        "`RESET row_security` precedes the `SET`, so the DML between them is unguarded"
+    );
+
+    for verb in ["INSERT INTO ", "UPDATE ", "DELETE FROM "] {
+        for (offset, _) in normalized.match_indices(verb) {
+            assert!(
+                offset > guard_at && offset < reset_at,
+                "postgres_schema.sql issues `{verb}...` outside the \
+                 `SET row_security = off` … `RESET row_security` window. The schema runs \
+                 on an unbound connection, so that statement reads through whatever \
+                 namespace the previous checkout left set — silently, with no error to \
+                 notice. Move it inside the window, or take it out of the schema."
+            );
+        }
     }
 }
 

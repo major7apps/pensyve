@@ -117,11 +117,33 @@ edge belongs to the namespace of its source entity — plus a
 bind it on their connection, so the graph is covered by both layers rather than
 by neither. Erasing edges rather than only counting them is #264.
 
+Source-namespace ownership has one consequence worth stating plainly: an edge
+whose source is in namespace A and whose target is in namespace B is stored in
+A, so B cannot see it at all — not even on the `target` leg, where B would
+otherwise expect to find an edge pointing at its own entity. An erase running
+in B therefore does not see and does not delete A's edge into B. That is the
+intended trade (the edge is A's data, and B must not be handed a read into A),
+and #264 owns what the erase side does about it.
+
 Databases provisioned before the column existed are migrated in place: the
 column is backfilled from `entities.namespace_id` via `edges.source`, and edges
 whose source entity no longer exists are deleted, because they can be
 attributed to no namespace and no scoped accessor can reach them. On Postgres
 the count is reported as a `NOTICE`; on `SQLite` it is logged at `WARN`.
+
+**If you have already applied enforcement, the Postgres migration may refuse to
+run, and that refusal is doing its job.** `run_schema` sends the schema through
+a connection with no namespace bound. Under enforcement that connection reads
+`entities` as empty, which would make the backfill match nothing and the orphan
+delete match everything — silently destroying the graph. The migration
+therefore runs under `SET row_security = off`, which makes Postgres raise
+rather than filter, and it aborts the whole schema batch with
+`refusing to migrate edges.namespace_id`. Nothing is written. You will only see
+this if `edges` actually holds rows; an empty `edges` table migrates cleanly
+under enforcement, and so does a database that has already been migrated. To
+clear the refusal, apply the schema once as a role the policies do not apply
+to, or `ALTER TABLE entities NO FORCE ROW LEVEL SECURITY` for the duration of
+the upgrade and restore it afterwards.
 
 #### Applying enforcement
 

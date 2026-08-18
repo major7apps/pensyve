@@ -193,28 +193,72 @@ CREATE TABLE IF NOT EXISTS edges (
 -- An edge belongs to the namespace of its source entity, which is where the
 -- extraction path that writes edges already stands. Rows whose source entity
 -- no longer exists cannot be attributed to anything and no scoped accessor
--- could ever reach them, so they are deleted; the DO block is only there to
--- report how many. On a fresh database every statement here is a no-op:
--- the column already exists and is already NOT NULL, and there are no rows.
+-- could ever reach them, so they are deleted.
+--
+-- # Why `row_security = off`, and why it is the safe setting here
+--
+-- `PostgresBackend::run_schema` sends this file through
+-- `ScopedPool::unbound`, a connection with no `pensyve.namespace_id` bound.
+-- On a deployment that has applied `postgres_rls_enforce.sql`, `entities` is
+-- FORCEd, so through that connection it reads back EMPTY. The backfill below
+-- would then match nothing, and the delete that follows would see every edge
+-- as an orphan — on a table an older on-disk enforce file never FORCEd, so
+-- nothing would stop it. The batch would commit and the graph would be gone.
+--
+-- `row_security = off` does not bypass anything. It tells Postgres to RAISE
+-- instead of silently filtering, so a connection that cannot read `entities`
+-- truthfully fails loudly rather than deleting on the strength of a blinded
+-- read. The invariant is: never delete an edge on the basis of a read RLS may
+-- have narrowed. An operator who hits the refusal runs the migration as a
+-- role the policies do not apply to, or NO FORCEs `entities` for its duration.
+--
+-- The `attnotnull` gate is a catalog read, which RLS never filters, so an
+-- already-migrated database skips the guarded body entirely and an enforced
+-- deployment keeps starting normally. The `EXISTS` gate means a deployment
+-- whose `edges` table is empty — the common case, since nothing wrote edges
+-- before this change — migrates cleanly under enforcement too, instead of
+-- refusing over rows that do not exist.
+--
+-- On a fresh database every statement here is a no-op: the column already
+-- exists and is already NOT NULL, so the gate returns immediately.
 ALTER TABLE edges ADD COLUMN IF NOT EXISTS namespace_id UUID;
 
-UPDATE edges
-   SET namespace_id = entities.namespace_id
-  FROM entities
- WHERE entities.id = edges.source
-   AND edges.namespace_id IS NULL;
+SET row_security = off;
 
 DO $$
 DECLARE orphaned BIGINT;
 BEGIN
-    DELETE FROM edges WHERE namespace_id IS NULL;
-    GET DIAGNOSTICS orphaned = ROW_COUNT;
-    IF orphaned > 0 THEN
-        RAISE NOTICE 'pensyve: deleted % orphan edge row(s) whose source entity no longer exists', orphaned;
+    IF (SELECT attnotnull FROM pg_attribute
+         WHERE attrelid = 'public.edges'::regclass
+           AND attname = 'namespace_id') THEN
+        RETURN;
     END IF;
+
+    IF EXISTS (SELECT 1 FROM edges WHERE namespace_id IS NULL) THEN
+        UPDATE edges
+           SET namespace_id = entities.namespace_id
+          FROM entities
+         WHERE entities.id = edges.source
+           AND edges.namespace_id IS NULL;
+
+        DELETE FROM edges WHERE namespace_id IS NULL;
+        GET DIAGNOSTICS orphaned = ROW_COUNT;
+        IF orphaned > 0 THEN
+            RAISE NOTICE 'pensyve: deleted % orphan edge row(s) whose source entity no longer exists', orphaned;
+        END IF;
+    END IF;
+
+    ALTER TABLE edges ALTER COLUMN namespace_id SET NOT NULL;
+EXCEPTION WHEN insufficient_privilege THEN
+    RAISE EXCEPTION 'pensyve: refusing to migrate edges.namespace_id (%)', SQLERRM
+        USING HINT = 'Row-level security hid a table this migration has to read, so it '
+                     'cannot tell an orphan edge from one it simply cannot see, and it '
+                     'will not delete on that basis. Re-run the schema as a role the '
+                     'policies do not apply to, or lift enforcement on entities for the '
+                     'duration of the upgrade. See docs/SECURITY.md.';
 END $$;
 
-ALTER TABLE edges ALTER COLUMN namespace_id SET NOT NULL;
+RESET row_security;
 
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);

@@ -296,3 +296,54 @@ fn get_edges_for_entity_in_namespace_partitions_a_shared_entity_id() {
     assert_eq!(seen_by_a[0].id, a_edge.id);
     assert_eq!(seen_by_a[0].relation, "belongs_to_a");
 }
+
+/// An edge belongs to the namespace of its **source** entity. That is the rule,
+/// and this test is where it is written down.
+///
+/// The consequence a caller has to know: an edge whose source is in A and whose
+/// target is in B is stored in A, so it is invisible from B — including on B's
+/// `target` leg, where B would otherwise expect to find it. B erasing the
+/// target entity therefore does not see, and cannot delete, A's edge pointing
+/// at it. That is deliberate (an edge is A's data, and B cannot be handed a
+/// read into A), and handling the erase-side consequence is #264.
+#[test]
+fn an_edge_belongs_to_its_source_entitys_namespace_only() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let t = two_tenants(&dir);
+
+    let source_in_a = Uuid::new_v4();
+    let target_in_b = Uuid::new_v4();
+    let crossing = Edge::new(source_in_a, target_in_b, "reports_to");
+    t.db.save_edge(&crossing, t.ns_a)
+        .expect("save the crossing edge into the source's namespace");
+
+    // A owns it, and reaches it from either end.
+    assert_eq!(
+        t.db.get_edges_for_entity_in_namespace(source_in_a, t.ns_a)
+            .expect("edge lookup")
+            .iter()
+            .map(|e| e.id)
+            .collect::<Vec<_>>(),
+        vec![crossing.id],
+        "the source's own namespace must reach the edge on the source leg"
+    );
+    assert_eq!(
+        t.db.get_edges_for_entity_in_namespace(target_in_b, t.ns_a)
+            .expect("edge lookup")
+            .iter()
+            .map(|e| e.id)
+            .collect::<Vec<_>>(),
+        vec![crossing.id],
+        "the target leg still resolves inside the owning namespace"
+    );
+
+    // B does not, even though the target is B's entity. This is the
+    // consequence #264 has to reckon with, not an accident.
+    assert!(
+        t.db.get_edges_for_entity_in_namespace(target_in_b, t.ns_b)
+            .expect("edge lookup")
+            .is_empty(),
+        "namespace B must not read an edge stored in namespace A, even one pointing \
+         at B's own entity"
+    );
+}
