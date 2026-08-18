@@ -172,8 +172,9 @@ pub struct ForgetOutcome {
 /// another's.
 ///
 /// `None` disables that bound. The serving states map their `0` sentinel to
-/// `None`, so `Some(0)` — which would evict the snapshot the current forget
-/// just wrote — is not a value this type is constructed with in production.
+/// `None`, so `Some(0)` is not a value this type is constructed with in
+/// production; should one reach [`forget_entity`] anyway, the snapshot that
+/// call just wrote is still exempt — see [`prune_namespace_dir_with`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPolicy {
     /// Evict snapshots captured longer ago than this.
@@ -309,8 +310,13 @@ fn forget_entity_with(
     // housekeeping charged to whichever caller happened to forget nothing.
     // Runs here rather than inside `persist` so a prune can never be part of
     // the transaction that the delete rolls back.
-    let pruned = if path.is_some() {
-        let outcome = prune_namespace_dir_with(&dir, retention, Utc::now(), remove_file);
+    let pruned = if let Some(written) = path.as_deref() {
+        // `written` is handed to the prune as protected, not left to sort its
+        // way to safety: it is the only recovery artifact for rows that are
+        // already gone, so it must not depend on every other name in the
+        // directory being honest about its capture time.
+        let outcome =
+            prune_namespace_dir_with(&dir, retention, Utc::now(), Some(written), remove_file);
         for warning in &outcome.warnings {
             tracing::warn!(
                 directory = %dir.display(),
@@ -354,7 +360,7 @@ pub fn prune_namespace_dir(
     policy: RetentionPolicy,
     now: DateTime<Utc>,
 ) -> PruneOutcome {
-    prune_namespace_dir_with(dir, policy, now, remove_snapshot_file)
+    prune_namespace_dir_with(dir, policy, now, None, remove_snapshot_file)
 }
 
 /// The real removal retention performs, named so it has the `for<'a>` signature
@@ -364,10 +370,23 @@ fn remove_snapshot_file(path: &Path) -> std::io::Result<()> {
     std::fs::remove_file(path)
 }
 
+/// [`prune_namespace_dir`] with the file removal injected, and with one file in
+/// the directory declared off-limits.
+///
+/// `protected` is the snapshot the calling [`forget_entity`] just wrote. It
+/// cannot be left to survive on its ordering: that only holds while every other
+/// name in the directory tells the truth about its capture time, and a
+/// container whose clock steps backwards between two forgets leaves a
+/// future-dated sibling that sorts the new file oldest. Evicting it would mean
+/// rows destroyed with no artifact to restore them from — the fail-closed
+/// contract undone after the fact. So it is excluded structurally: exempt from
+/// the age bound, sorted last so the count cap consumes genuinely older files
+/// first, and skipped outright at the point of removal.
 fn prune_namespace_dir_with(
     dir: &Path,
     policy: RetentionPolicy,
     now: DateTime<Utc>,
+    protected: Option<&Path>,
     remove_file: fn(&Path) -> std::io::Result<()>,
 ) -> PruneOutcome {
     let mut outcome = PruneOutcome::default();
@@ -385,11 +404,17 @@ fn prune_namespace_dir_with(
         }
     };
 
-    // `(captured_at, file_name)`: sorting the pair puts the oldest first and
-    // breaks ties on the name, so two snapshots captured in the same
-    // millisecond still evict in a fixed order rather than in whatever order
-    // the directory happened to be read.
-    let mut snapshots: Vec<(DateTime<Utc>, std::ffi::OsString)> = Vec::new();
+    // Same directory by construction, so the file name identifies the
+    // protected snapshot as well as its full path and does so without caring
+    // how the caller spelled the path.
+    let protected_name = protected.and_then(Path::file_name);
+
+    // `(is_protected, captured_at, file_name)`: sorting the triple puts the
+    // oldest first, breaks ties on the name so two snapshots captured in the
+    // same millisecond still evict in a fixed order rather than in whatever
+    // order the directory happened to be read, and puts the protected file
+    // last no matter what any name claims about its capture time.
+    let mut snapshots: Vec<(bool, DateTime<Utc>, std::ffi::OsString)> = Vec::new();
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -407,23 +432,35 @@ fn prune_namespace_dir_with(
         let Some(captured_at) = name.to_str().and_then(parse_snapshot_file_name) else {
             continue;
         };
-        snapshots.push((captured_at, name));
+        let is_protected = protected_name == Some(name.as_os_str());
+        snapshots.push((is_protected, captured_at, name));
     }
     snapshots.sort();
 
     let cutoff = policy
         .max_age_days
         .map(|days| now - Duration::days(i64::from(days)));
-    let (mut survivors, mut victims): (Vec<_>, Vec<_>) = snapshots
-        .into_iter()
-        .partition(|(captured_at, _)| cutoff.is_none_or(|cutoff| *captured_at >= cutoff));
+    let (mut survivors, mut victims): (Vec<_>, Vec<_>) =
+        snapshots
+            .into_iter()
+            .partition(|(is_protected, captured_at, _)| {
+                *is_protected || cutoff.is_none_or(|cutoff| *captured_at >= cutoff)
+            });
 
     if let Some(max) = policy.max_count {
         let excess = survivors.len().saturating_sub(max as usize);
         victims.extend(survivors.drain(..excess));
     }
 
-    for (_, name) in victims {
+    for (is_protected, _, name) in victims {
+        if is_protected {
+            // Only reachable through a `max_count` of `Some(0)`, which no
+            // configuration can produce (`0` disables the bound rather than
+            // meaning "keep none"). Skipped rather than asserted: the delete
+            // has already committed by the time this runs, so a policy nobody
+            // can set must not be able to take the artifact with it.
+            continue;
+        }
         let path = dir.join(name);
         match remove_file(&path) {
             Ok(()) => outcome.removed += 1,
@@ -1096,6 +1133,76 @@ mod tests {
         assert!(outcome.pruned.warnings.is_empty());
         assert!(path.exists(), "the snapshot just written must survive");
         assert_eq!(file_names(&dir).len(), 2);
+    }
+
+    /// The snapshot this call just wrote is never a victim of its own prune.
+    ///
+    /// Ordering by `captured_at` makes "the newest file survives" true only as
+    /// long as every name in the directory tells the truth about its time. A
+    /// container whose clock steps backwards between two forgets leaves a
+    /// future-dated sibling behind, and the new snapshot then sorts oldest —
+    /// the count cap would evict the one artifact standing between rows that
+    /// are already gone and no way back. Survival has to be structural.
+    #[test]
+    fn forget_entity_never_evicts_the_snapshot_it_just_wrote() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let root = f.dir.path().join("snapshots");
+        let dir = namespace_dir(&root, f.namespace.id);
+        let future = write_aged(&f, &dir, Utc::now() + Duration::days(365));
+
+        let outcome = forget_entity(
+            &f.storage,
+            f.entity.id,
+            None,
+            f.namespace.id,
+            &root,
+            RetentionPolicy {
+                max_age_days: None,
+                max_count: Some(1),
+            },
+        )
+        .unwrap();
+
+        let path = outcome.path.expect("a non-empty snapshot must be written");
+        assert!(
+            path.exists(),
+            "the snapshot this forget wrote must survive its own prune"
+        );
+        assert_eq!(outcome.pruned.removed, 1, "the cap must still be enforced");
+        assert!(outcome.pruned.warnings.is_empty());
+        assert!(!future.exists(), "the future-dated sibling is the victim");
+        assert_eq!(file_names(&dir).len(), 1);
+    }
+
+    /// The exemption is structural, not arithmetic: it holds even for the one
+    /// policy that asks for an empty directory, which no configuration can
+    /// produce but the public type can express.
+    #[test]
+    fn prune_spares_the_protected_file_even_under_a_zero_count_cap() {
+        let f = fixture();
+        let dir = f.dir.path().join("snapshots");
+        let stale = write_aged(&f, &dir, epoch());
+        let protected = write_aged(&f, &dir, epoch() + Duration::hours(1));
+
+        let outcome = prune_namespace_dir_with(
+            &dir,
+            RetentionPolicy {
+                max_age_days: Some(1),
+                max_count: Some(0),
+            },
+            epoch() + Duration::days(365),
+            Some(&protected),
+            remove_snapshot_file,
+        );
+
+        assert_eq!(outcome.removed, 1);
+        assert!(outcome.warnings.is_empty());
+        assert!(!stale.exists());
+        assert!(
+            protected.exists(),
+            "the protected snapshot must survive every policy"
+        );
     }
 
     /// Eviction is housekeeping, not part of the delete's contract: a prune
