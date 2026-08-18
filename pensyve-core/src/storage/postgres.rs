@@ -20,7 +20,9 @@ use crate::types::{
     Outcome, ProceduralMemory, SemanticMemory,
 };
 
-use super::{ActivityAggregate, ActivityEvent, StorageResult, StorageTrait};
+use super::{
+    ActivityAggregate, ActivityEvent, StorageResult, StorageTrait, cross_namespace_edge_id,
+};
 use crate::graph::EdgeType;
 
 // ---------------------------------------------------------------------------
@@ -1989,11 +1991,26 @@ impl StorageTrait for PostgresBackend {
         let metadata = serde_json::to_value(&edge.metadata)?;
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
-            query::<Postgres>(
+            // `edges.id` is the primary key on its own, and edge ids are
+            // caller-supplied, so `ON CONFLICT (id)` alone lands on whatever
+            // row already holds the id — another tenant's included. The
+            // namespace-bound connection does not cover this: in the shape
+            // every deployment ships today the application connects as the
+            // schema owner, which is exempt from its own policies, so RLS is
+            // inert and the predicate below is the only thing standing there.
+            //
+            // `RETURNING id` is how the outcome is observed. When the `WHERE`
+            // fails the statement affects no row and returns none, which is
+            // rejected rather than skipped: a colliding id is a caller bug or
+            // an attack, and returning Ok for a write that did not happen is
+            // how a caller ends up trusting a store that never took its data.
+            let landed: Option<(Uuid,)> = query_as::<Postgres, _>(
                 r"INSERT INTO edges (id, namespace_id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata)
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                    ON CONFLICT (id) DO UPDATE SET
-                       relation = $5, weight = $6, invalid_at = $8, superseded_by = $9, metadata = $10",
+                       relation = $5, weight = $6, invalid_at = $8, superseded_by = $9, metadata = $10
+                     WHERE edges.namespace_id = EXCLUDED.namespace_id
+                   RETURNING id",
             )
             .bind(edge.id)
             .bind(namespace_id)
@@ -2005,9 +2022,12 @@ impl StorageTrait for PostgresBackend {
             .bind(edge.invalid_at)
             .bind(edge.superseded_by)
             .bind(&metadata)
-            .execute(&mut *conn)
+            .fetch_optional(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
+            if landed.is_none() {
+                return Err(cross_namespace_edge_id(edge.id));
+            }
             Ok(())
         })
     }

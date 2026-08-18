@@ -1247,6 +1247,145 @@ fn schema_migrates_a_database_that_predates_the_edges_namespace() {
     );
 }
 
+/// `save_edge` must not let one namespace write through another's edge id.
+///
+/// `edges.id` is the primary key on its own, and edge ids are caller-supplied
+/// UUIDs, so an upsert keyed on id alone lands on whatever row already holds
+/// that id — including another tenant's. The namespace-bound connection is no
+/// protection here: this runs **without** enforcement, which is the shape every
+/// deployment ships today, because the application connects as the schema owner
+/// and the owner is exempt from its own policies.
+///
+/// So the predicate has to do the work, and it has to reject rather than skip:
+/// a colliding id is a caller bug or an attack, and silently doing nothing
+/// would report success for a write that never happened.
+#[test]
+fn save_edge_rejects_an_id_that_belongs_to_another_namespace() {
+    let Some(admin_opts) = skip_notice("save_edge_rejects_an_id_that_belongs_to_another_namespace")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns_a = Namespace::new(format!("edge-write-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("edge-write-b-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns_a).expect("save namespace A");
+    backend.save_namespace(&ns_b).expect("save namespace B");
+
+    let mine = Edge::new(Uuid::new_v4(), Uuid::new_v4(), "reports_to");
+    backend.save_edge(&mine, ns_a.id).expect("save A's edge");
+
+    // The whole row as one text literal: a rejected write has to leave every
+    // column exactly as it was, not merely leave the row in place.
+    let row_verbatim = |id: Uuid| -> String {
+        fixture.rt.block_on(async {
+            let (row,): (String,) =
+                query_as::<Postgres, _>("SELECT edges::text FROM edges WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(backend.pool())
+                    .await
+                    .expect("read the edge row verbatim");
+            row
+        })
+    };
+    let before = row_verbatim(mine.id);
+
+    // B names A's edge id and rewrites every field around it.
+    let mut theirs = Edge::new(Uuid::new_v4(), Uuid::new_v4(), "hijacked");
+    theirs.id = mine.id;
+    theirs.weight = 99.0;
+    theirs.superseded_by = Some(Uuid::new_v4());
+
+    let error = backend
+        .save_edge(&theirs, ns_b.id)
+        .expect_err("a save into namespace B must not land on namespace A's edge id");
+
+    assert_eq!(
+        row_verbatim(mine.id),
+        before,
+        "namespace A's edge row was modified by a write issued for namespace B"
+    );
+
+    let message = error.to_string();
+    assert!(
+        message.contains("namespace"),
+        "the rejection should name the invariant it is protecting; got: {message}"
+    );
+    assert!(
+        !message.contains(&ns_a.id.to_string()) && !message.contains("reports_to"),
+        "the rejection leaks the other tenant's data back to the caller: {message}"
+    );
+
+    // A still reads its edge; B still has none.
+    assert_eq!(
+        backend
+            .get_edges_for_entity_in_namespace(mine.source, ns_a.id)
+            .expect("read namespace A's edges")
+            .iter()
+            .map(|edge| edge.id)
+            .collect::<Vec<_>>(),
+        vec![mine.id],
+    );
+    assert!(
+        backend
+            .get_edges_for_entity_in_namespace(theirs.source, ns_b.id)
+            .expect("read namespace B's edges")
+            .is_empty(),
+        "the rejected write left a row behind in namespace B"
+    );
+}
+
+/// The guard must only catch the cross-namespace case. Re-saving an edge inside
+/// its own namespace is the ordinary update path and has to keep working.
+#[test]
+fn save_edge_still_upserts_within_its_own_namespace() {
+    let Some(admin_opts) = skip_notice("save_edge_still_upserts_within_its_own_namespace") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns = Namespace::new(format!("edge-upsert-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns).expect("save namespace");
+
+    let entity = Uuid::new_v4();
+    let mut edge = Edge::new(entity, Uuid::new_v4(), "reports_to");
+    backend.save_edge(&edge, ns.id).expect("save the edge");
+
+    edge.relation = "reported_to".to_string();
+    edge.weight = 0.25;
+    edge.invalid_at = Some(edge.valid_at);
+    backend
+        .save_edge(&edge, ns.id)
+        .expect("re-saving an edge in its own namespace must still update it");
+
+    let stored = backend
+        .get_edges_for_entity_in_namespace(entity, ns.id)
+        .expect("read the edge back");
+
+    assert_eq!(
+        stored.len(),
+        1,
+        "the update should not have inserted a second row"
+    );
+    assert_eq!(stored[0].id, edge.id);
+    assert_eq!(stored[0].relation, "reported_to");
+    assert!((stored[0].weight - 0.25).abs() < f32::EPSILON);
+    assert!(
+        stored[0].invalid_at.is_some(),
+        "the invalidation stamp must have landed"
+    );
+
+    // Re-saving the very same edge again changes no column. The rejection is
+    // driven by whether the statement returned a row, so a write that happens
+    // to be a no-op must still count as having landed — otherwise an
+    // idempotent retry looks exactly like a cross-namespace collision.
+    backend
+        .save_edge(&edge, ns.id)
+        .expect("an idempotent re-save must not be mistaken for a collision");
+}
+
 /// The edges migration must never delete a row on the strength of a read that
 /// RLS may have blinded.
 ///

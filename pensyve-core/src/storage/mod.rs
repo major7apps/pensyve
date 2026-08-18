@@ -36,6 +36,22 @@ pub enum StorageError {
 
 pub type StorageResult<T> = Result<T, StorageError>;
 
+/// Rejection returned by `save_edge` when the supplied edge id already exists
+/// in a different namespace.
+///
+/// Shared by both backends so the contract reads the same whichever one is
+/// mounted. It names the rule the caller broke and the id the caller itself
+/// supplied, and nothing else: the row it collided with belongs to another
+/// tenant, so describing it — its namespace, its relation, even its existence
+/// in a particular namespace — would answer a question the caller has no right
+/// to ask.
+pub(crate) fn cross_namespace_edge_id(edge_id: Uuid) -> StorageError {
+    StorageError::Context(format!(
+        "edge {edge_id} already exists outside this namespace; edge ids are unique across \
+         the whole store, so a save cannot claim one that another namespace owns"
+    ))
+}
+
 fn capturing_delete_not_implemented() -> StorageResult<Vec<Memory>> {
     Err(StorageError::Context(
         "storage backend does not implement capturing entity deletion, \

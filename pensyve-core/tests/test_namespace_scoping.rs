@@ -347,3 +347,117 @@ fn an_edge_belongs_to_its_source_entitys_namespace_only() {
          at B's own entity"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Edge writes
+//
+// Edge ids are caller-supplied UUIDs and the primary key is the id alone, not
+// (namespace, id). A save that upserted on id would therefore let one tenant
+// overwrite — or, with `INSERT OR REPLACE`, take ownership of — another
+// tenant's edge by naming its id. The save rejects that rather than skipping
+// it silently: a colliding id is a caller bug or an attack, and both deserve
+// an error.
+// ---------------------------------------------------------------------------
+
+/// The stored `edges` row, verbatim, so a rejected write can be shown to have
+/// changed nothing at all rather than merely nothing observable.
+fn raw_edge_row(dir: &tempfile::TempDir, id: Uuid) -> Vec<String> {
+    let conn = rusqlite::Connection::open(dir.path().join("memories.db"))
+        .expect("open raw connection to memories.db");
+    conn.query_row(
+        "SELECT namespace_id, source, target, relation, CAST(weight AS TEXT), valid_at, \
+                COALESCE(invalid_at, ''), COALESCE(superseded_by, ''), metadata \
+           FROM edges WHERE id = ?1",
+        rusqlite::params![id.to_string()],
+        |row| (0..9).map(|i| row.get::<_, String>(i)).collect(),
+    )
+    .expect("the edge row must still exist")
+}
+
+#[test]
+fn save_edge_rejects_an_id_that_belongs_to_another_namespace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let t = two_tenants(&dir);
+
+    let mine = Edge::new(Uuid::new_v4(), Uuid::new_v4(), "reports_to");
+    t.db.save_edge(&mine, t.ns_a).expect("save A's edge");
+    let before = raw_edge_row(&dir, mine.id);
+
+    // B names A's edge id and rewrites every field around it.
+    let mut theirs = Edge::new(Uuid::new_v4(), Uuid::new_v4(), "hijacked");
+    theirs.id = mine.id;
+    theirs.weight = 99.0;
+
+    let error =
+        t.db.save_edge(&theirs, t.ns_b)
+            .expect_err("a save into namespace B must not land on namespace A's edge id");
+
+    assert_eq!(
+        raw_edge_row(&dir, mine.id),
+        before,
+        "namespace A's edge row was modified by a write issued for namespace B"
+    );
+
+    // The message explains the rule the caller broke; it must not describe the
+    // row it collided with, which belongs to someone else.
+    let message = error.to_string();
+    assert!(
+        message.contains("namespace"),
+        "the rejection should name the invariant it is protecting; got: {message}"
+    );
+    assert!(
+        !message.contains(&t.ns_a.to_string()) && !message.contains("reports_to"),
+        "the rejection leaks the other tenant's data back to the caller: {message}"
+    );
+
+    // And the rejection did not quietly create a second edge for B either.
+    assert!(
+        t.db.get_edges_for_entity_in_namespace(theirs.source, t.ns_b)
+            .expect("edge lookup")
+            .is_empty(),
+        "the rejected write left a row behind in namespace B"
+    );
+}
+
+/// The guard must only catch the cross-namespace case. Re-saving an edge
+/// inside its own namespace is the ordinary update path — supersession stamps
+/// an `invalid_at` through it — and has to keep working.
+#[test]
+fn save_edge_still_upserts_within_its_own_namespace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let t = two_tenants(&dir);
+
+    let entity = Uuid::new_v4();
+    let mut edge = Edge::new(entity, Uuid::new_v4(), "reports_to");
+    t.db.save_edge(&edge, t.ns_a).expect("save the edge");
+
+    edge.relation = "reported_to".to_string();
+    edge.weight = 0.25;
+    edge.invalid_at = Some(edge.valid_at);
+    t.db.save_edge(&edge, t.ns_a)
+        .expect("re-saving an edge in its own namespace must still update it");
+
+    let stored =
+        t.db.get_edges_for_entity_in_namespace(entity, t.ns_a)
+            .expect("edge lookup");
+
+    assert_eq!(
+        stored.len(),
+        1,
+        "the update should not have inserted a second row"
+    );
+    assert_eq!(stored[0].id, edge.id);
+    assert_eq!(stored[0].relation, "reported_to");
+    assert!((stored[0].weight - 0.25).abs() < f32::EPSILON);
+    assert!(
+        stored[0].invalid_at.is_some(),
+        "the invalidation stamp must have landed"
+    );
+
+    // Re-saving the very same edge again changes no column. The rejection is
+    // driven by the number of rows the statement touched, so a write that
+    // happens to be a no-op must still count as having landed — otherwise an
+    // idempotent retry looks exactly like a cross-namespace collision.
+    t.db.save_edge(&edge, t.ns_a)
+        .expect("an idempotent re-save must not be mistaken for a collision");
+}

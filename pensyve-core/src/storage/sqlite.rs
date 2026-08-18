@@ -11,7 +11,10 @@ use crate::types::{
     ObservationMemory, Outcome, ProceduralMemory, SemanticMemory,
 };
 
-use super::{ActivityAggregate, ActivityEvent, StorageError, StorageResult, StorageTrait};
+use super::{
+    ActivityAggregate, ActivityEvent, StorageError, StorageResult, StorageTrait,
+    cross_namespace_edge_id,
+};
 use crate::graph::EdgeType;
 
 // ---------------------------------------------------------------------------
@@ -2669,9 +2672,32 @@ impl StorageTrait for SqliteBackend {
     fn save_edge(&self, edge: &Edge, namespace_id: Uuid) -> StorageResult<()> {
         let conn = lock_conn!(self);
         let metadata = serde_json::to_string(&edge.metadata)?;
-        conn.execute(
-            "INSERT OR REPLACE INTO edges (id, namespace_id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        // `edges.id` is the primary key on its own, and edge ids are
+        // caller-supplied, so an unqualified upsert lands on whatever row
+        // already holds the id — another tenant's included. The old
+        // `INSERT OR REPLACE` was worse than an overwrite: it deletes the
+        // conflicting row and inserts this one, moving the edge into the
+        // caller's namespace outright.
+        //
+        // The `WHERE` confines the update half to the namespace that already
+        // owns the row, so a cross-namespace collision updates nothing and
+        // reports zero changed rows. That is rejected below rather than
+        // skipped: a colliding id is a caller bug or an attack, and returning
+        // Ok for a write that did not happen is how a caller ends up trusting
+        // a store that never took its data.
+        let changed = conn.execute(
+            "INSERT INTO edges (id, namespace_id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+             ON CONFLICT(id) DO UPDATE SET \
+                 source = excluded.source, \
+                 target = excluded.target, \
+                 relation = excluded.relation, \
+                 weight = excluded.weight, \
+                 valid_at = excluded.valid_at, \
+                 invalid_at = excluded.invalid_at, \
+                 superseded_by = excluded.superseded_by, \
+                 metadata = excluded.metadata \
+             WHERE edges.namespace_id = excluded.namespace_id",
             params![
                 edge.id.to_string(),
                 namespace_id.to_string(),
@@ -2685,6 +2711,9 @@ impl StorageTrait for SqliteBackend {
                 metadata,
             ],
         )?;
+        if changed == 0 {
+            return Err(cross_namespace_edge_id(edge.id));
+        }
         Ok(())
     }
 
