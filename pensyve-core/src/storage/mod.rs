@@ -539,8 +539,18 @@ pub trait StorageTrait: Send + Sync {
     fn list_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Entity>>;
 
     // Edges
-    fn save_edge(&self, edge: &Edge) -> StorageResult<()>;
-    fn get_edges_for_entity(&self, entity_id: Uuid) -> StorageResult<Vec<Edge>>;
+    //
+    // `Edge` has no namespace field, so both accessors take one. An edge
+    // belongs to the namespace of its source entity. Entity ids are not
+    // globally unique, so before the parameter existed the read matched on
+    // entity id alone and crossed tenants, and the write left the row
+    // attributed to nobody.
+    fn save_edge(&self, edge: &Edge, namespace_id: Uuid) -> StorageResult<()>;
+    fn get_edges_for_entity_in_namespace(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Vec<Edge>>;
 
     // Counts (lightweight, no embedding pipeline)
     /// Count memories by type for a namespace without loading memory content.

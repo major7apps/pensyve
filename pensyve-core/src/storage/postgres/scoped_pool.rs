@@ -71,8 +71,8 @@ impl ScopedPool {
     /// a `namespace_isolation_*` policy. Two uses are legitimate:
     ///
     /// * DDL, which RLS does not apply to.
-    /// * Queries against `namespaces`, `edges`, and `activity_events`, none of
-    ///   which carry a policy.
+    /// * Queries against `namespaces` and `activity_events`, neither of which
+    ///   carries a policy.
     ///
     /// Anything else needs [`Self::acquire_bound`].
     pub(super) fn unbound(&self) -> &PgPool {

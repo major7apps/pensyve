@@ -234,7 +234,7 @@ impl MemoryGraph {
             }
 
             // Explicit entity → entity edges from Edge table (with temporal metadata).
-            if let Ok(edges) = storage.get_edges_for_entity(entity.id) {
+            if let Ok(edges) = storage.get_edges_for_entity_in_namespace(entity.id, namespace_id) {
                 for edge in edges {
                     graph.add_edge_with_meta(edge);
                 }

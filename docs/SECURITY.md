@@ -68,7 +68,7 @@ policy through such a connection must bind a namespace first, with
 closed on purpose. Without that, a query reads the previous caller's namespace
 once RLS is enforced, which is a cross-namespace read rather than an empty
 result. The internal uses are limited to DDL, which RLS does not apply to, and
-to `namespaces`, `edges`, and `activity_events`, none of which carry a policy.
+to `namespaces` and `activity_events`, neither of which carries a policy.
 
 Layer 2 is not active by default. Postgres exempts a table's owner from its own
 policies, and the application connects as the role that owns the schema, so the
@@ -104,11 +104,24 @@ same way. Every `StorageTrait` method that reaches a policied table without a
 `update_semantic_content`, `update_procedural_reliability` and
 `delete_observations_by_entity`. One of those is still on the recall path:
 `update_episodic_access` writes the reinforcement stamp. GDPR erase
-reaches three: #256 scoped its memory deletion only, and its observation,
-graph-edge and entity-record steps still match on the entity id alone. All of
-it is tracked by #254.
+reaches two: #256 scoped its memory deletion and the edge accessor is scoped
+now, but its observation and entity-record steps still match on the entity id
+alone. All of it is tracked by #254.
 
 Do not apply enforcement to a deployment until those paths carry a namespace.
+
+Edges are the newest addition to layer 2. They gained a `namespace_id` — an
+edge belongs to the namespace of its source entity — plus a
+`namespace_isolation_edges` policy and a `FORCE` line in the enforcement file.
+`save_edge` and `get_edges_for_entity_in_namespace` both take a namespace and
+bind it on their connection, so the graph is covered by both layers rather than
+by neither. Erasing edges rather than only counting them is #264.
+
+Databases provisioned before the column existed are migrated in place: the
+column is backfilled from `entities.namespace_id` via `edges.source`, and edges
+whose source entity no longer exists are deleted, because they can be
+attributed to no namespace and no scoped accessor can reach them. On Postgres
+the count is reported as a `NOTICE`; on `SQLite` it is logged at `WARN`.
 
 #### Applying enforcement
 
@@ -138,7 +151,7 @@ SELECT relname, relrowsecurity, relforcerowsecurity
   FROM pg_class
  WHERE relname IN ('entities', 'episodes', 'episodic_memories',
                    'semantic_memories', 'procedural_memories',
-                   'observation_memories');
+                   'observation_memories', 'edges');
 ```
 
 All `t` proves the tables are forced. It does not prove the policies apply to

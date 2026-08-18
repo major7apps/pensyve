@@ -84,7 +84,8 @@ use uuid::Uuid;
 use super::PostgresBackend;
 use crate::storage::StorageTrait;
 use crate::types::{
-    EpisodicMemory, Memory, Namespace, ObservationMemory, Outcome, ProceduralMemory, SemanticMemory,
+    Edge, Entity, EntityKind, EpisodicMemory, Memory, Namespace, ObservationMemory, Outcome,
+    ProceduralMemory, SemanticMemory,
 };
 
 /// Environment variable naming the admin connection string.
@@ -110,6 +111,7 @@ const RLS_POLICIES: &[(&str, &str)] = &[
     ("semantic_memories", "namespace_isolation_semantic"),
     ("procedural_memories", "namespace_isolation_procedural"),
     ("observation_memories", "namespace_isolation_observation"),
+    ("edges", "namespace_isolation_edges"),
 ];
 
 /// How Postgres renders the expected `USING` clause back out of `pg_policies`.
@@ -1059,6 +1061,192 @@ fn entity_delete_is_confined_to_its_namespace() {
     );
 }
 
+/// Edges must be as confined as the memory rows, in both layers: the scoped
+/// accessor's own `namespace_id` predicate, and RLS as the backstop.
+///
+/// Before edges carried a `namespace_id` there was neither. The accessor
+/// matched on entity id alone, and entity ids are not globally unique, so a
+/// graph build or a GDPR erase in one tenant enumerated another tenant's
+/// relationships; the table carried no policy for RLS to fall back on either.
+/// This is the prerequisite for a scoped erase that really deletes edges
+/// (#264) and for RLS ever covering the graph (#254).
+#[test]
+fn edges_are_confined_to_their_namespace_under_enforced_rls() {
+    // `get_edges_for_entity_in_namespace`'s statement, minus its namespace
+    // predicate, counted instead of hydrated. The real one reads:
+    //     ... FROM edges WHERE namespace_id = $2 AND (source = $1 OR target = $1)
+    const SABOTAGED_SELECT: &str = "SELECT count(*) FROM edges WHERE source = $1 OR target = $1";
+
+    let Some(admin_opts) = skip_notice("edges_are_confined_to_their_namespace_under_enforced_rls")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns_a = Namespace::new(format!("edges-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("edges-b-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns_a).expect("save namespace A");
+    backend.save_namespace(&ns_b).expect("save namespace B");
+    fixture.enforce_rls();
+
+    // One edge in A only: namespace B holds nothing, so anything it sees for
+    // this entity id came across the boundary.
+    let entity_id = Uuid::new_v4();
+    let mine = Edge::new(entity_id, Uuid::new_v4(), "reports_to");
+    backend
+        .save_edge(&mine, ns_a.id)
+        .expect("save_edge must succeed under enforced RLS");
+
+    assert_eq!(
+        backend
+            .get_edges_for_entity_in_namespace(entity_id, ns_a.id)
+            .expect("read namespace A's edges")
+            .iter()
+            .map(|edge| edge.id)
+            .collect::<Vec<_>>(),
+        vec![mine.id],
+        "enforced RLS must not hide a namespace's own edges from it"
+    );
+    assert!(
+        backend
+            .get_edges_for_entity_in_namespace(entity_id, ns_b.id)
+            .expect("read namespace B's edges")
+            .is_empty(),
+        "namespace A's edge must be invisible from namespace B"
+    );
+
+    // Layer 2 on its own: the accessor's predicate is deleted, leaving the
+    // policy as the only thing between namespace B and namespace A's row.
+    let seen_from_b = fixture.rt.block_on(async {
+        let mut conn = fixture
+            .backend
+            .scoped_conn(ns_b.id)
+            .await
+            .expect("scoped connection for namespace B");
+        let (count,): (i64,) = query_as::<Postgres, _>(SABOTAGED_SELECT)
+            .bind(entity_id)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("run predicate-free edge select scoped to namespace B");
+        count
+    });
+    assert_eq!(
+        seen_from_b, 0,
+        "RLS did not block a predicate-free cross-namespace edge read: the row was \
+         reachable from namespace B. Defense in depth is not actually in depth."
+    );
+
+    // The same sabotaged statement through the owning namespace must find it —
+    // otherwise the assertion above is vacuous.
+    let seen_from_a = fixture.rt.block_on(async {
+        let mut conn = fixture
+            .backend
+            .scoped_conn(ns_a.id)
+            .await
+            .expect("scoped connection for namespace A");
+        let (count,): (i64,) = query_as::<Postgres, _>(SABOTAGED_SELECT)
+            .bind(entity_id)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("run predicate-free edge select scoped to namespace A");
+        count
+    });
+    assert_eq!(
+        seen_from_a, 1,
+        "the predicate-free select matched nothing even in the owning namespace, \
+         so the cross-namespace assertion above proved nothing"
+    );
+}
+
+/// The schema runs on every startup, so it has to migrate a database that
+/// predates `edges.namespace_id` as cleanly as it creates a fresh one.
+///
+/// An edge belongs to the namespace of its source entity, so that is what the
+/// backfill reads. An edge whose source entity is gone can be attributed to
+/// nothing and no scoped accessor could ever reach it, so the migration
+/// deletes it — which is also what lets the column be tightened to NOT NULL.
+#[test]
+fn schema_migrates_a_database_that_predates_the_edges_namespace() {
+    let Some(admin_opts) =
+        skip_notice("schema_migrates_a_database_that_predates_the_edges_namespace")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns = Namespace::new(format!("edges-migrate-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns).expect("save namespace");
+    let mut entity = Entity::new("alice", EntityKind::User);
+    entity.namespace_id = ns.id;
+    backend.save_entity(&entity).expect("save source entity");
+
+    // Take `edges` back to the shape it had before it carried a namespace.
+    // The policy depends on the column, so it goes first.
+    fixture.rt.block_on(async {
+        for statement in [
+            "DROP POLICY IF EXISTS namespace_isolation_edges ON edges",
+            "DROP INDEX IF EXISTS idx_edges_namespace",
+            "ALTER TABLE edges DROP COLUMN namespace_id",
+        ] {
+            exec(backend.pool(), statement).await;
+        }
+    });
+
+    let attributable = Uuid::new_v4();
+    let orphan = Uuid::new_v4();
+    fixture.rt.block_on(async {
+        for (id, source) in [(attributable, entity.id), (orphan, Uuid::new_v4())] {
+            exec(
+                backend.pool(),
+                format!(
+                    "INSERT INTO edges (id, source, target, relation)
+                     VALUES ('{id}', '{source}', '{}', 'reports_to')",
+                    Uuid::new_v4()
+                ),
+            )
+            .await;
+        }
+    });
+
+    // Re-apply the schema exactly as a startup would.
+    fixture.rt.block_on(async {
+        raw_sql(super::SCHEMA)
+            .execute(backend.pool())
+            .await
+            .expect("re-apply the schema over a pre-migration database");
+    });
+
+    let attributed: Vec<(Uuid, Uuid)> = fixture.rt.block_on(async {
+        query_as::<Postgres, _>("SELECT id, namespace_id FROM edges ORDER BY id")
+            .fetch_all(backend.pool())
+            .await
+            .expect("read migrated edges")
+    });
+    assert_eq!(
+        attributed,
+        vec![(attributable, ns.id)],
+        "the migration should have backfilled the attributable edge from its source \
+         entity's namespace and dropped the orphan {orphan}"
+    );
+
+    let (not_null,): (bool,) = fixture.rt.block_on(async {
+        query_as::<Postgres, _>(
+            "SELECT attnotnull FROM pg_attribute
+              WHERE attrelid = 'public.edges'::regclass AND attname = 'namespace_id'",
+        )
+        .fetch_one(backend.pool())
+        .await
+        .expect("read edges.namespace_id nullability")
+    });
+    assert!(
+        not_null,
+        "edges.namespace_id must end the migration NOT NULL, so a new row cannot be \
+         written without a namespace"
+    );
+}
+
 /// The accessor callers use to collect vector-index ids before an entity-wide
 /// forget must return exactly what [`entity_delete_is_confined_to_its_namespace`]
 /// deletes — every shape, superseded rows included, and only this namespace's
@@ -1730,7 +1918,7 @@ fn only_bound_connections_reach_policied_tables() {
          namespace, so a query on a table with a namespace_isolation_* policy would read \
          another namespace's rows once RLS is enforced. Use `scoped_conn` or \
          `maybe_scoped_conn` unless the statement is DDL or targets an unpolicied table \
-         (namespaces, edges, activity_events), and update this count if it is."
+         (namespaces, activity_events), and update this count if it is."
     );
 
     // The wrapper is only worth having if the raw pool is genuinely out of

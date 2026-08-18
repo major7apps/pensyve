@@ -45,8 +45,10 @@ fn v3_database_upgrades_to_v4_without_losing_rows() {
     let legacy_id = Uuid::new_v4();
     {
         let conn = open_raw(tempdir.path());
-        conn.execute("DELETE FROM schema_versions WHERE version = 4", [])
-            .expect("remove v4 registry row");
+        // Every row at or above v4 has to go: the runner reads MAX(version)
+        // once, so leaving a later row behind skips v4 entirely.
+        conn.execute("DELETE FROM schema_versions WHERE version >= 4", [])
+            .expect("remove v4 and later registry rows");
         for (table, column) in V4_COLUMNS {
             // The pre-v4 SQLite schema already had the dead episodic
             // superseded_by column; keep it to reproduce the real v3 shape.

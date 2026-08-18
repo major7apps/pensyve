@@ -173,6 +173,7 @@ CREATE INDEX IF NOT EXISTS idx_observation_entity_type
 
 CREATE TABLE IF NOT EXISTS edges (
     id              UUID PRIMARY KEY,
+    namespace_id    UUID NOT NULL,
     source          UUID NOT NULL,
     target          UUID NOT NULL,
     relation        TEXT NOT NULL,
@@ -183,8 +184,41 @@ CREATE TABLE IF NOT EXISTS edges (
     metadata        JSONB NOT NULL DEFAULT '{}'
 );
 
+-- Idempotent migration for databases provisioned before `namespace_id` was
+-- added to the CREATE TABLE statement. The column has to exist before the
+-- policy below can reference it, so this runs here rather than at the bottom
+-- of the file, and the whole schema is one implicit transaction — an existing
+-- database is never left with the column but not the policy, or vice versa.
+--
+-- An edge belongs to the namespace of its source entity, which is where the
+-- extraction path that writes edges already stands. Rows whose source entity
+-- no longer exists cannot be attributed to anything and no scoped accessor
+-- could ever reach them, so they are deleted; the DO block is only there to
+-- report how many. On a fresh database every statement here is a no-op:
+-- the column already exists and is already NOT NULL, and there are no rows.
+ALTER TABLE edges ADD COLUMN IF NOT EXISTS namespace_id UUID;
+
+UPDATE edges
+   SET namespace_id = entities.namespace_id
+  FROM entities
+ WHERE entities.id = edges.source
+   AND edges.namespace_id IS NULL;
+
+DO $$
+DECLARE orphaned BIGINT;
+BEGIN
+    DELETE FROM edges WHERE namespace_id IS NULL;
+    GET DIAGNOSTICS orphaned = ROW_COUNT;
+    IF orphaned > 0 THEN
+        RAISE NOTICE 'pensyve: deleted % orphan edge row(s) whose source entity no longer exists', orphaned;
+    END IF;
+END $$;
+
+ALTER TABLE edges ALTER COLUMN namespace_id SET NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);
+CREATE INDEX IF NOT EXISTS idx_edges_namespace ON edges(namespace_id);
 
 -- ---------------------------------------------------------------------------
 -- Activity Events
@@ -232,6 +266,7 @@ ALTER TABLE episodic_memories    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE semantic_memories    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE procedural_memories  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE observation_memories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE edges                ENABLE ROW LEVEL SECURITY;
 
 -- DROP + CREATE rather than "create if absent": this file is re-applied on
 -- every startup, so an existing database has to pick up a corrected policy.
@@ -272,5 +307,10 @@ CREATE POLICY namespace_isolation_procedural ON procedural_memories
 
 DROP POLICY IF EXISTS namespace_isolation_observation ON observation_memories;
 CREATE POLICY namespace_isolation_observation ON observation_memories
+  USING (namespace_id::text = current_setting('pensyve.namespace_id', true))
+  WITH CHECK (namespace_id::text = current_setting('pensyve.namespace_id', true));
+
+DROP POLICY IF EXISTS namespace_isolation_edges ON edges;
+CREATE POLICY namespace_isolation_edges ON edges
   USING (namespace_id::text = current_setting('pensyve.namespace_id', true))
   WITH CHECK (namespace_id::text = current_setting('pensyve.namespace_id', true));

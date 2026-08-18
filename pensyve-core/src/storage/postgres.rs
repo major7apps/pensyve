@@ -1864,9 +1864,9 @@ impl StorageTrait for PostgresBackend {
     /// has an analogue in `postgres_schema.sql`: the KG tables are not part of
     /// the Postgres schema at all, and full-text search is a generated
     /// `tsvector` column on each memory table, so deleting the row takes its
-    /// index entry with it. `edges` is untouched on both backends — it carries
-    /// no `namespace_id`, so a namespace-scoped delete is not expressible
-    /// against it.
+    /// index entry with it. `edges` is untouched on both backends. It carries
+    /// a `namespace_id` now, so a namespace-scoped delete has become
+    /// expressible against it; actually deleting edges here is #264.
     ///
     /// Every statement names `namespace_id = $1` explicitly even though all
     /// four run on a namespace-bound connection. That is the #254 convention:
@@ -1985,18 +1985,18 @@ impl StorageTrait for PostgresBackend {
     // Edges
     // -----------------------------------------------------------------------
 
-    fn save_edge(&self, edge: &Edge) -> StorageResult<()> {
+    fn save_edge(&self, edge: &Edge, namespace_id: Uuid) -> StorageResult<()> {
         let metadata = serde_json::to_value(&edge.metadata)?;
         self.block_on(async {
-            // Edge has no namespace_id field; use default_namespace if configured.
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             query::<Postgres>(
-                r"INSERT INTO edges (id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                r"INSERT INTO edges (id, namespace_id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                    ON CONFLICT (id) DO UPDATE SET
-                       relation = $4, weight = $5, invalid_at = $7, superseded_by = $8, metadata = $9",
+                       relation = $5, weight = $6, invalid_at = $8, superseded_by = $9, metadata = $10",
             )
             .bind(edge.id)
+            .bind(namespace_id)
             .bind(edge.source)
             .bind(edge.target)
             .bind(&edge.relation)
@@ -2012,14 +2012,19 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn get_edges_for_entity(&self, entity_id: Uuid) -> StorageResult<Vec<Edge>> {
+    fn get_edges_for_entity_in_namespace(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Vec<Edge>> {
         self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             let rows: Vec<EdgeRow> = query_as::<Postgres, _>(
                 r"SELECT id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata
-                   FROM edges WHERE source = $1 OR target = $1",
+                   FROM edges WHERE namespace_id = $2 AND (source = $1 OR target = $1)",
             )
             .bind(entity_id)
+            .bind(namespace_id)
             .fetch_all(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;

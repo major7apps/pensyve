@@ -12,7 +12,7 @@
 
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
-use pensyve_core::types::{Episode, Namespace, ObservationMemory};
+use pensyve_core::types::{Edge, Episode, Namespace, ObservationMemory};
 use uuid::Uuid;
 
 /// Two namespaces on one shared backend, mirroring the gateway's
@@ -215,4 +215,84 @@ fn delete_observations_by_episode_deletes_owned_rows() {
             .expect("observation lookup")
             .is_empty()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Edge reads
+//
+// Edges carry their own `namespace_id`. Before they did, the accessor matched
+// on entity id alone, and entity ids are not globally unique: a graph build or
+// a GDPR erase running in one tenant enumerated another tenant's relationships
+// whenever the two happened to share an entity id.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn get_edges_for_entity_in_namespace_does_not_return_foreign_edges() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let t = two_tenants(&dir);
+
+    // Only namespace B holds an edge for this entity, so anything A reads back
+    // for it crossed the tenant boundary.
+    let victim_entity = Uuid::new_v4();
+    let victim = Edge::new(victim_entity, Uuid::new_v4(), "reports_to");
+    t.db.save_edge(&victim, t.ns_b).expect("save B's edge");
+
+    let seen =
+        t.db.get_edges_for_entity_in_namespace(victim_entity, t.ns_a)
+            .expect("edge lookup");
+
+    assert!(
+        seen.is_empty(),
+        "namespace A read {} edge(s) owned by namespace B: {:?}",
+        seen.len(),
+        seen.iter().map(|e| e.relation.as_str()).collect::<Vec<_>>()
+    );
+}
+
+/// Both legs of the accessor's `source OR target` match must stay inside the
+/// namespace, and both must still resolve for the owning one.
+#[test]
+fn get_edges_for_entity_in_namespace_returns_owned_edges_on_both_legs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let t = two_tenants(&dir);
+
+    let entity = Uuid::new_v4();
+    let outgoing = Edge::new(entity, Uuid::new_v4(), "reports_to");
+    let incoming = Edge::new(Uuid::new_v4(), entity, "manages");
+    t.db.save_edge(&outgoing, t.ns_a).expect("save outgoing");
+    t.db.save_edge(&incoming, t.ns_a).expect("save incoming");
+
+    let mut seen: Vec<Uuid> =
+        t.db.get_edges_for_entity_in_namespace(entity, t.ns_a)
+            .expect("edge lookup")
+            .iter()
+            .map(|e| e.id)
+            .collect();
+    seen.sort();
+
+    let mut expected = vec![outgoing.id, incoming.id];
+    expected.sort();
+    assert_eq!(seen, expected, "owned edges on both legs must resolve");
+}
+
+/// The same entity id on both sides of the tenant boundary: each namespace
+/// sees exactly its own edge, never the other's.
+#[test]
+fn get_edges_for_entity_in_namespace_partitions_a_shared_entity_id() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let t = two_tenants(&dir);
+
+    let shared_entity = Uuid::new_v4();
+    let a_edge = Edge::new(shared_entity, Uuid::new_v4(), "belongs_to_a");
+    let b_edge = Edge::new(shared_entity, Uuid::new_v4(), "belongs_to_b");
+    t.db.save_edge(&a_edge, t.ns_a).expect("save A's edge");
+    t.db.save_edge(&b_edge, t.ns_b).expect("save B's edge");
+
+    let seen_by_a =
+        t.db.get_edges_for_entity_in_namespace(shared_entity, t.ns_a)
+            .expect("edge lookup");
+
+    assert_eq!(seen_by_a.len(), 1, "A saw {seen_by_a:?}");
+    assert_eq!(seen_by_a[0].id, a_edge.id);
+    assert_eq!(seen_by_a[0].relation, "belongs_to_a");
 }
