@@ -60,6 +60,36 @@ fn capturing_delete_not_implemented() -> StorageResult<Vec<Memory>> {
     ))
 }
 
+fn capturing_erase_not_implemented() -> StorageResult<ErasedRows> {
+    Err(StorageError::Context(
+        "storage backend does not implement capturing entity erasure, \
+         so a GDPR erase cannot delete observations, memories, edges and the \
+         entity record in one atomic transaction"
+            .to_string(),
+    ))
+}
+
+/// Everything one [`StorageTrait::erase_entity_capturing`] transaction removed.
+///
+/// These are the rows the committed `DELETE`s actually returned, not the rows a
+/// preceding `SELECT` predicted they would remove. Callers that have to clean up
+/// out-of-band state — the gateway strips the vector index — must drive that
+/// cleanup from here: a set collected by a separate query before the delete
+/// leaves a window in which a concurrent writer inserts a matching row, and the
+/// delete then destroys it while its index entry survives (#268).
+#[derive(Debug, Clone, Default)]
+pub struct ErasedRows {
+    /// Observations derived from episodes the entity participated in.
+    pub observations: Vec<ObservationMemory>,
+    /// Episodic and semantic memories, superseded rows included.
+    pub memories: Vec<Memory>,
+    /// Graph edges touching the entity, within the erasing namespace.
+    pub edges: Vec<Edge>,
+    /// Whether the entity record itself was removed. `false` means no such row
+    /// existed in the namespace, which is not an error.
+    pub entity_deleted: bool,
+}
+
 /// Maximum whitespace-delimited tokens an FTS query contributes to the search
 /// expression; both backends truncate identically so their candidate sets stay
 /// comparable (#225).
@@ -508,6 +538,44 @@ pub trait StorageTrait: Send + Sync {
         capturing_delete_not_implemented()
     }
 
+    /// Erase everything belonging to `entity_id` within `namespace_id` in ONE
+    /// transaction, and hand back the rows it removed.
+    ///
+    /// This is the storage half of `gdpr::erase_entity`. The legs run in a fixed
+    /// order, and the order is load-bearing:
+    ///
+    /// 1. **observations** — they are found by joining through
+    ///    `episodic_memories.about_entity / source_entity`, so once the episodic
+    ///    rows are gone the association no longer exists;
+    /// 2. **memories** — episodic and semantic, superseded rows included, with
+    ///    any search-index cleanup in the same transaction;
+    /// 3. **edges** — `(source = entity OR target = entity) AND namespace_id`;
+    /// 4. **the entity record**.
+    ///
+    /// Implementations must:
+    /// - qualify every statement by `namespace_id` — entity ids repeat across
+    ///   namespaces, so an entity-only predicate reaches into other tenants and
+    ///   also drags their rows into the caller's captured set;
+    /// - run all four legs in one transaction, rolling the whole thing back on
+    ///   any error. A GDPR erase is all-or-nothing: a caller told an erase
+    ///   failed must not have to guess which legs already committed.
+    ///
+    /// Edges are only ever this namespace's edges. An edge whose source is in
+    /// another namespace and whose target is the entity being erased is stored
+    /// in — and visible only from — the source's namespace, so it survives. See
+    /// the `save_edge` / `get_edges_for_entity_in_namespace` comment below for
+    /// why that ownership rule is the one being kept.
+    ///
+    /// The default fails closed: a backend that cannot erase atomically must not
+    /// have a partial erase reported as a completed one.
+    fn erase_entity_capturing(
+        &self,
+        _entity_id: Uuid,
+        _namespace_id: Uuid,
+    ) -> StorageResult<ErasedRows> {
+        capturing_erase_not_implemented()
+    }
+
     /// Delete a single memory (episodic, semantic, procedural or observation)
     /// only when it belongs to `namespace_id`.
     ///
@@ -703,5 +771,16 @@ mod tests {
 
         assert!(matches!(error, StorageError::Context(_)));
         assert!(error.to_string().contains("capturing entity deletion"));
+    }
+
+    /// Same rule one level up: a backend that cannot run the four erase legs in
+    /// one transaction must error rather than let a partial GDPR erase be
+    /// reported as a completed one.
+    #[test]
+    fn capturing_erase_not_implemented_fails_closed() {
+        let error = capturing_erase_not_implemented().unwrap_err();
+
+        assert!(matches!(error, StorageError::Context(_)));
+        assert!(error.to_string().contains("capturing entity erasure"));
     }
 }

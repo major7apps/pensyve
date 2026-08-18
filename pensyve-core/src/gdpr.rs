@@ -6,7 +6,7 @@
 
 use uuid::Uuid;
 
-use crate::storage::{StorageError, StorageTrait};
+use crate::storage::{ErasedRows, StorageError, StorageTrait};
 use crate::types::Memory;
 
 /// Result of a GDPR erasure operation.
@@ -22,8 +22,16 @@ pub struct ErasureResult {
     /// Number of entities deleted.
     pub entities_deleted: usize,
     /// Whether the operation completed fully.
+    ///
+    /// The storage half is all-or-nothing now, so on `Ok` this is `true` unless
+    /// a caller appended a warning for cleanup it owns outside the transaction
+    /// (the gateway's vector index).
     pub complete: bool,
-    /// Any errors encountered (non-fatal).
+    /// Errors from post-commit cleanup the erasure itself does not own.
+    ///
+    /// The storage legs no longer contribute here: they run in one transaction
+    /// that either commits whole or rolls back whole, and a rollback surfaces as
+    /// `Err` rather than as a warning on a nominally successful result.
     pub warnings: Vec<String>,
 }
 
@@ -38,58 +46,52 @@ pub struct ExportResult {
     pub total_records: usize,
 }
 
-/// Execute a GDPR erasure for all data belonging to an entity.
+/// Execute a GDPR erasure for all data belonging to an entity, and hand back the
+/// rows it removed.
 ///
-/// Cascades through:
-/// 1. All memories (episodic, semantic, procedural) about the entity
-/// 2. All graph edges involving the entity
-/// 3. The entity record itself
+/// One [`StorageTrait::erase_entity_capturing`] transaction removes, in this
+/// order: observations derived from the entity's episodes, its episodic and
+/// semantic memories (superseded rows included), its graph edges, and the entity
+/// record. Any leg failing rolls the whole thing back and surfaces as `Err` —
+/// there is no partial erase to report on. `namespace_id` scopes every leg.
 ///
-/// Returns an `ErasureResult` summarizing what was deleted.
+/// The returned [`ErasedRows`] is what callers must drive out-of-band cleanup
+/// from. Collecting ids with a separate query first leaves a window in which a
+/// concurrent writer inserts a matching row: the erase then deletes it while its
+/// vector-index entry survives, pointing at content that no longer exists
+/// (#268).
 ///
-/// `namespace_id` names the tenant the erasure belongs to, matching
-/// [`export_entity_data`]. The memory and edge steps carry it; the observation
-/// and entity steps still match on `entity_id` alone and are tracked by #254
-/// along with the rest of the unscoped `StorageTrait` surface.
+/// One residue is intentional. An edge belongs to its source entity's namespace,
+/// so an edge whose source lives in another tenant and whose target is the
+/// entity being erased is stored there, is not visible here, and is not deleted.
+/// Reading it would be a cross-tenant read; the edge is the other tenant's data.
+pub fn erase_entity_captured(
+    storage: &dyn StorageTrait,
+    entity_id: Uuid,
+    namespace_id: Uuid,
+) -> Result<(ErasureResult, ErasedRows), StorageError> {
+    let erased = storage.erase_entity_capturing(entity_id, namespace_id)?;
+
+    let result = ErasureResult {
+        memories_deleted: erased.memories.len(),
+        observations_deleted: erased.observations.len(),
+        edges_deleted: erased.edges.len(),
+        entities_deleted: usize::from(erased.entity_deleted),
+        complete: true,
+        warnings: Vec::new(),
+    };
+
+    Ok((result, erased))
+}
+
+/// [`erase_entity_captured`] for callers with no out-of-band state to clean up
+/// (the CLI, `erase_namespace`). The captured rows are dropped.
 pub fn erase_entity(
     storage: &dyn StorageTrait,
     entity_id: Uuid,
     namespace_id: Uuid,
 ) -> Result<ErasureResult, StorageError> {
-    let mut result = ErasureResult::default();
-
-    // Step 1: Delete observations derived from episodes the entity
-    // participated in. MUST run BEFORE `delete_memories_by_entity` because
-    // the join uses `episodic_memories.about_entity / source_entity` — once
-    // the episodic rows are gone the association is lost.
-    match storage.delete_observations_by_entity(entity_id) {
-        Ok(count) => result.observations_deleted = count,
-        Err(e) => result
-            .warnings
-            .push(format!("Observation deletion error: {e}")),
-    }
-
-    // Step 2: Delete all episodic / semantic memories about this entity.
-    match storage.delete_memories_by_entity(entity_id, namespace_id) {
-        Ok(count) => result.memories_deleted = count,
-        Err(e) => result.warnings.push(format!("Memory deletion error: {e}")),
-    }
-
-    // Step 3: Delete graph edges
-    match storage.get_edges_for_entity_in_namespace(entity_id, namespace_id) {
-        Ok(edges) => result.edges_deleted = edges.len(),
-        Err(e) => result.warnings.push(format!("Edge query error: {e}")),
-    }
-
-    // Step 4: Delete entity record (not found is OK — entity may not exist)
-    match storage.delete_entity(entity_id) {
-        Ok(true) => result.entities_deleted = 1,
-        Ok(false) => {} // Entity record didn't exist — nothing to delete
-        Err(e) => result.warnings.push(format!("Entity deletion error: {e}")),
-    }
-
-    result.complete = result.warnings.is_empty();
-    Ok(result)
+    erase_entity_captured(storage, entity_id, namespace_id).map(|(result, _)| result)
 }
 
 /// Execute a GDPR erasure for ALL entities in a namespace.
@@ -217,7 +219,7 @@ mod tests {
     use super::*;
     use crate::embedding::OnnxEmbedder;
     use crate::storage::sqlite::SqliteBackend;
-    use crate::types::{Entity, EntityKind, Episode, EpisodicMemory, Namespace};
+    use crate::types::{Edge, Entity, EntityKind, Episode, EpisodicMemory, Namespace};
 
     #[test]
     fn test_erase_entity_empty() {
@@ -277,6 +279,46 @@ mod tests {
         let result = export_entity_data(&storage, entity.id, ns.id).unwrap();
         assert_eq!(result.total_records, 2); // 1 memory + 1 entity
         assert!(!result.memories.is_empty());
+    }
+
+    /// #264: `edges_deleted` used to be the row count of a *query*, so an erase
+    /// reported a number while every edge stayed in the table. The count and the
+    /// table have to agree.
+    ///
+    /// Both directions are seeded — the entity as `source` and as `target` — so
+    /// a delete that only covered one leg fails here rather than in production.
+    #[test]
+    fn erase_entity_deletes_the_edges_it_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteBackend::open(dir.path()).unwrap();
+
+        let ns = Namespace::new("edge-erase-test");
+        storage.save_namespace(&ns).unwrap();
+
+        let mut subject = Entity::new("subject", EntityKind::User);
+        subject.namespace_id = ns.id;
+        storage.save_entity(&subject).unwrap();
+
+        let mut peer = Entity::new("peer", EntityKind::User);
+        peer.namespace_id = ns.id;
+        storage.save_entity(&peer).unwrap();
+
+        let outgoing = Edge::new(subject.id, peer.id, "knows");
+        storage.save_edge(&outgoing, ns.id).unwrap();
+        let incoming = Edge::new(peer.id, subject.id, "manages");
+        storage.save_edge(&incoming, ns.id).unwrap();
+
+        let result = erase_entity(&storage, subject.id, ns.id).unwrap();
+
+        assert_eq!(result.edges_deleted, 2, "both legs must be reported");
+        assert!(
+            storage
+                .get_edges_for_entity_in_namespace(subject.id, ns.id)
+                .unwrap()
+                .is_empty(),
+            "an erase that reports deleted edges must leave none behind"
+        );
+        assert!(result.complete);
     }
 
     #[test]
