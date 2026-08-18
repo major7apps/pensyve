@@ -12,7 +12,7 @@ use crate::types::{
 };
 
 use super::{
-    ActivityAggregate, ActivityEvent, StorageError, StorageResult, StorageTrait,
+    ActivityAggregate, ActivityEvent, ErasedRows, StorageError, StorageResult, StorageTrait,
     cross_namespace_edge_id,
 };
 use crate::graph::EdgeType;
@@ -2409,6 +2409,63 @@ impl StorageTrait for SqliteBackend {
         }
     }
 
+    /// One-transaction GDPR erase — the trait docs carry the leg order and why
+    /// it is fixed. `RETURNING` supplies the captured rows, so what the caller
+    /// gets back is what each `DELETE` removed rather than what a preceding
+    /// `SELECT` predicted it would remove.
+    ///
+    /// Every leg is qualified by `namespace_id`, the observation join included.
+    /// The unscoped `delete_observations_by_entity` this replaces on the erase
+    /// path matched on the entity id alone, and entity ids are not globally
+    /// unique in this schema, so that predicate reached into other tenants.
+    fn erase_entity_capturing(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<ErasedRows> {
+        let conn = lock_conn!(self);
+        let id_str = entity_id.to_string();
+        let ns_str = namespace_id.to_string();
+
+        conn.execute_batch("BEGIN")?;
+
+        let result = (|| -> StorageResult<ErasedRows> {
+            // Leg 1 — observations. MUST precede the episodic delete: the only
+            // link from an observation back to the entity runs through
+            // `episodic_memories.about_entity / source_entity`, and once those
+            // rows are gone the association cannot be reconstructed.
+            let observations = erase_observations_for_entity(&conn, &id_str, &ns_str)?;
+            // Leg 2 — episodic and semantic memories, superseded rows included.
+            let memories = erase_memories_for_entity(&conn, &id_str, &ns_str)?;
+            // Leg 3 — graph edges.
+            let edges = erase_edges_for_entity(&conn, &id_str, &ns_str)?;
+            // Leg 4 — the entity record. Absence is not an error: the caller may
+            // be erasing data for an entity whose record was already removed.
+            let deleted = conn.execute(
+                "DELETE FROM entities WHERE id = ?1 AND namespace_id = ?2",
+                params![&id_str, &ns_str],
+            )?;
+
+            Ok(ErasedRows {
+                observations,
+                memories,
+                edges,
+                entity_deleted: deleted > 0,
+            })
+        })();
+
+        match result {
+            Ok(erased) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(erased)
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     fn delete_memories_by_entity(
         &self,
         entity_id: Uuid,
@@ -2725,66 +2782,14 @@ impl StorageTrait for SqliteBackend {
         let conn = lock_conn!(self);
         let id_str = entity_id.to_string();
         let namespace_str = namespace_id.to_string();
-        let mut stmt = conn.prepare(
-            "SELECT id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata \
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {EDGE_COLUMNS} \
              FROM edges WHERE namespace_id = ?2 AND (source = ?1 OR target = ?1)",
-        )?;
-        let rows = stmt.query_map(params![&id_str, &namespace_str], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, f64>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, String>(8)?,
-            ))
-        })?;
-        let mut edges = Vec::new();
-        for row in rows {
-            let (
-                id_str,
-                src_str,
-                tgt_str,
-                relation,
-                weight,
-                valid_at_str,
-                invalid_at_opt,
-                superseded_by_opt,
-                metadata_str,
-            ) = row?;
-            let id = Uuid::parse_str(&id_str)
-                .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?;
-            let source = Uuid::parse_str(&src_str)
-                .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?;
-            let target = Uuid::parse_str(&tgt_str)
-                .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?;
-            let valid_at = str_to_dt(&valid_at_str);
-            let invalid_at = invalid_at_opt.map(|s| str_to_dt(&s));
-            let superseded_by = superseded_by_opt
-                .map(|s| {
-                    Uuid::parse_str(&s)
-                        .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))
-                })
-                .transpose()?;
-            let metadata: std::collections::HashMap<String, serde_json::Value> =
-                serde_json::from_str(&metadata_str)?;
-            edges.push(Edge {
-                id,
-                source,
-                target,
-                relation,
-                weight: weight as f32,
-                valid_at,
-                invalid_at,
-                superseded_by,
-                metadata,
-                edge_type: EdgeType::default(),
-            });
-        }
-        Ok(edges)
+        ))?;
+        let rows = stmt
+            .query_map(params![&id_str, &namespace_str], edge_columns)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(columns_to_edge).collect()
     }
 
     // -----------------------------------------------------------------------
@@ -3002,6 +3007,213 @@ fn load_memories_by_namespace(
 /// Parse a UUID string, returning `StorageError::Context` on failure.
 fn parse_uuid(s: &str) -> Result<Uuid, StorageError> {
     Uuid::parse_str(s).map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))
+}
+
+/// Leg 1 of [`SqliteBackend::erase_entity_capturing`]: capture and delete the
+/// observations derived from episodes the entity took part in, and cascade the
+/// rows keyed by each observation's id.
+///
+/// Must run before the episodic delete — the join that finds these observations
+/// goes through `episodic_memories.about_entity / source_entity`.
+fn erase_observations_for_entity(
+    conn: &Connection,
+    id_str: &str,
+    ns_str: &str,
+) -> StorageResult<Vec<ObservationMemory>> {
+    let mut stmt = conn.prepare(
+        r"DELETE FROM observation_memories
+           WHERE namespace_id = ?2
+             AND episode_id IN (
+               SELECT DISTINCT episode_id FROM episodic_memories
+                WHERE (about_entity = ?1 OR source_entity = ?1)
+                  AND namespace_id = ?2
+             )
+           RETURNING id, namespace_id, episode_id, entity_type, instance, action,
+                     quantity, unit, content, embedding, confidence, event_time,
+                     created_at, stability, retrievability, agent_id, user_id,
+                     superseded_by, invalid_at",
+    )?;
+    let rows = stmt
+        .query_map(params![id_str, ns_str], row_to_observation)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let observations = rows
+        .into_iter()
+        .collect::<Result<Vec<ObservationMemory>, _>>()?;
+
+    // Phase 2B cascade: `kg_triples` / `kg_passage_entities` are keyed by the
+    // observation's id (== `passage_id`). Driving the cleanup off the captured
+    // ids rather than off a repeat of the subquery keeps it aimed at exactly
+    // the passages this delete removed. `kg_entities` stay: they are
+    // namespace-scoped rather than passage-scoped and other passages' triples
+    // still reference them.
+    //
+    // Each statement still needs the namespace on top of the passage id, and
+    // the two tables supply it differently. `kg_triples` has a `namespace_id`
+    // column. `kg_passage_entities` does not — its key is
+    // `(passage_id, entity_id)` — so the only thing that attributes one of its
+    // rows to a tenant is the `kg_entities` row it points at, and matching on
+    // `passage_id` alone deletes every tenant that shares the id. The join
+    // below is the same one `delete_memory_by_id_with_namespace` uses for the
+    // single-memory path; the two have to agree.
+    for observation in &observations {
+        let passage = observation.id.to_string();
+        conn.execute(
+            "DELETE FROM kg_triples WHERE passage_id = ?1 AND namespace_id = ?2",
+            params![&passage, ns_str],
+        )?;
+        conn.execute(
+            "DELETE FROM kg_passage_entities
+              WHERE passage_id = ?1
+                AND entity_id IN (SELECT id FROM kg_entities WHERE namespace_id = ?2)",
+            params![&passage, ns_str],
+        )?;
+        conn.execute(
+            "DELETE FROM memory_fts
+              WHERE memory_id = ?1 AND namespace_id = ?2 AND memory_type = 'observation'",
+            params![&passage, ns_str],
+        )?;
+    }
+
+    Ok(observations)
+}
+
+/// Leg 2 of [`SqliteBackend::erase_entity_capturing`]: capture and delete the
+/// entity's episodic and semantic rows, superseded ones included, and strip
+/// their search-index entries.
+///
+/// Predicates match [`SqliteBackend::delete_memories_by_entity`] verbatim.
+fn erase_memories_for_entity(
+    conn: &Connection,
+    id_str: &str,
+    ns_str: &str,
+) -> StorageResult<Vec<Memory>> {
+    let mut memories = Vec::new();
+
+    let mut stmt = conn.prepare(
+        r"DELETE FROM episodic_memories
+           WHERE (about_entity = ?1 OR source_entity = ?1) AND namespace_id = ?2
+           RETURNING id, namespace_id, episode_id, source_entity, about_entity, content,
+                     content_type, summary, embedding, context_intent, timestamp,
+                     stability, retrievability, access_count, last_accessed, event_time,
+                     agent_id, user_id, superseded_by, invalid_at",
+    )?;
+    let rows = stmt
+        .query_map(params![id_str, ns_str], row_to_episodic)?
+        .collect::<Result<Vec<_>, _>>()?;
+    for row in rows {
+        memories.push(Memory::Episodic(row?));
+    }
+
+    let mut stmt = conn.prepare(
+        r"DELETE FROM semantic_memories
+           WHERE (subject = ?1 OR object_entity = ?1) AND namespace_id = ?2
+           RETURNING id, namespace_id, subject, predicate, object, content_type,
+                     object_entity, confidence, valid_at, invalid_at,
+                     source_episodes, embedding, stability, retrievability,
+                     agent_id, user_id, superseded_by",
+    )?;
+    let rows = stmt
+        .query_map(params![id_str, ns_str], row_to_semantic)?
+        .collect::<Result<Vec<_>, _>>()?;
+    for row in rows {
+        memories.push(Memory::Semantic(row?));
+    }
+
+    // `memory_fts` is keyed by `memory_id`, which identifies nothing on its own:
+    // ids repeat across namespaces, and within one namespace the same id can
+    // name both an episodic and a semantic row. Both halves of the key are
+    // pinned, or the cleanup strips an index entry whose base row is still live.
+    for memory in &memories {
+        conn.execute(
+            "DELETE FROM memory_fts
+              WHERE memory_id = ?1 AND namespace_id = ?2 AND memory_type = ?3",
+            params![memory.id().to_string(), ns_str, memory.type_name()],
+        )?;
+    }
+
+    Ok(memories)
+}
+
+/// Leg 3 of [`SqliteBackend::erase_entity_capturing`]: capture and delete the
+/// entity's graph edges.
+///
+/// Same-namespace edges only, by construction: an edge belongs to its source
+/// entity's namespace, so an edge from another tenant pointing at this entity is
+/// not visible here and survives. See the trait docs.
+fn erase_edges_for_entity(
+    conn: &Connection,
+    id_str: &str,
+    ns_str: &str,
+) -> StorageResult<Vec<Edge>> {
+    let mut stmt = conn.prepare(&format!(
+        "DELETE FROM edges
+          WHERE (source = ?1 OR target = ?1) AND namespace_id = ?2
+          RETURNING {EDGE_COLUMNS}",
+    ))?;
+    let rows = stmt
+        .query_map(params![id_str, ns_str], edge_columns)?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter().map(columns_to_edge).collect()
+}
+
+/// The `edges` columns [`columns_to_edge`] decodes, positionally.
+///
+/// Named once so the read's `SELECT` and the erase's `DELETE ... RETURNING`
+/// cannot drift apart: a mismatch there is a silent mis-decode, not a
+/// compile error.
+const EDGE_COLUMNS: &str =
+    "id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata";
+
+type EdgeColumns = (
+    String,
+    String,
+    String,
+    String,
+    f64,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+fn edge_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<EdgeColumns> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+    ))
+}
+
+fn columns_to_edge(columns: EdgeColumns) -> StorageResult<Edge> {
+    let (
+        id_str,
+        src_str,
+        tgt_str,
+        relation,
+        weight,
+        valid_at_str,
+        invalid_at_opt,
+        superseded_by_opt,
+        metadata_str,
+    ) = columns;
+    Ok(Edge {
+        id: parse_uuid(&id_str)?,
+        source: parse_uuid(&src_str)?,
+        target: parse_uuid(&tgt_str)?,
+        relation,
+        weight: weight as f32,
+        valid_at: str_to_dt(&valid_at_str),
+        invalid_at: invalid_at_opt.map(|s| str_to_dt(&s)),
+        superseded_by: superseded_by_opt.as_deref().map(parse_uuid).transpose()?,
+        metadata: serde_json::from_str(&metadata_str)?,
+        edge_type: EdgeType::default(),
+    })
 }
 
 fn row_to_episodic(
@@ -5254,6 +5466,29 @@ mod tests {
         .unwrap()
     }
 
+    /// `kg_passage_entities` rows for `passage_id` whose entity belongs to
+    /// `namespace_id`.
+    ///
+    /// The table carries no `namespace_id` of its own — its key is
+    /// `(passage_id, entity_id)` — so the only way to attribute a row to a
+    /// tenant is through `kg_entities`, which is what the cleanup has to do
+    /// too.
+    fn kg_passage_entities_count_in_namespace(
+        db: &SqliteBackend,
+        passage_id: Uuid,
+        namespace_id: Uuid,
+    ) -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM kg_passage_entities \
+              WHERE passage_id = ?1 \
+                AND entity_id IN (SELECT id FROM kg_entities WHERE namespace_id = ?2)",
+            params![passage_id.to_string(), namespace_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
     fn kg_entities_count_for_namespace(db: &SqliteBackend, namespace_id: Uuid) -> i64 {
         let conn = db.conn.lock().unwrap();
         conn.query_row(
@@ -5617,5 +5852,330 @@ mod tests {
         let current_hits = db.search_fts("currenttoken", ns.id, 10).unwrap();
         assert_eq!(current_hits.len(), 1);
         assert_eq!(current_hits[0].id(), new.id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Capturing GDPR erase (#264, #268)
+    // -----------------------------------------------------------------------
+
+    /// One transaction, four legs, and the captured set is what the legs
+    /// removed.
+    ///
+    /// The observation leg is the ordering proof: an observation is only
+    /// reachable from the entity by joining through
+    /// `episodic_memories.about_entity / source_entity`, so if the episodic
+    /// delete ran first the captured observation list would be empty and the
+    /// rows would be orphaned in the table.
+    #[test]
+    fn erase_entity_capturing_removes_every_leg_and_returns_what_it_removed() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+
+        let mut subject = Entity::new("subject", EntityKind::User);
+        subject.namespace_id = ns.id;
+        db.save_entity(&subject).unwrap();
+
+        let mut peer = Entity::new("peer", EntityKind::User);
+        peer.namespace_id = ns.id;
+        db.save_entity(&peer).unwrap();
+
+        let episode = Episode::new(ns.id, vec![subject.id]);
+        db.save_episode(&episode).unwrap();
+
+        // Source-side episodic: the subject spoke, the row is about the peer.
+        let episodic = EpisodicMemory::new(ns.id, episode.id, subject.id, peer.id, "a turn");
+        db.save_episodic(&episodic).unwrap();
+
+        // Object-side semantic: the subject is the object of the peer's fact.
+        let mut semantic = SemanticMemory::new(ns.id, peer.id, "manages", "subject", 0.9);
+        semantic.object_entity = Some(subject.id);
+        db.save_semantic(&semantic).unwrap();
+
+        let observation =
+            ObservationMemory::new(ns.id, episode.id, "x", "y", "z", "an observation");
+        db.save_observation(&observation).unwrap();
+        let kg_subject = seed_kg_entity(&db, ns.id, "S");
+        let kg_object = seed_kg_entity(&db, ns.id, "O");
+        seed_kg_triple(&db, ns.id, observation.id, kg_subject, kg_object);
+
+        let outgoing = Edge::new(subject.id, peer.id, "knows");
+        db.save_edge(&outgoing, ns.id).unwrap();
+        let incoming = Edge::new(peer.id, subject.id, "manages");
+        db.save_edge(&incoming, ns.id).unwrap();
+
+        let erased = db.erase_entity_capturing(subject.id, ns.id).unwrap();
+
+        assert_eq!(
+            erased.observations.iter().map(|o| o.id).collect::<Vec<_>>(),
+            vec![observation.id],
+            "observations must be captured before the episodic rows they join through"
+        );
+        let memory_ids: Vec<Uuid> = erased.memories.iter().map(Memory::id).collect();
+        assert!(memory_ids.contains(&episodic.id) && memory_ids.contains(&semantic.id));
+        assert_eq!(memory_ids.len(), 2);
+        let mut edge_ids: Vec<Uuid> = erased.edges.iter().map(|e| e.id).collect();
+        edge_ids.sort();
+        let mut expected_edges = vec![outgoing.id, incoming.id];
+        expected_edges.sort();
+        assert_eq!(edge_ids, expected_edges, "both edge legs must be captured");
+        assert!(erased.entity_deleted);
+
+        // …and the table agrees with the capture.
+        assert!(
+            db.get_all_memories_by_namespace_including_superseded(ns.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.get_edges_for_entity_in_namespace(subject.id, ns.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.get_entity(subject.id).unwrap().is_none());
+        assert_eq!(fts_rows_for(&db, episodic.id), 0);
+        assert_eq!(fts_rows_for(&db, semantic.id), 0);
+        assert_eq!(fts_rows_for(&db, observation.id), 0);
+        assert_eq!(kg_triples_count_for_passage(&db, observation.id), 0);
+        assert_eq!(
+            kg_passage_entities_count_for_passage(&db, observation.id),
+            0
+        );
+        assert_eq!(
+            kg_entities_count_for_namespace(&db, ns.id),
+            2,
+            "kg_entities are namespace-scoped and must not cascade with an entity erase"
+        );
+    }
+
+    /// Every leg carries `namespace_id`. Entity ids are not globally unique in
+    /// this schema, so an erase in one namespace must not reach the identically
+    /// keyed rows of another — including the observation and entity-record legs,
+    /// which the pre-#264 erase path matched on the entity id alone.
+    #[test]
+    fn erase_entity_capturing_is_confined_to_its_namespace() {
+        let (_dir, db) = setup();
+        let ns_a = make_namespace(&db);
+        let ns_b = Namespace::new("other-ns");
+        db.save_namespace(&ns_b).unwrap();
+
+        // The same entity id in both namespaces — the collision the memory,
+        // observation and edge predicates have to disambiguate. The `entities`
+        // row itself can only exist once (`id` is the primary key), so it is
+        // seeded in A alone.
+        let mut entity = Entity::new("subject", EntityKind::User);
+        entity.namespace_id = ns_a.id;
+        db.save_entity(&entity).unwrap();
+        let entity_id = entity.id;
+
+        let mut seeded = Vec::new();
+        for ns in [&ns_a, &ns_b] {
+            let episode = Episode::new(ns.id, vec![entity_id]);
+            db.save_episode(&episode).unwrap();
+            let episodic = EpisodicMemory::new(ns.id, episode.id, entity_id, entity_id, "a turn");
+            db.save_episodic(&episodic).unwrap();
+            let observation =
+                ObservationMemory::new(ns.id, episode.id, "x", "y", "z", "an observation");
+            db.save_observation(&observation).unwrap();
+            let edge = Edge::new(entity_id, Uuid::new_v4(), "knows");
+            db.save_edge(&edge, ns.id).unwrap();
+            seeded.push((episodic.id, observation.id, edge.id));
+        }
+
+        let erased = db.erase_entity_capturing(entity_id, ns_a.id).unwrap();
+        assert_eq!(erased.memories.len(), 1);
+        assert_eq!(erased.observations.len(), 1);
+        assert_eq!(erased.edges.len(), 1);
+        assert!(erased.entity_deleted);
+
+        let (b_episodic, b_observation, b_edge) = seeded[1];
+        let surviving: Vec<Uuid> = db
+            .get_all_memories_by_namespace_including_superseded(ns_b.id)
+            .unwrap()
+            .iter()
+            .map(Memory::id)
+            .collect();
+        assert!(
+            surviving.contains(&b_episodic) && surviving.contains(&b_observation),
+            "namespace B's rows must survive an erase issued for namespace A; B holds {surviving:?}"
+        );
+        assert_eq!(
+            db.get_edges_for_entity_in_namespace(entity_id, ns_b.id)
+                .unwrap()
+                .iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>(),
+            vec![b_edge],
+            "namespace B's edge must survive"
+        );
+        assert!(
+            db.get_all_memories_by_namespace_including_superseded(ns_a.id)
+                .unwrap()
+                .is_empty(),
+            "namespace A must be empty after its own erase"
+        );
+    }
+
+    /// An entity with nothing attached is not an error, and reports nothing
+    /// deleted rather than a bare `entity_deleted`.
+    #[test]
+    fn erase_entity_capturing_on_an_absent_entity_captures_nothing() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+
+        let erased = db.erase_entity_capturing(Uuid::new_v4(), ns.id).unwrap();
+
+        assert!(erased.observations.is_empty());
+        assert!(erased.memories.is_empty());
+        assert!(erased.edges.is_empty());
+        assert!(!erased.entity_deleted);
+    }
+
+    /// The knowledge-graph cascade must stay inside the erasing namespace.
+    ///
+    /// `kg_passage_entities` has no `namespace_id` column — its key is
+    /// `(passage_id, entity_id)` — so a delete matching `passage_id` alone
+    /// reaches every tenant that happens to share the id. Passage ids are
+    /// observation ids, and this schema does not treat ids as globally unique
+    /// anywhere else; the sibling single-memory path
+    /// (`delete_memory_by_id_with_namespace`) already joins through
+    /// `kg_entities` to attribute the row, and the erase has to match it.
+    ///
+    /// `kg_triples` carries its own `namespace_id` and is seeded here as the
+    /// control: it was already qualified, so it must survive on B's side too
+    /// and its survival is not what this test is about.
+    #[test]
+    fn erase_entity_capturing_kg_cascade_is_confined_to_its_namespace() {
+        let (_dir, db) = setup();
+        let ns_a = make_namespace(&db);
+        let ns_b = Namespace::new("other-ns");
+        db.save_namespace(&ns_b).unwrap();
+
+        let mut entity = Entity::new("subject", EntityKind::User);
+        entity.namespace_id = ns_a.id;
+        db.save_entity(&entity).unwrap();
+
+        let episode = Episode::new(ns_a.id, vec![entity.id]);
+        db.save_episode(&episode).unwrap();
+        let episodic = EpisodicMemory::new(ns_a.id, episode.id, entity.id, entity.id, "a turn");
+        db.save_episodic(&episodic).unwrap();
+
+        let observation =
+            ObservationMemory::new(ns_a.id, episode.id, "x", "y", "z", "an observation");
+        db.save_observation(&observation).unwrap();
+
+        // A's knowledge-graph rows for that passage.
+        let a_subject = seed_kg_entity(&db, ns_a.id, "S-A");
+        let a_object = seed_kg_entity(&db, ns_a.id, "O-A");
+        seed_kg_triple(&db, ns_a.id, observation.id, a_subject, a_object);
+
+        // B's knowledge-graph rows for the SAME passage id, wired to B's own
+        // `kg_entities`. Nothing in the schema prevents this: the passage id is
+        // not a foreign key, and `kg_passage_entities` cannot tell the two
+        // tenants apart on its own.
+        let b_subject = seed_kg_entity(&db, ns_b.id, "S-B");
+        let b_object = seed_kg_entity(&db, ns_b.id, "O-B");
+        seed_kg_triple(&db, ns_b.id, observation.id, b_subject, b_object);
+
+        assert_eq!(
+            kg_passage_entities_count_in_namespace(&db, observation.id, ns_a.id),
+            2
+        );
+        assert_eq!(
+            kg_passage_entities_count_in_namespace(&db, observation.id, ns_b.id),
+            2,
+            "B's rows must exist before the erase, or their absence afterwards proves nothing"
+        );
+
+        let erased = db.erase_entity_capturing(entity.id, ns_a.id).unwrap();
+        assert_eq!(
+            erased.observations.iter().map(|o| o.id).collect::<Vec<_>>(),
+            vec![observation.id],
+            "the erase must have captured the observation whose cascade is under test"
+        );
+
+        assert_eq!(
+            kg_passage_entities_count_in_namespace(&db, observation.id, ns_a.id),
+            0,
+            "namespace A's own passage-entity rows must cascade with its observation"
+        );
+        assert_eq!(
+            kg_passage_entities_count_in_namespace(&db, observation.id, ns_b.id),
+            2,
+            "namespace B's passage-entity rows were deleted by an erase issued for \
+             namespace A: the cleanup matched `passage_id` alone, and that column \
+             names nothing on its own"
+        );
+
+        // Control: the already-qualified legs behave.
+        assert_eq!(
+            kg_entities_count_for_namespace(&db, ns_b.id),
+            2,
+            "namespace B's kg_entities must survive"
+        );
+        assert_eq!(
+            kg_triples_count_for_passage(&db, observation.id),
+            1,
+            "only namespace A's triple may go; `kg_triples` was already namespace-qualified"
+        );
+    }
+
+    /// Superseded rows are erased too, and appear in the capture.
+    ///
+    /// A GDPR erase has to remove the entity's *history*, not just its current
+    /// state — a superseded memory still holds the content that was written
+    /// about the subject. The predicates deliberately carry no
+    /// `superseded_by IS NULL` clause; this pins that, because both the delete
+    /// and every read path around it filter on supersession somewhere, so an
+    /// added clause would look natural and silently strand history.
+    ///
+    /// It also pins the capture side: a superseded row that is deleted but not
+    /// returned keeps its vector-index entry, which is #268's failure one row
+    /// at a time.
+    #[test]
+    fn erase_entity_capturing_takes_superseded_rows_too() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+
+        let mut entity = Entity::new("subject", EntityKind::User);
+        entity.namespace_id = ns.id;
+        db.save_entity(&entity).unwrap();
+
+        let episode = Episode::new(ns.id, vec![entity.id]);
+        db.save_episode(&episode).unwrap();
+
+        let episodic = EpisodicMemory::new(ns.id, episode.id, entity.id, entity.id, "an old turn");
+        db.save_episodic(&episodic).unwrap();
+        let semantic = SemanticMemory::new(ns.id, entity.id, "lived_in", "berlin", 0.5);
+        db.save_semantic(&semantic).unwrap();
+
+        for id in [episodic.id, semantic.id] {
+            assert!(
+                db.supersede_memory_in_namespace(id, ns.id, Uuid::new_v4(), Utc::now())
+                    .unwrap(),
+                "the row must actually be superseded, or this test proves nothing"
+            );
+        }
+        // Live-row reads no longer see either one — which is exactly why the
+        // erase must not be built on a live-row read.
+        assert!(db.get_all_memories_by_namespace(ns.id).unwrap().is_empty());
+
+        let erased = db.erase_entity_capturing(entity.id, ns.id).unwrap();
+
+        let mut captured: Vec<Uuid> = erased.memories.iter().map(Memory::id).collect();
+        captured.sort();
+        let mut expected = vec![episodic.id, semantic.id];
+        expected.sort();
+        assert_eq!(
+            captured, expected,
+            "both superseded rows must be captured by the erase"
+        );
+        assert!(
+            db.get_all_memories_by_namespace_including_superseded(ns.id)
+                .unwrap()
+                .is_empty(),
+            "superseded history must be gone from storage, not just from live reads"
+        );
+        assert_eq!(fts_rows_for(&db, episodic.id), 0);
+        assert_eq!(fts_rows_for(&db, semantic.id), 0);
     }
 }

@@ -2297,6 +2297,36 @@ async fn feedback(
 // GDPR handler
 // ---------------------------------------------------------------------------
 
+/// Run the capturing GDPR erase on the blocking pool.
+///
+/// The call is synchronous the whole way down — a rusqlite transaction behind a
+/// mutex on `SQLite`, a `block_on` of an sqlx transaction on Postgres — so it
+/// goes to the blocking pool rather than parking a runtime worker for its
+/// duration. Same reasoning as [`forget_entity_blocking`] for the sibling
+/// entity-wide delete (#251).
+///
+/// The `Err` is the caller-facing message.
+async fn erase_entity_blocking(
+    ps: &PensyveState,
+    entity_id: Uuid,
+) -> Result<
+    (
+        pensyve_core::gdpr::ErasureResult,
+        pensyve_core::storage::ErasedRows,
+    ),
+    String,
+> {
+    let storage = ps.storage.clone();
+    let namespace_id = ps.namespace.id;
+
+    tokio::task::spawn_blocking(move || {
+        pensyve_core::gdpr::erase_entity_captured(storage.as_ref(), entity_id, namespace_id)
+    })
+    .await
+    .map_err(|err| format!("GDPR erasure task failed: {err}"))
+    .and_then(|outcome| outcome.map_err(|err| format!("GDPR erasure error: {err}")))
+}
+
 async fn gdpr_erase(
     State(state): State<Arc<AppState>>,
     axum::Extension(auth_ctx): axum::Extension<AuthContext>,
@@ -2320,33 +2350,48 @@ async fn gdpr_erase(
         }
     };
 
-    // Collect memory IDs before deletion so we can remove them from vector
-    // index. The accessor mirrors the erasure's own delete predicates
-    // (`about_entity OR source_entity`, `subject OR object_entity`, superseded
-    // rows included) — the per-type `list_*_by_entity` calls that used to stand
-    // in here saw only the about-side, the subject-side and live rows, so every
-    // other deleted row kept its index entry (#261).
-    let memory_ids: Vec<Uuid> = ps
-        .storage
-        .list_memories_by_entity_including_superseded(entity.id, ps.namespace.id)
-        .map(|mems| mems.iter().map(pensyve_core::types::Memory::id).collect())
-        .unwrap_or_default();
+    // The erase and its vector-index cleanup run on a spawned task the handler
+    // only observes. axum drops handler futures when the client disconnects,
+    // and the cleanup waits on the index write lock *after* the transaction has
+    // committed — a drop in that window leaves index entries pointing at rows
+    // the erase destroyed. That is #268's failure mode with the concurrent
+    // writer replaced by a hang-up, and it needs no writer at all. A spawned
+    // task is detached from the request, so once the erase starts its
+    // bookkeeping runs to completion. Same reasoning and same shape as
+    // `forget_entity` above.
+    let ps_task = ps.clone();
+    let entity_id = entity.id;
+    let task = tokio::spawn(async move {
+        let (result, erased) = erase_entity_blocking(&ps_task, entity_id).await?;
 
-    let result = pensyve_core::gdpr::erase_entity(ps.storage.as_ref(), entity.id, ps.namespace.id)
-        .map_err(|e| {
+        // The captured rows are exactly what the transaction removed, so they
+        // are also the authoritative list for index cleanup. Listing the ids
+        // beforehand — which this handler used to do — leaves a window in which
+        // a concurrent writer inserts a matching row: the erase deletes it, the
+        // pre-list never saw it, and its index entry survives the request that
+        // was supposed to destroy its content (#268).
+        if !erased.memories.is_empty() {
+            let mut vi = ps_task.vector_index.write().await;
+            for memory in &erased.memories {
+                let _ = vi.remove(memory.id());
+            }
+        }
+
+        Ok::<_, String>(result)
+    });
+
+    // A panicked task cannot claim "nothing was erased" — the transaction may
+    // have committed before the bookkeeping panicked — so the message stays
+    // neutral, matching `forget_entity`.
+    let result = task
+        .await
+        .map_err(|err| {
             RestError(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("GDPR erasure error: {e}"),
+                format!("GDPR erasure task failed: {err}"),
             )
-        })?;
-
-    // Clean vector index.
-    if result.memories_deleted > 0 {
-        let mut vi = ps.vector_index.write().await;
-        for id in &memory_ids {
-            let _ = vi.remove(*id);
-        }
-    }
+        })?
+        .map_err(|err| RestError(StatusCode::INTERNAL_SERVER_ERROR, err))?;
 
     Ok(Json(json!({
         "entity": name,

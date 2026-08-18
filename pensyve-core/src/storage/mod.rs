@@ -60,6 +60,27 @@ fn capturing_delete_not_implemented() -> StorageResult<Vec<Memory>> {
     ))
 }
 
+/// Everything one [`StorageTrait::erase_entity_capturing`] transaction removed.
+///
+/// These are the rows the committed `DELETE`s actually returned, not the rows a
+/// preceding `SELECT` predicted they would remove. Callers that have to clean up
+/// out-of-band state — the gateway strips the vector index — must drive that
+/// cleanup from here: a set collected by a separate query before the delete
+/// leaves a window in which a concurrent writer inserts a matching row, and the
+/// delete then destroys it while its index entry survives (#268).
+#[derive(Debug, Clone, Default)]
+pub struct ErasedRows {
+    /// Observations derived from episodes the entity participated in.
+    pub observations: Vec<ObservationMemory>,
+    /// Episodic and semantic memories, superseded rows included.
+    pub memories: Vec<Memory>,
+    /// Graph edges touching the entity, within the erasing namespace.
+    pub edges: Vec<Edge>,
+    /// Whether the entity record itself was removed. `false` means no such row
+    /// existed in the namespace, which is not an error.
+    pub entity_deleted: bool,
+}
+
 /// Maximum whitespace-delimited tokens an FTS query contributes to the search
 /// expression; both backends truncate identically so their candidate sets stay
 /// comparable (#225).
@@ -394,7 +415,13 @@ pub trait StorageTrait: Send + Sync {
     /// `namespace_id`.
     ///
     /// This exists so callers can collect the ids to strip from a vector index
-    /// before an entity-wide forget (#261). `list_episodic_by_entity` and
+    /// before an entity-wide forget (#261). It is a read, not a capture, so it
+    /// must not be used to drive cleanup for a delete: the rows can change
+    /// between the listing and the delete. Both paths that used to do that now
+    /// take their ids from what the delete returned —
+    /// [`StorageTrait::delete_memories_by_entity_capturing`] for forget and
+    /// [`StorageTrait::erase_entity_capturing`] for GDPR erase (#268).
+    /// `list_episodic_by_entity` and
     /// `list_semantic_by_entity` are not a substitute: they look at
     /// `about_entity` and `subject` alone and skip superseded rows, so every
     /// source-side episodic, object-side semantic and superseded row kept its
@@ -508,6 +535,45 @@ pub trait StorageTrait: Send + Sync {
         capturing_delete_not_implemented()
     }
 
+    /// Erase everything belonging to `entity_id` within `namespace_id` in ONE
+    /// transaction, and hand back the rows it removed.
+    ///
+    /// This is the storage half of `gdpr::erase_entity`. The legs run in a fixed
+    /// order, and the order is load-bearing:
+    ///
+    /// 1. **observations** — they are found by joining through
+    ///    `episodic_memories.about_entity / source_entity`, so once the episodic
+    ///    rows are gone the association no longer exists;
+    /// 2. **memories** — episodic and semantic, superseded rows included, with
+    ///    any search-index cleanup in the same transaction;
+    /// 3. **edges** — `(source = entity OR target = entity) AND namespace_id`;
+    /// 4. **the entity record**.
+    ///
+    /// Implementations must:
+    /// - qualify every statement by `namespace_id` — entity ids repeat across
+    ///   namespaces, so an entity-only predicate reaches into other tenants and
+    ///   also drags their rows into the caller's captured set;
+    /// - run all four legs in one transaction, rolling the whole thing back on
+    ///   any error. A GDPR erase is all-or-nothing: a caller told an erase
+    ///   failed must not have to guess which legs already committed.
+    ///
+    /// Edges are only ever this namespace's edges. An edge whose source is in
+    /// another namespace and whose target is the entity being erased is stored
+    /// in — and visible only from — the source's namespace, so it survives. See
+    /// the `save_edge` / `get_edges_for_entity_in_namespace` comment below for
+    /// why that ownership rule is the one being kept.
+    ///
+    /// Required rather than defaulted. A default that errors at runtime would
+    /// let a backend which cannot erase atomically compile, ship, and only then
+    /// fail the one request that had to work — turning a build failure into a
+    /// production one. An implementor that cannot satisfy the contract above
+    /// should find that out from the compiler.
+    fn erase_entity_capturing(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<ErasedRows>;
+
     /// Delete a single memory (episodic, semantic, procedural or observation)
     /// only when it belongs to `namespace_id`.
     ///
@@ -566,8 +632,9 @@ pub trait StorageTrait: Send + Sync {
     // and whose target is in B is stored in A and is therefore invisible from
     // B, including on B's `target` leg — so an erase running in B will not see
     // it and cannot delete it (pinned by
-    // `an_edge_belongs_to_its_source_entitys_namespace_only`; #264 owns the
-    // erase-side consequence).
+    // `an_edge_belongs_to_its_source_entitys_namespace_only`). That is the
+    // residue [`StorageTrait::erase_entity_capturing`] deliberately leaves
+    // behind: reading the edge to delete it would be a read into A.
     fn save_edge(&self, edge: &Edge, namespace_id: Uuid) -> StorageResult<()>;
     fn get_edges_for_entity_in_namespace(
         &self,

@@ -305,7 +305,8 @@ fn get_edges_for_entity_in_namespace_partitions_a_shared_entity_id() {
 /// `target` leg, where B would otherwise expect to find it. B erasing the
 /// target entity therefore does not see, and cannot delete, A's edge pointing
 /// at it. That is deliberate (an edge is A's data, and B cannot be handed a
-/// read into A), and handling the erase-side consequence is #264.
+/// read into A), and it is the one residue a GDPR erase leaves behind — see
+/// `StorageTrait::erase_entity_capturing`.
 #[test]
 fn an_edge_belongs_to_its_source_entitys_namespace_only() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -337,8 +338,8 @@ fn an_edge_belongs_to_its_source_entitys_namespace_only() {
         "the target leg still resolves inside the owning namespace"
     );
 
-    // B does not, even though the target is B's entity. This is the
-    // consequence #264 has to reckon with, not an accident.
+    // B does not, even though the target is B's entity. This is the accepted
+    // consequence of source-namespace ownership, not an accident.
     assert!(
         t.db.get_edges_for_entity_in_namespace(target_in_b, t.ns_b)
             .expect("edge lookup")

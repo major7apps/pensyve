@@ -21,7 +21,8 @@ use crate::types::{
 };
 
 use super::{
-    ActivityAggregate, ActivityEvent, StorageResult, StorageTrait, cross_namespace_edge_id,
+    ActivityAggregate, ActivityEvent, ErasedRows, StorageResult, StorageTrait,
+    cross_namespace_edge_id,
 };
 use crate::graph::EdgeType;
 
@@ -1731,6 +1732,129 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    /// One-transaction GDPR erase — the trait docs carry the leg order and why
+    /// it is fixed. Each leg is a `DELETE ... RETURNING`, so the captured rows
+    /// are the rows the statement removed rather than rows a preceding `SELECT`
+    /// predicted, and all four run in one transaction: any error drops `tx`,
+    /// which rolls back, leaving the erase to be retried whole.
+    ///
+    /// The connection is bound to `namespace_id` rather than left unscoped. This
+    /// method knows its namespace, and an unscoped connection matches no row
+    /// once RLS is enforced — a capturing erase that quietly deleted nothing,
+    /// or ran against whatever namespace the previous checkout left set, is
+    /// exactly the failure #253 caught. The explicit `AND namespace_id = $2`
+    /// predicates stay regardless: they are what confines the delete while RLS
+    /// is inert, which is every deployment shipping today.
+    ///
+    /// There is no full-text cleanup, unlike the `SQLite` backend: this schema
+    /// indexes through a `fts_content` generated column on each table, so
+    /// deleting the row deletes its index entry.
+    fn erase_entity_capturing(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<ErasedRows> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            let mut erased = ErasedRows::default();
+
+            // Leg 1 — observations. MUST precede the episodic delete: the only
+            // link from an observation back to the entity runs through
+            // `episodic_memories.about_entity / source_entity`, and once those
+            // rows are gone the association cannot be reconstructed.
+            let rows: Vec<ObservationRow> = query_as::<Postgres, _>(
+                r"DELETE FROM observation_memories
+                   WHERE namespace_id = $2
+                     AND episode_id IN (
+                       SELECT DISTINCT episode_id FROM episodic_memories
+                        WHERE (about_entity = $1 OR source_entity = $1)
+                          AND namespace_id = $2
+                     )
+                   RETURNING id, namespace_id, episode_id, entity_type, instance, action,
+                             quantity, unit, content, embedding::text AS embedding, confidence,
+                             event_time, created_at, stability, retrievability,
+                             superseded_by, invalid_at",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            erased
+                .observations
+                .extend(rows.into_iter().map(row_to_observation));
+
+            // Leg 2 — episodic and semantic memories, superseded rows included.
+            // Predicates match `delete_memories_by_entity` verbatim.
+            let rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
+                r"DELETE FROM episodic_memories
+                   WHERE (about_entity = $1 OR source_entity = $1) AND namespace_id = $2
+                   RETURNING id, namespace_id, episode_id, source_entity, about_entity, content,
+                             summary, embedding::text AS embedding, context_intent, timestamp,
+                             stability, retrievability, access_count, last_accessed, event_time,
+                             superseded_by, invalid_at",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            erased
+                .memories
+                .extend(rows.into_iter().map(row_to_episodic).map(Memory::Episodic));
+
+            let rows: Vec<SemanticRow> = query_as::<Postgres, _>(
+                r"DELETE FROM semantic_memories
+                   WHERE (subject = $1 OR object_entity = $1) AND namespace_id = $2
+                   RETURNING id, namespace_id, subject, predicate, object, object_entity,
+                             confidence, valid_at, invalid_at, source_episodes,
+                             embedding::text AS embedding, stability, retrievability,
+                             superseded_by",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            erased
+                .memories
+                .extend(rows.into_iter().map(row_to_semantic).map(Memory::Semantic));
+
+            // Leg 3 — graph edges. Same-namespace edges only, by construction:
+            // an edge belongs to its source entity's namespace, so an edge from
+            // another tenant pointing at this entity is not visible here and
+            // survives. See the trait docs.
+            let rows: Vec<EdgeRow> = query_as::<Postgres, _>(
+                r"DELETE FROM edges
+                   WHERE (source = $1 OR target = $1) AND namespace_id = $2
+                   RETURNING id, source, target, relation, weight, valid_at, invalid_at,
+                             superseded_by, metadata",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            erased.edges.extend(rows.into_iter().map(row_to_edge));
+
+            // Leg 4 — the entity record. Absence is not an error: the caller may
+            // be erasing data for an entity whose record was already removed.
+            let result =
+                query::<Postgres>("DELETE FROM entities WHERE id = $1 AND namespace_id = $2")
+                    .bind(entity_id)
+                    .bind(namespace_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(sqlx_to_io)?;
+            erased.entity_deleted = result.rows_affected() > 0;
+
+            tx.commit().await.map_err(sqlx_to_io)?;
+
+            Ok(erased)
+        })
+    }
+
     /// Entity-wide delete, confined to `namespace_id`.
     ///
     /// The `AND namespace_id = $2` predicates carry the isolation on their own.
@@ -1866,9 +1990,12 @@ impl StorageTrait for PostgresBackend {
     /// has an analogue in `postgres_schema.sql`: the KG tables are not part of
     /// the Postgres schema at all, and full-text search is a generated
     /// `tsvector` column on each memory table, so deleting the row takes its
-    /// index entry with it. `edges` is untouched on both backends. It carries
-    /// a `namespace_id` now, so a namespace-scoped delete has become
-    /// expressible against it; actually deleting edges here is #264.
+    /// index entry with it. `edges` and `entities` are untouched on both
+    /// backends: a purge empties the memory tables and leaves the namespace's
+    /// graph and entity records standing. The entity-scoped
+    /// [`StorageTrait::erase_entity_capturing`] does delete both, so the
+    /// expression is available — the purge simply does not use it. That gap is
+    /// #278.
     ///
     /// Every statement names `namespace_id = $1` explicitly even though all
     /// four run on a namespace-bound connection. That is the #254 convention:
@@ -2057,27 +2184,7 @@ impl StorageTrait for PostgresBackend {
             .await
             .map_err(sqlx_to_io)?;
 
-            Ok(rows
-                .into_iter()
-                .map(
-                    |(id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata)| {
-                        let metadata: HashMap<String, serde_json::Value> =
-                            serde_json::from_value(metadata).unwrap_or_default();
-                        Edge {
-                            id,
-                            source,
-                            target,
-                            relation,
-                            weight,
-                            valid_at,
-                            invalid_at,
-                            superseded_by,
-                            metadata,
-                            edge_type: EdgeType::default(),
-                        }
-                    },
-                )
-                .collect())
+            Ok(rows.into_iter().map(row_to_edge).collect())
         })
     }
 
@@ -2385,6 +2492,22 @@ fn row_to_procedural(row: ProceduralRow) -> ProceduralMemory {
         // G1: postgres backend does not yet carry the multi-tenant scope columns.
         agent_id: None,
         user_id: None,
+    }
+}
+
+fn row_to_edge(row: EdgeRow) -> Edge {
+    let (id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata) = row;
+    Edge {
+        id,
+        source,
+        target,
+        relation,
+        weight,
+        valid_at,
+        invalid_at,
+        superseded_by,
+        metadata: serde_json::from_value(metadata).unwrap_or_default(),
+        edge_type: EdgeType::default(),
     }
 }
 
