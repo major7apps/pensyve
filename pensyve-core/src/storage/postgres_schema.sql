@@ -4,6 +4,27 @@
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- ---------------------------------------------------------------------------
+-- Schema state
+--
+-- One row, holding the digest of the schema text that was last applied.
+-- `PostgresBackend::run_schema` reads it before doing anything: when it names
+-- this build's digest the whole file is skipped, which is what lets a
+-- deployment serve traffic as a role that does not own these tables and
+-- therefore cannot run the DDL below. The row is written from Rust, after the
+-- batch commits — the file cannot name its own digest, and DML belongs in this
+-- file only inside the `row_security = off` window further down.
+--
+-- Carries no namespace and therefore no RLS policy: it describes the database,
+-- not a tenant's data.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS pensyve_schema_state (
+    id             SMALLINT PRIMARY KEY,
+    schema_digest  TEXT NOT NULL,
+    applied_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ---------------------------------------------------------------------------
 -- Namespaces
 -- ---------------------------------------------------------------------------
 

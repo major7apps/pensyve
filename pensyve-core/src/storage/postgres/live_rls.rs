@@ -55,16 +55,26 @@
 //! [`namespace_scoping_end_to_end_under_enforced_rls`]. The checklist is empty
 //! and therefore gone; the per-method tests are the standing gate in its place.
 //!
-//! **Still open — enforcement is not yet the default.** Two things remain.
-//! The rest of the storage surface still runs unscoped and fails closed the
-//! same way; `docs/SECURITY.md` enumerates it. And the role matters:
-//! `PostgresBackend::new` applies the schema on every startup, which is
-//! owner-only DDL, so the application has to connect as the table owner — and
-//! a managed-Postgres owner role typically also carries `BYPASSRLS`, which
-//! exempts it from the policies whether or not `FORCE` is set. Separating
-//! schema application from serving traffic is the other #254 work item. Until
-//! both land, `FORCE` stays in `postgres_rls_enforce.sql` as an explicit
-//! operator step — see `docs/SECURITY.md`.
+//! **Fixed — the role can now be an unprivileged one.**
+//! `PostgresBackend::new` used to apply the schema unconditionally on every
+//! startup, which is owner-only DDL, so the application had to connect as the
+//! table owner — and an owner is exempt from its own policies until `FORCE`,
+//! while a managed-Postgres owner typically also carries `BYPASSRLS`, which
+//! `FORCE` cannot remove. Startup now reads `pensyve_schema_state` first and
+//! skips the DDL batch when the applied digest is this build's, so a serving
+//! role that only holds DML grants starts normally:
+//! [`a_non_owner_starts_against_an_already_migrated_database`],
+//! [`a_non_owner_that_must_apply_ddl_is_told_it_needs_the_owner`] and
+//! [`the_schema_skip_follows_the_schema_text`]. Startup also reports the
+//! role's own exemptions —
+//! [`startup_reports_whether_the_role_is_exempt_from_rls`] — because a
+//! `BYPASSRLS` role makes `FORCE` enforce nothing with no other symptom.
+//!
+//! **Still open — enforcement is not yet the default.** The rest of the
+//! storage surface still runs unscoped and fails closed the same way;
+//! `docs/SECURITY.md` enumerates it. Until that lands, `FORCE` stays in
+//! `postgres_rls_enforce.sql` as an explicit operator step — see
+//! `docs/SECURITY.md`.
 //!
 //! Tests therefore come in two flavours: [`Fixture::provision`] mirrors a
 //! current deployment (policies present, not enforced), and a test that wants
@@ -72,7 +82,7 @@
 
 use std::collections::HashMap;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx_core::query::query;
 use sqlx_core::query_as::query_as;
 use sqlx_core::raw_sql::raw_sql;
@@ -187,6 +197,11 @@ struct Fixture {
     backend: PostgresBackend,
     database: String,
     role: String,
+    /// Extra roles this fixture created — see [`Fixture::serving_role`]. They
+    /// hold grants inside the throwaway database, so they can only be dropped
+    /// after it is, which is why [`Drop`] owns their teardown rather than the
+    /// tests that ask for them.
+    extra_roles: std::cell::RefCell<Vec<String>>,
 }
 
 impl Fixture {
@@ -261,6 +276,7 @@ impl Fixture {
             backend,
             database,
             role,
+            extra_roles: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -278,6 +294,77 @@ impl Fixture {
             .enforce_rls()
             .expect("force row level security");
     }
+    /// Create — once — an unprivileged role that can read and write every
+    /// table but owns none of them, and return its name.
+    ///
+    /// This is the `pensyve_app` role of the DDL/serving split: it holds the
+    /// DML grants a serving deployment needs and nothing that would let it run
+    /// `CREATE TABLE` or `ALTER TABLE`, which is exactly the shape that makes
+    /// `FORCE ROW LEVEL SECURITY` mean something.
+    fn serving_role(&self, admin_opts: &PgConnectOptions) -> String {
+        let role = format!("{}_serving", self.role);
+        self.rt.block_on(async {
+            exec(
+                &self.admin,
+                format!(
+                    "CREATE ROLE \"{role}\" LOGIN PASSWORD '{APP_ROLE_PASSWORD}' \
+                     NOSUPERUSER NOBYPASSRLS"
+                ),
+            )
+            .await;
+        });
+        self.grant_dml(admin_opts, &role);
+        self.extra_roles.borrow_mut().push(role.clone());
+        role
+    }
+
+    /// Give `role` everything a serving deployment needs and nothing more:
+    /// `USAGE` on the schema and DML on every table, but no ownership, so it
+    /// cannot run the schema's DDL.
+    fn grant_dml(&self, admin_opts: &PgConnectOptions, role: &str) {
+        {
+            let mut extra = self.extra_roles.borrow_mut();
+            if !extra.iter().any(|existing| existing == role) {
+                extra.push(role.to_string());
+            }
+        }
+        with_admin_pool(&self.rt, admin_opts, &self.database, |rt, pool| {
+            rt.block_on(async {
+                for statement in [
+                    format!("GRANT USAGE ON SCHEMA public TO \"{role}\""),
+                    format!(
+                        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public \
+                         TO \"{role}\""
+                    ),
+                ] {
+                    exec(pool, statement).await;
+                }
+            });
+        });
+    }
+
+    /// A single-connection pool against this fixture's database as `role`.
+    fn pool_for(&self, admin_opts: &PgConnectOptions, role: &str) -> PgPool {
+        self.rt.block_on(async {
+            PgPoolOptions::new()
+                .max_connections(1)
+                .connect_with(
+                    admin_opts
+                        .clone()
+                        .username(role)
+                        .password(APP_ROLE_PASSWORD)
+                        .database(&self.database),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("connect to the fixture database as {role}: {e}"))
+        })
+    }
+
+    /// A second backend against this fixture's database, connected as `role`.
+    fn backend_as(&self, admin_opts: &PgConnectOptions, role: &str) -> PostgresBackend {
+        PostgresBackend::from_pool(self.pool_for(admin_opts, role))
+            .unwrap_or_else(|e| panic!("build a backend as {role}: {e}"))
+    }
 }
 
 impl Drop for Fixture {
@@ -286,16 +373,21 @@ impl Drop for Fixture {
         // that panics mid-run leaks its database; CI throws the container away.
         let admin = self.admin.clone();
         let database = self.database.clone();
-        let role = self.role.clone();
+        let mut roles = self.extra_roles.borrow().clone();
+        roles.push(self.role.clone());
         self.rt.block_on(async {
             let _ = raw_sql(AssertSqlSafe(format!(
                 "DROP DATABASE IF EXISTS \"{database}\" WITH (FORCE)"
             )))
             .execute(&admin)
             .await;
-            let _ = raw_sql(AssertSqlSafe(format!("DROP ROLE IF EXISTS \"{role}\"")))
-                .execute(&admin)
-                .await;
+            // Roles only after the database: a grant inside it is a dependency
+            // that would otherwise refuse the drop.
+            for role in &roles {
+                let _ = raw_sql(AssertSqlSafe(format!("DROP ROLE IF EXISTS \"{role}\"")))
+                    .execute(&admin)
+                    .await;
+            }
         });
     }
 }
@@ -2131,6 +2223,192 @@ fn supersede_still_works_under_enforced_rls() {
             .and_then(|m| m.superseded_by),
         Some(successor),
         "the stamp must be the one this namespace wrote"
+    );
+}
+
+/// Startup must be able to say whether the connected role is exempt from RLS
+/// at all, because a role that is exempt makes `FORCE ROW LEVEL SECURITY`
+/// enforce nothing and there is no other symptom.
+///
+/// Both sides are checked: the fixture's `NOSUPERUSER NOBYPASSRLS` application
+/// role must report clean, and a `BYPASSRLS` role must report exempt. Only the
+/// second half is the interesting one, but without the first the probe could
+/// be reporting `true` unconditionally.
+#[test]
+fn startup_reports_whether_the_role_is_exempt_from_rls() {
+    let Some(admin_opts) = skip_notice("startup_reports_whether_the_role_is_exempt_from_rls")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+
+    let serving = fixture
+        .backend
+        .role_rls_exemptions()
+        .expect("read the serving role's exemptions");
+    assert_eq!(serving.role, fixture.role);
+    assert!(
+        !serving.exempt(),
+        "the fixture's application role is NOSUPERUSER NOBYPASSRLS, so it must not report \
+         exempt; if it does, the probe is not reading what it claims to"
+    );
+
+    let bypass_role = format!("{}_bypass", fixture.role);
+    fixture.rt.block_on(async {
+        exec(
+            &fixture.admin,
+            format!(
+                "CREATE ROLE \"{bypass_role}\" LOGIN PASSWORD '{APP_ROLE_PASSWORD}' \
+                 NOSUPERUSER BYPASSRLS"
+            ),
+        )
+        .await;
+    });
+    fixture.grant_dml(&admin_opts, &bypass_role);
+
+    let exempt = fixture
+        .backend_as(&admin_opts, &bypass_role)
+        .role_rls_exemptions()
+        .expect("read the BYPASSRLS role's exemptions");
+    assert_eq!(exempt.role, bypass_role);
+    assert!(
+        exempt.bypassrls && exempt.exempt(),
+        "a BYPASSRLS role must be reported as exempt: FORCE ROW LEVEL SECURITY does not \
+         remove that exemption, so a deployment running as one enforces nothing"
+    );
+}
+
+/// A role that does not own the tables must be able to start against an
+/// already-migrated database.
+///
+/// This is the serving half of the DDL/serving split. `PostgresBackend::new`
+/// applies the schema on every startup, which is owner-only DDL, so before the
+/// applied-state probe a non-owner could not get past construction at all —
+/// which is why every deployment connects as the owner, and why the policies
+/// are inert for it. Startup now reads `pensyve_schema_state` first and skips
+/// the batch when it names this build's digest.
+#[test]
+fn a_non_owner_starts_against_an_already_migrated_database() {
+    let Some(admin_opts) = skip_notice("a_non_owner_starts_against_an_already_migrated_database")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+
+    // The owner's startup has already applied the schema and stamped the
+    // marker; that is the state a serving role is expected to find.
+    let serving = fixture.serving_role(&admin_opts);
+    let backend = PostgresBackend::from_pool(fixture.pool_for(&admin_opts, &serving))
+        .expect("a non-owner must start against an already-migrated database");
+
+    // And it can actually serve: the skip must not have left the backend in a
+    // state where ordinary reads fail.
+    let ns = Namespace::new(format!("non-owner-{}", Uuid::new_v4().simple()));
+    backend
+        .save_namespace(&ns)
+        .expect("write as the serving role");
+    assert_eq!(
+        backend
+            .get_namespace(ns.id)
+            .expect("read as the serving role")
+            .map(|n| n.id),
+        Some(ns.id)
+    );
+}
+
+/// …and when the schema is *not* current, the non-owner is told why rather
+/// than being handed `must be owner of table entities`.
+///
+/// The failure has to name the deployment model, because the operator's next
+/// action — run the migration as the owner, then restart the serving role — is
+/// not deducible from the Postgres error alone.
+#[test]
+fn a_non_owner_that_must_apply_ddl_is_told_it_needs_the_owner() {
+    let Some(admin_opts) =
+        skip_notice("a_non_owner_that_must_apply_ddl_is_told_it_needs_the_owner")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let serving = fixture.serving_role(&admin_opts);
+
+    // Stale marker: the database is at *some* version, but not this build's,
+    // so the probe correctly refuses to skip.
+    fixture.rt.block_on(async {
+        exec(
+            fixture.backend.pool(),
+            "UPDATE pensyve_schema_state SET schema_digest = 'fnv1a64:0000000000000000' \
+              WHERE id = 1",
+        )
+        .await;
+    });
+
+    let error = PostgresBackend::from_pool(fixture.pool_for(&admin_opts, &serving))
+        .err()
+        .expect("a non-owner must not silently start against an out-of-date schema");
+    let message = error.to_string();
+    assert!(
+        message.contains("owner-only DDL") && message.contains("docs/SECURITY.md"),
+        "the failure must name the owner requirement and where the deployment model is \
+         documented, not just Postgres's `must be owner of table ...`; got: {message}"
+    );
+}
+
+/// Re-applying the same schema is skipped, and editing it un-skips it.
+///
+/// The skip is what makes the split possible, but it must not be able to
+/// swallow a real migration: the marker records a digest of the schema text,
+/// so any edit invalidates it. Both directions are asserted, because a probe
+/// that always skips and a probe that never skips each pass one of them.
+#[test]
+fn the_schema_skip_follows_the_schema_text() {
+    let Some(admin_opts) = skip_notice("the_schema_skip_follows_the_schema_text") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+
+    let applied_at = |label: &str| -> DateTime<Utc> {
+        fixture.rt.block_on(async {
+            let (at,): (DateTime<Utc>,) =
+                query_as::<Postgres, _>("SELECT applied_at FROM pensyve_schema_state WHERE id = 1")
+                    .fetch_one(fixture.backend.pool())
+                    .await
+                    .unwrap_or_else(|e| panic!("read schema state ({label}): {e}"));
+            at
+        })
+    };
+
+    let first = applied_at("after provisioning");
+
+    // Re-running startup against an unchanged schema must not re-apply it.
+    let again = PostgresBackend::from_pool(fixture.pool_for(&admin_opts, &fixture.role.clone()))
+        .expect("restart as the owner");
+    drop(again);
+    assert_eq!(
+        applied_at("after an unchanged restart"),
+        first,
+        "an unchanged schema must be skipped, not re-applied — that skip is the only \
+         reason a non-owner can start at all"
+    );
+
+    // A changed schema must be re-applied. Standing in for an edit by rolling
+    // the marker back to a digest no build will ever produce.
+    fixture.rt.block_on(async {
+        exec(
+            fixture.backend.pool(),
+            "UPDATE pensyve_schema_state SET schema_digest = 'fnv1a64:ffffffffffffffff' \
+              WHERE id = 1",
+        )
+        .await;
+    });
+    let reapplied =
+        PostgresBackend::from_pool(fixture.pool_for(&admin_opts, &fixture.role.clone()))
+            .expect("restart as the owner over a changed schema");
+    drop(reapplied);
+    assert!(
+        applied_at("after a changed restart") > first,
+        "a schema whose text differs from what was applied must be applied again; \
+         otherwise a real migration would be skipped forever"
     );
 }
 
