@@ -71,12 +71,14 @@ result. The internal uses are limited to DDL, which RLS does not apply to, and
 to `namespaces` and `activity_events`, neither of which carries a policy.
 
 Layer 2 is not active by default. Postgres exempts a table's owner from its own
-policies, and the application connects as the role that owns the schema, so the
-policies do not apply to it. Removing that exemption requires
-`FORCE ROW LEVEL SECURITY`, which ships as a separate file that an operator
-applies (`postgres_rls_enforce.sql`, also reachable as
-`PostgresBackend::enforce_rls`) rather than as part of the schema that runs on
-every startup.
+policies, and a deployment that applies the schema on startup connects as the
+role that owns it, so the policies do not apply to that connection. Removing
+the exemption requires `FORCE ROW LEVEL SECURITY`, which ships as a separate
+file that an operator applies (`postgres_rls_enforce.sql`, also reachable as
+`PostgresBackend::enforce_rls`) rather than as part of the schema. Every
+storage path now carries a namespace, so enforcement is safe to apply; making
+it the default is the remaining step, and it is a schema change rather than a
+code one.
 
 #### Before enabling enforcement
 
@@ -86,30 +88,42 @@ deletes nothing while still returning `Ok`. The hazard is that the call
 succeeds at all, so a caller that only checks for an error treats a no-op as a
 completed erase.
 
-The memory read, supersede and delete-by-id paths no longer have that problem.
-Recall candidate hydration, memory supersession and delete-by-id took no
-`namespace_id` until #254, which replaced each with an `_in_namespace` variant;
-entity forget left the same list in #256. `live_rls.rs` now gates each of them
-under enforcement directly, in
+No `StorageTrait` method has that problem any more. Every method that reaches
+a table carrying a `namespace_isolation_*` policy now takes a `namespace_id`
+and puts it in the SQL. The list used to be enumerated here and is now empty.
+
+Getting there took three rounds. #254 replaced recall candidate hydration,
+memory supersession and delete-by-id with `_in_namespace` variants; #256 did
+the same for entity forget; #264 folded the GDPR erase's four independent
+calls into one transaction whose every leg — observations and the entity record
+included — carries a `namespace_id` predicate and runs on a namespace-bound
+connection. The last round replaced the remaining nine. Five became scoped
+variants — `get_entity_in_namespace`,
+`list_episodic_by_entity_in_namespace`, `list_semantic_by_entity_in_namespace`,
+`update_episodic_access_in_namespace` and
+`update_procedural_reliability_in_namespace`. The other four —
+`delete_entity`, `invalidate_semantic`, `update_semantic_content` and
+`delete_observations_by_entity` — had no caller left once the capturing erase
+absorbed their work, and were removed rather than scoped, so there is no
+unscoped path left to call by accident.
+
+The highest-traffic one is worth naming: `update_episodic_access_in_namespace`
+writes the retrieval reinforcement stamp, once per episodic result of every
+recall. Unscoped, that `UPDATE` matched no row under enforcement and returned
+success, so spaced-repetition decay would have quietly stopped tracking access
+on every enforced deployment.
+
+`live_rls.rs` gates each replacement under enforcement directly, in
 `scoped_memory_reads_still_work_under_enforced_rls`,
 `supersede_still_works_under_enforced_rls`,
-`namespace_scoping_end_to_end_under_enforced_rls` and
-`entity_delete_still_works_under_enforced_rls`, so the old
-`enforced_rls_fails_closed_for_unscoped_methods` checklist is empty and gone.
-
-The rest of the storage surface still runs unscoped and would fail closed the
-same way. Every `StorageTrait` method that reaches a policied table without a
-`namespace_id` is: `get_entity`, `delete_entity`, `list_episodic_by_entity`,
-`list_semantic_by_entity`, `update_episodic_access`, `invalidate_semantic`,
-`update_semantic_content`, `update_procedural_reliability` and
-`delete_observations_by_entity`. One of those is still on the recall path:
-`update_episodic_access` writes the reinforcement stamp. GDPR erase no longer
-reaches any of them: `erase_entity_capturing` replaced the four independent
-calls with one transaction whose every leg — observations and the entity record
-included — carries a `namespace_id` predicate and runs on a namespace-bound
-connection (#264). The rest is tracked by #254.
-
-Do not apply enforcement to a deployment until those paths carry a namespace.
+`namespace_scoping_end_to_end_under_enforced_rls`,
+`entity_delete_still_works_under_enforced_rls`,
+`entity_lookup_by_id_still_works_under_enforced_rls`,
+`entity_scoped_memory_listings_still_work_under_enforced_rls`,
+`reinforcement_stamp_still_lands_under_enforced_rls` and
+`procedural_reliability_update_still_lands_under_enforced_rls`. The old
+`enforced_rls_fails_closed_for_unscoped_methods` checklist is empty and gone;
+the per-method tests are the standing gate in its place.
 
 Edges are the newest addition to layer 2. They gained a `namespace_id` — an
 edge belongs to the namespace of its source entity — plus a
@@ -149,20 +163,37 @@ clear the refusal, apply the schema once as a role the policies do not apply
 to, or `ALTER TABLE entities NO FORCE ROW LEVEL SECURITY` for the duration of
 the upgrade and restore it afterward.
 
-#### Applying enforcement
+#### The startup self-check
 
-First check that the application's role is not a superuser. Postgres exempts
-superusers from row-level security unconditionally, and `FORCE` does not change
-that, so enforcement applied to a superuser connection silently does nothing.
-The enforce script will still report success, which makes this easy to get
-wrong. Check with the query below, and expect `f`:
+The backend runs this check itself, on every Postgres startup:
 
 ```sql
-SELECT rolsuper FROM pg_roles WHERE rolname = current_user;
+SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user;
 ```
 
-If it returns `t`, enforcement cannot work on that connection. Move the
-application to an ordinary role that owns the tables before going further.
+If either column is true it logs a `WARN` naming the role and both flags.
+Both exemptions survive `FORCE ROW LEVEL SECURITY`, so a deployment running as
+such a role has enforced nothing, and there is no other symptom — queries keep
+returning rows, the catalog keeps reporting the tables as forced. Making it
+observable from the application is the point; it is not a runbook step anyone
+has to remember.
+
+It is a warning, not a refusal. A local or single-tenant deployment
+legitimately connects as the owner or as `postgres`, and enforcement there is
+an operator choice rather than a precondition for starting. If you see this
+warning on a multi-tenant deployment, treat it as enforcement being off no
+matter what the enforce script reported.
+
+`PostgresBackend::role_rls_exemptions` exposes the same answer to callers that
+want to assert on it.
+
+#### Applying enforcement
+
+First check that the application's role is not a superuser and does not hold
+`BYPASSRLS` — the startup self-check above will already have told you, and the
+query it runs is the one to re-run by hand. Expect `f` in both columns. If
+either is `t`, enforcement cannot work on that connection; move the application
+to an ordinary role before going further.
 
 Then apply `pensyve-core/src/storage/postgres_rls_enforce.sql`, or call
 `PostgresBackend::enforce_rls`. Both run the same statements. The connecting
@@ -200,29 +231,43 @@ To roll back, run `ALTER TABLE <table> NO FORCE ROW LEVEL SECURITY;` for each
 table. Rollback takes effect immediately and touches neither the policies nor
 the data.
 
-#### The dedicated application role, and why it is not available yet
+#### The dedicated application role
 
 A role that does not own the tables is subject to their policies regardless of
-whether `FORCE` is set, so running the application as a non-owner role would be
-the more durable control. It is not possible today. Do not follow the SQL below
-as deployment instructions, because an application pointed at such a role will
-not start. Issue #254 tracks the change that makes it usable.
+whether `FORCE` is set, so running the application as a non-owner role is the
+more durable control. It is supported.
 
-`PostgresBackend::new` applies the schema on every startup, and the schema
-contains statements only a table's owner may run, including
-`ALTER TABLE ... ADD COLUMN`, `CREATE INDEX`, `ALTER TABLE ... ENABLE ROW LEVEL
-SECURITY`, and `CREATE POLICY`. A non-owner role fails at startup with
-`must be owner of table entities`, even when it holds every table privilege and
-`CREATE` on the schema. Pointing `DATABASE_URL` at a non-owner role today stops
-the application from starting.
+It used not to be. `PostgresBackend::new` applied the schema unconditionally on
+every startup, and the schema contains statements only a table's owner may run
+— `ALTER TABLE ... ADD COLUMN`, `CREATE INDEX`, `ALTER TABLE ... ENABLE ROW
+LEVEL SECURITY`, `CREATE POLICY`. A non-owner failed at startup with
+`must be owner of table entities`, even holding every table privilege and
+`CREATE` on the schema.
 
-Supporting a non-owner role needs a code change first, so that applying the
-schema is separate from serving traffic. Once that exists, the role should look
-like the target state below. `NOBYPASSRLS` is required because a role with
-`BYPASSRLS`, and any superuser, ignores every policy.
+Startup now separates applying the schema from serving traffic. It first reads
+`pensyve_schema_state`, a one-row table holding a digest of the schema text
+that was last applied. When that digest is the one this build ships, the whole
+DDL batch is skipped and a role with only DML grants starts normally. When it
+is not — a fresh database, or an upgrade carrying a schema change — the batch
+runs, which still requires ownership, and a non-owner is told so:
+
+> pensyve: the database schema is not at the version this build applies, and
+> the connected role may not apply it. Schema application is owner-only DDL …
+
+The digest covers the whole schema file, so any edit invalidates it and the
+batch runs again. The idempotent re-apply is preserved where it matters, a
+changed file, and skipped only where it was already a guaranteed no-op.
+
+The operational consequence is one extra step on upgrades that change the
+schema: run the new build once as the owner (or run
+`pensyve-core/src/storage/postgres_schema.sql` by hand as the owner), then
+start the serving role. A build whose schema is unchanged needs nothing.
+
+`NOBYPASSRLS` is required because a role with `BYPASSRLS`, and any superuser,
+ignores every policy — the startup self-check above will warn if you get this
+wrong.
 
 ```sql
--- Target state. Not usable until issue #254 lands.
 CREATE ROLE pensyve_app LOGIN PASSWORD '...' NOSUPERUSER NOBYPASSRLS;
 GRANT USAGE ON SCHEMA public TO pensyve_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pensyve_app;
@@ -237,7 +282,10 @@ ALTER DEFAULT PRIVILEGES FOR ROLE pensyve_owner IN SCHEMA public
 
 `ALTER DEFAULT PRIVILEGES` never applies to tables that already exist, so the
 `GRANT ... ON ALL TABLES` above is what covers the current schema. Both
-statements are needed.
+statements are needed. The `GRANT ... ON ALL TABLES` also covers
+`pensyve_schema_state`; without `SELECT` on it the serving role cannot read the
+applied digest and startup fails with `permission denied for table
+pensyve_schema_state` rather than skipping the DDL.
 
 #### What goes wrong
 
