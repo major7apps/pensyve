@@ -109,13 +109,14 @@ fn fresh_store_lands_v2_migration() {
     let versions = schema_version_rows(&conn);
     assert_eq!(
         versions.len(),
-        4,
-        "expected v=1 through v=4 migration rows, got {versions:?}"
+        5,
+        "expected v=1 through v=5 migration rows, got {versions:?}"
     );
     assert_eq!(versions[0].0, 1);
     assert_eq!(versions[1].0, 2);
     assert_eq!(versions[2].0, 3);
     assert_eq!(versions[3].0, 4);
+    assert_eq!(versions[4].0, 5);
 
     // observation_memories has the new columns.
     assert_v2_columns_present(&conn);
@@ -176,8 +177,8 @@ fn v2_migration_idempotent_on_third_open() {
     let versions = schema_version_rows(&conn);
     assert_eq!(
         versions.len(),
-        4,
-        "exactly 4 schema_versions rows after 3 opens (v=1 through v=4); got {versions:?}"
+        5,
+        "exactly 5 schema_versions rows after 3 opens (v=1 through v=5); got {versions:?}"
     );
     assert_v2_columns_present(&conn);
 }
@@ -325,8 +326,9 @@ fn v1_only_fixture_upgrades_to_v2() {
 
     // Step 2: Manually roll back to a v=1-only state. The migration
     // runner skips migrations whose version is `<= max_applied`, so we
-    // must also drop the v=3 row + kg_* tables — otherwise max_applied
-    // would stay at 3 and the v=2 migration would never re-run.
+    // must also drop every later registry row + the kg_* tables —
+    // otherwise max_applied would stay high and the v=2 migration would
+    // never re-run.
     {
         let conn = open_raw(tmp.path());
         for col in V2_NEW_COLUMNS {
@@ -336,8 +338,8 @@ fn v1_only_fixture_upgrades_to_v2() {
             )
             .unwrap_or_else(|e| panic!("drop column {col}: {e}"));
         }
-        conn.execute("DELETE FROM schema_versions WHERE version IN (2, 3, 4)", [])
-            .expect("delete v=2 through v=4 schema_versions rows");
+        conn.execute("DELETE FROM schema_versions WHERE version >= 2", [])
+            .expect("delete v=2 and later schema_versions rows");
         conn.execute_batch(
             "DROP TABLE IF EXISTS kg_passage_entities;
              DROP TABLE IF EXISTS kg_triples;
@@ -375,12 +377,12 @@ fn v1_only_fixture_upgrades_to_v2() {
     // v=2 columns now present.
     assert_v2_columns_present(&conn);
 
-    // schema_versions has v=1 through v=4 again.
+    // schema_versions has v=1 through v=5 again.
     let versions = schema_version_rows(&conn);
     assert_eq!(
         versions.len(),
-        4,
-        "expected v=1 through v=4 after upgrade; got {versions:?}"
+        5,
+        "expected v=1 through v=5 after upgrade; got {versions:?}"
     );
 
     // The legacy row survived with NULL across all new columns.

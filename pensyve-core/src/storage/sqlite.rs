@@ -11,7 +11,10 @@ use crate::types::{
     ObservationMemory, Outcome, ProceduralMemory, SemanticMemory,
 };
 
-use super::{ActivityAggregate, ActivityEvent, StorageError, StorageResult, StorageTrait};
+use super::{
+    ActivityAggregate, ActivityEvent, StorageError, StorageResult, StorageTrait,
+    cross_namespace_edge_id,
+};
 use crate::graph::EdgeType;
 
 // ---------------------------------------------------------------------------
@@ -318,6 +321,56 @@ impl SqliteBackend {
             )?;
         }
 
+        // ----- Migration v5: edges carry the namespace they belong to. -----
+        //
+        // An edge belongs to the namespace of its source entity, which is
+        // where the extraction path that writes edges already stands. Existing
+        // rows are backfilled from `entities`; rows whose source entity no
+        // longer exists cannot be attributed to anything and no scoped
+        // accessor could ever reach them, so they are deleted and the count is
+        // logged.
+        //
+        // The added column is NULLABLE, matching every prior column addition
+        // here (v1's `agent_id` / `user_id`, v2's typed slots, v4's
+        // supersession columns): `SQLite` cannot add a NOT NULL column without
+        // a default, and tightening one afterward means rebuilding the table.
+        // Fresh stores get `namespace_id TEXT NOT NULL` from `SCHEMA` above,
+        // and both backends' `save_edge` always writes it.
+        if max_applied < 5 {
+            if !Self::column_exists(conn, "edges", "namespace_id")? {
+                conn.execute_batch("ALTER TABLE edges ADD COLUMN namespace_id TEXT;")?;
+            }
+
+            conn.execute(
+                "UPDATE edges
+                    SET namespace_id = (SELECT namespace_id FROM entities
+                                         WHERE entities.id = edges.source)
+                  WHERE namespace_id IS NULL",
+                [],
+            )?;
+            let orphaned = conn.execute("DELETE FROM edges WHERE namespace_id IS NULL", [])?;
+            if orphaned > 0 {
+                tracing::warn!(
+                    orphaned,
+                    "migration v5: deleted orphan edge rows whose source entity no longer exists"
+                );
+            }
+
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_edges_namespace ON edges(namespace_id);",
+            )?;
+
+            conn.execute(
+                "INSERT INTO schema_versions (version, applied_at, description)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    5_i64,
+                    Utc::now().to_rfc3339(),
+                    "Issue 264/254: add namespace_id to edges, backfilled from the source entity",
+                ],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -584,6 +637,7 @@ CREATE INDEX IF NOT EXISTS idx_observation_entity_type
 
 CREATE TABLE IF NOT EXISTS edges (
     id              TEXT PRIMARY KEY,
+    namespace_id    TEXT NOT NULL,
     source          TEXT NOT NULL,
     target          TEXT NOT NULL,
     relation        TEXT NOT NULL,
@@ -595,6 +649,9 @@ CREATE TABLE IF NOT EXISTS edges (
 );
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target);
+-- `idx_edges_namespace` is created by migration v5, not here: this batch runs
+-- before the migration runner, and on a database that predates the column the
+-- index would be built against a column that does not exist yet.
 
 CREATE TABLE IF NOT EXISTS activity_events (
     id TEXT PRIMARY KEY,
@@ -2612,14 +2669,38 @@ impl StorageTrait for SqliteBackend {
     // Edges
     // -----------------------------------------------------------------------
 
-    fn save_edge(&self, edge: &Edge) -> StorageResult<()> {
+    fn save_edge(&self, edge: &Edge, namespace_id: Uuid) -> StorageResult<()> {
         let conn = lock_conn!(self);
         let metadata = serde_json::to_string(&edge.metadata)?;
-        conn.execute(
-            "INSERT OR REPLACE INTO edges (id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        // `edges.id` is the primary key on its own, and edge ids are
+        // caller-supplied, so an unqualified upsert lands on whatever row
+        // already holds the id — another tenant's included. The old
+        // `INSERT OR REPLACE` was worse than an overwrite: it deletes the
+        // conflicting row and inserts this one, moving the edge into the
+        // caller's namespace outright.
+        //
+        // The `WHERE` confines the update half to the namespace that already
+        // owns the row, so a cross-namespace collision updates nothing and
+        // reports zero changed rows. That is rejected below rather than
+        // skipped: a colliding id is a caller bug or an attack, and returning
+        // Ok for a write that did not happen is how a caller ends up trusting
+        // a store that never took its data.
+        let changed = conn.execute(
+            "INSERT INTO edges (id, namespace_id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+             ON CONFLICT(id) DO UPDATE SET \
+                 source = excluded.source, \
+                 target = excluded.target, \
+                 relation = excluded.relation, \
+                 weight = excluded.weight, \
+                 valid_at = excluded.valid_at, \
+                 invalid_at = excluded.invalid_at, \
+                 superseded_by = excluded.superseded_by, \
+                 metadata = excluded.metadata \
+             WHERE edges.namespace_id = excluded.namespace_id",
             params![
                 edge.id.to_string(),
+                namespace_id.to_string(),
                 edge.source.to_string(),
                 edge.target.to_string(),
                 edge.relation,
@@ -2630,17 +2711,25 @@ impl StorageTrait for SqliteBackend {
                 metadata,
             ],
         )?;
+        if changed == 0 {
+            return Err(cross_namespace_edge_id(edge.id));
+        }
         Ok(())
     }
 
-    fn get_edges_for_entity(&self, entity_id: Uuid) -> StorageResult<Vec<Edge>> {
+    fn get_edges_for_entity_in_namespace(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Vec<Edge>> {
         let conn = lock_conn!(self);
         let id_str = entity_id.to_string();
+        let namespace_str = namespace_id.to_string();
         let mut stmt = conn.prepare(
             "SELECT id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata \
-             FROM edges WHERE source = ?1 OR target = ?1",
+             FROM edges WHERE namespace_id = ?2 AND (source = ?1 OR target = ?1)",
         )?;
-        let rows = stmt.query_map(params![&id_str], |row| {
+        let rows = stmt.query_map(params![&id_str, &namespace_str], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -5057,7 +5146,9 @@ mod tests {
         let (_dir, db) = setup();
         {
             let conn = db.conn.lock().unwrap();
-            conn.execute("DELETE FROM schema_versions WHERE version IN (3, 4)", [])
+            // Every row at or above v3 has to go: the runner reads MAX(version)
+            // once, so leaving a later row behind skips v3 entirely.
+            conn.execute("DELETE FROM schema_versions WHERE version >= 3", [])
                 .unwrap();
             conn.execute_batch(
                 "DROP TABLE IF EXISTS kg_passage_entities;

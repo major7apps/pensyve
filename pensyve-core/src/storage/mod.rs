@@ -36,6 +36,22 @@ pub enum StorageError {
 
 pub type StorageResult<T> = Result<T, StorageError>;
 
+/// Rejection returned by `save_edge` when the supplied edge id already exists
+/// in a different namespace.
+///
+/// Shared by both backends so the contract reads the same whichever one is
+/// mounted. It names the rule the caller broke and the id the caller itself
+/// supplied, and nothing else: the row it collided with belongs to another
+/// tenant, so describing it — its namespace, its relation, even its existence
+/// in a particular namespace — would answer a question the caller has no right
+/// to ask.
+pub(crate) fn cross_namespace_edge_id(edge_id: Uuid) -> StorageError {
+    StorageError::Context(format!(
+        "edge {edge_id} already exists outside this namespace; edge ids are unique across \
+         the whole store, so a save cannot claim one that another namespace owns"
+    ))
+}
+
 fn capturing_delete_not_implemented() -> StorageResult<Vec<Memory>> {
     Err(StorageError::Context(
         "storage backend does not implement capturing entity deletion, \
@@ -539,8 +555,25 @@ pub trait StorageTrait: Send + Sync {
     fn list_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Entity>>;
 
     // Edges
-    fn save_edge(&self, edge: &Edge) -> StorageResult<()>;
-    fn get_edges_for_entity(&self, entity_id: Uuid) -> StorageResult<Vec<Edge>>;
+    //
+    // `Edge` has no namespace field, so both accessors take one. An edge
+    // belongs to the namespace of its source entity. Entity ids are not
+    // globally unique, so before the parameter existed the read matched on
+    // entity id alone and crossed tenants, and the write left the row
+    // attributed to nobody.
+    //
+    // Consequence of source-namespace ownership: an edge whose source is in A
+    // and whose target is in B is stored in A and is therefore invisible from
+    // B, including on B's `target` leg — so an erase running in B will not see
+    // it and cannot delete it (pinned by
+    // `an_edge_belongs_to_its_source_entitys_namespace_only`; #264 owns the
+    // erase-side consequence).
+    fn save_edge(&self, edge: &Edge, namespace_id: Uuid) -> StorageResult<()>;
+    fn get_edges_for_entity_in_namespace(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Vec<Edge>>;
 
     // Counts (lightweight, no embedding pipeline)
     /// Count memories by type for a namespace without loading memory content.

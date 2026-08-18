@@ -48,9 +48,9 @@ pub struct ExportResult {
 /// Returns an `ErasureResult` summarizing what was deleted.
 ///
 /// `namespace_id` names the tenant the erasure belongs to, matching
-/// [`export_entity_data`]. Only the memory delete carries it today; the
-/// observation, edge and entity steps still match on `entity_id` alone and are
-/// tracked by #254 along with the rest of the unscoped `StorageTrait` surface.
+/// [`export_entity_data`]. The memory and edge steps carry it; the observation
+/// and entity steps still match on `entity_id` alone and are tracked by #254
+/// along with the rest of the unscoped `StorageTrait` surface.
 pub fn erase_entity(
     storage: &dyn StorageTrait,
     entity_id: Uuid,
@@ -76,7 +76,7 @@ pub fn erase_entity(
     }
 
     // Step 3: Delete graph edges
-    match storage.get_edges_for_entity(entity_id) {
+    match storage.get_edges_for_entity_in_namespace(entity_id, namespace_id) {
         Ok(edges) => result.edges_deleted = edges.len(),
         Err(e) => result.warnings.push(format!("Edge query error: {e}")),
     }

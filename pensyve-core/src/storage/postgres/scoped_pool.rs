@@ -68,13 +68,25 @@ impl ScopedPool {
     ///
     /// A connection from here carries whatever namespace the previous checkout
     /// left set, so it must never run a statement against a table that carries
-    /// a `namespace_isolation_*` policy. Two uses are legitimate:
+    /// a `namespace_isolation_*` policy. Three uses are legitimate:
     ///
     /// * DDL, which RLS does not apply to.
-    /// * Queries against `namespaces`, `edges`, and `activity_events`, none of
-    ///   which carry a policy.
+    /// * Queries against `namespaces` and `activity_events`, neither of which
+    ///   carries a policy.
+    /// * The one-time migrations in `postgres_schema.sql` that have to touch a
+    ///   policied table, which `run_schema` sends through here. Those run under
+    ///   `SET row_security = off` — which does not bypass RLS, it makes
+    ///   Postgres *raise* instead of silently returning fewer rows. A blinded
+    ///   read on this connection therefore becomes a loud failure rather than a
+    ///   wrong answer that a migration would then act on. Without it the edges
+    ///   migration read an empty `entities` on an enforced deployment and
+    ///   deleted the whole table as orphans.
     ///
-    /// Anything else needs [`Self::acquire_bound`].
+    /// Anything else needs [`Self::acquire_bound`]. The two halves of that rule
+    /// are pinned by `only_bound_connections_reach_policied_tables` (which call
+    /// sites may reach this) and
+    /// `schema_dml_on_policied_tables_cannot_be_silently_blinded` (what the SQL
+    /// they execute is allowed to do) in `live_rls.rs`.
     pub(super) fn unbound(&self) -> &PgPool {
         &self.inner
     }

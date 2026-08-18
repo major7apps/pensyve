@@ -20,7 +20,9 @@ use crate::types::{
     Outcome, ProceduralMemory, SemanticMemory,
 };
 
-use super::{ActivityAggregate, ActivityEvent, StorageResult, StorageTrait};
+use super::{
+    ActivityAggregate, ActivityEvent, StorageResult, StorageTrait, cross_namespace_edge_id,
+};
 use crate::graph::EdgeType;
 
 // ---------------------------------------------------------------------------
@@ -1864,9 +1866,9 @@ impl StorageTrait for PostgresBackend {
     /// has an analogue in `postgres_schema.sql`: the KG tables are not part of
     /// the Postgres schema at all, and full-text search is a generated
     /// `tsvector` column on each memory table, so deleting the row takes its
-    /// index entry with it. `edges` is untouched on both backends — it carries
-    /// no `namespace_id`, so a namespace-scoped delete is not expressible
-    /// against it.
+    /// index entry with it. `edges` is untouched on both backends. It carries
+    /// a `namespace_id` now, so a namespace-scoped delete has become
+    /// expressible against it; actually deleting edges here is #264.
     ///
     /// Every statement names `namespace_id = $1` explicitly even though all
     /// four run on a namespace-bound connection. That is the #254 convention:
@@ -1985,18 +1987,41 @@ impl StorageTrait for PostgresBackend {
     // Edges
     // -----------------------------------------------------------------------
 
-    fn save_edge(&self, edge: &Edge) -> StorageResult<()> {
+    fn save_edge(&self, edge: &Edge, namespace_id: Uuid) -> StorageResult<()> {
         let metadata = serde_json::to_value(&edge.metadata)?;
         self.block_on(async {
-            // Edge has no namespace_id field; use default_namespace if configured.
-            let mut conn = self.maybe_scoped_conn().await?;
-            query::<Postgres>(
-                r"INSERT INTO edges (id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            // `edges.id` is the primary key on its own, and edge ids are
+            // caller-supplied, so `ON CONFLICT (id)` alone lands on whatever
+            // row already holds the id — another tenant's included. The
+            // namespace-bound connection does not cover this: in the shape
+            // every deployment ships today the application connects as the
+            // schema owner, which is exempt from its own policies, so RLS is
+            // inert and the predicate below is the only thing standing there.
+            //
+            // The SET list restates every column the insert supplies, matching
+            // `SqliteBackend::save_edge`. Omitting `source`, `target` or
+            // `valid_at` would make a re-save that repoints an edge take effect
+            // on one backend and vanish on the other, both returning Ok;
+            // `save_edge_repoints_an_edge_on_a_same_namespace_resave` exists on
+            // both sides to keep the two set lists honest.
+            //
+            // `RETURNING id` is how the outcome is observed. When the `WHERE`
+            // fails the statement affects no row and returns none, which is
+            // rejected rather than skipped: a colliding id is a caller bug or
+            // an attack, and returning Ok for a write that did not happen is
+            // how a caller ends up trusting a store that never took its data.
+            let landed: Option<(Uuid,)> = query_as::<Postgres, _>(
+                r"INSERT INTO edges (id, namespace_id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                    ON CONFLICT (id) DO UPDATE SET
-                       relation = $4, weight = $5, invalid_at = $7, superseded_by = $8, metadata = $9",
+                       source = $3, target = $4, relation = $5, weight = $6, valid_at = $7,
+                       invalid_at = $8, superseded_by = $9, metadata = $10
+                     WHERE edges.namespace_id = EXCLUDED.namespace_id
+                   RETURNING id",
             )
             .bind(edge.id)
+            .bind(namespace_id)
             .bind(edge.source)
             .bind(edge.target)
             .bind(&edge.relation)
@@ -2005,21 +2030,29 @@ impl StorageTrait for PostgresBackend {
             .bind(edge.invalid_at)
             .bind(edge.superseded_by)
             .bind(&metadata)
-            .execute(&mut *conn)
+            .fetch_optional(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
+            if landed.is_none() {
+                return Err(cross_namespace_edge_id(edge.id));
+            }
             Ok(())
         })
     }
 
-    fn get_edges_for_entity(&self, entity_id: Uuid) -> StorageResult<Vec<Edge>> {
+    fn get_edges_for_entity_in_namespace(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Vec<Edge>> {
         self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             let rows: Vec<EdgeRow> = query_as::<Postgres, _>(
                 r"SELECT id, source, target, relation, weight, valid_at, invalid_at, superseded_by, metadata
-                   FROM edges WHERE source = $1 OR target = $1",
+                   FROM edges WHERE namespace_id = $2 AND (source = $1 OR target = $1)",
             )
             .bind(entity_id)
+            .bind(namespace_id)
             .fetch_all(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
