@@ -196,9 +196,12 @@ either is `t`, enforcement cannot work on that connection; move the application
 to an ordinary role before going further.
 
 Then apply `pensyve-core/src/storage/postgres_rls_enforce.sql`, or call
-`PostgresBackend::enforce_rls`. Both run the same statements. The connecting
-role must own the tables, and the application already connects as the owner, so
-no new role is needed.
+`PostgresBackend::enforce_rls`. Both run the same statements, and both are
+`ALTER TABLE ... FORCE ROW LEVEL SECURITY`, so **the connecting role must own
+the tables**. Run this step as the owning role — the same one that applies the
+schema. It is not the role that has to serve traffic afterwards: enforcement is
+a one-off migration, and the point of forcing the policies is that an
+unprivileged `pensyve_app` can then serve under them. See the role setup below.
 
 Then verify enforcement actually took effect, because a successful run does not
 prove it. Every row below should report `t`:
