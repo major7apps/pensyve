@@ -1013,6 +1013,41 @@ mod tests {
         assert_eq!(file_names(&dir).len(), 4, "{:?}", file_names(&dir));
     }
 
+    /// A symlink named like a snapshot is skipped, not followed: retention
+    /// must never be able to unlink something outside the directory it was
+    /// pointed at, whoever planted the link.
+    #[cfg(unix)]
+    #[test]
+    fn prune_never_follows_a_symlink_out_of_the_directory() {
+        let f = fixture();
+        let dir = f.dir.path().join("snapshots");
+        let outside = f.dir.path().join("somebody-elses-file");
+        std::fs::write(&outside, b"not retention's to delete").unwrap();
+        write_aged(&f, &dir, epoch());
+        std::os::unix::fs::symlink(
+            &outside,
+            dir.join(format!(
+                "forget-{}-20260101T000000.000Z-{}.json",
+                Uuid::new_v4(),
+                Uuid::new_v4()
+            )),
+        )
+        .unwrap();
+
+        let outcome = prune_namespace_dir(
+            &dir,
+            RetentionPolicy {
+                max_age_days: Some(1),
+                max_count: None,
+            },
+            epoch() + Duration::days(365),
+        );
+
+        assert_eq!(outcome.removed, 1, "only the real snapshot may be removed");
+        assert!(outside.exists(), "the symlink's target must be untouched");
+        assert_eq!(file_names(&dir).len(), 1, "the symlink itself stays too");
+    }
+
     #[test]
     fn an_unbounded_policy_prunes_nothing() {
         let f = fixture();
