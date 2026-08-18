@@ -1990,9 +1990,12 @@ impl StorageTrait for PostgresBackend {
     /// has an analogue in `postgres_schema.sql`: the KG tables are not part of
     /// the Postgres schema at all, and full-text search is a generated
     /// `tsvector` column on each memory table, so deleting the row takes its
-    /// index entry with it. `edges` is untouched on both backends. It carries
-    /// a `namespace_id` now, so a namespace-scoped delete has become
-    /// expressible against it; actually deleting edges here is #264.
+    /// index entry with it. `edges` and `entities` are untouched on both
+    /// backends: a purge empties the memory tables and leaves the namespace's
+    /// graph and entity records standing. The entity-scoped
+    /// [`StorageTrait::erase_entity_capturing`] does delete both, so the
+    /// expression is available — the purge simply does not use it. That gap is
+    /// #278.
     ///
     /// Every statement names `namespace_id = $1` explicitly even though all
     /// four run on a namespace-bound connection. That is the #254 convention:

@@ -640,8 +640,9 @@ pub trait StorageTrait: Send + Sync {
     // and whose target is in B is stored in A and is therefore invisible from
     // B, including on B's `target` leg — so an erase running in B will not see
     // it and cannot delete it (pinned by
-    // `an_edge_belongs_to_its_source_entitys_namespace_only`; #264 owns the
-    // erase-side consequence).
+    // `an_edge_belongs_to_its_source_entitys_namespace_only`). That is the
+    // residue [`StorageTrait::erase_entity_capturing`] deliberately leaves
+    // behind: reading the edge to delete it would be a read into A.
     fn save_edge(&self, edge: &Edge, namespace_id: Uuid) -> StorageResult<()>;
     fn get_edges_for_entity_in_namespace(
         &self,

@@ -5994,4 +5994,64 @@ mod tests {
         assert!(erased.edges.is_empty());
         assert!(!erased.entity_deleted);
     }
+
+    /// Superseded rows are erased too, and appear in the capture.
+    ///
+    /// A GDPR erase has to remove the entity's *history*, not just its current
+    /// state — a superseded memory still holds the content that was written
+    /// about the subject. The predicates deliberately carry no
+    /// `superseded_by IS NULL` clause; this pins that, because both the delete
+    /// and every read path around it filter on supersession somewhere, so an
+    /// added clause would look natural and silently strand history.
+    ///
+    /// It also pins the capture side: a superseded row that is deleted but not
+    /// returned keeps its vector-index entry, which is #268's failure one row
+    /// at a time.
+    #[test]
+    fn erase_entity_capturing_takes_superseded_rows_too() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+
+        let mut entity = Entity::new("subject", EntityKind::User);
+        entity.namespace_id = ns.id;
+        db.save_entity(&entity).unwrap();
+
+        let episode = Episode::new(ns.id, vec![entity.id]);
+        db.save_episode(&episode).unwrap();
+
+        let episodic = EpisodicMemory::new(ns.id, episode.id, entity.id, entity.id, "an old turn");
+        db.save_episodic(&episodic).unwrap();
+        let semantic = SemanticMemory::new(ns.id, entity.id, "lived_in", "berlin", 0.5);
+        db.save_semantic(&semantic).unwrap();
+
+        for id in [episodic.id, semantic.id] {
+            assert!(
+                db.supersede_memory_in_namespace(id, ns.id, Uuid::new_v4(), Utc::now())
+                    .unwrap(),
+                "the row must actually be superseded, or this test proves nothing"
+            );
+        }
+        // Live-row reads no longer see either one — which is exactly why the
+        // erase must not be built on a live-row read.
+        assert!(db.get_all_memories_by_namespace(ns.id).unwrap().is_empty());
+
+        let erased = db.erase_entity_capturing(entity.id, ns.id).unwrap();
+
+        let mut captured: Vec<Uuid> = erased.memories.iter().map(Memory::id).collect();
+        captured.sort();
+        let mut expected = vec![episodic.id, semantic.id];
+        expected.sort();
+        assert_eq!(
+            captured, expected,
+            "both superseded rows must be captured by the erase"
+        );
+        assert!(
+            db.get_all_memories_by_namespace_including_superseded(ns.id)
+                .unwrap()
+                .is_empty(),
+            "superseded history must be gone from storage, not just from live reads"
+        );
+        assert_eq!(fts_rows_for(&db, episodic.id), 0);
+        assert_eq!(fts_rows_for(&db, semantic.id), 0);
+    }
 }

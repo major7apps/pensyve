@@ -13,9 +13,17 @@
 //! a row that exists by the time the delete runs and did not exist when a
 //! pre-list would have been taken. Cleanup driven from the captured rows sees
 //! it; cleanup driven from a pre-list cannot.
+//!
+//! The same fake also signals the moment the erase transaction **commits**,
+//! which is what the second test needs: the identical orphaned entry is
+//! reachable with no concurrent writer at all, by disconnecting the client
+//! between the commit and the cleanup. Driving cleanup from the captured rows
+//! fixes the first; running the erase and its bookkeeping on a detached task
+//! fixes the second. Both are needed, and each has its own test below.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::Extension;
 use chrono::{DateTime, Utc};
@@ -39,6 +47,7 @@ use pensyve_mcp_gateway::tenant::TenantStateManager;
 use pensyve_mcp_gateway::usage::UsageReporter;
 use pensyve_mcp_gateway::usage_counter::UsageCounter;
 use tempfile::TempDir;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -57,6 +66,7 @@ const DIMENSIONS: usize = 768;
 struct RacingStorage {
     inner: Arc<SqliteBackend>,
     racer: Mutex<Option<EpisodicMemory>>,
+    committed: Mutex<Option<mpsc::UnboundedSender<()>>>,
 }
 
 impl RacingStorage {
@@ -64,6 +74,7 @@ impl RacingStorage {
         Self {
             inner,
             racer: Mutex::new(None),
+            committed: Mutex::new(None),
         }
     }
 
@@ -71,6 +82,15 @@ impl RacingStorage {
     /// namespace exists, which is what the row has to be keyed on.
     fn arm(&self, racer: EpisodicMemory) {
         *self.racer.lock().expect("racer lock") = Some(racer);
+    }
+
+    /// A receiver that fires once the erase transaction has **committed** and
+    /// before the caller has done any of its post-commit bookkeeping. That is
+    /// the window a dropped handler future strands.
+    fn signal_on_commit(&self) -> mpsc::UnboundedReceiver<()> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.committed.lock().expect("commit-signal lock") = Some(tx);
+        rx
     }
 }
 
@@ -83,7 +103,11 @@ impl StorageTrait for RacingStorage {
         if let Some(racer) = self.racer.lock().expect("racer lock").take() {
             self.inner.save_episodic(&racer)?;
         }
-        self.inner.erase_entity_capturing(entity_id, namespace_id)
+        let erased = self.inner.erase_entity_capturing(entity_id, namespace_id)?;
+        if let Some(tx) = self.committed.lock().expect("commit-signal lock").take() {
+            let _ = tx.send(());
+        }
+        Ok(erased)
     }
 
     // --- pure delegation from here down -------------------------------------
@@ -477,7 +501,10 @@ struct Seeded {
     racer: Uuid,
 }
 
-async fn app_state(dir: &TempDir, snapshot_root: PathBuf) -> (Arc<AppState>, Seeded) {
+async fn app_state(
+    dir: &TempDir,
+    snapshot_root: PathBuf,
+) -> (Arc<AppState>, Seeded, Arc<RacingStorage>) {
     let inner = Arc::new(SqliteBackend::open(dir.path()).expect("open storage"));
     let default_namespace = Namespace::new("default");
     inner
@@ -567,13 +594,13 @@ async fn app_state(dir: &TempDir, snapshot_root: PathBuf) -> (Arc<AppState>, See
         racer: racer.id,
     };
 
-    (state, seeded)
+    (state, seeded, racing)
 }
 
 #[tokio::test]
 async fn gdpr_erase_strips_the_index_of_a_row_written_after_a_pre_list_would_have_run() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (state, seeded) = app_state(&dir, dir.path().join("snapshots")).await;
+    let (state, seeded, _racing) = app_state(&dir, dir.path().join("snapshots")).await;
 
     let (url, cancellation) = start_test_server(state.clone()).await;
     let client = reqwest::Client::new();
@@ -603,6 +630,93 @@ async fn gdpr_erase_strips_the_index_of_a_row_written_after_a_pre_list_would_hav
         "the row written after a pre-list would have been taken was deleted by the \
          erase, so its index entry must go too — cleanup driven from a pre-list \
          leaves it behind, pointing at content the request destroyed (#268)"
+    );
+
+    cancellation.cancel();
+}
+
+/// The same orphaned index entry, reached by a different door: the client goes
+/// away after the erase has committed but before the cleanup has run.
+///
+/// No concurrent writer is needed for this one. `gdpr_erase` awaits the vector
+/// index's write lock *after* the transaction commits, and axum drops a handler
+/// future when the client disconnects — so a disconnect while that lock is
+/// contended abandons the cleanup with the rows already gone from storage. The
+/// entries left behind point at content the request destroyed, which is #268's
+/// failure mode with the race replaced by a hang-up.
+///
+/// The fix is the one the sibling `forget_entity` handler already uses: run the
+/// erase and its bookkeeping on a `tokio::spawn`ed task the handler only
+/// observes, so once the erase starts it finishes regardless of the request.
+///
+/// The window is forced rather than raced: the test holds the index write lock,
+/// waits for `RacingStorage` to signal that the transaction committed, aborts
+/// the request, and only then releases the lock.
+#[tokio::test]
+async fn gdpr_erase_finishes_its_index_cleanup_after_the_client_disconnects() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (state, seeded, racing) = app_state(&dir, dir.path().join("snapshots")).await;
+    let mut committed = racing.signal_on_commit();
+
+    let ps = state
+        .tenant_mgr
+        .get_tenant_state(TEST_TENANT)
+        .expect("tenant state");
+
+    // Park the cleanup: whoever owns it will block here until this is dropped.
+    let index_guard = ps.vector_index.write().await;
+
+    let (url, cancellation) = start_test_server(state.clone()).await;
+    let request_url = format!("{url}/v1/gdpr/erase/{}", seeded.entity_name);
+    let request = tokio::spawn(async move {
+        let _ = reqwest::Client::new().delete(request_url).send().await;
+    });
+
+    // The transaction has committed; the rows are gone from storage.
+    tokio::time::timeout(Duration::from_secs(30), committed.recv())
+        .await
+        .expect("the erase must reach its commit point")
+        .expect("commit signal");
+
+    // The client hangs up, then the lock frees.
+    request.abort();
+    let _ = request.await;
+    drop(index_guard);
+
+    // The cleanup must still happen. Polled rather than asserted once: it now
+    // runs on a task nothing awaits, so "eventually" is the only honest
+    // contract — but it is bounded, and a handler that abandoned the cleanup
+    // never gets there at all.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let stranded: Vec<Uuid> = {
+            let index = ps.vector_index.read().await;
+            [seeded.settled, seeded.racer]
+                .into_iter()
+                .filter(|id| index.get(*id).is_some())
+                .collect()
+        };
+        if stranded.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the erase committed and the client disconnected, and these index entries \
+             were never cleaned up: {stranded:?}. They now point at content the request \
+             destroyed. Run the erase and its bookkeeping on a spawned task, the way \
+             `forget_entity` does."
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // …and storage really is empty, so the assertion above is about cleanup
+    // rather than about an erase that never ran.
+    assert!(
+        ps.storage
+            .get_all_memories_by_namespace_including_superseded(ps.namespace.id)
+            .expect("read storage")
+            .is_empty(),
+        "the erase must have committed for this test to mean anything"
     );
 
     cancellation.cancel();

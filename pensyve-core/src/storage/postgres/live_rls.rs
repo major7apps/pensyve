@@ -1159,6 +1159,77 @@ fn edges_are_confined_to_their_namespace_under_enforced_rls() {
     );
 }
 
+/// One row of every shape a capturing erase removes, seeded in one namespace.
+struct ErasableRows {
+    episodic: Uuid,
+    fact: Uuid,
+    observation: Uuid,
+    /// A superseded episodic row. A GDPR erase has to take history, not just
+    /// current state, so neither predicate may grow a `superseded_by IS NULL`
+    /// clause — and every read path around the delete filters on supersession
+    /// somewhere, so such a clause would look natural.
+    superseded: Uuid,
+    edge: Uuid,
+}
+
+impl ErasableRows {
+    /// Every memory id seeded here, in sorted order.
+    fn memory_ids(&self) -> Vec<Uuid> {
+        let mut ids = vec![self.episodic, self.fact, self.superseded];
+        ids.sort();
+        ids
+    }
+}
+
+/// Seed one of each into `namespace_id`, all attached to `entity_id`.
+fn seed_erasable_rows(
+    backend: &PostgresBackend,
+    namespace_id: Uuid,
+    entity_id: Uuid,
+) -> ErasableRows {
+    let episode_id = Uuid::new_v4();
+
+    let episodic = EpisodicMemory::new(namespace_id, episode_id, entity_id, entity_id, "a turn");
+    backend.save_episodic(&episodic).expect("save episodic");
+
+    let mut fact = SemanticMemory::new(namespace_id, Uuid::new_v4(), "reports to", "alice", 0.9);
+    fact.object_entity = Some(entity_id);
+    backend.save_semantic(&fact).expect("save object-side fact");
+
+    let observation = ObservationMemory::new(namespace_id, episode_id, "x", "y", "z", "an obs");
+    backend
+        .save_observation(&observation)
+        .expect("save observation");
+
+    let superseded = EpisodicMemory::new(
+        namespace_id,
+        episode_id,
+        entity_id,
+        entity_id,
+        "an older turn",
+    );
+    backend
+        .save_episodic(&superseded)
+        .expect("save superseded episodic");
+    assert!(
+        backend
+            .supersede_memory_in_namespace(superseded.id, namespace_id, Uuid::new_v4(), Utc::now())
+            .expect("supersede"),
+        "the row must actually be superseded, or the assertions that read it prove nothing"
+    );
+
+    let edge = Edge::new(entity_id, Uuid::new_v4(), "knows");
+    backend.save_edge(&edge, namespace_id).expect("save edge");
+
+    ErasableRows {
+        episodic: episodic.id,
+        fact: fact.id,
+        observation: observation.id,
+        superseded: superseded.id,
+        edge: edge.id,
+    }
+}
+
 /// The capturing GDPR erase must work under enforced RLS, and must stay inside
 /// its own namespace on all four legs.
 ///
@@ -1195,44 +1266,25 @@ fn capturing_erase_is_confined_to_its_namespace_under_enforced_rls() {
     backend.save_entity(&entity).expect("save entity in A");
     let entity_id = entity.id;
 
-    let mut seeded = Vec::new();
-    for ns in [&ns_a, &ns_b] {
-        let episode_id = Uuid::new_v4();
-        let episodic = EpisodicMemory::new(ns.id, episode_id, entity_id, entity_id, "a turn");
-        backend.save_episodic(&episodic).expect("save episodic");
-
-        let mut fact = SemanticMemory::new(ns.id, Uuid::new_v4(), "reports to", "alice", 0.9);
-        fact.object_entity = Some(entity_id);
-        backend.save_semantic(&fact).expect("save object-side fact");
-
-        let observation = ObservationMemory::new(ns.id, episode_id, "x", "y", "z", "an obs");
-        backend
-            .save_observation(&observation)
-            .expect("save observation");
-
-        let edge = Edge::new(entity_id, Uuid::new_v4(), "knows");
-        backend.save_edge(&edge, ns.id).expect("save edge");
-
-        seeded.push((episodic.id, fact.id, observation.id, edge.id));
-    }
+    let in_a = seed_erasable_rows(backend, ns_a.id, entity_id);
+    let in_b = seed_erasable_rows(backend, ns_b.id, entity_id);
 
     let erased = backend
         .erase_entity_capturing(entity_id, ns_a.id)
         .expect("capturing erase must succeed under enforced RLS");
 
-    let (a_episodic, a_fact, a_observation, _) = seeded[0];
     assert_eq!(
         erased.observations.iter().map(|o| o.id).collect::<Vec<_>>(),
-        vec![a_observation],
+        vec![in_a.observation],
         "only namespace A's observation may be captured"
     );
     let mut captured = memory_ids(&erased.memories);
     captured.sort();
-    let mut expected = vec![a_episodic, a_fact];
-    expected.sort();
     assert_eq!(
-        captured, expected,
-        "only namespace A's episodic and object-side semantic rows may be captured"
+        captured,
+        in_a.memory_ids(),
+        "namespace A's episodic, object-side semantic and superseded rows — and \
+         nothing of namespace B's — may be captured"
     );
     assert_eq!(
         erased.edges.len(),
@@ -1245,13 +1297,14 @@ fn capturing_erase_is_confined_to_its_namespace_under_enforced_rls() {
     );
 
     // Namespace A really is empty — the erase committed rather than fail-closed
-    // no-op'ing on a connection bound to nothing.
+    // no-op'ing on a connection bound to nothing. Read including superseded
+    // rows, or the superseded one would count as "gone" while still on disk.
     assert!(
         backend
-            .get_all_memories_by_namespace(ns_a.id)
+            .get_all_memories_by_namespace_including_superseded(ns_a.id)
             .expect("read namespace A")
             .is_empty(),
-        "namespace A must be empty after its own erase"
+        "namespace A must be empty after its own erase, history included"
     );
     assert!(
         backend
@@ -1262,16 +1315,16 @@ fn capturing_erase_is_confined_to_its_namespace_under_enforced_rls() {
     );
 
     // …and namespace B is untouched.
-    let (b_episodic, b_fact, b_observation, b_edge) = seeded[1];
     let surviving = memory_ids(
         &backend
-            .get_all_memories_by_namespace(ns_b.id)
+            .get_all_memories_by_namespace_including_superseded(ns_b.id)
             .expect("read namespace B"),
     );
     for (label, id) in [
-        ("episodic", b_episodic),
-        ("semantic", b_fact),
-        ("observation", b_observation),
+        ("episodic", in_b.episodic),
+        ("semantic", in_b.fact),
+        ("observation", in_b.observation),
+        ("superseded episodic", in_b.superseded),
     ] {
         assert!(
             surviving.contains(&id),
@@ -1286,7 +1339,7 @@ fn capturing_erase_is_confined_to_its_namespace_under_enforced_rls() {
             .iter()
             .map(|edge| edge.id)
             .collect::<Vec<_>>(),
-        vec![b_edge],
+        vec![in_b.edge],
         "namespace B's edge must survive"
     );
 }
