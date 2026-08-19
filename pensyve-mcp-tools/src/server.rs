@@ -639,7 +639,7 @@ impl PensyveMcpServer {
             let namespace_id = task_state.namespace.id;
             let blocking_name = entity_name.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                pensyve_core::snapshot::forget_entity(
+                pensyve_core::snapshot::forget_entity_bounded(
                     storage.as_ref(),
                     entity_id,
                     Some(blocking_name.as_str()),

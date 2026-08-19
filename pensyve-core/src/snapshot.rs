@@ -3,7 +3,7 @@
 //! `pensyve_forget` destroys every memory attached to an entity in one call.
 //! Issue #217 recorded two production incidents where a caller who meant to
 //! retract a single memory invoked it instead and lost 1,528 and 79 memories
-//! with no server-side way back. [`forget_entity`] is the recovery path.
+//! with no server-side way back. [`forget_entity_bounded`] is the recovery path.
 //!
 //! # The snapshot is the delete
 //!
@@ -147,7 +147,7 @@ pub struct RestoreOutcome {
     pub restored: usize,
 }
 
-/// Result of a [`forget_entity`] call.
+/// Result of a [`forget_entity_bounded`] call.
 #[derive(Debug, Clone)]
 pub struct ForgetOutcome {
     /// The rows the delete removed. Empty when the entity had no memories.
@@ -173,7 +173,7 @@ pub struct ForgetOutcome {
 ///
 /// `None` disables that bound. The serving states map their `0` sentinel to
 /// `None`, so `Some(0)` is not a value this type is constructed with in
-/// production; should one reach [`forget_entity`] anyway, the snapshot that
+/// production; should one reach [`forget_entity_bounded`] anyway, the snapshot that
 /// call just wrote is still exempt — see [`prune_namespace_dir_with`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPolicy {
@@ -221,7 +221,7 @@ pub struct PruneOutcome {
 /// `retention` bounds what that directory accumulates. It is applied *after*
 /// the delete has committed with its new snapshot on disk, and it can only
 /// report problems, never cause them: see [`prune_namespace_dir`].
-pub fn forget_entity(
+pub fn forget_entity_bounded(
     storage: &dyn StorageTrait,
     entity_id: Uuid,
     entity_name: Option<&str>,
@@ -229,7 +229,7 @@ pub fn forget_entity(
     snapshot_root: &Path,
     retention: RetentionPolicy,
 ) -> StorageResult<ForgetOutcome> {
-    forget_entity_with(
+    forget_entity_bounded_with(
         storage,
         entity_id,
         entity_name,
@@ -240,10 +240,40 @@ pub fn forget_entity(
     )
 }
 
-/// [`forget_entity`] with retention's file removal injected, so the "a prune
-/// failure does not fail the forget" path can be exercised — a real `unlink`
-/// only fails on conditions a test cannot create without root.
-fn forget_entity_with(
+/// [`forget_entity_bounded`] with no bound on what the namespace directory
+/// accumulates.
+///
+/// Superseded by [`forget_entity_bounded`] in #265 rather than removed: keeping
+/// snapshots forever is a behaviour this crate still supports and can still
+/// express ([`RetentionPolicy::UNBOUNDED`]), so this entry point is merely
+/// outgrown, not unsafe to call. Per `AGENTS.md`, an API that is superseded
+/// gets a deprecation cycle; only an API that is *itself* the defect gets
+/// broken outright.
+#[deprecated(
+    since = "3.1.0",
+    note = "use `forget_entity_bounded`, which takes a `RetentionPolicy`. This entry point is equivalent to passing `RetentionPolicy::UNBOUNDED`, under which one namespace's snapshot directory grows without bound (#265)."
+)]
+pub fn forget_entity(
+    storage: &dyn StorageTrait,
+    entity_id: Uuid,
+    entity_name: Option<&str>,
+    namespace_id: Uuid,
+    snapshot_root: &Path,
+) -> StorageResult<ForgetOutcome> {
+    forget_entity_bounded(
+        storage,
+        entity_id,
+        entity_name,
+        namespace_id,
+        snapshot_root,
+        RetentionPolicy::UNBOUNDED,
+    )
+}
+
+/// [`forget_entity_bounded`] with retention's file removal injected, so the "a
+/// prune failure does not fail the forget" path can be exercised — a real
+/// `unlink` only fails on conditions a test cannot create without root.
+fn forget_entity_bounded_with(
     storage: &dyn StorageTrait,
     entity_id: Uuid,
     entity_name: Option<&str>,
@@ -373,7 +403,7 @@ fn remove_snapshot_file(path: &Path) -> std::io::Result<()> {
 /// [`prune_namespace_dir`] with the file removal injected, and with one file in
 /// the directory declared off-limits.
 ///
-/// `protected` is the snapshot the calling [`forget_entity`] just wrote. It
+/// `protected` is the snapshot the calling [`forget_entity_bounded`] just wrote. It
 /// cannot be left to survive on its ordering: that only holds while every other
 /// name in the directory tells the truth about its capture time, and a
 /// container whose clock steps backwards between two forgets leaves a
@@ -794,7 +824,7 @@ mod tests {
         let f = fixture();
         let root = f.dir.path().join("snapshots");
 
-        let outcome = forget_entity(
+        let outcome = forget_entity_bounded(
             &f.storage,
             Uuid::new_v4(),
             None,
@@ -820,7 +850,7 @@ mod tests {
         let f = fixture();
         seed_one_of_each(&f);
 
-        let outcome = forget_entity(
+        let outcome = forget_entity_bounded(
             &f.storage,
             f.entity.id,
             None,
@@ -844,7 +874,7 @@ mod tests {
         seed_one_of_each(&f);
         let root = f.dir.path().join("snapshots");
 
-        let outcome = forget_entity(
+        let outcome = forget_entity_bounded(
             &f.storage,
             f.entity.id,
             None,
@@ -867,7 +897,7 @@ mod tests {
         let f = fixture();
         seed_one_of_each(&f);
 
-        let outcome = forget_entity(
+        let outcome = forget_entity_bounded(
             &f.storage,
             f.entity.id,
             Some("subject"),
@@ -906,7 +936,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(namespace_dir(&root, f.namespace.id), b"not a directory").unwrap();
 
-        let error = forget_entity(
+        let error = forget_entity_bounded(
             &f.storage,
             f.entity.id,
             None,
@@ -1115,7 +1145,7 @@ mod tests {
             write_aged(&f, &dir, epoch() + Duration::hours(hours));
         }
 
-        let outcome = forget_entity(
+        let outcome = forget_entity_bounded(
             &f.storage,
             f.entity.id,
             None,
@@ -1135,6 +1165,33 @@ mod tests {
         assert_eq!(file_names(&dir).len(), 2);
     }
 
+    /// The superseded five-argument entry point still does what it always did:
+    /// deletes, snapshots, and keeps every snapshot. Callers get a deprecation
+    /// warning pointing at `forget_entity_bounded`, not a behaviour change.
+    #[test]
+    #[allow(
+        deprecated,
+        reason = "exercising the deprecated entry point is the point of this test"
+    )]
+    fn the_deprecated_forget_entity_still_forgets_and_prunes_nothing() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let root = f.dir.path().join("snapshots");
+        let dir = namespace_dir(&root, f.namespace.id);
+        let ancient = write_aged(&f, &dir, epoch() - Duration::days(10_000));
+
+        let outcome = forget_entity(&f.storage, f.entity.id, None, f.namespace.id, &root).unwrap();
+
+        assert_eq!(outcome.snapshot.counts().total, 2);
+        assert!(outcome.path.is_some());
+        assert_eq!(outcome.pruned, PruneOutcome::default());
+        assert!(
+            ancient.exists(),
+            "the superseded entry point keeps every snapshot, as it always did"
+        );
+        assert_eq!(file_names(&dir).len(), 2);
+    }
+
     /// The snapshot this call just wrote is never a victim of its own prune.
     ///
     /// Ordering by `captured_at` makes "the newest file survives" true only as
@@ -1151,7 +1208,7 @@ mod tests {
         let dir = namespace_dir(&root, f.namespace.id);
         let future = write_aged(&f, &dir, Utc::now() + Duration::days(365));
 
-        let outcome = forget_entity(
+        let outcome = forget_entity_bounded(
             &f.storage,
             f.entity.id,
             None,
@@ -1226,7 +1283,7 @@ mod tests {
         let dir = namespace_dir(&root, f.namespace.id);
         let stale = write_aged(&f, &dir, epoch());
 
-        let outcome = forget_entity_with(
+        let outcome = forget_entity_bounded_with(
             &f.storage,
             f.entity.id,
             None,
@@ -1374,7 +1431,7 @@ mod tests {
     fn a_snapshot_written_before_owner_only_existed_still_restores() {
         let f = fixture();
         seed_one_of_each(&f);
-        let outcome = forget_entity(
+        let outcome = forget_entity_bounded(
             &f.storage,
             f.entity.id,
             None,

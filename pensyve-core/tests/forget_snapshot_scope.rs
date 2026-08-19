@@ -202,7 +202,7 @@ fn snapshot_scope_equals_delete_scope() {
 
     let before = live_ids(storage, fixture.namespace.id);
 
-    let outcome = snapshot::forget_entity(
+    let outcome = snapshot::forget_entity_bounded(
         storage,
         fixture.target.id,
         None,
@@ -332,7 +332,7 @@ fn snapshot_round_trips_the_deleted_memories_back_into_storage() {
     let storage = &fixture.storage;
 
     let before = live_ids(storage, fixture.namespace.id);
-    let outcome = snapshot::forget_entity(
+    let outcome = snapshot::forget_entity_bounded(
         storage,
         fixture.target.id,
         Some(fixture.target.name.as_str()),
@@ -396,7 +396,7 @@ fn restore_is_idempotent() {
     let storage = &fixture.storage;
 
     let before = live_ids(storage, fixture.namespace.id);
-    let outcome = snapshot::forget_entity(
+    let outcome = snapshot::forget_entity_bounded(
         storage,
         fixture.target.id,
         None,

@@ -1182,7 +1182,7 @@ async fn forget_entity_blocking(
     let namespace_id = ps.namespace.id;
 
     tokio::task::spawn_blocking(move || {
-        pensyve_core::snapshot::forget_entity(
+        pensyve_core::snapshot::forget_entity_bounded(
             storage.as_ref(),
             entity_id,
             Some(entity_name.as_str()),
