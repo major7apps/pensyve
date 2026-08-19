@@ -261,10 +261,32 @@ The digest covers the whole schema file, so any edit invalidates it and the
 batch runs again. The idempotent re-apply is preserved where it matters, a
 changed file, and skipped only where it was already a guaranteed no-op.
 
-The operational consequence is one extra step on upgrades that change the
-schema: run the new build once as the owner (or run
-`pensyve-core/src/storage/postgres_schema.sql` by hand as the owner), then
-start the serving role. A build whose schema is unchanged needs nothing.
+##### Upgrading a deployment that serves as `pensyve_app`
+
+A build whose schema text is unchanged needs nothing: the digest still matches,
+the DDL is skipped, and the serving role starts as it always did. A build that
+changes the schema needs this sequence, in this order:
+
+1. **Apply the new schema text**, however you prefer. Starting the new build on
+   an owner connection does it; so does
+   `psql -f pensyve-core/src/storage/postgres_schema.sql` as the owner. Either
+   is fine, and this step is where the owner-only DDL actually happens.
+2. **Start the new build once on an owner connection.** This step is required
+   even if step 1 already applied the file by hand, and it is not optional
+   ceremony: `postgres_schema.sql` cannot record its own digest, so a
+   hand-applied schema leaves `pensyve_schema_state` present but empty. Only a
+   startup stamps it. The startup verifies the schema, re-applies it —
+   idempotently, so doing step 1 by hand first costs nothing — and writes the
+   digest. It logs `schema marker present but unstamped` when it finds the
+   hand-applied state.
+3. **Flip serving back to `pensyve_app`.** With the digest stamped, the probe
+   reads "current", the DDL batch is skipped, and the unprivileged role starts.
+
+Step 2 is the one worth not skipping. Without it the marker is never stamped,
+every later startup reads "not current", and `pensyve_app` fails on owner-only
+DDL indefinitely — the database is fine and the application will not start.
+Running the new build as the owner for step 1 collapses steps 1 and 2 into one
+action, which is the simplest way to do this.
 
 `NOBYPASSRLS` is required because a role with `BYPASSRLS`, and any superuser,
 ignores every policy — the startup self-check above will warn if you get this
@@ -312,13 +334,19 @@ count) is what settles it either way.
 
 **Startup fails with `must be owner of table entities`.** The serving role has
 been asked to apply the schema, which is owner-only DDL. It is only asked to
-when the schema is not already at this build's version, so this means the
-database is behind: apply the new build's schema once as the owning role — start
-the new build as the owner, or run
-`pensyve-core/src/storage/postgres_schema.sql` by hand as the owner — and then
-start the serving role again. A build whose schema text is unchanged skips the
-DDL entirely and needs none of this. The error the application raises says the
-same thing; the bare Postgres message is not what you will see.
+when the digest in `pensyve_schema_state` is not this build's, so the fix is
+always the same: **start the new build once on an owner connection**, then start
+the serving role again. See the upgrade sequence above. A build whose schema
+text is unchanged skips the DDL entirely and never reaches this. The error the
+application raises says the same thing; the bare Postgres message is not what
+you will see.
+
+Note that applying `postgres_schema.sql` by hand does *not* on its own clear
+this. The file creates `pensyve_schema_state` but cannot record its own digest,
+so a hand-applied schema leaves the marker empty and the serving role still
+fails here. The owner-connected startup is what stamps it — look for
+`schema marker present but unstamped` in that startup's log to confirm it found
+and fixed exactly this state.
 
 **Startup fails with `permission denied for table pensyve_schema_state`.** The
 serving role cannot read the applied-schema marker, so it cannot establish that

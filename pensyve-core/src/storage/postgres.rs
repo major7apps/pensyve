@@ -230,6 +230,26 @@ fn schema_digest() -> String {
     format!("fnv1a64:{hash:016x}")
 }
 
+/// What `pensyve_schema_state` says about the schema this build ships.
+///
+/// Only [`SchemaState::Current`] authorises skipping the DDL batch. The other
+/// three are all "apply it", and are distinguished so the startup log can say
+/// which situation the operator is in — see [`PostgresBackend::schema_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaState {
+    /// No marker table: a fresh database, or one provisioned before the marker
+    /// existed.
+    Absent,
+    /// Marker table exists but holds no row. The schema text was applied by
+    /// something that cannot record its own digest — a hand-run
+    /// `psql -f postgres_schema.sql`.
+    Unstamped,
+    /// Marker names a different digest: the database is at some other version.
+    Stale,
+    /// Marker names this build's digest.
+    Current,
+}
+
 /// Turn a failure to apply the schema into an error that names the cause.
 ///
 /// A non-owner reaching the DDL batch gets `must be owner of table entities`
@@ -369,12 +389,32 @@ impl PostgresBackend {
     /// rather than surfacing as a bare `must be owner of table entities`.
     fn run_schema(&self) -> StorageResult<()> {
         let digest = schema_digest();
-        if self.schema_state_matches(&digest)? {
-            tracing::debug!(
+        match self.schema_state(&digest)? {
+            SchemaState::Current => {
+                tracing::debug!(
+                    schema_digest = %digest,
+                    "pensyve: database schema already at this build's version; skipping DDL"
+                );
+                return Ok(());
+            }
+            SchemaState::Unstamped => tracing::info!(
                 schema_digest = %digest,
-                "pensyve: database schema already at this build's version; skipping DDL"
-            );
-            return Ok(());
+                "pensyve: schema marker present but unstamped — applying and stamping now. \
+                 This is the state a hand-applied `psql -f postgres_schema.sql` leaves \
+                 behind: the file creates pensyve_schema_state but cannot record its own \
+                 digest, so only a startup can. This startup must therefore be on an owner \
+                 connection; once it stamps, an unprivileged serving role starts normally. \
+                 See docs/SECURITY.md."
+            ),
+            SchemaState::Stale => tracing::info!(
+                schema_digest = %digest,
+                "pensyve: database schema is not at this build's version; applying it. \
+                 Requires an owner connection."
+            ),
+            SchemaState::Absent => tracing::info!(
+                schema_digest = %digest,
+                "pensyve: no schema marker; applying the schema. Requires an owner connection."
+            ),
         }
 
         self.block_on(async {
@@ -389,15 +429,20 @@ impl PostgresBackend {
         self.record_schema_state(&digest)
     }
 
-    /// Read `pensyve_schema_state` and report whether it names `digest`.
+    /// Read `pensyve_schema_state` and classify what it says about `digest`.
     ///
-    /// Returns `false` — "not current, apply the schema" — for every reason the
-    /// answer is not an unambiguous yes: the table does not exist yet (a fresh
-    /// database, or one provisioned before this marker existed), it is empty,
-    /// or it names a different digest. Failing towards applying keeps this
-    /// probe unable to *skip* a migration that is genuinely needed; the worst
-    /// it can do is make an owner re-run a batch that is a no-op.
-    fn schema_state_matches(&self, digest: &str) -> StorageResult<bool> {
+    /// Only [`SchemaState::Current`] authorises a skip; every other answer means
+    /// "apply the schema". Failing towards applying keeps this probe unable to
+    /// *skip* a migration that is genuinely needed; the worst it can do is make
+    /// an owner re-run a batch that is a no-op.
+    ///
+    /// The three not-current answers are distinguished for the log alone —
+    /// [`SchemaState::Unstamped`] in particular is the state a hand-applied
+    /// `psql -f postgres_schema.sql` leaves behind, and an operator who reaches
+    /// it is one owner-connected startup away from a working deployment rather
+    /// than looking at a broken one. Saying which of the three it is turns that
+    /// into a readable line instead of an inference.
+    fn schema_state(&self, digest: &str) -> StorageResult<SchemaState> {
         self.block_on(async {
             let mut conn = self.conn_with_namespace(UNSCOPED_NAMESPACE).await?;
 
@@ -419,7 +464,7 @@ impl PostgresBackend {
                     .await
                     .map_err(sqlx_to_io)?;
             if present.is_none() {
-                return Ok(false);
+                return Ok(SchemaState::Absent);
             }
 
             let applied: Option<(String,)> = query_as::<Postgres, _>(
@@ -429,7 +474,11 @@ impl PostgresBackend {
             .await
             .map_err(sqlx_to_io)?;
 
-            Ok(applied.is_some_and(|(applied,)| applied == digest))
+            Ok(match applied {
+                None => SchemaState::Unstamped,
+                Some((applied,)) if applied == digest => SchemaState::Current,
+                Some(_) => SchemaState::Stale,
+            })
         })
     }
 

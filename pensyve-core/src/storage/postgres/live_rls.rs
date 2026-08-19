@@ -2670,6 +2670,76 @@ fn the_schema_skip_follows_the_schema_text() {
     );
 }
 
+/// The documented manual-upgrade sequence has to actually complete.
+///
+/// `docs/SECURITY.md` tells an operator they may apply new schema text however
+/// they like — `psql -f postgres_schema.sql` included — and then start the
+/// application once on an owner connection before flipping serving back to the
+/// unprivileged role. That middle step is not optional and the docs used to
+/// present it as an alternative rather than a follow-on: the schema file
+/// creates `pensyve_schema_state` but cannot record its own digest, so a
+/// hand-applied schema leaves the marker table present and empty. Without the
+/// owner-connected startup the marker never gets stamped, every later startup
+/// reads "not current", and the serving role fails on owner-only DDL forever —
+/// the upgrade path as written could not finish.
+///
+/// This runs the sequence as documented. The empty-marker state is what stands
+/// in for the hand-applied schema, because that is precisely what `psql` leaves.
+#[test]
+fn the_documented_manual_upgrade_sequence_completes() {
+    let Some(admin_opts) = skip_notice("the_documented_manual_upgrade_sequence_completes") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let serving = fixture.serving_role(&admin_opts);
+    let owner = fixture.role.clone();
+
+    // Step 1 — the schema is applied by something that cannot stamp the digest.
+    // `psql -f postgres_schema.sql` creates the marker table and leaves it
+    // empty; nothing else about the database differs.
+    fixture.rt.block_on(async {
+        exec(fixture.backend.pool(), "DELETE FROM pensyve_schema_state").await;
+    });
+
+    // The serving role cannot get past this state on its own — it would be
+    // asked for owner-only DDL. This is the failure the docs must not lead an
+    // operator into.
+    let blocked = PostgresBackend::from_pool(fixture.pool_for(&admin_opts, &serving))
+        .err()
+        .expect("an unstamped marker must not let a non-owner start");
+    assert!(
+        blocked.to_string().contains("owner-only DDL"),
+        "and it must say why: {blocked}"
+    );
+
+    // Step 2 — start once on an owner connection. This is the step the docs
+    // now require rather than offer.
+    let stamping = PostgresBackend::from_pool(fixture.pool_for(&admin_opts, &owner))
+        .expect("an owner startup must complete over a hand-applied schema");
+    drop(stamping);
+
+    let stamped: i64 = fixture.rt.block_on(async {
+        let (count,): (i64,) =
+            query_as::<Postgres, _>("SELECT count(*) FROM pensyve_schema_state WHERE id = 1")
+                .fetch_one(fixture.backend.pool())
+                .await
+                .expect("read the marker after the owner startup");
+        count
+    });
+    assert_eq!(
+        stamped, 1,
+        "the owner startup must stamp the digest; without it the sequence cannot finish"
+    );
+
+    // Step 3 — flip serving back. This is what the whole sequence is for.
+    let serving_backend = PostgresBackend::from_pool(fixture.pool_for(&admin_opts, &serving))
+        .expect("the serving role must start once the owner startup has stamped the digest");
+    let ns = Namespace::new(format!("upgraded-{}", Uuid::new_v4().simple()));
+    serving_backend
+        .save_namespace(&ns)
+        .expect("and must be able to serve");
+}
+
 /// The applied-schema probe must resolve the marker the same way the
 /// statements it gates do.
 ///
