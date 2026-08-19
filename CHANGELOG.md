@@ -5,6 +5,20 @@ All notable changes to Pensyve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Postgres row-level security is enforced by default** (#254). `postgres_schema.sql` now ends with `ALTER TABLE ... FORCE ROW LEVEL SECURITY` on all seven policied tables (`entities`, `episodes`, `episodic_memories`, `semantic_memories`, `procedural_memories`, `observation_memories`, `edges`), so the `namespace_isolation_*` policies apply to the role that owns the schema instead of being inert for it. Enforcement was the last step of the tenant-isolation sweep and was held back only until every `StorageTrait` method carried a namespace; 3.1.0 finished that. The statements are idempotent and sit after the edges backfill, so an upgrade from an unenforced database migrates first and is forced afterwards, in the same batch.
+- **`postgres_rls_enforce.sql` and `PostgresBackend::enforce_rls` are removed.** They existed to let an operator turn enforcement on ahead of the schema; there is nothing left for them to do. Nothing needs to be applied by hand any more.
+
+### Upgrade notes
+
+- **Enforcement only means something if the serving role is `NOSUPERUSER NOBYPASSRLS`.** A superuser, and any role holding `BYPASSRLS`, ignores every policy no matter what the catalog reports — `FORCE` cannot remove either attribute. Startup warns on every start when the connected role holds one. A deployment still connecting as a managed-Postgres owner should move to the `pensyve_app` role model in `docs/SECURITY.md` before or with this upgrade; nothing breaks if it does not, but nothing is enforced either.
+- **Anything reaching a policied table outside `StorageTrait` must bind `pensyve.namespace_id` itself.** Under enforcement such a connection reads zero rows and writes nothing, without raising. This covers the `PostgresBackend::pool` accessor and any external tool, script or migration holding its own connection.
+- A deployment that applied the old `postgres_rls_enforce.sql` by hand and has not yet run the 3.1.0 edges migration may hit `refusing to migrate edges.namespace_id`. That refusal is deliberate and nothing is written; `docs/SECURITY.md` has the remedy.
+- To roll back: `ALTER TABLE <table> NO FORCE ROW LEVEL SECURITY;` per table. Immediate, and it touches neither the policies nor the data — but the next startup that applies the schema forces again, so it unblocks an investigation rather than serving as a way to run.
+
 ## [3.1.0] - 2026-08-19
 
 Carries 3.0.0's tenant-isolation sweep into the parts of the store it had not reached — the knowledge graph, GDPR erase, and the last storage methods that still resolved rows without a namespace — and puts a bound on the pre-delete snapshot store that 3.0.0's recoverable `forget` introduced. The `StorageTrait` breaks follow the same API-break ruling as 3.0.0 (`AGENTS.md`, #262): a method that cannot be called safely in a multi-tenant deployment is replaced outright, not deprecated.
@@ -52,7 +66,7 @@ Major release. The version jump is driven by deliberate breaks in the `pensyve-c
 
 ### Security
 
-- Namespace scoping enforced across the hosted gateway's storage access: episode and observation access (#247), entity-wide forget and its FTS rows (#259), the REST/A2A forget routes (#263), and the remaining namespace-less storage methods (#269). Explicit SQL predicates enforce isolation in every deployment shape; Postgres row-level security backs them as defence in depth now that the session GUC binds correctly (#253). `FORCE ROW LEVEL SECURITY` ships as an explicit operator step (`postgres_rls_enforce.sql`) — see `docs/SECURITY.md` for the preconditions, including the application-role requirement.
+- Namespace scoping enforced across the hosted gateway's storage access: episode and observation access (#247), entity-wide forget and its FTS rows (#259), the REST/A2A forget routes (#263), and the remaining namespace-less storage methods (#269). Explicit SQL predicates enforce isolation in every deployment shape; Postgres row-level security backs them as defence in depth now that the session GUC binds correctly (#253). `FORCE ROW LEVEL SECURITY` shipped as an explicit operator step (`postgres_rls_enforce.sql`) at this release; it became the schema's default in the release after — see `docs/SECURITY.md` for the preconditions, including the application-role requirement.
 - Entity-wide `pensyve_forget` is recoverable: a fail-closed pre-delete snapshot is captured inside the delete's transaction — if the snapshot cannot be written, nothing is deleted (#248), and the REST and A2A routes carry the same guarantee (#263). Snapshot restore is `pensyve_core::snapshot::restore`.
 
 ### Added

@@ -43,8 +43,10 @@ On the Postgres backend, namespace isolation is meant to have two independent
 layers:
 
 1. The explicit `namespace_id = $n` predicates in the storage layer's SQL.
-   This is what enforces isolation in every deployment today.
+   This is the load-bearing layer: it is the only one on `SQLite`, and the only
+   one left on a Postgres whose role holds `BYPASSRLS`.
 2. Row-level security, as a backstop for a query that omits the predicate.
+   Enforced by default since 3.2 — see below.
 
 `postgres_schema.sql` enables RLS and declares a `namespace_isolation_*` policy
 per namespaced table. Each policy matches `namespace_id` against the
@@ -70,17 +72,27 @@ once RLS is enforced, which is a cross-namespace read rather than an empty
 result. The internal uses are limited to DDL, which RLS does not apply to, and
 to `namespaces` and `activity_events`, neither of which carries a policy.
 
-Layer 2 is not active by default. Postgres exempts a table's owner from its own
-policies, and a deployment that applies the schema on startup connects as the
-role that owns it, so the policies do not apply to that connection. Removing
-the exemption requires `FORCE ROW LEVEL SECURITY`, which ships as a separate
-file that an operator applies (`postgres_rls_enforce.sql`, also reachable as
-`PostgresBackend::enforce_rls`) rather than as part of the schema. Every
-storage path now carries a namespace, so enforcement is safe to apply; making
-it the default is the remaining step, and it is a schema change rather than a
-code one.
+Layer 2 is active by default. Postgres exempts a table's owner from its own
+policies, so `ENABLE ROW LEVEL SECURITY` alone would leave them inert for the
+role that applies the schema. `postgres_schema.sql` therefore ends with
+`ALTER TABLE ... FORCE ROW LEVEL SECURITY` on all seven policied tables, which
+removes that exemption. It is applied by every startup that applies the schema,
+and it is idempotent, so a re-apply is a no-op.
 
-#### Before enabling enforcement
+Enforcement used to ship as a separate file an operator applied by hand
+(`postgres_rls_enforce.sql`). That was a staging device: it existed while parts
+of the storage surface still reached the database without a namespace, and
+enforcing then would have turned those paths into silent no-ops. Every
+`StorageTrait` method carries a namespace now, so the file has been folded into
+the schema and removed.
+
+The one thing `FORCE` cannot do is override a role's own attributes. A
+superuser, and any role holding `BYPASSRLS`, ignores every policy no matter what
+the catalog says the tables are forced to. That is why the role model below is
+part of the control and not an optional hardening step, and why startup reports
+the connected role's exemptions on every start.
+
+#### What enforcement does to an unscoped path
 
 Enforcement fails closed, and it fails without raising an error. A query path
 that does not carry a namespace returns no rows, and a delete on that path
@@ -127,7 +139,7 @@ the per-method tests are the standing gate in its place.
 
 Edges are the newest addition to layer 2. They gained a `namespace_id` — an
 edge belongs to the namespace of its source entity — plus a
-`namespace_isolation_edges` policy and a `FORCE` line in the enforcement file.
+`namespace_isolation_edges` policy and a `FORCE` line alongside the other six.
 `save_edge` and `get_edges_for_entity_in_namespace` both take a namespace and
 bind it on their connection, so the graph is covered by both layers rather than
 by neither. A GDPR erase now really deletes them: the edge leg of
@@ -149,19 +161,26 @@ whose source entity no longer exists are deleted, because they can be
 attributed to no namespace and no scoped accessor can reach them. On Postgres
 the count is reported as a `NOTICE`; on `SQLite` it is logged at `WARN`.
 
-**If you have already applied enforcement, the Postgres migration may refuse to
-run, and that refusal is doing its job.** `run_schema` sends the schema through
-a connection with no namespace bound. Under enforcement that connection reads
-`entities` as empty, which would make the backfill match nothing and the orphan
+**On an already-enforced database the Postgres migration may refuse to run, and
+that refusal is doing its job.** `run_schema` sends the schema through a
+connection with no namespace bound. Where `entities` is forced, that connection
+reads it as empty, which would make the backfill match nothing and the orphan
 delete match everything — silently destroying the graph. The migration
 therefore runs under `SET row_security = off`, which makes Postgres raise
 rather than filter, and it aborts the whole schema batch with
-`refusing to migrate edges.namespace_id`. Nothing is written. You will only see
-this if `edges` actually holds rows; an empty `edges` table migrates cleanly
-under enforcement, and so does a database that has already been migrated. To
-clear the refusal, apply the schema once as a role the policies do not apply
-to, or `ALTER TABLE entities NO FORCE ROW LEVEL SECURITY` for the duration of
-the upgrade and restore it afterward.
+`refusing to migrate edges.namespace_id`. Nothing is written.
+
+The ordinary upgrade does not hit this. The `FORCE` block is the last thing in
+`postgres_schema.sql`, after the backfill, so a database being brought up from
+an unenforced build migrates first and is forced afterwards, in one batch. The
+refusal is for a deployment that had enforcement applied by hand — through the
+old `postgres_rls_enforce.sql` — and still has the edges migration ahead of it,
+or one whose tables have drifted into different enforcement states. You will
+only see it if `edges` actually holds rows; an empty `edges` table migrates
+cleanly under enforcement, and so does a database that has already been
+migrated. To clear the refusal, `ALTER TABLE entities NO FORCE ROW LEVEL
+SECURITY` for the duration of the upgrade and restore it afterward, or apply the
+schema once as a role the policies do not apply to.
 
 #### The startup self-check
 
@@ -179,32 +198,26 @@ observable from the application is the point; it is not a runbook step anyone
 has to remember.
 
 It is a warning, not a refusal. A local or single-tenant deployment
-legitimately connects as the owner or as `postgres`, and enforcement there is
-an operator choice rather than a precondition for starting. If you see this
-warning on a multi-tenant deployment, treat it as enforcement being off no
-matter what the enforce script reported.
+legitimately connects as the owner or as `postgres`, and neither is worth
+refusing to start over. If you see this warning on a multi-tenant deployment,
+treat it as enforcement being off no matter what the catalog says.
 
 `PostgresBackend::role_rls_exemptions` exposes the same answer to callers that
 want to assert on it.
 
-#### Applying enforcement
+#### Verifying enforcement
+
+Applying the schema is all there is to enabling enforcement; there is no
+separate step and no separate file. What is worth doing is checking that it
+took effect, because a clean startup does not prove it.
 
 First check that the application's role is not a superuser and does not hold
 `BYPASSRLS` — the startup self-check above will already have told you, and the
 query it runs is the one to re-run by hand. Expect `f` in both columns. If
-either is `t`, enforcement cannot work on that connection; move the application
-to an ordinary role before going further.
+either is `t`, enforcement cannot work on that connection whatever the tables
+say; move the application to an ordinary role.
 
-Then apply `pensyve-core/src/storage/postgres_rls_enforce.sql`, or call
-`PostgresBackend::enforce_rls`. Both run the same statements, and both are
-`ALTER TABLE ... FORCE ROW LEVEL SECURITY`, so **the connecting role must own
-the tables**. Run this step as the owning role — the same one that applies the
-schema. It is not the role that has to serve traffic afterwards: enforcement is
-a one-off migration, and the point of forcing the policies is that an
-unprivileged `pensyve_app` can then serve under them. See the role setup below.
-
-Then verify enforcement actually took effect, because a successful run does not
-prove it. Every row below should report `t`:
+Then check the tables. Every row below should report `t`:
 
 ```sql
 SELECT relname, relrowsecurity, relforcerowsecurity
@@ -232,7 +245,27 @@ superuser or as a role holding `BYPASSRLS`.
 
 To roll back, run `ALTER TABLE <table> NO FORCE ROW LEVEL SECURITY;` for each
 table. Rollback takes effect immediately and touches neither the policies nor
-the data.
+the data. It lasts until the next startup that applies the schema, which forces
+again — so it is a way to unblock an upgrade or an investigation, not a way to
+run.
+
+#### Upgrading a deployment provisioned before enforcement shipped
+
+A database whose schema predates this change is already enforced the moment the
+new build applies its schema, and that is a behaviour change, not just a
+migration. Two things have to be true first, and both are about the role:
+
+1. The role the application serves as must be `NOSUPERUSER NOBYPASSRLS`. If it
+   holds either attribute, forcing the tables changes nothing and the isolation
+   you think you turned on is not on. The startup self-check reports this.
+2. Nothing outside `StorageTrait` may reach a policied table on a connection
+   with no namespace bound. Inside the backend this is structural. A tool,
+   script or migration holding its own connection is not, and under enforcement
+   it reads nothing rather than erroring.
+
+The role setup below is the same one the DDL/serving split needs, so a
+deployment that already runs as `pensyve_app` has nothing to do beyond the
+ordinary upgrade sequence.
 
 #### The dedicated application role
 
@@ -318,15 +351,15 @@ pensyve_schema_state` rather than skipping the DDL.
 
 #### What goes wrong
 
-**Reads come back empty after applying enforcement.** Enforcement fails closed
-without raising, so an unscoped query path returns nothing and an unscoped
-delete deletes nothing while still returning `Ok`. Every `StorageTrait` method
-carries a namespace now, so the usual cause is not the application: check the
-connection. A path that reached the database without going through a storage
-method — the `PostgresBackend::pool` accessor, or a tool holding its own
-connection — has to bind `pensyve.namespace_id` itself. Roll back with
-`NO FORCE` while you find it; rollback is immediate and touches neither the
-policies nor the data.
+**Reads come back empty.** Enforcement fails closed without raising, so an
+unscoped query path returns nothing and an unscoped delete deletes nothing while
+still returning `Ok`. Every `StorageTrait` method carries a namespace, so the
+usual cause is not the application: check the connection. A path that reached
+the database without going through a storage method — the
+`PostgresBackend::pool` accessor, or a tool holding its own connection — has to
+bind `pensyve.namespace_id` itself. `NO FORCE` while you find it; that is
+immediate and touches neither the policies nor the data, and the next schema
+apply restores enforcement.
 
 **Enforcement appears to do nothing: rows from every namespace still come
 back.** Look at the startup log. The backend warns on every start when
