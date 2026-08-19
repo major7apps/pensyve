@@ -220,11 +220,20 @@ CREATE TABLE IF NOT EXISTS edges (
 --
 -- `PostgresBackend::run_schema` sends this file through
 -- `ScopedPool::unbound`, a connection with no `pensyve.namespace_id` bound.
--- On a deployment that has applied `postgres_rls_enforce.sql`, `entities` is
--- FORCEd, so through that connection it reads back EMPTY. The backfill below
--- would then match nothing, and the delete that follows would see every edge
--- as an orphan — on a table an older on-disk enforce file never FORCEd, so
--- nothing would stop it. The batch would commit and the graph would be gone.
+-- On any deployment past its first schema apply, `entities` is FORCEd — the
+-- block at the bottom of this file does it, and enforcement is state on the
+-- table rather than a property of the file, so it is already in place when the
+-- next batch runs. Through that connection `entities` therefore reads back
+-- EMPTY. The backfill below would then match nothing, and the delete that
+-- follows would see every edge as an orphan — on a table that had not been
+-- FORCEd, so nothing would stop it. The batch would commit and the graph would
+-- be gone.
+--
+-- This is not specific to `edges`, and it is the rule for anything added to
+-- this file later: DML here against a policied table runs on a connection the
+-- policies apply to, so it must sit inside the window below.
+-- `schema_dml_on_policied_tables_cannot_be_silently_blinded` enforces that.
+-- docs/SECURITY.md spells out what it means for a migration author.
 --
 -- `row_security = off` does not bypass anything. It tells Postgres to RAISE
 -- instead of silently filtering, so a connection that cannot read `entities`

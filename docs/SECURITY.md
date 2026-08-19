@@ -46,7 +46,7 @@ layers:
    This is the load-bearing layer: it is the only one on `SQLite`, and the only
    one left on a Postgres whose role holds `BYPASSRLS`.
 2. Row-level security, as a backstop for a query that omits the predicate.
-   Enforced by default since 3.2 — see below.
+   Enforced by default since the enforce-by-default change — see below.
 
 `postgres_schema.sql` enables RLS and declares a `namespace_isolation_*` policy
 per namespaced table. Each policy matches `namespace_id` against the
@@ -170,17 +170,45 @@ therefore runs under `SET row_security = off`, which makes Postgres raise
 rather than filter, and it aborts the whole schema batch with
 `refusing to migrate edges.namespace_id`. Nothing is written.
 
-The ordinary upgrade does not hit this. The `FORCE` block is the last thing in
-`postgres_schema.sql`, after the backfill, so a database being brought up from
-an unenforced build migrates first and is forced afterwards, in one batch. The
-refusal is for a deployment that had enforcement applied by hand — through the
-old `postgres_rls_enforce.sql` — and still has the edges migration ahead of it,
-or one whose tables have drifted into different enforcement states. You will
-only see it if `edges` actually holds rows; an empty `edges` table migrates
-cleanly under enforcement, and so does a database that has already been
-migrated. To clear the refusal, `ALTER TABLE entities NO FORCE ROW LEVEL
-SECURITY` for the duration of the upgrade and restore it afterward, or apply the
-schema once as a role the policies do not apply to.
+The *edges* migration in particular does not hit this on an ordinary upgrade.
+The `FORCE` block is the last thing in `postgres_schema.sql`, after the
+backfill, so a database being brought up from an unenforced build migrates
+first and is forced afterwards, in one batch. You will only see it there if
+`edges` actually holds rows; an empty `edges` table migrates cleanly under
+enforcement, and so does a database that has already been migrated. To clear
+that refusal, `ALTER TABLE entities NO FORCE ROW LEVEL SECURITY` for the
+duration of the upgrade and restore it afterward, or apply the schema once as a
+role the policies do not apply to.
+
+**But the shape of that refusal is now a standing rule, not a one-off.** Read
+this part if you are about to add a migration to `postgres_schema.sql`.
+
+From the enforce-by-default change onward, every deployment past its first
+schema apply has `entities` — and the other six policied tables — already
+FORCEd when the *next* schema batch runs. Enforcement is state on the tables,
+not a property of the file, so it is in place before the batch starts. At the
+same time, `schema_dml_on_policied_tables_cannot_be_silently_blinded` requires
+any DML in this file against a policied table to sit inside the
+`SET row_security = off` … `RESET row_security` window, precisely so a blinded
+read raises instead of returning a wrong answer.
+
+Put together: **any future migration that reads or writes a policied table will
+raise, on every already-enforced database, unless it runs as a role the
+policies do not apply to.** That is the guardrail working, not a bug — the
+alternative is a migration that silently sees an empty table and acts on it.
+The consequences for a schema author are:
+
+- A migration touching policied tables must be run by the owner, and the owner
+  must not be subject to the policies for its duration. In practice that means
+  the owner-connected startup in the upgrade sequence below, with
+  `NO FORCE` on the tables it reads if the owner is itself forced. The
+  unprivileged `pensyve_app` serving role can never apply such a migration.
+- Prefer a migration that does not need to read tenant rows at all. Catalog
+  reads (`pg_attribute`, `pg_class`) are never filtered by RLS, which is why
+  the edges migration gates itself on `attnotnull` and why an already-migrated
+  database skips the guarded body entirely and starts normally.
+- Gate the expensive or dangerous part behind that catalog check, so the common
+  path — a database with nothing to migrate — never enters the window.
 
 #### The startup self-check
 
