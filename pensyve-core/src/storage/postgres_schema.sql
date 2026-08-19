@@ -235,10 +235,18 @@ CREATE TABLE IF NOT EXISTS edges (
 --
 -- The `attnotnull` gate is a catalog read, which RLS never filters, so an
 -- already-migrated database skips the guarded body entirely and an enforced
--- deployment keeps starting normally. The `EXISTS` gate means a deployment
--- whose `edges` table is empty — the common case, since nothing wrote edges
--- before this change — migrates cleanly under enforcement too, instead of
--- refusing over rows that do not exist.
+-- deployment keeps starting normally. Its `regclass` cast is deliberately
+-- unqualified, matching the applied-schema probe in `PostgresBackend::
+-- schema_state` and the `ALTER TABLE edges` above it: `edges` lands wherever
+-- `search_path` puts it, so `public.edges` would name a different relation
+-- than the one this gate is about — and on a deployment with a non-default
+-- `search_path`, one that does not exist. The file is a single implicit
+-- transaction, so that failed lookup would not merely mis-gate the migration,
+-- it would abort the whole batch and stop the owner starting at all.
+--
+-- The `EXISTS` gate means a deployment whose `edges` table is empty — the
+-- common case, since nothing wrote edges before this change — migrates cleanly
+-- under enforcement too, instead of refusing over rows that do not exist.
 --
 -- On a fresh database every statement here is a no-op: the column already
 -- exists and is already NOT NULL, so the gate returns immediately.
@@ -250,7 +258,7 @@ DO $$
 DECLARE orphaned BIGINT;
 BEGIN
     IF (SELECT attnotnull FROM pg_attribute
-         WHERE attrelid = 'public.edges'::regclass
+         WHERE attrelid = 'edges'::regclass
            AND attname = 'namespace_id') THEN
         RETURN;
     END IF;

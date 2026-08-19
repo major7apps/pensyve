@@ -99,6 +99,10 @@ Python env setup: `uv sync --extra dev && uv run maturin develop --manifest-path
 | `PENSYVE_TIER2_MODEL_PATH` | (unset) | Path to GGUF model for Tier 2 |
 | `DATABASE_URL` | (unset) | Postgres connection string (optional) |
 | `REDIS_URL` | (unset) | Redis for caching, rate limiting, and daily quota enforcement (optional) |
+| `PENSYVE_SNAPSHOT_RETENTION_DAYS` | `30` | How long a `forget` pre-delete snapshot is kept; `0` disables the age bound |
+| `PENSYVE_SNAPSHOT_MAX_PER_NAMESPACE` | `50` | How many snapshots one namespace keeps; `0` disables the count bound |
+
+The two retention bounds apply per namespace to the pre-delete snapshot store (`<storage_root>/snapshots`, overridable with `PENSYVE_SNAPSHOT_DIR`) that makes entity-wide `forget` recoverable. Setting both to `0` keeps every snapshot forever, which is how the store behaved before #265.
 
 ## When in doubt
 

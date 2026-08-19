@@ -52,14 +52,6 @@ pub(crate) fn cross_namespace_edge_id(edge_id: Uuid) -> StorageError {
     ))
 }
 
-fn capturing_delete_not_implemented() -> StorageResult<Vec<Memory>> {
-    Err(StorageError::Context(
-        "storage backend does not implement capturing entity deletion, \
-         so an entity-wide delete cannot be snapshotted atomically"
-            .to_string(),
-    ))
-}
-
 /// Everything one [`StorageTrait::erase_entity_capturing`] transaction removed.
 ///
 /// These are the rows the committed `DELETE`s actually returned, not the rows a
@@ -583,16 +575,18 @@ pub trait StorageTrait: Send + Sync {
     /// - roll back, deleting nothing, if `persist` returns `Err` (fail closed);
     /// - call `persist` exactly once, even when nothing matched.
     ///
-    /// The default fails closed: a backend that cannot capture atomically must
-    /// not have its entity-wide delete treated as recoverable.
+    /// Required rather than defaulted, for the same reason as
+    /// [`StorageTrait::erase_entity_capturing`]. A default that errored at
+    /// runtime would let a backend which cannot capture atomically compile,
+    /// ship, and only then fail the one request that had to work — turning a
+    /// build failure into a production one. An implementor that cannot satisfy
+    /// the contract above should find that out from the compiler.
     fn delete_memories_by_entity_capturing(
         &self,
-        _entity_id: Uuid,
-        _namespace_id: Uuid,
-        _persist: &mut dyn FnMut(&[Memory]) -> StorageResult<()>,
-    ) -> StorageResult<Vec<Memory>> {
-        capturing_delete_not_implemented()
-    }
+        entity_id: Uuid,
+        namespace_id: Uuid,
+        persist: &mut dyn FnMut(&[Memory]) -> StorageResult<()>,
+    ) -> StorageResult<Vec<Memory>>;
 
     /// Erase everything belonging to `entity_id` within `namespace_id` in ONE
     /// transaction, and hand back the rows it removed.
@@ -812,21 +806,4 @@ pub fn memory_matches_scope(
         None => row_user.is_none(),
     };
     agent_match && user_match
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The one remaining fail-closed default: a backend that cannot capture
-    /// atomically must error rather than let an entity-wide delete be treated
-    /// as recoverable. (Its sibling `scoped_delete_not_implemented` went away
-    /// in #254, when `delete_memory_by_id_in_namespace` became required.)
-    #[test]
-    fn capturing_delete_not_implemented_fails_closed() {
-        let error = capturing_delete_not_implemented().unwrap_err();
-
-        assert!(matches!(error, StorageError::Context(_)));
-        assert!(error.to_string().contains("capturing entity deletion"));
-    }
 }

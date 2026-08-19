@@ -391,9 +391,15 @@ impl PostgresBackend {
         let digest = schema_digest();
         match self.schema_state(&digest)? {
             SchemaState::Current => {
-                tracing::debug!(
+                // `info!`, not `debug!`. This is the arm the whole apply/serve
+                // split exists to reach, and an operator following the runbook
+                // through the role flip has to be able to see that it *was*
+                // reached. Logged at `debug!` the healthy path said nothing,
+                // and absence of a line is not evidence of a skip.
+                tracing::info!(
                     schema_digest = %digest,
-                    "pensyve: database schema already at this build's version; skipping DDL"
+                    "pensyve: database schema already at this build's version; skipping DDL. \
+                     No owner privileges were needed to start."
                 );
                 return Ok(());
             }
@@ -542,13 +548,18 @@ impl PostgresBackend {
         })
     }
 
-    /// Log a prominent warning when the connected role is exempt from RLS.
+    /// Log a prominent warning when the connected role is exempt from RLS, and
+    /// say so affirmatively when it is not.
     ///
     /// A warning rather than a refusal: a local or single-tenant deployment
     /// legitimately connects as the owner or as `postgres`, and enforcement is
     /// an operator step there, not a precondition for starting. Failing to
     /// *read* the answer is likewise only worth a warning — an unreadable
     /// `pg_roles` is not a reason to refuse traffic.
+    ///
+    /// All three arms log. A silent clean arm would make "no warning" the only
+    /// evidence that the role flip worked, and no warning is also what an
+    /// operator sees when nothing checked at all.
     fn warn_on_rls_exempt_role(&self) {
         match self.role_rls_exemptions() {
             Ok(exemptions) if exemptions.exempt() => {
@@ -564,7 +575,16 @@ impl PostgresBackend {
                      the tables. See docs/SECURITY.md."
                 );
             }
-            Ok(_) => {}
+            Ok(exemptions) => tracing::info!(
+                role = %exemptions.role,
+                // The clean arm is stated, not left silent. The role flip is
+                // the riskiest step in the runbook, and an operator checking
+                // that it took hold should be reading a line that says so
+                // rather than inferring it from the absence of the warning
+                // above — which is equally absent when the check never ran.
+                "pensyve: the database role is subject to row-level security; the \
+                 namespace_isolation_* policies apply to this connection."
+            ),
             Err(e) => tracing::warn!(
                 error = %e,
                 "pensyve: could not determine whether the database role is exempt from \

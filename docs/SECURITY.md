@@ -277,8 +277,12 @@ changes the schema needs this sequence, in this order:
    hand-applied schema leaves `pensyve_schema_state` present but empty. Only a
    startup stamps it. The startup verifies the schema, re-applies it —
    idempotently, so doing step 1 by hand first costs nothing — and writes the
-   digest. It logs `schema marker present but unstamped` when it finds the
-   hand-applied state.
+   digest. Which line it logs depends on what step 1 left behind: a marker
+   holding no row at all — a first hand-apply, or one on a pre-marker database
+   — logs `schema marker present but unstamped`, while a deployment that has
+   been stamped before and is now on older schema text logs `database schema is
+   not at this build's version; applying it`. Either line means the same thing
+   here, and this step is the remedy for both.
 3. **Flip serving back to `pensyve_app`.** With the digest stamped, the probe
    reads "current", the DDL batch is skipped, and the unprivileged role starts.
 
@@ -343,10 +347,13 @@ you will see.
 
 Note that applying `postgres_schema.sql` by hand does *not* on its own clear
 this. The file creates `pensyve_schema_state` but cannot record its own digest,
-so a hand-applied schema leaves the marker empty and the serving role still
-fails here. The owner-connected startup is what stamps it — look for
-`schema marker present but unstamped` in that startup's log to confirm it found
-and fixed exactly this state.
+so a hand-applied schema leaves the marker unstamped for this build and the
+serving role still fails here. The owner-connected startup is what stamps it —
+to confirm it found and fixed exactly this state, look in that startup's log for
+`schema marker present but unstamped` if the marker held no row (a first
+hand-apply, or one on a pre-marker database), or `database schema is not at this
+build's version; applying it` if the deployment had been stamped by an earlier
+build. The remedy is the same either way.
 
 **Startup fails with `permission denied for table pensyve_schema_state`.** The
 serving role cannot read the applied-schema marker, so it cannot establish that
