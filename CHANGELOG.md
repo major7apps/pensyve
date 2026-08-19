@@ -5,7 +5,7 @@ All notable changes to Pensyve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.1.0] - 2026-08-19
 
 Carries 3.0.0's tenant-isolation sweep into the parts of the store it had not reached — the knowledge graph, GDPR erase, and the last storage methods that still resolved rows without a namespace — and puts a bound on the pre-delete snapshot store that 3.0.0's recoverable `forget` introduced. The `StorageTrait` breaks follow the same API-break ruling as 3.0.0 (`AGENTS.md`, #262): a method that cannot be called safely in a multi-tenant deployment is replaced outright, not deprecated.
 

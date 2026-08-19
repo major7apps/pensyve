@@ -1,6 +1,6 @@
 [package]
 name = "pensyve-python"
-version = "3.0.0"
+version = "3.1.0"
 edition = "2024"
 rust-version = "1.88"
 readme = "README.md"
@@ -15,7 +15,7 @@ name = "pensyve_python"
 crate-type = ["cdylib"]
 
 [dependencies]
-pensyve-core = { path = "../pensyve-core", version = "3.0.0", features = ["observation-extraction"] }
+pensyve-core = { path = "../pensyve-core", version = "3.1.0", features = ["observation-extraction"] }
 pyo3 = { version = "^0.29.0", features = ["extension-module"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"

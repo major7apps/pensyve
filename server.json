@@ -3,7 +3,7 @@
   "name": "io.github.major7apps/pensyve",
   "title": "Pensyve",
   "description": "Universal memory runtime for AI agents — episodic, semantic, and procedural memory.",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "repository": {
     "url": "https://github.com/major7apps/pensyve",
     "source": "github"
