@@ -51,7 +51,9 @@
 //! lossy human-readable JSON rather than restorable rows. Different question,
 //! different answer — the two are intentionally separate.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -284,6 +286,14 @@ fn forget_entity_bounded_with(
 ) -> StorageResult<ForgetOutcome> {
     let dir = namespace_dir(snapshot_root, namespace_id);
 
+    // Held across the delete, the snapshot write, and the prune that follows —
+    // see [`namespace_lock`]. Poisoning is ignored deliberately: the guarded
+    // value is `()`, so a thread that panicked here left nothing inconsistent
+    // behind, and refusing every later forget in the namespace would be a worse
+    // failure than whatever poisoned it.
+    let lock = namespace_lock(namespace_id);
+    let _serialized = lock.lock().unwrap_or_else(PoisonError::into_inner);
+
     let mut captured: Option<ForgetSnapshot> = None;
     let mut path: Option<PathBuf> = None;
 
@@ -501,6 +511,37 @@ fn prune_namespace_dir_with(
     }
 
     outcome
+}
+
+/// The lock serializing snapshot write and prune within one namespace.
+///
+/// A prune protects the file its own call wrote, which is only enough while no
+/// other forget is working in the same directory. Once the count cap is
+/// reached, two concurrent forgets each see the other's fresh snapshot as an
+/// eviction candidate; if both enumerate before either removes, they delete
+/// each other's recovery artifacts — for rows both deletes have already
+/// committed, so there is nothing left to write them from. Under `SQLite` the
+/// backend's own mutex makes that window narrow; under `Postgres` the two
+/// transactions genuinely run in parallel and both writes can land before
+/// either enumeration.
+///
+/// In-process is where the race is and therefore where the fix belongs: both
+/// serving states run one process over one storage backend, and #251 puts every
+/// forget on the same blocking pool. A deployment with two writers against one
+/// snapshot volume would need a filesystem-level guard (an `O_EXCL` lock file
+/// per namespace) instead. Nothing ships that shape today, so nothing here
+/// builds one.
+///
+/// The registry keeps one small entry per namespace that has ever run a forget
+/// and never drops one: that is bounded by the tenant count, and dropping
+/// entries would need reference counting to avoid handing out a lock another
+/// thread is about to acquire.
+fn namespace_lock(namespace_id: Uuid) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>> = OnceLock::new();
+
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().unwrap_or_else(PoisonError::into_inner);
+    Arc::clone(locks.entry(namespace_id).or_default())
 }
 
 /// Per-namespace snapshot directory. Keeps one gateway tenant's memory dumps
@@ -1189,6 +1230,148 @@ mod tests {
             ancient.exists(),
             "the superseded entry point keeps every snapshot, as it always did"
         );
+        assert_eq!(file_names(&dir).len(), 2);
+    }
+
+    /// A forget must not enter the snapshot-write-and-prune section while
+    /// another forget is inside it for the same namespace.
+    ///
+    /// This is the property that closes the race: a prune protects the file its
+    /// own call wrote, so two prunes running against one directory can each
+    /// pick the other's fresh snapshot as an eviction candidate and destroy the
+    /// recovery artifact for rows that are already gone. Asserted by holding
+    /// the namespace's lock and showing a forget cannot get past it — the
+    /// failing direction is exact: without the lock the spawned forget finishes
+    /// in single-digit milliseconds, so "still running" cannot be a slow
+    /// machine.
+    #[test]
+    fn a_forget_cannot_enter_the_critical_section_while_another_holds_it() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let root = f.dir.path().join("snapshots");
+
+        let lock = namespace_lock(f.namespace.id);
+        let held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+
+        std::thread::scope(|scope| {
+            let forget = scope.spawn(|| {
+                forget_entity_bounded(
+                    &f.storage,
+                    f.entity.id,
+                    None,
+                    f.namespace.id,
+                    &root,
+                    RetentionPolicy {
+                        max_age_days: None,
+                        max_count: Some(1),
+                    },
+                )
+            });
+
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            assert!(
+                !forget.is_finished(),
+                "a forget got into the critical section while it was held"
+            );
+            assert!(
+                f.storage
+                    .get_all_memories_by_namespace_including_superseded(f.namespace.id)
+                    .unwrap()
+                    .len()
+                    == 2,
+                "the delete must not have run either — the lock covers it too"
+            );
+
+            drop(held);
+            let outcome = forget
+                .join()
+                .expect("forget thread")
+                .expect("the forget must complete once the lock is released");
+            assert!(outcome.path.expect("a snapshot was written").exists());
+        });
+    }
+
+    /// Concurrent forgets in one namespace all succeed, evict only what the cap
+    /// requires, and leave every artifact they wrote behind.
+    ///
+    /// A property test, not a reproduction: the interleaving that loses an
+    /// artifact needs both writes to land before either enumeration, which two
+    /// racing threads cannot be made to do from outside this function. What it
+    /// does pin is what serialization buys — no prune warning (a prune that
+    /// found a file another thread had already removed would report one), no
+    /// cap violation, and both fresh snapshots still on disk. The mutual
+    /// exclusion itself is pinned by the test above.
+    #[test]
+    fn concurrent_forgets_in_one_namespace_keep_both_snapshots() {
+        let f = fixture();
+        let mut other = Entity::new("other", EntityKind::User);
+        other.namespace_id = f.namespace.id;
+        f.storage.save_entity(&other).unwrap();
+        for subject in [f.entity.id, other.id] {
+            f.storage
+                .save_semantic(&SemanticMemory::new(
+                    f.namespace.id,
+                    subject,
+                    "likes",
+                    "rust",
+                    0.9,
+                ))
+                .unwrap();
+        }
+
+        let root = f.dir.path().join("snapshots");
+        let dir = namespace_dir(&root, f.namespace.id);
+        // Two snapshots of history, so a cap of two makes every prune evict
+        // exactly one file and neither fresh artifact is due to go.
+        let stale = [
+            write_aged(&f, &dir, epoch()),
+            write_aged(&f, &dir, epoch() + Duration::hours(1)),
+        ];
+        let policy = RetentionPolicy {
+            max_age_days: None,
+            max_count: Some(2),
+        };
+
+        let start = std::sync::Barrier::new(2);
+        let written = std::thread::scope(|scope| {
+            let threads: Vec<_> = [f.entity.id, other.id]
+                .map(|entity_id| {
+                    let (f, root, start) = (&f, &root, &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        forget_entity_bounded(
+                            &f.storage,
+                            entity_id,
+                            None,
+                            f.namespace.id,
+                            root,
+                            policy,
+                        )
+                        .expect("a concurrent forget must still succeed")
+                    })
+                })
+                .into_iter()
+                .collect();
+
+            threads
+                .into_iter()
+                .map(|thread| thread.join().expect("forget thread"))
+                .collect::<Vec<_>>()
+        });
+
+        for outcome in &written {
+            assert!(
+                outcome.pruned.warnings.is_empty(),
+                "a serialized prune never races another: {:?}",
+                outcome.pruned.warnings
+            );
+            let path = outcome.path.as_ref().expect("a snapshot was written");
+            assert!(
+                path.exists(),
+                "a concurrent forget's artifact was evicted by the other's prune"
+            );
+        }
+        assert!(stale.iter().all(|path| !path.exists()));
         assert_eq!(file_names(&dir).len(), 2);
     }
 
