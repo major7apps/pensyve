@@ -219,7 +219,7 @@ mod tests {
         });
     }
 
-    const TEST_MAX: u32 = 36_500;
+    const TEST_MAX: u32 = MAX_SNAPSHOT_RETENTION_DAYS;
 
     #[test]
     fn retention_bound_falls_back_to_the_default_when_unset() {

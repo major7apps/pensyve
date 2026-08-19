@@ -395,6 +395,10 @@ fn forget_entity_bounded_with(
 ///   directory, and a subdirectory is never descended into.
 /// - Age is the snapshot's own `captured_at`, read from the name, never the
 ///   file's mtime — see [`parse_snapshot_file_name`].
+///
+/// Takes no namespace lock, so a caller pruning a directory a live namespace is
+/// still forgetting into bypasses the serialization [`namespace_lock`] provides
+/// and can evict a snapshot a concurrent [`forget_entity_bounded`] just wrote.
 pub fn prune_namespace_dir(
     dir: &Path,
     policy: RetentionPolicy,
@@ -1301,9 +1305,15 @@ mod tests {
         let root = f.dir.path().join("snapshots");
 
         let lock = namespace_lock(f.namespace.id);
-        let held = lock.lock().unwrap_or_else(PoisonError::into_inner);
 
         std::thread::scope(|scope| {
+            // Acquired inside the scope, not outside it: `thread::scope` joins
+            // its threads before propagating a panic from this closure, so a
+            // guard living longer than the closure would leave the forget
+            // blocked on it forever. A failing assertion below has to release
+            // the lock as it unwinds, or a genuine regression would surface as
+            // a hung test run instead of a red one.
+            let held = lock.lock().unwrap_or_else(PoisonError::into_inner);
             let forget = scope.spawn(|| {
                 forget_entity_bounded(
                     &f.storage,
