@@ -3,7 +3,7 @@
 //! `pensyve_forget` destroys every memory attached to an entity in one call.
 //! Issue #217 recorded two production incidents where a caller who meant to
 //! retract a single memory invoked it instead and lost 1,528 and 79 memories
-//! with no server-side way back. [`forget_entity`] is the recovery path.
+//! with no server-side way back. [`forget_entity_bounded`] is the recovery path.
 //!
 //! # The snapshot is the delete
 //!
@@ -51,9 +51,11 @@
 //! lossy human-readable JSON rather than restorable rows. Different question,
 //! different answer — the two are intentionally separate.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -147,7 +149,7 @@ pub struct RestoreOutcome {
     pub restored: usize,
 }
 
-/// Result of a [`forget_entity`] call.
+/// Result of a [`forget_entity_bounded`] call.
 #[derive(Debug, Clone)]
 pub struct ForgetOutcome {
     /// The rows the delete removed. Empty when the entity had no memories.
@@ -156,6 +158,56 @@ pub struct ForgetOutcome {
     /// empty snapshot has nothing to recover, and writing one per call would
     /// let a caller fill the disk by invoking `pensyve_forget` in a loop.
     pub path: Option<PathBuf>,
+    /// What retention evicted from this namespace's directory afterwards, and
+    /// anything that went wrong doing it. Never affects whether the delete
+    /// happened — see [`prune_namespace_dir`].
+    pub pruned: PruneOutcome,
+}
+
+/// How much snapshot history one namespace directory keeps.
+///
+/// An empty snapshot is never written, but a non-empty one always is, so a
+/// caller looping `remember` → `forget` leaves the live database small while
+/// the snapshot volume grows without bound (#265) — in the hosted deployment
+/// that volume is a network mount nobody is watching. These bounds put a
+/// ceiling on it, per namespace, so one tenant's history cannot crowd out
+/// another's.
+///
+/// `None` disables that bound. The serving states map their `0` sentinel to
+/// `None`, so `Some(0)` is not a value this type is constructed with in
+/// production; should one reach [`forget_entity_bounded`] anyway, the snapshot that
+/// call just wrote is still exempt — see [`prune_namespace_dir_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    /// Evict snapshots captured longer ago than this.
+    pub max_age_days: Option<u32>,
+    /// Keep at most this many snapshots in one namespace directory, oldest
+    /// evicted first.
+    pub max_count: Option<u32>,
+}
+
+impl RetentionPolicy {
+    /// Keep everything, forever. The behaviour before #265, and what callers
+    /// that manage their own snapshot lifecycle (tests, one-shot tooling) want.
+    pub const UNBOUNDED: Self = Self {
+        max_age_days: None,
+        max_count: None,
+    };
+
+    const fn is_unbounded(self) -> bool {
+        self.max_age_days.is_none() && self.max_count.is_none()
+    }
+}
+
+/// What a [`prune_namespace_dir`] pass did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PruneOutcome {
+    pub removed: usize,
+    /// Everything that went wrong, in the order it was hit. Pruning has no
+    /// error type: the rows a failed prune would abort over are already gone
+    /// from storage, so the only thing aborting could achieve is turning a
+    /// successful delete into a reported failure.
+    pub warnings: Vec<String>,
 }
 
 /// Delete every memory attached to `entity_id` and persist a snapshot of
@@ -167,6 +219,42 @@ pub struct ForgetOutcome {
 ///
 /// `snapshot_root` is the root for all namespaces; the file lands under
 /// `<snapshot_root>/<namespace_id>/`.
+///
+/// `retention` bounds what that directory accumulates. It is applied *after*
+/// the delete has committed with its new snapshot on disk, and it can only
+/// report problems, never cause them: see [`prune_namespace_dir`].
+pub fn forget_entity_bounded(
+    storage: &dyn StorageTrait,
+    entity_id: Uuid,
+    entity_name: Option<&str>,
+    namespace_id: Uuid,
+    snapshot_root: &Path,
+    retention: RetentionPolicy,
+) -> StorageResult<ForgetOutcome> {
+    forget_entity_bounded_with(
+        storage,
+        entity_id,
+        entity_name,
+        namespace_id,
+        snapshot_root,
+        retention,
+        remove_snapshot_file,
+    )
+}
+
+/// [`forget_entity_bounded`] with no bound on what the namespace directory
+/// accumulates.
+///
+/// Superseded by [`forget_entity_bounded`] in #265 rather than removed: keeping
+/// snapshots forever is a behaviour this crate still supports and can still
+/// express ([`RetentionPolicy::UNBOUNDED`]), so this entry point is merely
+/// outgrown, not unsafe to call. Per `AGENTS.md`, an API that is superseded
+/// gets a deprecation cycle; only an API that is *itself* the defect gets
+/// broken outright.
+#[deprecated(
+    since = "3.1.0",
+    note = "use `forget_entity_bounded`, which takes a `RetentionPolicy`. This entry point is equivalent to passing `RetentionPolicy::UNBOUNDED`, under which one namespace's snapshot directory grows without bound (#265)."
+)]
 pub fn forget_entity(
     storage: &dyn StorageTrait,
     entity_id: Uuid,
@@ -174,7 +262,37 @@ pub fn forget_entity(
     namespace_id: Uuid,
     snapshot_root: &Path,
 ) -> StorageResult<ForgetOutcome> {
+    forget_entity_bounded(
+        storage,
+        entity_id,
+        entity_name,
+        namespace_id,
+        snapshot_root,
+        RetentionPolicy::UNBOUNDED,
+    )
+}
+
+/// [`forget_entity_bounded`] with retention's file removal injected, so the "a
+/// prune failure does not fail the forget" path can be exercised — a real
+/// `unlink` only fails on conditions a test cannot create without root.
+fn forget_entity_bounded_with(
+    storage: &dyn StorageTrait,
+    entity_id: Uuid,
+    entity_name: Option<&str>,
+    namespace_id: Uuid,
+    snapshot_root: &Path,
+    retention: RetentionPolicy,
+    remove_file: fn(&Path) -> std::io::Result<()>,
+) -> StorageResult<ForgetOutcome> {
     let dir = namespace_dir(snapshot_root, namespace_id);
+
+    // Held across the delete, the snapshot write, and the prune that follows —
+    // see [`namespace_lock`]. Poisoning is ignored deliberately: the guarded
+    // value is `()`, so a thread that panicked here left nothing inconsistent
+    // behind, and refusing every later forget in the namespace would be a worse
+    // failure than whatever poisoned it.
+    let lock = namespace_lock(namespace_id);
+    let _serialized = lock.lock().unwrap_or_else(PoisonError::into_inner);
 
     let mut captured: Option<ForgetSnapshot> = None;
     let mut path: Option<PathBuf> = None;
@@ -227,7 +345,224 @@ pub fn forget_entity(
         )
     })?;
 
-    Ok(ForgetOutcome { snapshot, path })
+    // Only after the delete committed, and only when it actually left a new
+    // file behind: pruning a directory this call did not add to would be
+    // housekeeping charged to whichever caller happened to forget nothing.
+    // Runs here rather than inside `persist` so a prune can never be part of
+    // the transaction that the delete rolls back.
+    let pruned = if let Some(written) = path.as_deref() {
+        // `written` is handed to the prune as protected, not left to sort its
+        // way to safety: it is the only recovery artifact for rows that are
+        // already gone, so it must not depend on every other name in the
+        // directory being honest about its capture time.
+        let outcome =
+            prune_namespace_dir_with(&dir, retention, Utc::now(), Some(written), remove_file);
+        for warning in &outcome.warnings {
+            tracing::warn!(
+                directory = %dir.display(),
+                "snapshot retention could not complete: {warning}"
+            );
+        }
+        outcome
+    } else {
+        PruneOutcome::default()
+    };
+
+    Ok(ForgetOutcome {
+        snapshot,
+        path,
+        pruned,
+    })
+}
+
+/// Evict snapshots from one namespace directory until it satisfies `policy`,
+/// oldest first.
+///
+/// Returns rather than fails. This runs after an irreversible delete has
+/// already committed, so there is nothing an error could protect: the caller
+/// cannot undo the delete, and reporting a failed unlink as a failed forget
+/// would tell them their memories are still there when they are not. Problems
+/// come back as [`PruneOutcome::warnings`] for the operator.
+///
+/// What it will touch is deliberately narrow — a snapshot directory is a place
+/// operators poke around in, and this is code that deletes files:
+///
+/// - Only names [`write_to_dir`] produces are candidates. Anything else in the
+///   directory, including a half-written `.partial` from a crashed write, is
+///   not ours to remove.
+/// - Only regular files. `DirEntry::file_type` does not follow symlinks, so a
+///   symlink named like a snapshot is skipped rather than followed out of the
+///   directory, and a subdirectory is never descended into.
+/// - Age is the snapshot's own `captured_at`, read from the name, never the
+///   file's mtime — see [`parse_snapshot_file_name`].
+///
+/// Takes no namespace lock, so a caller pruning a directory a live namespace is
+/// still forgetting into bypasses the serialization [`namespace_lock`] provides
+/// and can evict a snapshot a concurrent [`forget_entity_bounded`] just wrote.
+pub fn prune_namespace_dir(
+    dir: &Path,
+    policy: RetentionPolicy,
+    now: DateTime<Utc>,
+) -> PruneOutcome {
+    prune_namespace_dir_with(dir, policy, now, None, remove_snapshot_file)
+}
+
+/// The real removal retention performs, named so it has the `for<'a>` signature
+/// the injection point takes (`std::fs::remove_file` is generic over its path
+/// argument and does not coerce to one on its own).
+fn remove_snapshot_file(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
+}
+
+/// [`prune_namespace_dir`] with the file removal injected, and with one file in
+/// the directory declared off-limits.
+///
+/// `protected` is the snapshot the calling [`forget_entity_bounded`] just wrote. It
+/// cannot be left to survive on its ordering: that only holds while every other
+/// name in the directory tells the truth about its capture time, and a
+/// container whose clock steps backwards between two forgets leaves a
+/// future-dated sibling that sorts the new file oldest. Evicting it would mean
+/// rows destroyed with no artifact to restore them from — the fail-closed
+/// contract undone after the fact. So it is excluded structurally: exempt from
+/// the age bound, sorted last so the count cap consumes genuinely older files
+/// first, and skipped outright at the point of removal.
+fn prune_namespace_dir_with(
+    dir: &Path,
+    policy: RetentionPolicy,
+    now: DateTime<Utc>,
+    protected: Option<&Path>,
+    remove_file: fn(&Path) -> std::io::Result<()>,
+) -> PruneOutcome {
+    let mut outcome = PruneOutcome::default();
+    if policy.is_unbounded() {
+        return outcome;
+    }
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            outcome
+                .warnings
+                .push(format!("cannot list {}: {err}", dir.display()));
+            return outcome;
+        }
+    };
+
+    // Same directory by construction, so the file name identifies the
+    // protected snapshot as well as its full path and does so without caring
+    // how the caller spelled the path.
+    let protected_name = protected.and_then(Path::file_name);
+
+    // `(is_protected, captured_at, file_name)`: sorting the triple puts the
+    // oldest first, breaks ties on the name so two snapshots captured in the
+    // same millisecond still evict in a fixed order rather than in whatever
+    // order the directory happened to be read, and puts the protected file
+    // last no matter what any name claims about its capture time.
+    let mut snapshots: Vec<(bool, DateTime<Utc>, std::ffi::OsString)> = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                outcome
+                    .warnings
+                    .push(format!("cannot read an entry of {}: {err}", dir.display()));
+                continue;
+            }
+        };
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(captured_at) = name.to_str().and_then(parse_snapshot_file_name) else {
+            continue;
+        };
+        let is_protected = protected_name == Some(name.as_os_str());
+        snapshots.push((is_protected, captured_at, name));
+    }
+    snapshots.sort();
+
+    // Subtracting the window can leave the calendar: `max_age_days` is a `u32`
+    // and `DateTime - TimeDelta` panics rather than saturating. This code runs
+    // on the blocking pool *after* the delete committed, where a panic reaches
+    // the caller as a `JoinError` — the forget reported as failed while the
+    // rows are gone, and the bookkeeping that follows it skipped. So an
+    // unrepresentable cutoff bounds nothing and says so, which is the same
+    // outcome the operator would get from setting the window to `0`.
+    let cutoff = match policy.max_age_days {
+        None => None,
+        Some(days) => {
+            let cutoff = Duration::try_days(i64::from(days))
+                .and_then(|window| now.checked_sub_signed(window));
+            if cutoff.is_none() {
+                outcome.warnings.push(format!(
+                    "ignoring the age bound: {days} days before {now} is not a representable date"
+                ));
+            }
+            cutoff
+        }
+    };
+    let (mut survivors, mut victims): (Vec<_>, Vec<_>) =
+        snapshots
+            .into_iter()
+            .partition(|(is_protected, captured_at, _)| {
+                *is_protected || cutoff.is_none_or(|cutoff| *captured_at >= cutoff)
+            });
+
+    if let Some(max) = policy.max_count {
+        let excess = survivors.len().saturating_sub(max as usize);
+        victims.extend(survivors.drain(..excess));
+    }
+
+    for (is_protected, _, name) in victims {
+        if is_protected {
+            // Only reachable through a `max_count` of `Some(0)`, which no
+            // configuration can produce (`0` disables the bound rather than
+            // meaning "keep none"). Skipped rather than asserted: the delete
+            // has already committed by the time this runs, so a policy nobody
+            // can set must not be able to take the artifact with it.
+            continue;
+        }
+        let path = dir.join(name);
+        match remove_file(&path) {
+            Ok(()) => outcome.removed += 1,
+            Err(err) => outcome
+                .warnings
+                .push(format!("cannot remove {}: {err}", path.display())),
+        }
+    }
+
+    outcome
+}
+
+/// The lock serializing snapshot write and prune within one namespace.
+///
+/// A prune protects the file its own call wrote, which is only enough while no
+/// other forget is working in the same directory. Once the count cap is
+/// reached, two concurrent forgets each see the other's fresh snapshot as an
+/// eviction candidate; if both enumerate before either removes, they delete
+/// each other's recovery artifacts — for rows both deletes have already
+/// committed, so there is nothing left to write them from. Under `SQLite` the
+/// backend's own mutex makes that window narrow; under `Postgres` the two
+/// transactions genuinely run in parallel and both writes can land before
+/// either enumeration.
+///
+/// In-process is where the race is and therefore where the fix belongs: both
+/// serving states run one process over one storage backend, and #251 puts every
+/// forget on the same blocking pool. A deployment with two writers against one
+/// snapshot volume would need a filesystem-level guard (an `O_EXCL` lock file
+/// per namespace) instead. Nothing ships that shape today, so nothing here
+/// builds one.
+///
+/// The registry keeps one small entry per namespace that has ever run a forget
+/// and never drops one: that is bounded by the tenant count, and dropping
+/// entries would need reference counting to avoid handing out a lock another
+/// thread is about to acquire.
+fn namespace_lock(namespace_id: Uuid) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>> = OnceLock::new();
+
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().unwrap_or_else(PoisonError::into_inner);
+    Arc::clone(locks.entry(namespace_id).or_default())
 }
 
 /// Per-namespace snapshot directory. Keeps one gateway tenant's memory dumps
@@ -419,15 +754,60 @@ pub fn restore(
     Ok(outcome)
 }
 
-/// `forget-<entity>-<captured_at>-<snapshot>.json`, with a timestamp format
-/// that is safe on every filesystem (no colons).
+/// Timestamp format inside a snapshot file name: safe on every filesystem (no
+/// colons), fixed width, and sorts the same as the instant it encodes. Shared
+/// by [`file_name`] and [`parse_snapshot_file_name`] so the two cannot drift.
+const FILE_NAME_TIMESTAMP: &str = "%Y%m%dT%H%M%S%.3fZ";
+
+/// Length of a hyphenated UUID as [`Uuid`]'s `Display` writes one.
+const UUID_LEN: usize = 36;
+
+/// `forget-<entity>-<captured_at>-<snapshot>.json`.
 fn file_name(snapshot: &ForgetSnapshot) -> String {
     format!(
         "forget-{}-{}-{}.json",
         snapshot.entity_id,
-        snapshot.captured_at.format("%Y%m%dT%H%M%S%.3fZ"),
+        snapshot.captured_at.format(FILE_NAME_TIMESTAMP),
         snapshot.snapshot_id
     )
+}
+
+/// The `captured_at` encoded in a name [`file_name`] produced, or `None` for
+/// any other name.
+///
+/// Retention uses this for two things, and both want the same strictness.
+///
+/// It decides what may be deleted at all: a name this does not parse is not a
+/// file this module wrote, so it is left alone. Both UUIDs are parsed, not just
+/// counted, so `forget-anything-else.json` is not a candidate.
+///
+/// It also supplies the ordering. Deletion order has to come from the
+/// snapshot's own capture time, because the alternative — the file's mtime — is
+/// not a property of the snapshot: in the hosted deployment these files live on
+/// a network mount, and a restore, a re-sync, or a remount rewrites mtimes
+/// wholesale, which would silently invert oldest-first eviction.
+///
+/// Reading that timestamp from the name rather than from the file's
+/// `captured_at` field keeps a prune proportional to the number of directory
+/// entries instead of to their size. A snapshot at #217's scale is megabytes of
+/// JSON; parsing every one of them on every forget would push hundreds of
+/// megabytes through the blocking pool just to decide which files to unlink.
+/// The name is written from `captured_at` by [`file_name`], and nothing but
+/// [`write_to_dir`] writes these files.
+fn parse_snapshot_file_name(name: &str) -> Option<DateTime<Utc>> {
+    let rest = name.strip_prefix("forget-")?.strip_suffix(".json")?;
+
+    let entity_id = rest.get(..UUID_LEN)?;
+    Uuid::parse_str(entity_id).ok()?;
+    let rest = rest.strip_prefix(entity_id)?.strip_prefix('-')?;
+
+    let timestamp = rest.get(..rest.len().checked_sub(UUID_LEN + 1)?)?;
+    let snapshot_id = rest.strip_prefix(timestamp)?.strip_prefix('-')?;
+    Uuid::parse_str(snapshot_id).ok()?;
+
+    NaiveDateTime::parse_from_str(timestamp, FILE_NAME_TIMESTAMP)
+        .ok()
+        .map(|naive| naive.and_utc())
 }
 
 #[cfg(test)]
@@ -435,6 +815,7 @@ mod tests {
     use super::*;
     use crate::storage::sqlite::SqliteBackend;
     use crate::types::{Entity, EntityKind, Episode, EpisodicMemory, Namespace, SemanticMemory};
+    use chrono::{Duration, TimeZone};
 
     struct Fixture {
         dir: tempfile::TempDir,
@@ -505,8 +886,15 @@ mod tests {
         let f = fixture();
         let root = f.dir.path().join("snapshots");
 
-        let outcome =
-            forget_entity(&f.storage, Uuid::new_v4(), None, f.namespace.id, &root).unwrap();
+        let outcome = forget_entity_bounded(
+            &f.storage,
+            Uuid::new_v4(),
+            None,
+            f.namespace.id,
+            &root,
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap();
 
         assert!(outcome.snapshot.is_empty());
         assert!(
@@ -524,12 +912,13 @@ mod tests {
         let f = fixture();
         seed_one_of_each(&f);
 
-        let outcome = forget_entity(
+        let outcome = forget_entity_bounded(
             &f.storage,
             f.entity.id,
             None,
             f.namespace.id,
             &f.dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
         )
         .unwrap();
 
@@ -547,7 +936,15 @@ mod tests {
         seed_one_of_each(&f);
         let root = f.dir.path().join("snapshots");
 
-        let outcome = forget_entity(&f.storage, f.entity.id, None, f.namespace.id, &root).unwrap();
+        let outcome = forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            None,
+            f.namespace.id,
+            &root,
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap();
 
         let path = outcome.path.expect("a non-empty snapshot must be written");
         assert_eq!(
@@ -562,12 +959,13 @@ mod tests {
         let f = fixture();
         seed_one_of_each(&f);
 
-        let outcome = forget_entity(
+        let outcome = forget_entity_bounded(
             &f.storage,
             f.entity.id,
             Some("subject"),
             f.namespace.id,
             &f.dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
         )
         .unwrap();
 
@@ -600,8 +998,15 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(namespace_dir(&root, f.namespace.id), b"not a directory").unwrap();
 
-        let error =
-            forget_entity(&f.storage, f.entity.id, None, f.namespace.id, &root).unwrap_err();
+        let error = forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            None,
+            f.namespace.id,
+            &root,
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap_err();
 
         assert!(
             f.storage
@@ -610,6 +1015,546 @@ mod tests {
                 .len()
                 == before,
             "delete must roll back when the snapshot write fails: {error}"
+        );
+    }
+
+    /// Write a snapshot the way a forget on `captured_at` would have left it,
+    /// so retention tests can lay down history without waiting for a clock.
+    fn write_aged(f: &Fixture, dir: &Path, captured_at: DateTime<Utc>) -> PathBuf {
+        let mut snapshot = snapshot_of(f, Vec::new());
+        snapshot.captured_at = captured_at;
+        write_to_dir(dir, &snapshot).unwrap()
+    }
+
+    fn file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn epoch() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+    }
+
+    /// Eviction order comes from the snapshot's own `captured_at`, never from
+    /// the filesystem: these are written newest-first, so mtime order is the
+    /// exact reverse of capture order and an mtime-based prune would delete the
+    /// two the tenant most likely wants back.
+    #[test]
+    fn prune_evicts_the_oldest_snapshots_beyond_the_count_cap() {
+        let f = fixture();
+        let dir = f.dir.path().join("snapshots");
+
+        let mut expected_kept = Vec::new();
+        for hours in (0..5).rev() {
+            let path = write_aged(&f, &dir, epoch() + Duration::hours(hours));
+            if hours >= 2 {
+                expected_kept.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+        expected_kept.sort();
+
+        let outcome = prune_namespace_dir(
+            &dir,
+            RetentionPolicy {
+                max_age_days: None,
+                max_count: Some(3),
+            },
+            epoch() + Duration::hours(5),
+        );
+
+        assert_eq!(outcome.removed, 2, "warnings: {:?}", outcome.warnings);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(file_names(&dir), expected_kept);
+    }
+
+    /// The window is measured against an injected `now` rather than the process
+    /// clock, so the boundary is assertable: a snapshot captured exactly at the
+    /// cutoff is inside the window and stays.
+    #[test]
+    fn prune_removes_snapshots_older_than_the_retention_window() {
+        let f = fixture();
+        let dir = f.dir.path().join("snapshots");
+
+        let mut expected_kept = Vec::new();
+        for days in 0..5 {
+            let path = write_aged(&f, &dir, epoch() + Duration::days(days));
+            if days >= 3 {
+                expected_kept.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+        expected_kept.sort();
+
+        let outcome = prune_namespace_dir(
+            &dir,
+            RetentionPolicy {
+                max_age_days: Some(7),
+                max_count: None,
+            },
+            epoch() + Duration::days(10),
+        );
+
+        assert_eq!(outcome.removed, 3, "warnings: {:?}", outcome.warnings);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(file_names(&dir), expected_kept);
+    }
+
+    /// Retention only ever deletes files this module wrote. Anything else in
+    /// the directory — an operator's notes, a half-written `.partial`, a
+    /// subdirectory, a symlink pointing outside — is not ours to remove.
+    #[test]
+    fn prune_only_removes_files_matching_the_snapshot_naming_pattern() {
+        let f = fixture();
+        let dir = f.dir.path().join("snapshots");
+        write_aged(&f, &dir, epoch());
+
+        std::fs::write(dir.join("operator-notes.txt"), b"keep me").unwrap();
+        std::fs::write(dir.join("forget-not-a-snapshot.json"), b"keep me").unwrap();
+        std::fs::write(
+            dir.join(format!(
+                "forget-{}-20260101T000000.000Z-{}.json.partial",
+                Uuid::new_v4(),
+                Uuid::new_v4()
+            )),
+            b"keep me",
+        )
+        .unwrap();
+        std::fs::create_dir(dir.join(format!(
+            "forget-{}-20260101T000000.000Z-{}.json",
+            Uuid::new_v4(),
+            Uuid::new_v4()
+        )))
+        .unwrap();
+
+        let outcome = prune_namespace_dir(
+            &dir,
+            RetentionPolicy {
+                max_age_days: Some(1),
+                max_count: Some(1),
+            },
+            epoch() + Duration::days(365),
+        );
+
+        assert_eq!(outcome.removed, 1, "only the snapshot file may be removed");
+        assert_eq!(file_names(&dir).len(), 4, "{:?}", file_names(&dir));
+    }
+
+    /// A symlink named like a snapshot is skipped, not followed: retention
+    /// must never be able to unlink something outside the directory it was
+    /// pointed at, whoever planted the link.
+    #[cfg(unix)]
+    #[test]
+    fn prune_never_follows_a_symlink_out_of_the_directory() {
+        let f = fixture();
+        let dir = f.dir.path().join("snapshots");
+        let outside = f.dir.path().join("somebody-elses-file");
+        std::fs::write(&outside, b"not retention's to delete").unwrap();
+        write_aged(&f, &dir, epoch());
+        std::os::unix::fs::symlink(
+            &outside,
+            dir.join(format!(
+                "forget-{}-20260101T000000.000Z-{}.json",
+                Uuid::new_v4(),
+                Uuid::new_v4()
+            )),
+        )
+        .unwrap();
+
+        let outcome = prune_namespace_dir(
+            &dir,
+            RetentionPolicy {
+                max_age_days: Some(1),
+                max_count: None,
+            },
+            epoch() + Duration::days(365),
+        );
+
+        assert_eq!(outcome.removed, 1, "only the real snapshot may be removed");
+        assert!(outside.exists(), "the symlink's target must be untouched");
+        assert_eq!(file_names(&dir).len(), 1, "the symlink itself stays too");
+    }
+
+    /// A retention window so long its cutoff falls outside the calendar must
+    /// not panic. This runs on the blocking pool *after* the delete committed:
+    /// a panic there surfaces as a `JoinError`, so the caller is told the
+    /// forget failed while the rows are gone and the bookkeeping that follows
+    /// — vector-index cleanup, the activity record — never runs.
+    #[test]
+    fn prune_survives_a_retention_window_longer_than_the_calendar() {
+        let f = fixture();
+        let dir = f.dir.path().join("snapshots");
+        let ancient = write_aged(&f, &dir, epoch());
+
+        let outcome = prune_namespace_dir(
+            &dir,
+            RetentionPolicy {
+                max_age_days: Some(u32::MAX),
+                max_count: None,
+            },
+            Utc::now(),
+        );
+
+        assert_eq!(
+            outcome.removed, 0,
+            "an unrepresentable window bounds nothing"
+        );
+        assert!(ancient.exists());
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert!(
+            outcome.warnings[0].contains(&u32::MAX.to_string()),
+            "the warning must name the value the operator set: {:?}",
+            outcome.warnings
+        );
+    }
+
+    #[test]
+    fn an_unbounded_policy_prunes_nothing() {
+        let f = fixture();
+        let dir = f.dir.path().join("snapshots");
+        for days in 0..3 {
+            write_aged(&f, &dir, epoch() - Duration::days(days * 1000));
+        }
+
+        let outcome = prune_namespace_dir(
+            &dir,
+            RetentionPolicy::UNBOUNDED,
+            epoch() + Duration::days(100_000),
+        );
+
+        assert_eq!(outcome.removed, 0);
+        assert_eq!(file_names(&dir).len(), 3);
+    }
+
+    /// End to end: the quota is applied to the directory the new snapshot just
+    /// landed in, and the new snapshot is one of the survivors.
+    #[test]
+    fn forget_entity_prunes_the_namespace_directory_after_writing() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let root = f.dir.path().join("snapshots");
+        let dir = namespace_dir(&root, f.namespace.id);
+        for hours in 0..3 {
+            write_aged(&f, &dir, epoch() + Duration::hours(hours));
+        }
+
+        let outcome = forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            None,
+            f.namespace.id,
+            &root,
+            RetentionPolicy {
+                max_age_days: None,
+                max_count: Some(2),
+            },
+        )
+        .unwrap();
+
+        let path = outcome.path.expect("a non-empty snapshot must be written");
+        assert_eq!(outcome.pruned.removed, 2);
+        assert!(outcome.pruned.warnings.is_empty());
+        assert!(path.exists(), "the snapshot just written must survive");
+        assert_eq!(file_names(&dir).len(), 2);
+    }
+
+    /// The superseded five-argument entry point still does what it always did:
+    /// deletes, snapshots, and keeps every snapshot. Callers get a deprecation
+    /// warning pointing at `forget_entity_bounded`, not a behaviour change.
+    #[test]
+    #[allow(
+        deprecated,
+        reason = "exercising the deprecated entry point is the point of this test"
+    )]
+    fn the_deprecated_forget_entity_still_forgets_and_prunes_nothing() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let root = f.dir.path().join("snapshots");
+        let dir = namespace_dir(&root, f.namespace.id);
+        let ancient = write_aged(&f, &dir, epoch() - Duration::days(10_000));
+
+        let outcome = forget_entity(&f.storage, f.entity.id, None, f.namespace.id, &root).unwrap();
+
+        assert_eq!(outcome.snapshot.counts().total, 2);
+        assert!(outcome.path.is_some());
+        assert_eq!(outcome.pruned, PruneOutcome::default());
+        assert!(
+            ancient.exists(),
+            "the superseded entry point keeps every snapshot, as it always did"
+        );
+        assert_eq!(file_names(&dir).len(), 2);
+    }
+
+    /// A forget must not enter the snapshot-write-and-prune section while
+    /// another forget is inside it for the same namespace.
+    ///
+    /// This is the property that closes the race: a prune protects the file its
+    /// own call wrote, so two prunes running against one directory can each
+    /// pick the other's fresh snapshot as an eviction candidate and destroy the
+    /// recovery artifact for rows that are already gone. Asserted by holding
+    /// the namespace's lock and showing a forget cannot get past it — the
+    /// failing direction is exact: without the lock the spawned forget finishes
+    /// in single-digit milliseconds, so "still running" cannot be a slow
+    /// machine.
+    #[test]
+    fn a_forget_cannot_enter_the_critical_section_while_another_holds_it() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let root = f.dir.path().join("snapshots");
+
+        let lock = namespace_lock(f.namespace.id);
+
+        std::thread::scope(|scope| {
+            // Acquired inside the scope, not outside it: `thread::scope` joins
+            // its threads before propagating a panic from this closure, so a
+            // guard living longer than the closure would leave the forget
+            // blocked on it forever. A failing assertion below has to release
+            // the lock as it unwinds, or a genuine regression would surface as
+            // a hung test run instead of a red one.
+            let held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            let forget = scope.spawn(|| {
+                forget_entity_bounded(
+                    &f.storage,
+                    f.entity.id,
+                    None,
+                    f.namespace.id,
+                    &root,
+                    RetentionPolicy {
+                        max_age_days: None,
+                        max_count: Some(1),
+                    },
+                )
+            });
+
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            assert!(
+                !forget.is_finished(),
+                "a forget got into the critical section while it was held"
+            );
+            assert!(
+                f.storage
+                    .get_all_memories_by_namespace_including_superseded(f.namespace.id)
+                    .unwrap()
+                    .len()
+                    == 2,
+                "the delete must not have run either — the lock covers it too"
+            );
+
+            drop(held);
+            let outcome = forget
+                .join()
+                .expect("forget thread")
+                .expect("the forget must complete once the lock is released");
+            assert!(outcome.path.expect("a snapshot was written").exists());
+        });
+    }
+
+    /// Concurrent forgets in one namespace all succeed, evict only what the cap
+    /// requires, and leave every artifact they wrote behind.
+    ///
+    /// A property test, not a reproduction: the interleaving that loses an
+    /// artifact needs both writes to land before either enumeration, which two
+    /// racing threads cannot be made to do from outside this function. What it
+    /// does pin is what serialization buys — no prune warning (a prune that
+    /// found a file another thread had already removed would report one), no
+    /// cap violation, and both fresh snapshots still on disk. The mutual
+    /// exclusion itself is pinned by the test above.
+    #[test]
+    fn concurrent_forgets_in_one_namespace_keep_both_snapshots() {
+        let f = fixture();
+        let mut other = Entity::new("other", EntityKind::User);
+        other.namespace_id = f.namespace.id;
+        f.storage.save_entity(&other).unwrap();
+        for subject in [f.entity.id, other.id] {
+            f.storage
+                .save_semantic(&SemanticMemory::new(
+                    f.namespace.id,
+                    subject,
+                    "likes",
+                    "rust",
+                    0.9,
+                ))
+                .unwrap();
+        }
+
+        let root = f.dir.path().join("snapshots");
+        let dir = namespace_dir(&root, f.namespace.id);
+        // Two snapshots of history, so a cap of two makes every prune evict
+        // exactly one file and neither fresh artifact is due to go.
+        let stale = [
+            write_aged(&f, &dir, epoch()),
+            write_aged(&f, &dir, epoch() + Duration::hours(1)),
+        ];
+        let policy = RetentionPolicy {
+            max_age_days: None,
+            max_count: Some(2),
+        };
+
+        let start = std::sync::Barrier::new(2);
+        let written = std::thread::scope(|scope| {
+            let threads: Vec<_> = [f.entity.id, other.id]
+                .map(|entity_id| {
+                    let (f, root, start) = (&f, &root, &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        forget_entity_bounded(
+                            &f.storage,
+                            entity_id,
+                            None,
+                            f.namespace.id,
+                            root,
+                            policy,
+                        )
+                        .expect("a concurrent forget must still succeed")
+                    })
+                })
+                .into_iter()
+                .collect();
+
+            threads
+                .into_iter()
+                .map(|thread| thread.join().expect("forget thread"))
+                .collect::<Vec<_>>()
+        });
+
+        for outcome in &written {
+            assert!(
+                outcome.pruned.warnings.is_empty(),
+                "a serialized prune never races another: {:?}",
+                outcome.pruned.warnings
+            );
+            let path = outcome.path.as_ref().expect("a snapshot was written");
+            assert!(
+                path.exists(),
+                "a concurrent forget's artifact was evicted by the other's prune"
+            );
+        }
+        assert!(stale.iter().all(|path| !path.exists()));
+        assert_eq!(file_names(&dir).len(), 2);
+    }
+
+    /// The snapshot this call just wrote is never a victim of its own prune.
+    ///
+    /// Ordering by `captured_at` makes "the newest file survives" true only as
+    /// long as every name in the directory tells the truth about its time. A
+    /// container whose clock steps backwards between two forgets leaves a
+    /// future-dated sibling behind, and the new snapshot then sorts oldest —
+    /// the count cap would evict the one artifact standing between rows that
+    /// are already gone and no way back. Survival has to be structural.
+    #[test]
+    fn forget_entity_never_evicts_the_snapshot_it_just_wrote() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let root = f.dir.path().join("snapshots");
+        let dir = namespace_dir(&root, f.namespace.id);
+        let future = write_aged(&f, &dir, Utc::now() + Duration::days(365));
+
+        let outcome = forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            None,
+            f.namespace.id,
+            &root,
+            RetentionPolicy {
+                max_age_days: None,
+                max_count: Some(1),
+            },
+        )
+        .unwrap();
+
+        let path = outcome.path.expect("a non-empty snapshot must be written");
+        assert!(
+            path.exists(),
+            "the snapshot this forget wrote must survive its own prune"
+        );
+        assert_eq!(outcome.pruned.removed, 1, "the cap must still be enforced");
+        assert!(outcome.pruned.warnings.is_empty());
+        assert!(!future.exists(), "the future-dated sibling is the victim");
+        assert_eq!(file_names(&dir).len(), 1);
+    }
+
+    /// The exemption is structural, not arithmetic: it holds even for the one
+    /// policy that asks for an empty directory, which no configuration can
+    /// produce but the public type can express.
+    #[test]
+    fn prune_spares_the_protected_file_even_under_a_zero_count_cap() {
+        let f = fixture();
+        let dir = f.dir.path().join("snapshots");
+        let stale = write_aged(&f, &dir, epoch());
+        let protected = write_aged(&f, &dir, epoch() + Duration::hours(1));
+
+        let outcome = prune_namespace_dir_with(
+            &dir,
+            RetentionPolicy {
+                max_age_days: Some(1),
+                max_count: Some(0),
+            },
+            epoch() + Duration::days(365),
+            Some(&protected),
+            remove_snapshot_file,
+        );
+
+        assert_eq!(outcome.removed, 1);
+        assert!(outcome.warnings.is_empty());
+        assert!(!stale.exists());
+        assert!(
+            protected.exists(),
+            "the protected snapshot must survive every policy"
+        );
+    }
+
+    /// Eviction is housekeeping, not part of the delete's contract: a prune
+    /// that cannot remove a file leaves the forget successful and reports a
+    /// warning. Aborting here would be strictly worse than an oversized
+    /// directory — the rows are already gone from storage.
+    ///
+    /// A real `unlink` only fails on conditions this test cannot create without
+    /// root (an unwritable parent, a read-only mount, an immutable inode), so
+    /// the failure is injected through the same kind of seam `write_to_dir`
+    /// uses for `fsync`.
+    #[test]
+    fn forget_entity_reports_a_prune_failure_as_a_warning_and_still_succeeds() {
+        fn always_fails(_: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::other("simulated unlink failure"))
+        }
+
+        let f = fixture();
+        seed_one_of_each(&f);
+        let root = f.dir.path().join("snapshots");
+        let dir = namespace_dir(&root, f.namespace.id);
+        let stale = write_aged(&f, &dir, epoch());
+
+        let outcome = forget_entity_bounded_with(
+            &f.storage,
+            f.entity.id,
+            None,
+            f.namespace.id,
+            &root,
+            RetentionPolicy {
+                max_age_days: None,
+                max_count: Some(1),
+            },
+            always_fails,
+        )
+        .expect("a prune failure must not fail the forget");
+
+        assert!(outcome.path.is_some(), "the new snapshot was still written");
+        assert_eq!(outcome.pruned.removed, 0);
+        assert_eq!(outcome.pruned.warnings.len(), 1);
+        assert!(
+            outcome.pruned.warnings[0].contains("simulated unlink failure"),
+            "unexpected warning: {:?}",
+            outcome.pruned.warnings
+        );
+        assert!(stale.exists(), "a file we failed to remove must remain");
+        assert!(
+            f.storage
+                .get_all_memories_by_namespace_including_superseded(f.namespace.id)
+                .unwrap()
+                .is_empty(),
+            "the delete must still have committed"
         );
     }
 
@@ -729,12 +1674,13 @@ mod tests {
     fn a_snapshot_written_before_owner_only_existed_still_restores() {
         let f = fixture();
         seed_one_of_each(&f);
-        let outcome = forget_entity(
+        let outcome = forget_entity_bounded(
             &f.storage,
             f.entity.id,
             None,
             f.namespace.id,
             &f.dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
         )
         .unwrap();
         let path = outcome.path.expect("a non-empty snapshot must be written");

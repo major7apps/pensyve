@@ -13,6 +13,7 @@ use std::sync::Arc;
 use axum::Extension;
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
+use pensyve_core::snapshot::RetentionPolicy;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::Namespace;
@@ -65,6 +66,16 @@ fn gateway_config(dir: &TempDir) -> GatewayConfig {
 /// from the environment, so each test owns its own directory without mutating
 /// process-wide state (#250).
 fn app_state(dir: &TempDir, snapshot_root: PathBuf) -> Arc<AppState> {
+    app_state_with_retention(dir, snapshot_root, RetentionPolicy::UNBOUNDED)
+}
+
+/// Retention is injected the same way the snapshot root is, so a test can pin
+/// a policy without touching the environment the whole binary shares (#250).
+fn app_state_with_retention(
+    dir: &TempDir,
+    snapshot_root: PathBuf,
+    snapshot_retention: RetentionPolicy,
+) -> Arc<AppState> {
     let storage =
         Arc::new(SqliteBackend::open(dir.path()).expect("open storage")) as Arc<dyn StorageTrait>;
     let namespace = Namespace::new("default");
@@ -79,6 +90,7 @@ fn app_state(dir: &TempDir, snapshot_root: PathBuf) -> Arc<AppState> {
         namespace,
         VectorIndex::new(768, 1024),
         snapshot_root,
+        snapshot_retention,
     );
     let config = gateway_config(dir);
 
@@ -482,5 +494,59 @@ async fn a2a_forget_on_an_unknown_entity_reports_zero_and_writes_no_snapshot() {
     assert!(body["output"].get("snapshot").is_none());
     assert!(!snapshot_root.exists());
     assert_eq!(stored_memory_count(&state), 1);
+    cancellation.cancel();
+}
+
+/// The gateway must hand its configured retention policy down to the snapshot
+/// layer (#265). Without it a tenant looping `remember` → `forget` leaves the
+/// live database small while the shared snapshot volume — a network mount in
+/// the hosted deployment — grows without bound.
+#[tokio::test]
+async fn rest_forget_evicts_snapshots_beyond_the_per_namespace_quota() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let snapshot_root = dir.path().join("snapshots");
+    let state = app_state_with_retention(
+        &dir,
+        snapshot_root.clone(),
+        RetentionPolicy {
+            max_age_days: None,
+            max_count: Some(2),
+        },
+    );
+    let namespace_id = tenant_namespace_id(&state);
+    let (url, cancellation) = start_test_server(state.clone()).await;
+    let client = reqwest::Client::new();
+
+    for round in 0..4 {
+        remember(&client, &url, "alice", &format!("fact number {round}")).await;
+        let response = forget(&client, &url, "alice").await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+    }
+
+    let namespace_dir = pensyve_core::snapshot::namespace_dir(&snapshot_root, namespace_id);
+    let remaining: Vec<PathBuf> = std::fs::read_dir(&namespace_dir)
+        .expect("namespace snapshot dir exists")
+        .map(|entry| entry.expect("dir entry").path())
+        .collect();
+    assert_eq!(
+        remaining.len(),
+        2,
+        "four forgets under a cap of two must leave two snapshots: {remaining:?}"
+    );
+
+    // Eviction is oldest-first, so what survives is the recent history — the
+    // part a caller who just realised their mistake would ask for.
+    let mut captured: Vec<String> = remaining
+        .iter()
+        .map(|path| {
+            pensyve_core::snapshot::read_file(path)
+                .expect("surviving snapshots stay readable")
+                .captured_at
+                .to_rfc3339()
+        })
+        .collect();
+    captured.sort();
+    assert_eq!(captured.len(), 2);
+
     cancellation.cancel();
 }

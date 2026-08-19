@@ -519,6 +519,7 @@ async fn app_state(
         default_namespace,
         VectorIndex::new(DIMENSIONS, 1024),
         snapshot_root,
+        pensyve_core::snapshot::RetentionPolicy::UNBOUNDED,
     );
     let config = gateway_config(dir);
 
