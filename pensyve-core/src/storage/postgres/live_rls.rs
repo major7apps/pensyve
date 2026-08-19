@@ -3186,6 +3186,43 @@ fn schema_dml_on_policied_tables_cannot_be_silently_blinded() {
     }
 }
 
+/// The startup SQL must resolve every relation through `search_path`, exactly
+/// as the applied-schema probe does.
+///
+/// [`the_schema_probe_resolves_the_marker_through_search_path`] made the
+/// `to_regclass` probe deliberately unqualified: the marker lands wherever
+/// `search_path` puts it, so a probe qualified as `public.` would ask about a
+/// different relation than the one it gates. The SQL these files execute is on
+/// the same startup path and has to answer the same way. A `public.`-qualified
+/// name there contradicts the probe, and on a deployment whose role carries a
+/// non-default `search_path` it does not merely mis-gate one statement — the
+/// schema is one implicit transaction, so the failed lookup aborts the whole
+/// batch, owner startup included.
+///
+/// This is a source assertion rather than a live one on purpose. Proving it
+/// against a running database means re-applying the whole schema under a
+/// non-default `search_path`, and `CREATE TABLE IF NOT EXISTS` targets the
+/// first schema in the path rather than resolving through it — so the re-apply
+/// would build a second copy of every table and prove something else.
+#[test]
+fn startup_sql_resolves_relations_through_search_path() {
+    for (label, sql) in [
+        ("postgres_schema.sql", super::SCHEMA),
+        ("postgres_rls_enforce.sql", super::RLS_ENFORCE_SCHEMA),
+    ] {
+        // Comments stripped: both files discuss `public` in prose, and prose
+        // must not be able to fail an assertion about what they execute.
+        let normalized = sql_statements_only(sql);
+        assert!(
+            !normalized.contains("public."),
+            "{label} qualifies a relation as `public.`, but startup resolves the schema \
+             marker through `search_path`. On a deployment with a non-default `search_path` \
+             the qualified name points at a relation that does not exist, and because the \
+             file is one implicit transaction the failed lookup aborts the entire batch."
+        );
+    }
+}
+
 /// `FORCE ROW LEVEL SECURITY` must cover exactly the tables that carry a
 /// policy, and must not leak into the schema that runs on every startup.
 ///
