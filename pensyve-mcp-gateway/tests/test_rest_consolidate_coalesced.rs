@@ -84,6 +84,7 @@ fn app_state(dir: &TempDir) -> Arc<AppState> {
         namespace,
         VectorIndex::new(EMBEDDING_DIMS, 1024),
         dir.path().join("snapshots"),
+        pensyve_core::snapshot::RetentionPolicy::UNBOUNDED,
     );
     let config = gateway_config(dir);
 

@@ -992,12 +992,13 @@ fn capturing_delete_still_works_under_enforced_rls() {
     fixture.enforce_rls();
 
     let snapshot_root = tempfile::tempdir().expect("snapshot tempdir");
-    let outcome = crate::snapshot::forget_entity(
+    let outcome = crate::snapshot::forget_entity_bounded(
         backend,
         entity_id,
         Some("shared-entity"),
         ns_a.id,
         snapshot_root.path(),
+        crate::snapshot::RetentionPolicy::UNBOUNDED,
     )
     .expect("forget in namespace A must still succeed under enforced RLS");
 
@@ -3017,12 +3018,13 @@ fn capturing_delete_is_confined_to_its_namespace() {
     backend.save_semantic(&their_fact).expect("save B's fact");
 
     let snapshot_root = tempfile::tempdir().expect("snapshot tempdir");
-    let outcome = crate::snapshot::forget_entity(
+    let outcome = crate::snapshot::forget_entity_bounded(
         backend,
         entity_id,
         Some("shared-entity"),
         ns_a.id,
         snapshot_root.path(),
+        crate::snapshot::RetentionPolicy::UNBOUNDED,
     )
     .expect("forget in namespace A");
 

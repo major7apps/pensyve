@@ -9,6 +9,7 @@ use uuid::Uuid;
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::reranker::Reranker;
+use pensyve_core::snapshot::RetentionPolicy;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::types::Namespace;
 use pensyve_core::vector::VectorIndex;
@@ -38,6 +39,11 @@ pub struct TenantStateManager {
     /// tenants. Derived from the gateway's own storage path so recovery
     /// artifacts sit inside the directory operators actually back up.
     snapshot_root: PathBuf,
+    /// How much snapshot history each tenant's directory keeps (#265). One
+    /// policy for every tenant: the bound exists so no single tenant can grow
+    /// the shared volume without limit, which only works if it applies to all
+    /// of them.
+    snapshot_retention: RetentionPolicy,
 }
 
 impl TenantStateManager {
@@ -48,6 +54,7 @@ impl TenantStateManager {
         default_namespace: Namespace,
         default_vector_index: VectorIndex,
         snapshot_root: PathBuf,
+        snapshot_retention: RetentionPolicy,
     ) -> Self {
         let dimensions = default_vector_index.dimensions();
         let reranker_cell = Arc::new(OnceLock::new());
@@ -61,6 +68,7 @@ impl TenantStateManager {
             is_remote: true,
             reranker_cell: reranker_cell.clone(),
             snapshot_root: snapshot_root.clone(),
+            snapshot_retention,
         });
 
         Self {
@@ -72,6 +80,7 @@ impl TenantStateManager {
             tenants: DashMap::new(),
             reranker_cell,
             snapshot_root,
+            snapshot_retention,
         }
     }
 
@@ -178,6 +187,7 @@ impl TenantStateManager {
             is_remote: true,
             reranker_cell: self.reranker_cell.clone(),
             snapshot_root: self.snapshot_root.clone(),
+            snapshot_retention: self.snapshot_retention,
         }))
     }
 }
@@ -210,6 +220,7 @@ mod tests {
             ns,
             index,
             dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
         )
     }
 

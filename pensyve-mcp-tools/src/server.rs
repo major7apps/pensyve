@@ -635,15 +635,17 @@ impl PensyveMcpServer {
         let task = tokio::spawn(async move {
             let storage = task_state.storage.clone();
             let snapshot_root = task_state.snapshot_root.clone();
+            let retention = task_state.snapshot_retention;
             let namespace_id = task_state.namespace.id;
             let blocking_name = entity_name.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                pensyve_core::snapshot::forget_entity(
+                pensyve_core::snapshot::forget_entity_bounded(
                     storage.as_ref(),
                     entity_id,
                     Some(blocking_name.as_str()),
                     namespace_id,
                     &snapshot_root,
+                    retention,
                 )
             })
             .await
@@ -1044,6 +1046,14 @@ mod tests {
     }
 
     fn forget_fixture(snapshot_root: PathBuf, is_remote: bool) -> ForgetFixture {
+        forget_fixture_with_retention(snapshot_root, is_remote, RetentionPolicy::UNBOUNDED)
+    }
+
+    fn forget_fixture_with_retention(
+        snapshot_root: PathBuf,
+        is_remote: bool,
+        snapshot_retention: RetentionPolicy,
+    ) -> ForgetFixture {
         let dir = tempfile::tempdir().unwrap();
         let storage = SqliteBackend::open(dir.path()).unwrap();
 
@@ -1087,6 +1097,7 @@ mod tests {
             is_remote,
             reranker_cell: Arc::new(OnceLock::new()),
             snapshot_root,
+            snapshot_retention,
         });
 
         ForgetFixture {
@@ -1258,6 +1269,61 @@ mod tests {
         );
     }
 
+    /// The tool must hand its state's retention policy to the snapshot layer.
+    /// Without it a tenant looping `remember` → `forget` grows the snapshot
+    /// volume without bound while the live database stays small (#265).
+    #[tokio::test]
+    async fn forget_enforces_the_states_snapshot_retention_policy() {
+        let snapshot_root = tempfile::tempdir().unwrap();
+        let snapshot_dir = snapshot_root.path().join("snapshots");
+        let fixture = forget_fixture_with_retention(
+            snapshot_dir.clone(),
+            false,
+            RetentionPolicy {
+                max_age_days: None,
+                max_count: Some(2),
+            },
+        );
+        let namespace_dir =
+            pensyve_core::snapshot::namespace_dir(&snapshot_dir, fixture.server.state.namespace.id);
+
+        // Three snapshots a previous forget loop left behind.
+        std::fs::create_dir_all(&namespace_dir).unwrap();
+        for hour in 0..3 {
+            std::fs::write(
+                namespace_dir.join(format!(
+                    "forget-{}-2026010{}T0{hour}0000.000Z-{}.json",
+                    Uuid::new_v4(),
+                    hour + 1,
+                    Uuid::new_v4()
+                )),
+                b"{}",
+            )
+            .unwrap();
+        }
+
+        let raw = fixture
+            .server
+            .forget(Parameters(ForgetParams {
+                entity: "subject".to_string(),
+            }))
+            .await
+            .expect("forget should succeed");
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(response["forgotten_count"], 2);
+        let path = PathBuf::from(response["snapshot"]["path"].as_str().unwrap());
+        assert!(
+            path.is_file(),
+            "the new snapshot must survive its own prune"
+        );
+        assert_eq!(
+            std::fs::read_dir(&namespace_dir).unwrap().count(),
+            2,
+            "retention must cap the directory at max_count"
+        );
+    }
+
     #[tokio::test]
     async fn forget_on_an_unknown_entity_writes_no_snapshot_and_deletes_nothing() {
         let snapshot_root = tempfile::tempdir().unwrap();
@@ -1371,6 +1437,7 @@ mod tests {
     use pensyve_core::config::RetrievalConfig;
     use pensyve_core::embedding::OnnxEmbedder;
     use pensyve_core::reranker::Reranker;
+    use pensyve_core::snapshot::RetentionPolicy;
     use pensyve_core::storage::sqlite::SqliteBackend;
     use pensyve_core::types::{Episode, Namespace};
     use pensyve_core::vector::VectorIndex;
@@ -1423,6 +1490,7 @@ mod tests {
                 is_remote: true,
                 reranker_cell: reranker_cell.clone(),
                 snapshot_root: dir.path().join("snapshots"),
+                snapshot_retention: RetentionPolicy::UNBOUNDED,
             })));
         }
         let victim = servers.pop().expect("victim server");

@@ -319,6 +319,7 @@ async fn main() -> Result<()> {
         // unreranked) — see `pensyve_mcp_tools::state::PensyveState::reranker`.
         reranker_cell: Arc::new(OnceLock::new()),
         snapshot_root: PensyveState::snapshot_root_for(&storage_path),
+        snapshot_retention: PensyveState::snapshot_retention_from_env(),
     });
 
     let server = PensyveMcpServer::new(state);

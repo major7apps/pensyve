@@ -85,6 +85,7 @@ fn make_mgr(dir: &tempfile::TempDir) -> Arc<TenantStateManager> {
         ns,
         idx,
         dir.path().join("snapshots"),
+        pensyve_core::snapshot::RetentionPolicy::UNBOUNDED,
     ));
 
     // Resolve the shared reranker cell up front with a mock, so nothing in
