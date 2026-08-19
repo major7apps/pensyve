@@ -55,16 +55,35 @@
 //! [`namespace_scoping_end_to_end_under_enforced_rls`]. The checklist is empty
 //! and therefore gone; the per-method tests are the standing gate in its place.
 //!
-//! **Still open — enforcement is not yet the default.** Two things remain.
-//! The rest of the storage surface still runs unscoped and fails closed the
-//! same way; `docs/SECURITY.md` enumerates it. And the role matters:
-//! `PostgresBackend::new` applies the schema on every startup, which is
-//! owner-only DDL, so the application has to connect as the table owner — and
-//! a managed-Postgres owner role typically also carries `BYPASSRLS`, which
-//! exempts it from the policies whether or not `FORCE` is set. Separating
-//! schema application from serving traffic is the other #254 work item. Until
-//! both land, `FORCE` stays in `postgres_rls_enforce.sql` as an explicit
-//! operator step — see `docs/SECURITY.md`.
+//! **Fixed — the whole storage surface now carries a namespace.** The last
+//! nine unscoped methods were replaced with `_in_namespace` variants or, where
+//! nothing called them any more, removed outright (#254). Each replacement has
+//! its own enforced-mode test here:
+//! [`entity_lookup_by_id_still_works_under_enforced_rls`],
+//! [`entity_scoped_memory_listings_still_work_under_enforced_rls`],
+//! [`reinforcement_stamp_still_lands_under_enforced_rls`] and
+//! [`procedural_reliability_update_still_lands_under_enforced_rls`].
+//! `docs/SECURITY.md` no longer enumerates anything.
+//!
+//! **Fixed — the role can now be an unprivileged one.**
+//! `PostgresBackend::new` used to apply the schema unconditionally on every
+//! startup, which is owner-only DDL, so the application had to connect as the
+//! table owner — and an owner is exempt from its own policies until `FORCE`,
+//! while a managed-Postgres owner typically also carries `BYPASSRLS`, which
+//! `FORCE` cannot remove. Startup now reads `pensyve_schema_state` first and
+//! skips the DDL batch when the applied digest is this build's, so a serving
+//! role that only holds DML grants starts normally:
+//! [`a_non_owner_starts_against_an_already_migrated_database`],
+//! [`a_non_owner_that_must_apply_ddl_is_told_it_needs_the_owner`] and
+//! [`the_schema_skip_follows_the_schema_text`]. Startup also reports the
+//! role's own exemptions —
+//! [`startup_reports_whether_the_role_is_exempt_from_rls`] — because a
+//! `BYPASSRLS` role makes `FORCE` enforce nothing with no other symptom.
+//!
+//! **Still open — enforcement is not yet the default.** What is left is the
+//! flip itself: moving `FORCE` out of `postgres_rls_enforce.sql` and into
+//! `postgres_schema.sql`. Until that lands it stays an explicit operator step
+//! — see `docs/SECURITY.md`.
 //!
 //! Tests therefore come in two flavours: [`Fixture::provision`] mirrors a
 //! current deployment (policies present, not enforced), and a test that wants
@@ -72,7 +91,7 @@
 
 use std::collections::HashMap;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx_core::query::query;
 use sqlx_core::query_as::query_as;
 use sqlx_core::raw_sql::raw_sql;
@@ -187,6 +206,11 @@ struct Fixture {
     backend: PostgresBackend,
     database: String,
     role: String,
+    /// Extra roles this fixture created — see [`Fixture::serving_role`]. They
+    /// hold grants inside the throwaway database, so they can only be dropped
+    /// after it is, which is why [`Drop`] owns their teardown rather than the
+    /// tests that ask for them.
+    extra_roles: std::cell::RefCell<Vec<String>>,
 }
 
 impl Fixture {
@@ -261,6 +285,7 @@ impl Fixture {
             backend,
             database,
             role,
+            extra_roles: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -278,6 +303,78 @@ impl Fixture {
             .enforce_rls()
             .expect("force row level security");
     }
+
+    /// Create — once — an unprivileged role that can read and write every
+    /// table but owns none of them, and return its name.
+    ///
+    /// This is the `pensyve_app` role of the DDL/serving split: it holds the
+    /// DML grants a serving deployment needs and nothing that would let it run
+    /// `CREATE TABLE` or `ALTER TABLE`, which is exactly the shape that makes
+    /// `FORCE ROW LEVEL SECURITY` mean something.
+    fn serving_role(&self, admin_opts: &PgConnectOptions) -> String {
+        let role = format!("{}_serving", self.role);
+        self.rt.block_on(async {
+            exec(
+                &self.admin,
+                format!(
+                    "CREATE ROLE \"{role}\" LOGIN PASSWORD '{APP_ROLE_PASSWORD}' \
+                     NOSUPERUSER NOBYPASSRLS"
+                ),
+            )
+            .await;
+        });
+        self.grant_dml(admin_opts, &role);
+        self.extra_roles.borrow_mut().push(role.clone());
+        role
+    }
+
+    /// Give `role` everything a serving deployment needs and nothing more:
+    /// `USAGE` on the schema and DML on every table, but no ownership, so it
+    /// cannot run the schema's DDL.
+    fn grant_dml(&self, admin_opts: &PgConnectOptions, role: &str) {
+        {
+            let mut extra = self.extra_roles.borrow_mut();
+            if !extra.iter().any(|existing| existing == role) {
+                extra.push(role.to_string());
+            }
+        }
+        with_admin_pool(&self.rt, admin_opts, &self.database, |rt, pool| {
+            rt.block_on(async {
+                for statement in [
+                    format!("GRANT USAGE ON SCHEMA public TO \"{role}\""),
+                    format!(
+                        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public \
+                         TO \"{role}\""
+                    ),
+                ] {
+                    exec(pool, statement).await;
+                }
+            });
+        });
+    }
+
+    /// A single-connection pool against this fixture's database as `role`.
+    fn pool_for(&self, admin_opts: &PgConnectOptions, role: &str) -> PgPool {
+        self.rt.block_on(async {
+            PgPoolOptions::new()
+                .max_connections(1)
+                .connect_with(
+                    admin_opts
+                        .clone()
+                        .username(role)
+                        .password(APP_ROLE_PASSWORD)
+                        .database(&self.database),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("connect to the fixture database as {role}: {e}"))
+        })
+    }
+
+    /// A second backend against this fixture's database, connected as `role`.
+    fn backend_as(&self, admin_opts: &PgConnectOptions, role: &str) -> PostgresBackend {
+        PostgresBackend::from_pool(self.pool_for(admin_opts, role))
+            .unwrap_or_else(|e| panic!("build a backend as {role}: {e}"))
+    }
 }
 
 impl Drop for Fixture {
@@ -286,16 +383,21 @@ impl Drop for Fixture {
         // that panics mid-run leaks its database; CI throws the container away.
         let admin = self.admin.clone();
         let database = self.database.clone();
-        let role = self.role.clone();
+        let mut roles = self.extra_roles.borrow().clone();
+        roles.push(self.role.clone());
         self.rt.block_on(async {
             let _ = raw_sql(AssertSqlSafe(format!(
                 "DROP DATABASE IF EXISTS \"{database}\" WITH (FORCE)"
             )))
             .execute(&admin)
             .await;
-            let _ = raw_sql(AssertSqlSafe(format!("DROP ROLE IF EXISTS \"{role}\"")))
-                .execute(&admin)
-                .await;
+            // Roles only after the database: a grant inside it is a dependency
+            // that would otherwise refuse the drop.
+            for role in &roles {
+                let _ = raw_sql(AssertSqlSafe(format!("DROP ROLE IF EXISTS \"{role}\"")))
+                    .execute(&admin)
+                    .await;
+            }
         });
     }
 }
@@ -658,11 +760,12 @@ fn scoped_namespace_does_not_leak_into_the_next_checkout() {
             };
 
             // The scoped connection is now back in the pool. Take it again
-            // through the *unscoped* path, which is what every `StorageTrait`
-            // method lacking a namespace parameter uses.
+            // through the *unscoped* path — the one schema application and the
+            // `namespaces` read use, and the one a checkout would inherit a
+            // stale namespace through if acquisition did not rebind the GUC.
             let mut conn = fixture
                 .backend
-                .maybe_scoped_conn()
+                .conn_with_namespace(super::UNSCOPED_NAMESPACE)
                 .await
                 .expect("acquire unscoped connection");
             let (second_pid,): (i32,) = query_as::<Postgres, _>("SELECT pg_backend_pid()")
@@ -2135,6 +2238,594 @@ fn supersede_still_works_under_enforced_rls() {
     );
 }
 
+/// Resolving an entity by id keeps working with RLS enforced, and only inside
+/// its own namespace.
+///
+/// `get_entity` took no `namespace_id`, so the REST identifier resolver read
+/// whichever tenant's row carried the id and compared `entity.namespace_id`
+/// afterwards. Under enforcement the read returned nothing at all and the
+/// resolver reported "no such entity" for an entity the caller owns.
+#[test]
+fn entity_lookup_by_id_still_works_under_enforced_rls() {
+    let Some(admin_opts) = skip_notice("entity_lookup_by_id_still_works_under_enforced_rls") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns_a = Namespace::new(format!("rls-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("rls-b-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns_a).expect("save namespace A");
+    backend.save_namespace(&ns_b).expect("save namespace B");
+
+    let mut entity = Entity::new("alice", EntityKind::User);
+    entity.namespace_id = ns_a.id;
+    backend.save_entity(&entity).expect("save A's entity");
+
+    fixture.enforce_rls();
+
+    assert_eq!(
+        backend
+            .get_entity_in_namespace(entity.id, ns_a.id)
+            .expect("read A's entity")
+            .map(|e| e.id),
+        Some(entity.id),
+        "the scoped lookup must still resolve its own namespace's entity"
+    );
+    assert!(
+        backend
+            .get_entity_in_namespace(entity.id, ns_b.id)
+            .expect("read A's entity through B")
+            .is_none(),
+        "a foreign namespace must not resolve another namespace's entity"
+    );
+}
+
+/// The entity-scoped memory listings behind `pensyve_inspect`, the REST
+/// inspect handler, the CLI and the graph build keep working with RLS
+/// enforced, and neither of them reaches across namespaces.
+///
+/// Both took an entity id and a limit and nothing else. Entity ids are not
+/// globally unique, so with RLS inert they enumerated every tenant's rows for
+/// that id, and with RLS enforced they enumerated none — `Ok(vec![])`, which a
+/// caller cannot tell from an entity that simply has no memories.
+#[test]
+fn entity_scoped_memory_listings_still_work_under_enforced_rls() {
+    let Some(admin_opts) =
+        skip_notice("entity_scoped_memory_listings_still_work_under_enforced_rls")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns_a = Namespace::new(format!("rls-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("rls-b-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns_a).expect("save namespace A");
+    backend.save_namespace(&ns_b).expect("save namespace B");
+
+    // The same entity id on both sides — the collision the predicate has to
+    // disambiguate.
+    let entity_id = Uuid::new_v4();
+    let mine = EpisodicMemory::new(
+        ns_a.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        entity_id,
+        "A's turn",
+    );
+    backend.save_episodic(&mine).expect("save A's memory");
+    let theirs = EpisodicMemory::new(
+        ns_b.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        entity_id,
+        "B's turn",
+    );
+    backend.save_episodic(&theirs).expect("save B's memory");
+
+    let my_fact = SemanticMemory::new(ns_a.id, entity_id, "likes", "rust", 0.9);
+    backend.save_semantic(&my_fact).expect("save A's fact");
+    let their_fact = SemanticMemory::new(ns_b.id, entity_id, "likes", "go", 0.9);
+    backend.save_semantic(&their_fact).expect("save B's fact");
+
+    fixture.enforce_rls();
+
+    assert_eq!(
+        backend
+            .list_episodic_by_entity_in_namespace(entity_id, ns_a.id, 10)
+            .expect("list A's episodic")
+            .iter()
+            .map(|m| m.id)
+            .collect::<Vec<_>>(),
+        vec![mine.id],
+        "the episodic listing must return its own namespace's row, and only that"
+    );
+    assert_eq!(
+        backend
+            .list_semantic_by_entity_in_namespace(entity_id, ns_a.id, 10)
+            .expect("list A's semantic")
+            .iter()
+            .map(|m| m.id)
+            .collect::<Vec<_>>(),
+        vec![my_fact.id],
+        "the semantic listing must return its own namespace's row, and only that"
+    );
+
+    // And B still sees exactly its own, which is what keeps the assertions
+    // above from passing on a query that simply never matches anything.
+    assert_eq!(
+        backend
+            .list_episodic_by_entity_in_namespace(entity_id, ns_b.id, 10)
+            .expect("list B's episodic")
+            .iter()
+            .map(|m| m.id)
+            .collect::<Vec<_>>(),
+        vec![theirs.id]
+    );
+    assert_eq!(
+        backend
+            .list_semantic_by_entity_in_namespace(entity_id, ns_b.id, 10)
+            .expect("list B's semantic")
+            .iter()
+            .map(|m| m.id)
+            .collect::<Vec<_>>(),
+        vec![their_fact.id]
+    );
+}
+
+/// The reinforcement stamp on the recall path keeps landing with RLS enforced,
+/// and only on its own namespace's row.
+///
+/// This is the highest-traffic write in the system — the retrieval engine
+/// calls it for every episodic result of every recall — and the one that fails
+/// most quietly. `update_episodic_access` took no `namespace_id`, so under
+/// enforcement the `UPDATE` matched nothing, affected nothing, and returned
+/// `Ok(())`: spaced-repetition decay would have silently stopped tracking
+/// access on every enforced deployment.
+#[test]
+fn reinforcement_stamp_still_lands_under_enforced_rls() {
+    let Some(admin_opts) = skip_notice("reinforcement_stamp_still_lands_under_enforced_rls") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+    let ns_a = Namespace::new(format!("rls-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("rls-b-{}", Uuid::new_v4().simple()));
+    let memory = seed(&fixture, &ns_a, &ns_b);
+    fixture.enforce_rls();
+
+    backend
+        .update_episodic_access_in_namespace(memory.id, ns_b.id, 0.1, 0.1)
+        .expect("stamp through namespace B must not error");
+    assert_eq!(
+        backend
+            .get_episodic_in_namespace(memory.id, ns_a.id)
+            .expect("re-read the row")
+            .expect("the row is still there")
+            .access_count,
+        0,
+        "a foreign namespace must not stamp another namespace's row"
+    );
+
+    backend
+        .update_episodic_access_in_namespace(memory.id, ns_a.id, 0.8, 0.7)
+        .expect("stamp through namespace A");
+    let stamped = backend
+        .get_episodic_in_namespace(memory.id, ns_a.id)
+        .expect("re-read the stamped row")
+        .expect("the row is still there");
+    assert_eq!(
+        stamped.access_count, 1,
+        "the scoped stamp must still take effect in its own namespace"
+    );
+    assert!((stamped.stability - 0.8).abs() < 0.001);
+    assert!((stamped.retrievability - 0.7).abs() < 0.001);
+    assert!(stamped.last_accessed.is_some());
+}
+
+/// The consolidation engine's procedural-reliability write keeps landing with
+/// RLS enforced, and only on its own namespace's row. Same silent-no-op
+/// failure mode as [`reinforcement_stamp_still_lands_under_enforced_rls`].
+#[test]
+fn procedural_reliability_update_still_lands_under_enforced_rls() {
+    let Some(admin_opts) =
+        skip_notice("procedural_reliability_update_still_lands_under_enforced_rls")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns_a = Namespace::new(format!("rls-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("rls-b-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns_a).expect("save namespace A");
+    backend.save_namespace(&ns_b).expect("save namespace B");
+
+    let procedural = ProceduralMemory::new(
+        ns_a.id,
+        "on_error",
+        "log_and_retry",
+        Outcome::Failure,
+        HashMap::new(),
+    );
+    backend
+        .save_procedural(&procedural)
+        .expect("save A's procedural memory");
+
+    fixture.enforce_rls();
+
+    backend
+        .update_procedural_reliability_in_namespace(procedural.id, ns_b.id, 0.01, 99, 99)
+        .expect("update through namespace B must not error");
+    let untouched = backend
+        .get_procedural_in_namespace(procedural.id, ns_a.id)
+        .expect("re-read the row")
+        .expect("the row is still there");
+    assert_eq!(
+        (untouched.trial_count, untouched.success_count),
+        (procedural.trial_count, procedural.success_count),
+        "a foreign namespace must not rewrite another namespace's row"
+    );
+    assert!(
+        (untouched.reliability - procedural.reliability).abs() < 0.001,
+        "nor its reliability"
+    );
+
+    backend
+        .update_procedural_reliability_in_namespace(procedural.id, ns_a.id, 0.75, 4, 3)
+        .expect("update through namespace A");
+    let updated = backend
+        .get_procedural_in_namespace(procedural.id, ns_a.id)
+        .expect("re-read the updated row")
+        .expect("the row is still there");
+    assert_eq!(updated.trial_count, 4);
+    assert_eq!(updated.success_count, 3);
+    assert!((updated.reliability - 0.75).abs() < 0.001);
+    assert!(updated.last_used.is_some());
+}
+
+/// Startup must be able to say whether the connected role is exempt from RLS
+/// at all, because a role that is exempt makes `FORCE ROW LEVEL SECURITY`
+/// enforce nothing and there is no other symptom.
+///
+/// Both sides are checked: the fixture's `NOSUPERUSER NOBYPASSRLS` application
+/// role must report clean, and a `BYPASSRLS` role must report exempt. Only the
+/// second half is the interesting one, but without the first the probe could
+/// be reporting `true` unconditionally.
+#[test]
+fn startup_reports_whether_the_role_is_exempt_from_rls() {
+    let Some(admin_opts) = skip_notice("startup_reports_whether_the_role_is_exempt_from_rls")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+
+    let serving = fixture
+        .backend
+        .role_rls_exemptions()
+        .expect("read the serving role's exemptions");
+    assert_eq!(serving.role, fixture.role);
+    assert!(
+        !serving.exempt(),
+        "the fixture's application role is NOSUPERUSER NOBYPASSRLS, so it must not report \
+         exempt; if it does, the probe is not reading what it claims to"
+    );
+
+    let bypass_role = format!("{}_bypass", fixture.role);
+    fixture.rt.block_on(async {
+        exec(
+            &fixture.admin,
+            format!(
+                "CREATE ROLE \"{bypass_role}\" LOGIN PASSWORD '{APP_ROLE_PASSWORD}' \
+                 NOSUPERUSER BYPASSRLS"
+            ),
+        )
+        .await;
+    });
+    fixture.grant_dml(&admin_opts, &bypass_role);
+
+    let exempt = fixture
+        .backend_as(&admin_opts, &bypass_role)
+        .role_rls_exemptions()
+        .expect("read the BYPASSRLS role's exemptions");
+    assert_eq!(exempt.role, bypass_role);
+    assert!(
+        exempt.bypassrls && exempt.exempt(),
+        "a BYPASSRLS role must be reported as exempt: FORCE ROW LEVEL SECURITY does not \
+         remove that exemption, so a deployment running as one enforces nothing"
+    );
+}
+
+/// A role that does not own the tables must be able to start against an
+/// already-migrated database.
+///
+/// This is the serving half of the DDL/serving split. `PostgresBackend::new`
+/// applies the schema on every startup, which is owner-only DDL, so before the
+/// applied-state probe a non-owner could not get past construction at all —
+/// which is why every deployment connects as the owner, and why the policies
+/// are inert for it. Startup now reads `pensyve_schema_state` first and skips
+/// the batch when it names this build's digest.
+#[test]
+fn a_non_owner_starts_against_an_already_migrated_database() {
+    let Some(admin_opts) = skip_notice("a_non_owner_starts_against_an_already_migrated_database")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+
+    // The owner's startup has already applied the schema and stamped the
+    // marker; that is the state a serving role is expected to find.
+    let serving = fixture.serving_role(&admin_opts);
+    let backend = PostgresBackend::from_pool(fixture.pool_for(&admin_opts, &serving))
+        .expect("a non-owner must start against an already-migrated database");
+
+    // And it can actually serve: the skip must not have left the backend in a
+    // state where ordinary reads fail.
+    let ns = Namespace::new(format!("non-owner-{}", Uuid::new_v4().simple()));
+    backend
+        .save_namespace(&ns)
+        .expect("write as the serving role");
+    assert_eq!(
+        backend
+            .get_namespace(ns.id)
+            .expect("read as the serving role")
+            .map(|n| n.id),
+        Some(ns.id)
+    );
+}
+
+/// …and when the schema is *not* current, the non-owner is told why rather
+/// than being handed `must be owner of table entities`.
+///
+/// The failure has to name the deployment model, because the operator's next
+/// action — run the migration as the owner, then restart the serving role — is
+/// not deducible from the Postgres error alone.
+#[test]
+fn a_non_owner_that_must_apply_ddl_is_told_it_needs_the_owner() {
+    let Some(admin_opts) =
+        skip_notice("a_non_owner_that_must_apply_ddl_is_told_it_needs_the_owner")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let serving = fixture.serving_role(&admin_opts);
+
+    // Stale marker: the database is at *some* version, but not this build's,
+    // so the probe correctly refuses to skip.
+    fixture.rt.block_on(async {
+        exec(
+            fixture.backend.pool(),
+            "UPDATE pensyve_schema_state SET schema_digest = 'fnv1a64:0000000000000000' \
+              WHERE id = 1",
+        )
+        .await;
+    });
+
+    let error = PostgresBackend::from_pool(fixture.pool_for(&admin_opts, &serving))
+        .err()
+        .expect("a non-owner must not silently start against an out-of-date schema");
+    let message = error.to_string();
+    assert!(
+        message.contains("owner-only DDL") && message.contains("docs/SECURITY.md"),
+        "the failure must name the owner requirement and where the deployment model is \
+         documented, not just Postgres's `must be owner of table ...`; got: {message}"
+    );
+}
+
+/// Re-applying the same schema is skipped, and editing it un-skips it.
+///
+/// The skip is what makes the split possible, but it must not be able to
+/// swallow a real migration: the marker records a digest of the schema text,
+/// so any edit invalidates it. Both directions are asserted, because a probe
+/// that always skips and a probe that never skips each pass one of them.
+#[test]
+fn the_schema_skip_follows_the_schema_text() {
+    let Some(admin_opts) = skip_notice("the_schema_skip_follows_the_schema_text") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+
+    let applied_at = |label: &str| -> DateTime<Utc> {
+        fixture.rt.block_on(async {
+            let (at,): (DateTime<Utc>,) =
+                query_as::<Postgres, _>("SELECT applied_at FROM pensyve_schema_state WHERE id = 1")
+                    .fetch_one(fixture.backend.pool())
+                    .await
+                    .unwrap_or_else(|e| panic!("read schema state ({label}): {e}"));
+            at
+        })
+    };
+
+    let first = applied_at("after provisioning");
+
+    // Re-running startup against an unchanged schema must not re-apply it.
+    let again = PostgresBackend::from_pool(fixture.pool_for(&admin_opts, &fixture.role.clone()))
+        .expect("restart as the owner");
+    drop(again);
+    assert_eq!(
+        applied_at("after an unchanged restart"),
+        first,
+        "an unchanged schema must be skipped, not re-applied — that skip is the only \
+         reason a non-owner can start at all"
+    );
+
+    // A changed schema must be re-applied. Standing in for an edit by rolling
+    // the marker back to a digest no build will ever produce.
+    fixture.rt.block_on(async {
+        exec(
+            fixture.backend.pool(),
+            "UPDATE pensyve_schema_state SET schema_digest = 'fnv1a64:ffffffffffffffff' \
+              WHERE id = 1",
+        )
+        .await;
+    });
+    let reapplied =
+        PostgresBackend::from_pool(fixture.pool_for(&admin_opts, &fixture.role.clone()))
+            .expect("restart as the owner over a changed schema");
+    drop(reapplied);
+    assert!(
+        applied_at("after a changed restart") > first,
+        "a schema whose text differs from what was applied must be applied again; \
+         otherwise a real migration would be skipped forever"
+    );
+}
+
+/// The documented manual-upgrade sequence has to actually complete.
+///
+/// `docs/SECURITY.md` tells an operator they may apply new schema text however
+/// they like — `psql -f postgres_schema.sql` included — and then start the
+/// application once on an owner connection before flipping serving back to the
+/// unprivileged role. That middle step is not optional and the docs used to
+/// present it as an alternative rather than a follow-on: the schema file
+/// creates `pensyve_schema_state` but cannot record its own digest, so a
+/// hand-applied schema leaves the marker table present and empty. Without the
+/// owner-connected startup the marker never gets stamped, every later startup
+/// reads "not current", and the serving role fails on owner-only DDL forever —
+/// the upgrade path as written could not finish.
+///
+/// This runs the sequence as documented. The empty-marker state is what stands
+/// in for the hand-applied schema, because that is precisely what `psql` leaves.
+#[test]
+fn the_documented_manual_upgrade_sequence_completes() {
+    let Some(admin_opts) = skip_notice("the_documented_manual_upgrade_sequence_completes") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let serving = fixture.serving_role(&admin_opts);
+    let owner = fixture.role.clone();
+
+    // Step 1 — the schema is applied by something that cannot stamp the digest.
+    // `psql -f postgres_schema.sql` creates the marker table and leaves it
+    // empty; nothing else about the database differs.
+    fixture.rt.block_on(async {
+        exec(fixture.backend.pool(), "DELETE FROM pensyve_schema_state").await;
+    });
+
+    // The serving role cannot get past this state on its own — it would be
+    // asked for owner-only DDL. This is the failure the docs must not lead an
+    // operator into.
+    let blocked = PostgresBackend::from_pool(fixture.pool_for(&admin_opts, &serving))
+        .err()
+        .expect("an unstamped marker must not let a non-owner start");
+    assert!(
+        blocked.to_string().contains("owner-only DDL"),
+        "and it must say why: {blocked}"
+    );
+
+    // Step 2 — start once on an owner connection. This is the step the docs
+    // now require rather than offer.
+    let stamping = PostgresBackend::from_pool(fixture.pool_for(&admin_opts, &owner))
+        .expect("an owner startup must complete over a hand-applied schema");
+    drop(stamping);
+
+    let stamped: i64 = fixture.rt.block_on(async {
+        let (count,): (i64,) =
+            query_as::<Postgres, _>("SELECT count(*) FROM pensyve_schema_state WHERE id = 1")
+                .fetch_one(fixture.backend.pool())
+                .await
+                .expect("read the marker after the owner startup");
+        count
+    });
+    assert_eq!(
+        stamped, 1,
+        "the owner startup must stamp the digest; without it the sequence cannot finish"
+    );
+
+    // Step 3 — flip serving back. This is what the whole sequence is for.
+    let serving_backend = PostgresBackend::from_pool(fixture.pool_for(&admin_opts, &serving))
+        .expect("the serving role must start once the owner startup has stamped the digest");
+    let ns = Namespace::new(format!("upgraded-{}", Uuid::new_v4().simple()));
+    serving_backend
+        .save_namespace(&ns)
+        .expect("and must be able to serve");
+}
+
+/// The applied-schema probe must resolve the marker the same way the
+/// statements it gates do.
+///
+/// `CREATE TABLE pensyve_schema_state` in the schema file, the `SELECT` that
+/// reads the digest and the `INSERT` that stamps it all resolve through
+/// `search_path`. A probe qualified as `public.pensyve_schema_state` would
+/// therefore ask about a different relation than the one it gates on any
+/// deployment whose role carries a non-default `search_path`: the marker lands
+/// wherever `search_path` puts it, `to_regclass` returns NULL forever, and the
+/// DDL batch is re-applied on every startup — harmless for an owner, and
+/// permanently unstartable for the non-owner serving role this whole mechanism
+/// exists to support. Silently, with no error to notice.
+///
+/// So this stages exactly that: the marker moved out of `public`, and the role
+/// pointed at the schema holding it. Startup must still skip.
+#[test]
+fn the_schema_probe_resolves_the_marker_through_search_path() {
+    let Some(admin_opts) = skip_notice("the_schema_probe_resolves_the_marker_through_search_path")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let alt = format!("alt_{}", Uuid::new_v4().simple());
+
+    // Move the marker out of `public` and point the role's `search_path` at
+    // where it now lives. `ALTER TABLE ... SET SCHEMA` needs ownership, which
+    // the fixture role has, but `CREATE SCHEMA` and `ALTER ROLE` need the
+    // admin.
+    let role = fixture.role.clone();
+    let database = fixture.database.clone();
+    with_admin_pool(&fixture.rt, &admin_opts, &database, |rt, pool| {
+        rt.block_on(async {
+            exec(
+                pool,
+                format!("CREATE SCHEMA \"{alt}\" AUTHORIZATION \"{role}\""),
+            )
+            .await;
+            exec(
+                pool,
+                format!(
+                    "ALTER ROLE \"{role}\" IN DATABASE \"{database}\" \
+                     SET search_path = \"{alt}\", public"
+                ),
+            )
+            .await;
+        });
+    });
+    fixture.rt.block_on(async {
+        exec(
+            fixture.backend.pool(),
+            format!("ALTER TABLE public.pensyve_schema_state SET SCHEMA \"{alt}\""),
+        )
+        .await;
+    });
+
+    let applied_at = |label: &str| -> DateTime<Utc> {
+        with_admin_pool(&fixture.rt, &admin_opts, &database, |rt, pool| {
+            rt.block_on(async {
+                // Identifier is a hex-only name generated in this module, so
+                // `AssertSqlSafe` is sound — same rule as `exec`.
+                let (at,): (DateTime<Utc>,) = query_as::<Postgres, _>(AssertSqlSafe(format!(
+                    "SELECT applied_at FROM \"{alt}\".pensyve_schema_state WHERE id = 1"
+                )))
+                .fetch_one(pool)
+                .await
+                .unwrap_or_else(|e| panic!("read relocated schema state ({label}): {e}"));
+                at
+            })
+        })
+    };
+    let before = applied_at("after relocating the marker");
+
+    let restarted = PostgresBackend::from_pool(fixture.pool_for(&admin_opts, &role))
+        .expect("restart against a marker outside `public`");
+    drop(restarted);
+
+    assert_eq!(
+        applied_at("after restarting"),
+        before,
+        "startup re-applied the schema even though the marker names this build's digest, \
+         so the probe resolved a different relation than the statements it gates. A \
+         non-owner serving role would never be able to start on this deployment."
+    );
+}
+
 /// Every table in [`RLS_POLICIES`] must carry exactly one policy, named as
 /// expected and qualified by the namespace GUC, as Postgres actually
 /// registered it.
@@ -2417,9 +3108,11 @@ fn only_bound_connections_reach_policied_tables() {
         "postgres.rs has {unbound} uses of `ScopedPool::unbound()`, expected \
          {ALLOWED_UNBOUND_USES}. An unbound connection carries the previous checkout's \
          namespace, so a query on a table with a namespace_isolation_* policy would read \
-         another namespace's rows once RLS is enforced. Use `scoped_conn` or \
-         `maybe_scoped_conn` unless the statement is DDL or targets an unpolicied table \
-         (namespaces, activity_events), and update this count if it is."
+         another namespace's rows once RLS is enforced. Use `scoped_conn`, or \
+         `conn_with_namespace(UNSCOPED_NAMESPACE)` for a statement that genuinely has no \
+         namespace, unless the statement is DDL or targets an unpolicied table \
+         (namespaces, activity_events, pensyve_schema_state), and update this count if \
+         it is."
     );
 
     // The wrapper is only worth having if the raw pool is genuinely out of
@@ -2428,8 +3121,8 @@ fn only_bound_connections_reach_policied_tables() {
         assert!(
             !source.contains(forbidden),
             "postgres.rs contains `{forbidden}`, which takes a connection without binding a \
-             namespace. Go through `scoped_conn`, `maybe_scoped_conn`, or an allowlisted \
-             `unbound()` call."
+             namespace. Go through `scoped_conn`, `conn_with_namespace`, or an \
+             allowlisted `unbound()` call."
         );
     }
 }

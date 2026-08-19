@@ -21,7 +21,7 @@ use crate::types::{
 };
 
 use super::{
-    ActivityAggregate, ActivityEvent, ErasedRows, StorageResult, StorageTrait,
+    ActivityAggregate, ActivityEvent, ErasedRows, StorageError, StorageResult, StorageTrait,
     cross_namespace_edge_id,
 };
 use crate::graph::EdgeType;
@@ -173,13 +173,106 @@ mod scoped_pool;
 
 use scoped_pool::ScopedPool;
 
-/// The namespace GUC value used for connections that are not scoped to any
-/// namespace.
+/// The namespace GUC value bound on connections that carry no namespace.
 ///
 /// Namespaces are UUIDs, so the empty string matches no row: under enforced
 /// RLS such a connection reads nothing and writes nothing. It fails closed
 /// instead of falling back to whatever the previous checkout left set.
-const UNSCOPED_NAMESPACE: &str = "";
+///
+/// No `StorageTrait` method takes this path any more — every one of them now
+/// carries a `namespace_id` and goes through [`PostgresBackend::scoped_conn`]
+/// (#254). It survives as the value [`ScopedPool::unbound`] checkouts are
+/// pinned to, which is what keeps a schema-application or `namespaces` read
+/// from inheriting the previous tenant's namespace.
+pub(crate) const UNSCOPED_NAMESPACE: &str = "";
+
+/// What the connected role's own privileges do to row-level security.
+///
+/// Either flag makes the `namespace_isolation_*` policies inert for this
+/// connection regardless of `FORCE ROW LEVEL SECURITY`, so a deployment can
+/// believe it has enforced tenant isolation while enforcing nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleRlsExemptions {
+    /// `current_user`, as Postgres reports it.
+    pub role: String,
+    /// `pg_roles.rolsuper` — superusers are unconditionally exempt.
+    pub superuser: bool,
+    /// `pg_roles.rolbypassrls` — `BYPASSRLS` survives `FORCE`.
+    pub bypassrls: bool,
+}
+
+impl RoleRlsExemptions {
+    /// Whether row-level security is inert for this role.
+    ///
+    /// Note what this deliberately does *not* cover: a role that merely *owns*
+    /// the tables is also exempt, but only until `FORCE ROW LEVEL SECURITY` is
+    /// applied, which is the supported way to run. These two flags are the ones
+    /// `FORCE` cannot fix.
+    #[must_use]
+    pub fn exempt(&self) -> bool {
+        self.superuser || self.bypassrls
+    }
+}
+
+/// A 64-bit FNV-1a digest of the schema text this build ships, in hex.
+///
+/// Used only to answer "is the applied schema the one in this binary?" — see
+/// [`PostgresBackend::run_schema`]. Any edit to `postgres_schema.sql` changes
+/// it, which is the whole requirement.
+fn schema_digest() -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET;
+    for byte in SCHEMA.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+/// What `pensyve_schema_state` says about the schema this build ships.
+///
+/// Only [`SchemaState::Current`] authorises skipping the DDL batch. The other
+/// three are all "apply it", and are distinguished so the startup log can say
+/// which situation the operator is in — see [`PostgresBackend::schema_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaState {
+    /// No marker table: a fresh database, or one provisioned before the marker
+    /// existed.
+    Absent,
+    /// Marker table exists but holds no row. The schema text was applied by
+    /// something that cannot record its own digest — a hand-run
+    /// `psql -f postgres_schema.sql`.
+    Unstamped,
+    /// Marker names a different digest: the database is at some other version.
+    Stale,
+    /// Marker names this build's digest.
+    Current,
+}
+
+/// Turn a failure to apply the schema into an error that names the cause.
+///
+/// A non-owner reaching the DDL batch gets `must be owner of table entities`
+/// from Postgres, which says nothing about the deployment model that produced
+/// it. Startup is the one place that knows the schema was out of date *and*
+/// that applying it is owner-only, so it says so.
+fn schema_apply_error(error: &sqlx_core::error::Error) -> StorageError {
+    let insufficient_privilege = error
+        .as_database_error()
+        .and_then(sqlx_core::error::DatabaseError::code)
+        .is_some_and(|code| code == "42501");
+
+    if insufficient_privilege {
+        return StorageError::Context(format!(
+            "pensyve: the database schema is not at the version this build applies, and \
+             the connected role may not apply it. Schema application is owner-only DDL \
+             (CREATE TABLE / ALTER TABLE / CREATE POLICY). Run the schema once as the role \
+             that owns the tables, then start the application as the unprivileged serving \
+             role — see docs/SECURITY.md. Underlying error: {error}"
+        ));
+    }
+    io_err(error)
+}
 
 pub struct PostgresBackend {
     /// Wrapped so that the only ways to obtain a connection are
@@ -190,9 +283,6 @@ pub struct PostgresBackend {
     /// `self.pool.begin()` check out an unbound connection.
     pool: ScopedPool,
     rt: Runtime,
-    /// Optional default namespace for RLS scoping on get-by-id methods
-    /// where the trait signature does not provide a `namespace_id`.
-    default_namespace: Option<Uuid>,
 }
 
 impl PostgresBackend {
@@ -235,9 +325,8 @@ impl PostgresBackend {
         let backend = Self {
             pool: ScopedPool::new(pool),
             rt,
-            default_namespace: None,
         };
-        backend.run_schema()?;
+        backend.start()?;
         Ok(backend)
     }
 
@@ -247,29 +336,241 @@ impl PostgresBackend {
         let backend = Self {
             pool: ScopedPool::new(pool),
             rt,
-            default_namespace: None,
         };
-        backend.run_schema()?;
+        backend.start()?;
         Ok(backend)
     }
 
-    /// Set the default namespace used to scope RLS on get-by-id queries
-    /// where the `StorageTrait` signature does not provide a `namespace_id`.
-    #[must_use]
-    pub fn with_default_namespace(mut self, namespace_id: Uuid) -> Self {
-        self.default_namespace = Some(namespace_id);
-        self
+    /// Everything both constructors do once the pool exists: bring the schema
+    /// up to date (or establish that it already is), then report what the
+    /// connected role's own privileges mean for row-level security.
+    fn start(&self) -> StorageResult<()> {
+        self.run_schema()?;
+        self.warn_on_rls_exempt_role();
+        Ok(())
     }
 
+    // `with_default_namespace` is gone. It existed so the `StorageTrait`
+    // methods whose signatures carried no `namespace_id` could still bind
+    // *something* on their connection. Every one of those methods now takes the
+    // namespace explicitly (#254), so a backend-wide default would only be a
+    // way to make a query look scoped while reading a namespace the caller
+    // never asked for.
+
+    /// Bring the database schema up to the version this build ships, or
+    /// establish that it is already there and do nothing.
+    ///
+    /// # Why "already applied" is checked before anything is applied
+    ///
+    /// `postgres_schema.sql` is owner-only DDL: `CREATE TABLE`, `ALTER TABLE`,
+    /// `CREATE POLICY`. Unconditionally sending it on every startup means the
+    /// serving role must own every table — and a role that owns a table is
+    /// exempt from that table's policies unless `FORCE ROW LEVEL SECURITY` is
+    /// set, while a managed-Postgres owner typically also carries `BYPASSRLS`,
+    /// which no amount of `FORCE` removes. Separating "apply the schema" from
+    /// "serve traffic" is what lets a deployment run as an unprivileged
+    /// `pensyve_app` role that the policies genuinely apply to.
+    ///
+    /// So startup probes first. `pensyve_schema_state` records the digest of
+    /// the schema text that was last applied; when it matches this build's, the
+    /// DDL batch is skipped entirely and a non-owner starts normally. The probe
+    /// is two plain `SELECT`s on an unpolicied table, which any role with
+    /// `SELECT` can run.
+    ///
+    /// The digest is over the whole file, so *any* schema edit invalidates it
+    /// and the batch runs again — the idempotent re-apply is preserved where it
+    /// matters (a changed file) and only skipped where it was a guaranteed
+    /// no-op (an unchanged one). It is a drift marker, not a security control:
+    /// a 64-bit FNV-1a is ample for telling two revisions of a file in this
+    /// repository apart, and nothing trusts it for anything else.
+    ///
+    /// When the schema *is* out of date and the role cannot apply it, the
+    /// privilege error is re-raised with the owner requirement spelled out,
+    /// rather than surfacing as a bare `must be owner of table entities`.
     fn run_schema(&self) -> StorageResult<()> {
+        let digest = schema_digest();
+        match self.schema_state(&digest)? {
+            SchemaState::Current => {
+                tracing::debug!(
+                    schema_digest = %digest,
+                    "pensyve: database schema already at this build's version; skipping DDL"
+                );
+                return Ok(());
+            }
+            SchemaState::Unstamped => tracing::info!(
+                schema_digest = %digest,
+                "pensyve: schema marker present but unstamped — applying and stamping now. \
+                 This is the state a hand-applied `psql -f postgres_schema.sql` leaves \
+                 behind: the file creates pensyve_schema_state but cannot record its own \
+                 digest, so only a startup can. This startup must therefore be on an owner \
+                 connection; once it stamps, an unprivileged serving role starts normally. \
+                 See docs/SECURITY.md."
+            ),
+            SchemaState::Stale => tracing::info!(
+                schema_digest = %digest,
+                "pensyve: database schema is not at this build's version; applying it. \
+                 Requires an owner connection."
+            ),
+            SchemaState::Absent => tracing::info!(
+                schema_digest = %digest,
+                "pensyve: no schema marker; applying the schema. Requires an owner connection."
+            ),
+        }
+
         self.block_on(async {
             self.pool
                 .unbound()
                 .execute(raw_sql(SCHEMA))
                 .await
-                .map_err(sqlx_to_io)?;
+                .map_err(|e| schema_apply_error(&e))?;
+            Ok::<(), StorageError>(())
+        })?;
+
+        self.record_schema_state(&digest)
+    }
+
+    /// Read `pensyve_schema_state` and classify what it says about `digest`.
+    ///
+    /// Only [`SchemaState::Current`] authorises a skip; every other answer means
+    /// "apply the schema". Failing towards applying keeps this probe unable to
+    /// *skip* a migration that is genuinely needed; the worst it can do is make
+    /// an owner re-run a batch that is a no-op.
+    ///
+    /// The three not-current answers are distinguished for the log alone —
+    /// [`SchemaState::Unstamped`] in particular is the state a hand-applied
+    /// `psql -f postgres_schema.sql` leaves behind, and an operator who reaches
+    /// it is one owner-connected startup away from a working deployment rather
+    /// than looking at a broken one. Saying which of the three it is turns that
+    /// into a readable line instead of an inference.
+    fn schema_state(&self, digest: &str) -> StorageResult<SchemaState> {
+        self.block_on(async {
+            let mut conn = self.conn_with_namespace(UNSCOPED_NAMESPACE).await?;
+
+            // `to_regclass` yields NULL instead of raising for an absent
+            // relation, so this cannot poison the connection on a fresh
+            // database.
+            //
+            // Deliberately unqualified. `CREATE TABLE pensyve_schema_state` in
+            // the schema file and the `SELECT` below both resolve through
+            // `search_path`, so the probe has to resolve the same way or it
+            // asks about a different relation than the one it gates. Qualified
+            // as `public.`, a deployment with a non-default `search_path` would
+            // create the marker elsewhere, read NULL here forever, and never
+            // stop re-applying the schema — which fails safe for an owner and
+            // makes a non-owner permanently unstartable.
+            let (present,): (Option<String>,) =
+                query_as::<Postgres, _>("SELECT to_regclass('pensyve_schema_state')::text")
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(sqlx_to_io)?;
+            if present.is_none() {
+                return Ok(SchemaState::Absent);
+            }
+
+            let applied: Option<(String,)> = query_as::<Postgres, _>(
+                "SELECT schema_digest FROM pensyve_schema_state WHERE id = 1",
+            )
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+
+            Ok(match applied {
+                None => SchemaState::Unstamped,
+                Some((applied,)) if applied == digest => SchemaState::Current,
+                Some(_) => SchemaState::Stale,
+            })
+        })
+    }
+
+    /// Stamp the digest of the schema text that was just applied.
+    ///
+    /// Deliberately issued from Rust rather than added to
+    /// `postgres_schema.sql`: the file cannot name its own digest, and its DML
+    /// is confined to the `SET row_security = off` window that
+    /// `schema_dml_on_policied_tables_cannot_be_silently_blinded` pins.
+    /// `pensyve_schema_state` carries no `namespace_isolation_*` policy, so
+    /// writing it from an unbound connection reads and writes exactly one row
+    /// regardless of what namespace the previous checkout left set.
+    fn record_schema_state(&self, digest: &str) -> StorageResult<()> {
+        self.block_on(async {
+            let mut conn = self.conn_with_namespace(UNSCOPED_NAMESPACE).await?;
+            query::<Postgres>(
+                "INSERT INTO pensyve_schema_state (id, schema_digest, applied_at)
+                      VALUES (1, $1, now())
+                 ON CONFLICT (id) DO UPDATE
+                        SET schema_digest = EXCLUDED.schema_digest,
+                            applied_at = EXCLUDED.applied_at",
+            )
+            .bind(digest)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| schema_apply_error(&e))?;
             Ok(())
         })
+    }
+
+    /// Report the row-level-security exemptions the connected role carries.
+    ///
+    /// `rolsuper` and `rolbypassrls` both make the policies inert for this
+    /// connection no matter what `FORCE ROW LEVEL SECURITY` says, so a
+    /// deployment that believes it has enforced isolation may have enforced
+    /// nothing at all. That is invisible from the outside — queries keep
+    /// returning rows — which is exactly why it is worth saying out loud at
+    /// startup.
+    pub fn role_rls_exemptions(&self) -> StorageResult<RoleRlsExemptions> {
+        self.block_on(async {
+            let mut conn = self.conn_with_namespace(UNSCOPED_NAMESPACE).await?;
+            let row: Option<(String, bool, bool)> = query_as::<Postgres, _>(
+                "SELECT rolname, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user",
+            )
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+
+            let (role, superuser, bypassrls) = row.ok_or_else(|| {
+                StorageError::Context(
+                    "pg_roles has no row for current_user, so the connected role's \
+                     row-level-security exemptions cannot be determined"
+                        .to_string(),
+                )
+            })?;
+            Ok(RoleRlsExemptions {
+                role,
+                superuser,
+                bypassrls,
+            })
+        })
+    }
+
+    /// Log a prominent warning when the connected role is exempt from RLS.
+    ///
+    /// A warning rather than a refusal: a local or single-tenant deployment
+    /// legitimately connects as the owner or as `postgres`, and enforcement is
+    /// an operator step there, not a precondition for starting. Failing to
+    /// *read* the answer is likewise only worth a warning — an unreadable
+    /// `pg_roles` is not a reason to refuse traffic.
+    fn warn_on_rls_exempt_role(&self) {
+        match self.role_rls_exemptions() {
+            Ok(exemptions) if exemptions.exempt() => {
+                tracing::warn!(
+                    role = %exemptions.role,
+                    rolsuper = exemptions.superuser,
+                    rolbypassrls = exemptions.bypassrls,
+                    "pensyve: the database role is exempt from row-level security. The \
+                     namespace_isolation_* policies do not apply to this connection, so \
+                     FORCE ROW LEVEL SECURITY enforces nothing here and namespace \
+                     isolation rests entirely on the namespace_id predicates in the SQL. \
+                     Serve traffic as a NOSUPERUSER NOBYPASSRLS role that does not own \
+                     the tables. See docs/SECURITY.md."
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                error = %e,
+                "pensyve: could not determine whether the database role is exempt from \
+                 row-level security"
+            ),
+        }
     }
 
     /// Subject the schema-owning role to its own row-level security policies.
@@ -319,23 +620,6 @@ impl PostgresBackend {
         namespace_id: Uuid,
     ) -> StorageResult<sqlx_core::pool::PoolConnection<sqlx_postgres::Postgres>> {
         self.conn_with_namespace(&namespace_id.to_string()).await
-    }
-
-    /// Acquire a connection, scoping it to `default_namespace` if one has been
-    /// configured.  Used for `StorageTrait` methods whose signatures do not
-    /// include a `namespace_id` parameter.
-    ///
-    /// With no default namespace configured this still sets the GUC — to
-    /// [`UNSCOPED_NAMESPACE`], which no row can match.  Such a connection
-    /// therefore reads nothing and writes nothing once RLS is enforced, rather
-    /// than inheriting whatever namespace the previous checkout left behind.
-    async fn maybe_scoped_conn(
-        &self,
-    ) -> StorageResult<sqlx_core::pool::PoolConnection<sqlx_postgres::Postgres>> {
-        match self.default_namespace {
-            Some(ns) => self.scoped_conn(ns).await,
-            None => self.conn_with_namespace(UNSCOPED_NAMESPACE).await,
-        }
     }
 
     /// Acquire a pooled connection and bind the namespace GUC that the RLS
@@ -721,31 +1005,38 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn get_entity(&self, id: Uuid) -> StorageResult<Option<Entity>> {
+    fn get_entity_in_namespace(
+        &self,
+        id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<Entity>> {
         self.block_on(async {
-            // Trait provides only entity id; use default_namespace for RLS if set.
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             let row: Option<(Uuid, Uuid, String, String, serde_json::Value, DateTime<Utc>)> =
                 query_as::<Postgres, _>(
-                    "SELECT id, namespace_id, name, kind, metadata, created_at FROM entities WHERE id = $1",
+                    "SELECT id, namespace_id, name, kind, metadata, created_at FROM entities \
+                      WHERE id = $1 AND namespace_id = $2",
                 )
                 .bind(id)
+                .bind(namespace_id)
                 .fetch_optional(&mut *conn)
                 .await
                 .map_err(sqlx_to_io)?;
 
-            Ok(row.map(|(id, namespace_id, name, kind_str, metadata, created_at)| {
-                let metadata: HashMap<String, serde_json::Value> =
-                    serde_json::from_value(metadata).unwrap_or_default();
-                Entity {
-                    id,
-                    namespace_id,
-                    name,
-                    kind: str_to_entity_kind(&kind_str),
-                    metadata,
-                    created_at,
-                }
-            }))
+            Ok(
+                row.map(|(id, namespace_id, name, kind_str, metadata, created_at)| {
+                    let metadata: HashMap<String, serde_json::Value> =
+                        serde_json::from_value(metadata).unwrap_or_default();
+                    Entity {
+                        id,
+                        namespace_id,
+                        name,
+                        kind: str_to_entity_kind(&kind_str),
+                        metadata,
+                        created_at,
+                    }
+                }),
+            )
         })
     }
 
@@ -929,22 +1220,25 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn list_episodic_by_entity(
+    fn list_episodic_by_entity_in_namespace(
         &self,
         about_entity: Uuid,
+        namespace_id: Uuid,
         limit: usize,
     ) -> StorageResult<Vec<EpisodicMemory>> {
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             let rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
                           access_count, last_accessed, event_time, superseded_by, invalid_at
-                   FROM episodic_memories WHERE about_entity = $1 AND superseded_by IS NULL
-                   ORDER BY timestamp DESC LIMIT $2",
+                   FROM episodic_memories
+                   WHERE about_entity = $1 AND namespace_id = $2 AND superseded_by IS NULL
+                   ORDER BY timestamp DESC LIMIT $3",
             )
             .bind(about_entity)
+            .bind(namespace_id)
             .bind(limit_i64)
             .fetch_all(&mut *conn)
             .await
@@ -981,26 +1275,28 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn update_episodic_access(
+    fn update_episodic_access_in_namespace(
         &self,
         id: Uuid,
+        namespace_id: Uuid,
         stability: f32,
         retrievability: f32,
     ) -> StorageResult<()> {
         let now = Utc::now();
         self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             query::<Postgres>(
                 r"UPDATE episodic_memories
                    SET stability = $1, retrievability = $2,
                        access_count = access_count + 1,
                        last_accessed = $3
-                   WHERE id = $4",
+                   WHERE id = $4 AND namespace_id = $5",
             )
             .bind(stability)
             .bind(retrievability)
             .bind(now)
             .bind(id)
+            .bind(namespace_id)
             .execute(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
@@ -1072,42 +1368,31 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn list_semantic_by_entity(
+    fn list_semantic_by_entity_in_namespace(
         &self,
         subject: Uuid,
+        namespace_id: Uuid,
         limit: usize,
     ) -> StorageResult<Vec<SemanticMemory>> {
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             let rows: Vec<SemanticRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
                           valid_at, invalid_at, source_episodes, embedding::text, stability,
                           retrievability, superseded_by
-                   FROM semantic_memories WHERE subject = $1 AND superseded_by IS NULL
-                   ORDER BY valid_at DESC LIMIT $2",
+                   FROM semantic_memories
+                   WHERE subject = $1 AND namespace_id = $2 AND superseded_by IS NULL
+                   ORDER BY valid_at DESC LIMIT $3",
             )
             .bind(subject)
+            .bind(namespace_id)
             .bind(limit_i64)
             .fetch_all(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
 
             Ok(rows.into_iter().map(row_to_semantic).collect())
-        })
-    }
-
-    fn invalidate_semantic(&self, id: Uuid) -> StorageResult<()> {
-        let now = Utc::now();
-        self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
-            query::<Postgres>("UPDATE semantic_memories SET invalid_at = $1 WHERE id = $2")
-                .bind(now)
-                .bind(id)
-                .execute(&mut *conn)
-                .await
-                .map_err(sqlx_to_io)?;
-            Ok(())
         })
     }
 
@@ -1179,26 +1464,28 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn update_procedural_reliability(
+    fn update_procedural_reliability_in_namespace(
         &self,
         id: Uuid,
+        namespace_id: Uuid,
         reliability: f32,
         trial_count: u32,
         success_count: u32,
     ) -> StorageResult<()> {
         let now = Utc::now();
         self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
+            let mut conn = self.scoped_conn(namespace_id).await?;
             query::<Postgres>(
                 r"UPDATE procedural_memories
                    SET reliability = $1, trial_count = $2, success_count = $3, last_used = $4
-                   WHERE id = $5",
+                   WHERE id = $5 AND namespace_id = $6",
             )
             .bind(reliability)
             .bind(i32::try_from(trial_count).unwrap_or(i32::MAX))
             .bind(i32::try_from(success_count).unwrap_or(i32::MAX))
             .bind(now)
             .bind(id)
+            .bind(namespace_id)
             .execute(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
@@ -1341,24 +1628,6 @@ impl StorageTrait for PostgresBackend {
             )
             .bind(episode_id)
             .bind(namespace_id)
-            .execute(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
-            Ok(usize::try_from(result.rows_affected()).unwrap_or(0))
-        })
-    }
-
-    fn delete_observations_by_entity(&self, entity_id: Uuid) -> StorageResult<usize> {
-        self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
-            let result = query::<Postgres>(
-                "DELETE FROM observation_memories \
-                 WHERE episode_id IN (\
-                   SELECT DISTINCT episode_id FROM episodic_memories \
-                    WHERE about_entity = $1 OR source_entity = $1\
-                 )",
-            )
-            .bind(entity_id)
             .execute(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
@@ -2027,43 +2296,6 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    fn update_semantic_content(
-        &self,
-        id: Uuid,
-        predicate: &str,
-        object: &str,
-        confidence: Option<f32>,
-    ) -> StorageResult<()> {
-        self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
-
-            if let Some(conf) = confidence {
-                query::<Postgres>(
-                    "UPDATE semantic_memories SET predicate = $1, object = $2, confidence = $3 WHERE id = $4",
-                )
-                .bind(predicate)
-                .bind(object)
-                .bind(conf)
-                .bind(id)
-                .execute(&mut *conn)
-                .await
-                .map_err(sqlx_to_io)?;
-            } else {
-                query::<Postgres>(
-                    "UPDATE semantic_memories SET predicate = $1, object = $2 WHERE id = $3",
-                )
-                .bind(predicate)
-                .bind(object)
-                .bind(id)
-                .execute(&mut *conn)
-                .await
-                .map_err(sqlx_to_io)?;
-            }
-
-            Ok(())
-        })
-    }
-
     // -----------------------------------------------------------------------
     // Entities (bulk)
     // -----------------------------------------------------------------------
@@ -2095,18 +2327,6 @@ impl StorageTrait for PostgresBackend {
                     }
                 })
                 .collect())
-        })
-    }
-
-    fn delete_entity(&self, id: Uuid) -> StorageResult<bool> {
-        self.block_on(async {
-            let mut conn = self.maybe_scoped_conn().await?;
-            let result = query::<Postgres>("DELETE FROM entities WHERE id = $1")
-                .bind(id)
-                .execute(&mut *conn)
-                .await
-                .map_err(sqlx_to_io)?;
-            Ok(result.rows_affected() > 0)
         })
     }
 

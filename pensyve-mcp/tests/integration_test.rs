@@ -128,7 +128,7 @@ async fn test_remember_creates_semantic_memory() {
     // Verify retrieval.
     let stored = state
         .storage
-        .list_semantic_by_entity(entity.id, 10)
+        .list_semantic_by_entity_in_namespace(entity.id, state.namespace.id, 10)
         .expect("list semantic");
 
     assert_eq!(stored.len(), 1, "should have exactly one semantic memory");
@@ -235,7 +235,7 @@ async fn test_forget_removes_all_memories_for_entity() {
     // Confirm they're there.
     let before = state
         .storage
-        .list_semantic_by_entity(entity.id, 10)
+        .list_semantic_by_entity_in_namespace(entity.id, state.namespace.id, 10)
         .expect("list semantic");
     assert_eq!(before.len(), 2);
 
@@ -249,7 +249,7 @@ async fn test_forget_removes_all_memories_for_entity() {
     // Confirm they're gone.
     let after = state
         .storage
-        .list_semantic_by_entity(entity.id, 10)
+        .list_semantic_by_entity_in_namespace(entity.id, state.namespace.id, 10)
         .expect("list semantic after delete");
     assert!(after.is_empty(), "no memories should remain after forget");
 }
@@ -295,7 +295,7 @@ async fn test_inspect_lists_semantic_memories_for_entity() {
     let limit = 20_usize;
     let semantics = state
         .storage
-        .list_semantic_by_entity(entity.id, limit)
+        .list_semantic_by_entity_in_namespace(entity.id, state.namespace.id, limit)
         .expect("list semantic");
 
     assert_eq!(semantics.len(), 2);

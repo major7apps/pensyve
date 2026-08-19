@@ -227,7 +227,9 @@ impl MemoryGraph {
             graph.add_node(entity.id);
 
             // Entity → memory edges for episodic memories.
-            if let Ok(memories) = storage.list_episodic_by_entity(entity.id, usize::MAX) {
+            if let Ok(memories) =
+                storage.list_episodic_by_entity_in_namespace(entity.id, namespace_id, usize::MAX)
+            {
                 for mem in memories {
                     graph.add_edge(entity.id, mem.id, 1.0);
                 }
@@ -243,7 +245,9 @@ impl MemoryGraph {
 
         // Also pull semantic memories: subject → memory node.
         for entity in &entities {
-            if let Ok(sem_mems) = storage.list_semantic_by_entity(entity.id, usize::MAX) {
+            if let Ok(sem_mems) =
+                storage.list_semantic_by_entity_in_namespace(entity.id, namespace_id, usize::MAX)
+            {
                 for mem in sem_mems {
                     graph.add_edge(entity.id, mem.id, mem.confidence);
                 }
