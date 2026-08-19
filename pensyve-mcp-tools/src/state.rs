@@ -23,16 +23,36 @@ const DEFAULT_SNAPSHOT_RETENTION_DAYS: u32 = 30;
 /// normal rate never reaches it; one looping `remember` → `forget` stops here.
 const DEFAULT_SNAPSHOT_MAX_PER_NAMESPACE: u32 = 50;
 
+/// Longest accepted retention window: a century. Past this the value is not a
+/// retention policy, it is a typo (`20260818` as a date, say) — and a window
+/// long enough to push the cutoff off the end of the calendar makes the bound
+/// inert anyway, which is not what someone typing a very large number meant.
+/// `0` remains the way to say "keep everything".
+const MAX_SNAPSHOT_RETENTION_DAYS: u32 = 36_500;
+
+/// Largest accepted per-namespace count cap. Same reasoning: a directory this
+/// deep is not a policy anyone chose, and enumerating it on every forget would
+/// cost more than the bound saves.
+const MAX_SNAPSHOT_MAX_PER_NAMESPACE: u32 = 1_000_000;
+
 /// One retention bound, from its raw environment value.
 ///
 /// Takes the value rather than reading the variable so it is testable without
 /// mutating process-global state (#273). `0` disables the bound; anything
-/// unparseable keeps the default and says so — silently disabling a bound
-/// because someone wrote `30d` would be the one outcome nobody asked for.
-fn retention_bound(var: &str, raw: Option<&str>, default: u32) -> Option<u32> {
+/// unparseable — or larger than `max` — keeps the default and says so.
+/// Silently disabling a bound because someone wrote `30d`, or accepting a
+/// window so long the bound is inert, would each be the one outcome nobody
+/// asked for.
+fn retention_bound(var: &str, raw: Option<&str>, default: u32, max: u32) -> Option<u32> {
     let value = match raw {
         None => default,
         Some(raw) => match raw.trim().parse::<u32>() {
+            Ok(parsed) if parsed > max => {
+                tracing::warn!(
+                    "{var}={raw:?} exceeds the maximum of {max}; using the default of {default}"
+                );
+                default
+            }
             Ok(parsed) => parsed,
             Err(err) => {
                 tracing::warn!(
@@ -115,6 +135,7 @@ impl PensyveState {
                     .ok()
                     .as_deref(),
                 DEFAULT_SNAPSHOT_RETENTION_DAYS,
+                MAX_SNAPSHOT_RETENTION_DAYS,
             ),
             max_count: retention_bound(
                 "PENSYVE_SNAPSHOT_MAX_PER_NAMESPACE",
@@ -122,6 +143,7 @@ impl PensyveState {
                     .ok()
                     .as_deref(),
                 DEFAULT_SNAPSHOT_MAX_PER_NAMESPACE,
+                MAX_SNAPSHOT_MAX_PER_NAMESPACE,
             ),
         }
     }
@@ -197,15 +219,17 @@ mod tests {
         });
     }
 
+    const TEST_MAX: u32 = 36_500;
+
     #[test]
     fn retention_bound_falls_back_to_the_default_when_unset() {
-        assert_eq!(retention_bound("VAR", None, 30), Some(30));
+        assert_eq!(retention_bound("VAR", None, 30, TEST_MAX), Some(30));
     }
 
     #[test]
     fn retention_bound_reads_an_explicit_value() {
-        assert_eq!(retention_bound("VAR", Some("7"), 30), Some(7));
-        assert_eq!(retention_bound("VAR", Some(" 7 "), 30), Some(7));
+        assert_eq!(retention_bound("VAR", Some("7"), 30, TEST_MAX), Some(7));
+        assert_eq!(retention_bound("VAR", Some(" 7 "), 30, TEST_MAX), Some(7));
     }
 
     /// The documented way to turn a bound off — and the only value that may
@@ -213,25 +237,55 @@ mod tests {
     /// one the current forget just wrote.
     #[test]
     fn retention_bound_treats_zero_as_disabled() {
-        assert_eq!(retention_bound("VAR", Some("0"), 30), None);
+        assert_eq!(retention_bound("VAR", Some("0"), 30, TEST_MAX), None);
     }
 
     /// A typo must not silently disable the bound it was trying to set.
     #[test]
     fn retention_bound_keeps_the_default_for_an_unparseable_value() {
-        assert_eq!(retention_bound("VAR", Some("30d"), 30), Some(30));
-        assert_eq!(retention_bound("VAR", Some("-1"), 30), Some(30));
-        assert_eq!(retention_bound("VAR", Some(""), 30), Some(30));
+        assert_eq!(retention_bound("VAR", Some("30d"), 30, TEST_MAX), Some(30));
+        assert_eq!(retention_bound("VAR", Some("-1"), 30, TEST_MAX), Some(30));
+        assert_eq!(retention_bound("VAR", Some(""), 30, TEST_MAX), Some(30));
+    }
+
+    /// A window whose cutoff falls off the end of the calendar makes the bound
+    /// inert, which is never what a very large number was meant to express.
+    /// `pensyve-core` refuses to panic on one; this stops it reaching there.
+    #[test]
+    fn retention_bound_keeps_the_default_for_a_value_past_the_maximum() {
+        assert_eq!(
+            retention_bound("VAR", Some(&u32::MAX.to_string()), 30, TEST_MAX),
+            Some(30)
+        );
+        assert_eq!(
+            retention_bound("VAR", Some("20260818"), 30, TEST_MAX),
+            Some(30)
+        );
+        assert_eq!(
+            retention_bound("VAR", Some(&TEST_MAX.to_string()), 30, TEST_MAX),
+            Some(TEST_MAX),
+            "the maximum itself is accepted"
+        );
     }
 
     #[test]
     fn the_shipped_defaults_bound_both_dimensions() {
         assert_eq!(
-            retention_bound("VAR", None, DEFAULT_SNAPSHOT_RETENTION_DAYS),
+            retention_bound(
+                "VAR",
+                None,
+                DEFAULT_SNAPSHOT_RETENTION_DAYS,
+                MAX_SNAPSHOT_RETENTION_DAYS
+            ),
             Some(30)
         );
         assert_eq!(
-            retention_bound("VAR", None, DEFAULT_SNAPSHOT_MAX_PER_NAMESPACE),
+            retention_bound(
+                "VAR",
+                None,
+                DEFAULT_SNAPSHOT_MAX_PER_NAMESPACE,
+                MAX_SNAPSHOT_MAX_PER_NAMESPACE
+            ),
             Some(50)
         );
     }

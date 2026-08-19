@@ -477,9 +477,26 @@ fn prune_namespace_dir_with(
     }
     snapshots.sort();
 
-    let cutoff = policy
-        .max_age_days
-        .map(|days| now - Duration::days(i64::from(days)));
+    // Subtracting the window can leave the calendar: `max_age_days` is a `u32`
+    // and `DateTime - TimeDelta` panics rather than saturating. This code runs
+    // on the blocking pool *after* the delete committed, where a panic reaches
+    // the caller as a `JoinError` — the forget reported as failed while the
+    // rows are gone, and the bookkeeping that follows it skipped. So an
+    // unrepresentable cutoff bounds nothing and says so, which is the same
+    // outcome the operator would get from setting the window to `0`.
+    let cutoff = match policy.max_age_days {
+        None => None,
+        Some(days) => {
+            let cutoff = Duration::try_days(i64::from(days))
+                .and_then(|window| now.checked_sub_signed(window));
+            if cutoff.is_none() {
+                outcome.warnings.push(format!(
+                    "ignoring the age bound: {days} days before {now} is not a representable date"
+                ));
+            }
+            cutoff
+        }
+    };
     let (mut survivors, mut victims): (Vec<_>, Vec<_>) =
         snapshots
             .into_iter()
@@ -1154,6 +1171,39 @@ mod tests {
         assert_eq!(outcome.removed, 1, "only the real snapshot may be removed");
         assert!(outside.exists(), "the symlink's target must be untouched");
         assert_eq!(file_names(&dir).len(), 1, "the symlink itself stays too");
+    }
+
+    /// A retention window so long its cutoff falls outside the calendar must
+    /// not panic. This runs on the blocking pool *after* the delete committed:
+    /// a panic there surfaces as a `JoinError`, so the caller is told the
+    /// forget failed while the rows are gone and the bookkeeping that follows
+    /// — vector-index cleanup, the activity record — never runs.
+    #[test]
+    fn prune_survives_a_retention_window_longer_than_the_calendar() {
+        let f = fixture();
+        let dir = f.dir.path().join("snapshots");
+        let ancient = write_aged(&f, &dir, epoch());
+
+        let outcome = prune_namespace_dir(
+            &dir,
+            RetentionPolicy {
+                max_age_days: Some(u32::MAX),
+                max_count: None,
+            },
+            Utc::now(),
+        );
+
+        assert_eq!(
+            outcome.removed, 0,
+            "an unrepresentable window bounds nothing"
+        );
+        assert!(ancient.exists());
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert!(
+            outcome.warnings[0].contains(&u32::MAX.to_string()),
+            "the warning must name the value the operator set: {:?}",
+            outcome.warnings
+        );
     }
 
     #[test]
