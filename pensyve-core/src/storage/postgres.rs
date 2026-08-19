@@ -205,8 +205,9 @@ impl RoleRlsExemptions {
     /// Whether row-level security is inert for this role.
     ///
     /// Note what this deliberately does *not* cover: a role that merely *owns*
-    /// the tables is also exempt, but only until `FORCE ROW LEVEL SECURITY` is
-    /// applied, which is the supported way to run. These two flags are the ones
+    /// the tables is also exempt, but `postgres_schema.sql` ends with `FORCE
+    /// ROW LEVEL SECURITY` on every policied table, so that exemption is gone
+    /// by the time the backend serves anything. These two flags are the ones
     /// `FORCE` cannot fix.
     #[must_use]
     pub fn exempt(&self) -> bool {
@@ -364,10 +365,10 @@ impl PostgresBackend {
     ///
     /// `postgres_schema.sql` is owner-only DDL: `CREATE TABLE`, `ALTER TABLE`,
     /// `CREATE POLICY`. Unconditionally sending it on every startup means the
-    /// serving role must own every table — and a role that owns a table is
-    /// exempt from that table's policies unless `FORCE ROW LEVEL SECURITY` is
-    /// set, while a managed-Postgres owner typically also carries `BYPASSRLS`,
-    /// which no amount of `FORCE` removes. Separating "apply the schema" from
+    /// serving role must own every table — and while the schema's `FORCE ROW
+    /// LEVEL SECURITY` removes the ownership exemption, a managed-Postgres
+    /// owner typically also carries `BYPASSRLS`, which no amount of `FORCE`
+    /// removes. Separating "apply the schema" from
     /// "serve traffic" is what lets a deployment run as an unprivileged
     /// `pensyve_app` role that the policies genuinely apply to.
     ///
@@ -593,31 +594,6 @@ impl PostgresBackend {
         }
     }
 
-    /// Subject the schema-owning role to its own row-level security policies.
-    ///
-    /// `postgres_schema.sql` enables RLS and declares the
-    /// `namespace_isolation_*` policies, but Postgres exempts a table's owner
-    /// from its own policies, so those policies do nothing for an application
-    /// that connects as the owner. This applies `FORCE ROW LEVEL SECURITY`,
-    /// which removes the exemption.
-    ///
-    /// Deliberately not called by [`Self::new`]: enforcement fails closed, so
-    /// a connection that has not bound a namespace stops seeing rows. Every
-    /// query path must carry a namespace before this is switched on. See
-    /// `postgres_rls_enforce.sql` and `docs/SECURITY.md`.
-    ///
-    /// Requires the connecting role to own the tables. Idempotent.
-    pub fn enforce_rls(&self) -> StorageResult<()> {
-        self.block_on(async {
-            self.pool
-                .unbound()
-                .execute(raw_sql(RLS_ENFORCE_SCHEMA))
-                .await
-                .map_err(sqlx_to_io)?;
-            Ok(())
-        })
-    }
-
     /// Execute an async future from a sync context.
     ///
     /// If we're already inside a tokio runtime (e.g. the MCP gateway), uses
@@ -803,9 +779,6 @@ impl PostgresBackend {
 // ---------------------------------------------------------------------------
 
 const SCHEMA: &str = include_str!("postgres_schema.sql");
-
-/// Applied by [`PostgresBackend::enforce_rls`], not by [`PostgresBackend::new`].
-const RLS_ENFORCE_SCHEMA: &str = include_str!("postgres_rls_enforce.sql");
 
 const LIST_OBSERVATIONS_BY_ENTITY_INSTANCE_SQL: &str = r"SELECT id, namespace_id, episode_id, entity_type, instance, action,
              quantity, unit, content, embedding::text AS embedding, confidence,
@@ -2146,12 +2119,13 @@ impl StorageTrait for PostgresBackend {
 
     /// Entity-wide delete, confined to `namespace_id`.
     ///
-    /// The `AND namespace_id = $2` predicates carry the isolation on their own.
-    /// Row-level security cannot: the application connects as the schema owner,
-    /// which Postgres exempts from its own policies, so an entity-only
-    /// predicate would delete across tenants in every deployment shipping
-    /// today. The connection is bound to the namespace as well, which is what
-    /// keeps the statements working once `postgres_rls_enforce.sql` is applied.
+    /// The `AND namespace_id = $2` predicates carry the isolation on their own,
+    /// and have to: row-level security is the second layer, not the first, and
+    /// it is inert for a `BYPASSRLS` role — which a managed Postgres commonly
+    /// grants the database owner — no matter what the schema forces. Without
+    /// the predicate an entity-only match would delete across tenants there.
+    /// The connection is bound to the namespace as well, which is what keeps
+    /// the statements working under the schema's `FORCE ROW LEVEL SECURITY`.
     ///
     /// There is no full-text cleanup here, unlike the `SQLite` backend: this
     /// schema indexes through the `fts_content` generated column on each table,

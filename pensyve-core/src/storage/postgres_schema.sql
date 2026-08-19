@@ -333,14 +333,10 @@ CREATE INDEX IF NOT EXISTS idx_activity_ns_date ON activity_events(namespace_id,
 -- namespace.  Namespaces are UUIDs, so both compare unequal to every row:
 -- an unscoped connection reads nothing and writes nothing.
 --
--- ENABLE alone does not make these policies apply to the application.
--- Postgres exempts a table's owner from its own policies, and the application
--- connects as the role that owns the schema, so the policies below are inert
--- in a default deployment.  Removing that exemption is a deliberate,
--- operator-run step -- `postgres_rls_enforce.sql`, applied via
--- `PostgresBackend::enforce_rls` -- because it fails closed: any query path
--- that does not carry a namespace stops returning rows.  See docs/SECURITY.md
--- for the role model, the preconditions, and the migration order.
+-- ENABLE alone does not make these policies apply to the schema owner:
+-- Postgres exempts a table's owner from its own policies.  The FORCE block at
+-- the bottom of this file removes that exemption, so the policies apply to
+-- every role.  See docs/SECURITY.md for the role model.
 -- ---------------------------------------------------------------------------
 
 ALTER TABLE entities             ENABLE ROW LEVEL SECURITY;
@@ -397,3 +393,55 @@ DROP POLICY IF EXISTS namespace_isolation_edges ON edges;
 CREATE POLICY namespace_isolation_edges ON edges
   USING (namespace_id::text = current_setting('pensyve.namespace_id', true))
   WITH CHECK (namespace_id::text = current_setting('pensyve.namespace_id', true));
+
+-- ---------------------------------------------------------------------------
+-- Enforcement
+--
+-- Postgres exempts a table's owner from its own policies, so everything above
+-- is inert for the role that applies this file.  FORCE removes the exemption
+-- and is what makes row-level security a real second layer rather than a
+-- declaration.  It shipped as a separate operator-applied migration until
+-- #254; production now runs as a NOBYPASSRLS role with every storage call site
+-- carrying a namespace, so enforcement is the schema's default state.
+--
+-- Enforcement fails CLOSED.  A connection that has not bound
+-- `pensyve.namespace_id` sees zero rows and cannot insert.  That is the point.
+-- `ScopedPool` makes it structural: every acquisition binds the GUC, and the
+-- `unbound()` escape hatch is allowlisted by
+-- `only_bound_connections_reach_policied_tables`.
+--
+-- # Why this block is last
+--
+-- FORCE is DDL, which row-level security never applies to, so its own
+-- placement is unconstrained -- but the edges backfill further up has to READ
+-- `entities` inside the `SET row_security = off` window, and that read is
+-- refused rather than filtered once the reading role is subject to the
+-- policies.  Forcing before the window would make the very startup that
+-- introduces enforcement blind its own migration and refuse.  Running last,
+-- the upgrade order is: migrate under the old (unforced) state, then force.
+-- `schema_forces_every_policied_table_and_only_those` pins both the coverage
+-- and the placement.
+--
+-- Exactly the tables with a `namespace_isolation_*` policy, and no others: a
+-- forced table with no policy denies every row.  `pensyve_schema_state`,
+-- `namespaces` and `activity_events` therefore stay out.
+--
+-- Every statement is idempotent, so the re-apply on every startup is a no-op.
+--
+-- Rollback, if a deployment has to be taken back to the unenforced shape:
+--   ALTER TABLE <table> NO FORCE ROW LEVEL SECURITY;
+-- per table.  Instant, and the policies and the data are untouched.
+--
+-- One thing FORCE cannot do: a role with the `BYPASSRLS` attribute -- which a
+-- managed Postgres commonly grants the database owner -- is exempt regardless.
+-- Startup reports that (`PostgresBackend::role_rls_exemptions`); the role must
+-- be NOBYPASSRLS for any of this to mean anything.  See docs/SECURITY.md.
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE entities             FORCE ROW LEVEL SECURITY;
+ALTER TABLE episodes             FORCE ROW LEVEL SECURITY;
+ALTER TABLE episodic_memories    FORCE ROW LEVEL SECURITY;
+ALTER TABLE semantic_memories    FORCE ROW LEVEL SECURITY;
+ALTER TABLE procedural_memories  FORCE ROW LEVEL SECURITY;
+ALTER TABLE observation_memories FORCE ROW LEVEL SECURITY;
+ALTER TABLE edges                FORCE ROW LEVEL SECURITY;

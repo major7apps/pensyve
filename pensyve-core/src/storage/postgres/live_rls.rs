@@ -35,12 +35,15 @@
 //! of that: the setting must survive to the next statement, and must not
 //! survive into the next checkout.
 //!
-//! **Fixed — enforcement is now possible.** Postgres exempts a table's owner
-//! from its own policies, and the application connects as the schema owner, so
-//! `ENABLE ROW LEVEL SECURITY` alone left the policies inert.
-//! `postgres_rls_enforce.sql` adds `FORCE`, applied through
-//! [`PostgresBackend::enforce_rls`] and by [`Fixture::enforce_rls`] here.
-//! [`rls_alone_blocks_cross_namespace_access`] is the payoff: it runs a
+//! **Fixed — enforcement is now the default.** Postgres exempts a table's
+//! owner from its own policies, and the application connects as the schema
+//! owner, so `ENABLE ROW LEVEL SECURITY` alone left the policies inert. `FORCE`
+//! removes that exemption. It shipped as a separate operator-applied file
+//! (`postgres_rls_enforce.sql`) while the storage surface was still being
+//! converted; #254 finished that work and moved the statements into
+//! `postgres_schema.sql`, so every startup enforces.
+//! [`schema_forces_every_policied_table_and_only_those`] pins the statements
+//! and [`rls_alone_blocks_cross_namespace_access`] is the payoff: it runs a
 //! storage method's own SQL with the `namespace_id` predicate *deleted* and
 //! shows RLS still blocks the cross-namespace access.
 //!
@@ -80,14 +83,20 @@
 //! [`startup_reports_whether_the_role_is_exempt_from_rls`] — because a
 //! `BYPASSRLS` role makes `FORCE` enforce nothing with no other symptom.
 //!
-//! **Still open — enforcement is not yet the default.** What is left is the
-//! flip itself: moving `FORCE` out of `postgres_rls_enforce.sql` and into
-//! `postgres_schema.sql`. Until that lands it stays an explicit operator step
-//! — see `docs/SECURITY.md`.
+//! # Which layer a test is gating
 //!
-//! Tests therefore come in two flavours: [`Fixture::provision`] mirrors a
-//! current deployment (policies present, not enforced), and a test that wants
-//! layer 2 calls [`Fixture::enforce_rls`] on top.
+//! [`Fixture::provision`] applies `postgres_schema.sql` as an ordinary
+//! `NOSUPERUSER NOBYPASSRLS` role, so a fixture arrives with **both** layers
+//! live — that is the deployed shape. Most tests take it as it comes.
+//!
+//! A test that is gating *layer 1* calls [`Fixture::relax_rls`] first, which
+//! un-forces every policied table. Without that, a cross-namespace assertion
+//! passes on the policies alone and proves nothing about the `namespace_id`
+//! predicate it was written for — and that predicate is not redundant: it is
+//! the only layer on `SQLite`, and the only one left on a Postgres whose role
+//! carries `BYPASSRLS`, which `FORCE` cannot remove
+//! ([`startup_reports_whether_the_role_is_exempt_from_rls`] is why startup says
+//! so out loud). Those tests name the reason in their own docs.
 
 use std::collections::HashMap;
 
@@ -198,8 +207,10 @@ async fn exec(pool: &PgPool, sql: impl Into<String>) {
 ///
 /// The role matters: Postgres exempts superusers unconditionally, and table
 /// owners by default, from row-level security. Applying the schema as an
-/// ordinary `NOSUPERUSER NOBYPASSRLS` role is what lets [`Fixture::enforce_rls`]
-/// produce a connection the policies actually apply to.
+/// ordinary `NOSUPERUSER NOBYPASSRLS` role is what lets the schema's own
+/// `FORCE ROW LEVEL SECURITY` produce a connection the policies actually apply
+/// to. A fixture therefore arrives enforced; [`Fixture::relax_rls`] is how a
+/// test that needs the un-forced shape asks for it.
 struct Fixture {
     rt: Runtime,
     admin: PgPool,
@@ -289,19 +300,34 @@ impl Fixture {
         }
     }
 
-    /// Subject the schema owner to its own RLS policies, turning layer 2 on.
+    /// Give the schema owner its ownership exemption back, turning layer 2
+    /// *off* for this fixture.
     ///
-    /// Runs the same `postgres_rls_enforce.sql` an operator would, through the
-    /// same entry point, so these tests gate the real migration rather than a
-    /// test-local imitation of it.
+    /// The inverse of the `FORCE ROW LEVEL SECURITY` block `postgres_schema.sql`
+    /// ends with, which [`Fixture::provision`] has therefore already applied.
+    /// Two kinds of test want it undone:
     ///
-    /// Unlike before, this can be called before seeding: the backend's write
-    /// paths bind the namespace GUC, so the policies' `WITH CHECK` half
-    /// accepts their inserts.
-    fn enforce_rls(&self) {
-        self.backend
-            .enforce_rls()
-            .expect("force row level security");
+    /// * The ones that gate layer 1 — the explicit `namespace_id = $n`
+    ///   predicates in the handwritten SQL. Those predicates are what confines
+    ///   a statement on `SQLite`, and on any Postgres whose role carries
+    ///   `BYPASSRLS`, which `FORCE` cannot remove. With the policies live a
+    ///   cross-namespace assertion passes whether or not the predicate is
+    ///   there, so the test would pin nothing.
+    /// * The ones that stage a database provisioned before enforcement shipped,
+    ///   where the schema still has migrations to run.
+    ///
+    /// Instant and total: the policies and the rows are untouched, exactly as
+    /// the rollback note in the schema describes.
+    fn relax_rls(&self) {
+        self.rt.block_on(async {
+            for (table, _) in RLS_POLICIES {
+                exec(
+                    self.backend.pool(),
+                    format!("ALTER TABLE {table} NO FORCE ROW LEVEL SECURITY"),
+                )
+                .await;
+            }
+        });
     }
 
     /// Create — once — an unprivileged role that can read and write every
@@ -583,17 +609,18 @@ fn rows_visible_to_namespace(fixture: &Fixture, namespace_id: Uuid) -> i64 {
 /// readable only through namespace A, and `delete_memory_by_id_in_namespace`
 /// must refuse to delete it through namespace B.
 ///
-/// This runs without `FORCE ROW LEVEL SECURITY`, mirroring a deployment as
-/// shipped today: the application connects as the schema owner, so the policies
-/// do not apply and the SQL predicates are the only thing enforcing isolation.
-/// [`namespace_scoping_end_to_end_under_enforced_rls`] is the same contract
-/// with RLS switched on.
+/// Runs with `FORCE ROW LEVEL SECURITY` lifted, so the SQL predicates are the
+/// only thing enforcing isolation — the layer that also carries `SQLite`, and
+/// the only one left on a Postgres whose role holds `BYPASSRLS`.
+/// [`namespace_scoping_end_to_end_under_enforced_rls`] is the same contract in
+/// the shape the schema ships, with both layers live.
 #[test]
 fn namespace_scoping_end_to_end() {
     let Some(admin_opts) = skip_notice("namespace_scoping_end_to_end") else {
         return;
     };
     let fixture = Fixture::provision(&admin_opts);
+    fixture.relax_rls();
     let backend = &fixture.backend;
 
     let ns_a = Namespace::new(format!("rls-a-{}", Uuid::new_v4().simple()));
@@ -670,7 +697,6 @@ fn rls_policies_isolate_namespaces_when_the_guc_is_set() {
     let ns_a = Namespace::new(format!("rls-a-{}", Uuid::new_v4().simple()));
     let ns_b = Namespace::new(format!("rls-b-{}", Uuid::new_v4().simple()));
     seed(&fixture, &ns_a, &ns_b);
-    fixture.enforce_rls();
 
     assert_eq!(
         rows_visible_to_namespace(&fixture, ns_a.id),
@@ -821,7 +847,6 @@ fn rls_alone_blocks_cross_namespace_access() {
     let ns_a = Namespace::new(format!("rls-a-{}", Uuid::new_v4().simple()));
     let ns_b = Namespace::new(format!("rls-b-{}", Uuid::new_v4().simple()));
     let memory = seed(&fixture, &ns_a, &ns_b);
-    fixture.enforce_rls();
 
     let deleted_via_b = fixture.rt.block_on(async {
         let mut conn = fixture
@@ -876,11 +901,11 @@ fn rls_alone_blocks_cross_namespace_access() {
 
 /// The end-to-end scoping contract, re-run with RLS enforced.
 ///
-/// [`namespace_scoping_end_to_end`] covers a deployment as shipped today, where
-/// the policies are inert and the SQL predicates do all the work. This is the
-/// same contract with layer 2 switched on, and is the #218 regression gate as
-/// originally intended: a scoped delete must no-op through a foreign namespace
-/// even when RLS — not the predicate — is what stops it.
+/// [`namespace_scoping_end_to_end`] covers the same contract with enforcement
+/// lifted, where the SQL predicates do all the work. This one runs in the
+/// shape the schema ships — both layers live — and is the #218 regression gate
+/// as originally intended: a scoped delete must no-op through a foreign
+/// namespace even when RLS, not the predicate, is what stops it.
 #[test]
 fn namespace_scoping_end_to_end_under_enforced_rls() {
     let Some(admin_opts) = skip_notice("namespace_scoping_end_to_end_under_enforced_rls") else {
@@ -892,7 +917,6 @@ fn namespace_scoping_end_to_end_under_enforced_rls() {
     let ns_a = Namespace::new(format!("rls-a-{}", Uuid::new_v4().simple()));
     let ns_b = Namespace::new(format!("rls-b-{}", Uuid::new_v4().simple()));
     let memory = seed(&fixture, &ns_a, &ns_b);
-    fixture.enforce_rls();
 
     assert_eq!(
         memory_ids(
@@ -967,9 +991,9 @@ fn namespace_scoping_end_to_end_under_enforced_rls() {
 /// transaction still commits.
 ///
 /// [`capturing_delete_is_confined_to_its_namespace`] is the same contract with
-/// RLS inert, which is the configuration that ships. Together they show the
-/// explicit `namespace_id` predicates hold in both modes, which is why they
-/// stay even though the GUC now binds correctly.
+/// enforcement lifted. Together they show the explicit `namespace_id`
+/// predicates hold in both modes, which is why they stay even though the
+/// schema now forces.
 #[test]
 fn capturing_delete_still_works_under_enforced_rls() {
     let Some(admin_opts) = skip_notice("capturing_delete_still_works_under_enforced_rls") else {
@@ -988,8 +1012,6 @@ fn capturing_delete_still_works_under_enforced_rls() {
     backend.save_episodic(&mine).expect("save A's memory");
     let theirs = EpisodicMemory::new(ns_b.id, Uuid::new_v4(), entity_id, entity_id, "tenant B");
     backend.save_episodic(&theirs).expect("save B's memory");
-
-    fixture.enforce_rls();
 
     let snapshot_root = tempfile::tempdir().expect("snapshot tempdir");
     let outcome = crate::snapshot::forget_entity_bounded(
@@ -1033,8 +1055,8 @@ fn capturing_delete_still_works_under_enforced_rls() {
 /// Now that the connection is bound, the delete takes effect in its own
 /// namespace and only there.
 ///
-/// [`entity_delete_is_confined_to_its_namespace`] is the same contract with RLS
-/// inert, which is the configuration that ships.
+/// [`entity_delete_is_confined_to_its_namespace`] is the same contract with
+/// enforcement lifted.
 #[test]
 fn entity_delete_still_works_under_enforced_rls() {
     let Some(admin_opts) = skip_notice("entity_delete_still_works_under_enforced_rls") else {
@@ -1053,8 +1075,6 @@ fn entity_delete_still_works_under_enforced_rls() {
     backend.save_episodic(&mine).expect("save A's memory");
     let theirs = EpisodicMemory::new(ns_b.id, Uuid::new_v4(), entity_id, entity_id, "tenant B");
     backend.save_episodic(&theirs).expect("save B's memory");
-
-    fixture.enforce_rls();
 
     assert_eq!(
         backend
@@ -1086,10 +1106,10 @@ fn entity_delete_still_works_under_enforced_rls() {
 /// `gdpr::erase_entity` must not reach across namespaces.
 ///
 /// Same shape as [`capturing_delete_is_confined_to_its_namespace`], and the
-/// same reasoning: entity ids are not globally unique, and with RLS inert — the
-/// configuration every deployment runs today, because the backend connects as
-/// the schema owner — an entity-only predicate has nothing else filtering it.
-/// This variant reaches further than the capturing one, which is MCP-only.
+/// same reasoning: entity ids are not globally unique, and with enforcement
+/// lifted — the shape of any deployment whose role holds `BYPASSRLS` — an
+/// entity-only predicate has nothing else filtering it. This variant reaches
+/// further than the capturing one, which is MCP-only.
 ///
 /// Object-side semantic rows are seeded deliberately: the delete has always
 /// matched `subject OR object_entity`, so both must go, and both must stay out
@@ -1100,6 +1120,7 @@ fn entity_delete_is_confined_to_its_namespace() {
         return;
     };
     let fixture = Fixture::provision(&admin_opts);
+    fixture.relax_rls();
     let backend = &fixture.backend;
 
     let ns_a = Namespace::new(format!("forget-a-{}", Uuid::new_v4().simple()));
@@ -1192,7 +1213,6 @@ fn edges_are_confined_to_their_namespace_under_enforced_rls() {
     let ns_b = Namespace::new(format!("edges-b-{}", Uuid::new_v4().simple()));
     backend.save_namespace(&ns_a).expect("save namespace A");
     backend.save_namespace(&ns_b).expect("save namespace B");
-    fixture.enforce_rls();
 
     // One edge in A only: namespace B holds nothing, so anything it sees for
     // this entity id came across the boundary.
@@ -1361,7 +1381,6 @@ fn capturing_erase_is_confined_to_its_namespace_under_enforced_rls() {
     let ns_b = Namespace::new(format!("erase-b-{}", Uuid::new_v4().simple()));
     backend.save_namespace(&ns_a).expect("save namespace A");
     backend.save_namespace(&ns_b).expect("save namespace B");
-    fixture.enforce_rls();
 
     // The `entities` row can only exist once — `id` is the primary key — so it
     // is seeded in A. Everything else collides deliberately.
@@ -1455,6 +1474,16 @@ fn capturing_erase_is_confined_to_its_namespace_under_enforced_rls() {
 /// backfill reads. An edge whose source entity is gone can be attributed to
 /// nothing and no scoped accessor could ever reach it, so the migration
 /// deletes it — which is also what lets the column be tightened to NOT NULL.
+///
+/// Staged un-forced ([`Fixture::relax_rls`]) because that is the truthful
+/// shape of a database old enough to still need this migration: it was
+/// provisioned before the schema forced anything. It is also the only shape in
+/// which the migration can run — the backfill has to read `entities`, and a
+/// forced `entities` refuses that read rather than answering it wrongly, which
+/// [`schema_migration_refuses_rather_than_deleting_edges_it_cannot_attribute`]
+/// is the gate on. The re-applied schema forces again on its way out, which is
+/// what makes the upgrade order (migrate, then enforce) work on a real
+/// deployment.
 #[test]
 fn schema_migrates_a_database_that_predates_the_edges_namespace() {
     let Some(admin_opts) =
@@ -1463,6 +1492,7 @@ fn schema_migrates_a_database_that_predates_the_edges_namespace() {
         return;
     };
     let fixture = Fixture::provision(&admin_opts);
+    fixture.relax_rls();
     let backend = &fixture.backend;
 
     let ns = Namespace::new(format!("edges-migrate-{}", Uuid::new_v4().simple()));
@@ -1541,9 +1571,9 @@ fn schema_migrates_a_database_that_predates_the_edges_namespace() {
 /// `edges.id` is the primary key on its own, and edge ids are caller-supplied
 /// UUIDs, so an upsert keyed on id alone lands on whatever row already holds
 /// that id — including another tenant's. The namespace-bound connection is no
-/// protection here: this runs **without** enforcement, which is the shape every
-/// deployment ships today, because the application connects as the schema owner
-/// and the owner is exempt from its own policies.
+/// protection here: this runs **without** enforcement, the shape of a
+/// deployment whose role holds `BYPASSRLS`, so the owner is exempt from the
+/// policies and only the predicate is left.
 ///
 /// So the predicate has to do the work, and it has to reject rather than skip:
 /// a colliding id is a caller bug or an attack, and silently doing nothing
@@ -1555,6 +1585,7 @@ fn save_edge_rejects_an_id_that_belongs_to_another_namespace() {
         return;
     };
     let fixture = Fixture::provision(&admin_opts);
+    fixture.relax_rls();
     let backend = &fixture.backend;
 
     let ns_a = Namespace::new(format!("edge-write-a-{}", Uuid::new_v4().simple()));
@@ -1735,21 +1766,24 @@ fn save_edge_repoints_an_edge_on_a_same_namespace_resave() {
 /// RLS may have blinded.
 ///
 /// `run_schema` sends the whole schema through `ScopedPool::unbound`, a
-/// connection with no `pensyve.namespace_id` bound. On a deployment that has
-/// applied `postgres_rls_enforce.sql`, `entities` is forced, so it reads back
-/// *empty* on that connection. The backfill then matches nothing, and the
-/// `DELETE FROM edges WHERE namespace_id IS NULL` that follows sees every edge
-/// as an orphan — on a table the operator's older on-disk enforce file never
-/// forced, so nothing stops it. The batch commits and the graph is gone.
+/// connection with no `pensyve.namespace_id` bound. Where `entities` is forced,
+/// it reads back *empty* on that connection. The backfill then matches
+/// nothing, and the `DELETE FROM edges WHERE namespace_id IS NULL` that
+/// follows sees every edge as an orphan — on a table that was never forced, so
+/// nothing stops it. The batch commits and the graph is gone.
 ///
-/// This test stages exactly that deployment: `entities` enforced,
-/// `edges` back in its pre-migration shape and un-enforced, both an
-/// attributable edge and a real orphan present. The migration has to refuse
-/// rather than guess, so the attributable edge survives.
+/// The asymmetry is the whole hazard, and it is still reachable now that the
+/// schema forces on its own: an operator who applied the old
+/// `postgres_rls_enforce.sql` by hand and then took `edges` back out of
+/// enforcement, or any deployment where the two tables' enforcement state has
+/// drifted apart. So the test stages it explicitly — `entities` left as the
+/// schema forced it, `edges` back in its pre-migration shape and un-forced,
+/// both an attributable edge and a real orphan present. The migration has to
+/// refuse rather than guess, so the attributable edge survives.
 ///
 /// [`schema_migrates_a_database_that_predates_the_edges_namespace`] is the
-/// same migration on an un-enforced database, which is every deployment
-/// today; that one must still backfill and delete.
+/// same migration with nothing forced, which is what a database old enough to
+/// need it actually looks like; that one must still backfill and delete.
 #[test]
 fn schema_migration_refuses_rather_than_deleting_edges_it_cannot_attribute() {
     let Some(admin_opts) =
@@ -1766,12 +1800,10 @@ fn schema_migration_refuses_rather_than_deleting_edges_it_cannot_attribute() {
     entity.namespace_id = ns.id;
     backend.save_entity(&entity).expect("save source entity");
 
-    fixture.enforce_rls();
-
     // Stage the pre-migration deployment: `edges` as it was before it carried
-    // a namespace, and — like the operator's older enforce file — not FORCEd,
-    // while `entities` stays enforced. That asymmetry is the whole hazard:
-    // the read is blinded, the delete is not.
+    // a namespace, and not FORCEd, while `entities` stays as the schema left
+    // it. That asymmetry is the whole hazard: the read is blinded, the delete
+    // is not.
     fixture.rt.block_on(async {
         for statement in [
             "DROP POLICY IF EXISTS namespace_isolation_edges ON edges",
@@ -1859,12 +1891,18 @@ fn schema_migration_refuses_rather_than_deleting_edges_it_cannot_attribute() {
 /// SQL for both halves. An accessor that under-collects here leaves stale
 /// vector-index entries; one that over-collects would hand a caller another
 /// tenant's memory ids.
+///
+/// Enforcement is lifted for the same reason as the other confinement tests:
+/// the seeded decoy is another namespace's row under the *same* entity id, and
+/// with the policies live it would be hidden whether or not the accessor's own
+/// `namespace_id` predicate is there.
 #[test]
 fn entity_scoped_listing_matches_the_delete_scope() {
     let Some(admin_opts) = skip_notice("entity_scoped_listing_matches_the_delete_scope") else {
         return;
     };
     let fixture = Fixture::provision(&admin_opts);
+    fixture.relax_rls();
     let backend = &fixture.backend;
 
     let ns_a = Namespace::new(format!("listing-a-{}", Uuid::new_v4().simple()));
@@ -1988,10 +2026,9 @@ fn surviving_ids(backend: &PostgresBackend, namespace_id: Uuid) -> Vec<Uuid> {
 /// The namespace-wide purge behind the REST `purge_all_memories` handler must
 /// not reach across namespaces.
 ///
-/// Same reasoning as [`entity_delete_is_confined_to_its_namespace`]: with RLS
-/// inert — the configuration every deployment runs today, because the backend
-/// connects as the schema owner — the explicit `namespace_id = $1` predicate in
-/// each `DELETE` is the only thing confining the purge.
+/// Same reasoning as [`entity_delete_is_confined_to_its_namespace`]: with
+/// enforcement lifted, the explicit `namespace_id = $1` predicate in each
+/// `DELETE` is the only thing confining the purge.
 ///
 /// All four memory kinds are seeded on both sides because the purge is four
 /// separate statements, and a single over-broad one would be invisible to a
@@ -2002,6 +2039,7 @@ fn purge_namespace_is_confined_to_its_namespace() {
         return;
     };
     let fixture = Fixture::provision(&admin_opts);
+    fixture.relax_rls();
     let backend = &fixture.backend;
 
     let ns_a = Namespace::new(format!("purge-a-{}", Uuid::new_v4().simple()));
@@ -2035,7 +2073,7 @@ fn purge_namespace_is_confined_to_its_namespace() {
 /// The namespace-wide purge keeps working with RLS enforced.
 ///
 /// [`purge_namespace_is_confined_to_its_namespace`] is the same contract with
-/// RLS inert, which is the configuration that ships. Both halves matter: the
+/// enforcement lifted, isolating the predicates. Both halves matter: the
 /// purge must still take effect in its own namespace once the policies apply
 /// (a purge that silently deletes nothing while returning `Ok(0)` is the
 /// failure mode #254 catalogued), and it must still stop at the boundary.
@@ -2055,8 +2093,6 @@ fn purge_namespace_still_works_under_enforced_rls() {
     let mine = seed_one_of_each_kind(backend, ns_a.id, "tenant-a");
     let mut theirs = seed_one_of_each_kind(backend, ns_b.id, "tenant-b");
     theirs.sort();
-
-    fixture.enforce_rls();
 
     assert_eq!(
         backend
@@ -2136,8 +2172,8 @@ fn purge_namespace_counts_superseded_rows_like_sqlite() {
 ///
 /// The foreign-namespace half matters as much as the own-namespace half: the
 /// vector index is not partitioned by namespace, so a hydration keyed on `id`
-/// alone is a cross-namespace read whenever RLS is *not* enforced, which is
-/// every deployment shipping today.
+/// alone is a cross-namespace read wherever RLS is inert — any deployment
+/// whose role holds `BYPASSRLS`, which `FORCE` cannot remove.
 #[test]
 fn scoped_memory_reads_still_work_under_enforced_rls() {
     let Some(admin_opts) = skip_notice("scoped_memory_reads_still_work_under_enforced_rls") else {
@@ -2150,7 +2186,6 @@ fn scoped_memory_reads_still_work_under_enforced_rls() {
     let memory = seed(&fixture, &ns_a, &ns_b);
     let fact = SemanticMemory::new(ns_a.id, Uuid::new_v4(), "likes", "rust", 0.9);
     backend.save_semantic(&fact).expect("save A's fact");
-    fixture.enforce_rls();
 
     assert_eq!(
         backend
@@ -2203,7 +2238,6 @@ fn supersede_still_works_under_enforced_rls() {
     let ns_a = Namespace::new(format!("rls-a-{}", Uuid::new_v4().simple()));
     let ns_b = Namespace::new(format!("rls-b-{}", Uuid::new_v4().simple()));
     let memory = seed(&fixture, &ns_a, &ns_b);
-    fixture.enforce_rls();
 
     assert!(
         !backend
@@ -2262,8 +2296,6 @@ fn entity_lookup_by_id_still_works_under_enforced_rls() {
     entity.namespace_id = ns_a.id;
     backend.save_entity(&entity).expect("save A's entity");
 
-    fixture.enforce_rls();
-
     assert_eq!(
         backend
             .get_entity_in_namespace(entity.id, ns_a.id)
@@ -2288,7 +2320,8 @@ fn entity_lookup_by_id_still_works_under_enforced_rls() {
 /// Both took an entity id and a limit and nothing else. Entity ids are not
 /// globally unique, so with RLS inert they enumerated every tenant's rows for
 /// that id, and with RLS enforced they enumerated none — `Ok(vec![])`, which a
-/// caller cannot tell from an entity that simply has no memories.
+/// caller cannot tell from an entity that simply has no memories. The schema
+/// now enforces on every startup, so the second failure would be everyone's.
 #[test]
 fn entity_scoped_memory_listings_still_work_under_enforced_rls() {
     let Some(admin_opts) =
@@ -2328,8 +2361,6 @@ fn entity_scoped_memory_listings_still_work_under_enforced_rls() {
     backend.save_semantic(&my_fact).expect("save A's fact");
     let their_fact = SemanticMemory::new(ns_b.id, entity_id, "likes", "go", 0.9);
     backend.save_semantic(&their_fact).expect("save B's fact");
-
-    fixture.enforce_rls();
 
     assert_eq!(
         backend
@@ -2393,7 +2424,6 @@ fn reinforcement_stamp_still_lands_under_enforced_rls() {
     let ns_a = Namespace::new(format!("rls-a-{}", Uuid::new_v4().simple()));
     let ns_b = Namespace::new(format!("rls-b-{}", Uuid::new_v4().simple()));
     let memory = seed(&fixture, &ns_a, &ns_b);
-    fixture.enforce_rls();
 
     backend
         .update_episodic_access_in_namespace(memory.id, ns_b.id, 0.1, 0.1)
@@ -2452,8 +2482,6 @@ fn procedural_reliability_update_still_lands_under_enforced_rls() {
     backend
         .save_procedural(&procedural)
         .expect("save A's procedural memory");
-
-    fixture.enforce_rls();
 
     backend
         .update_procedural_reliability_in_namespace(procedural.id, ns_b.id, 0.01, 99, 99)
@@ -2543,9 +2571,9 @@ fn startup_reports_whether_the_role_is_exempt_from_rls() {
 /// This is the serving half of the DDL/serving split. `PostgresBackend::new`
 /// applies the schema on every startup, which is owner-only DDL, so before the
 /// applied-state probe a non-owner could not get past construction at all —
-/// which is why every deployment connects as the owner, and why the policies
-/// are inert for it. Startup now reads `pensyve_schema_state` first and skips
-/// the batch when it names this build's digest.
+/// which is why every deployment used to connect as the owner. Startup now
+/// reads `pensyve_schema_state` first and skips the batch when it names this
+/// build's digest.
 #[test]
 fn a_non_owner_starts_against_an_already_migrated_database() {
     let Some(admin_opts) = skip_notice("a_non_owner_starts_against_an_already_migrated_database")
@@ -2893,8 +2921,9 @@ fn every_rls_table_has_exactly_one_namespace_policy() {
         );
     }
 
-    // Enforcement is what makes all of the above apply to the schema owner.
-    fixture.enforce_rls();
+    // Enforcement is what makes all of the above apply to the schema owner,
+    // and applying the schema is the whole of it — nothing beyond
+    // `Fixture::provision` has run at this point.
     let forced: Vec<(String, bool)> = fixture.rt.block_on(async {
         query_as::<Postgres, _>(
             // Scoped to `public`: `relname` alone is not unique across schemas,
@@ -2916,7 +2945,8 @@ fn every_rls_table_has_exactly_one_namespace_policy() {
                 .find(|(name, _)| name == table)
                 .map(|(_, f)| *f),
             Some(true),
-            "enforce_rls did not force RLS on {table}, so its owner still bypasses the policy"
+            "applying postgres_schema.sql did not force RLS on {table}, so its owner \
+             still bypasses the policy"
         );
     }
 }
@@ -2926,9 +2956,9 @@ fn every_rls_table_has_exactly_one_namespace_policy() {
 /// `PENSYVE_TEST_DATABASE_URL` unset.
 #[test]
 fn schema_declares_rls_for_every_expected_table() {
-    // Comments stripped, like the enforcement-file test: a rollback note or
-    // example quoting a CREATE POLICY would otherwise satisfy these assertions
-    // without the schema declaring anything.
+    // Comments stripped: a rollback note or an example quoting a CREATE POLICY
+    // would otherwise satisfy these assertions without the schema declaring
+    // anything.
     let normalized = sql_statements_only(super::SCHEMA);
     let predicate = "namespace_id::text = current_setting('pensyve.namespace_id', true)";
     for (table, policy) in RLS_POLICIES {
@@ -2961,16 +2991,15 @@ fn schema_declares_rls_for_every_expected_table() {
 /// Entity ids are not globally unique in this schema, and nothing stops two
 /// tenants from holding rows keyed to the same id. Without an explicit
 /// `namespace_id` predicate the delete matches on entity id alone, leaving RLS
-/// as the only other filter — and RLS is inert in every deployment today,
-/// because the backend connects as the schema owner and nothing has applied
-/// `postgres_rls_enforce.sql`. The foreign tenant's rows are then deleted
-/// *and* handed to the snapshot callback, which writes them into this tenant's
-/// snapshot file — a cross-tenant leak into the very artifact that
-/// per-namespace directories exist to prevent.
+/// as the only other filter — and RLS is inert wherever the connecting role
+/// carries `BYPASSRLS`, which the schema's `FORCE` cannot remove. The foreign
+/// tenant's rows are then deleted *and* handed to the snapshot callback, which
+/// writes them into this tenant's snapshot file — a cross-tenant leak into the
+/// very artifact that per-namespace directories exist to prevent.
 ///
-/// So the predicates stay whether or not RLS is enforced. This test runs with
-/// it inert, which is the configuration that actually ships, and therefore
-/// gates the predicates rather than the policies.
+/// So the predicates stay whether or not RLS is enforced, and this test lifts
+/// enforcement so that it gates the predicates rather than the policies.
+/// [`capturing_delete_still_works_under_enforced_rls`] is the other half.
 ///
 /// `SQLite` cannot observe this: `forget_snapshot_scope.rs` covers scope parity
 /// there, but only live Postgres exercises the RLS-plus-pool path.
@@ -2980,6 +3009,7 @@ fn capturing_delete_is_confined_to_its_namespace() {
         return;
     };
     let fixture = Fixture::provision(&admin_opts);
+    fixture.relax_rls();
     let backend = &fixture.backend;
 
     let ns_a = Namespace::new(format!("forget-a-{}", Uuid::new_v4().simple()));
@@ -3092,14 +3122,14 @@ fn capturing_delete_is_confined_to_its_namespace() {
 /// Each entry is safe for a specific reason, and a new one is only safe if it
 /// has the same kind of reason:
 ///
-/// * `run_schema` and `enforce_rls` run DDL, which RLS does not apply to.
+/// * `run_schema` runs DDL, which RLS does not apply to.
 /// * `get_namespace_by_name` reads `namespaces`, which carries no policy, and
 ///   is how a caller learns the namespace id it would scope by.
 /// * `pool` hands the pool to external callers, who own the scoping contract
 ///   documented on `set_namespace_config`.
 #[test]
 fn only_bound_connections_reach_policied_tables() {
-    const ALLOWED_UNBOUND_USES: usize = 4;
+    const ALLOWED_UNBOUND_USES: usize = 3;
 
     let source = rust_code_only(include_str!("../postgres.rs"));
     let unbound = source.matches(".unbound()").count();
@@ -3206,54 +3236,66 @@ fn schema_dml_on_policied_tables_cannot_be_silently_blinded() {
 /// would build a second copy of every table and prove something else.
 #[test]
 fn startup_sql_resolves_relations_through_search_path() {
-    for (label, sql) in [
-        ("postgres_schema.sql", super::SCHEMA),
-        ("postgres_rls_enforce.sql", super::RLS_ENFORCE_SCHEMA),
-    ] {
-        // Comments stripped: both files discuss `public` in prose, and prose
-        // must not be able to fail an assertion about what they execute.
-        let normalized = sql_statements_only(sql);
-        assert!(
-            !normalized.contains("public."),
-            "{label} qualifies a relation as `public.`, but startup resolves the schema \
-             marker through `search_path`. On a deployment with a non-default `search_path` \
-             the qualified name points at a relation that does not exist, and because the \
-             file is one implicit transaction the failed lookup aborts the entire batch."
-        );
-    }
+    // Comments stripped: the file discusses `public` in prose, and prose must
+    // not be able to fail an assertion about what it executes.
+    let normalized = sql_statements_only(super::SCHEMA);
+    assert!(
+        !normalized.contains("public."),
+        "postgres_schema.sql qualifies a relation as `public.`, but startup resolves the \
+         schema marker through `search_path`. On a deployment with a non-default \
+         `search_path` the qualified name points at a relation that does not exist, and \
+         because the file is one implicit transaction the failed lookup aborts the entire \
+         batch."
+    );
 }
 
 /// `FORCE ROW LEVEL SECURITY` must cover exactly the tables that carry a
-/// policy, and must not leak into the schema that runs on every startup.
+/// policy, and must sit outside the `row_security = off` migration window.
 ///
 /// A table forced without a policy would deny everything; a table with a
 /// policy but never forced keeps the owner exemption that made the policies
-/// inert in the first place.
+/// inert in the first place. Enforcement now ships in the schema itself
+/// (#254), so this is a source assertion on `postgres_schema.sql` rather than
+/// on a separate operator-applied file.
+///
+/// The placement half is as load-bearing as the coverage half. FORCE is DDL,
+/// which RLS never applies to, but the edges backfill between `SET
+/// row_security = off` and `RESET row_security` has to *read* `entities`. If
+/// FORCE ran before that window on the same batch, the very startup that
+/// introduces enforcement would blind its own migration and refuse — see
+/// [`schema_migration_refuses_rather_than_deleting_edges_it_cannot_attribute`]
+/// for what that refusal looks like when an operator really is in that state.
 #[test]
-fn enforcement_file_forces_every_policied_table_and_only_those() {
-    // Comments are stripped first: both files document the statements they
-    // contain, and the rollback note spells out `NO FORCE ROW LEVEL SECURITY`.
-    let normalized = sql_statements_only(super::RLS_ENFORCE_SCHEMA);
+fn schema_forces_every_policied_table_and_only_those() {
+    // Comments are stripped first: the file documents the statements it
+    // contains, and the rollback note spells out `NO FORCE ROW LEVEL SECURITY`.
+    let normalized = sql_statements_only(super::SCHEMA);
     for (table, _) in RLS_POLICIES {
         assert!(
             normalized.contains(&format!("ALTER TABLE {table} FORCE ROW LEVEL SECURITY;")),
-            "postgres_rls_enforce.sql no longer forces RLS on {table}, leaving the schema \
+            "postgres_schema.sql no longer forces RLS on {table}, leaving the schema \
              owner exempt from {table}'s policy"
         );
     }
     assert_eq!(
         normalized.matches("FORCE ROW LEVEL SECURITY;").count(),
         RLS_POLICIES.len(),
-        "postgres_rls_enforce.sql forces a table that carries no namespace policy; \
+        "postgres_schema.sql forces a table that carries no namespace policy; \
          with no policy to satisfy, RLS denies every row"
     );
-    assert!(
-        !sql_statements_only(super::SCHEMA).contains("FORCE ROW LEVEL SECURITY"),
-        "FORCE moved into postgres_schema.sql, which runs on every startup. Enforcement \
-         fails closed, so this would silently break every query path that does not carry \
-         a namespace — see the module docs and docs/SECURITY.md for the paths that still \
-         do not, and for the role the application has to stop connecting as."
-    );
+
+    let reset_at = normalized
+        .find("RESET row_security;")
+        .expect("the migration guard window is pinned by schema_dml_on_policied_tables_*");
+    for (offset, _) in normalized.match_indices("FORCE ROW LEVEL SECURITY;") {
+        assert!(
+            offset > reset_at,
+            "postgres_schema.sql forces row-level security at or before the \
+             `SET row_security = off` … `RESET row_security` window. The edges backfill \
+             inside that window reads `entities`; forcing first makes the batch that \
+             introduces enforcement refuse its own migration."
+        );
+    }
 }
 
 /// FTS must OR-join query tokens on Postgres exactly as `SQLite` does after
