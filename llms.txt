@@ -15,9 +15,9 @@ Pensyve gives AI agents persistent, cognitive memory that spans across sessions.
 
 ## Integration Options
 
-### MCP Server (Claude Code, Cursor, Cline, Windsurf, Continue, VS Code Copilot)
+### MCP Server (Antigravity CLI, Claude Code, Cursor, Cline, Windsurf, Continue, VS Code Copilot)
 
-The MCP server exposes 6 tools: `pensyve_recall`, `pensyve_remember`, `pensyve_episode_start`, `pensyve_episode_end`, `pensyve_forget`, `pensyve_inspect`.
+The MCP server exposes 10 tools: `pensyve_recall`, `pensyve_remember`, `pensyve_observe`, `pensyve_episode_start`, `pensyve_episode_end`, `pensyve_forget`, `pensyve_forget_memory`, `pensyve_inspect`, `pensyve_status`, `pensyve_account`.
 
 **Cloud** (no build required):
 ```json
@@ -53,6 +53,14 @@ Build: `cargo build --release -p pensyve-mcp`
 ```
 
 Provides 6 slash commands (`/remember`, `/recall`, `/forget`, `/inspect`, `/consolidate`, `/memory-status`), 4 skills, 2 agents, and 4 lifecycle hooks.
+
+### Antigravity CLI Plugin
+
+```bash
+agy plugin install https://github.com/major7apps/pensyve/tree/main/integrations/antigravity-plugin
+```
+
+Provides 8 working-memory rules, 8 skills, and a URL-only OAuth MCP definition. Open `/mcp` in Antigravity to authenticate. Full setup: [Antigravity plugin README](https://github.com/major7apps/pensyve/blob/main/integrations/antigravity-plugin/README.md).
 
 ### Python SDK (PyO3, zero-overhead)
 
@@ -141,5 +149,5 @@ Set `PENSYVE_API_KEY` environment variable for cloud access. API keys use the `p
 - [Getting Started](https://github.com/major7apps/pensyve/blob/main/docs/GETTING_STARTED.md) — Per-language setup guides
 - [Claude Code Plugin](https://github.com/major7apps/pensyve/blob/main/integrations/claude-code/README.md)
 - [Codex Plugin](https://github.com/major7apps/pensyve/blob/main/integrations/codex-plugin/README.md)
-- [Gemini Extension](https://github.com/major7apps/pensyve/blob/main/integrations/gemini-extension/README.md)
+- [Antigravity CLI Plugin](https://github.com/major7apps/pensyve/blob/main/integrations/antigravity-plugin/README.md)
 - [CHANGELOG](https://github.com/major7apps/pensyve/blob/main/CHANGELOG.md)

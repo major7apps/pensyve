@@ -1,7 +1,6 @@
 ---
 name: memory-informed-refactor
 description: "Pre-refactor context briefing -- loads relevant prior decisions, failures, and pitfalls from Pensyve memory before refactoring a module. Use before any refactor to avoid repeating past mistakes."
-version: 1.0.0
 ---
 
 # Memory-Informed Refactor
@@ -16,9 +15,11 @@ Invoke before refactoring any module, file, or component. Provides a structured 
 
 ### Step 1: Query Memory for Context
 
-Run multiple `pensyve_recall` queries to gather comprehensive context about the target:
+Normalize the target to a lowercase-hyphenated entity and pass it as `entity`
+to every query. Run multiple `pensyve_recall` queries to gather comprehensive
+context about the target within the shared recall budget:
 
-1. **Direct matches**: `pensyve_recall` with query `"<target>"` (limit: 10)
+1. **Direct matches**: `pensyve_recall` with query `"<target>"` (limit: 5)
 2. **Refactor history**: `pensyve_recall` with query `"<target> refactor"` (limit: 5)
 3. **Past failures**: `pensyve_recall` with query `"<target> failed"` (limit: 5)
 4. **Past failures (alternate)**: `pensyve_recall` with query `"<target> error"` (limit: 5)
@@ -27,7 +28,9 @@ Run multiple `pensyve_recall` queries to gather comprehensive context about the 
 
 ### Step 2: Inspect the Entity
 
-If the target matches an entity name, also call `pensyve_inspect` with `entity: "<target>"` to get the full memory inventory for that entity.
+Call `pensyve_inspect` with `entity: "<target>"` and `limit: 20` to get up to 20
+memories for that entity. The tool has no pagination, so do not describe this
+sample as a complete inventory.
 
 ### Step 3: Compile Briefing
 
@@ -80,7 +83,7 @@ After presenting the briefing, offer to track the refactor as an episode:
 
 > Would you like me to track this refactor as an episode? This will let Pensyve capture the decisions and outcomes from this session for future reference.
 >
-> If yes, I will call `pensyve_episode_start` with participants `["gemini-cli", "<target>"]`.
+> If yes, I will call `pensyve_episode_start` with participants `["antigravity-cli", "<target>"]`.
 
 If the user accepts, call `pensyve_episode_start`. Remind the user to close the episode at the end of the refactor (or suggest using the session-memory skill).
 
@@ -96,5 +99,5 @@ If the user accepts, call `pensyve_episode_start`. Remind the user to close the 
 
 - If `pensyve_recall` returns errors on some queries, present results from the successful queries and note the failures.
 - If `pensyve_inspect` fails, skip the entity inspection and rely on recall results.
-- If the MCP server is not connected, inform the user and suggest checking their Pensyve API key configuration.
+- If the MCP server is not connected, tell the user to open `/mcp` and authenticate Pensyve.
 - If `pensyve_episode_start` fails when the user accepts tracking, report the error but do not block the refactor.

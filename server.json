@@ -50,6 +50,10 @@
       "description": "Delete all memories for an entity"
     },
     {
+      "name": "pensyve_forget_memory",
+      "description": "Delete one memory by its exact id"
+    },
+    {
       "name": "pensyve_inspect",
       "description": "List all memories stored for an entity"
     },

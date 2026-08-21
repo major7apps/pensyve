@@ -1016,6 +1016,7 @@ impl PensyveMcpServer {
     }
 }
 
+#[allow(clippy::unused_async_trait_impl)] // rmcp generates the async handler surface
 #[tool_handler]
 impl ServerHandler for PensyveMcpServer {
     fn get_info(&self) -> ServerInfo {

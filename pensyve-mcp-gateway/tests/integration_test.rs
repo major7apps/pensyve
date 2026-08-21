@@ -230,6 +230,22 @@ async fn test_mcp_tools_list() {
     assert!(tool_names.contains(&"pensyve_account"));
     assert!(tool_names.contains(&"pensyve_observe"));
 
+    let forget_memory = tools
+        .iter()
+        .find(|tool| tool["name"] == "pensyve_forget_memory")
+        .expect("pensyve_forget_memory tool");
+    assert_eq!(
+        forget_memory["inputSchema"]["properties"]["memory_id"]["type"],
+        "string"
+    );
+    assert!(
+        forget_memory["inputSchema"]["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .any(|field| field == "memory_id")
+    );
+
     ct.cancel();
 }
 

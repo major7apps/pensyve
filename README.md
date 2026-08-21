@@ -55,7 +55,7 @@ npm install @pensyve/sdk     # TypeScript (npm)
 go get github.com/major7apps/pensyve/pensyve-go/v3@latest  # Go
 ```
 
-Or use the MCP server directly with Codex, Claude Code, Cursor, or any MCP client — see [MCP Setup](https://pensyve.com/docs/getting-started/mcp-setup).
+Or use the MCP server directly with Antigravity CLI, Codex, Claude Code, Cursor, or any MCP client — see [MCP Setup](https://pensyve.com/docs/getting-started/mcp-setup).
 
 ## Quick Start
 
@@ -183,7 +183,7 @@ p.consolidate()
 
 ### MCP Server
 
-Works with Claude Code, Cursor, and any MCP-compatible client.
+Works with Antigravity CLI, Claude Code, Cursor, and any MCP-compatible client.
 
 ```bash
 cargo build --release --bin pensyve-mcp
@@ -299,6 +299,18 @@ export PENSYVE_API_KEY="psy_your_key_here"
 The plugin bundles `integrations/codex-plugin/.mcp.json`, so Codex can load the Pensyve MCP server without copying a project config file. Use `/skills`, `$pensyve`, or `/pensyve` for explicit memory work, or let the bundled hooks and instructions prompt Codex to recall before substantive project decisions. `@pensyve` is documented as a text-level compatibility convention; true native Codex @-mention dispatch still needs platform support.
 
 See [`integrations/codex-plugin/README.md`](integrations/codex-plugin/README.md) for the manual fallback and local-stdio setup.
+
+### Antigravity CLI Plugin
+
+Install the native Pensyve plugin for Google Antigravity CLI:
+
+```bash
+agy plugin install https://github.com/major7apps/pensyve/tree/main/integrations/antigravity-plugin
+```
+
+The plugin bundles eight working-memory rules, eight skills, and a URL-only remote MCP definition. Open `/mcp` in Antigravity and authenticate Pensyve in the browser; no API key is stored in the plugin.
+
+See [`integrations/antigravity-plugin/README.md`](integrations/antigravity-plugin/README.md) for MCP-only, local-stdio, and migration setup.
 
 ### REST API
 
@@ -477,6 +489,7 @@ pensyve/
 ├── pensyve_server/       Shared Python utilities — billing, extraction
 ├── integrations/       All integrations — IDE plugins, framework adapters, code harnesses
 │   ├── claude-code/    Claude Code plugin (commands, skills, agents, hooks)
+│   ├── antigravity-plugin/ Antigravity plugin (rules, skills, OAuth MCP)
 │   ├── vscode/         VS Code sidebar extension
 │   ├── openclaw-plugin/ OpenClaw native memory plugin (TypeScript)
 │   ├── opencode-plugin/ OpenCode native memory plugin (TypeScript)

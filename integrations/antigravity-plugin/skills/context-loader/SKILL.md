@@ -1,7 +1,6 @@
 ---
 name: context-loader
 description: "Session-start context loading -- loads historical decisions, issues, and patterns from Pensyve to provide cross-session continuity. Use at session start or when switching context."
-version: 1.0.0
 ---
 
 # Context Loader
@@ -22,22 +21,31 @@ Check for a mode argument if provided:
 - **summary** (default): Load a concise overview (10-15 lines max).
 - **full**: Load comprehensive context with relevance scores and details.
 
-### Step 2: Query Memories
+### Step 2: Load Project Memories
 
-Run the following `pensyve_recall` queries to gather session context:
+Resolve the active project entity independently from the storage namespace:
+use the user's explicitly named project when present, then fall back to the
+repository root, and normalize it to lowercase-hyphenated form.
+`PENSYVE_NAMESPACE` is consumed by the MCP server as its storage namespace; do
+not pass it as `entity`.
 
-1. **Recent decisions**: `pensyve_recall` with query `"decided"` (limit: 5)
-2. **Known issues**: `pensyve_recall` with query `"issue OR bug OR error OR problem"` (limit: 5)
-3. **Workflow patterns**: `pensyve_recall` with query `"workflow OR pattern OR process"` (limit: 5)
-4. **Recent activity**: `pensyve_recall` with query `"*"` (limit: 10) -- broad query to capture recent memories by recency
+Call `pensyve_inspect` with `entity: <active-project-entity>` and `limit: 20`.
+Categorize the returned entity memories into decisions, known issues, workflow
+patterns, and other activity. This is an exact entity inventory sample of up to
+20 memories, not a complete or chronologically sorted inventory.
 
-Deduplicate results across queries (same memory ID should appear only once).
+Do not use `pensyve_recall` for purported strict scoping: its `entity` parameter
+is a ranking hint, not a filter. If the user explicitly opts into cross-entity
+discovery, run targeted recall queries with `types: ["episodic",
+"procedural", "semantic"]`, `limit: 5`, and label the results as top matches
+ranked by relevance/RRF score.
 
 ### Step 3: Present Context
 
 #### Summary Mode (10-15 lines max)
 
-Present a concise briefing with the most important items:
+Present a concise briefing with the most important items. The block below is an
+illustrative example only; replace every item with actual MCP results:
 
 > **Session Context** (from Pensyve memory)
 >
@@ -66,11 +74,13 @@ Rules for summary mode:
 
 #### Full Mode (comprehensive)
 
-Present a detailed briefing with scores and metadata:
+Present a detailed briefing with scores and metadata. The block below is an
+illustrative example only; replace every value with actual MCP results:
 
 > **Session Context** (from Pensyve memory)
 >
 > **Recent Decisions** (3 found):
+>
 > | Entity | Decision | Confidence | When |
 > |--------|----------|------------|------|
 > | auth-service | Using RS256 for JWT signing | 0.9 | 2026-03-15 |
@@ -78,17 +88,20 @@ Present a detailed briefing with scores and metadata:
 > | database | SQLite for MVP, migrate to Postgres later | 0.9 | 2026-03-12 |
 >
 > **Known Issues** (2 found):
+>
 > | Entity | Issue | Confidence | Score |
 > |--------|-------|------------|-------|
 > | database | Migration requires Python 3.11+ | 0.8 | 0.91 |
 > | cache | Invalidation race condition on concurrent writes | 0.8 | 0.85 |
 >
 > **Workflow Patterns** (1 found):
+>
 > | Entity | Pattern | Confidence | Score |
 > |--------|---------|------------|-------|
 > | testing | Integration tests need tmpdir cleanup | 0.7 | 0.78 |
 >
-> **Recent Activity** (5 unique memories, most recent first):
+> **Other Entity Memories** (5 returned):
+>
 > | Type | Entity | Summary | Score |
 > |------|--------|---------|-------|
 > | semantic | auth-service | RS256 JWT signing | 0.92 |
@@ -99,7 +112,7 @@ Present a detailed briefing with scores and metadata:
 
 Rules for full mode:
 
-- Show all results with relevance scores
+- Show all returned results, up to the 20-memory inspect limit
 - Include confidence values and timestamps where available
 - Group by category with counts
 - Show memory types in the recent activity section
@@ -115,6 +128,6 @@ Rules for full mode:
 
 ## Error Handling
 
-- If some `pensyve_recall` queries fail but others succeed, present the successful results and note the failures briefly.
-- If all queries fail, report the error and suggest checking the MCP server connection.
-- If the MCP server is not connected, inform the user: "Pensyve MCP server is not connected. Context loading skipped. Verify your API key with `gemini extensions configure pensyve`."
+- If `pensyve_inspect` fails, report the error and suggest checking the MCP server connection.
+- If an explicitly requested broader recall partly fails, present successful results and note the failures briefly.
+- If the MCP server is not connected, inform the user: "Pensyve MCP server is not connected. Context loading skipped. Open `/mcp` and authenticate Pensyve."

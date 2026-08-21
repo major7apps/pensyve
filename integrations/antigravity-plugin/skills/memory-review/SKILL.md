@@ -1,7 +1,6 @@
 ---
 name: memory-review
 description: "Memory hygiene audit -- finds stale facts, contradictions, low-confidence entries, and consolidation candidates in Pensyve memory. Use periodically to maintain memory quality."
-version: 1.0.0
 ---
 
 # Memory Review
@@ -69,31 +68,31 @@ Present the findings in a structured report:
 >
 > ### Stale Memories (4 found)
 >
-> | #   | Entity  | Memory                   | Last Accessed | Retrievability |
-> | --- | ------- | ------------------------ | ------------- | -------------- |
-> | 1   | old-api | Used XML responses       | 45 days ago   | 0.15           |
-> | 2   | config  | Default port was 3000    | 38 days ago   | 0.22           |
-> | 3   | testing | Used mocha for tests     | 60 days ago   | 0.08           |
-> | 4   | deploy  | Manual deploy to staging | 33 days ago   | 0.28           |
+> | #   | Memory ID | Entity  | Memory                   | Last Accessed | Retrievability |
+> | --- | --------- | ------- | ------------------------ | ------------- | -------------- |
+> | 1   | `<id-1>`  | old-api | Used XML responses       | 45 days ago   | 0.15           |
+> | 2   | `<id-2>`  | config  | Default port was 3000    | 38 days ago   | 0.22           |
+> | 3   | `<id-3>`  | testing | Used mocha for tests     | 60 days ago   | 0.08           |
+> | 4   | `<id-4>`  | deploy  | Manual deploy to staging | 33 days ago   | 0.28           |
 >
 > ### Contradictions (1 found)
 >
-> | #   | Entity       | Memory A                         | Memory B                         | Issue                         |
-> | --- | ------------ | -------------------------------- | -------------------------------- | ----------------------------- |
-> | 5   | auth-service | "uses HS256 signing" (conf: 0.8) | "uses RS256 signing" (conf: 0.9) | Conflicting signing algorithm |
+> | #   | Entity       | Memory A                                 | Memory B                                 | Issue                         |
+> | --- | ------------ | ---------------------------------------- | ---------------------------------------- | ----------------------------- |
+> | 5   | auth-service | `<id-5a>` "uses HS256" (conf: 0.8) | `<id-5b>` "uses RS256" (conf: 0.9) | Conflicting signing algorithm |
 >
 > ### Low Confidence (2 found)
 >
-> | #   | Entity | Memory                               | Confidence |
-> | --- | ------ | ------------------------------------ | ---------- |
-> | 6   | cache  | "might need Redis for sessions"      | 0.3        |
-> | 7   | api    | "possibly rate limited at 100 req/s" | 0.4        |
+> | #   | Memory ID | Entity | Memory                               | Confidence |
+> | --- | --------- | ------ | ------------------------------------ | ---------- |
+> | 6   | `<id-6>`  | cache  | "might need Redis for sessions"      | 0.3        |
+> | 7   | `<id-7>`  | api    | "possibly rate limited at 100 req/s" | 0.4        |
 >
 > ### Consolidation Candidates (1 found)
 >
-> | #   | Entity   | Description                               | Suggestion                                                     |
-> | --- | -------- | ----------------------------------------- | -------------------------------------------------------------- |
-> | 8   | database | 3 episodic memories about migration fixes | Promote to semantic: "migration script requires version check" |
+> | #   | Source Memory IDs       | Entity   | Description                               | Suggestion                                                     |
+> | --- | ----------------------- | -------- | ----------------------------------------- | -------------------------------------------------------------- |
+> | 8   | `<id-8a>`, `<id-8b>`, `<id-8c>` | database | 3 episodic memories about migration fixes | Promote to semantic: "migration script requires version check" |
 >
 > **Summary:** 4 stale, 1 contradiction, 2 low-confidence, 1 consolidation candidate
 
@@ -109,12 +108,16 @@ If a category has no issues, omit that section entirely. If all checks pass, rep
 
 After presenting the report, offer cleanup actions with user confirmation:
 
+Retain the memory ID returned by `pensyve_inspect` or `pensyve_recall` for every
+reported item. Show the exact ID beside each proposed deletion so the user can
+confirm individual memories rather than an entire entity.
+
 > **Recommended Actions:**
 >
-> 1. **Archive stale memories** (#1-4): Remove from active recall. Use `pensyve_forget` on each.
-> 2. **Resolve contradiction** (#5): Keep the RS256 memory (higher confidence, more recent). Forget the HS256 memory.
-> 3. **Review low-confidence** (#6-7): Confirm or remove these uncertain memories.
-> 4. **Run consolidation** (#8): Promote episodic patterns to semantic memories.
+> 1. **Delete stale memories** (#1-4): Permanently delete `<id-1>` through `<id-4>` with `pensyve_forget_memory`.
+> 2. **Resolve contradiction** (#5): Keep `<id-5b>` (RS256) and delete `<id-5a>` (HS256).
+> 3. **Review low-confidence** (#6-7): Confirm or delete `<id-6>` and `<id-7>`.
+> 4. **Run consolidation** (#8): Promote the pattern, then optionally delete `<id-8a>`, `<id-8b>`, and `<id-8c>`.
 >
 > Which actions should I take? (e.g., "1,2", "all", "none")
 
@@ -124,9 +127,16 @@ After presenting the report, offer cleanup actions with user confirmation:
 
 For confirmed actions:
 
-- **Archive/forget**: Call `pensyve_forget` with the entity name for each confirmed deletion.
-- **Resolve contradiction**: Call `pensyve_forget` for the outdated memory. If both should be kept, note the conflict and move on.
-- **Consolidation**: Store the consolidated semantic memory via `pensyve_remember`, then optionally forget the source episodic memories.
+`pensyve_forget_memory` is the registered, namespace-scoped single-memory tool.
+Its input schema is `memory_id: "<uuid>"`; invoke it once per exact confirmed ID.
+
+- **Delete stale memory**: Call `pensyve_forget_memory` with the exact confirmed `memory_id` for each deletion.
+- **Resolve contradiction**: Call `pensyve_forget_memory` with the outdated memory's confirmed `memory_id`. If both should be kept, note the conflict and move on.
+- **Review low-confidence memory**: Keep any memory the user accepts or does not explicitly confirm for deletion. Call `pensyve_forget_memory` separately for each exact `memory_id` the user confirms for deletion.
+- **Consolidation**: Store the consolidated semantic memory via `pensyve_remember`, then optionally delete individually confirmed source memories with `pensyve_forget_memory`.
+
+Use entity-wide `pensyve_forget` only when the user separately asks to delete
+all memories for a named entity and explicitly confirms that destructive scope.
 
 Report results after each action.
 
@@ -145,4 +155,5 @@ Report results after each action.
 - If `pensyve_inspect` fails for an entity, skip it and note the failure in the report.
 - If `pensyve_recall` returns errors, report partial results and note which queries failed.
 - If `pensyve_forget` fails during cleanup, report the error and continue with remaining actions.
-- If the MCP server is not connected, inform the user and suggest checking their Pensyve API key configuration.
+- If `pensyve_forget_memory` fails during cleanup, report the error and continue with remaining actions.
+- If the MCP server is not connected, tell the user to open `/mcp` and authenticate Pensyve.
