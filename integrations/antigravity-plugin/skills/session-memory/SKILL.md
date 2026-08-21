@@ -83,7 +83,7 @@ For each confirmed item, decide the storage type based on its tier:
 **Tier 1 items -> Semantic (durable facts).** Call `pensyve_remember` with:
 
 - `entity`: The inferred entity name (lowercase, hyphenated)
-- `fact`: `"[capture/session-memory/tier-1] <fact text>"`
+- `fact`: `"[auto-capture/user/residual/tier-1] <fact text>"`
 - `confidence`: 0.9-0.95 (based on classification)
 
 Use for: architecture decisions, technology choices, user preferences, project constraints.
@@ -91,7 +91,7 @@ Use for: architecture decisions, technology choices, user preferences, project c
 **Tier 2 items -> Episodic (observations).** Call `pensyve_observe` with:
 
 - `episode_id`: From the session state (if episode tracking is active)
-- `content`: `"[capture/session-memory/tier-2] <observation text>"`
+- `content`: `"[auto-capture/user/residual/tier-2] <observation text>"`
 - `source_entity`: `"antigravity-cli"`
 - `about_entity`: The inferred entity name (lowercase, hyphenated)
 - `content_type`: `"text"` for decisions/patterns, `"code"` for code-related outcomes
@@ -102,7 +102,15 @@ If no episode is active, fall back to `pensyve_remember` with confidence 0.7-0.8
 
 When in doubt, prefer `pensyve_observe` -- the consolidation engine promotes recurring patterns to semantic facts automatically.
 
-### Step 5: Report Results
+### Step 5: Close an Active Episode
+
+If a working episode remains active, derive its outcome from the actual session
+result, call `pensyve_episode_end`, and clear the working ID. Use `"success"`
+only when the requested work completed, `"failure"` when it produced no usable
+result, and `"partial"` when required work remains. Do not double-close an
+episode already closed by another workflow.
+
+### Step 6: Report Results
 
 After storing, summarize what was saved:
 

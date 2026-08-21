@@ -49,7 +49,10 @@ Antigravity CLI has no session-start/session-end hooks, so you own the episode l
 
 - Before your first `pensyve_observe` call in this conversation, check whether a working `episode_id` is already tracked. If none exists, call `pensyve_episode_start(participants: ["antigravity-cli", "<project entity>"])` first, record the returned `episode_id`, then make the observation.
 - Reuse the same `episode_id` for all subsequent observations in the same conversation.
-- Do not explicitly close the episode under normal operation. Server-side consolidation handles aging.
+- At the natural end of the substantive task, close any working episode this
+  rule opened unless another active workflow will close it. Derive the outcome
+  from the actual result (`"success"`, `"failure"`, or `"partial"`), call
+  `pensyve_episode_end`, and clear the working ID. Never double-close an episode.
 - Recovery: if `pensyve_observe` fails with a missing-episode error, call `pensyve_episode_start` and retry.
 
 ### Surface style

@@ -4,16 +4,23 @@ Use when starting a new substantive conversation or switching contexts — load 
 
 ### Step 1: Detect project entity
 
-Use the repository root name (lowercase-hyphenated) as the default project entity. Override with `PENSYVE_NAMESPACE` environment variable if explicitly set.
+Use the user's explicitly named project when present, then fall back to the
+repository root name. Normalize the project entity to lowercase-hyphenated
+form. `PENSYVE_NAMESPACE` selects the MCP server's storage namespace; never use
+it as an entity.
 
-### Step 2: Scoped recall
+### Step 2: Load strictly scoped context
 
-Call `pensyve_recall`:
+Call `pensyve_inspect`:
 
-- `query`: `"recent decisions issues patterns"` + any key terms from the user's opening message
 - `entity`: detected project entity
-- `types`: `["episodic"]`
 - `limit`: 5
+
+Omitting `memory_type` includes semantic, episodic, procedural, and observation
+memories for that exact entity. Do not describe `pensyve_recall(entity: ...)` as
+strict scoping: its `entity` parameter is a ranking hint. Only use broader
+recall when the user explicitly opts into cross-entity discovery; in that case,
+request `types: ["episodic", "procedural", "semantic"]` and `limit: 5`.
 
 ### Step 3: Compute continuity signal
 
@@ -105,4 +112,7 @@ Medium-signal items that benefit from user confirmation:
 | `pensyve_episode_start` | Begin tracking a conversation                  | `participants`                                                            |
 | `pensyve_episode_end`   | End episode with outcome summary               | `episode_id`, `outcome?`                                                  |
 | `pensyve_forget`        | Delete all memories for an entity (irreversible) | `entity`                                                                |
-| `pensyve_inspect`       | View all memories for an entity                | `entity`, `memory_type?`, `limit?`                                        |
+| `pensyve_forget_memory` | Delete one memory by exact ID                  | `memory_id`                                                             |
+| `pensyve_inspect`       | View up to the requested number of memories    | `entity`, `memory_type?`, `limit?`                                      |
+| `pensyve_status`        | Check namespace and connection health          | none                                                                    |
+| `pensyve_account`       | Check plan, usage, and quota                    | none                                                                    |

@@ -17,7 +17,9 @@ Examples:
    - `query`: the search terms after removing flags;
    - `entity`: the normalized `--entity` value when supplied;
    - `limit`: the supplied `--limit`, otherwise `10`.
-2. Group results into semantic, episodic, and procedural memory tables. Include scores and the useful fields returned for each type.
+2. Group results into semantic, episodic, and procedural memory tables. Include
+   a **Memory ID** column in every table and copy each result's exact `id`
+   unchanged. Also include scores and the useful fields returned for each type.
 3. Provide a brief summary of the highest-relevance findings.
 4. If no result exists, say so and suggest a broader query.
 

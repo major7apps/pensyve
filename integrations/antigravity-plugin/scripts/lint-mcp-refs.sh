@@ -86,7 +86,7 @@ else
   EXIT_CODE=1
 fi
 
-echo "Check 3: every pensyve_observe example has source_entity and about_entity"
+echo "Check 3: every pensyve_observe example has all required fields"
 MISSING_FIELDS=0
 for content_file in "${CONTENT_FILES[@]}"; do
   while IFS= read -r line; do
@@ -102,6 +102,7 @@ for content_file in "${CONTENT_FILES[@]}"; do
        if(c==")") depth--;
        };
        if(depth==0 && buf ~ /pensyve_observe\(/){
+       if(buf !~ /episode_id/) print FILENAME ": missing episode_id near:" buf;
        if(buf !~ /source_entity/) print FILENAME ": missing source_entity near:" buf;
        if(buf !~ /about_entity/) print FILENAME ": missing about_entity near:" buf;
        capture=0;
@@ -115,9 +116,15 @@ else
 fi
 
 echo "Check 4: provenance tags use the documented format"
-VALID_PROVENANCE_RE='\[(proactive|auto-capture)/(in-flight|stop|pre-compact|curator|user)/(tier-1|tier-2|residual/tier-1|residual/tier-2|open-question)\]'
-if rg -n '\[(proactive|auto-capture)' "${CONTENT_FILES[@]}" | rg -v "$VALID_PROVENANCE_RE"; then
-  echo "  FAIL: some provenance tags do not match [<origin>/<trigger>/<tier>]"
+VALID_PROVENANCE_RE='^\[(proactive/in-flight/(tier-1|tier-2|open-question)|auto-capture/(stop|pre-compact|curator)/(tier-1|tier-2)|auto-capture/user/residual/(tier-1|tier-2))\]$'
+INVALID_PROVENANCE=0
+while IFS= read -r provenance_tag; do
+  if [[ ! "$provenance_tag" =~ $VALID_PROVENANCE_RE ]]; then
+    echo "  FAIL: invalid provenance tag: $provenance_tag"
+    INVALID_PROVENANCE=1
+  fi
+done < <(rg -o --no-filename '\[(proactive|auto-capture|capture)/[^]]+\]' "${CONTENT_FILES[@]}" || true)
+if [ "$INVALID_PROVENANCE" = "1" ]; then
   EXIT_CODE=1
 else
   echo "  PASS"
@@ -129,6 +136,12 @@ if rg -q 'source_entity: "antigravity-cli"|participants: \["antigravity-cli"' "$
 else
   echo "  FAIL: no antigravity-cli provenance found"
   EXIT_CODE=1
+fi
+if rg -n '"?source_entity"?[[:space:]]*:[[:space:]]*"gemini(-cli)?"|"?participants"?[[:space:]]*:[^]]*"gemini(-cli)?"' "${CONTENT_FILES[@]}"; then
+  echo "  FAIL: stale Gemini provenance found"
+  EXIT_CODE=1
+else
+  echo "  PASS: stale Gemini provenance absent"
 fi
 
 LEGACY_CLIENT_RE='Gemini'' CLI|gemini''-cli|gemini'' mcp|gemini''-extension|gemini''cli\.com'
@@ -147,7 +160,24 @@ for content_file in "${CONTENT_FILES[@]}"; do
   fi
 done
 
-echo "Check 6: every rule is at most 12,000 characters"
+echo "Check 6: legacy extension artifacts are absent"
+FORBIDDEN_ARTIFACT=0
+while IFS= read -r -d '' artifact; do
+  echo "  FAIL: forbidden legacy artifact: $artifact"
+  FORBIDDEN_ARTIFACT=1
+done < <(find "$PLUGIN_DIR" -type f \( \
+  -name 'GEMINI.md' -o \
+  -name 'gemini-extension.json' -o \
+  -path '*/.gemini/settings*' -o \
+  -path '*/commands/*.toml' \
+\) -print0)
+if [ "$FORBIDDEN_ARTIFACT" = "0" ]; then
+  echo "  PASS"
+else
+  EXIT_CODE=1
+fi
+
+echo "Check 7: every rule is at most 12,000 characters"
 RULE_SIZE_FAILURE=0
 while IFS= read -r -d '' rule_file; do
   rule_chars="$(wc -m < "$rule_file")"
@@ -162,7 +192,7 @@ else
   EXIT_CODE=1
 fi
 
-echo "Check 7: procedural captures use the [procedural] prefix"
+echo "Check 8: procedural captures use the [procedural] prefix"
 if rg -q '\[procedural\]' "${CONTENT_FILES[@]}"; then
   echo "  PASS"
 else

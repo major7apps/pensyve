@@ -14,7 +14,8 @@ Call `pensyve_recall` once at the start:
 
 No `types` filter — longitudinal work benefits from all three memory types.
 
-Surface: `Recalled N prior findings on <sub-topic>.`
+When `N > 0`, surface: `Recalled N prior findings on <sub-topic>.` Do not
+narrate an empty recall.
 
 ### Step 2: Proactively recall per topic shift
 
@@ -24,9 +25,9 @@ When the session pivots to a new sub-topic, call `pensyve_recall` again scoped t
 
 | What you learned | Type | MCP call |
 |---|---|---|
-| Per-run outcome | episodic | `pensyve_observe(..., content: "[proactive/in-flight/tier-1] Run N+1: ...", source_entity: "antigravity-cli", about_entity: <entity>, content_type: "text")` |
+| Per-run outcome | episodic | `pensyve_observe(episode_id: <working_id>, content: "[proactive/in-flight/tier-1] Run N+1: ...", source_entity: "antigravity-cli", about_entity: <entity>, content_type: "text")` |
 | Stable truth | semantic | `pensyve_remember(entity, fact: "[proactive/in-flight/tier-1] ...", confidence: 0.9)` |
-| Reusable procedure | procedural | `pensyve_observe(..., content: "[procedural] [proactive/in-flight/tier-1] trigger=..., action=..., outcome=...", source_entity: "antigravity-cli", about_entity: <entity>, content_type: "text")` |
+| Reusable procedure | procedural | `pensyve_observe(episode_id: <working_id>, content: "[procedural] [proactive/in-flight/tier-1] trigger=..., action=..., outcome=...", source_entity: "antigravity-cli", about_entity: <entity>, content_type: "text")` |
 
 ### Step 4: Capture open questions
 

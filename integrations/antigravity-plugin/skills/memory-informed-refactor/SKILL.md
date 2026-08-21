@@ -28,8 +28,9 @@ context about the target within the shared recall budget:
 
 ### Step 2: Inspect the Entity
 
-Call `pensyve_inspect` with `entity: "<target>"` to get the full memory inventory
-for that entity.
+Call `pensyve_inspect` with `entity: "<target>"` and `limit: 20` to get up to 20
+memories for that entity. The tool has no pagination, so do not describe this
+sample as a complete inventory.
 
 ### Step 3: Compile Briefing
 
