@@ -3,7 +3,7 @@
   "name": "io.github.major7apps/pensyve",
   "title": "Pensyve",
   "description": "Universal memory runtime for AI agents — episodic, semantic, and procedural memory.",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "repository": {
     "url": "https://github.com/major7apps/pensyve",
     "source": "github"
@@ -13,15 +13,7 @@
   "remotes": [
     {
       "type": "streamable-http",
-      "url": "https://mcp.pensyve.com/mcp",
-      "headers": [
-        {
-          "name": "Authorization",
-          "description": "Bearer token for authentication, e.g. 'Bearer <PENSYVE_API_KEY>'",
-          "isRequired": true,
-          "isSecret": true
-        }
-      ]
+      "url": "https://mcp.pensyve.com/mcp"
     }
   ],
   "tools": [

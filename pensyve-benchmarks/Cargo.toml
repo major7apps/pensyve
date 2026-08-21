@@ -1,6 +1,6 @@
 [package]
 name = "pensyve-benchmarks"
-version = "3.1.0"
+version = "3.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -8,7 +8,7 @@ description = "Evaluation framework for Pensyve memory engine"
 publish = false
 
 [dependencies]
-pensyve-core = { path = "../pensyve-core", version = "3.1.0" }
+pensyve-core = { path = "../pensyve-core", version = "3.2.0" }
 rand = "0.10"
 rand_distr = "0.6"
 serde = { version = "1", features = ["derive"] }
