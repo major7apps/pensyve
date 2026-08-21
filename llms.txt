@@ -17,7 +17,7 @@ Pensyve gives AI agents persistent, cognitive memory that spans across sessions.
 
 ### MCP Server (Antigravity CLI, Claude Code, Cursor, Cline, Windsurf, Continue, VS Code Copilot)
 
-The MCP server exposes 6 tools: `pensyve_recall`, `pensyve_remember`, `pensyve_episode_start`, `pensyve_episode_end`, `pensyve_forget`, `pensyve_inspect`.
+The MCP server exposes 10 tools: `pensyve_recall`, `pensyve_remember`, `pensyve_observe`, `pensyve_episode_start`, `pensyve_episode_end`, `pensyve_forget`, `pensyve_forget_memory`, `pensyve_inspect`, `pensyve_status`, `pensyve_account`.
 
 **Cloud** (no build required):
 ```json

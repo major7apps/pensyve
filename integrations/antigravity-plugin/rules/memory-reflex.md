@@ -31,7 +31,7 @@ When in doubt, prefer episodic. Server-side consolidation promotes recurring pat
 
 ALL observe calls MUST include every required field:
 
-```
+```text
 pensyve_observe(
   episode_id: <current session's working episode_id>,
   content: "[proactive/in-flight/tier-1] <observation text>",

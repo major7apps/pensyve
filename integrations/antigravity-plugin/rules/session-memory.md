@@ -34,11 +34,21 @@ For each candidate, call `pensyve_recall` with `query: <candidate fact text>`, `
 
 ### Step 5: Optionally close the episode
 
-If the user indicates this is a final wrap, call `pensyve_episode_end(episode_id: <working_id>, outcome: "success")`. Valid outcomes: `"success"`, `"failure"`, `"partial"`.
+If the user indicates this is a final wrap, derive the outcome from the actual
+session result and call `pensyve_episode_end(episode_id: <working_id>, outcome:
+<derived_outcome>)`. Use `"success"` only when the intended work completed,
+`"failure"` when it did not produce a usable result, and `"partial"` when some
+work completed but required work remains.
 
 ### Step 6: Report
 
-> Stored N memories. Episode <outcome> closed.
+If `pensyve_episode_end` was called successfully, report:
+
+> Stored N memories. Episode closed with outcome `<derived_outcome>`.
+
+Otherwise report:
+
+> Stored N memories. Episode remains open.
 
 **Constraint: Never auto-store.** Every candidate MUST be presented for user confirmation before storage.
 

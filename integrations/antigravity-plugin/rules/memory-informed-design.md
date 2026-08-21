@@ -30,7 +30,7 @@ If the user's current question directly contradicts a prior decision, flag it:
 
 ### Step 5: Capture evaluation procedures
 
-```
+```text
 pensyve_observe(
   episode_id: <working_id>,
   content: "[procedural] [proactive/in-flight/tier-1] trigger=design-question-on-<area>, action=<steps>, outcome=<what-you-learn>",

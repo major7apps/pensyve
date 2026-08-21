@@ -23,20 +23,27 @@ Check for a mode argument if provided:
 
 ### Step 2: Query Memories
 
-Run the following `pensyve_recall` queries to gather session context:
+If `PENSYVE_NAMESPACE` is explicitly set, use it as the active project entity.
+Otherwise use the user's explicitly named project when present, then fall back
+to the repository root. Normalize the selected value to lowercase-hyphenated
+form. Run the following `pensyve_recall` queries with `entity:
+<active-project-entity>` to gather session context:
 
 1. **Recent decisions**: `pensyve_recall` with query `"decided"` (limit: 5)
 2. **Known issues**: `pensyve_recall` with query `"issue OR bug OR error OR problem"` (limit: 5)
 3. **Workflow patterns**: `pensyve_recall` with query `"workflow OR pattern OR process"` (limit: 5)
-4. **Recent activity**: `pensyve_recall` with query `"*"` (limit: 10) -- broad query to capture recent memories by recency
+4. **Recent activity**: `pensyve_recall` with query `"*"` (limit: 5), still scoped to the active project entity
 
 Deduplicate results across queries (same memory ID should appear only once).
+Do not run an unscoped or global wildcard query unless the user explicitly opts
+into cross-project discovery.
 
 ### Step 3: Present Context
 
 #### Summary Mode (10-15 lines max)
 
-Present a concise briefing with the most important items:
+Present a concise briefing with the most important items. The block below is an
+illustrative example only; replace every item with actual MCP results:
 
 > **Session Context** (from Pensyve memory)
 >
@@ -65,11 +72,13 @@ Rules for summary mode:
 
 #### Full Mode (comprehensive)
 
-Present a detailed briefing with scores and metadata:
+Present a detailed briefing with scores and metadata. The block below is an
+illustrative example only; replace every value with actual MCP results:
 
 > **Session Context** (from Pensyve memory)
 >
 > **Recent Decisions** (3 found):
+>
 > | Entity | Decision | Confidence | When |
 > |--------|----------|------------|------|
 > | auth-service | Using RS256 for JWT signing | 0.9 | 2026-03-15 |
@@ -77,17 +86,20 @@ Present a detailed briefing with scores and metadata:
 > | database | SQLite for MVP, migrate to Postgres later | 0.9 | 2026-03-12 |
 >
 > **Known Issues** (2 found):
+>
 > | Entity | Issue | Confidence | Score |
 > |--------|-------|------------|-------|
 > | database | Migration requires Python 3.11+ | 0.8 | 0.91 |
 > | cache | Invalidation race condition on concurrent writes | 0.8 | 0.85 |
 >
 > **Workflow Patterns** (1 found):
+>
 > | Entity | Pattern | Confidence | Score |
 > |--------|---------|------------|-------|
 > | testing | Integration tests need tmpdir cleanup | 0.7 | 0.78 |
 >
 > **Recent Activity** (5 unique memories, most recent first):
+>
 > | Type | Entity | Summary | Score |
 > |------|--------|---------|-------|
 > | semantic | auth-service | RS256 JWT signing | 0.92 |

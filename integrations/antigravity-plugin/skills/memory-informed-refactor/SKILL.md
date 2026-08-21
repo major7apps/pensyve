@@ -15,9 +15,11 @@ Invoke before refactoring any module, file, or component. Provides a structured 
 
 ### Step 1: Query Memory for Context
 
-Run multiple `pensyve_recall` queries to gather comprehensive context about the target:
+Normalize the target to a lowercase-hyphenated entity and pass it as `entity`
+to every query. Run multiple `pensyve_recall` queries to gather comprehensive
+context about the target within the shared recall budget:
 
-1. **Direct matches**: `pensyve_recall` with query `"<target>"` (limit: 10)
+1. **Direct matches**: `pensyve_recall` with query `"<target>"` (limit: 5)
 2. **Refactor history**: `pensyve_recall` with query `"<target> refactor"` (limit: 5)
 3. **Past failures**: `pensyve_recall` with query `"<target> failed"` (limit: 5)
 4. **Past failures (alternate)**: `pensyve_recall` with query `"<target> error"` (limit: 5)
@@ -26,7 +28,8 @@ Run multiple `pensyve_recall` queries to gather comprehensive context about the 
 
 ### Step 2: Inspect the Entity
 
-If the target matches an entity name, also call `pensyve_inspect` with `entity: "<target>"` to get the full memory inventory for that entity.
+Call `pensyve_inspect` with `entity: "<target>"` to get the full memory inventory
+for that entity.
 
 ### Step 3: Compile Briefing
 

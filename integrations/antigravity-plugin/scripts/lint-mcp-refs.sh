@@ -35,8 +35,10 @@ echo "Linting MCP references in $PLUGIN_DIR..."
 echo "Check 1: only documented Pensyve MCP tool names are referenced"
 UNKNOWN_TOOLS=0
 while IFS= read -r tool_name; do
+  # Keep this allowlist aligned with the ten tools asserted by the gateway
+  # integration test, including single-memory and entity-wide deletion.
   case "$tool_name" in
-    pensyve_recall|pensyve_remember|pensyve_observe|pensyve_episode_start|pensyve_episode_end|pensyve_forget|pensyve_inspect)
+    pensyve_recall|pensyve_remember|pensyve_observe|pensyve_episode_start|pensyve_episode_end|pensyve_forget|pensyve_forget_memory|pensyve_inspect|pensyve_status|pensyve_account)
       ;;
     *)
       echo "  FAIL: undocumented MCP tool name: $tool_name"
@@ -103,6 +105,7 @@ for content_file in "${CONTENT_FILES[@]}"; do
        if(buf !~ /source_entity/) print FILENAME ": missing source_entity near:" buf;
        if(buf !~ /about_entity/) print FILENAME ": missing about_entity near:" buf;
        capture=0;
+       buf="";
        }}' "$content_file")
 done
 if [ "$MISSING_FIELDS" = "0" ]; then
@@ -129,13 +132,15 @@ else
 fi
 
 LEGACY_CLIENT_RE='Gemini'' CLI|gemini''-cli|gemini'' mcp|gemini''-extension|gemini''cli\.com'
-APPROVED_MIGRATION_NOTE='Former Gemini'' CLI users should install the Antigravity plugin'
+APPROVED_MIGRATION_LINE='Former Gemini'' CLI users should install the Antigravity plugin. Google'\''s enterprise and paid API-key Gemini'' CLI compatibility path is a Google-owned legacy option; Pensyve supports Antigravity as its current Google coding-agent integration.'
 for content_file in "${CONTENT_FILES[@]}"; do
   if [ "$content_file" = "$README_FILE" ]; then
-    if rg -n -i "$LEGACY_CLIENT_RE" "$content_file" | rg -v -F "$APPROVED_MIGRATION_NOTE"; then
-      echo "  FAIL: unapproved legacy reference in $content_file"
-      EXIT_CODE=1
-    fi
+    while IFS= read -r legacy_line; do
+      if [ "$legacy_line" != "$APPROVED_MIGRATION_LINE" ]; then
+        echo "  FAIL: unapproved legacy reference in $content_file: $legacy_line"
+        EXIT_CODE=1
+      fi
+    done < <(rg --no-line-number -i "$LEGACY_CLIENT_RE" "$content_file" || true)
   elif rg -n -i "$LEGACY_CLIENT_RE" "$content_file"; then
     echo "  FAIL: legacy Google CLI reference in $content_file"
     EXIT_CODE=1

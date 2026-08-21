@@ -44,11 +44,16 @@ The [`shared/`](shared/) directory contains the common Pensyve client libraries 
 
 ## Quick Start
 
-Every integration connects to Pensyve via its MCP endpoint. You need an API key:
+Every integration connects to Pensyve via its MCP endpoint. Most remote
+integrations can use an API key:
 
 1. Sign up at [pensyve.com](https://pensyve.com)
 2. Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys)
 3. Follow the setup instructions in the integration's own README
+
+Antigravity uses browser OAuth for interactive cloud access; follow its
+[plugin setup](antigravity-plugin/) instead of placing an API key in the
+bundled configuration.
 
 For manual MCP setup in any tool that supports it:
 

@@ -53,7 +53,7 @@ Use **lowercase, hyphenated** names for entities:
 
 ## Tiered Capture Classification
 
-### Tier 1 (auto-store, confidence >= 0.9)
+### Tier 1 (high-confidence in-flight capture, confidence >= 0.9)
 
 High-signal items that should almost always be captured:
 
@@ -61,13 +61,15 @@ High-signal items that should almost always be captured:
 - **Behavioral corrections**: "don't do X", "stop doing Y"
 - **Project constraints**: "we can't use X because Y"
 - **Technology migrations**: "switching to X", "migrating from Y to Z"
+- **Confirmed root causes**: a diagnosis supported by the completed debug work
+- **Confirmed abandoned approaches**: an attempted path with a verified reason it failed
 
 ### Tier 2 (batch for review, confidence 0.7-0.89)
 
 Medium-signal items that benefit from user confirmation:
 
-- **Root causes**: "the bug was caused by..."
-- **Failed approaches**: "tried X but it failed because..."
+- **Root-cause hypotheses**: plausible but not yet confirmed by the debug work
+- **Unconfirmed failed approaches**: attempted paths whose failure reason is still uncertain
 - **Performance findings**: measurable results
 - **Non-obvious solutions**: workarounds for framework/tool limitations
 
@@ -83,7 +85,7 @@ Medium-signal items that benefit from user confirmation:
 
 1. **Never store secrets.** Do not store API keys, passwords, tokens, or credentials. Warn the user if they ask you to remember something that looks like a secret.
 
-2. **Never auto-store.** Always present memory candidates to the user and get explicit confirmation before calling `pensyve_remember`. The only exception is episode tracking, which the user opts into.
+2. **Respect the active workflow's storage contract.** Session-memory candidates are never auto-stored and require explicit confirmation. Memory-informed rules capture confirmed lessons immediately when they land, using the lazy episode lifecycle in Part 1. Installing and enabling the plugin opts into that in-flight behavior; destructive forgetting still always requires its separate confirmation.
 
 3. **Deduplicate before storing.** Run `pensyve_recall` with a query matching the candidate fact. If a highly similar memory already exists (score > 0.85), skip it.
 

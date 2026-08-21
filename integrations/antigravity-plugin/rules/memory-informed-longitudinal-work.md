@@ -30,7 +30,7 @@ When the session pivots to a new sub-topic, call `pensyve_recall` again scoped t
 
 ### Step 4: Capture open questions
 
-```
+```text
 pensyve_observe(
   episode_id: <working_id>,
   content: "[proactive/in-flight/open-question] <question>",
