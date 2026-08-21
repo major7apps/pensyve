@@ -128,14 +128,16 @@ else
   EXIT_CODE=1
 fi
 
+LEGACY_CLIENT_RE='Gemini'' CLI|gemini''-cli|gemini'' mcp|gemini''-extension|gemini''cli\.com'
+APPROVED_MIGRATION_NOTE='Former Gemini'' CLI users should install the Antigravity plugin'
 for content_file in "${CONTENT_FILES[@]}"; do
   if [ "$content_file" = "$README_FILE" ]; then
-    if rg -n -i 'Gemini CLI|gemini-cli|gemini mcp|gemini-extension|geminicli\.com' "$content_file" | rg -v 'Former Gemini CLI users should install the Antigravity plugin'; then
+    if rg -n -i "$LEGACY_CLIENT_RE" "$content_file" | rg -v -F "$APPROVED_MIGRATION_NOTE"; then
       echo "  FAIL: unapproved legacy reference in $content_file"
       EXIT_CODE=1
     fi
-  elif rg -n -i 'Gemini CLI|gemini-cli|gemini mcp|gemini-extension|geminicli\.com' "$content_file"; then
-    echo "  FAIL: legacy Gemini CLI reference in $content_file"
+  elif rg -n -i "$LEGACY_CLIENT_RE" "$content_file"; then
+    echo "  FAIL: legacy Google CLI reference in $content_file"
     EXIT_CODE=1
   fi
 done
