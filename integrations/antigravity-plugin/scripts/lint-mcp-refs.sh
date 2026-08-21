@@ -4,7 +4,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PLUGIN_DIR="$SCRIPT_DIR/.."
+PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 RULES_DIR="$PLUGIN_DIR/rules"
 SKILLS_DIR="$PLUGIN_DIR/skills"
 README_FILE="$PLUGIN_DIR/README.md"
