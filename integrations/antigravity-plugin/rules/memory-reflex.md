@@ -86,4 +86,3 @@ When a capture is both procedural AND a proactive in-flight write:
 - `pensyve_observe(episode_id, content, source_entity, about_entity, content_type?)` — `source_entity` and `about_entity` are **required**
 
 ---
-

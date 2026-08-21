@@ -29,4 +29,3 @@ Extract candidate entity names from:
 A set of 1–3 candidate entity names per turn. The primary entity is the most specific. Since `pensyve_recall` accepts only a single `entity` parameter, fold secondary entities into the `query` string.
 
 ---
-

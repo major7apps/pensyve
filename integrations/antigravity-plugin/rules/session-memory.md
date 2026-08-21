@@ -43,4 +43,3 @@ If the user indicates this is a final wrap, call `pensyve_episode_end(episode_id
 **Constraint: Never auto-store.** Every candidate MUST be presented for user confirmation before storage.
 
 ---
-

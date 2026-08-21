@@ -31,4 +31,3 @@ Briefly summarize what prior memories say about decisions, prior attempts, and k
 - **A known-good refactoring sequence** — `pensyve_observe` with `[procedural]` prefix
 
 ---
-
