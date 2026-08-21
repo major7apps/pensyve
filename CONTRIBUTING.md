@@ -37,7 +37,7 @@ pensyve-mcp-gateway/   MCP HTTP gateway (cloud)
 pensyve-mcp-tools/     Shared MCP tool definitions
 pensyve-cli/           CLI (clap)
 pensyve-wasm/          WASM bindings
-integrations/          Claude Code, Codex, Gemini, LangChain, CrewAI, etc.
+integrations/          Claude Code, Codex, Antigravity, LangChain, CrewAI, etc.
 ```
 
 ## How to Contribute

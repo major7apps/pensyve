@@ -7,7 +7,7 @@ Pensyve integrations connect the memory runtime to AI coding agents, IDEs, and a
 | Integration                     | Directory           | Status   | Description                                                   |
 | ------------------------------- | ------------------- | -------- | ------------------------------------------------------------- |
 | [Claude Code](claude-code/)     | `claude-code/`      | Stable   | Plugin with hooks, skills, commands, and memory-curator agent |
-| [Gemini CLI](gemini-extension/) | `gemini-extension/` | Stable   | Extension with skills, commands, and context injection        |
+| [Antigravity CLI](antigravity-plugin/) | `antigravity-plugin/` | Stable | Native plugin with OAuth MCP, rules, and skills |
 | [Codex](codex-plugin/)          | `codex-plugin/`     | Stable   | Native Codex plugin with bundled MCP, hooks, and `$pensyve` skill |
 | [OpenCode](opencode-plugin/)    | `opencode-plugin/`  | Stable   | Plugin with MCP integration                                   |
 | [OpenClaw](openclaw-plugin/)    | `openclaw-plugin/`  | Stable   | Plugin with MCP integration                                   |
@@ -68,4 +68,4 @@ Each integration directory should contain:
 - Integration-specific configuration files
 - A `LICENSE` file (Apache 2.0)
 
-See the [Claude Code](claude-code/) or [Gemini CLI](gemini-extension/) integrations as reference implementations.
+See the [Claude Code](claude-code/) or [Antigravity CLI](antigravity-plugin/) integrations as reference implementations.

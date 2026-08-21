@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The Gemini CLI extension is replaced by a native Antigravity CLI plugin.** Install it with `agy plugin install https://github.com/major7apps/pensyve/tree/main/integrations/antigravity-plugin`. The package includes URL-only OAuth MCP configuration, eight rules, and eight skills; dated Gemini CLI release history remains below for migration provenance.
 - **Postgres row-level security is enforced by default** (#254). `postgres_schema.sql` now ends with `ALTER TABLE ... FORCE ROW LEVEL SECURITY` on all seven policied tables (`entities`, `episodes`, `episodic_memories`, `semantic_memories`, `procedural_memories`, `observation_memories`, `edges`), so the `namespace_isolation_*` policies apply to the role that owns the schema instead of being inert for it. Enforcement was the last step of the tenant-isolation sweep and was held back only until every `StorageTrait` method carried a namespace; 3.1.0 finished that. The statements are idempotent and sit after the edges backfill, so an upgrade from an unenforced database migrates first and is forced afterwards, in the same batch.
 - **`postgres_rls_enforce.sql` and `PostgresBackend::enforce_rls` are removed.** They existed to let an operator turn enforcement on ahead of the schema; there is nothing left for them to do. Nothing needs to be applied by hand any more.
 
