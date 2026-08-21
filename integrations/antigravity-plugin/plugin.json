@@ -1,0 +1,5 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "pensyve",
+  "description": "Persistent working memory for Antigravity CLI across projects and sessions."
+}

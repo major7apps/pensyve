@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "pensyve": {
+      "serverUrl": "https://mcp.pensyve.com/mcp"
+    }
+  }
+}
