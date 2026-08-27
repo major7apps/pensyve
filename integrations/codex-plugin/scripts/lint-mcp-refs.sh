@@ -171,6 +171,11 @@ in_dependencies = False
 in_tools = False
 current = None
 
+# This is intentionally a canonical-format validator, not a general YAML parser.
+# The plugin owns this small file and requires dependencies.tools to use block
+# mappings, two-space indentation, quoted scalars, and no inline comments. Keeping
+# that surface exact avoids adding a YAML runtime dependency to the release job.
+
 for number, raw_line in enumerate(lines, start=1):
     if not raw_line.strip() or raw_line.lstrip().startswith("#"):
         continue
@@ -200,7 +205,9 @@ for number, raw_line in enumerate(lines, start=1):
     if match and current is not None:
         current[match.group(1)] = match.group(2)
         continue
-    raise SystemExit(f"unsupported dependencies.tools syntax at {path}:{number}: {raw_line}")
+    raise SystemExit(
+        f"non-canonical dependencies.tools syntax at {path}:{number}: {raw_line}"
+    )
 
 def scalar(value):
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
@@ -221,7 +228,7 @@ PY
 then
   echo "  PASS"
 else
-  echo "  FAIL: dependencies.tools must contain exactly one complete Pensyve MCP object"
+  echo "  FAIL: dependencies.tools must use the canonical one-object Pensyve MCP block"
   EXIT_CODE=1
 fi
 echo ""
@@ -235,18 +242,25 @@ import sys
 
 path = pathlib.Path(sys.argv[1])
 manifest = json.loads(path.read_text(encoding="utf-8"))
-prompts = manifest.get("interface", {}).get("defaultPrompt")
-if not isinstance(prompts, list):
-    raise SystemExit("interface.defaultPrompt must be an array")
-if not 1 <= len(prompts) <= 3:
-    raise SystemExit(f"interface.defaultPrompt must contain 1-3 entries, found {len(prompts)}")
+value = manifest.get("interface", {}).get("defaultPrompt")
+if isinstance(value, str):
+    prompts = [value]
+elif isinstance(value, list):
+    prompts = value
+else:
+    raise SystemExit("interface.defaultPrompt must be a string or an array of strings")
+if len(prompts) > 3:
+    raise SystemExit(f"interface.defaultPrompt supports at most 3 entries, found {len(prompts)}")
 for index, prompt in enumerate(prompts):
     if not isinstance(prompt, str):
         raise SystemExit(f"defaultPrompt[{index}] must be a string")
-    if not prompt.strip():
+    normalized = " ".join(prompt.split())
+    if not normalized:
         raise SystemExit(f"defaultPrompt[{index}] must not be empty")
-    if len(prompt) > 128:
-        raise SystemExit(f"defaultPrompt[{index}] exceeds 128 characters ({len(prompt)})")
+    if len(normalized) > 128:
+        raise SystemExit(
+            f"defaultPrompt[{index}] exceeds 128 normalized characters ({len(normalized)})"
+        )
 print(f"validated {len(prompts)} prompts")
 PY
 then
