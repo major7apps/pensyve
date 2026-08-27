@@ -212,7 +212,7 @@ for number, raw_line in enumerate(lines, start=1):
 def scalar(value):
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
         return value[1:-1]
-    return value
+    raise SystemExit(f"canonical dependencies.tools scalars must be quoted: {value!r}")
 
 parsed = [{key: scalar(value) for key, value in item.items()} for item in items]
 expected = [{
