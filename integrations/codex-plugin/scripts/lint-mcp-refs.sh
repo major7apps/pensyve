@@ -159,27 +159,101 @@ echo ""
 
 # Check 7: current Codex requires structured DependencyTool objects, not scalar tool names.
 echo "Check 7: openai.yaml declares the Pensyve MCP as a structured dependency"
-if grep -Eq '^[[:space:]]*-[[:space:]]+pensyve_[a-z_]+[[:space:]]*$' "$OPENAI_METADATA"; then
-  echo "  FAIL: dependencies.tools contains legacy scalar tool names"
-  EXIT_CODE=1
-elif ! grep -Eq '^[[:space:]]*-[[:space:]]+type:[[:space:]]+"?mcp"?[[:space:]]*$' "$OPENAI_METADATA" \
-  || ! grep -Eq '^[[:space:]]+value:[[:space:]]+"?pensyve"?[[:space:]]*$' "$OPENAI_METADATA" \
-  || ! grep -Eq '^[[:space:]]+url:[[:space:]]+"?https://mcp\.pensyve\.com/mcp"?[[:space:]]*$' "$OPENAI_METADATA"; then
-  echo "  FAIL: structured Pensyve MCP dependency is incomplete"
-  EXIT_CODE=1
-else
+if python3 - "$OPENAI_METADATA" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+lines = path.read_text(encoding="utf-8").splitlines()
+items = []
+in_dependencies = False
+in_tools = False
+current = None
+
+for number, raw_line in enumerate(lines, start=1):
+    if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+        continue
+    indent = len(raw_line) - len(raw_line.lstrip(" "))
+    text = raw_line.strip()
+
+    if indent == 0:
+        in_dependencies = text == "dependencies:"
+        in_tools = False
+        current = None
+        continue
+    if not in_dependencies:
+        continue
+    if indent == 2:
+        in_tools = text == "tools:"
+        current = None
+        continue
+    if not in_tools:
+        continue
+
+    match = re.fullmatch(r"- ([a-z_]+):\s*(.+)", text) if indent == 4 else None
+    if match:
+        current = {match.group(1): match.group(2)}
+        items.append(current)
+        continue
+    match = re.fullmatch(r"([a-z_]+):\s*(.+)", text) if indent == 6 else None
+    if match and current is not None:
+        current[match.group(1)] = match.group(2)
+        continue
+    raise SystemExit(f"unsupported dependencies.tools syntax at {path}:{number}: {raw_line}")
+
+def scalar(value):
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+parsed = [{key: scalar(value) for key, value in item.items()} for item in items]
+expected = [{
+    "type": "mcp",
+    "value": "pensyve",
+    "description": "Pensyve persistent-memory MCP server",
+    "transport": "streamable_http",
+    "url": "https://mcp.pensyve.com/mcp",
+}]
+if parsed != expected:
+    raise SystemExit(f"expected exactly one Pensyve MCP dependency, found: {parsed!r}")
+PY
+then
   echo "  PASS"
+else
+  echo "  FAIL: dependencies.tools must contain exactly one complete Pensyve MCP object"
+  EXIT_CODE=1
 fi
 echo ""
 
-# Check 8: Codex currently accepts at most three plugin default prompts.
-echo "Check 8: plugin manifest has at most three default prompts"
-DEFAULT_PROMPT_COUNT="$(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1]))["interface"]["defaultPrompt"]))' "$PLUGIN_MANIFEST")"
-if [ "$DEFAULT_PROMPT_COUNT" -gt 3 ]; then
-  echo "  FAIL: found $DEFAULT_PROMPT_COUNT default prompts; Codex supports at most 3"
-  EXIT_CODE=1
+# Check 8: Codex accepts up to three non-empty string prompts, each at most 128 characters.
+echo "Check 8: plugin manifest default prompts satisfy Codex constraints"
+if python3 - "$PLUGIN_MANIFEST" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+manifest = json.loads(path.read_text(encoding="utf-8"))
+prompts = manifest.get("interface", {}).get("defaultPrompt")
+if not isinstance(prompts, list):
+    raise SystemExit("interface.defaultPrompt must be an array")
+if not 1 <= len(prompts) <= 3:
+    raise SystemExit(f"interface.defaultPrompt must contain 1-3 entries, found {len(prompts)}")
+for index, prompt in enumerate(prompts):
+    if not isinstance(prompt, str):
+        raise SystemExit(f"defaultPrompt[{index}] must be a string")
+    if not prompt.strip():
+        raise SystemExit(f"defaultPrompt[{index}] must not be empty")
+    if len(prompt) > 128:
+        raise SystemExit(f"defaultPrompt[{index}] exceeds 128 characters ({len(prompt)})")
+print(f"validated {len(prompts)} prompts")
+PY
+then
+  echo "  PASS"
 else
-  echo "  PASS: $DEFAULT_PROMPT_COUNT default prompts"
+  echo "  FAIL: invalid interface.defaultPrompt"
+  EXIT_CODE=1
 fi
 echo ""
 
