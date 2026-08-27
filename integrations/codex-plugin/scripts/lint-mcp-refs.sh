@@ -203,7 +203,10 @@ for number, raw_line in enumerate(lines, start=1):
         continue
     match = re.fullmatch(r"([a-z_]+):\s*(.+)", text) if indent == 6 else None
     if match and current is not None:
-        current[match.group(1)] = match.group(2)
+        key = match.group(1)
+        if key in current:
+            raise SystemExit(f"duplicate dependencies.tools key at {path}:{number}: {key}")
+        current[key] = match.group(2)
         continue
     raise SystemExit(
         f"non-canonical dependencies.tools syntax at {path}:{number}: {raw_line}"
