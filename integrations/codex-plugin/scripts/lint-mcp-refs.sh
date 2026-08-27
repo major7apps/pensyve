@@ -22,6 +22,8 @@ MENTION_DOC_FILES=(
   "$PLUGIN_ROOT/commands/pensyve.md"
   "$PLUGIN_ROOT/docs/ARCHITECTURE.md"
 )
+OPENAI_METADATA="$PLUGIN_ROOT/skills/pensyve/agents/openai.yaml"
+PLUGIN_MANIFEST="$PLUGIN_ROOT/.codex-plugin/plugin.json"
 
 EXIT_CODE=0
 
@@ -152,6 +154,32 @@ done
 if [ "$MISSING_MENTION_DOC" != "0" ]; then
   echo "  FAIL: mention workflow must document that true @-mention dispatch is not currently exposed in every mention surface"
   EXIT_CODE=1
+fi
+echo ""
+
+# Check 7: current Codex requires structured DependencyTool objects, not scalar tool names.
+echo "Check 7: openai.yaml declares the Pensyve MCP as a structured dependency"
+if grep -Eq '^[[:space:]]*-[[:space:]]+pensyve_[a-z_]+[[:space:]]*$' "$OPENAI_METADATA"; then
+  echo "  FAIL: dependencies.tools contains legacy scalar tool names"
+  EXIT_CODE=1
+elif ! grep -Eq '^[[:space:]]*-[[:space:]]+type:[[:space:]]+"?mcp"?[[:space:]]*$' "$OPENAI_METADATA" \
+  || ! grep -Eq '^[[:space:]]+value:[[:space:]]+"?pensyve"?[[:space:]]*$' "$OPENAI_METADATA" \
+  || ! grep -Eq '^[[:space:]]+url:[[:space:]]+"?https://mcp\.pensyve\.com/mcp"?[[:space:]]*$' "$OPENAI_METADATA"; then
+  echo "  FAIL: structured Pensyve MCP dependency is incomplete"
+  EXIT_CODE=1
+else
+  echo "  PASS"
+fi
+echo ""
+
+# Check 8: Codex currently accepts at most three plugin default prompts.
+echo "Check 8: plugin manifest has at most three default prompts"
+DEFAULT_PROMPT_COUNT="$(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1]))["interface"]["defaultPrompt"]))' "$PLUGIN_MANIFEST")"
+if [ "$DEFAULT_PROMPT_COUNT" -gt 3 ]; then
+  echo "  FAIL: found $DEFAULT_PROMPT_COUNT default prompts; Codex supports at most 3"
+  EXIT_CODE=1
+else
+  echo "  PASS: $DEFAULT_PROMPT_COUNT default prompts"
 fi
 echo ""
 
