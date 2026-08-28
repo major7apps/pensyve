@@ -1664,7 +1664,8 @@ impl StorageTrait for SqliteBackend {
             // caller-supplied `episode_id` alone selects rows across tenants.
             conn.execute(
                 "DELETE FROM kg_triples \
-                 WHERE passage_id IN (SELECT id FROM observation_memories \
+                 WHERE namespace_id = ?2 \
+                   AND passage_id IN (SELECT id FROM observation_memories \
                                        WHERE episode_id = ?1 AND namespace_id = ?2)",
                 params![&ep_str, &ns_str],
             )?;
@@ -5424,6 +5425,20 @@ mod tests {
         .unwrap()
     }
 
+    fn kg_triples_count_in_namespace(
+        db: &SqliteBackend,
+        passage_id: Uuid,
+        namespace_id: Uuid,
+    ) -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM kg_triples WHERE passage_id = ?1 AND namespace_id = ?2",
+            params![passage_id.to_string(), namespace_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
     fn kg_passage_entities_count_for_passage(db: &SqliteBackend, passage_id: Uuid) -> i64 {
         let conn = db.conn.lock().unwrap();
         conn.query_row(
@@ -5533,6 +5548,11 @@ mod tests {
             2,
             "B's rows must exist before the delete, or their absence afterwards proves nothing"
         );
+        assert_eq!(
+            kg_triples_count_in_namespace(&db, observation.id, ns_b.id),
+            1,
+            "B's triple must exist before the delete, or its absence afterwards proves nothing"
+        );
 
         let deleted = db.delete_observations_by_episode(ns_a.id, episode).unwrap();
         assert_eq!(deleted, 1, "namespace A's observation must be deleted");
@@ -5547,6 +5567,11 @@ mod tests {
             2,
             "namespace B's passage-entity rows were deleted by an episode cleanup issued for \
              namespace A"
+        );
+        assert_eq!(
+            kg_triples_count_in_namespace(&db, observation.id, ns_b.id),
+            1,
+            "namespace B's triple was deleted by an episode cleanup issued for namespace A"
         );
     }
 
