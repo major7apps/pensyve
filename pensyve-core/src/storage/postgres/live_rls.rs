@@ -983,6 +983,73 @@ fn namespace_scoping_end_to_end_under_enforced_rls() {
     );
 }
 
+/// Deleting observations by an episode UUID shared across namespaces must
+/// remove only the caller's row, with both explicit predicates and RLS active.
+/// `tests/test_namespace_scoping.rs` pins the same supported API contract on
+/// `SQLite`.
+#[test]
+fn delete_observations_by_episode_partitions_a_shared_episode_id_under_enforced_rls() {
+    let Some(admin_opts) = skip_notice(
+        "delete_observations_by_episode_partitions_a_shared_episode_id_under_enforced_rls",
+    ) else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns_a = Namespace::new(format!("episode-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("episode-b-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns_a).expect("save namespace A");
+    backend.save_namespace(&ns_b).expect("save namespace B");
+
+    let shared_episode = Uuid::new_v4();
+    let observation_a = ObservationMemory::new(
+        ns_a.id,
+        shared_episode,
+        "tenant",
+        "A",
+        "owns",
+        "namespace A observation",
+    );
+    backend
+        .save_observation(&observation_a)
+        .expect("save namespace A observation");
+    let observation_b = ObservationMemory::new(
+        ns_b.id,
+        shared_episode,
+        "tenant",
+        "B",
+        "owns",
+        "namespace B observation",
+    );
+    backend
+        .save_observation(&observation_b)
+        .expect("save namespace B observation");
+
+    let deleted = backend
+        .delete_observations_by_episode(ns_a.id, shared_episode)
+        .expect("delete namespace A observations");
+    assert_eq!(deleted, 1, "namespace A must delete only its observation");
+    assert!(
+        backend
+            .list_observations_by_episode_ids(ns_a.id, &[shared_episode], 1024)
+            .expect("read namespace A")
+            .is_empty(),
+        "namespace A's observation must be deleted"
+    );
+    let survivors = backend
+        .list_observations_by_episode_ids(ns_b.id, &[shared_episode], 1024)
+        .expect("read namespace B");
+    assert_eq!(
+        survivors.len(),
+        1,
+        "namespace B's observation was destroyed"
+    );
+    assert_eq!(survivors[0].id, observation_b.id);
+    assert_ne!(survivors[0].id, observation_a.id);
+    assert_eq!(survivors[0].namespace_id, ns_b.id);
+}
+
 /// The capturing delete keeps working with RLS enforced.
 ///
 /// It takes a `namespace_id`, so its connection is bound to that namespace

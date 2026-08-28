@@ -199,6 +199,39 @@ fn delete_observations_by_episode_does_not_delete_foreign_rows() {
 }
 
 #[test]
+fn delete_observations_by_episode_partitions_a_shared_episode_id() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let t = two_tenants(&dir);
+    let shared_episode = Uuid::new_v4();
+
+    let observation_a = seed_observation(&t.db, t.ns_a, shared_episode, "belongs to A");
+    let observation_b = seed_observation(&t.db, t.ns_b, shared_episode, "belongs to B");
+
+    let deleted =
+        t.db.delete_observations_by_episode(t.ns_a, shared_episode)
+            .expect("delete observations in namespace A");
+
+    assert_eq!(deleted, 1, "namespace A must delete only its observation");
+    assert!(
+        t.db.list_observations_by_episode_ids(t.ns_a, &[shared_episode], 1024)
+            .expect("read namespace A")
+            .is_empty(),
+        "namespace A's observation must be deleted"
+    );
+    let survivors =
+        t.db.list_observations_by_episode_ids(t.ns_b, &[shared_episode], 1024)
+            .expect("read namespace B");
+    assert_eq!(
+        survivors.len(),
+        1,
+        "namespace B's observation was destroyed"
+    );
+    assert_eq!(survivors[0].id, observation_b);
+    assert_ne!(survivors[0].id, observation_a);
+    assert_eq!(survivors[0].namespace_id, t.ns_b);
+}
+
+#[test]
 fn delete_observations_by_episode_deletes_owned_rows() {
     let dir = tempfile::tempdir().expect("tempdir");
     let t = two_tenants(&dir);
