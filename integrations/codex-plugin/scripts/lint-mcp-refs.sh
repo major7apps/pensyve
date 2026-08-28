@@ -22,6 +22,8 @@ MENTION_DOC_FILES=(
   "$PLUGIN_ROOT/commands/pensyve.md"
   "$PLUGIN_ROOT/docs/ARCHITECTURE.md"
 )
+OPENAI_METADATA="$PLUGIN_ROOT/skills/pensyve/agents/openai.yaml"
+PLUGIN_MANIFEST="$PLUGIN_ROOT/.codex-plugin/plugin.json"
 
 EXIT_CODE=0
 
@@ -151,6 +153,123 @@ for file in "${MENTION_DOC_FILES[@]}"; do
 done
 if [ "$MISSING_MENTION_DOC" != "0" ]; then
   echo "  FAIL: mention workflow must document that true @-mention dispatch is not currently exposed in every mention surface"
+  EXIT_CODE=1
+fi
+echo ""
+
+# Check 7: current Codex requires structured DependencyTool objects, not scalar tool names.
+echo "Check 7: openai.yaml declares the Pensyve MCP as a structured dependency"
+if python3 - "$OPENAI_METADATA" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+lines = path.read_text(encoding="utf-8").splitlines()
+items = []
+in_dependencies = False
+in_tools = False
+current = None
+
+# This is intentionally a canonical-format validator, not a general YAML parser.
+# The plugin owns this small file and requires dependencies.tools to use block
+# mappings, two-space indentation, quoted scalars, and no inline comments. Keeping
+# that surface exact avoids adding a YAML runtime dependency to the release job.
+
+for number, raw_line in enumerate(lines, start=1):
+    if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+        continue
+    indent = len(raw_line) - len(raw_line.lstrip(" "))
+    text = raw_line.strip()
+
+    if indent == 0:
+        in_dependencies = text == "dependencies:"
+        in_tools = False
+        current = None
+        continue
+    if not in_dependencies:
+        continue
+    if indent == 2:
+        in_tools = text == "tools:"
+        current = None
+        continue
+    if not in_tools:
+        continue
+
+    match = re.fullmatch(r"- ([a-z_]+):\s*(.+)", text) if indent == 4 else None
+    if match:
+        current = {match.group(1): match.group(2)}
+        items.append(current)
+        continue
+    match = re.fullmatch(r"([a-z_]+):\s*(.+)", text) if indent == 6 else None
+    if match and current is not None:
+        key = match.group(1)
+        if key in current:
+            raise SystemExit(f"duplicate dependencies.tools key at {path}:{number}: {key}")
+        current[key] = match.group(2)
+        continue
+    raise SystemExit(
+        f"non-canonical dependencies.tools syntax at {path}:{number}: {raw_line}"
+    )
+
+def scalar(value):
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    raise SystemExit(f"canonical dependencies.tools scalars must be quoted: {value!r}")
+
+parsed = [{key: scalar(value) for key, value in item.items()} for item in items]
+expected = [{
+    "type": "mcp",
+    "value": "pensyve",
+    "description": "Pensyve persistent-memory MCP server",
+    "transport": "streamable_http",
+    "url": "https://mcp.pensyve.com/mcp",
+}]
+if parsed != expected:
+    raise SystemExit(f"expected exactly one Pensyve MCP dependency, found: {parsed!r}")
+PY
+then
+  echo "  PASS"
+else
+  echo "  FAIL: dependencies.tools must use the canonical one-object Pensyve MCP block"
+  EXIT_CODE=1
+fi
+echo ""
+
+# Check 8: Codex accepts up to three non-empty string prompts, each at most 128 characters.
+echo "Check 8: plugin manifest default prompts satisfy Codex constraints"
+if python3 - "$PLUGIN_MANIFEST" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+manifest = json.loads(path.read_text(encoding="utf-8"))
+value = manifest.get("interface", {}).get("defaultPrompt")
+if isinstance(value, str):
+    prompts = [value]
+elif isinstance(value, list):
+    prompts = value
+else:
+    raise SystemExit("interface.defaultPrompt must be a string or an array of strings")
+if len(prompts) > 3:
+    raise SystemExit(f"interface.defaultPrompt supports at most 3 entries, found {len(prompts)}")
+for index, prompt in enumerate(prompts):
+    if not isinstance(prompt, str):
+        raise SystemExit(f"defaultPrompt[{index}] must be a string")
+    normalized = " ".join(prompt.split())
+    if not normalized:
+        raise SystemExit(f"defaultPrompt[{index}] must not be empty")
+    if len(normalized) > 128:
+        raise SystemExit(
+            f"defaultPrompt[{index}] exceeds 128 normalized characters ({len(normalized)})"
+        )
+print(f"validated {len(prompts)} prompts")
+PY
+then
+  echo "  PASS"
+else
+  echo "  FAIL: invalid interface.defaultPrompt"
   EXIT_CODE=1
 fi
 echo ""

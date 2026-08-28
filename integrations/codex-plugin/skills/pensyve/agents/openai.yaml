@@ -7,9 +7,8 @@ policy:
   allow_implicit_invocation: true
 dependencies:
   tools:
-    - pensyve_recall
-    - pensyve_remember
-    - pensyve_observe
-    - pensyve_inspect
-    - pensyve_status
-    - pensyve_forget
+    - type: "mcp"
+      value: "pensyve"
+      description: "Pensyve persistent-memory MCP server"
+      transport: "streamable_http"
+      url: "https://mcp.pensyve.com/mcp"

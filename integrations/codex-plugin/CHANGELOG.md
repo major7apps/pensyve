@@ -4,6 +4,14 @@ All notable changes to the Pensyve Codex CLI adapter are documented in this file
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The Codex CLI adapter versions independently of the Claude Code plugin.
 
+## [1.4.3] - 2026-08-27
+
+### Fixed
+
+- Replaced scalar Pensyve tool names in `skills/pensyve/agents/openai.yaml` with Codex's structured MCP dependency metadata so current Codex releases load the skill instead of rejecting its sidecar.
+- Reduced the plugin manifest's default prompts to Codex's supported maximum of three.
+- Added static release checks for the structured Pensyve MCP dependency and default-prompt limit.
+
 ## [1.4.2] - 2026-05-24
 
 ### Fixed

@@ -1,6 +1,6 @@
 {
   "name": "pensyve",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "description": "Persistent working memory for Codex with Pensyve recall, capture, hooks, skills, commands, and MCP tools",
   "author": {
     "name": "Major7 Apps",
@@ -26,8 +26,7 @@
     "defaultPrompt": [
       "Use Pensyve to recall relevant project memory before we continue.",
       "$pensyve what do you remember about this project?",
-      "/pensyve status",
-      "$pensyve review my memory health and suggest cleanup."
+      "/pensyve status"
     ]
   }
 }
