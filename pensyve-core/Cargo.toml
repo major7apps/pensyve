@@ -46,7 +46,7 @@ regex = "1"
 # requirement now that CI runs `test_no_network_invariants` against a
 # seeded cache on every PR (see `.github/workflows/ci.yml`) and will fail
 # the build if cached-model resolution ever regresses again.
-fastembed = "5.17.3"
+fastembed = "=6.0.1"
 petgraph = "0.8"
 # Phase 2B: compile-time predicate-verb lexicon for the shallow dependency
 # parser (`extraction::dep_parse`). `phf::Map` keys are interned at build
