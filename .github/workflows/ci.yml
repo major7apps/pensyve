@@ -355,3 +355,38 @@ jobs:
         run: cargo build -p pensyve-mcp-gateway
       - name: Run gateway tests
         run: cargo test -p pensyve-mcp-gateway -p pensyve-mcp-tools
+
+  test-gateway-artifact-source:
+    name: Gateway Artifact Source Contracts
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      # actions/setup-python v6.3.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Verify shell syntax and immutable artifact flow fixtures
+        run: |
+          python3 - <<'PY'
+          import platform
+          assert platform.python_version().startswith("3.12.")
+          assert platform.python_implementation() == "CPython"
+          assert platform.machine() in {"x86_64", "aarch64", "arm64"}
+          PY
+          python3 -m venv "$RUNNER_TEMP/gateway-workflow-validator"
+          printf '%s\n' \
+            'PyYAML==6.0.2 --hash=sha256:1f71ea527786de97d1a0cc0eacd1defc0985dcf6b3f17bb77dcfc8c34bec4dc5 --hash=sha256:80bab7bfc629882493af4aa31a4cfa43a4c57c83813253626916b8c7ada83476' \
+            > "$RUNNER_TEMP/gateway-workflow-validator.requirements.txt"
+          "$RUNNER_TEMP/gateway-workflow-validator/bin/pip" install --disable-pip-version-check \
+            --only-binary=:all: --require-hashes -r "$RUNNER_TEMP/gateway-workflow-validator.requirements.txt"
+          export PATH="$RUNNER_TEMP/gateway-workflow-validator/bin:$PATH"
+          bash -n pensyve-mcp-gateway/scripts/fetch-model-bundle.sh
+          bash -n pensyve-mcp-gateway/scripts/test-model-bundle.sh
+          bash -n pensyve-mcp-gateway/scripts/gateway-image-artifact.sh
+          bash -n pensyve-mcp-gateway/scripts/test-gateway-release-image.sh
+          bash -n pensyve-mcp-gateway/scripts/promote-gateway-image.sh
+          bash -n pensyve-mcp-gateway/scripts/test-gateway-artifact-flow.sh
+          pensyve-mcp-gateway/scripts/test-gateway-artifact-flow.sh all
