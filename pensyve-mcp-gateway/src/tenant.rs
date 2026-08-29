@@ -56,9 +56,64 @@ impl TenantStateManager {
         snapshot_root: PathBuf,
         snapshot_retention: RetentionPolicy,
     ) -> Self {
-        let dimensions = default_vector_index.dimensions();
         let reranker_cell = Arc::new(OnceLock::new());
+        Self::new_with_reranker_cell(
+            storage,
+            embedder,
+            retrieval_config,
+            default_namespace,
+            default_vector_index,
+            snapshot_root,
+            snapshot_retention,
+            reranker_cell,
+        )
+    }
 
+    /// Construct tenant state around a reranker that strict startup already
+    /// loaded successfully. The populated cell is installed before the
+    /// default state or manager can become visible to request handling.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors the compatibility constructor plus the required preinitialized model"
+    )]
+    pub fn new_with_preinitialized_reranker(
+        storage: Arc<dyn StorageTrait>,
+        embedder: Arc<OnnxEmbedder>,
+        retrieval_config: RetrievalConfig,
+        default_namespace: Namespace,
+        default_vector_index: VectorIndex,
+        snapshot_root: PathBuf,
+        snapshot_retention: RetentionPolicy,
+        reranker: Arc<Reranker>,
+    ) -> Self {
+        let reranker_cell = PensyveState::preinitialized_reranker_cell(reranker);
+        Self::new_with_reranker_cell(
+            storage,
+            embedder,
+            retrieval_config,
+            default_namespace,
+            default_vector_index,
+            snapshot_root,
+            snapshot_retention,
+            reranker_cell,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "single internal assembly point shared by permissive and strict constructors"
+    )]
+    fn new_with_reranker_cell(
+        storage: Arc<dyn StorageTrait>,
+        embedder: Arc<OnnxEmbedder>,
+        retrieval_config: RetrievalConfig,
+        default_namespace: Namespace,
+        default_vector_index: VectorIndex,
+        snapshot_root: PathBuf,
+        snapshot_retention: RetentionPolicy,
+        reranker_cell: Arc<OnceLock<Option<Arc<Reranker>>>>,
+    ) -> Self {
+        let dimensions = default_vector_index.dimensions();
         let default_state = Arc::new(PensyveState {
             storage: storage.clone(),
             embedder: embedder.clone(),
@@ -224,6 +279,34 @@ mod tests {
         )
     }
 
+    fn test_manager_with_reranker(
+        dir: &tempfile::TempDir,
+        reranker: Arc<Reranker>,
+    ) -> TenantStateManager {
+        let storage = Arc::new(SqliteBackend::open(dir.path()).unwrap()) as Arc<dyn StorageTrait>;
+        let ns = Namespace::new("default");
+        storage.save_namespace(&ns).unwrap();
+        TenantStateManager::new_with_preinitialized_reranker(
+            storage,
+            Arc::new(OnnxEmbedder::new_mock(768)),
+            RetrievalConfig {
+                default_limit: 5,
+                max_candidates: 100,
+                weights: [0.30, 0.15, 0.20, 0.10, 0.10, 0.05, 0.05, 0.05],
+                recall_timeout_secs: 5,
+                rrf_k: 60,
+                rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.0],
+                beam_width: 10,
+                max_depth: 4,
+            },
+            ns,
+            VectorIndex::new(768, 1024),
+            dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
+            reranker,
+        )
+    }
+
     #[test]
     fn test_different_tenants_get_different_namespaces() {
         let dir = tempfile::tempdir().unwrap();
@@ -247,5 +330,37 @@ mod tests {
         let s1 = mgr.get_tenant_state("key_carol").unwrap();
         let s2 = mgr.get_tenant_state("key_carol").unwrap();
         assert_eq!(s1.namespace.id, s2.namespace.id);
+    }
+
+    #[test]
+    fn all_tenants_share_preinitialized_reranker_on_first_recall() {
+        let dir = tempfile::tempdir().unwrap();
+        let supplied = Arc::new(Reranker::new_mock());
+        let mgr = test_manager_with_reranker(&dir, Arc::clone(&supplied));
+        let states = [
+            mgr.default_state(),
+            mgr.get_tenant_state("key_alice").unwrap(),
+            mgr.get_tenant_state("key_bob").unwrap(),
+        ];
+
+        for state in &states {
+            assert!(
+                state.reranker_cell.get().is_some(),
+                "tenant state became visible before reranker initialization"
+            );
+            let first_recall = state
+                .reranker()
+                .expect("strict tenant recall must receive the preloaded reranker");
+            assert!(
+                Arc::ptr_eq(&supplied, &first_recall),
+                "tenant did not receive the process-wide reranker instance"
+            );
+        }
+
+        let first = states[0].reranker().unwrap();
+        let second = states[1].reranker().unwrap();
+        let third = states[2].reranker().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(&second, &third));
     }
 }

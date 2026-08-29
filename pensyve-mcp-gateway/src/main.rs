@@ -11,7 +11,11 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use pensyve_core::config::RetrievalConfig;
-use pensyve_core::embedding::OnnxEmbedder;
+use pensyve_core::embedding::{
+    OnnxEmbedder, resolved_embedding_pool_size, resolved_fastembed_cache_dir,
+};
+use pensyve_core::network_policy::NetworkPolicy;
+use pensyve_core::reranker::Reranker;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::postgres::PostgresBackend;
 use pensyve_core::storage::sqlite::SqliteBackend;
@@ -39,10 +43,96 @@ struct InitResources {
     namespace: Namespace,
     vector_index: VectorIndex,
     retrieval_config: RetrievalConfig,
+    strict_reranker: Option<Arc<Reranker>>,
+}
+
+const EMBEDDING_MODEL: &str = "Alibaba-NLP/gte-base-en-v1.5";
+const MINILM_MODEL: &str = "all-MiniLM-L6-v2";
+const MINILM_REPOSITORY: &str = "Qdrant/all-MiniLM-L6-v2-onnx";
+const RERANKER_MODEL: &str = "BGERerankerBase";
+const RERANKER_REPOSITORY: &str = "BAAI/bge-reranker-base";
+
+fn validate_model_runtime_configuration(
+    strict_local_models: bool,
+    allow_mock_embedder_value: Option<&std::ffi::OsStr>,
+    reranker_value: Option<&str>,
+) -> Result<()> {
+    if !strict_local_models {
+        return Ok(());
+    }
+    if allow_mock_embedder_value.is_some() {
+        anyhow::bail!(
+            "Invalid model runtime configuration: PENSYVE_REQUIRE_LOCAL_MODELS=1 conflicts with \
+             the presence of PENSYVE_ALLOW_MOCK_EMBEDDER"
+        );
+    }
+    if reranker_value == Some("0") {
+        anyhow::bail!(
+            "Invalid model runtime configuration: PENSYVE_REQUIRE_LOCAL_MODELS=1 conflicts with \
+             PENSYVE_RERANKER=0"
+        );
+    }
+    Ok(())
+}
+
+fn cached_model_revision(cache_root: &std::path::Path, repository: &str) -> String {
+    let ref_path = cache_root
+        .join(format!("models--{}", repository.replace('/', "--")))
+        .join("refs/main");
+    std::fs::read_to_string(ref_path).unwrap_or_else(|_| "unresolved".to_string())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RerankerRuntimeMetadata {
+    state: &'static str,
+    model: &'static str,
+    revision: String,
+}
+
+fn reranker_runtime_metadata(
+    preinitialized: bool,
+    reranker_value: Option<&str>,
+    initialized_revision: Option<&str>,
+) -> RerankerRuntimeMetadata {
+    if preinitialized {
+        return RerankerRuntimeMetadata {
+            state: "initialized",
+            model: RERANKER_MODEL,
+            revision: initialized_revision.unwrap_or("unresolved").to_string(),
+        };
+    }
+    if reranker_value == Some("0") {
+        return RerankerRuntimeMetadata {
+            state: "disabled",
+            model: "none",
+            revision: "not-applicable".to_string(),
+        };
+    }
+    RerankerRuntimeMetadata {
+        state: "deferred",
+        model: RERANKER_MODEL,
+        revision: "resolved-on-first-use".to_string(),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
 fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
+    let strict_local_models = std::env::var("PENSYVE_REQUIRE_LOCAL_MODELS").as_deref() == Ok("1");
+    let allow_mock_embedder_value = std::env::var_os("PENSYVE_ALLOW_MOCK_EMBEDDER");
+    let allow_mock_embedder = allow_mock_embedder_value
+        .as_deref()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some();
+    let reranker_value = std::env::var("PENSYVE_RERANKER").ok();
+    validate_model_runtime_configuration(
+        strict_local_models,
+        allow_mock_embedder_value.as_deref(),
+        reranker_value.as_deref(),
+    )?;
+    let embedding_pool_size = resolved_embedding_pool_size();
+    let cache_root = resolved_fastembed_cache_dir()
+        .map_err(|error| anyhow::anyhow!("Failed to resolve model cache root: {error}"))?;
+
     let storage: Arc<dyn StorageTrait> = if let Ok(database_url) = std::env::var("DATABASE_URL") {
         if database_url.starts_with("postgres") {
             tracing::info!("Using Postgres backend");
@@ -80,35 +170,82 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
         Err(e) => return Err(anyhow::anyhow!("Storage error: {e}")),
     };
 
-    let embedder = match OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5") {
-        Ok(e) => {
-            tracing::info!("Using ONNX embedder (Alibaba-NLP/gte-base-en-v1.5, 768 dims)");
-            e
-        }
-        Err(gte_err) => {
-            tracing::warn!("GTE model unavailable ({gte_err}), trying MiniLM fallback");
-            match OnnxEmbedder::new("all-MiniLM-L6-v2") {
-                Ok(e) => {
-                    tracing::info!("Using fallback ONNX embedder (all-MiniLM-L6-v2, 384 dims)");
-                    e
-                }
-                Err(mini_err) => {
-                    if std::env::var("PENSYVE_ALLOW_MOCK_EMBEDDER").is_ok() {
-                        // PENSYVE_ALLOW_MOCK_EMBEDDER is the explicit opt-in
-                        // for environments that intentionally ship without the
-                        // ONNX models (e.g. prod containers built without the
-                        // model artifacts). Surface as info, not warn.
-                        tracing::info!("Using mock embedder (768 dims) — {mini_err}");
-                        OnnxEmbedder::new_mock(768)
-                    } else {
-                        return Err(anyhow::anyhow!(
-                            "No ONNX model available. Set PENSYVE_ALLOW_MOCK_EMBEDDER=1 to use mock. Error: {mini_err}"
-                        ));
+    let (embedder, embedding_model, embedding_repository, strict_reranker) = if strict_local_models
+    {
+        let embedder = OnnxEmbedder::new_with_policy_and_pool_size(
+            EMBEDDING_MODEL,
+            &NetworkPolicy::Disabled,
+            embedding_pool_size,
+        )
+        .map_err(|error| anyhow::anyhow!("Strict local GTE initialization failed: {error}"))?;
+        let reranker = Reranker::new_cached_with_policy(RERANKER_MODEL, &NetworkPolicy::Disabled)
+            .map_err(|error| {
+            anyhow::anyhow!("Strict local BGE initialization failed: {error}")
+        })?;
+        (
+            embedder,
+            EMBEDDING_MODEL,
+            Some(EMBEDDING_MODEL),
+            Some(reranker),
+        )
+    } else {
+        let (embedder, embedding_model, embedding_repository) = match OnnxEmbedder::new(
+            EMBEDDING_MODEL,
+        ) {
+            Ok(embedder) => {
+                tracing::info!("Using ONNX embedder (Alibaba-NLP/gte-base-en-v1.5, 768 dims)");
+                (embedder, EMBEDDING_MODEL, Some(EMBEDDING_MODEL))
+            }
+            Err(gte_err) => {
+                tracing::warn!("GTE model unavailable ({gte_err}), trying MiniLM fallback");
+                match OnnxEmbedder::new(MINILM_MODEL) {
+                    Ok(embedder) => {
+                        tracing::info!("Using fallback ONNX embedder (all-MiniLM-L6-v2, 384 dims)");
+                        (embedder, MINILM_MODEL, Some(MINILM_REPOSITORY))
+                    }
+                    Err(mini_err) => {
+                        if allow_mock_embedder {
+                            // PENSYVE_ALLOW_MOCK_EMBEDDER is the explicit opt-in
+                            // for environments that intentionally ship without the
+                            // ONNX models (e.g. prod containers built without the
+                            // model artifacts). Surface as info, not warn.
+                            tracing::info!("Using mock embedder (768 dims) — {mini_err}");
+                            (OnnxEmbedder::new_mock(768), "mock", None)
+                        } else {
+                            return Err(anyhow::anyhow!(
+                                "No ONNX model available. Set PENSYVE_ALLOW_MOCK_EMBEDDER=1 to use mock. Error: {mini_err}"
+                            ));
+                        }
                     }
                 }
             }
-        }
+        };
+        (embedder, embedding_model, embedding_repository, None)
     };
+
+    let embedding_revision = embedding_repository.map_or_else(
+        || "not-applicable".to_string(),
+        |repository| cached_model_revision(&cache_root, repository),
+    );
+    let initialized_reranker_revision = strict_reranker
+        .as_ref()
+        .map(|_| cached_model_revision(&cache_root, RERANKER_REPOSITORY));
+    let reranker_metadata = reranker_runtime_metadata(
+        strict_reranker.is_some(),
+        reranker_value.as_deref(),
+        initialized_reranker_revision.as_deref(),
+    );
+    tracing::info!(
+        strict_local_models,
+        embedding_model,
+        embedding_revision,
+        reranker_state = reranker_metadata.state,
+        reranker_model = reranker_metadata.model,
+        reranker_revision = reranker_metadata.revision,
+        cache_root = %cache_root.display(),
+        embedding_pool_size,
+        "model runtime initialized"
+    );
 
     let embedder = Arc::new(embedder);
     let dimensions = embedder.dimensions();
@@ -163,6 +300,7 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
         namespace,
         vector_index: index,
         retrieval_config,
+        strict_reranker,
     })
 }
 
@@ -206,21 +344,33 @@ fn main() -> Result<()> {
 
 #[allow(clippy::too_many_lines)]
 async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
-    let tenant_mgr = TenantStateManager::new(
-        res.storage,
-        res.embedder,
-        res.retrieval_config,
-        res.namespace,
-        res.vector_index,
-        // Derived from the gateway's own storage path, not a shared default:
-        // recovery artifacts belong inside the directory that backups and
-        // volume mounts already cover.
-        PensyveState::snapshot_root_for(&config.storage_path),
-        // Bounds what that directory accumulates: every non-empty forget
-        // writes a full copy of what it destroyed, so an unbounded snapshot
-        // volume is one `remember`/`forget` loop away from filling (#265).
-        PensyveState::snapshot_retention_from_env(),
-    );
+    // Recovery artifacts belong inside the directory that backups and volume
+    // mounts cover; the shared bound prevents any one tenant from growing it
+    // without limit through a `remember`/`forget` loop.
+    let snapshot_root = PensyveState::snapshot_root_for(&config.storage_path);
+    let snapshot_retention = PensyveState::snapshot_retention_from_env();
+    let tenant_mgr = if let Some(reranker) = res.strict_reranker {
+        TenantStateManager::new_with_preinitialized_reranker(
+            res.storage,
+            res.embedder,
+            res.retrieval_config,
+            res.namespace,
+            res.vector_index,
+            snapshot_root,
+            snapshot_retention,
+            reranker,
+        )
+    } else {
+        TenantStateManager::new(
+            res.storage,
+            res.embedder,
+            res.retrieval_config,
+            res.namespace,
+            res.vector_index,
+            snapshot_root,
+            snapshot_retention,
+        )
+    };
 
     let ct = CancellationToken::new();
 
@@ -580,6 +730,73 @@ async fn health_handler() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_reranker_metadata_reports_initialized_exact_revision() {
+        let metadata =
+            reranker_runtime_metadata(true, None, Some("2cfc18c9415c912f9d8155881c133215df768a70"));
+
+        assert_eq!(metadata.state, "initialized");
+        assert_eq!(metadata.model, RERANKER_MODEL);
+        assert_eq!(
+            metadata.revision,
+            "2cfc18c9415c912f9d8155881c133215df768a70"
+        );
+    }
+
+    #[test]
+    fn permissive_disabled_reranker_metadata_reports_no_model() {
+        let metadata = reranker_runtime_metadata(false, Some("0"), Some("cached-but-unused"));
+
+        assert_eq!(metadata.state, "disabled");
+        assert_eq!(metadata.model, "none");
+        assert_eq!(metadata.revision, "not-applicable");
+    }
+
+    #[test]
+    fn permissive_enabled_reranker_metadata_reports_deferred_load() {
+        let metadata = reranker_runtime_metadata(false, None, Some("cached-but-not-loaded"));
+
+        assert_eq!(metadata.state, "deferred");
+        assert_eq!(metadata.model, RERANKER_MODEL);
+        assert_eq!(metadata.revision, "resolved-on-first-use");
+    }
+
+    #[test]
+    fn strict_local_models_rejects_mock_embedder_marker_even_when_empty() {
+        let error =
+            validate_model_runtime_configuration(true, Some(std::ffi::OsStr::new("")), None)
+                .expect_err("strict mode must reject any mock-embedder marker");
+
+        assert!(
+            error.to_string().contains(
+                "PENSYVE_REQUIRE_LOCAL_MODELS=1 conflicts with the presence of \
+                 PENSYVE_ALLOW_MOCK_EMBEDDER"
+            ),
+            "startup error must identify the conflicting settings: {error}"
+        );
+    }
+
+    #[test]
+    fn strict_local_models_rejects_disabled_reranker() {
+        let error = validate_model_runtime_configuration(true, None, Some("0"))
+            .expect_err("strict mode must reject a disabled reranker");
+
+        assert!(
+            error
+                .to_string()
+                .contains("PENSYVE_REQUIRE_LOCAL_MODELS=1 conflicts with PENSYVE_RERANKER=0"),
+            "startup error must identify the conflicting settings: {error}"
+        );
+    }
+
+    #[test]
+    fn permissive_model_runtime_keeps_existing_fallback_configuration() {
+        assert!(
+            validate_model_runtime_configuration(false, Some(std::ffi::OsStr::new("")), Some("0"))
+                .is_ok()
+        );
+    }
 
     #[test]
     fn positive_millis_env_falls_back_for_unset_or_zero() {
