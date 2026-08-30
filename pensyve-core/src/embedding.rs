@@ -23,10 +23,11 @@ use crate::network_policy::{NetworkPolicy, NetworkRequiredError};
 // monotonic ~250 MB-per-construction RSS leak in long-running eval harnesses
 // (see pensyve-docs/research/benchmark-sprint/_leak_diagnosis.md).
 //
-// The fix: a process-wide cache keyed by `(model_name, pool_size)`. Sessions
-// are immutable post-load; sharing across `Pensyve` instances is safe because
-// embedder calls already serialize through internal `Mutex<TextEmbedding>`s.
-type EmbedderCache = Mutex<HashMap<(String, usize), Arc<OnnxEmbedder>>>;
+// The fix: a process-wide cache keyed by `(model_name, pool_size, cache_root)`.
+// Sessions are immutable post-load; sharing across `Pensyve` instances is safe
+// because embedder calls already serialize through internal
+// `Mutex<TextEmbedding>`s.
+type EmbedderCache = Mutex<HashMap<(String, usize, PathBuf), Arc<OnnxEmbedder>>>;
 
 static EMBEDDER_CACHE: OnceLock<EmbedderCache> = OnceLock::new();
 
@@ -560,7 +561,8 @@ impl OnnxEmbedder {
     }
 
     /// Cached variant of [`Self::new`]. Returns an `Arc<OnnxEmbedder>` shared
-    /// across the process for the same `(model_name, pool_size)` pair.
+    /// across the process for the same `(model_name, pool_size, cache_root)`
+    /// tuple.
     ///
     /// Use this in long-running contexts (eval harnesses, servers) where
     /// repeated `Pensyve(...)` construction would otherwise leak ONNX session
@@ -577,24 +579,30 @@ impl OnnxEmbedder {
     /// Per pre-reg §2 invariant I4 + §3.0 item 10: this is the entry point
     /// the Pensyve handle constructor MUST use so that
     /// [`NetworkPolicy::Disabled`] propagates from the handle down to the
-    /// embedder. A cache hit on the process-shared `Arc` short-circuits
-    /// without re-checking the policy — by construction, an entry only
-    /// exists in the cache because a previous successful construction
-    /// (under whatever policy was active then) populated the on-disk
-    /// fastembed cache, and `new_with_policy` itself treats an already-cached
-    /// model as a no-op (no network request is needed).
+    /// embedder. Non-permissive cache hits revalidate the active on-disk cache
+    /// before returning the process-shared `Arc`.
     pub fn new_cached_with_policy(
         model_name: &str,
         policy: &NetworkPolicy,
     ) -> EmbeddingResult<Arc<Self>> {
         let pool_size = resolved_embedding_pool_size();
-        let key = (model_name.to_string(), pool_size);
+        let cache_dir = resolved_fastembed_cache_dir()?;
+        if !matches!(policy, NetworkPolicy::Permissive) {
+            let (_, _, hf_model_code, model_file) = resolve_model(model_name)?;
+            if let Err(detail) = preflight_model_cache(&cache_dir, hf_model_code, model_file) {
+                let hf_url = format!("https://huggingface.co/{hf_model_code}");
+                policy.check(&hf_url).map_err(|policy_error| {
+                    EmbeddingError::Network(format!("{CACHE_ERROR_PREFIX}{detail}; {policy_error}"))
+                })?;
+            }
+        }
+        let key = (model_name.to_string(), pool_size, cache_dir.clone());
         let mut guard = embedder_cache().lock().expect("embedder cache poisoned");
         if let Some(existing) = guard.get(&key) {
             return Ok(Arc::clone(existing));
         }
-        let fresh = Arc::new(Self::new_with_policy_and_pool_size(
-            model_name, policy, pool_size,
+        let fresh = Arc::new(Self::new_with_policy_pool_size_at_cache(
+            model_name, policy, pool_size, &cache_dir,
         )?);
         guard.insert(key, Arc::clone(&fresh));
         Ok(fresh)

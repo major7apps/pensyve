@@ -7,6 +7,8 @@ readonly REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 readonly ARTIFACT_SCRIPT="${SCRIPT_DIR}/gateway-image-artifact.sh"
 readonly RELEASE_SCRIPT="${SCRIPT_DIR}/test-gateway-release-image.sh"
 readonly PROMOTE_SCRIPT="${SCRIPT_DIR}/promote-gateway-image.sh"
+readonly FETCH_SCRIPT="${SCRIPT_DIR}/fetch-model-bundle.sh"
+readonly MODEL_TEST="${SCRIPT_DIR}/test-model-bundle.sh"
 readonly WORKFLOW="${REPO_ROOT}/.github/workflows/deploy-gateway.yml"
 readonly CI_WORKFLOW="${REPO_ROOT}/.github/workflows/ci.yml"
 readonly DOCKERFILE="${REPO_ROOT}/pensyve-mcp-gateway/Dockerfile"
@@ -16,8 +18,8 @@ readonly SCANNER_DIGEST="sha256:55ad20f8a239a3e95427e60b8aaea38788550c18a3f17729
 readonly SCANNER_VERSION="0.74.0"
 
 case "${CASE}" in
-    structural | artifact | seal | storage | reviewed-pr | deployment | release-scan | promote | cleanup | handoff | round4-review | round5-review | round6-review | round9-review | round10-review | round11-review | round12-review | round13-review | round14-review | all) ;;
-    *) echo "usage: $0 [structural|artifact|seal|storage|reviewed-pr|deployment|release-scan|promote|cleanup|handoff|round4-review|round5-review|round6-review|round9-review|round10-review|round11-review|round12-review|round13-review|round14-review|all]" >&2; exit 2 ;;
+    structural | artifact | seal | storage | reviewed-pr | deployment | release-scan | promote | cleanup | handoff | round4-review | round5-review | round6-review | round9-review | round10-review | round11-review | round12-review | round13-review | round14-review | round15-review | all) ;;
+    *) echo "usage: $0 [structural|artifact|seal|storage|reviewed-pr|deployment|release-scan|promote|cleanup|handoff|round4-review|round5-review|round6-review|round9-review|round10-review|round11-review|round12-review|round13-review|round14-review|round15-review|all]" >&2; exit 2 ;;
 esac
 
 readonly TEST_ROOT="$(mktemp -d /tmp/pensyve-artifact-flow.XXXXXX)"
@@ -53,7 +55,7 @@ capture_failure() {
 
 require_scripts() {
     local path
-    for path in "${ARTIFACT_SCRIPT}" "${RELEASE_SCRIPT}" "${PROMOTE_SCRIPT}"; do
+    for path in "${ARTIFACT_SCRIPT}" "${RELEASE_SCRIPT}" "${PROMOTE_SCRIPT}" "${FETCH_SCRIPT}" "${MODEL_TEST}"; do
         [[ -x "${path}" ]] || fail "required executable script is absent: ${path}"
     done
 }
@@ -122,8 +124,11 @@ mode = mapping(inputs.get("mode"))
 options = mode.get("options", [])
 if mode.get("required") != "true" or set(options) != {"artifact-build", "artifact-promote", "artifact-custodian"}:
     errors.append("workflow_dispatch must expose one required mutually exclusive mode")
-if mapping(inputs.get("pull_request_number")).get("required") != "true":
+pull_request_input = mapping(inputs.get("pull_request_number"))
+if pull_request_input.get("required") != "true":
     errors.append("workflow_dispatch must require pull_request_number")
+if pull_request_input.get("description") != "Exact same-repository open non-draft pull request number":
+    errors.append("workflow_dispatch must describe the full open non-draft pull request contract")
 if "push" not in on:
     errors.append("push-main trigger is missing")
 
@@ -206,9 +211,11 @@ for job_name, job, resolver_id in (
             'for attempt in 1 2 3' not in resolver_text or '[[ "$matches" == 1 ]]' not in resolver_text):
         errors.append(f"{job_name} resolver must default uploaded custody true and clear it only at terminal success")
 
-build_pr = str(named_step(jobs.get("artifact-build"), "Bind exact open draft pull request before checkout").get("run", ""))
+if build.get("name") != "Build one reviewed non-draft ARM64 artifact":
+    errors.append("artifact-build job must name the reviewed non-draft authority")
+build_pr = str(named_step(jobs.get("artifact-build"), "Bind exact open non-draft pull request before checkout").get("run", ""))
 for predicate in (
-    '.state == "open"', '.draft == true', '.base.ref == "main"',
+    '.state == "open"', '.draft == false', '.base.ref == "main"',
     '.base.repo.full_name == $repo', '.head.repo.full_name == $repo',
     '.head.ref == $branch', '.head.sha == $sha',
 ):
@@ -247,6 +254,17 @@ for token in ("artifact-custodian", "custody_lease_id", "custody_request", "work
         errors.append(f"artifact-promote dispatcher missing exact custodian dispatch/run binding: {token}")
 if any(token in dispatcher_text for token in ("promote-gateway-image.sh", "configure-aws-credentials", "aws ", "docker ")):
     errors.append("artifact-promote dispatcher contains forbidden production/build authority")
+dispatcher_step = named_step(dispatcher, "Dispatch one exact-ref custodian and bind its exact run")
+dispatcher_env = mapping(dispatcher_step.get("env"))
+dispatcher_run = str(dispatcher_step.get("run", ""))
+if (dispatcher_env.get("INPUT_MODE") != "${{ inputs.mode }}" or
+        dispatcher_env.get("PR_NUMBER") != "${{ inputs.pull_request_number }}"):
+    errors.append("artifact-promote dispatcher must bind workflow inputs through explicit environment values")
+if "${{ inputs." in dispatcher_run:
+    errors.append("artifact-promote dispatcher shell must not interpolate GitHub inputs directly")
+for predicate in ('"$INPUT_MODE" == artifact-promote', '"$PR_NUMBER" =~ ^[1-9][0-9]*$'):
+    if predicate not in dispatcher_run:
+        errors.append(f"artifact-promote dispatcher input validation is missing: {predicate}")
 
 promote = mapping(jobs.get("artifact-promote"))
 promote_permissions = mapping(promote.get("permissions"))
@@ -1245,7 +1263,7 @@ make_local_fixture() {
             event: "workflow_dispatch", head_sha: $sha
           },
           pull_request: {
-            number: 42, repository: "major7apps/pensyve", state: "open", draft: true,
+            number: 42, repository: "major7apps/pensyve", state: "open", draft: false,
             base_ref: "main", head_repository: "major7apps/pensyve",
             head_ref: "fix/strict-local-model-runtime-2026-08-28", head_sha: $sha
           },
@@ -1758,7 +1776,7 @@ run_artifact() {
     expect_failure "run attempt" "${ARTIFACT_SCRIPT}" verify-local --tuple "${mutation}"
     mutate_json "${fixture}/tuple.json" "${mutation}" '.pull_request.number=null'
     expect_failure "pull request number" "${ARTIFACT_SCRIPT}" verify-local --tuple "${mutation}"
-    mutate_json "${fixture}/tuple.json" "${mutation}" '.pull_request.draft=false'
+    mutate_json "${fixture}/tuple.json" "${mutation}" '.pull_request.draft=true'
     expect_failure "draft" "${ARTIFACT_SCRIPT}" verify-local --tuple "${mutation}"
     mutate_json "${fixture}/tuple.json" "${mutation}" '.pull_request.repository="fork/pensyve"'
     expect_failure "pull request repository" "${ARTIFACT_SCRIPT}" verify-local --tuple "${mutation}"
@@ -4166,7 +4184,8 @@ exit 91'
       : > "${STUB_LOG}"
       rm -f -- "${STUB_DISPATCH_JSON}" "${fixture}/dispatch.outputs"
       PATH="${bin}:${PATH}" RUNNER_TEMP="${fixture}" GITHUB_OUTPUT="${fixture}/dispatch.outputs" \
-        GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REPOSITORY=major7apps/pensyve \
+        GITHUB_EVENT_NAME=workflow_dispatch INPUT_MODE=artifact-promote PR_NUMBER=16 \
+        GITHUB_REPOSITORY=major7apps/pensyve \
         GITHUB_REF_NAME="${STUB_CUSTODIAN_REF}" GITHUB_SHA="${SOURCE_SHA}" GITHUB_RUN_ID=1234 \
         GITHUB_RUN_ATTEMPT=2 HANDOFF_ID=888 \
         HANDOFF_NAME="gateway-handoff-1234-2-${SOURCE_SHA}" HANDOFF_DIGEST="${handoff_digest}" \
@@ -5251,6 +5270,272 @@ run_round14_review() {
     echo "round14 conservative same-device disk precheck contract passed"
 }
 
+run_round15_review() {
+    require_scripts
+    local fixture="${TEST_ROOT}/round15-shell-feedback" failures=0
+    mkdir -p "${fixture}/bin"
+
+    if ! validate_workflow "${WORKFLOW}" > "${fixture}/workflow.log" 2>&1; then
+        cat "${fixture}/workflow.log" >&2
+        echo "ROUND15-RED workflow: non-draft build authority or safe custodian input binding is absent" >&2
+        failures=$((failures + 1))
+    fi
+
+    local source_fixture="${fixture}/source"
+    make_local_fixture "${source_fixture}"
+    if ! "${ARTIFACT_SCRIPT}" verify-local --tuple "${source_fixture}/tuple.json" \
+      > "${fixture}/non-draft-source.log" 2>&1; then
+        cat "${fixture}/non-draft-source.log" >&2
+        echo "ROUND15-RED source: an open non-draft artifact-build tuple was rejected" >&2
+        failures=$((failures + 1))
+    fi
+
+    local prefix_root="${fixture}/verify.[literal]"
+    mkdir -p "${prefix_root}/models--Alibaba-NLP--gte-base-en-v1.5/refs"
+    printf 'extra\n' > "${prefix_root}/models--Alibaba-NLP--gte-base-en-v1.5/refs/extra"
+    capture_failure "${fixture}/literal-prefix.log" "${FETCH_SCRIPT}" --verify-only "${prefix_root}"
+    if ! grep -F 'extra ref rejected: models--Alibaba-NLP--gte-base-en-v1.5/refs/extra' \
+      "${fixture}/literal-prefix.log" >/dev/null; then
+        echo "ROUND15-RED prefix: verifier did not strip a literal glob-bearing root" >&2
+        failures=$((failures + 1))
+    fi
+
+    local model_fixture="${fixture}/model-fixture"
+    local gte_repo="models--Alibaba-NLP--gte-base-en-v1.5"
+    local gte_revision="a829fd0e060bb84554da0dfd354d0de0f7712b7f"
+    local model_cache_path tokenizer_cache_path
+    model_cache_path="$(awk -v snapshot="${gte_repo}/snapshots/${gte_revision}/onnx/model.onnx" '$1=="blob" && $5==snapshot {print $4}' "${REPO_ROOT}/pensyve-mcp-gateway/models/manifest.sha256")"
+    tokenizer_cache_path="$(awk -v snapshot="${gte_repo}/snapshots/${gte_revision}/tokenizer.json" '$1=="blob" && $5==snapshot {print $4}' "${REPO_ROOT}/pensyve-mcp-gateway/models/manifest.sha256")"
+    mkdir -p "${model_fixture}/${gte_repo}/snapshots/${gte_revision}/onnx" \
+      "$(dirname -- "${model_fixture}/${model_cache_path}")" \
+      "$(dirname -- "${model_fixture}/${tokenizer_cache_path}")"
+    printf 'model\n' > "${model_fixture}/${model_cache_path}"
+    printf 'tokenizer\n' > "${model_fixture}/${tokenizer_cache_path}"
+    ln -s "$(realpath --relative-to="${model_fixture}/${gte_repo}/snapshots/${gte_revision}/onnx" "${model_fixture}/${model_cache_path}")" \
+      "${model_fixture}/${gte_repo}/snapshots/${gte_revision}/onnx/model.onnx"
+    ln -s "$(realpath --relative-to="${model_fixture}/${gte_repo}/snapshots/${gte_revision}" "${model_fixture}/${tokenizer_cache_path}")" \
+      "${model_fixture}/${gte_repo}/snapshots/${gte_revision}/tokenizer.json"
+    for model_case in missing-blob lfs-pointer; do
+        if ! "${MODEL_TEST}" "${model_fixture}" "${model_case}" > "${fixture}/model-${model_case}.log" 2>&1; then
+            cat "${fixture}/model-${model_case}.log" >&2
+            echo "ROUND15-RED model-${model_case}: literal-root expected path drifted" >&2
+            failures=$((failures + 1))
+        fi
+    done
+
+    local fetch_copy="${fixture}/fetch-copy"
+    mkdir -p "${fetch_copy}/scripts" "${fetch_copy}/models"
+    cp -- "${FETCH_SCRIPT}" "${fetch_copy}/scripts/fetch-model-bundle.sh"
+    cp -- "${REPO_ROOT}/pensyve-mcp-gateway/models/manifest.sha256" \
+      "${REPO_ROOT}/pensyve-mcp-gateway/models/revisions.env" "${fetch_copy}/models/"
+    export STUB_LOG="${fixture}/fetch-stub.log" CURL_MARKER="${fixture}/curl-called"
+    write_stub "${fixture}/bin/curl" 'touch "${CURL_MARKER}"; exit 97'
+    for unsafe_case in blob-cache snapshot license-cache; do
+        cp -- "${REPO_ROOT}/pensyve-mcp-gateway/models/manifest.sha256" "${fetch_copy}/models/manifest.sha256"
+        python3 - "${fetch_copy}/models/manifest.sha256" "${unsafe_case}" <<'PY'
+from pathlib import Path
+import sys
+
+path, mode = Path(sys.argv[1]), sys.argv[2]
+rows = path.read_text().splitlines()
+for index, row in enumerate(rows):
+    fields = row.split()
+    if mode in {"blob-cache", "snapshot"} and fields and fields[0] == "blob":
+        fields[3 if mode == "blob-cache" else 4] = "../round15-escape"
+        rows[index] = " ".join(fields)
+        break
+    if mode == "license-cache" and fields and fields[0] == "license-file":
+        fields[3] = "../round15-license-escape"
+        rows[index] = " ".join(fields)
+        break
+path.write_text("\n".join(rows) + "\n")
+PY
+        rm -f -- "${CURL_MARKER}"
+        : > "${STUB_LOG}"
+        local unsafe_log="${fixture}/unsafe-${unsafe_case}.log"
+        if [[ "${unsafe_case}" == license-cache ]]; then
+            python3 - "${fetch_copy}/scripts/fetch-model-bundle.sh" "${fetch_copy}/scripts/license-driver.sh" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text()
+prefix = source.split("\ndownload_model() {", 1)[0]
+Path(sys.argv[2]).write_text(prefix + '\ndownload_licenses "$1"\n')
+PY
+            chmod +x "${fetch_copy}/scripts/license-driver.sh"
+            capture_failure "${unsafe_log}" env PATH="${fixture}/bin:${PATH}" \
+              bash "${fetch_copy}/scripts/license-driver.sh" "${fixture}/license-root"
+        else
+            capture_failure "${unsafe_log}" env PATH="${fixture}/bin:${PATH}" \
+              "${fetch_copy}/scripts/fetch-model-bundle.sh" --output "${fixture}/unsafe-output-${unsafe_case}"
+        fi
+        if [[ -e "${CURL_MARKER}" ]]; then
+            echo "ROUND15-RED ${unsafe_case}: unsafe manifest data reached curl" >&2
+            failures=$((failures + 1))
+        fi
+    done
+
+    export STUB_LOG="${fixture}/registry-stub.log" CURL_STATE="${fixture}/registry-curl-count"
+    : > "${STUB_LOG}"
+    write_stub "${fixture}/bin/git" '
+if [[ "$*" == *"rev-parse HEAD"* ]]; then printf "%s\n" "${SOURCE_SHA}"; fi
+exit 0'
+    write_stub "${fixture}/bin/cargo" 'exit 0'
+    write_stub "${fixture}/bin/uname" 'printf "arm64\n"'
+    write_stub "${fixture}/bin/sleep" 'exit 0'
+    write_stub "${fixture}/bin/docker" '
+case "${1:-}" in
+  save)
+    while [[ $# -gt 0 ]]; do
+      if [[ "$1" == --output ]]; then printf "archive\n" > "$2"; break; fi
+      shift
+    done ;;
+  image)
+    case "$*" in
+      *"{{.Id}}"*) printf "sha256:%064d\n" 0 ;;
+      *"{{.Architecture}}"*) printf "arm64\n" ;;
+      *"org.opencontainers.image.revision"*) printf "%s\n" "${SOURCE_SHA}" ;;
+      *"{{.Config.User}}"*) printf "1001:1001\n" ;;
+      *"{{.Config.StopSignal}}"*) printf "SIGINT\n" ;;
+      *"{{.Size}}"*) printf "123\n" ;;
+      *) printf "{}\n" ;;
+    esac ;;
+  run) printf "round15-registry\n" ;;
+  port) printf "127.0.0.1:5001\n" ;;
+  push) printf "pushed\n" ;;
+esac
+exit 0'
+    write_stub "${fixture}/bin/curl" '
+url="${!#}"
+if [[ "$url" == "http://127.0.0.1:5001/v2/" ]]; then
+  count=0; [[ ! -f "${CURL_STATE}" ]] || count=$(cat "${CURL_STATE}")
+  count=$((count + 1)); printf "%s\n" "$count" > "${CURL_STATE}"
+  [[ "$count" -ge 3 ]]
+  exit
+fi
+exit 88'
+    capture_failure "${fixture}/registry-build.log" env PATH="${fixture}/bin:${PATH}" \
+      SOURCE_SHA="${SOURCE_SHA}" STUB_LOG="${STUB_LOG}" CURL_STATE="${CURL_STATE}" \
+      "${ARTIFACT_SCRIPT}" build --source-sha "${SOURCE_SHA}" \
+      --archive "${fixture}/registry-image.tar" --evidence-dir "${fixture}/registry-evidence" \
+      --image-ref "pensyve-gateway:${SOURCE_SHA}"
+    if [[ "$(call_count "${STUB_LOG}" curl 'http://127.0.0.1:5001/v2/')" -ne 3 ]]; then
+        echo "ROUND15-RED registry: bounded /v2/ readiness did not precede the single push" >&2
+        failures=$((failures + 1))
+    fi
+
+    local deployment_fixture="${fixture}/deployment"
+    make_local_fixture "${deployment_fixture}"
+    make_reviewed_tuple_and_request "${deployment_fixture}/tuple.json" \
+      "${deployment_fixture}/reviewed.json" "${deployment_fixture}/request.json"
+    if "${ARTIFACT_SCRIPT}" fetch-verify --tuple "${deployment_fixture}/reviewed.json" \
+      --request "${deployment_fixture}/request.json" --output "${deployment_fixture}/verified.json"; then
+        jq '.deployment.baseline_image="123456789012.dkr.ecr.us-east-2.amazonaws.com/pensyve-gateway@sha256:157bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' \
+          "${deployment_fixture}/verified.json" > "${deployment_fixture}/digest-prefix.json"
+        if ! "${ARTIFACT_SCRIPT}" verify-handoff --input "${deployment_fixture}/digest-prefix.json" \
+          > "${fixture}/digest-prefix.log" 2>&1; then
+            cat "${fixture}/digest-prefix.log" >&2
+            echo "ROUND15-RED digest: valid immutable digest prefix was rejected as a task revision" >&2
+            failures=$((failures + 1))
+        fi
+    else
+        echo "ROUND15-RED digest: deployment fixture could not be sealed" >&2
+        failures=$((failures + 1))
+    fi
+
+    local promotion_verified="${fixture}/promotion-verified.json" environment_sha snapshot_sha
+    printf '[{"name":"MCP_ALLOWED_HOSTS","value":"mcp.pensyve.com"}]\n' > "${fixture}/environment.json"
+    environment_sha="$(jq -S -c . "${fixture}/environment.json" | sha256sum | cut -d' ' -f1)"
+    jq -n '{service_name:"pensyve-prod-gateway",status:"ACTIVE",
+      cluster_arn:"arn:aws:ecs:us-east-2:123456789012:cluster/pensyve-prod",
+      task_definition:"arn:aws:ecs:us-east-2:123456789012:task-definition/pensyve-prod-gateway:200",
+      counts:{desired:2,running:2,pending:0},
+      network_configuration:{awsvpcConfiguration:{subnets:["subnet-aaa","subnet-bbb"],securityGroups:["sg-aaa"],assignPublicIp:"DISABLED"}},
+      load_balancers:[{targetGroupArn:"arn:aws:elasticloadbalancing:us-east-2:123456789012:targetgroup/pensyve-gateway/abc",containerName:"gateway",containerPort:3100}],
+      deployment_configuration:{deploymentCircuitBreaker:{enable:true,rollback:true},maximumPercent:200,minimumHealthyPercent:100},
+      health_grace_period_seconds:300,
+      primary_deployment:{status:"PRIMARY",task_definition:"arn:aws:ecs:us-east-2:123456789012:task-definition/pensyve-prod-gateway:200",rollout_state:"COMPLETED",desired:2,running:2,pending:0}}' \
+      > "${fixture}/service-snapshot.json"
+    snapshot_sha="$(jq -S -c . "${fixture}/service-snapshot.json" | sha256sum | cut -d' ' -f1)"
+    jq --arg env_sha "${environment_sha}" --arg snapshot_sha "${snapshot_sha}" \
+      --slurpfile snapshot "${fixture}/service-snapshot.json" \
+      '{schema_version:1,cleanup_required:false,image:.image,scanner:.scanner,scan:.scan,
+        deployment:{region:"us-east-2",ecr_registry:"123456789012.dkr.ecr.us-east-2.amazonaws.com",ecr_repository:"pensyve-gateway",cluster:"pensyve-prod",service:"pensyve-prod-gateway",gateway_container:"gateway",baseline_task_definition_arn:"arn:aws:ecs:us-east-2:123456789012:task-definition/pensyve-prod-gateway:200",baseline_image:"123456789012.dkr.ecr.us-east-2.amazonaws.com/pensyve-gateway@sha256:157bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",baseline_environment_sha256:$env_sha,baseline_service_snapshot:$snapshot[0],baseline_service_snapshot_sha256:$snapshot_sha,probe_entity:"task9-runtime-1234-2-0123456789abcdef",promotion_run_id:1234,promotion_run_attempt:2,cpu:"512",memory:"4096",desired_count:2,running_count:2,pending_count:0}}' \
+      "${deployment_fixture}/tuple.json" > "${promotion_verified}"
+    export STUB_LOG="${fixture}/promotion-stub.log"
+    : > "${STUB_LOG}"
+    write_stub "${fixture}/bin/aws" 'exit 91'
+    write_stub "${fixture}/bin/docker" 'exit 92'
+    write_stub "${fixture}/bin/curl" 'exit 93'
+    write_stub "${fixture}/bin/sleep" 'exit 94'
+    capture_failure "${fixture}/promotion-digest.log" env DOCKER_BIN="${fixture}/bin/docker" \
+      AWS_BIN="${fixture}/bin/aws" CURL_BIN="${fixture}/bin/curl" SLEEP_BIN="${fixture}/bin/sleep" \
+      STUB_LOG="${STUB_LOG}" "${PROMOTE_SCRIPT}" "${promotion_verified}"
+    if [[ "$(call_count "${STUB_LOG}" docker load)" -ne 1 ]]; then
+        cat "${fixture}/promotion-digest.log" >&2
+        echo "ROUND15-RED promotion digest: valid digest prefix did not reach promotion execution" >&2
+        failures=$((failures + 1))
+    fi
+
+    write_stub "${fixture}/bin/mktemp" 'exit 95'
+    : > "${STUB_LOG}"
+    capture_failure "${fixture}/mktemp.log" env PATH="${fixture}/bin:${PATH}" \
+      DOCKER_BIN="${fixture}/bin/docker" AWS_BIN="${fixture}/bin/aws" \
+      CURL_BIN="${fixture}/bin/curl" SLEEP_BIN="${fixture}/bin/sleep" STUB_LOG="${STUB_LOG}" \
+      "${PROMOTE_SCRIPT}" "${promotion_verified}"
+    if ! grep -F 'could not create the promotion temporary root' "${fixture}/mktemp.log" >/dev/null; then
+        echo "ROUND15-RED mktemp: promotion did not fail explicitly at temporary-root creation" >&2
+        failures=$((failures + 1))
+    fi
+    rm -f -- "${fixture}/bin/mktemp"
+
+    export STUB_LOG="${fixture}/relative-stub.log" STUB_CACHE_ABS="${fixture}/relative/cache"
+    : > "${STUB_LOG}"
+    mkdir -p "${fixture}/relative"
+    write_stub "${fixture}/bin/docker" '
+if [[ " $* " == *" version "* ]]; then printf "Version: 0.74.0\n"; fi
+if [[ " $* " == *" --download-db-only "* ]]; then
+  mkdir -p "${STUB_CACHE_ABS}/db"
+  printf "{\"UpdatedAt\":\"2026-08-30T00:00:00Z\",\"DownloadedAt\":\"2026-08-30T00:00:00Z\"}\n" > "${STUB_CACHE_ABS}/db/metadata.json"
+  printf "db\n" > "${STUB_CACHE_ABS}/db/trivy.db"
+fi
+exit 0'
+    (
+      cd "${fixture}/relative"
+      PATH="${fixture}/bin:${PATH}" STUB_LOG="${STUB_LOG}" STUB_CACHE_ABS="${STUB_CACHE_ABS}" \
+        "${RELEASE_SCRIPT}" prepare-trivy --cache-dir cache --evidence-dir evidence
+    )
+    if [[ "$(call_count "${STUB_LOG}" docker "type=bind,src=${STUB_CACHE_ABS},dst=/trivy-cache")" -ne 1 ]]; then
+        echo "ROUND15-RED relative paths: Trivy bind source was not canonicalized" >&2
+        failures=$((failures + 1))
+    fi
+
+    python3 - "${RELEASE_SCRIPT}" "${fixture}/missing-model-driver.sh" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text()
+prefix = source.split("\nrun_trivy() {", 1)[0]
+Path(sys.argv[2]).write_text(prefix + '\nrun_missing_model_failure "sha256:' + ('a' * 64) + '" "base:test" "$1"\n')
+PY
+    chmod +x "${fixture}/missing-model-driver.sh"
+    export STUB_LOG="${fixture}/mutation-cleanup-stub.log"
+    : > "${STUB_LOG}"
+    write_stub "${fixture}/bin/docker" '
+if [[ "${1:-}" == build ]]; then exit 0; fi
+if [[ "${1:-}" == run ]]; then exit 96; fi
+exit 0'
+    capture_failure "${fixture}/mutation-cleanup.log" env PATH="${fixture}/bin:${PATH}" \
+      STUB_LOG="${STUB_LOG}" bash "${fixture}/missing-model-driver.sh" "${fixture}/missing-model-evidence"
+    if [[ "$(call_count "${STUB_LOG}" docker image)" -lt 1 ]]; then
+        echo "ROUND15-RED mutation cleanup: derived image was not removed by EXIT cleanup" >&2
+        failures=$((failures + 1))
+    fi
+
+    [[ "${failures}" -eq 0 ]] || fail "round15 shell/workflow review contracts failed: ${failures}"
+    echo "round15 shell/workflow review contract passed"
+}
+
 if [[ "${CASE}" == "structural" || "${CASE}" == "all" ]]; then run_structural; fi
 if [[ "${CASE}" == "artifact" || "${CASE}" == "all" ]]; then run_artifact; fi
 if [[ "${CASE}" == "seal" || "${CASE}" == "all" ]]; then run_seal; fi
@@ -5270,5 +5555,6 @@ if [[ "${CASE}" == "round11-review" || "${CASE}" == "all" ]]; then run_round11_r
 if [[ "${CASE}" == "round12-review" || "${CASE}" == "all" ]]; then run_round12_review; fi
 if [[ "${CASE}" == "round13-review" || "${CASE}" == "all" ]]; then run_round13_review; fi
 if [[ "${CASE}" == "round14-review" || "${CASE}" == "all" ]]; then run_round14_review; fi
+if [[ "${CASE}" == "round15-review" || "${CASE}" == "all" ]]; then run_round15_review; fi
 
 echo "gateway artifact flow tests passed (${CASE})"

@@ -139,6 +139,14 @@ const BGE_RERANKER_REQUIRED_FILES: &[&str] = &[
 /// canonical mapping for our exposed `"all-MiniLM-L6-v2"` model name).
 const MINILM_CACHE_DIR: &str = "models--Qdrant--all-MiniLM-L6-v2-onnx";
 
+const MINILM_REQUIRED_FILES: &[&str] = &[
+    "config.json",
+    "model.onnx",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+];
+
 /// Resolve the effective cache dir the same way fastembed 6.0.1's
 /// `pull_from_hf` does (`HF_HOME`, then its `FASTEMBED_CACHE_DIR`-derived
 /// option, then `.fastembed_cache`) and check that the named subdir exists.
@@ -174,6 +182,33 @@ fn seed_bge_cache(source_root: &Path, destination_root: &Path) -> PathBuf {
         std::fs::create_dir_all(destination.parent().expect("required file parent"))
             .expect("create seeded BGE snapshot directory");
         std::os::unix::fs::symlink(source, destination).expect("symlink real cached BGE file");
+    }
+    destination_snapshot
+}
+
+/// Seed an isolated MiniLM cache from a real local snapshot using symlinks.
+/// The source cache remains read-only; the returned snapshot can be mutated
+/// to prove cached construction revalidates the active cache.
+#[cfg(unix)]
+fn seed_minilm_cache(source_root: &Path, destination_root: &Path) -> PathBuf {
+    let source_repository = source_root.join(MINILM_CACHE_DIR);
+    let revision = std::fs::read_to_string(source_repository.join("refs/main"))
+        .expect("read seeded MiniLM main ref");
+    let destination_repository = destination_root.join(MINILM_CACHE_DIR);
+    std::fs::create_dir_all(destination_repository.join("refs"))
+        .expect("create seeded MiniLM refs");
+    std::fs::write(destination_repository.join("refs/main"), &revision)
+        .expect("write seeded MiniLM main ref");
+
+    let source_snapshot = source_repository.join("snapshots").join(&revision);
+    let destination_snapshot = destination_repository.join("snapshots").join(&revision);
+    for required in MINILM_REQUIRED_FILES {
+        let source = std::fs::canonicalize(source_snapshot.join(required))
+            .unwrap_or_else(|_| panic!("resolve real cached MiniLM file {required}"));
+        let destination = destination_snapshot.join(required);
+        std::fs::create_dir_all(destination.parent().expect("required file parent"))
+            .expect("create seeded MiniLM snapshot directory");
+        std::os::unix::fs::symlink(source, destination).expect("symlink real cached MiniLM file");
     }
     destination_snapshot
 }
@@ -490,6 +525,63 @@ fn onnx_embedder_constructor_under_disabled_with_cached_model_succeeds() {
     );
 }
 
+/// A process-cached embedder must not bypass the active cache certification
+/// required by `NetworkPolicy::Disabled`. Both a required file disappearing
+/// from the original root and switching to a distinct empty root must fail
+/// before a cached `Arc<OnnxEmbedder>` is returned.
+#[test]
+#[cfg(unix)]
+fn onnx_embedder_cached_disabled_revalidates_active_cache() {
+    let real = real_cache_dir().to_path_buf();
+    if !real.join(MINILM_CACHE_DIR).is_dir() {
+        eprintln!(
+            "skipping onnx_embedder_cached_disabled_revalidates_active_cache: \
+             {MINILM_CACHE_DIR} not in fastembed cache at {}. \
+             Pre-cache by running `OnnxEmbedder::new(\"all-MiniLM-L6-v2\")` \
+             once with network access.",
+            real.display()
+        );
+        return;
+    }
+    let _serial = cache_env_lock().lock().expect("env lock poisoned");
+
+    let seeded_cache = TempDir::new().expect("isolated seeded MiniLM cache");
+    let seeded_snapshot = seed_minilm_cache(&real, seeded_cache.path());
+    let seeded_guard = FastembedCacheGuard::set(seeded_cache.path());
+    let cached = OnnxEmbedder::new_cached_with_policy("all-MiniLM-L6-v2", &NetworkPolicy::Disabled)
+        .expect("complete seeded cache should initialize under Disabled");
+    assert_eq!(cached.dimensions(), 384);
+
+    std::fs::remove_file(seeded_snapshot.join("tokenizer_config.json"))
+        .expect("remove required file from isolated MiniLM cache");
+    let same_root =
+        OnnxEmbedder::new_cached_with_policy("all-MiniLM-L6-v2", &NetworkPolicy::Disabled);
+
+    drop(seeded_guard);
+    let empty_cache = TempDir::new().expect("distinct empty MiniLM cache");
+    let _empty_guard = FastembedCacheGuard::set(empty_cache.path());
+    let distinct_root =
+        OnnxEmbedder::new_cached_with_policy("all-MiniLM-L6-v2", &NetworkPolicy::Disabled);
+
+    let mut failures = Vec::new();
+    match same_root {
+        Err(error)
+            if error.is_cache_error() && error.to_string().contains("tokenizer_config.json") => {}
+        Err(error) => failures.push(format!("same root returned the wrong error: {error}")),
+        Ok(_) => failures.push("same-root cached Arc bypassed required-file preflight".to_string()),
+    }
+    match distinct_root {
+        Err(error) if error.is_cache_error() && error.to_string().contains("refs/main") => {}
+        Err(error) => failures.push(format!("distinct root returned the wrong error: {error}")),
+        Ok(_) => failures.push("cached Arc from another cache root bypassed preflight".to_string()),
+    }
+    assert!(
+        failures.is_empty(),
+        "Disabled cached construction did not revalidate the active cache: {}",
+        failures.join("; ")
+    );
+}
+
 /// **Invariant I4.OnnxEmbedder.lazy-disabled-uncached**: a *lazy*
 /// embedder (`new_lazy_with_options`) constructed under
 /// `NetworkPolicy::Disabled` for an uncached model MUST succeed at
@@ -563,7 +655,8 @@ fn onnx_embedder_lazy_under_disabled_with_uncached_model_errors_at_first_use() {
 
 /// RAII guard that pins `FASTEMBED_CACHE_DIR`, clears the higher-precedence
 /// `HF_HOME`, and points `HF_ENDPOINT` at a closed loopback port for the
-/// duration of a test. All three previous values are restored on drop.
+/// duration of a test. It also pins the embedding pool to one session so real
+/// model fixtures stay bounded. All four previous values are restored on drop.
 /// Used by the `Disabled`-policy tests above to control whether the model
 /// appears cached while ensuring a regression cannot reach the public hub.
 ///
@@ -577,6 +670,7 @@ struct FastembedCacheGuard {
     cache_dir: Option<String>,
     hf_home: Option<String>,
     hf_endpoint: Option<String>,
+    embedding_pool_size: Option<String>,
 }
 
 #[allow(
@@ -588,16 +682,19 @@ impl FastembedCacheGuard {
         let previous_cache_dir = std::env::var("FASTEMBED_CACHE_DIR").ok();
         let previous_hf_home = std::env::var("HF_HOME").ok();
         let previous_hf_endpoint = std::env::var("HF_ENDPOINT").ok();
+        let previous_embedding_pool_size = std::env::var("PENSYVE_EMBEDDING_POOL_SIZE").ok();
         // SAFETY: see struct doc — tests using this guard run sequentially.
         unsafe {
             std::env::set_var("FASTEMBED_CACHE_DIR", path);
             std::env::remove_var("HF_HOME");
             std::env::set_var("HF_ENDPOINT", "http://127.0.0.1:9");
+            std::env::set_var("PENSYVE_EMBEDDING_POOL_SIZE", "1");
         }
         Self {
             cache_dir: previous_cache_dir,
             hf_home: previous_hf_home,
             hf_endpoint: previous_hf_endpoint,
+            embedding_pool_size: previous_embedding_pool_size,
         }
     }
 }
@@ -621,6 +718,10 @@ impl Drop for FastembedCacheGuard {
             match self.hf_endpoint.as_deref() {
                 Some(v) => std::env::set_var("HF_ENDPOINT", v),
                 None => std::env::remove_var("HF_ENDPOINT"),
+            }
+            match self.embedding_pool_size.as_deref() {
+                Some(v) => std::env::set_var("PENSYVE_EMBEDDING_POOL_SIZE", v),
+                None => std::env::remove_var("PENSYVE_EMBEDDING_POOL_SIZE"),
             }
         }
     }

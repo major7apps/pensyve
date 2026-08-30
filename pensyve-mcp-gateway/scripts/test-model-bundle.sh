@@ -73,7 +73,7 @@ expect_failure_naming() {
     fi
 }
 
-readonly TEST_ROOT="$(mktemp -d "$(dirname -- "${FIXTURE_ROOT}")/.pensyve-model-test.XXXXXX")"
+readonly TEST_ROOT="$(mktemp -d "$(dirname -- "${FIXTURE_ROOT}")/.pensyve-model-test.[literal].XXXXXX")"
 trap 'find "${TEST_ROOT}" -type d -exec chmod u+w {} + 2>/dev/null || true; rm -rf -- "${TEST_ROOT}"' EXIT
 
 readonly EMPTY_ROOT="${TEST_ROOT}/empty"
@@ -94,7 +94,7 @@ if [[ "${TEST_CASE}" == "missing-blob" || "${TEST_CASE}" == "all" ]]; then
     rm -- "${GTE_MODEL_BLOB}"
     expect_failure_naming \
         "${MISSING_BLOB_ROOT}" \
-        "${GTE_MODEL_BLOB#${MISSING_BLOB_ROOT}/}" \
+        "${GTE_MODEL_BLOB#"${MISSING_BLOB_ROOT}"/}" \
         "" \
         "${TEST_ROOT}/missing-blob.log"
 fi
@@ -135,7 +135,7 @@ if [[ "${TEST_CASE}" == "lfs-pointer" || "${TEST_CASE}" == "all" ]]; then
         'size 711661' > "${LFS_BLOB}"
     expect_failure_naming \
         "${LFS_ROOT}" \
-        "${LFS_BLOB#${LFS_ROOT}/}" \
+        "${LFS_BLOB#"${LFS_ROOT}"/}" \
         "" \
         "${TEST_ROOT}/lfs-pointer.log"
 fi

@@ -144,7 +144,7 @@ if not re.fullmatch(rf"arn:aws:ecs:us-east-2:{account}:task-definition/pensyve-p
     fail("Task 8 baseline task definition ARN is invalid")
 if not re.fullmatch(re.escape(registry) + r"/pensyve-gateway@sha256:[0-9a-f]{64}", baseline_image):
     fail("Task 8 baseline image is not the exact immutable digest URI")
-if baseline_arn.endswith(":157") or baseline_image.endswith(":157") or ":157" in baseline_image:
+if baseline_arn.endswith(":157"):
     fail("rejected task definition :157 must never be selected or used for rollback")
 if not re.fullmatch(r"[0-9a-f]{64}", str(field("deployment.baseline_environment_sha256"))):
     fail("Task 8 environment identity is invalid")
@@ -228,7 +228,9 @@ if not Path(field("image.archive_path")).is_file() or not Path(field("image.raw_
     fail("reviewed archive/raw manifest is absent")
 PY
 
-readonly TEMP_ROOT="$(mktemp -d /tmp/pensyve-gateway-promote.XXXXXX)"
+TEMP_ROOT="$(mktemp -d /tmp/pensyve-gateway-promote.XXXXXX)" \
+    || die "could not create the promotion temporary root"
+readonly TEMP_ROOT
 
 cleanup_temp() {
     rm -rf -- "${TEMP_ROOT}"

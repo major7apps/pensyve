@@ -18,7 +18,7 @@ on:
           - artifact-promote
           - artifact-custodian
       pull_request_number:
-        description: Exact same-repository draft pull request number
+        description: Exact same-repository open non-draft pull request number
         required: true
         type: string
       custody_lease_id:
@@ -46,7 +46,7 @@ concurrency:
 
 jobs:
   artifact-build:
-    name: Build one reviewed ARM64 artifact
+    name: Build one reviewed non-draft ARM64 artifact
     if: github.event_name == 'workflow_dispatch' && inputs.mode == 'artifact-build'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
@@ -62,7 +62,7 @@ jobs:
       cleanup_run_id: ${{ steps.build-custody-resolver.outputs.run_id }}
       cleanup_status: ${{ steps.build-custody-resolver.outputs.cleanup_status }}
     steps:
-      - name: Bind exact open draft pull request before checkout
+      - name: Bind exact open non-draft pull request before checkout
         id: pr
         env:
           GH_TOKEN: ${{ github.token }}
@@ -72,7 +72,7 @@ jobs:
           [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
           gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > "$RUNNER_TEMP/pr.json"
           jq -e --arg repo "$GITHUB_REPOSITORY" --arg branch "$GITHUB_REF_NAME" --arg sha "$GITHUB_SHA" '
-            .state == "open" and .draft == true and .base.ref == "main" and
+            .state == "open" and .draft == false and .base.ref == "main" and
             .base.repo.full_name == $repo and .head.repo.full_name == $repo and
             .head.ref == $branch and .head.sha == $sha
           ' "$RUNNER_TEMP/pr.json" >/dev/null
@@ -880,6 +880,8 @@ jobs:
         id: custodian-ready
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_MODE: ${{ inputs.mode }}
+          PR_NUMBER: ${{ inputs.pull_request_number }}
           REVIEWED_REF: ${{ vars.TASK5_REVIEWED_REF }}
           HANDOFF_ID: ${{ needs.artifact-promote-preflight.outputs.cleanup_artifact_id }}
           HANDOFF_NAME: ${{ needs.artifact-promote-preflight.outputs.cleanup_artifact_name }}
@@ -894,7 +896,8 @@ jobs:
           HANDOFF_REVIEWED_SHA: ${{ needs.artifact-promote-preflight.outputs.cleanup_reviewed_sha }}
         run: |
           set -euo pipefail
-          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "${{ inputs.mode }}" == artifact-promote ]]
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$INPUT_MODE" == artifact-promote ]]
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
           [[ "$HANDOFF_REPOSITORY" == "$GITHUB_REPOSITORY" && "$HANDOFF_RUN_ID" == "$GITHUB_RUN_ID" &&
              "$HANDOFF_RUN_ATTEMPT" == "$GITHUB_RUN_ATTEMPT" && "$HANDOFF_REVIEWED_SHA" == "$GITHUB_SHA" &&
              "$HANDOFF_ID" =~ ^[1-9][0-9]*$ && "$HANDOFF_DIGEST" =~ ^sha256:[0-9a-f]{64}$ &&
@@ -934,7 +937,7 @@ jobs:
           custody_base=$(jq -S -n -c --arg repository "$GITHUB_REPOSITORY" \
             --argjson parent_run_id "$GITHUB_RUN_ID" --argjson parent_run_attempt "$GITHUB_RUN_ATTEMPT" \
             --arg parent_ref "$GITHUB_REF_NAME" --arg reviewed_sha "$GITHUB_SHA" \
-            --argjson pull_request_number "${{ inputs.pull_request_number }}" \
+            --argjson pull_request_number "$PR_NUMBER" \
             --argjson handoff_id "$HANDOFF_ID" --arg handoff_name "$HANDOFF_NAME" \
             --arg handoff_digest "$HANDOFF_DIGEST" --argjson handoff_size "$HANDOFF_SIZE" \
             --arg handoff_created_at "$HANDOFF_CREATED_AT" --arg handoff_expires_at "$HANDOFF_EXPIRES_AT" \
@@ -952,7 +955,7 @@ jobs:
           lease=$(printf '%s' "$custody_base" | sha256sum | cut -d' ' -f1)
           [[ "$lease" =~ ^[0-9a-f]{64}$ ]]
           custody_request=$(jq -S -c --arg lease "$lease" '. + {custody_lease_id:$lease}' <<<"$custody_base")
-          jq -n --arg ref "$REVIEWED_REF" --arg pr "${{ inputs.pull_request_number }}" \
+          jq -n --arg ref "$REVIEWED_REF" --arg pr "$PR_NUMBER" \
             --arg lease "$lease" --arg request "$custody_request" \
             '{ref:$ref,inputs:{mode:"artifact-custodian",pull_request_number:$pr,
               custody_lease_id:$lease,custody_request:$request},return_run_details:true}' \

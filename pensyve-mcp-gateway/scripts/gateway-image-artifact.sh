@@ -39,6 +39,18 @@ sha256_file() {
     sha256sum "$1" | cut -d' ' -f1
 }
 
+wait_loopback_registry_ready() {
+    local url="$1" attempt
+
+    for attempt in $(seq 1 30); do
+        if curl --fail --silent --show-error --max-time 2 "${url}" >/dev/null 2>&1; then
+            return 0
+        fi
+        [[ "${attempt}" -eq 30 ]] || sleep 1
+    done
+    die "loopback registry did not become ready"
+}
+
 verify_scan_common() {
     local tuple="$1" require_artifact_created="$2"
     [[ -f "${tuple}" ]] || die "tuple is absent: ${tuple}"
@@ -272,8 +284,8 @@ if field("pull_request.repository") != expected_repository:
     fail("pull request repository mismatch")
 if field("pull_request.state") != "open":
     fail("pull request must remain open")
-if field("pull_request.draft") is not True:
-    fail("pull request must remain draft")
+if field("pull_request.draft") is not False:
+    fail("pull request must remain non-draft")
 if field("pull_request.base_ref") != "main":
     fail("pull request base must be main")
 if field("pull_request.head_repository") != expected_repository:
@@ -785,6 +797,7 @@ build_archive() {
     ACTIVE_REGISTRY="${registry_id}"
     registry_port="$(docker port "${registry_id}" 5000/tcp | awk -F: 'NR==1 {print $NF}')"
     [[ "${registry_port}" =~ ^[0-9]+$ ]] || die "failed to resolve loopback registry port"
+    wait_loopback_registry_ready "http://127.0.0.1:${registry_port}/v2/"
     loopback_ref="127.0.0.1:${registry_port}/pensyve-gateway:${source_sha}"
     docker tag "${image_ref}" "${loopback_ref}"
     docker push "${loopback_ref}" > "${evidence_dir}/loopback-push.log"
@@ -1450,7 +1463,7 @@ arn_match = re.fullmatch(
 )
 if not arn_match:
     fail("Task 8 baseline task-definition ARN mismatch")
-if arn_match.group(1) == "157" or ":157" in json.dumps(data, sort_keys=True, allow_nan=False):
+if arn_match.group(1) == "157":
     fail("Task 8 binding refuses rejected :157")
 expected_image_prefix = f"{registry}/pensyve-gateway@sha256:"
 baseline_image = str(deployment.get("baseline_image", ""))

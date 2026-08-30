@@ -37,6 +37,19 @@ safe_relative_path() {
         && "${path}" != *"://"* && "${path}" != *"@"* ]]
 }
 
+validate_manifest_paths() {
+    local kind expected_sha expected_bytes cache_path snapshot_path extra
+
+    while read -r kind expected_sha expected_bytes cache_path snapshot_path extra; do
+        [[ -n "${kind}" && "${kind}" != \#* ]] || continue
+        [[ -z "${extra:-}" ]] || fail "invalid manifest row: ${cache_path}"
+        safe_relative_path "${cache_path}" || fail "unsafe cache path: ${cache_path}"
+        if [[ "${kind}" == "blob" ]]; then
+            safe_relative_path "${snapshot_path}" || fail "unsafe snapshot path: ${snapshot_path}"
+        fi
+    done < "${MANIFEST}"
+}
+
 file_sha256() {
     sha256sum -- "$1" | cut -d' ' -f1
 }
@@ -183,7 +196,7 @@ verify_bundle() {
 
         if [[ -d "${root}/${repository}/refs" ]]; then
             while IFS= read -r path; do
-                path="${path#${root}/}"
+                path="${path#"${root}"/}"
                 if ! grep -Fx -- "${path}" <<<"${expected_ref_paths}" >/dev/null; then
                     echo "extra ref rejected: ${path}" >&2
                     errors=1
@@ -193,7 +206,7 @@ verify_bundle() {
     done
 
     while IFS= read -r path; do
-        path="${path#${root}/}"
+        path="${path#"${root}"/}"
         if ! grep -Fx -- "${path}" <<<"${expected_blob_paths}" >/dev/null; then
             echo "unmanifested blob rejected: ${path}" >&2
             errors=1
@@ -201,7 +214,7 @@ verify_bundle() {
     done < <(find "${root}" -path '*/blobs/*' -type f -print)
 
     while IFS= read -r path; do
-        path="${path#${root}/}"
+        path="${path#"${root}"/}"
         if ! grep -Fx -- "${path}" <<<"${expected_snapshot_paths}" >/dev/null; then
             echo "unmanifested snapshot path rejected: ${path}" >&2
             errors=1
@@ -209,7 +222,7 @@ verify_bundle() {
     done < <(find "${root}" -path '*/snapshots/*' \( -type f -o -type l \) -print)
 
     while IFS= read -r path; do
-        path="${path#${root}/}"
+        path="${path#"${root}"/}"
         case "${path}" in
             "${GTE_CACHE_REPOSITORY}" | "${BGE_CACHE_REPOSITORY}") ;;
             *)
@@ -232,6 +245,7 @@ download_licenses() {
     while read -r kind expected_sha expected_bytes cache_path source extra; do
         [[ "${kind}" == "license-file" ]] || continue
         [[ -z "${extra:-}" ]] || fail "invalid license manifest row: ${cache_path}"
+        safe_relative_path "${cache_path}" || fail "unsafe license cache path: ${cache_path}"
         case "${source}" in
             "spdx-license-list-data@${SPDX_LICENSE_REVISION}/Apache-2.0.txt") source_name="Apache-2.0.txt" ;;
             "spdx-license-list-data@${SPDX_LICENSE_REVISION}/MIT.txt") source_name="MIT.txt" ;;
@@ -261,7 +275,9 @@ download_model() {
     while read -r kind expected_sha expected_bytes cache_path snapshot_path extra; do
         [[ "${kind}" != "blob" || "${snapshot_path}" != "${cache_repository}/snapshots/${revision}/"* ]] \
             && continue
-        source_path="${snapshot_path#${cache_repository}/snapshots/${revision}/}"
+        safe_relative_path "${cache_path}" || fail "unsafe cache path: ${cache_path}"
+        safe_relative_path "${snapshot_path}" || fail "unsafe snapshot path: ${snapshot_path}"
+        source_path="${snapshot_path#"${cache_repository}/snapshots/${revision}/"}"
         blob_path="${root}/${cache_path}"
         mkdir -p -- "$(dirname -- "${blob_path}")" \
             "$(dirname -- "${root}/${snapshot_path}")"
@@ -284,6 +300,7 @@ fetch_bundle() {
     local parent
     local staging
 
+    validate_manifest_paths
     parent="$(dirname -- "${output}")"
     mkdir -p -- "${parent}"
     if [[ -e "${output}" ]]; then

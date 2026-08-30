@@ -13,13 +13,17 @@ readonly TRIVY_IMAGE_DIGEST="sha256:55ad20f8a239a3e95427e60b8aaea38788550c18a3f1
 readonly TRIVY_IMAGE="ghcr.io/aquasecurity/trivy@${TRIVY_IMAGE_DIGEST}"
 readonly MEMORY_LIMIT_BYTES="4294967296"
 ACTIVE_CONTAINER=""
+ACTIVE_MUTATION_IMAGE=""
 
-cleanup_active_container() {
+cleanup_active_resources() {
     if [[ -n "${ACTIVE_CONTAINER}" ]]; then
         docker rm -f "${ACTIVE_CONTAINER}" >/dev/null 2>&1 || true
     fi
+    if [[ -n "${ACTIVE_MUTATION_IMAGE}" ]]; then
+        docker image rm -f "${ACTIVE_MUTATION_IMAGE}" >/dev/null 2>&1 || true
+    fi
 }
-trap cleanup_active_container EXIT
+trap cleanup_active_resources EXIT
 
 die() {
     echo "gateway release image error: $*" >&2
@@ -37,6 +41,8 @@ sha256_file() {
 prepare_trivy() {
     local cache_dir="$1" evidence_dir="$2"
     mkdir -p -- "${cache_dir}" "${evidence_dir}"
+    cache_dir="$(realpath -- "${cache_dir}")"
+    evidence_dir="$(realpath -- "${evidence_dir}")"
     docker pull "${TRIVY_IMAGE}" > "${evidence_dir}/trivy-pull.log"
     docker image inspect "${TRIVY_IMAGE}" > "${evidence_dir}/trivy-image-inspect.json"
     docker run --rm "${TRIVY_IMAGE}" version > "${evidence_dir}/trivy-version.txt"
@@ -244,6 +250,7 @@ run_missing_model_failure() {
     local mutation_image="pensyve-gateway-missing-model:${image_id#sha256:}"
     local container="pensyve-release-${$}-missing"
     ACTIVE_CONTAINER="${container}"
+    ACTIVE_MUTATION_IMAGE="${mutation_image}"
     mkdir -p -- "${run_dir}"
     docker build --build-arg "BASE_IMAGE=${base_ref}" --tag "${mutation_image}" --file - "${REPO_ROOT}" \
         > "${run_dir}/derived-image-build.log" 2>&1 <<'DOCKERFILE'
@@ -273,12 +280,17 @@ DOCKERFILE
     docker rm "${container}" > "${run_dir}/remove-output.txt"
     ACTIVE_CONTAINER=""
     docker image rm "${mutation_image}" > "${run_dir}/derived-image-remove.txt"
+    ACTIVE_MUTATION_IMAGE=""
 }
 
 run_trivy() {
     local archive="$1" image_id="$2" cache_dir="$3" evidence_dir="$4"
+    archive="$(realpath -- "${archive}")"
+    cache_dir="$(realpath -- "${cache_dir}")"
+    evidence_dir="$(realpath -- "${evidence_dir}")"
     local scan_dir="${evidence_dir}/trivy"
     mkdir -p -- "${scan_dir}"
+    scan_dir="$(realpath -- "${scan_dir}")"
     local db_metadata db_file db_updated db_downloaded db_sha report report_sha policy_sha
     db_metadata="$(find "${cache_dir}" -type f -path '*/db/metadata.json' -print -quit)"
     db_file="$(find "${cache_dir}" -type f -path '*/db/trivy.db' -print -quit)"
@@ -340,9 +352,12 @@ prove_archive() {
     local archive="$1" source_sha="$2" evidence_dir="$3" trivy_cache="$4"
     [[ "${source_sha}" =~ ^[0-9a-f]{40}$ ]] || die "source SHA must be 40 lowercase hex"
     [[ -f "${archive}" ]] || die "release archive is absent"
+    archive="$(realpath -- "${archive}")"
     [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]] || die "release proof requires native ARM64"
     [[ "$(stat -fc '%T' /sys/fs/cgroup)" == "cgroup2fs" ]] || die "authoritative cgroup-v2 is unavailable"
-    mkdir -p -- "${evidence_dir}"
+    mkdir -p -- "${evidence_dir}" "${trivy_cache}"
+    evidence_dir="$(realpath -- "${evidence_dir}")"
+    trivy_cache="$(realpath -- "${trivy_cache}")"
     printf '%s\n' "${source_sha}" > "${evidence_dir}/source-sha.txt"
     sha256sum "${archive}" > "${evidence_dir}/archive.sha256"
     docker load --input "${archive}" > "${evidence_dir}/docker-load.log"
