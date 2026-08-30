@@ -569,11 +569,14 @@ if not gte_command:
 if not bge_command or "--ignored" in bge_command.group(0):
     errors.append("release BGE proof must select the non-ignored exact test")
 for token in (
-    "real-gte-inference.log", "real-bge-inference.log", "BGE exact test selection is invalid",
-    "1 passed; 0 failed; 0 ignored", "skipping",
+    "real-gte-inference.log", "real-bge-inference.log", "verify_exact_test_result",
+    "exact test selection is invalid", "1 passed; 0 failed; 0 ignored", "skipping",
 ):
     if token not in release_text:
-        errors.append(f"release BGE exact result gate is missing: {token}")
+        errors.append(f"release exact result gate is missing: {token}")
+for label, log_name in (("GTE", "real-gte-inference.log"), ("BGE", "real-bge-inference.log")):
+    if f'verify_exact_test_result "{label}" "${{evidence_dir}}/{log_name}"' not in release_text:
+        errors.append(f"release {label} proof must use the generalized exact result gate")
 if "verify_scan_common()" in release_text:
     errors.append("release script must delegate scanner policy ownership to the artifact script")
 if "gh api" in promotion_text or "GITHUB_" in promotion_text or "pull_request" in promotion_text:
@@ -4635,37 +4638,41 @@ run_round9_review() {
       "${ARTIFACT_SCRIPT}" fetch-verify --tuple "${fixture}/reviewed-draft-number.json" \
       --request "${fixture}/request-draft-number.json" --output "${fixture}/bad-verified.json" || failures=$((failures + 1))
 
-    if validate_workflow "${WORKFLOW}" >"${fixture}/bge-contract.log" 2>&1; then
-      echo "round9 BGE exact non-ignored selection and result gate passed"
+    if validate_workflow "${WORKFLOW}" >"${fixture}/exact-test-contract.log" 2>&1; then
+      echo "round9 GTE/BGE exact selection and result gate passed"
     else
-      cat "${fixture}/bge-contract.log" >&2
-      echo "ROUND9 RED current release lacks an exact non-ignored BGE result gate" >&2
+      cat "${fixture}/exact-test-contract.log" >&2
+      echo "ROUND9 RED current release lacks a generalized GTE/BGE exact result gate" >&2
       failures=$((failures + 1))
     fi
-    python3 - "${RELEASE_SCRIPT}" "${fixture}/verify-bge-result.sh" <<'PY'
+    python3 - "${RELEASE_SCRIPT}" "${fixture}/verify-exact-test-result.sh" <<'PY'
 from pathlib import Path
 import re
 import sys
 source = Path(sys.argv[1]).read_text()
-match = re.search(r'(?ms)^verify_exact_bge_result\(\) \{.*?^\}\n', source)
+match = re.search(r'(?ms)^verify_exact_test_result\(\) \{.*?^\}\n', source)
 if not match:
-    raise SystemExit("release BGE result verifier is absent")
+    raise SystemExit("release generalized exact result verifier is absent")
 Path(sys.argv[2]).write_text(
     '#!/usr/bin/env bash\nset -euo pipefail\ndie() { echo "gateway release image error: $*" >&2; exit 1; }\n' +
-    match.group(0) + '\nverify_exact_bge_result "$1"\n'
+    match.group(0) + '\nverify_exact_test_result "$1" "$2"\n'
 )
 PY
-    chmod +x "${fixture}/verify-bge-result.sh"
-    printf 'running 1 test\ntest reranker_does_not_make_network_calls ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.01s\n' \
-      > "${fixture}/bge-one-pass.log"
-    "${fixture}/verify-bge-result.sh" "${fixture}/bge-one-pass.log"
-    printf 'running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s\n' \
-      > "${fixture}/bge-zero-selected.log"
-    round9_expect_rejection bge-zero-selected "expected exactly one selected test" \
-      "${fixture}/verify-bge-result.sh" "${fixture}/bge-zero-selected.log" || failures=$((failures + 1))
+    chmod +x "${fixture}/verify-exact-test-result.sh"
+    for model in gte bge; do
+      local label="${model^^}"
+      printf 'running 1 test\ntest exact_model_proof ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.01s\n' \
+        > "${fixture}/${model}-one-pass.log"
+      "${fixture}/verify-exact-test-result.sh" "${label}" "${fixture}/${model}-one-pass.log"
+      printf 'running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s\n' \
+        > "${fixture}/${model}-zero-selected.log"
+      round9_expect_rejection "${model}-zero-selected" "expected exactly one selected test" \
+        "${fixture}/verify-exact-test-result.sh" "${label}" "${fixture}/${model}-zero-selected.log" \
+        || failures=$((failures + 1))
+    done
 
-    [[ "${failures}" -eq 0 ]] || fail "round9 exact numeric/BGE authority mutations accepted: ${failures}"
-    echo "round9 exact numeric and BGE authority contract passed"
+    [[ "${failures}" -eq 0 ]] || fail "round9 exact numeric/model authority mutations accepted: ${failures}"
+    echo "round9 exact numeric and model authority contract passed"
 }
 
 run_round10_review() {

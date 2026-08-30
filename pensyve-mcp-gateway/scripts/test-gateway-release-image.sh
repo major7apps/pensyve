@@ -324,15 +324,15 @@ run_trivy() {
     "${ARTIFACT_SCRIPT}" verify-scan-preupload --tuple "${scan_dir}/scan-tuple.json" > "${scan_dir}/policy.log"
 }
 
-verify_exact_bge_result() {
-    local log="$1"
-    [[ -f "${log}" ]] || die "BGE exact test selection is invalid: output is absent"
+verify_exact_test_result() {
+    local label="$1" log="$2"
+    [[ -f "${log}" ]] || die "${label} exact test selection is invalid: output is absent"
     [[ "$(grep -Ec '^running 1 test$' "${log}" || true)" -eq 1 ]] \
-        || die "BGE exact test selection is invalid: expected exactly one selected test"
+        || die "${label} exact test selection is invalid: expected exactly one selected test"
     [[ "$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored; [0-9]+ measured; [0-9]+ filtered out; finished in ' "${log}" || true)" -eq 1 ]] \
-        || die "BGE exact test selection is invalid: expected exactly 1 passed; 0 failed; 0 ignored"
+        || die "${label} exact test selection is invalid: expected exactly 1 passed; 0 failed; 0 ignored"
     if grep -Eiq 'skipping' "${log}"; then
-        die "BGE exact test selection is invalid: manual skipping message present"
+        die "${label} exact test selection is invalid: manual skipping message present"
     fi
 }
 
@@ -390,6 +390,7 @@ prove_archive() {
             embedding::tests::disabled_gte_constructs_from_complete_real_seeded_cache \
             -- --ignored --exact --nocapture --test-threads=1
     ) > "${evidence_dir}/real-gte-inference.log" 2>&1
+    verify_exact_test_result "GTE" "${evidence_dir}/real-gte-inference.log"
     (
         cd "${REPO_ROOT}"
         HF_HOME="${model_root}" FASTEMBED_CACHE_DIR="${model_root}" HF_HUB_OFFLINE=1 \
@@ -397,7 +398,7 @@ prove_archive() {
             --test test_no_network_invariants reranker_does_not_make_network_calls \
             -- --exact --nocapture --test-threads=1
     ) > "${evidence_dir}/real-bge-inference.log" 2>&1
-    verify_exact_bge_result "${evidence_dir}/real-bge-inference.log"
+    verify_exact_test_result "BGE" "${evidence_dir}/real-bge-inference.log"
     cat "${evidence_dir}/real-gte-inference.log" "${evidence_dir}/real-bge-inference.log" \
         > "${evidence_dir}/real-model-inference.log"
 

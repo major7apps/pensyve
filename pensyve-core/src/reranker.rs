@@ -165,7 +165,7 @@ fn resolve_load_mode(
     policy: &NetworkPolicy,
 ) -> Result<RerankerLoadMode, RerankerError> {
     match preflight_model_cache(&resolved.cache_dir, resolved.hf_model_code) {
-        Ok(files) if matches!(policy, NetworkPolicy::Disabled) => {
+        Ok(files) if !matches!(policy, NetworkPolicy::Permissive) => {
             Ok(RerankerLoadMode::Local(files))
         }
         Ok(_) => Ok(RerankerLoadMode::HuggingFace),
@@ -763,6 +763,52 @@ mod tests {
         assert!(
             matches!(mode, RerankerLoadMode::Local(_)),
             "Disabled selected the hf-hub load path"
+        );
+    }
+
+    #[test]
+    fn test_local_only_complete_cache_stays_local_after_preflight_file_disappears() {
+        let cache = tempfile::TempDir::new().expect("temporary fastembed cache");
+        let repository = cache.path().join("models--BAAI--bge-reranker-base");
+        let snapshot = repository.join("snapshots/test-revision");
+        std::fs::create_dir_all(snapshot.join("onnx")).expect("create snapshot structure");
+        std::fs::create_dir_all(repository.join("refs")).expect("create refs directory");
+        std::fs::write(repository.join("refs/main"), "test-revision")
+            .expect("write canonical main ref");
+        for required in REQUIRED_RERANKER_FILES {
+            std::fs::write(snapshot.join(required), []).expect("seed required cache file");
+        }
+        let (model, hf_model_code) =
+            resolve_model("BGERerankerBase").expect("resolve BGE reranker");
+        let resolved = ResolvedRerankerLoad {
+            model_name: "BGERerankerBase".to_string(),
+            model,
+            hf_model_code,
+            cache_dir: cache.path().to_path_buf(),
+        };
+        let mode = resolve_load_mode(
+            &resolved,
+            &NetworkPolicy::LocalOnly {
+                url: "http://127.0.0.1:9".to_string(),
+            },
+        )
+        .expect("complete LocalOnly cache should resolve locally");
+        let RerankerLoadMode::Local(local_files) = mode else {
+            panic!("LocalOnly selected the hf-hub load path");
+        };
+        std::fs::remove_file(snapshot.join("tokenizer_config.json"))
+            .expect("remove certified local file after preflight");
+
+        let result =
+            Reranker::new_from_resolved_mode(resolved, RerankerLoadMode::Local(local_files));
+
+        let Err(error) = result else {
+            panic!("LocalOnly load unexpectedly succeeded after local file removal");
+        };
+        assert!(error.is_cache_error(), "expected cache-classified error");
+        assert!(
+            error.to_string().contains("tokenizer_config.json"),
+            "local failure should identify the disappeared file: {error}"
         );
     }
 
