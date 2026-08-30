@@ -94,14 +94,10 @@ pub struct PensyveState {
     pub retrieval_config: RetrievalConfig,
     /// True when running as a remote gateway (Streamable HTTP), false for local (stdio).
     pub is_remote: bool,
-    /// Lazily resolved cross-encoder reranker. Callers that construct
-    /// multiple `PensyveState`s from the same process (e.g. the gateway's
-    /// per-tenant states) should clone the same `Arc<OnceLock<..>>` into
-    /// each one so the model loads — or fails — at most once per process
-    /// rather than once per tenant. Resolution happens on first call to
-    /// [`Self::reranker`], never at construction: `PENSYVE_RERANKER=0`
-    /// disables it outright, and a model-load failure is logged once and
-    /// leaves recall unreranked rather than failing startup or the request.
+    /// Shared cross-encoder reranker cell. Local/permissive callers leave it
+    /// empty for first-recall resolution. Strict gateways populate it before
+    /// exposing tenant state, so every recall receives the already-initialized
+    /// process-wide model. Multiple states must clone the same outer `Arc`.
     pub reranker_cell: Arc<OnceLock<Option<Arc<Reranker>>>>,
     /// Root directory that `pensyve_forget` writes its pre-delete snapshots
     /// into (#246). This is the root for *all* namespaces; each snapshot lands
@@ -121,6 +117,16 @@ pub struct PensyveState {
 }
 
 impl PensyveState {
+    /// Build a reranker cell that is populated before state becomes visible.
+    /// Strict gateways use this after fail-closed model initialization so the
+    /// first recall cannot enter the lazy resolver or fall back to `None`.
+    #[must_use]
+    pub fn preinitialized_reranker_cell(
+        reranker: Arc<Reranker>,
+    ) -> Arc<OnceLock<Option<Arc<Reranker>>>> {
+        Arc::new(OnceLock::from(Some(reranker)))
+    }
+
     /// Standard snapshot root for a server whose storage lives at
     /// `storage_root`: `<storage_root>/snapshots`, overridable with
     /// `PENSYVE_SNAPSHOT_DIR`.
@@ -362,6 +368,23 @@ mod tests {
             ),
             Some(50)
         );
+    }
+
+    #[test]
+    fn preinitialized_reranker_cell_returns_supplied_instance_on_first_resolution() {
+        let supplied = Arc::new(Reranker::new_mock());
+        let cell = PensyveState::preinitialized_reranker_cell(Arc::clone(&supplied));
+
+        assert!(
+            cell.get().is_some(),
+            "cell must be populated before recall can observe state"
+        );
+        let first = PensyveState::resolve_reranker_cell(&cell)
+            .expect("preinitialized reranker must be available on first recall");
+        let second = PensyveState::resolve_reranker_cell(&cell)
+            .expect("preinitialized reranker must remain available");
+        assert!(Arc::ptr_eq(&supplied, &first));
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]
