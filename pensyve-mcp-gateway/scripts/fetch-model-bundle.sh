@@ -42,10 +42,12 @@ validate_manifest_paths() {
 
     while read -r kind expected_sha expected_bytes cache_path snapshot_path extra; do
         [[ -n "${kind}" && "${kind}" != \#* ]] || continue
-        [[ -z "${extra:-}" ]] || fail "invalid manifest row: ${cache_path}"
-        safe_relative_path "${cache_path}" || fail "unsafe cache path: ${cache_path}"
+        [[ -z "${extra:-}" ]] || { fail "invalid manifest row: ${cache_path}"; return 1; }
+        safe_relative_path "${cache_path}" \
+            || { fail "unsafe cache path: ${cache_path}"; return 1; }
         if [[ "${kind}" == "blob" ]]; then
-            safe_relative_path "${snapshot_path}" || fail "unsafe snapshot path: ${snapshot_path}"
+            safe_relative_path "${snapshot_path}" \
+                || { fail "unsafe snapshot path: ${snapshot_path}"; return 1; }
         fi
     done < "${MANIFEST}"
 }
@@ -244,8 +246,10 @@ download_licenses() {
 
     while read -r kind expected_sha expected_bytes cache_path source extra; do
         [[ "${kind}" == "license-file" ]] || continue
-        [[ -z "${extra:-}" ]] || fail "invalid license manifest row: ${cache_path}"
-        safe_relative_path "${cache_path}" || fail "unsafe license cache path: ${cache_path}"
+        [[ -z "${extra:-}" ]] \
+            || { fail "invalid license manifest row: ${cache_path}"; return 1; }
+        safe_relative_path "${cache_path}" \
+            || { fail "unsafe license cache path: ${cache_path}"; return 1; }
         case "${source}" in
             "spdx-license-list-data@${SPDX_LICENSE_REVISION}/Apache-2.0.txt") source_name="Apache-2.0.txt" ;;
             "spdx-license-list-data@${SPDX_LICENSE_REVISION}/MIT.txt") source_name="MIT.txt" ;;
@@ -271,12 +275,15 @@ download_model() {
     local revision="$4"
     local kind expected_sha expected_bytes cache_path snapshot_path source_path blob_path
 
+    validate_manifest_paths || return 1
     printf '%s' "${revision}" > "${root}/${cache_repository}/refs/main"
     while read -r kind expected_sha expected_bytes cache_path snapshot_path extra; do
         [[ "${kind}" != "blob" || "${snapshot_path}" != "${cache_repository}/snapshots/${revision}/"* ]] \
             && continue
-        safe_relative_path "${cache_path}" || fail "unsafe cache path: ${cache_path}"
-        safe_relative_path "${snapshot_path}" || fail "unsafe snapshot path: ${snapshot_path}"
+        safe_relative_path "${cache_path}" \
+            || { fail "unsafe cache path: ${cache_path}"; return 1; }
+        safe_relative_path "${snapshot_path}" \
+            || { fail "unsafe snapshot path: ${snapshot_path}"; return 1; }
         source_path="${snapshot_path#"${cache_repository}/snapshots/${revision}/"}"
         blob_path="${root}/${cache_path}"
         mkdir -p -- "$(dirname -- "${blob_path}")" \

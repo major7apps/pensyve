@@ -73,7 +73,16 @@ expect_failure_naming() {
     fi
 }
 
-readonly TEST_ROOT="$(mktemp -d "$(dirname -- "${FIXTURE_ROOT}")/.pensyve-model-test.[literal].XXXXXX")"
+TEST_ROOT=""
+if ! TEST_ROOT="$(mktemp -d "$(dirname -- "${FIXTURE_ROOT}")/.pensyve-model-test.[literal].XXXXXX")"; then
+    echo "model bundle test error: could not create model-bundle test root" >&2
+    exit 1
+fi
+if [[ -z "${TEST_ROOT}" ]]; then
+    echo "model bundle test error: could not create model-bundle test root: empty path" >&2
+    exit 1
+fi
+readonly TEST_ROOT
 trap 'find "${TEST_ROOT}" -type d -exec chmod u+w {} + 2>/dev/null || true; rm -rf -- "${TEST_ROOT}"' EXIT
 
 readonly EMPTY_ROOT="${TEST_ROOT}/empty"

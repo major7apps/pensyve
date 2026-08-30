@@ -5328,9 +5328,40 @@ run_round15_review() {
     cp -- "${FETCH_SCRIPT}" "${fetch_copy}/scripts/fetch-model-bundle.sh"
     cp -- "${REPO_ROOT}/pensyve-mcp-gateway/models/manifest.sha256" \
       "${REPO_ROOT}/pensyve-mcp-gateway/models/revisions.env" "${fetch_copy}/models/"
-    export STUB_LOG="${fixture}/fetch-stub.log" CURL_MARKER="${fixture}/curl-called"
-    write_stub "${fixture}/bin/curl" 'touch "${CURL_MARKER}"; exit 97'
-    for unsafe_case in blob-cache snapshot license-cache; do
+    local fetch_bin="${fixture}/fetch-bin"
+    local fetch_driver="${fetch_copy}/scripts/fetch-guard-driver.sh"
+    mkdir -p "${fetch_bin}"
+    export STUB_LOG="${fixture}/fetch-stub.log"
+    write_stub "${fetch_bin}/curl" 'touch "${CURL_MARKER}"; exit 97'
+    write_stub "${fetch_bin}/mkdir" 'touch "${WRITE_MARKER}"; exit 97'
+    python3 - "${fetch_copy}/scripts/fetch-model-bundle.sh" "${fetch_driver}" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text()
+prefix = source.split("\nfetch_bundle() {", 1)[0]
+driver = r'''
+mode="$1"
+root="$2"
+status=0
+case "${mode}" in
+    validate) validate_manifest_paths || status=$? ;;
+    license) download_licenses "${root}" || status=$? ;;
+    model)
+        download_model "${root}" "${GTE_REPOSITORY}" "${GTE_CACHE_REPOSITORY}" \
+            "${GTE_REVISION}" || status=$?
+        ;;
+    *) exit 98 ;;
+esac
+if [[ "${status}" -eq 0 ]]; then
+    touch "${CONTINUATION_MARKER}"
+fi
+exit "${status}"
+'''
+Path(sys.argv[2]).write_text(prefix + driver)
+PY
+    chmod +x "${fetch_driver}"
+    for unsafe_case in blob-cache snapshot snapshot-nonprefix license-cache; do
         cp -- "${REPO_ROOT}/pensyve-mcp-gateway/models/manifest.sha256" "${fetch_copy}/models/manifest.sha256"
         python3 - "${fetch_copy}/models/manifest.sha256" "${unsafe_case}" <<'PY'
 from pathlib import Path
@@ -5340,8 +5371,13 @@ path, mode = Path(sys.argv[1]), sys.argv[2]
 rows = path.read_text().splitlines()
 for index, row in enumerate(rows):
     fields = row.split()
-    if mode in {"blob-cache", "snapshot"} and fields and fields[0] == "blob":
-        fields[3 if mode == "blob-cache" else 4] = "../round15-escape"
+    if mode in {"blob-cache", "snapshot", "snapshot-nonprefix"} and fields and fields[0] == "blob":
+        if mode == "blob-cache":
+            fields[3] = "../round15-escape"
+        elif mode == "snapshot":
+            fields[4] = "/".join(fields[4].split("/")[:3] + ["..", "round15-escape"])
+        else:
+            fields[4] = "../round15-escape"
         rows[index] = " ".join(fields)
         break
     if mode == "license-cache" and fields and fields[0] == "license-file":
@@ -5350,30 +5386,77 @@ for index, row in enumerate(rows):
         break
 path.write_text("\n".join(rows) + "\n")
 PY
-        rm -f -- "${CURL_MARKER}"
+        local curl_marker="${fixture}/${unsafe_case}-curl-called"
+        local write_marker="${fixture}/${unsafe_case}-write-called"
+        local continuation_marker="${fixture}/${unsafe_case}-continued"
+        rm -f -- "${curl_marker}" "${write_marker}" "${continuation_marker}"
         : > "${STUB_LOG}"
         local unsafe_log="${fixture}/unsafe-${unsafe_case}.log"
-        if [[ "${unsafe_case}" == license-cache ]]; then
-            python3 - "${fetch_copy}/scripts/fetch-model-bundle.sh" "${fetch_copy}/scripts/license-driver.sh" <<'PY'
-from pathlib import Path
-import sys
-
-source = Path(sys.argv[1]).read_text()
-prefix = source.split("\ndownload_model() {", 1)[0]
-Path(sys.argv[2]).write_text(prefix + '\ndownload_licenses "$1"\n')
-PY
-            chmod +x "${fetch_copy}/scripts/license-driver.sh"
-            capture_failure "${unsafe_log}" env PATH="${fixture}/bin:${PATH}" \
-              bash "${fetch_copy}/scripts/license-driver.sh" "${fixture}/license-root"
-        else
-            capture_failure "${unsafe_log}" env PATH="${fixture}/bin:${PATH}" \
-              "${fetch_copy}/scripts/fetch-model-bundle.sh" --output "${fixture}/unsafe-output-${unsafe_case}"
-        fi
-        if [[ -e "${CURL_MARKER}" ]]; then
+        capture_failure "${unsafe_log}" env PATH="${fetch_bin}:${PATH}" \
+          CURL_MARKER="${curl_marker}" WRITE_MARKER="${write_marker}" \
+          "${fetch_copy}/scripts/fetch-model-bundle.sh" --output "${fixture}/unsafe-output-${unsafe_case}"
+        if [[ -e "${curl_marker}" ]]; then
             echo "ROUND15-RED ${unsafe_case}: unsafe manifest data reached curl" >&2
             failures=$((failures + 1))
         fi
+
+        local direct_root="${fixture}/direct-${unsafe_case}"
+        mkdir -p "${direct_root}/${gte_repo}/refs"
+        local guard_mode=validate expected_error="unsafe cache path"
+        if [[ "${unsafe_case}" == snapshot || "${unsafe_case}" == snapshot-nonprefix ]]; then
+            expected_error="unsafe snapshot path"
+        fi
+        for guard_mode in validate direct; do
+            local driver_mode=validate
+            if [[ "${guard_mode}" == direct ]]; then
+                driver_mode=model
+                if [[ "${unsafe_case}" == license-cache ]]; then
+                    driver_mode=license
+                    expected_error="unsafe license cache path"
+                fi
+            fi
+            rm -f -- "${curl_marker}" "${write_marker}" "${continuation_marker}"
+            set +e
+            env PATH="${fetch_bin}:${PATH}" STUB_LOG="${STUB_LOG}" \
+              CURL_MARKER="${curl_marker}" WRITE_MARKER="${write_marker}" \
+              CONTINUATION_MARKER="${continuation_marker}" \
+              bash "${fetch_driver}" "${driver_mode}" "${direct_root}" \
+              > "${fixture}/${unsafe_case}-${guard_mode}.log" 2>&1
+            local guard_status=$?
+            set -e
+            if [[ "${guard_status}" -eq 0 ]]; then
+                echo "ROUND16-RED ${unsafe_case}-${guard_mode}: invalid-path guard returned zero" >&2
+                failures=$((failures + 1))
+            fi
+            if [[ -e "${curl_marker}" || -e "${write_marker}" || -e "${continuation_marker}" ]]; then
+                echo "ROUND16-RED ${unsafe_case}-${guard_mode}: invalid-path guard continued" >&2
+                failures=$((failures + 1))
+            fi
+            if [[ "${unsafe_case}" == snapshot-nonprefix && "${guard_mode}" == direct \
+              && -e "${direct_root}/${gte_repo}/refs/main" ]]; then
+                echo "ROUND16-RED ${unsafe_case}-${guard_mode}: refs/main was written before validation" >&2
+                failures=$((failures + 1))
+            fi
+            if ! grep -F -- "${expected_error}" "${fixture}/${unsafe_case}-${guard_mode}.log" >/dev/null; then
+                echo "ROUND16-RED ${unsafe_case}-${guard_mode}: invalid-path error was not named" >&2
+                failures=$((failures + 1))
+            fi
+        done
     done
+
+    write_stub "${fetch_bin}/mktemp" 'exit 95'
+    set +e
+    env PATH="${fetch_bin}:${PATH}" STUB_LOG="${STUB_LOG}" \
+      CURL_MARKER="${fixture}/model-test-curl" WRITE_MARKER="${fixture}/model-test-write" \
+      "${MODEL_TEST}" "${model_fixture}" missing-blob > "${fixture}/model-test-mktemp.log" 2>&1
+    local model_mktemp_status=$?
+    set -e
+    if [[ "${model_mktemp_status}" -eq 0 ]] \
+      || ! grep -F 'could not create model-bundle test root' "${fixture}/model-test-mktemp.log" >/dev/null; then
+        echo "ROUND16-RED model-test mktemp: failure was masked or unnamed" >&2
+        failures=$((failures + 1))
+    fi
+    rm -f -- "${fetch_bin}/mktemp"
 
     export STUB_LOG="${fixture}/registry-stub.log" CURL_STATE="${fixture}/registry-curl-count"
     : > "${STUB_LOG}"
