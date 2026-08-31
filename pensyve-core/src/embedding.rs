@@ -976,16 +976,14 @@ mod tests {
 
     #[test]
     fn test_sentence_transformers_alias() {
-        // "sentence-transformers/all-MiniLM-L6-v2" should resolve to the same model.
-        let result = OnnxEmbedder::new("sentence-transformers/all-MiniLM-L6-v2");
-        // This would succeed if the model is downloaded, but we only check it doesn't
-        // return "Unknown model" error.
-        if let Err(e) = &result {
-            assert!(
-                !e.to_string().contains("Unknown model"),
-                "sentence-transformers alias should be recognized"
-            );
-        }
+        let (model, dimensions, hf_model_code, model_file) =
+            resolve_model("sentence-transformers/all-MiniLM-L6-v2")
+                .expect("sentence-transformers alias should resolve");
+
+        assert!(matches!(model, EmbeddingModel::AllMiniLML6V2));
+        assert_eq!(dimensions, 384);
+        assert_eq!(hf_model_code, "Qdrant/all-MiniLM-L6-v2-onnx");
+        assert_eq!(model_file, "model.onnx");
     }
 
     #[test]

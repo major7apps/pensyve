@@ -122,9 +122,16 @@ def validate_service(
     service = as_object(services[0], "service")
     if service.get("serviceName") != SERVICE or service.get("status") != "ACTIVE":
         fail("service identity/status mismatch")
-    counts = [service.get(name) for name in ("desiredCount", "runningCount", "pendingCount")]
-    if counts != [2, 2, 0] or any(type(value) is not int for value in counts):
-        fail("desired/running/pending must be exactly 2/2/0")
+    desired = service.get("desiredCount")
+    running = service.get("runningCount")
+    pending = service.get("pendingCount")
+    if type(desired) is not int or not 2 <= desired <= 4:
+        fail("desiredCount must be an exact integer in range 2..4")
+    if type(running) is not int or running != desired:
+        fail("runningCount must equal desiredCount")
+    if type(pending) is not int or pending != 0:
+        fail("pendingCount must be exactly 0")
+    counts = [desired, running, pending]
     deployments = as_list(service.get("deployments"), "deployments")
     if len(deployments) != 1:
         fail("service must have a single deployment")
@@ -135,10 +142,11 @@ def validate_service(
     if (
         primary.get("status") != "PRIMARY"
         or primary.get("rolloutState") != "COMPLETED"
-        or primary_counts != [2, 2, 0]
         or any(type(value) is not int for value in primary_counts)
     ):
-        fail("service must have one completed PRIMARY deployment at 2/2/0")
+        fail("service must have one completed PRIMARY deployment")
+    if primary_counts != counts:
+        fail("PRIMARY deployment counts must equal service counts")
     active_arn = service.get("taskDefinition")
     if not isinstance(active_arn, str):
         fail("active task definition ARN is absent")
