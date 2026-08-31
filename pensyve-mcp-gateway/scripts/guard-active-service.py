@@ -18,6 +18,9 @@ TASK_ARN = re.compile(
     r"^arn:[^:]+:ecs:[^:]+:[0-9]{12}:task-definition/pensyve-prod-gateway:[0-9]+$"
 )
 IMMUTABLE_IMAGE = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
+AWS_CLI_CONNECT_TIMEOUT_SECONDS = "5"
+AWS_CLI_READ_TIMEOUT_SECONDS = "30"
+AWS_SUBPROCESS_TIMEOUT_SECONDS = 60
 REQUIRED_ENVIRONMENT = {
     "PENSYVE_REQUIRE_LOCAL_MODELS": "1",
     "HF_HOME": "/opt/pensyve/models",
@@ -45,9 +48,29 @@ def list_value(value: Any, label: str) -> list[Any]:
 
 
 def aws_json(aws_bin: str, *arguments: str) -> dict[str, Any]:
-    command = [aws_bin, *arguments, "--output", "json"]
+    command = [
+        aws_bin,
+        *arguments,
+        "--cli-connect-timeout",
+        AWS_CLI_CONNECT_TIMEOUT_SECONDS,
+        "--cli-read-timeout",
+        AWS_CLI_READ_TIMEOUT_SECONDS,
+        "--output",
+        "json",
+    ]
     try:
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=AWS_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        fail(
+            f"AWS read timed out after {AWS_SUBPROCESS_TIMEOUT_SECONDS} seconds: "
+            f"{' '.join(arguments)}"
+        )
     except (OSError, subprocess.CalledProcessError) as error:
         stderr = getattr(error, "stderr", "") or ""
         fail(f"AWS read failed: {' '.join(arguments)}: {stderr.strip()}")

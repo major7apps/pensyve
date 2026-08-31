@@ -627,9 +627,9 @@ if ('RELEASE_DISPLAY_NAME=${GITHUB_REF_NAME#v}' not in release_title_text or
     errors.append("release display title must strip exactly one leading v through GITHUB_ENV")
 if mapping(release_action.get("with")).get("name") != "${{ env.RELEASE_DISPLAY_NAME }}":
     errors.append("action-gh-release must receive the stripped display title")
-release_text = job_text(release_job)
-if ('VERSION="${GITHUB_REF_NAME}"' not in release_text or
-        'git tag "pensyve-go/${VERSION}"' not in release_text):
+release_job_text = job_text(release_job)
+if ('VERSION="${GITHUB_REF_NAME}"' not in release_job_text or
+        'git tag "pensyve-go/${VERSION}"' not in release_job_text):
     errors.append("Go module tag must retain the original v-prefixed release tag")
 
 ci_on = mapping(ci.get("on"))
@@ -760,10 +760,46 @@ run_active_base_guard() {
     [[ "${actual}" == "${arn}" ]] || fail "active-base guard did not emit the exact active ARN"
     [[ "$(wc -l < "${fixture}/aws.log")" == 2 ]] \
         || fail "active-base guard did not make exactly two read-only AWS calls"
-    grep -Fx 'ecs describe-services --region us-east-2 --cluster pensyve-prod --services pensyve-prod-gateway --output json' \
+    grep -Fx 'ecs describe-services --region us-east-2 --cluster pensyve-prod --services pensyve-prod-gateway --cli-connect-timeout 5 --cli-read-timeout 30 --output json' \
         "${fixture}/aws.log" >/dev/null || fail "active-base guard service read is not exact"
-    grep -Fx "ecs describe-task-definition --region us-east-2 --task-definition ${arn} --output json" \
+    grep -Fx "ecs describe-task-definition --region us-east-2 --task-definition ${arn} --cli-connect-timeout 5 --cli-read-timeout 30 --output json" \
         "${fixture}/aws.log" >/dev/null || fail "active-base guard task read is not exact"
+
+    python3 - "${ACTIVE_BASE_GUARD}" <<'PY'
+import contextlib
+import importlib.util
+import io
+import subprocess
+import sys
+from pathlib import Path
+
+script = Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("guard_active_service", script)
+assert spec is not None and spec.loader is not None
+guard = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(guard)
+
+calls = []
+
+def timed_out(command, **kwargs):
+    calls.append((command, kwargs))
+    raise subprocess.TimeoutExpired(command, 60, output="must-not-leak", stderr="must-not-leak")
+
+guard.subprocess.run = timed_out
+sys.argv = [str(script)]
+stderr = io.StringIO()
+with contextlib.redirect_stderr(stderr):
+    assert guard.main() == 1
+
+assert calls == [([
+    "aws", "ecs", "describe-services", "--region", "us-east-2", "--cluster",
+    "pensyve-prod", "--services", "pensyve-prod-gateway", "--cli-connect-timeout",
+    "5", "--cli-read-timeout", "30", "--output", "json",
+], {"check": True, "capture_output": True, "text": True, "timeout": 60})]
+message = stderr.getvalue()
+assert "AWS read timed out after 60 seconds: ecs describe-services" in message
+assert "must-not-leak" not in message
+PY
 
     jq 'del(.taskDefinition.containerDefinitions[0].environmentFiles)' \
         "${fixture}/task.json" > "${mutation}"
