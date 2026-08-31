@@ -215,17 +215,36 @@ wait_stable() {
     aws_call ecs wait services-stable --region "${REGION}" --cluster "${CLUSTER}" \
         --services "${SERVICE}"
     [[ -n "${TARGET_GROUP_ARN}" ]] || die "production target group is not bound"
+    aws_call ecs describe-services --region "${REGION}" --cluster "${CLUSTER}" \
+        --services "${SERVICE}" --output json > "${TEMP_ROOT}/stable-service.json"
     aws_call elbv2 describe-target-health --region "${REGION}" \
         --target-group-arn "${TARGET_GROUP_ARN}" --output json > "${TEMP_ROOT}/targets.json"
-    python3 - "${TEMP_ROOT}/targets.json" <<'PY'
+    python3 - "${TEMP_ROOT}/stable-service.json" "${TEMP_ROOT}/targets.json" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-payload = json.loads(Path(sys.argv[1]).read_text())
-descriptions = payload.get("TargetHealthDescriptions")
-if not isinstance(descriptions, list) or len(descriptions) != 2:
-    raise SystemExit("gateway promotion error: ALB must have exactly two target descriptions")
+service_payload = json.loads(Path(sys.argv[1]).read_text())
+if not isinstance(service_payload, dict) or service_payload.get("failures") not in (None, []):
+    raise SystemExit("gateway promotion error: stable ECS service read returned failures")
+services = service_payload.get("services")
+if not isinstance(services, list) or len(services) != 1 or not isinstance(services[0], dict):
+    raise SystemExit("gateway promotion error: stable ECS service read must return one service")
+service = services[0]
+if service.get("serviceName") != "pensyve-prod-gateway" or service.get("status") != "ACTIVE":
+    raise SystemExit("gateway promotion error: stable ECS service identity/status mismatch")
+desired = service.get("desiredCount")
+running = service.get("runningCount")
+pending = service.get("pendingCount")
+if (type(desired) is not int or not 2 <= desired <= 4 or
+        type(running) is not int or running != desired or
+        type(pending) is not int or pending != 0):
+    raise SystemExit("gateway promotion error: stable ECS counts are outside the steady 2..4 envelope")
+
+target_payload = json.loads(Path(sys.argv[2]).read_text())
+descriptions = target_payload.get("TargetHealthDescriptions")
+if not isinstance(descriptions, list) or len(descriptions) != desired:
+    raise SystemExit("gateway promotion error: ALB target count must equal steady ECS desiredCount")
 identities = []
 for description in descriptions:
     target = description.get("Target", {}) if isinstance(description, dict) else {}
@@ -235,7 +254,7 @@ for description in descriptions:
             type(target.get("Port")) is not int or health.get("State") != "healthy"):
         raise SystemExit("gateway promotion error: ALB target is not healthy on gateway port 3000")
     identities.append(identity)
-if len(set(identities)) != 2:
+if len(set(identities)) != len(identities):
     raise SystemExit("gateway promotion error: ALB healthy target identities must be distinct")
 PY
 }

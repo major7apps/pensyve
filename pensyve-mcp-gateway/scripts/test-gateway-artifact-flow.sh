@@ -238,7 +238,8 @@ for forbidden in ("\ndocker ", "buildx", "ecr put-image", "ecr initiate-layer-up
             f"promoter contains forbidden Docker/ECR-write path: {forbidden}")
 for mode in ("task8-create", "task8-rollback", "task9-promote", "task9-rollback"):
     require(mode in promote, f"promoter is missing mode {mode}")
-for forbidden in ("desired-count", "latest", ":157"):
+for forbidden in ("desired-count", "force-new-deployment", "application-autoscaling",
+                  "register-scalable-target", "put-scaling-policy", "latest", ":157"):
     require(forbidden not in promote,
             f"promoter contains forbidden selector/override: {forbidden}")
 for required in ("guard-active-service.py", "register-task-definition",
@@ -317,7 +318,7 @@ candidate["containerDefinitions"][0]["image"] = (
 )
 for name, task in (("156", base), ("200", task8), ("201", candidate)):
     (root / f"task-{name}.json").write_text(json.dumps({"taskDefinition": task}))
-(root / "service.json").write_text(json.dumps({"failures": [], "services": [{
+service = {"failures": [], "services": [{
     "serviceName": "pensyve-prod-gateway", "status": "ACTIVE",
     "taskDefinition": prefix + "156", "desiredCount": 2, "runningCount": 2,
     "pendingCount": 0, "loadBalancers": [{"targetGroupArn": target_group,
@@ -325,7 +326,13 @@ for name, task in (("156", base), ("200", task8), ("201", candidate)):
     "deployments": [{"status": "PRIMARY",
         "rolloutState": "COMPLETED", "taskDefinition": prefix + "156",
         "desiredCount": 2, "runningCount": 2, "pendingCount": 0}],
-}]}))
+}]}
+(root / "service.json").write_text(json.dumps(service))
+service4 = json.loads(json.dumps(service))
+for owner in (service4["services"][0], service4["services"][0]["deployments"][0]):
+    owner["desiredCount"] = 4
+    owner["runningCount"] = 4
+(root / "service-4.json").write_text(json.dumps(service4))
 PY
     printf '%s\n' \
         '#!/usr/bin/env bash' \
@@ -371,22 +378,67 @@ expected = [
 if calls != expected:
     raise SystemExit(f"guard complete ordered AWS sequence mismatch: {calls!r}")
 PY
+    AWS_BIN="${root}/bin/aws" AWS_LOG="${root}/aws.log" \
+        SERVICE_FIXTURE="${root}/service-4.json" TASK_FIXTURE_ROOT="${root}" \
+        "${GUARD_SCRIPT}" source-156 >/dev/null
     sed 's/:156"/:157"/g; s/"revision": 156/"revision": 157/' \
         "${root}/service.json" > "${root}/service-157.json"
     expect_failure "157" env AWS_BIN="${root}/bin/aws" AWS_LOG="${root}/aws.log" \
         SERVICE_FIXTURE="${root}/service-157.json" TASK_FIXTURE_ROOT="${root}" \
         "${GUARD_SCRIPT}" source-156
-    python3 - "${root}/service.json" "${root}/service-drift.json" <<'PY'
+    python3 - "${root}" <<'PY'
 import json
 import sys
+from pathlib import Path
 
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-data["services"][0]["runningCount"] = 1
-json.dump(data, open(sys.argv[2], "w", encoding="utf-8"))
+root = Path(sys.argv[1])
+base = json.loads((root / "service-4.json").read_text())
+
+def write(name, mutate):
+    data = json.loads(json.dumps(base))
+    mutate(data["services"][0], data["services"][0]["deployments"][0])
+    (root / f"service-{name}.json").write_text(json.dumps(data))
+
+def counts(service, primary, desired, running, pending):
+    for owner in (service, primary):
+        owner["desiredCount"] = desired
+        owner["runningCount"] = running
+        owner["pendingCount"] = pending
+
+write("desired-1", lambda service, primary: counts(service, primary, 1, 1, 0))
+write("desired-5", lambda service, primary: counts(service, primary, 5, 5, 0))
+write("desired-bool", lambda service, primary: counts(service, primary, True, True, 0))
+write("desired-float", lambda service, primary: counts(service, primary, 4.0, 4.0, 0))
+write("desired-string", lambda service, primary: counts(service, primary, "4", "4", 0))
+write("running-mismatch", lambda service, primary: counts(service, primary, 4, 3, 0))
+write("pending", lambda service, primary: counts(service, primary, 4, 4, 1))
+write("deployment-count-mismatch", lambda service, primary: primary.update(runningCount=3))
+write("secondary", lambda service, primary: service["deployments"].append(
+    {**primary, "status": "ACTIVE"}))
+write("rollout-drift", lambda service, primary: primary.update(rolloutState="IN_PROGRESS"))
 PY
-    expect_failure "2/2/0" env AWS_BIN="${root}/bin/aws" AWS_LOG="${root}/aws.log" \
-        SERVICE_FIXTURE="${root}/service-drift.json" TASK_FIXTURE_ROOT="${root}" \
-        "${GUARD_SCRIPT}" source-156
+    for kind in desired-1 desired-5 desired-bool desired-float desired-string; do
+        expect_failure "desiredCount must be an exact integer in range 2..4" env \
+            AWS_BIN="${root}/bin/aws" AWS_LOG="${root}/aws.log" \
+            SERVICE_FIXTURE="${root}/service-${kind}.json" TASK_FIXTURE_ROOT="${root}" \
+            "${GUARD_SCRIPT}" source-156
+    done
+    expect_failure "runningCount must equal desiredCount" env AWS_BIN="${root}/bin/aws" \
+        AWS_LOG="${root}/aws.log" SERVICE_FIXTURE="${root}/service-running-mismatch.json" \
+        TASK_FIXTURE_ROOT="${root}" "${GUARD_SCRIPT}" source-156
+    expect_failure "pendingCount must be exactly 0" env AWS_BIN="${root}/bin/aws" \
+        AWS_LOG="${root}/aws.log" SERVICE_FIXTURE="${root}/service-pending.json" \
+        TASK_FIXTURE_ROOT="${root}" "${GUARD_SCRIPT}" source-156
+    expect_failure "PRIMARY deployment counts must equal service counts" env \
+        AWS_BIN="${root}/bin/aws" AWS_LOG="${root}/aws.log" \
+        SERVICE_FIXTURE="${root}/service-deployment-count-mismatch.json" \
+        TASK_FIXTURE_ROOT="${root}" "${GUARD_SCRIPT}" source-156
+    expect_failure "single deployment" env AWS_BIN="${root}/bin/aws" \
+        AWS_LOG="${root}/aws.log" SERVICE_FIXTURE="${root}/service-secondary.json" \
+        TASK_FIXTURE_ROOT="${root}" "${GUARD_SCRIPT}" source-156
+    expect_failure "completed PRIMARY deployment" env AWS_BIN="${root}/bin/aws" \
+        AWS_LOG="${root}/aws.log" SERVICE_FIXTURE="${root}/service-rollout-drift.json" \
+        TASK_FIXTURE_ROOT="${root}" "${GUARD_SCRIPT}" source-156
     python3 - "${root}/service.json" "${root}/service-no-target.json" <<'PY'
 import json
 import sys
@@ -704,7 +756,7 @@ PY
       'operation="$1 $2"' \
       'case "$operation" in' \
       ' "ecr describe-images") [[ $# -eq 16 && "$*" == "ecr describe-images --region us-east-2 --registry-id 196881464893 --repository-name pensyve-gateway --image-ids imageTag=63011d55f8cbf52f6f9e5609621f6b8cf0c37535 --output json --cli-connect-timeout 5 --cli-read-timeout 30" ]] || reject "$@"; digest="${SOURCE_ECR_DIGEST:-sha256:6f5f36741bc4c5d39455b2f2fd41108561ea6ea28d438f815462b9febe3e329b}"; tag=63011d55f8cbf52f6f9e5609621f6b8cf0c37535; case "${SOURCE_ECR_CARDINALITY:-one}" in missing) jq -n '\''{imageDetails:[]}'\'' ;; multiple) jq -n --arg d "$digest" --arg tag "$tag" '\''{imageDetails:[{imageDigest:$d,imageTags:[$tag]},{imageDigest:$d,imageTags:[$tag]}]}'\'' ;; one) jq -n --arg d "$digest" --arg tag "$tag" '\''{imageDetails:[{imageDigest:$d,imageTags:[$tag]}]}'\'' ;; *) reject "$@" ;; esac ;;' \
-      ' "ecs describe-services") [[ $# -eq 14 && "$*" == "ecs describe-services --region us-east-2 --cluster pensyve-prod --services pensyve-prod-gateway --cli-connect-timeout 5 --cli-read-timeout 30 --output json" ]] || reject "$@"; if [[ "${SECOND_SIGNAL_PHASE:-}" == readback && -e "${ROLLBACK_UPDATE_MARKER:-/nonexistent}" && ! -e "${SECOND_SIGNAL_MARKER:-/nonexistent}" ]]; then : > "$SECOND_SIGNAL_MARKER"; promoter_pid=$(ps -o ppid= -p "$PPID" | tr -d " "); kill -s "$SECOND_SIGNAL" "$promoter_pid"; sleep 1; fi; arn=$(<"$SERVICE_STATE"); jq -n --arg arn "$arn" --arg tg "$FIXTURE_TARGET_GROUP_ARN" '\''{failures:[],services:[{serviceName:"pensyve-prod-gateway",status:"ACTIVE",taskDefinition:$arn,desiredCount:2,runningCount:2,pendingCount:0,loadBalancers:[{targetGroupArn:$tg,containerName:"gateway",containerPort:3000}],deployments:[{status:"PRIMARY",rolloutState:"COMPLETED",taskDefinition:$arn,desiredCount:2,runningCount:2,pendingCount:0}]}]}'\'' ;;' \
+      ' "ecs describe-services") [[ $# -eq 14 && ( "$*" == "ecs describe-services --region us-east-2 --cluster pensyve-prod --services pensyve-prod-gateway --cli-connect-timeout 5 --cli-read-timeout 30 --output json" || "$*" == "ecs describe-services --region us-east-2 --cluster pensyve-prod --services pensyve-prod-gateway --output json --cli-connect-timeout 5 --cli-read-timeout 30" ) ]] || reject "$@"; if [[ "${SECOND_SIGNAL_PHASE:-}" == readback && -e "${ROLLBACK_UPDATE_MARKER:-/nonexistent}" && ! -e "${SECOND_SIGNAL_MARKER:-/nonexistent}" ]]; then : > "$SECOND_SIGNAL_MARKER"; promoter_pid=$(ps -o ppid= -p "$PPID" | tr -d " "); kill -s "$SECOND_SIGNAL" "$promoter_pid"; sleep 1; fi; arn=$(<"$SERVICE_STATE"); count="${SERVICE_COUNT:-2}"; jq -n --arg arn "$arn" --arg tg "$FIXTURE_TARGET_GROUP_ARN" --argjson count "$count" '\''{failures:[],services:[{serviceName:"pensyve-prod-gateway",status:"ACTIVE",taskDefinition:$arn,desiredCount:$count,runningCount:$count,pendingCount:0,loadBalancers:[{targetGroupArn:$tg,containerName:"gateway",containerPort:3000}],deployments:[{status:"PRIMARY",rolloutState:"COMPLETED",taskDefinition:$arn,desiredCount:$count,runningCount:$count,pendingCount:0}]}]}'\'' ;;' \
       ' "ecs describe-task-definition") arn=$(arg --task-definition "$@"); [[ $# -eq 12 && ( "$*" == "ecs describe-task-definition --region us-east-2 --task-definition $arn --cli-connect-timeout 5 --cli-read-timeout 30 --output json" || "$*" == "ecs describe-task-definition --region us-east-2 --task-definition $arn --output json --cli-connect-timeout 5 --cli-read-timeout 30" ) ]] || reject "$@"; cat "$TASK_FIXTURE_ROOT/task-${arn##*:}.json" ;;' \
       ' "ecs register-task-definition") input=$(arg --cli-input-json "$@"); [[ $# -eq 12 && "$*" == "ecs register-task-definition --region us-east-2 --cli-input-json $input --output json --cli-connect-timeout 5 --cli-read-timeout 30" ]] || reject "$@"; input=${input#file://}; rev=${REGISTER_REVISION:?}; arn="arn:aws:ecs:us-east-2:196881464893:task-definition/pensyve-prod-gateway:$rev"; jq --arg arn "$arn" --argjson rev "$rev" '\''. + {taskDefinitionArn:$arn,revision:$rev} | {taskDefinition:.}'\'' "$input" > "$TASK_FIXTURE_ROOT/task-$rev.json"; cat "$TASK_FIXTURE_ROOT/task-$rev.json" ;;' \
       ' "ecs update-service") arn=$(arg --task-definition "$@"); [[ $# -eq 16 && "$*" == "ecs update-service --region us-east-2 --cluster pensyve-prod --service pensyve-prod-gateway --task-definition $arn --output json --cli-connect-timeout 5 --cli-read-timeout 30" ]] || reject "$@"; if [[ -e "${WAIT_MARKER:-/nonexistent}" && -n "${ROLLBACK_UPDATE_MARKER:-}" ]]; then : > "$ROLLBACK_UPDATE_MARKER"; fi; printf '\''%s\n'\'' "$arn" > "$SERVICE_STATE"; jq -n --arg arn "$arn" '\''{service:{taskDefinition:$arn}}'\'' ;;' \
@@ -712,6 +764,35 @@ PY
       ' "elbv2 describe-target-health") [[ $# -eq 12 && "$*" == "elbv2 describe-target-health --region us-east-2 --target-group-arn $FIXTURE_TARGET_GROUP_ARN --output json --cli-connect-timeout 5 --cli-read-timeout 30" ]] || reject "$@"; if [[ -n "${TARGET_HEALTH_FIXTURE:-}" ]]; then cat "$TARGET_HEALTH_FIXTURE"; else jq -n --arg state "${TARGET_HEALTH_STATE:-healthy}" '\''{TargetHealthDescriptions:[{Target:{Id:"10.0.1.10",Port:3000},TargetHealth:{State:$state}},{Target:{Id:"10.0.2.10",Port:3000},TargetHealth:{State:$state}}]}'\''; fi ;;' \
       ' *) reject "$@" ;; esac' > "${root}/bin/aws"
     chmod +x "${root}/bin/aws"
+}
+
+make_target_health_fixtures() {
+    python3 - "$1" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+
+def target(identity, port=3000, state="healthy"):
+    return {"Target": {"Id": identity, "Port": port}, "TargetHealth": {"State": state}}
+
+healthy = [target(f"10.0.{index}.10") for index in range(1, 6)]
+fixtures = {
+    "targets-1": healthy[:1],
+    "targets-2": healthy[:2],
+    "targets-4": healthy[:4],
+    "targets-5": healthy,
+    "targets-unhealthy": [*healthy[:3], target("10.0.4.10", state="unhealthy")],
+    "targets-wrong-port": [*healthy[:3], target("10.0.4.10", port=3001)],
+    "targets-duplicate": [*healthy[:3], target("10.0.3.10")],
+    "targets-missing": [*healthy[:3], {"Target": {"Port": 3000},
+                                       "TargetHealth": {"State": "healthy"}}],
+    "targets-malformed": [*healthy[:3], target("10.0.4.10", port="3000")],
+}
+for name, descriptions in fixtures.items():
+    (root / f"{name}.json").write_text(json.dumps({"TargetHealthDescriptions": descriptions}))
+PY
 }
 
 assert_promoter_argv() {
@@ -766,6 +847,10 @@ expected_wait = ["ecs", "wait", "services-stable", "--region", "us-east-2", "--c
 expected_target_health = ["elbv2", "describe-target-health", "--region", "us-east-2",
                           "--target-group-arn", target_group, "--output", "json",
                           "--cli-connect-timeout", "5", "--cli-read-timeout", "30"]
+stable_service_read = ["ecs", "describe-services", "--region", "us-east-2", "--cluster",
+                       "pensyve-prod", "--services", "pensyve-prod-gateway", "--output", "json",
+                       "--cli-connect-timeout", "5", "--cli-read-timeout", "30"]
+stable_health = [expected_wait, stable_service_read, expected_target_health]
 source_ecr = [
     "ecr", "describe-images", "--region", "us-east-2", "--registry-id", "196881464893",
     "--repository-name", "pensyve-gateway", "--image-ids",
@@ -776,33 +861,33 @@ source_ecr = [
 register = registers[0] if registers else None
 if expected_registers == 0 and target_arns[0].endswith(":200"):
     expected = [service_read(), guard_task(201), guard_task(156), guard_task(200),
-                source_ecr, expected_updates[0], expected_wait, expected_target_health,
+                source_ecr, expected_updates[0], *stable_health,
                 service_read(), guard_task(200), guard_task(156)]
 elif expected_registers == 0 and target_arns[0].endswith(":156"):
     expected = [service_read(), guard_task(200), guard_task(156), source_ecr,
-                expected_updates[0], expected_wait, expected_target_health,
+                expected_updates[0], *stable_health,
                 service_read(), guard_task(156)]
 elif len(target_arns) == 1 and target_arns[0].endswith(":200"):
     expected = [service_read(), guard_task(156), direct_task(156), source_ecr, register,
                 direct_task(200), service_read(), guard_task(156), source_ecr,
-                expected_updates[0], expected_wait, expected_target_health, service_read(),
+                expected_updates[0], *stable_health, service_read(),
                 guard_task(200), guard_task(156)]
 elif len(target_arns) == 1 and target_arns[0].endswith(":201"):
     expected = [service_read(), guard_task(200), guard_task(156), direct_task(200), source_ecr,
                 register, direct_task(201), service_read(), guard_task(200), guard_task(156),
-                source_ecr, expected_updates[0], expected_wait, expected_target_health,
+                source_ecr, expected_updates[0], *stable_health,
                 service_read(), guard_task(201), guard_task(156), guard_task(200)]
 elif len(target_arns) == 2 and expected_health == 1:
     expected = [service_read(), guard_task(156), direct_task(156), source_ecr, register,
                 direct_task(200), service_read(), guard_task(156), source_ecr,
                 expected_updates[0], expected_wait, source_ecr, expected_updates[1],
-                expected_wait, expected_target_health,
+                *stable_health,
                 service_read(), guard_task(156)]
 elif len(target_arns) == 2 and expected_health == 2:
     expected = [service_read(), guard_task(156), direct_task(156), source_ecr, register,
                 direct_task(200), service_read(), guard_task(156), source_ecr,
-                expected_updates[0], expected_wait, expected_target_health, source_ecr,
-                expected_updates[1], expected_wait, expected_target_health]
+                expected_updates[0], *stable_health, source_ecr,
+                expected_updates[1], *stable_health]
 else:
     raise SystemExit("promoter exact-argv test scenario is undefined")
 
@@ -869,10 +954,31 @@ PY
 }
 
 run_promoter() {
-    local root="${TEST_ROOT}/promoter-success"
+    local root service_count target_count
     local source_arn="arn:aws:ecs:us-east-2:196881464893:task-definition/pensyve-prod-gateway:156"
     local baseline_arn="arn:aws:ecs:us-east-2:196881464893:task-definition/pensyve-prod-gateway:200"
     local target_group="arn:aws:elasticloadbalancing:us-east-2:196881464893:targetgroup/pensyve-prod-gw-tg/0123456789abcdef"
+
+    for service_count in 4 2; do
+        if [[ "${service_count}" == 4 ]]; then target_count=2; else target_count=4; fi
+        root="${TEST_ROOT}/promoter-cardinality-${service_count}-${target_count}"
+        make_promoter_fixture "${root}"
+        make_target_health_fixtures "${root}"
+        printf '%s\n' "${source_arn}" > "${root}/state"
+        : > "${root}/aws.log"
+        expect_failure "ALB target count must equal steady ECS desiredCount" env \
+          AWS_BIN="${root}/bin/aws" AWS_LOG="${root}/aws.log" SERVICE_STATE="${root}/state" \
+          TASK_FIXTURE_ROOT="${root}" REGISTER_REVISION=200 WAIT_MARKER="${root}/wait.marker" \
+          SERVICE_COUNT="${service_count}" \
+          TARGET_HEALTH_FIXTURE="${root}/targets-${target_count}.json" \
+          FIXTURE_TARGET_GROUP_ARN="${target_group}" \
+          "${PROMOTE_SCRIPT}" task8-create --custody "${root}/custody.json"
+        [[ "$(grep -c '^ecs update-service ' "${root}/aws.log")" -eq 2 ]] ||
+            fail "service ${service_count} with ${target_count} targets changed exact rollback count"
+        assert_promoter_argv "${root}" 1 "${baseline_arn},${source_arn}" 2
+    done
+
+    root="${TEST_ROOT}/promoter-success"
     make_promoter_fixture "${root}"
     printf '%s\n' "${source_arn}" > "${root}/state"
     : > "${root}/aws.log"
@@ -890,7 +996,49 @@ run_promoter() {
       "${root}/task-200.json" >/dev/null ||
         fail "Task 8 registration did not preserve the exact live source image tag"
     assert_promoter_argv "${root}" 1 "${baseline_arn}" 1
-    ! grep -F -- '--desired-count' "${root}/aws.log" >/dev/null
+    ! grep -E -- '--desired-count|--force-new-deployment|application-autoscaling|register-scalable-target|put-scaling-policy' \
+      "${root}/aws.log" >/dev/null
+
+    root="${TEST_ROOT}/promoter-success-4"
+    make_promoter_fixture "${root}"
+    make_target_health_fixtures "${root}"
+    printf '%s\n' "${source_arn}" > "${root}/state"
+    : > "${root}/aws.log"
+    env AWS_BIN="${root}/bin/aws" AWS_LOG="${root}/aws.log" SERVICE_STATE="${root}/state" \
+      TASK_FIXTURE_ROOT="${root}" REGISTER_REVISION=200 WAIT_MARKER="${root}/wait.marker" \
+      SERVICE_COUNT=4 TARGET_HEALTH_FIXTURE="${root}/targets-4.json" \
+      FIXTURE_TARGET_GROUP_ARN="${target_group}" \
+      "${PROMOTE_SCRIPT}" task8-create --custody "${root}/custody.json" > "${root}/result.log"
+    grep -Fx "PENSYVE_TASK8_BASELINE_ARN=${baseline_arn}" "${root}/result.log" >/dev/null
+    [[ "$(grep -c '^ecs register-task-definition ' "${root}/aws.log")" -eq 1 ]]
+    [[ "$(grep -c '^ecs update-service ' "${root}/aws.log")" -eq 1 ]]
+    [[ "$(grep -c '^elbv2 describe-target-health ' "${root}/aws.log")" -eq 1 ]] ||
+        fail "four-task promotion must verify four healthy ALB targets once"
+    assert_promoter_argv "${root}" 1 "${baseline_arn}" 1
+    ! grep -E -- '--desired-count|--force-new-deployment|application-autoscaling|register-scalable-target|put-scaling-policy' \
+      "${root}/aws.log" >/dev/null
+
+    for kind in 1 5 unhealthy wrong-port duplicate missing malformed; do
+        root="${TEST_ROOT}/promoter-target-${kind}"
+        make_promoter_fixture "${root}"
+        make_target_health_fixtures "${root}"
+        printf '%s\n' "${source_arn}" > "${root}/state"
+        : > "${root}/aws.log"
+        case "${kind}" in
+            1 | 5) expected="ALB target count must equal steady ECS desiredCount" ;;
+            duplicate) expected="ALB healthy target identities must be distinct" ;;
+            *) expected="ALB target is not healthy on gateway port 3000" ;;
+        esac
+        expect_failure "${expected}" env AWS_BIN="${root}/bin/aws" AWS_LOG="${root}/aws.log" \
+          SERVICE_STATE="${root}/state" TASK_FIXTURE_ROOT="${root}" REGISTER_REVISION=200 \
+          WAIT_MARKER="${root}/wait.marker" SERVICE_COUNT=4 \
+          TARGET_HEALTH_FIXTURE="${root}/targets-${kind}.json" \
+          FIXTURE_TARGET_GROUP_ARN="${target_group}" \
+          "${PROMOTE_SCRIPT}" task8-create --custody "${root}/custody.json"
+        [[ "$(grep -c '^ecs update-service ' "${root}/aws.log")" -eq 2 ]] ||
+            fail "invalid ${kind} target fixture changed exact candidate/rollback update count"
+        assert_promoter_argv "${root}" 1 "${baseline_arn},${source_arn}" 2
+    done
 
     for ecr_case in wrong-digest missing multiple; do
         root="${TEST_ROOT}/promoter-source-ecr-${ecr_case}"
