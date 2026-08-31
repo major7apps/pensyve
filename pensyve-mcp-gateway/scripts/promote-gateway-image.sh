@@ -813,10 +813,10 @@ finalize_custody() {
           ([.taskDefinition.containerDefinitions[] | select(.name == $container)][0].image == $image)
         ' "${live_task_response}" >/dev/null || die "promotion-custody refuses unrelated live deployment"
         jq --arg container "${gateway_container}" --arg baseline "${baseline_image}" '
-          .taskDefinition | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy,.enableFaultInjection) |
+          .taskDefinition | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy) |
           .containerDefinitions |= map(if .name == $container then .image=$baseline else . end)
         ' "${live_task_response}" | jq -S . > "${TEMP_ROOT}/finalizer-live-reverted.json"
-        jq '.taskDefinition | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy,.enableFaultInjection)' \
+        jq '.taskDefinition | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
           "${baseline_task_response}" | jq -S . > "${TEMP_ROOT}/finalizer-baseline-canonical.json"
         cmp --silent "${TEMP_ROOT}/finalizer-live-reverted.json" "${TEMP_ROOT}/finalizer-baseline-canonical.json" \
           || die "promotion-custody candidate differs from Task 8 by more than gateway.image"
@@ -972,7 +972,7 @@ cmp --silent "${manifest_file}" "${TEMP_ROOT}/ecr-manifest.raw" || die "ECR mani
     || die "ECR manifest hash mismatch"
 
 digest_uri="${registry}/${repository}@${ecr_digest}"
-jq 'del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy,.enableFaultInjection)' \
+jq 'del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
     "${TEMP_ROOT}/task-before.json" > "${TEMP_ROOT}/register-before.json"
 jq --arg container "${gateway_container}" --arg image "${digest_uri}" '
     .containerDefinitions |= map(if .name == $container then .image = $image else . end)
@@ -990,7 +990,7 @@ new_arn="$(jq -r '.taskDefinition.taskDefinitionArn' "${TEMP_ROOT}/register-resp
 [[ -n "${new_arn}" && "${new_arn}" != "null" && "${new_arn}" != *":157" ]] || die "registered task definition ARN is invalid or rejected :157"
 aws_call ecs describe-task-definition --region "${region}" --task-definition "${new_arn}" \
     > "${TEMP_ROOT}/task-after-response.json"
-jq '.taskDefinition | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy,.enableFaultInjection)' \
+jq '.taskDefinition | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
     "${TEMP_ROOT}/task-after-response.json" | jq -S . > "${TEMP_ROOT}/task-after.canonical.json"
 jq -S . "${TEMP_ROOT}/register.json" > "${TEMP_ROOT}/register.canonical.json"
 cmp --silent "${TEMP_ROOT}/task-after.canonical.json" "${TEMP_ROOT}/register.canonical.json" \

@@ -7,9 +7,11 @@ readonly REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 readonly ARTIFACT_SCRIPT="${SCRIPT_DIR}/gateway-image-artifact.sh"
 readonly RELEASE_SCRIPT="${SCRIPT_DIR}/test-gateway-release-image.sh"
 readonly PROMOTE_SCRIPT="${SCRIPT_DIR}/promote-gateway-image.sh"
+readonly ACTIVE_BASE_GUARD="${SCRIPT_DIR}/guard-active-service.py"
 readonly FETCH_SCRIPT="${SCRIPT_DIR}/fetch-model-bundle.sh"
 readonly MODEL_TEST="${SCRIPT_DIR}/test-model-bundle.sh"
 readonly WORKFLOW="${REPO_ROOT}/.github/workflows/deploy-gateway.yml"
+readonly RELEASE_WORKFLOW="${REPO_ROOT}/.github/workflows/release.yml"
 readonly CI_WORKFLOW="${REPO_ROOT}/.github/workflows/ci.yml"
 readonly DOCKERFILE="${REPO_ROOT}/pensyve-mcp-gateway/Dockerfile"
 readonly CASE="${1:-all}"
@@ -55,16 +57,54 @@ capture_failure() {
 
 require_scripts() {
     local path
-    for path in "${ARTIFACT_SCRIPT}" "${RELEASE_SCRIPT}" "${PROMOTE_SCRIPT}" "${FETCH_SCRIPT}" "${MODEL_TEST}"; do
+    for path in "${ARTIFACT_SCRIPT}" "${RELEASE_SCRIPT}" "${PROMOTE_SCRIPT}" "${ACTIVE_BASE_GUARD}" "${FETCH_SCRIPT}" "${MODEL_TEST}"; do
         [[ -x "${path}" ]] || fail "required executable script is absent: ${path}"
     done
+}
+
+make_active_base_fixture() {
+    local root="$1"
+    local arn="arn:aws:ecs:us-east-2:123456789012:task-definition/pensyve-prod-gateway:200"
+    mkdir -p "${root}/bin"
+    jq -n --arg arn "${arn}" '
+      {failures:[],services:[{
+        serviceName:"pensyve-prod-gateway",taskDefinition:$arn,
+        desiredCount:2,runningCount:2,pendingCount:0,healthCheckGracePeriodSeconds:300,
+        deployments:[{status:"PRIMARY",rolloutState:"COMPLETED",taskDefinition:$arn}]
+      }]}' > "${root}/service.json"
+    jq -n --arg arn "${arn}" '
+      {taskDefinition:{taskDefinitionArn:$arn,family:"pensyve-prod-gateway",revision:200,
+        enableFaultInjection:true,
+        cpu:"512",memory:"4096",runtimePlatform:{cpuArchitecture:"ARM64",operatingSystemFamily:"LINUX"},
+        containerDefinitions:[{name:"gateway",
+          image:("123456789012.dkr.ecr.us-east-2.amazonaws.com/pensyve-gateway@sha256:"+("a"*64)),
+          environment:[
+            {name:"DATABASE_URL",value:"postgres://example.invalid/pensyve"},
+            {name:"PENSYVE_REQUIRE_LOCAL_MODELS",value:"1"},
+            {name:"HF_HOME",value:"/opt/pensyve/models"},
+            {name:"FASTEMBED_CACHE_DIR",value:"/opt/pensyve/models"},
+            {name:"PENSYVE_EMBEDDING_POOL_SIZE",value:"1"}
+          ],
+          secrets:[{name:"DATABASE_PASSWORD",valueFrom:"arn:aws:ssm:us-east-2:123456789012:parameter/database-password"}],
+          environmentFiles:[]}]}}' > "${root}/task.json"
+    printf '%s\n' \
+      '#!/usr/bin/env bash' \
+      'set -euo pipefail' \
+      'printf '\''%s\n'\'' "$*" >> "${AWS_FIXTURE_ROOT}/aws.log"' \
+      '[[ "$1" == ecs ]]' \
+      'case "$2" in' \
+      '  describe-services) cat "${AWS_SERVICE_FIXTURE:-${AWS_FIXTURE_ROOT}/service.json}" ;;' \
+      '  describe-task-definition) cat "${AWS_TASK_FIXTURE:-${AWS_FIXTURE_ROOT}/task.json}" ;;' \
+      '  *) echo "forbidden AWS call: $*" >&2; exit 90 ;;' \
+      'esac' > "${root}/bin/aws"
+    chmod +x "${root}/bin/aws"
 }
 
 validate_workflow() {
     local release_path="${2:-${RELEASE_SCRIPT}}"
     local artifact_path="${3:-${ARTIFACT_SCRIPT}}"
     local promote_path="${4:-${PROMOTE_SCRIPT}}"
-    python3 - "$1" "$CI_WORKFLOW" "$DOCKERFILE" "$artifact_path" "$release_path" "$promote_path" <<'PY'
+    python3 - "$1" "$CI_WORKFLOW" "$DOCKERFILE" "$artifact_path" "$release_path" "$promote_path" "$RELEASE_WORKFLOW" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -77,8 +117,10 @@ dockerfile_path = Path(sys.argv[3])
 artifact_script_path = Path(sys.argv[4])
 release_script_path = Path(sys.argv[5])
 promote_script_path = Path(sys.argv[6])
+release_workflow_path = Path(sys.argv[7])
 workflow = yaml.load(workflow_path.read_text(), Loader=yaml.BaseLoader)
 ci = yaml.load(ci_path.read_text(), Loader=yaml.BaseLoader)
+release_workflow = yaml.load(release_workflow_path.read_text(), Loader=yaml.BaseLoader)
 errors = []
 
 def mapping(value):
@@ -508,6 +550,7 @@ for token in ("workspace", "cargo", "model_scratch", "docker", "tmp", "docker in
 push_test = mapping(jobs.get("push-main-test"))
 push_deploy = mapping(jobs.get("push-main-deploy"))
 push_text = job_text(push_deploy)
+push_steps = [mapping(step) for step in push_deploy.get("steps", [])]
 if "github.event_name == 'push'" not in str(push_test.get("if", "")):
     errors.append("push-main test path is not event-isolated")
 if "github.event_name == 'push'" not in str(push_deploy.get("if", "")):
@@ -516,6 +559,78 @@ if "concurrency" in push_deploy or "github.event_name == 'push'" not in concurre
     errors.append("push-main deploy must share only the workflow-level production gateway lease")
 if ":latest" in push_text or "MCP_ALLOWED_HOSTS" in push_text:
     errors.append("push-main must not use latest or repair environment")
+if "--desired-count" in push_text:
+    errors.append("push-main image-only update must not override desired count")
+
+active_guard_step = named_step(push_deploy, "Guard exact active base before image build")
+build_step = named_step(push_deploy, "Build and push exact merge SHA image once")
+update_step = named_step(push_deploy, "Canonical image-only service update")
+ecr_steps = [step for step in push_steps
+             if str(step.get("uses", "")).startswith("aws-actions/amazon-ecr-login@")]
+if active_guard_step and build_step and len(ecr_steps) == 1:
+    if not (push_steps.index(active_guard_step) < push_steps.index(ecr_steps[0]) < push_steps.index(build_step)):
+        errors.append("push-main active-base guard must run before ECR login and image build")
+guard_text = str(active_guard_step.get("run", ""))
+for token in (
+    "guard-active-service.py", "active_task_arn=", "ACTIVE_TASK_ARN=${active_task_arn}",
+    '>> "$GITHUB_ENV"',
+):
+    if token not in guard_text:
+        errors.append(f"push-main initial active-base binding is missing: {token}")
+
+update_text = str(update_step.get("run", ""))
+if update_text.count("guard-active-service.py") != 2:
+    errors.append("push-main must re-run the active-base guard before registration and service update")
+guard_index = update_text.find('guard-active-service.py --expected-task-arn "$ACTIVE_TASK_ARN"')
+register_index = update_text.find("aws ecs register-task-definition")
+if guard_index < 0 or register_index < 0 or guard_index > register_index:
+    errors.append("push-main must fail closed on exact active-ARN drift immediately before registration")
+elif update_text[guard_index:register_index].count("\n") > 1:
+    errors.append("push-main active-ARN drift guard must be immediately before registration")
+preupdate_guard_index = update_text.rfind(
+    'guard-active-service.py --expected-task-arn "$ACTIVE_TASK_ARN"'
+)
+update_index = update_text.find("aws ecs update-service")
+if preupdate_guard_index <= guard_index or update_index < 0 or preupdate_guard_index > update_index:
+    errors.append("push-main must fail closed on exact active-ARN drift immediately before service update")
+elif update_text[preupdate_guard_index:update_index].count("\n") > 1:
+    errors.append("push-main active-ARN drift guard must be immediately before service update")
+if ('--task-definition "$ACTIVE_TASK_ARN"' not in update_text or
+        "aws ecs describe-services" in update_text):
+    errors.append("push-main image-only clone must use the earlier exact active ARN")
+for token in (
+    '"$new_arn" != *:157',
+    '--task-definition "$new_arn"',
+    'jq -S',
+    'cmp -s',
+):
+    if token not in update_text:
+        errors.append(f"push-main registered-task canonical gate is missing: {token}")
+describe_back_index = update_text.find('--task-definition "$new_arn"')
+compare_index = update_text.find("cmp -s")
+if min(register_index, describe_back_index, compare_index, update_index) < 0 or not (
+        register_index < describe_back_index < compare_index < update_index):
+    errors.append("push-main must describe back and require canonical equality before service update")
+if ".enableFaultInjection" in update_text:
+    errors.append("push-main canonical clone must preserve registrable enableFaultInjection")
+if "diff -u" in update_text:
+    errors.append("push-main canonical mismatch must not print task-definition content")
+if 'echo "registered task definition canonical mismatch" >&2' not in update_text:
+    errors.append("push-main canonical mismatch must emit only a generic error")
+
+release_job = mapping(mapping(release_workflow.get("jobs")).get("github-release"))
+release_title_step = named_step(release_job, "Bind release display title")
+release_action = named_step(release_job, "Create release")
+release_title_text = str(release_title_step.get("run", ""))
+if ('RELEASE_DISPLAY_NAME=${GITHUB_REF_NAME#v}' not in release_title_text or
+        '>> "$GITHUB_ENV"' not in release_title_text):
+    errors.append("release display title must strip exactly one leading v through GITHUB_ENV")
+if mapping(release_action.get("with")).get("name") != "${{ env.RELEASE_DISPLAY_NAME }}":
+    errors.append("action-gh-release must receive the stripped display title")
+release_text = job_text(release_job)
+if ('VERSION="${GITHUB_REF_NAME}"' not in release_text or
+        'git tag "pensyve-go/${VERSION}"' not in release_text):
+    errors.append("Go module tag must retain the original v-prefixed release tag")
 
 ci_on = mapping(ci.get("on"))
 if "workflow_dispatch" in ci_on:
@@ -540,6 +655,8 @@ if "libp11-kit0" not in docker_text or "0.25.3-4ubuntu2.2" not in docker_text:
 artifact_text = artifact_script_path.read_text()
 release_text = release_script_path.read_text()
 promotion_text = promote_script_path.read_text()
+if ".enableFaultInjection" in promotion_text:
+    errors.append("promotion canonical clone must preserve registrable enableFaultInjection")
 if artifact_text.count("docker buildx build") != 1 or artifact_text.count("docker save") != 1:
     errors.append("artifact script must own exactly one build and one export command")
 if 'blobs/sha256/${image_id#sha256:}' not in artifact_text:
@@ -631,9 +748,144 @@ copy_mutation() {
     printf '%s\n' "${destination}"
 }
 
+run_active_base_guard() {
+    local fixture="${TEST_ROOT}/active-base"
+    local arn="arn:aws:ecs:us-east-2:123456789012:task-definition/pensyve-prod-gateway:200"
+    local mutation="${fixture}/mutation.json"
+    make_active_base_fixture "${fixture}"
+
+    local actual
+    actual="$(env AWS_BIN="${fixture}/bin/aws" AWS_FIXTURE_ROOT="${fixture}" \
+        "${ACTIVE_BASE_GUARD}")"
+    [[ "${actual}" == "${arn}" ]] || fail "active-base guard did not emit the exact active ARN"
+    [[ "$(wc -l < "${fixture}/aws.log")" == 2 ]] \
+        || fail "active-base guard did not make exactly two read-only AWS calls"
+    grep -Fx 'ecs describe-services --region us-east-2 --cluster pensyve-prod --services pensyve-prod-gateway --output json' \
+        "${fixture}/aws.log" >/dev/null || fail "active-base guard service read is not exact"
+    grep -Fx "ecs describe-task-definition --region us-east-2 --task-definition ${arn} --output json" \
+        "${fixture}/aws.log" >/dev/null || fail "active-base guard task read is not exact"
+
+    jq 'del(.taskDefinition.containerDefinitions[0].environmentFiles)' \
+        "${fixture}/task.json" > "${mutation}"
+    actual="$(env AWS_BIN="${fixture}/bin/aws" AWS_FIXTURE_ROOT="${fixture}" \
+        AWS_TASK_FIXTURE="${mutation}" "${ACTIVE_BASE_GUARD}")"
+    [[ "${actual}" == "${arn}" ]] \
+        || fail "active-base guard rejected absent environmentFiles with legitimate secrets"
+
+    jq '.services[0].desiredCount=3' "${fixture}/service.json" > "${mutation}"
+    expect_failure "desired/running/pending must be exactly 2/2/0" env \
+        AWS_BIN="${fixture}/bin/aws" AWS_FIXTURE_ROOT="${fixture}" AWS_SERVICE_FIXTURE="${mutation}" \
+        "${ACTIVE_BASE_GUARD}"
+    jq '.services[0].deployments += [.services[0].deployments[0]]' \
+        "${fixture}/service.json" > "${mutation}"
+    expect_failure "exactly one completed PRIMARY deployment" env \
+        AWS_BIN="${fixture}/bin/aws" AWS_FIXTURE_ROOT="${fixture}" AWS_SERVICE_FIXTURE="${mutation}" \
+        "${ACTIVE_BASE_GUARD}"
+    jq '.services[0].healthCheckGracePeriodSeconds=0' "${fixture}/service.json" > "${mutation}"
+    expect_failure "health grace must be exactly 300" env \
+        AWS_BIN="${fixture}/bin/aws" AWS_FIXTURE_ROOT="${fixture}" AWS_SERVICE_FIXTURE="${mutation}" \
+        "${ACTIVE_BASE_GUARD}"
+    jq '.services[0].taskDefinition="arn:aws:ecs:us-east-2:123456789012:task-definition/pensyve-prod-gateway:157" |
+        .services[0].deployments[0].taskDefinition=.services[0].taskDefinition' \
+        "${fixture}/service.json" > "${mutation}"
+    expect_failure "rejected task definition :157" env \
+        AWS_BIN="${fixture}/bin/aws" AWS_FIXTURE_ROOT="${fixture}" AWS_SERVICE_FIXTURE="${mutation}" \
+        "${ACTIVE_BASE_GUARD}"
+
+    jq '.taskDefinition.cpu="1024"' "${fixture}/task.json" > "${mutation}"
+    expect_failure "task cpu/memory must be exactly 512/4096" env \
+        AWS_BIN="${fixture}/bin/aws" AWS_FIXTURE_ROOT="${fixture}" AWS_TASK_FIXTURE="${mutation}" \
+        "${ACTIVE_BASE_GUARD}"
+    jq '.taskDefinition.runtimePlatform.cpuArchitecture="X86_64"' "${fixture}/task.json" > "${mutation}"
+    expect_failure "runtime CPU architecture must be ARM64" env \
+        AWS_BIN="${fixture}/bin/aws" AWS_FIXTURE_ROOT="${fixture}" AWS_TASK_FIXTURE="${mutation}" \
+        "${ACTIVE_BASE_GUARD}"
+    jq '.taskDefinition.containerDefinitions[0].image="example.invalid/pensyve-gateway:latest"' \
+        "${fixture}/task.json" > "${mutation}"
+    expect_failure "gateway image must be an immutable sha256 digest" env \
+        AWS_BIN="${fixture}/bin/aws" AWS_FIXTURE_ROOT="${fixture}" AWS_TASK_FIXTURE="${mutation}" \
+        "${ACTIVE_BASE_GUARD}"
+    jq '.taskDefinition.containerDefinitions[0].environment |= map(
+          if .name == "HF_HOME" then .value="/tmp/models" else . end)' \
+        "${fixture}/task.json" > "${mutation}"
+    expect_failure "gateway environment mismatch for HF_HOME" env \
+        AWS_BIN="${fixture}/bin/aws" AWS_FIXTURE_ROOT="${fixture}" AWS_TASK_FIXTURE="${mutation}" \
+        "${ACTIVE_BASE_GUARD}"
+    jq '.taskDefinition.containerDefinitions[0].environment +=
+          [{name:"PENSYVE_REQUIRE_LOCAL_MODELS",value:"1"}]' \
+        "${fixture}/task.json" > "${mutation}"
+    expect_failure "duplicate authoritative environment key: PENSYVE_REQUIRE_LOCAL_MODELS" env \
+        AWS_BIN="${fixture}/bin/aws" AWS_FIXTURE_ROOT="${fixture}" AWS_TASK_FIXTURE="${mutation}" \
+        "${ACTIVE_BASE_GUARD}"
+    jq '.taskDefinition.containerDefinitions[0].environment +=
+          [{name:"PENSYVE_ALLOW_MOCK_EMBEDDER",value:"1"}]' \
+        "${fixture}/task.json" > "${mutation}"
+    expect_failure "forbidden gateway environment key: PENSYVE_ALLOW_MOCK_EMBEDDER" env \
+        AWS_BIN="${fixture}/bin/aws" AWS_FIXTURE_ROOT="${fixture}" AWS_TASK_FIXTURE="${mutation}" \
+        "${ACTIVE_BASE_GUARD}"
+    jq '.taskDefinition.containerDefinitions[0].environment +=
+          [{name:"PENSYVE_RERANKER",value:"0"}]' \
+        "${fixture}/task.json" > "${mutation}"
+    expect_failure "forbidden gateway environment key: PENSYVE_RERANKER" env \
+        AWS_BIN="${fixture}/bin/aws" AWS_FIXTURE_ROOT="${fixture}" AWS_TASK_FIXTURE="${mutation}" \
+        "${ACTIVE_BASE_GUARD}"
+    jq '.taskDefinition.containerDefinitions[0].secrets +=
+          [{name:"PENSYVE_REQUIRE_LOCAL_MODELS",valueFrom:"arn:aws:ssm:us-east-2:123456789012:parameter/strict"}]' \
+        "${fixture}/task.json" > "${mutation}"
+    expect_failure "authoritative gateway key must not be supplied via secrets: PENSYVE_REQUIRE_LOCAL_MODELS" env \
+        AWS_BIN="${fixture}/bin/aws" AWS_FIXTURE_ROOT="${fixture}" AWS_TASK_FIXTURE="${mutation}" \
+        "${ACTIVE_BASE_GUARD}"
+    jq '.taskDefinition.containerDefinitions[0].secrets +=
+          [{name:"PENSYVE_ALLOW_MOCK_EMBEDDER",valueFrom:"arn:aws:ssm:us-east-2:123456789012:parameter/mock"}]' \
+        "${fixture}/task.json" > "${mutation}"
+    expect_failure "authoritative gateway key must not be supplied via secrets: PENSYVE_ALLOW_MOCK_EMBEDDER" env \
+        AWS_BIN="${fixture}/bin/aws" AWS_FIXTURE_ROOT="${fixture}" AWS_TASK_FIXTURE="${mutation}" \
+        "${ACTIVE_BASE_GUARD}"
+    jq '.taskDefinition.containerDefinitions[0].environmentFiles =
+          [{type:"s3",value:"arn:aws:s3:::pensyve-prod/gateway.env"}]' \
+        "${fixture}/task.json" > "${mutation}"
+    expect_failure "gateway environmentFiles must be absent or empty" env \
+        AWS_BIN="${fixture}/bin/aws" AWS_FIXTURE_ROOT="${fixture}" AWS_TASK_FIXTURE="${mutation}" \
+        "${ACTIVE_BASE_GUARD}"
+
+    : > "${fixture}/aws.log"
+    expect_failure "active task definition drifted from expected ARN" env \
+        AWS_BIN="${fixture}/bin/aws" AWS_FIXTURE_ROOT="${fixture}" \
+        "${ACTIVE_BASE_GUARD}" --expected-task-arn \
+        "arn:aws:ecs:us-east-2:123456789012:task-definition/pensyve-prod-gateway:199"
+    [[ "$(wc -l < "${fixture}/aws.log")" == 1 ]] \
+        || fail "expected-ARN drift did not fail closed before task-definition selection"
+    echo "read-only strict active-base guard contract passed"
+}
+
+run_release_display_title() {
+    local script="${TEST_ROOT}/release-display-title.sh"
+    local github_env="${TEST_ROOT}/release-github.env"
+    python3 - "${RELEASE_WORKFLOW}" "${script}" <<'PY'
+from pathlib import Path
+import sys
+import yaml
+
+workflow_path, output_path = map(Path, sys.argv[1:])
+workflow = yaml.load(workflow_path.read_text(), Loader=yaml.BaseLoader)
+matches = [step for step in workflow["jobs"]["github-release"]["steps"]
+           if step.get("name") == "Bind release display title"]
+if len(matches) != 1:
+    raise SystemExit("release display-title step is absent or ambiguous")
+output_path.write_text(matches[0]["run"] + "\n")
+PY
+    : > "${github_env}"
+    env GITHUB_REF_NAME=v3.2.1 GITHUB_ENV="${github_env}" bash "${script}"
+    [[ "$(cat "${github_env}")" == "RELEASE_DISPLAY_NAME=3.2.1" ]] \
+        || fail "v3.2.1 did not produce the exact 3.2.1 GitHub release display title"
+    echo "release display-title behavior contract passed"
+}
+
 run_structural() {
     validate_workflow "${WORKFLOW}"
     require_scripts
+    run_active_base_guard
+    run_release_display_title
 
     local mutation
     local artifact_aws_mutation="${TEST_ROOT}/artifact-aws-mode.sh"
@@ -692,6 +944,83 @@ if s.count(target) != 1:
 p.write_text(s.replace(target, 'image="$REGISTRY/pensyve-gateway:latest"', 1))
 PY
     expect_failure "latest" validate_workflow "${mutation}"
+
+    mutation="$(copy_mutation workflow-push-main-missing-active-base-guard)"
+    python3 - "${mutation}" <<'PY'
+from pathlib import Path
+import sys
+import yaml
+p = Path(sys.argv[1]); workflow = yaml.load(p.read_text(), Loader=yaml.BaseLoader)
+steps = workflow["jobs"]["push-main-deploy"]["steps"]
+matches = [step for step in steps if step.get("name") == "Guard exact active base before image build"]
+if len(matches) != 1: raise SystemExit("push-main guard hard target lookup failed")
+steps.remove(matches[0]); p.write_text(yaml.safe_dump(workflow, sort_keys=False))
+PY
+    expect_failure "Guard exact active base before image build" validate_workflow "${mutation}"
+
+    mutation="$(copy_mutation workflow-push-main-drift-recheck)"
+    python3 - "${mutation}" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1]); s = p.read_text(); target=' --expected-task-arn "$ACTIVE_TASK_ARN"'
+if s.count(target) != 2: raise SystemExit("push-main drift recheck hard target lookup failed")
+p.write_text(s.replace(target, "", 1))
+PY
+    expect_failure "fail closed on exact active-ARN drift" validate_workflow "${mutation}"
+
+    mutation="$(copy_mutation workflow-push-main-preupdate-drift-recheck)"
+    python3 - "${mutation}" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1]); s = p.read_text()
+target='          pensyve-mcp-gateway/scripts/guard-active-service.py --expected-task-arn "$ACTIVE_TASK_ARN" >/dev/null\n'
+if s.count(target) != 2: raise SystemExit("push-main pre-update drift recheck hard target lookup failed")
+first = s.find(target); second = s.find(target, first + len(target))
+p.write_text(s[:second] + s[second + len(target):])
+PY
+    expect_failure "immediately before service update" validate_workflow "${mutation}"
+
+    mutation="$(copy_mutation workflow-push-main-canonical-compare)"
+    python3 - "${mutation}" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1]); s = p.read_text(); target="cmp -s"
+if s.count(target) != 1: raise SystemExit("push-main canonical compare hard target lookup failed")
+p.write_text(s.replace(target, "true # canonical comparison removed", 1))
+PY
+    expect_failure "canonical gate is missing: cmp -s" validate_workflow "${mutation}"
+
+    mutation="$(copy_mutation workflow-push-main-drops-enable-fault-injection)"
+    python3 - "${mutation}" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1]); s = p.read_text(); target=".registeredBy)"
+if s.count(target) != 2: raise SystemExit("enableFaultInjection preservation hard target lookup failed")
+p.write_text(s.replace(target, ".registeredBy,.enableFaultInjection)", 1))
+PY
+    expect_failure "must preserve registrable enableFaultInjection" validate_workflow "${mutation}"
+
+    mutation="$(copy_mutation workflow-push-main-leaks-canonical-diff)"
+    python3 - "${mutation}" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1]); s = p.read_text()
+target='            echo "registered task definition canonical mismatch" >&2\n'
+if s.count(target) != 1: raise SystemExit("generic canonical mismatch hard target lookup failed")
+p.write_text(s.replace(target,
+    '            diff -u "$RUNNER_TEMP/requested-canonical.json" "$RUNNER_TEMP/registered-canonical.json" >&2\n', 1))
+PY
+    expect_failure "must not print task-definition content" validate_workflow "${mutation}"
+
+    mutation="$(copy_mutation workflow-push-main-desired-count)"
+    python3 - "${mutation}" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1]); s = p.read_text(); target="--service pensyve-prod-gateway --task-definition \"$new_arn\""
+if s.count(target) != 1: raise SystemExit("push-main update hard target lookup failed")
+p.write_text(s.replace(target, target + " --desired-count 2", 1))
+PY
+    expect_failure "must not override desired count" validate_workflow "${mutation}"
 
     mutation="$(copy_mutation workflow-cleanup-unconditional)"
     python3 - "${mutation}" <<'PY'
@@ -1209,6 +1538,19 @@ if s.count(target) != 1 or s.count(anchor) != 1: raise SystemExit("pre-update Ta
 p.write_text(s.replace(target, '', 1).replace(anchor, anchor + target, 1))
 PY
     expect_failure "immediately before candidate update authority" validate_workflow "${WORKFLOW}" "${RELEASE_SCRIPT}" "${ARTIFACT_SCRIPT}" "${promote_preupdate_mutation}"
+
+    local promote_fault_injection_mutation="${TEST_ROOT}/promote-drops-enable-fault-injection.sh"
+    cp -- "${PROMOTE_SCRIPT}" "${promote_fault_injection_mutation}"
+    python3 - "${promote_fault_injection_mutation}" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1]); s = p.read_text(); target=".registeredBy)"
+if s.count(target) != 4: raise SystemExit("promotion enableFaultInjection hard target lookup failed")
+p.write_text(s.replace(target, ".registeredBy,.enableFaultInjection)", 1))
+PY
+    expect_failure "promotion canonical clone must preserve registrable enableFaultInjection" \
+      validate_workflow "${WORKFLOW}" "${RELEASE_SCRIPT}" "${ARTIFACT_SCRIPT}" \
+      "${promote_fault_injection_mutation}"
 
     echo "workflow structural contract passed"
 }
@@ -3147,7 +3489,7 @@ fi
     esac
     log_configuration=",\"logConfiguration\":{\"logDriver\":\"awslogs\",\"options\":{\"awslogs-group\":\"${log_group}\",\"awslogs-region\":\"${log_region}\",\"awslogs-stream-prefix\":\"${log_prefix}\"}}"
     [[ "${STUB_LOG_CONFIG_MODE:-exact}" != absent ]] || log_configuration=""
-    task_json="{\"taskDefinition\":{\"taskDefinitionArn\":\"${task_arn}\",\"family\":\"pensyve-prod-gateway\",\"cpu\":\"${task_cpu}\",\"memory\":\"${task_memory}\",\"containerDefinitions\":[{\"name\":\"${log_container}\",\"image\":\"${task_image}\",\"environment\":$(cat "$STUB_ENVIRONMENT_PATH"),\"secrets\":[{\"name\":\"PENSYVE_API_KEYS\",\"valueFrom\":\"/pensyve/prod/api-key\"}]${log_configuration}}],\"volumes\":[],\"requiresCompatibilities\":[\"FARGATE\"],\"networkMode\":\"awsvpc\",\"runtimePlatform\":{\"cpuArchitecture\":\"ARM64\",\"operatingSystemFamily\":\"LINUX\"}}}"
+    task_json="{\"taskDefinition\":{\"taskDefinitionArn\":\"${task_arn}\",\"family\":\"pensyve-prod-gateway\",\"cpu\":\"${task_cpu}\",\"memory\":\"${task_memory}\",\"enableFaultInjection\":true,\"containerDefinitions\":[{\"name\":\"${log_container}\",\"image\":\"${task_image}\",\"environment\":$(cat "$STUB_ENVIRONMENT_PATH"),\"secrets\":[{\"name\":\"PENSYVE_API_KEYS\",\"valueFrom\":\"/pensyve/prod/api-key\"}]${log_configuration}}],\"volumes\":[],\"requiresCompatibilities\":[\"FARGATE\"],\"networkMode\":\"awsvpc\",\"runtimePlatform\":{\"cpuArchitecture\":\"ARM64\",\"operatingSystemFamily\":\"LINUX\"}}}"
 running_task_1="arn:aws:ecs:us-east-2:123456789012:task/pensyve-prod/11111111111111111111111111111111"
 running_task_2="arn:aws:ecs:us-east-2:123456789012:task/pensyve-prod/22222222222222222222222222222222"
 list_tasks_json="{\"taskArns\":[\"${running_task_1}\",\"${running_task_2}\"]}"

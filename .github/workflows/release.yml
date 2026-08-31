@@ -287,9 +287,12 @@ jobs:
           VERSION="${GITHUB_REF_NAME}"
           git tag "pensyve-go/${VERSION}" || true
           git push origin "pensyve-go/${VERSION}" || true
+      - name: Bind release display title
+        run: echo "RELEASE_DISPLAY_NAME=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
+          name: ${{ env.RELEASE_DISPLAY_NAME }}
           generate_release_notes: true
           files: release-assets/*
           draft: false

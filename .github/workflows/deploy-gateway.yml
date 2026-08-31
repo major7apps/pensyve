@@ -1746,6 +1746,7 @@ jobs:
       # actions/checkout v7.0.1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       # dtolnay/rust-toolchain stable resolved 2026-08-30
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
@@ -1754,6 +1755,11 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-east-2
+      - name: Guard exact active base before image build
+        run: |
+          set -euo pipefail
+          active_task_arn="$(pensyve-mcp-gateway/scripts/guard-active-service.py)"
+          echo "ACTIVE_TASK_ARN=${active_task_arn}" >> "$GITHUB_ENV"
       - id: ecr
         # aws-actions/amazon-ecr-login v2
         uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd
@@ -1772,19 +1778,31 @@ jobs:
       - name: Canonical image-only service update
         run: |
           set -euo pipefail
-          task_arn=$(aws ecs describe-services --region us-east-2 --cluster pensyve-prod \
-            --services pensyve-prod-gateway --query 'services[0].taskDefinition' --output text)
-          aws ecs describe-task-definition --region us-east-2 --task-definition "$task_arn" \
+          aws ecs describe-task-definition --region us-east-2 --task-definition "$ACTIVE_TASK_ARN" \
             --query taskDefinition > "$RUNNER_TEMP/current-task.json"
-          jq 'del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy,.enableFaultInjection)' \
+          jq 'del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
             "$RUNNER_TEMP/current-task.json" > "$RUNNER_TEMP/register-before.json"
           jq --arg image "$IMAGE_URI" '
             if ([.containerDefinitions[] | select(.name == "gateway")] | length) != 1 then error("gateway cardinality")
             else .containerDefinitions |= map(if .name == "gateway" then .image=$image else . end) end
           ' "$RUNNER_TEMP/register-before.json" > "$RUNNER_TEMP/register.json"
+          pensyve-mcp-gateway/scripts/guard-active-service.py --expected-task-arn "$ACTIVE_TASK_ARN" >/dev/null
           new_arn=$(aws ecs register-task-definition --region us-east-2 \
             --cli-input-json "file://$RUNNER_TEMP/register.json" \
             --query 'taskDefinition.taskDefinitionArn' --output text)
+          [[ "$new_arn" =~ ^arn:[^:]+:ecs:[^:]+:[0-9]{12}:task-definition/pensyve-prod-gateway:[0-9]+$ && "$new_arn" != *:157 ]]
+          aws ecs describe-task-definition --region us-east-2 --task-definition "$new_arn" \
+            --query taskDefinition > "$RUNNER_TEMP/registered-task.json"
+          jq -e --arg arn "$new_arn" '.taskDefinitionArn == $arn and .revision != 157' \
+            "$RUNNER_TEMP/registered-task.json" >/dev/null
+          jq -S . "$RUNNER_TEMP/register.json" > "$RUNNER_TEMP/requested-canonical.json"
+          jq -S 'del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)' \
+            "$RUNNER_TEMP/registered-task.json" > "$RUNNER_TEMP/registered-canonical.json"
+          cmp -s "$RUNNER_TEMP/requested-canonical.json" "$RUNNER_TEMP/registered-canonical.json" || {
+            echo "registered task definition canonical mismatch" >&2
+            exit 1
+          }
+          pensyve-mcp-gateway/scripts/guard-active-service.py --expected-task-arn "$ACTIVE_TASK_ARN" >/dev/null
           aws ecs update-service --region us-east-2 --cluster pensyve-prod \
             --service pensyve-prod-gateway --task-definition "$new_arn"
           aws ecs wait services-stable --region us-east-2 --cluster pensyve-prod \
