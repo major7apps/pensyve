@@ -12,6 +12,8 @@ readonly AWS_BIN="${AWS_BIN:-aws}"
 readonly SOURCE_ACCOUNT="196881464893"
 readonly SOURCE_TAG="63011d55f8cbf52f6f9e5609621f6b8cf0c37535"
 readonly SOURCE_DIGEST="sha256:6f5f36741bc4c5d39455b2f2fd41108561ea6ea28d438f815462b9febe3e329b"
+readonly STABILIZATION_ATTEMPTS="${PENSYVE_PROMOTION_STABILIZATION_ATTEMPTS:-8}"
+readonly STABILIZATION_INTERVAL_SECONDS="${PENSYVE_PROMOTION_STABILIZATION_INTERVAL_SECONDS:-5}"
 
 die() {
     echo "gateway promotion error: $*" >&2
@@ -34,6 +36,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 [[ -f "${CUSTODY}" ]] || die "canonical custody JSON is required"
+[[ "${STABILIZATION_ATTEMPTS}" =~ ^([1-9]|1[0-2])$ ]] ||
+    die "stabilization attempts must be an integer in 1..12"
+[[ "${STABILIZATION_INTERVAL_SECONDS}" =~ ^([0-9]|[12][0-9]|30)$ ]] ||
+    die "stabilization interval must be an integer in 0..30 seconds"
 
 TEMP_ROOT="$(mktemp -d /tmp/pensyve-gateway-promote.XXXXXX)" \
     || die "could not create promotion temporary root"
@@ -212,14 +218,17 @@ update_once() {
 }
 
 wait_stable() {
+    local attempt status
     aws_call ecs wait services-stable --region "${REGION}" --cluster "${CLUSTER}" \
         --services "${SERVICE}"
     [[ -n "${TARGET_GROUP_ARN}" ]] || die "production target group is not bound"
-    aws_call ecs describe-services --region "${REGION}" --cluster "${CLUSTER}" \
-        --services "${SERVICE}" --output json > "${TEMP_ROOT}/stable-service.json"
-    aws_call elbv2 describe-target-health --region "${REGION}" \
-        --target-group-arn "${TARGET_GROUP_ARN}" --output json > "${TEMP_ROOT}/targets.json"
-    python3 - "${TEMP_ROOT}/stable-service.json" "${TEMP_ROOT}/targets.json" <<'PY'
+    for ((attempt = 1; attempt <= STABILIZATION_ATTEMPTS; attempt++)); do
+        aws_call ecs describe-services --region "${REGION}" --cluster "${CLUSTER}" \
+            --services "${SERVICE}" --output json > "${TEMP_ROOT}/stable-service.json"
+        aws_call elbv2 describe-target-health --region "${REGION}" \
+            --target-group-arn "${TARGET_GROUP_ARN}" --output json > "${TEMP_ROOT}/targets.json"
+        status=0
+        if python3 - "${TEMP_ROOT}/stable-service.json" "${TEMP_ROOT}/targets.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -242,21 +251,53 @@ if (type(desired) is not int or not 2 <= desired <= 4 or
     raise SystemExit("gateway promotion error: stable ECS counts are outside the steady 2..4 envelope")
 
 target_payload = json.loads(Path(sys.argv[2]).read_text())
-descriptions = target_payload.get("TargetHealthDescriptions")
-if not isinstance(descriptions, list) or len(descriptions) != desired:
-    raise SystemExit("gateway promotion error: ALB target count must equal steady ECS desiredCount")
+if (not isinstance(target_payload, dict) or
+        not isinstance(target_payload.get("TargetHealthDescriptions"), list)):
+    raise SystemExit("gateway promotion error: TargetHealthDescriptions must be a list")
+descriptions = target_payload["TargetHealthDescriptions"]
 identities = []
+states = []
 for description in descriptions:
-    target = description.get("Target", {}) if isinstance(description, dict) else {}
-    health = description.get("TargetHealth", {}) if isinstance(description, dict) else {}
+    if (not isinstance(description, dict) or
+            not isinstance(description.get("Target"), dict) or
+            not isinstance(description.get("TargetHealth"), dict)):
+        raise SystemExit("gateway promotion error: ALB target description is malformed")
+    target = description["Target"]
+    health = description["TargetHealth"]
     identity = target.get("Id")
-    if (not isinstance(identity, str) or not identity or target.get("Port") != 3000 or
-            type(target.get("Port")) is not int or health.get("State") != "healthy"):
-        raise SystemExit("gateway promotion error: ALB target is not healthy on gateway port 3000")
+    if not isinstance(identity, str) or not identity:
+        raise SystemExit("gateway promotion error: ALB target ID must be a nonempty string")
+    port = target.get("Port")
+    if type(port) is not int or port != 3000:
+        raise SystemExit("gateway promotion error: ALB target port must be exact integer 3000")
+    state = health.get("State")
+    if not isinstance(state, str):
+        raise SystemExit("gateway promotion error: ALB target state must be a string")
+    if state not in {"healthy", "initial", "draining"}:
+        raise SystemExit("gateway promotion error: ALB target state is terminal or unknown")
     identities.append(identity)
+    states.append(state)
 if len(set(identities)) != len(identities):
     raise SystemExit("gateway promotion error: ALB healthy target identities must be distinct")
+if len(descriptions) != desired:
+    print("gateway promotion error: ALB target count must equal steady ECS desiredCount",
+          file=sys.stderr)
+    raise SystemExit(75)
+if any(state != "healthy" for state in states):
+    print("gateway promotion error: ALB targets are still converging", file=sys.stderr)
+    raise SystemExit(75)
 PY
+        then
+            return 0
+        else
+            status=$?
+        fi
+        [[ "${status}" -eq 75 ]] || return "${status}"
+        if [[ "${attempt}" -lt "${STABILIZATION_ATTEMPTS}" ]]; then
+            sleep "${STABILIZATION_INTERVAL_SECONDS}"
+        fi
+    done
+    return 75
 }
 
 rollback_once() {

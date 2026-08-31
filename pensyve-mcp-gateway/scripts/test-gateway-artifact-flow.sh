@@ -10,6 +10,8 @@ readonly GUARD_SCRIPT="${SCRIPT_DIR}/guard-active-service.py"
 readonly DEPLOY_WORKFLOW="${REPO_ROOT}/.github/workflows/deploy-gateway.yml"
 readonly CI_WORKFLOW="${REPO_ROOT}/.github/workflows/ci.yml"
 readonly CASE="${1:-all}"
+export PENSYVE_PROMOTION_STABILIZATION_ATTEMPTS=1
+export PENSYVE_PROMOTION_STABILIZATION_INTERVAL_SECONDS=0
 
 case "${CASE}" in
     structural | guard | publisher | promoter | task8-rollback | rollback | workflow | mutations | all) ;;
@@ -761,7 +763,7 @@ PY
       ' "ecs register-task-definition") input=$(arg --cli-input-json "$@"); [[ $# -eq 12 && "$*" == "ecs register-task-definition --region us-east-2 --cli-input-json $input --output json --cli-connect-timeout 5 --cli-read-timeout 30" ]] || reject "$@"; input=${input#file://}; rev=${REGISTER_REVISION:?}; arn="arn:aws:ecs:us-east-2:196881464893:task-definition/pensyve-prod-gateway:$rev"; jq --arg arn "$arn" --argjson rev "$rev" '\''. + {taskDefinitionArn:$arn,revision:$rev} | {taskDefinition:.}'\'' "$input" > "$TASK_FIXTURE_ROOT/task-$rev.json"; cat "$TASK_FIXTURE_ROOT/task-$rev.json" ;;' \
       ' "ecs update-service") arn=$(arg --task-definition "$@"); [[ $# -eq 16 && "$*" == "ecs update-service --region us-east-2 --cluster pensyve-prod --service pensyve-prod-gateway --task-definition $arn --output json --cli-connect-timeout 5 --cli-read-timeout 30" ]] || reject "$@"; if [[ -e "${WAIT_MARKER:-/nonexistent}" && -n "${ROLLBACK_UPDATE_MARKER:-}" ]]; then : > "$ROLLBACK_UPDATE_MARKER"; fi; printf '\''%s\n'\'' "$arn" > "$SERVICE_STATE"; jq -n --arg arn "$arn" '\''{service:{taskDefinition:$arn}}'\'' ;;' \
       ' "ecs wait") [[ $# -eq 13 && "$*" == "ecs wait services-stable --region us-east-2 --cluster pensyve-prod --services pensyve-prod-gateway --cli-connect-timeout 5 --cli-read-timeout 30" ]] || reject "$@"; if [[ -n "${SIGNAL_FIRST_WAIT:-}" && ! -e "$WAIT_MARKER" ]]; then : > "$WAIT_MARKER"; kill -s "$SIGNAL_FIRST_WAIT" "$PPID"; sleep 1; exit 55; fi; if [[ "${FAIL_FIRST_WAIT:-0}" == 1 && ! -e "$WAIT_MARKER" ]]; then : > "$WAIT_MARKER"; exit 55; fi; if [[ "${SECOND_SIGNAL_PHASE:-}" == wait && -e "${ROLLBACK_UPDATE_MARKER:-/nonexistent}" && ! -e "${SECOND_SIGNAL_MARKER:-/nonexistent}" ]]; then : > "$SECOND_SIGNAL_MARKER"; kill -s "$SECOND_SIGNAL" "$PPID"; sleep 1; fi ;;' \
-      ' "elbv2 describe-target-health") [[ $# -eq 12 && "$*" == "elbv2 describe-target-health --region us-east-2 --target-group-arn $FIXTURE_TARGET_GROUP_ARN --output json --cli-connect-timeout 5 --cli-read-timeout 30" ]] || reject "$@"; if [[ -n "${TARGET_HEALTH_FIXTURE:-}" ]]; then cat "$TARGET_HEALTH_FIXTURE"; else jq -n --arg state "${TARGET_HEALTH_STATE:-healthy}" '\''{TargetHealthDescriptions:[{Target:{Id:"10.0.1.10",Port:3000},TargetHealth:{State:$state}},{Target:{Id:"10.0.2.10",Port:3000},TargetHealth:{State:$state}}]}'\''; fi ;;' \
+      ' "elbv2 describe-target-health") [[ $# -eq 12 && "$*" == "elbv2 describe-target-health --region us-east-2 --target-group-arn $FIXTURE_TARGET_GROUP_ARN --output json --cli-connect-timeout 5 --cli-read-timeout 30" ]] || reject "$@"; if [[ -n "${TARGET_HEALTH_FIRST_FIXTURE:-}" && ! -e "${TARGET_HEALTH_FIRST_MARKER:?}" ]]; then : > "$TARGET_HEALTH_FIRST_MARKER"; cat "$TARGET_HEALTH_FIRST_FIXTURE"; elif [[ -n "${TARGET_HEALTH_FIXTURE:-}" ]]; then cat "$TARGET_HEALTH_FIXTURE"; else jq -n --arg state "${TARGET_HEALTH_STATE:-healthy}" '\''{TargetHealthDescriptions:[{Target:{Id:"10.0.1.10",Port:3000},TargetHealth:{State:$state}},{Target:{Id:"10.0.2.10",Port:3000},TargetHealth:{State:$state}}]}'\''; fi ;;' \
       ' *) reject "$@" ;; esac' > "${root}/bin/aws"
     chmod +x "${root}/bin/aws"
 }
@@ -781,9 +783,15 @@ healthy = [target(f"10.0.{index}.10") for index in range(1, 6)]
 fixtures = {
     "targets-1": healthy[:1],
     "targets-2": healthy[:2],
+    "targets-2-draining": [healthy[0], target("10.0.2.10", state="draining")],
     "targets-4": healthy[:4],
+    "targets-4-initial": [*healthy[:3], target("10.0.4.10", state="initial")],
+    "targets-4-draining": [*healthy[:2], target("10.0.3.10", state="draining"),
+                           target("10.0.4.10", state="draining")],
     "targets-5": healthy,
     "targets-unhealthy": [*healthy[:3], target("10.0.4.10", state="unhealthy")],
+    "targets-unused": [*healthy[:3], target("10.0.4.10", state="unused")],
+    "targets-unavailable": [*healthy[:3], target("10.0.4.10", state="unavailable")],
     "targets-wrong-port": [*healthy[:3], target("10.0.4.10", port=3001)],
     "targets-duplicate": [*healthy[:3], target("10.0.3.10")],
     "targets-missing": [*healthy[:3], {"Target": {"Port": 3000},
@@ -792,6 +800,20 @@ fixtures = {
 }
 for name, descriptions in fixtures.items():
     (root / f"{name}.json").write_text(json.dumps({"TargetHealthDescriptions": descriptions}))
+(root / "targets-top-missing.json").write_text("{}")
+(root / "targets-top-null.json").write_text('{"TargetHealthDescriptions":null}')
+(root / "targets-top-non-list.json").write_text('{"TargetHealthDescriptions":{}}')
+short = {
+    "malformed": [healthy[0], "malformed"],
+    "wrong-port": [healthy[0], target("10.0.2.10", port=3001)],
+    "bad-id": [healthy[0], target(42)],
+    "bad-state": [healthy[0], target("10.0.2.10", state=True)],
+    "duplicate": [healthy[0], target("10.0.1.10")],
+    "unhealthy": [healthy[0], target("10.0.2.10", state="unhealthy")],
+}
+for name, descriptions in short.items():
+    (root / f"targets-short-{name}.json").write_text(
+        json.dumps({"TargetHealthDescriptions": descriptions}))
 PY
 }
 
@@ -850,7 +872,10 @@ expected_target_health = ["elbv2", "describe-target-health", "--region", "us-eas
 stable_service_read = ["ecs", "describe-services", "--region", "us-east-2", "--cluster",
                        "pensyve-prod", "--services", "pensyve-prod-gateway", "--output", "json",
                        "--cli-connect-timeout", "5", "--cli-read-timeout", "30"]
-stable_health = [expected_wait, stable_service_read, expected_target_health]
+
+def stable_health(attempts):
+    return [expected_wait, *[call for _ in range(attempts)
+                             for call in (stable_service_read, expected_target_health)]]
 source_ecr = [
     "ecr", "describe-images", "--region", "us-east-2", "--registry-id", "196881464893",
     "--repository-name", "pensyve-gateway", "--image-ids",
@@ -861,33 +886,34 @@ source_ecr = [
 register = registers[0] if registers else None
 if expected_registers == 0 and target_arns[0].endswith(":200"):
     expected = [service_read(), guard_task(201), guard_task(156), guard_task(200),
-                source_ecr, expected_updates[0], *stable_health,
+                source_ecr, expected_updates[0], *stable_health(expected_health),
                 service_read(), guard_task(200), guard_task(156)]
 elif expected_registers == 0 and target_arns[0].endswith(":156"):
     expected = [service_read(), guard_task(200), guard_task(156), source_ecr,
-                expected_updates[0], *stable_health,
+                expected_updates[0], *stable_health(expected_health),
                 service_read(), guard_task(156)]
 elif len(target_arns) == 1 and target_arns[0].endswith(":200"):
     expected = [service_read(), guard_task(156), direct_task(156), source_ecr, register,
                 direct_task(200), service_read(), guard_task(156), source_ecr,
-                expected_updates[0], *stable_health, service_read(),
+                expected_updates[0], *stable_health(expected_health), service_read(),
                 guard_task(200), guard_task(156)]
 elif len(target_arns) == 1 and target_arns[0].endswith(":201"):
     expected = [service_read(), guard_task(200), guard_task(156), direct_task(200), source_ecr,
                 register, direct_task(201), service_read(), guard_task(200), guard_task(156),
-                source_ecr, expected_updates[0], *stable_health,
+                source_ecr, expected_updates[0], *stable_health(expected_health),
                 service_read(), guard_task(201), guard_task(156), guard_task(200)]
 elif len(target_arns) == 2 and expected_health == 1:
     expected = [service_read(), guard_task(156), direct_task(156), source_ecr, register,
                 direct_task(200), service_read(), guard_task(156), source_ecr,
                 expected_updates[0], expected_wait, source_ecr, expected_updates[1],
-                *stable_health,
+                *stable_health(1),
                 service_read(), guard_task(156)]
-elif len(target_arns) == 2 and expected_health == 2:
+elif len(target_arns) == 2 and expected_health >= 2 and expected_health % 2 == 0:
+    attempts = expected_health // 2
     expected = [service_read(), guard_task(156), direct_task(156), source_ecr, register,
                 direct_task(200), service_read(), guard_task(156), source_ecr,
-                expected_updates[0], *stable_health, source_ecr,
-                expected_updates[1], *stable_health]
+                expected_updates[0], *stable_health(attempts), source_ecr,
+                expected_updates[1], *stable_health(attempts)]
 else:
     raise SystemExit("promoter exact-argv test scenario is undefined")
 
@@ -967,6 +993,7 @@ run_promoter() {
         printf '%s\n' "${source_arn}" > "${root}/state"
         : > "${root}/aws.log"
         expect_failure "ALB target count must equal steady ECS desiredCount" env \
+          PENSYVE_PROMOTION_STABILIZATION_ATTEMPTS=2 \
           AWS_BIN="${root}/bin/aws" AWS_LOG="${root}/aws.log" SERVICE_STATE="${root}/state" \
           TASK_FIXTURE_ROOT="${root}" REGISTER_REVISION=200 WAIT_MARKER="${root}/wait.marker" \
           SERVICE_COUNT="${service_count}" \
@@ -975,6 +1002,85 @@ run_promoter() {
           "${PROMOTE_SCRIPT}" task8-create --custody "${root}/custody.json"
         [[ "$(grep -c '^ecs update-service ' "${root}/aws.log")" -eq 2 ]] ||
             fail "service ${service_count} with ${target_count} targets changed exact rollback count"
+        [[ "$(grep -c '^elbv2 describe-target-health ' "${root}/aws.log")" -eq 4 ]] ||
+            fail "persistent mismatch did not exhaust two attempts before each exact update"
+        assert_promoter_argv "${root}" 1 "${baseline_arn},${source_arn}" 4
+    done
+
+    for service_count in 4 2; do
+        if [[ "${service_count}" == 4 ]]; then
+            target_count=4
+            first_fixture="targets-4-initial.json"
+        else
+            target_count=2
+            first_fixture="targets-4-draining.json"
+        fi
+        root="${TEST_ROOT}/promoter-converges-${service_count}-${target_count}"
+        make_promoter_fixture "${root}"
+        make_target_health_fixtures "${root}"
+        printf '%s\n' "${source_arn}" > "${root}/state"
+        : > "${root}/aws.log"
+        env PENSYVE_PROMOTION_STABILIZATION_ATTEMPTS=2 \
+          AWS_BIN="${root}/bin/aws" AWS_LOG="${root}/aws.log" SERVICE_STATE="${root}/state" \
+          TASK_FIXTURE_ROOT="${root}" REGISTER_REVISION=200 WAIT_MARKER="${root}/wait.marker" \
+          SERVICE_COUNT="${service_count}" \
+          TARGET_HEALTH_FIRST_FIXTURE="${root}/${first_fixture}" \
+          TARGET_HEALTH_FIRST_MARKER="${root}/first-target.marker" \
+          TARGET_HEALTH_FIXTURE="${root}/targets-${target_count}.json" \
+          FIXTURE_TARGET_GROUP_ARN="${target_group}" \
+          "${PROMOTE_SCRIPT}" task8-create --custody "${root}/custody.json" >/dev/null
+        [[ "$(grep -c '^ecs update-service ' "${root}/aws.log")" -eq 1 ]] ||
+            fail "converged service ${service_count} performed rollback or duplicate update"
+        [[ "$(grep -c '^elbv2 describe-target-health ' "${root}/aws.log")" -eq 2 ]] ||
+            fail "converged service ${service_count} did not use exactly one retry"
+        assert_promoter_argv "${root}" 1 "${baseline_arn}" 2
+    done
+
+    root="${TEST_ROOT}/promoter-converges-2-draining"
+    make_promoter_fixture "${root}"
+    make_target_health_fixtures "${root}"
+    printf '%s\n' "${source_arn}" > "${root}/state"
+    : > "${root}/aws.log"
+    env PENSYVE_PROMOTION_STABILIZATION_ATTEMPTS=2 \
+      AWS_BIN="${root}/bin/aws" AWS_LOG="${root}/aws.log" SERVICE_STATE="${root}/state" \
+      TASK_FIXTURE_ROOT="${root}" REGISTER_REVISION=200 WAIT_MARKER="${root}/wait.marker" \
+      SERVICE_COUNT=2 TARGET_HEALTH_FIRST_FIXTURE="${root}/targets-2-draining.json" \
+      TARGET_HEALTH_FIRST_MARKER="${root}/first-target.marker" \
+      TARGET_HEALTH_FIXTURE="${root}/targets-2.json" \
+      FIXTURE_TARGET_GROUP_ARN="${target_group}" \
+      "${PROMOTE_SCRIPT}" task8-create --custody "${root}/custody.json" >/dev/null
+    [[ "$(grep -c '^ecs update-service ' "${root}/aws.log")" -eq 1 ]] ||
+        fail "matching-cardinality draining convergence performed rollback or duplicate update"
+    [[ "$(grep -c '^elbv2 describe-target-health ' "${root}/aws.log")" -eq 2 ]] ||
+        fail "matching-cardinality draining convergence did not use exactly one retry"
+    assert_promoter_argv "${root}" 1 "${baseline_arn}" 2
+
+    for kind in top-missing top-null top-non-list short-malformed short-wrong-port \
+      short-bad-id short-bad-state short-duplicate short-unhealthy; do
+        root="${TEST_ROOT}/promoter-terminal-dominance-${kind}"
+        make_promoter_fixture "${root}"
+        make_target_health_fixtures "${root}"
+        printf '%s\n' "${source_arn}" > "${root}/state"
+        : > "${root}/aws.log"
+        case "${kind}" in
+            top-*) expected="TargetHealthDescriptions must be a list" ;;
+            short-malformed) expected="ALB target description is malformed" ;;
+            short-wrong-port) expected="ALB target port must be exact integer 3000" ;;
+            short-bad-id) expected="ALB target ID must be a nonempty string" ;;
+            short-bad-state) expected="ALB target state must be a string" ;;
+            short-duplicate) expected="ALB healthy target identities must be distinct" ;;
+            short-unhealthy) expected="ALB target state is terminal or unknown" ;;
+        esac
+        expect_failure "${expected}" env PENSYVE_PROMOTION_STABILIZATION_ATTEMPTS=2 \
+          AWS_BIN="${root}/bin/aws" AWS_LOG="${root}/aws.log" SERVICE_STATE="${root}/state" \
+          TASK_FIXTURE_ROOT="${root}" REGISTER_REVISION=200 WAIT_MARKER="${root}/wait.marker" \
+          SERVICE_COUNT=4 TARGET_HEALTH_FIXTURE="${root}/targets-${kind}.json" \
+          FIXTURE_TARGET_GROUP_ARN="${target_group}" \
+          "${PROMOTE_SCRIPT}" task8-create --custody "${root}/custody.json"
+        [[ "$(grep -c '^ecs update-service ' "${root}/aws.log")" -eq 2 ]] ||
+            fail "terminal ${kind} fixture changed exact rollback count"
+        [[ "$(grep -c '^elbv2 describe-target-health ' "${root}/aws.log")" -eq 2 ]] ||
+            fail "terminal ${kind} fixture was retried before candidate/rollback failure"
         assert_promoter_argv "${root}" 1 "${baseline_arn},${source_arn}" 2
     done
 
@@ -1018,7 +1124,7 @@ run_promoter() {
     ! grep -E -- '--desired-count|--force-new-deployment|application-autoscaling|register-scalable-target|put-scaling-policy' \
       "${root}/aws.log" >/dev/null
 
-    for kind in 1 5 unhealthy wrong-port duplicate missing malformed; do
+    for kind in 1 5 unhealthy unused unavailable wrong-port duplicate missing malformed; do
         root="${TEST_ROOT}/promoter-target-${kind}"
         make_promoter_fixture "${root}"
         make_target_health_fixtures "${root}"
@@ -1027,7 +1133,9 @@ run_promoter() {
         case "${kind}" in
             1 | 5) expected="ALB target count must equal steady ECS desiredCount" ;;
             duplicate) expected="ALB healthy target identities must be distinct" ;;
-            *) expected="ALB target is not healthy on gateway port 3000" ;;
+            unhealthy | unused | unavailable) expected="ALB target state is terminal or unknown" ;;
+            wrong-port | malformed) expected="ALB target port must be exact integer 3000" ;;
+            missing) expected="ALB target ID must be a nonempty string" ;;
         esac
         expect_failure "${expected}" env AWS_BIN="${root}/bin/aws" AWS_LOG="${root}/aws.log" \
           SERVICE_STATE="${root}/state" TASK_FIXTURE_ROOT="${root}" REGISTER_REVISION=200 \
