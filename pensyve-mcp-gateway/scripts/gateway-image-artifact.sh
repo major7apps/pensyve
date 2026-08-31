@@ -671,6 +671,7 @@ build_archive() {
     [[ "sha256:${config_sha}" == "${image_id}" ]] || die "exported config does not match image ID"
 
     jq -n --arg source_sha "${source_sha}" --arg archive "${archive}" \
+        --arg image_ref "${image_ref}" \
         --arg archive_sha "${archive_sha}" --arg config "${config_path}" \
         --arg config_id "${image_id}" --arg raw_manifest "${raw_manifest}" \
         --arg manifest_sha "$(sha256_file "${raw_manifest}")" --arg media "${media_type}" \

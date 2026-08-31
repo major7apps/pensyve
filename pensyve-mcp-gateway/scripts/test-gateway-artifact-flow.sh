@@ -66,6 +66,14 @@ def require(condition, message):
     if not condition:
         errors.append(message)
 
+build_archive = re.search(r"\nbuild_archive\(\) \{(?P<body>.*?)\n\}\n", artifact, re.S)
+build_result = re.search(
+    r'jq -n (?P<command>.*?) > "\$\{evidence_dir\}/build-result\.json"',
+    build_archive.group("body") if build_archive else "", re.S,
+)
+require(build_result is not None and '--arg image_ref "${image_ref}"' in build_result.group("command"),
+        "build-result jq must bind image_ref")
+
 on = mapping(deploy.get("on"))
 require(set(on) == {"workflow_dispatch"}, "deploy workflow must be manual-only")
 inputs = mapping(mapping(on.get("workflow_dispatch")).get("inputs"))
