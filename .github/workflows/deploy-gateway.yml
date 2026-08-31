@@ -1,1791 +1,276 @@
-name: Build & Deploy Gateway
-
-# A custodian run owns this lease across both its producer and always-finalizer.
-# Canceling the parent dispatcher cannot cancel that separate run.  Explicitly
-# force-canceling the custodian itself after mutation is the documented boundary
-# that requires an external scheduler; this workflow does not claim otherwise.
-run-name: ${{ inputs.mode == 'artifact-custodian' && format('gateway-custodian-{0}', inputs.custody_lease_id) || format('gateway-{0}-{1}-{2}', github.event_name, github.run_id, github.run_attempt) }}
+name: Deploy Gateway
 
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: Reviewed immutable-artifact operation
+      operation:
+        description: Trusted-main gateway operation
         required: true
         type: choice
         options:
-          - artifact-build
-          - artifact-promote
-          - artifact-custodian
-      pull_request_number:
-        description: Exact same-repository open non-draft pull request number
+          - task8-create
+          - task8-rollback
+          - task9-promote
+          - task9-rollback
+      custody_json:
+        description: Canonical local custody JSON (small record only)
         required: true
         type: string
-      custody_lease_id:
-        description: Deterministic exact promotion-custody lease
-        required: false
-        type: string
-      custody_request:
-        description: Sealed parent run and immutable handoff identity JSON
-        required: false
-        type: string
-  push:
-    branches: [main]
-    paths:
-      - "pensyve-core/**"
-      - "pensyve-mcp-tools/**"
-      - "pensyve-mcp-gateway/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
 
-permissions: {}
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ (github.event_name == 'push' || inputs.mode == 'artifact-custodian') && 'pensyve-production-gateway' || format('pensyve-gateway-nonproduction-{0}-{1}', github.run_id, github.run_attempt) }}
+  group: pensyve-production-gateway
   cancel-in-progress: false
 
 jobs:
-  artifact-build:
-    name: Build one reviewed non-draft ARM64 artifact
-    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'artifact-build'
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 90
-    permissions:
-      contents: read
-      actions: read
-      pull-requests: read
-    outputs:
-      cleanup_required: ${{ steps.build-custody-resolver.outputs.cleanup_required }}
-      cleanup_artifact_id: ${{ steps.build-custody-resolver.outputs.artifact_id }}
-      cleanup_artifact_name: ${{ steps.build-custody-resolver.outputs.artifact_name }}
-      cleanup_repository: ${{ steps.build-custody-resolver.outputs.repository }}
-      cleanup_run_id: ${{ steps.build-custody-resolver.outputs.run_id }}
-      cleanup_status: ${{ steps.build-custody-resolver.outputs.cleanup_status }}
-    steps:
-      - name: Bind exact open non-draft pull request before checkout
-        id: pr
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ inputs.pull_request_number }}
-        run: |
-          set -euo pipefail
-          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
-          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > "$RUNNER_TEMP/pr.json"
-          jq -e --arg repo "$GITHUB_REPOSITORY" --arg branch "$GITHUB_REF_NAME" --arg sha "$GITHUB_SHA" '
-            .state == "open" and .draft == false and .base.ref == "main" and
-            .base.repo.full_name == $repo and .head.repo.full_name == $repo and
-            .head.ref == $branch and .head.sha == $sha
-          ' "$RUNNER_TEMP/pr.json" >/dev/null
-          [[ "$GITHUB_REF" == "refs/heads/$GITHUB_REF_NAME" && "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
-          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
-
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      # actions/setup-python v6.3.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
-        with:
-          python-version: '3.12'
-      # dtolnay/rust-toolchain stable resolved 2026-08-30
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
-      # docker/setup-buildx-action v3.12.0
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
-
-      - name: Freeze pre-build storage approval and disk gate
-        env:
-          APPROVED_GB_HOURS: ${{ vars.GATEWAY_ARTIFACT_APPROVED_GB_HOURS }}
-          APPROVED_DOLLARS: ${{ vars.GATEWAY_ARTIFACT_APPROVED_DOLLARS }}
-          PRICE_PER_GB_MONTH: ${{ vars.GATEWAY_ARTIFACT_PRICE_PER_GB_MONTH }}
-          CURRENT_BILLABLE_BYTES: ${{ vars.GATEWAY_ARTIFACT_CURRENT_BILLABLE_BYTES }}
-          BILLING_SNAPSHOT_AT: ${{ vars.GATEWAY_ARTIFACT_BILLING_SNAPSHOT_AT }}
-          EXPECTED_ARCHIVE_BYTES: ${{ vars.GATEWAY_ARTIFACT_EXPECTED_ARCHIVE_BYTES }}
-          EXPECTED_EVIDENCE_BYTES: ${{ vars.GATEWAY_ARTIFACT_EXPECTED_EVIDENCE_BYTES }}
-          CONTAINER_OVERHEAD_BYTES: ${{ vars.GATEWAY_ARTIFACT_CONTAINER_OVERHEAD_BYTES }}
-          HANDOFF_OVERHEAD_BYTES: ${{ vars.GATEWAY_ARTIFACT_HANDOFF_OVERHEAD_BYTES }}
-          ORGANIZATION_ACTIONS_ARTIFACT_BYTES: ${{ vars.GATEWAY_ORG_ACTIONS_ARTIFACT_BYTES }}
-          ORGANIZATION_PACKAGES_BYTES: ${{ vars.GATEWAY_ORG_PACKAGES_BYTES }}
-          BILLING_UNIT: ${{ vars.GATEWAY_ARTIFACT_BILLING_UNIT }}
-          PAYMENT_STATUS: ${{ vars.GATEWAY_ARTIFACT_PAYMENT_STATUS }}
-          SPENDING_STATUS: ${{ vars.GATEWAY_ARTIFACT_SPENDING_STATUS }}
-          WORKSPACE_PEAK_BYTES: ${{ vars.GATEWAY_ARTIFACT_WORKSPACE_PEAK_BYTES }}
-          CARGO_PEAK_BYTES: ${{ vars.GATEWAY_ARTIFACT_CARGO_PEAK_BYTES }}
-          MODEL_SCRATCH_PEAK_BYTES: ${{ vars.GATEWAY_ARTIFACT_MODEL_SCRATCH_PEAK_BYTES }}
-          DOCKER_PEAK_BYTES: ${{ vars.GATEWAY_ARTIFACT_DOCKER_PEAK_BYTES }}
-          TMP_PEAK_BYTES: ${{ vars.GATEWAY_ARTIFACT_TMP_PEAK_BYTES }}
-        run: |
-          set -euo pipefail
-          for name in APPROVED_GB_HOURS APPROVED_DOLLARS PRICE_PER_GB_MONTH CURRENT_BILLABLE_BYTES BILLING_SNAPSHOT_AT EXPECTED_ARCHIVE_BYTES EXPECTED_EVIDENCE_BYTES CONTAINER_OVERHEAD_BYTES HANDOFF_OVERHEAD_BYTES ORGANIZATION_ACTIONS_ARTIFACT_BYTES ORGANIZATION_PACKAGES_BYTES BILLING_UNIT PAYMENT_STATUS SPENDING_STATUS WORKSPACE_PEAK_BYTES CARGO_PEAK_BYTES MODEL_SCRATCH_PEAK_BYTES DOCKER_PEAK_BYTES TMP_PEAK_BYTES; do
-            [[ -n "${!name:-}" ]] || { echo "missing approved storage input: $name" >&2; exit 1; }
-          done
-          mkdir -p /tmp/pensyve-reviewed-artifact/evidence /tmp/pensyve-model-scratch "${CARGO_HOME:-$HOME/.cargo}"
-          available=$(df --output=avail -B1 /tmp | awk 'NR==2 {print $1}')
-          docker_root=$(docker info --format '{{.DockerRootDir}}')
-          [[ "$docker_root" == /* && -d "$docker_root" ]]
-          fs_device() { df --output=source "$1" | awk 'NR==2 {print $1}'; }
-          fs_available() { df --output=avail -B1 "$1" | awk 'NR==2 {print $1}'; }
-          jq -n \
-            --arg workspace "$GITHUB_WORKSPACE" --arg workspace_device "$(fs_device "$GITHUB_WORKSPACE")" --argjson workspace_available "$(fs_available "$GITHUB_WORKSPACE")" --argjson workspace_required "$WORKSPACE_PEAK_BYTES" \
-            --arg cargo "${CARGO_HOME:-$HOME/.cargo}" --arg cargo_device "$(fs_device "${CARGO_HOME:-$HOME/.cargo}")" --argjson cargo_available "$(fs_available "${CARGO_HOME:-$HOME/.cargo}")" --argjson cargo_required "$CARGO_PEAK_BYTES" \
-            --arg model "/tmp/pensyve-model-scratch" --arg model_device "$(fs_device /tmp/pensyve-model-scratch)" --argjson model_available "$(fs_available /tmp/pensyve-model-scratch)" --argjson model_required "$MODEL_SCRATCH_PEAK_BYTES" \
-            --arg docker "$docker_root" --arg docker_device "$(fs_device "$docker_root")" --argjson docker_available "$(fs_available "$docker_root")" --argjson docker_required "$DOCKER_PEAK_BYTES" \
-            --arg tmp "/tmp" --arg tmp_device "$(fs_device /tmp)" --argjson tmp_available "$(fs_available /tmp)" --argjson tmp_required "$TMP_PEAK_BYTES" \
-            '{filesystems:[
-              {name:"workspace",path:$workspace,device:$workspace_device,available_bytes:$workspace_available,required_bytes:$workspace_required},
-              {name:"cargo",path:$cargo,device:$cargo_device,available_bytes:$cargo_available,required_bytes:$cargo_required},
-              {name:"model_scratch",path:$model,device:$model_device,available_bytes:$model_available,required_bytes:$model_required},
-              {name:"docker",path:$docker,device:$docker_device,available_bytes:$docker_available,required_bytes:$docker_required},
-              {name:"tmp",path:$tmp,device:$tmp_device,available_bytes:$tmp_available,required_bytes:$tmp_required}]}' \
-            > /tmp/pensyve-reviewed-artifact/disk-precheck-input.json
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh disk-precheck \
-            --input /tmp/pensyve-reviewed-artifact/disk-precheck-input.json \
-            --output /tmp/pensyve-reviewed-artifact/disk-precheck.json
-          jq -n --arg snapshot "$BILLING_SNAPSHOT_AT" --argjson ceiling_gbh "$APPROVED_GB_HOURS" \
-            --argjson ceiling_dollars "$APPROVED_DOLLARS" --argjson price "$PRICE_PER_GB_MONTH" \
-            --argjson current "$CURRENT_BILLABLE_BYTES" --argjson archive "$EXPECTED_ARCHIVE_BYTES" \
-            --argjson evidence "$EXPECTED_EVIDENCE_BYTES" --argjson container "$CONTAINER_OVERHEAD_BYTES" \
-            --argjson handoff "$HANDOFF_OVERHEAD_BYTES" --argjson available "$available" \
-            --argjson org_actions "$ORGANIZATION_ACTIONS_ARTIFACT_BYTES" \
-            --argjson org_packages "$ORGANIZATION_PACKAGES_BYTES" --arg unit "$BILLING_UNIT" \
-            --arg payment "$PAYMENT_STATUS" --arg spending "$SPENDING_STATUS" \
-            '{snapshot_at:$snapshot,approved_gb_hours_ceiling:$ceiling_gbh,
-              approved_dollar_ceiling:$ceiling_dollars,price_per_gb_month:$price,
-              current_billable_bytes:$current,archive_bytes:$archive,evidence_bytes:$evidence,
-              container_overhead_bytes:$container,handoff_overhead_bytes:$handoff,
-              runner_available_bytes:$available,organization_actions_artifact_bytes:$org_actions,
-              organization_packages_bytes:$org_packages,billing_unit:$unit,
-              snapshot_inclusion_mode:"source-excluded",retained_source_artifact_id:null,
-              retained_source_artifact_bytes:0,
-              payment_status:$payment,spending_status:$spending}' > /tmp/pensyve-reviewed-artifact/storage-input.json
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh storage-precheck \
-            --input /tmp/pensyve-reviewed-artifact/storage-input.json \
-            --output /tmp/pensyve-reviewed-artifact/storage-precheck.json
-
-      - name: Prepare pinned Trivy database while network is available
-        run: |
-          pensyve-mcp-gateway/scripts/test-gateway-release-image.sh prepare-trivy \
-            --cache-dir /tmp/pensyve-reviewed-artifact/evidence/trivy-cache \
-            --evidence-dir /tmp/pensyve-reviewed-artifact/evidence/trivy-prepare
-
-      - name: Build and export exact clean-SHA image once
-        run: |
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh build \
-            --source-sha "$GITHUB_SHA" \
-            --archive /tmp/pensyve-reviewed-artifact/gateway-image.tar \
-            --evidence-dir /tmp/pensyve-reviewed-artifact/evidence/image \
-            --image-ref "pensyve-gateway:$GITHUB_SHA"
-
-      - name: Run exact-archive release gates
-        run: |
-          pensyve-mcp-gateway/scripts/test-gateway-release-image.sh prove \
-            --archive /tmp/pensyve-reviewed-artifact/gateway-image.tar \
-            --source-sha "$GITHUB_SHA" \
-            --evidence-dir /tmp/pensyve-reviewed-artifact/evidence/release \
-            --trivy-cache /tmp/pensyve-reviewed-artifact/evidence/trivy-cache
-
-      - name: Run every exact-head source gate once before paid upload
-        id: source-gates
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import platform
-          assert platform.python_version().startswith("3.12.")
-          assert platform.python_implementation() == "CPython"
-          assert platform.machine() in {"x86_64", "aarch64", "arm64"}
-          PY
-          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" && -z "$(git status --porcelain)" ]]
-          sentinel=/tmp/pensyve-reviewed-artifact/evidence/source-gates.started
-          [[ ! -e "$sentinel" ]]
-          printf '%s\n' "$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT/$GITHUB_SHA" > "$sentinel"
-          python3 -m venv "$RUNNER_TEMP/gateway-workflow-validator"
-          printf '%s\n' \
-            'PyYAML==6.0.2 --hash=sha256:1f71ea527786de97d1a0cc0eacd1defc0985dcf6b3f17bb77dcfc8c34bec4dc5 --hash=sha256:80bab7bfc629882493af4aa31a4cfa43a4c57c83813253626916b8c7ada83476' \
-            > "$RUNNER_TEMP/gateway-workflow-validator.requirements.txt"
-          "$RUNNER_TEMP/gateway-workflow-validator/bin/pip" install --disable-pip-version-check \
-            --only-binary=:all: --require-hashes -r "$RUNNER_TEMP/gateway-workflow-validator.requirements.txt"
-          export PATH="$RUNNER_TEMP/gateway-workflow-validator/bin:$PATH"
-          for script in pensyve-mcp-gateway/scripts/fetch-model-bundle.sh \
-            pensyve-mcp-gateway/scripts/gateway-image-artifact.sh \
-            pensyve-mcp-gateway/scripts/promote-gateway-image.sh \
-            pensyve-mcp-gateway/scripts/test-gateway-artifact-flow.sh \
-            pensyve-mcp-gateway/scripts/test-gateway-release-image.sh \
-            pensyve-mcp-gateway/scripts/test-model-bundle.sh; do
-            bash -n "$script"
-          done
-          pensyve-mcp-gateway/scripts/test-gateway-artifact-flow.sh all
-          cargo test --locked -p pensyve-mcp-gateway -p pensyve-mcp-tools
-          cargo test --locked -p pensyve-core network_policy
-          model_container=$(docker create "pensyve-gateway:$GITHUB_SHA")
-          trap 'docker rm -f "$model_container" >/dev/null 2>&1 || true' EXIT
-          mkdir -p /tmp/pensyve-model-scratch/cache
-          docker cp "$model_container:/opt/pensyve/models/." /tmp/pensyve-model-scratch/cache
-          pensyve-mcp-gateway/scripts/test-model-bundle.sh /tmp/pensyve-model-scratch/cache all
-          HF_HOME=/tmp/pensyve-model-scratch/cache \
-            FASTEMBED_CACHE_DIR=/tmp/pensyve-model-scratch/cache \
-            HF_HUB_OFFLINE=1 PENSYVE_NETWORK_POLICY=disabled \
-            cargo test --locked -p pensyve-core --test test_no_network_invariants
-          docker rm -f "$model_container" >/dev/null
-          trap - EXIT
-          jq -e '
-            .gates.no_egress == true and .gates.read_only_root == true and
-            (.scanner.argv | index("--offline-scan")) != null and
-            (.scanner.argv | index("--skip-db-update")) != null and
-            (.scanner.argv | index("--skip-check-update")) != null
-          ' /tmp/pensyve-reviewed-artifact/evidence/release/release-evidence.json >/dev/null
-          actionlint_version=1.7.12
-          actionlint_tar_sha=325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6
-          curl --fail --location --silent --show-error \
-            "https://github.com/rhysd/actionlint/releases/download/v${actionlint_version}/actionlint_${actionlint_version}_linux_arm64.tar.gz" \
-            --output "$RUNNER_TEMP/actionlint.tar.gz"
-          printf '%s  %s\n' "$actionlint_tar_sha" "$RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check
-          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
-          [[ "$(sha256sum "$RUNNER_TEMP/actionlint" | cut -d' ' -f1)" == ac0323433c2853ec3fb978c611430c5b3dc5d43c58d1a1ec031b00ab572beb60 ]]
-          "$RUNNER_TEMP/actionlint"
-          jq -n --arg sha "$GITHUB_SHA" --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" \
-            --arg version "$actionlint_version" --arg tar_sha "$actionlint_tar_sha" \
-            '{schema_version:1,source_sha:$sha,run_id:$run,run_attempt:$attempt,status:"pass",
-              commands:{artifact_flow_all:"pass",model_bundle_all:"pass",shell_syntax:"pass",
-                gateway_tools_locked:"pass",network_policy:"pass",no_network_invariants:"pass",
-                release_no_network:"pass",actionlint:"pass"},
-              actionlint:{version:$version,archive_sha256:$tar_sha,
-                binary_sha256:"ac0323433c2853ec3fb978c611430c5b3dc5d43c58d1a1ec031b00ab572beb60"}}' \
-            > /tmp/pensyve-reviewed-artifact/evidence/source-gates.json
-          sha256sum /tmp/pensyve-reviewed-artifact/evidence/source-gates.json \
-            > /tmp/pensyve-reviewed-artifact/evidence/source-gates.sha256
-
-      - name: Seal pre-upload source evidence
-        env:
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-        run: |
-          set -euo pipefail
-          source_gate_sha=$(sha256sum /tmp/pensyve-reviewed-artifact/evidence/source-gates.json | cut -d' ' -f1)
-          jq -n --arg repo "$GITHUB_REPOSITORY" --arg ref "$GITHUB_REF" --arg sha "$GITHUB_SHA" \
-            --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" --argjson pr "$PR_NUMBER" \
-            --slurpfile pr_api "$RUNNER_TEMP/pr.json" \
-            --slurpfile image /tmp/pensyve-reviewed-artifact/evidence/image/build-result.json \
-            --slurpfile release /tmp/pensyve-reviewed-artifact/evidence/release/release-evidence.json \
-            --slurpfile source_gate /tmp/pensyve-reviewed-artifact/evidence/source-gates.json \
-            --slurpfile storage_approval /tmp/pensyve-reviewed-artifact/storage-input.json \
-            --arg source_gate_sha "$source_gate_sha" '
-            {schema_version:1,cleanup_required:false,
-             source:{repository:$repo,workflow:"Build & Deploy Gateway",
-               workflow_path:".github/workflows/deploy-gateway.yml",ref:$ref,mode:"artifact-build",
-               run_id:$run,run_attempt:$attempt,event:"workflow_dispatch",head_sha:$sha},
-             pull_request:{number:$pr,repository:$repo,state:$pr_api[0].state,draft:$pr_api[0].draft,
-               base_ref:$pr_api[0].base.ref,head_repository:$pr_api[0].head.repo.full_name,
-               head_ref:$pr_api[0].head.ref,head_sha:$pr_api[0].head.sha},
-             storage_approval:$storage_approval[0],image:$image[0],scanner:$release[0].scanner,
-             scan:$release[0].scan,gates:($release[0].gates + {
-               source_contract:$source_gate[0].status,
-               source_gate_evidence_path:"/tmp/pensyve-reviewed-artifact/evidence/source-gates.json",
-               source_gate_evidence_sha256:$source_gate_sha})}
-          ' > /tmp/pensyve-reviewed-artifact/source-evidence.json
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh materialize-model-links \
-            --root /tmp/pensyve-reviewed-artifact
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh seal-tree \
-            --root /tmp/pensyve-reviewed-artifact \
-            --manifest /tmp/pensyve-reviewed-artifact/sealed-files.sha256 \
-            --transcript /tmp/pensyve-reviewed-artifact/seal-reverify.log
-          actual_archive=$(stat -c '%s' /tmp/pensyve-reviewed-artifact/gateway-image.tar)
-          actual_uploaded_files=$(find /tmp/pensyve-reviewed-artifact -type f -printf '%s\n' | awk '{sum += $1} END {print sum+0}')
-          actual_evidence=$((actual_uploaded_files - actual_archive))
-          [[ "$actual_evidence" -ge 0 ]]
-          jq --argjson archive "$actual_archive" --argjson evidence "$actual_evidence" \
-            '.archive_bytes=$archive | .evidence_bytes=$evidence' \
-            /tmp/pensyve-reviewed-artifact/storage-input.json > "$RUNNER_TEMP/source-final-storage-input.json"
-          # This exact-tree near-ceiling gate must succeed before upload-artifact can run.
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh storage-precheck \
-            --input "$RUNNER_TEMP/source-final-storage-input.json" \
-            --output "$RUNNER_TEMP/source-final-storage-precheck.json"
-
-      - name: Upload one immutable release artifact
-        id: upload
-        # actions/upload-artifact v4
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: gateway-image-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
-          path: /tmp/pensyve-reviewed-artifact/*
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 30
-          include-hidden-files: true
-
-      - name: Reconcile REST bytes, retention, and approved ceilings
-        id: reconcile
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
-          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
-        run: |
-          set -euo pipefail
-          expected_name="gateway-image-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA}"
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" > "$RUNNER_TEMP/artifact.json"
-          jq -e --arg name "$expected_name" --arg digest "$ARTIFACT_DIGEST" --argjson run "$GITHUB_RUN_ID" '
-            .id == ($ENV.ARTIFACT_ID | tonumber) and .name == $name and .digest == $digest and .size_in_bytes > 0 and
-            .created_at != null and .expires_at != null and .expired == false and .workflow_run.id == $run
-          ' "$RUNNER_TEMP/artifact.json" >/dev/null
-          (cd /tmp/pensyve-reviewed-artifact && sha256sum --check sealed-files.sha256) \
-            | tee "$RUNNER_TEMP/source-post-upload-seal-reverify.log"
-          jq -n --slurpfile approved "$RUNNER_TEMP/source-final-storage-precheck.json" \
-            --slurpfile artifact "$RUNNER_TEMP/artifact.json" '
-            $approved[0] + {rest_size_in_bytes:$artifact[0].size_in_bytes,
-              created_at:$artifact[0].created_at,expires_at:$artifact[0].expires_at}
-          ' > "$RUNNER_TEMP/reconcile-input.json"
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh storage-reconcile \
-            --input "$RUNNER_TEMP/reconcile-input.json" --output "$RUNNER_TEMP/reconcile.json"
-          cleanup=$(jq -r '.cleanup_required' "$RUNNER_TEMP/reconcile.json")
-          status=over-ceiling
-          tuple_sha=null
-          if [[ "$cleanup" == false ]]; then
-            jq -n --slurpfile source /tmp/pensyve-reviewed-artifact/source-evidence.json \
-              --slurpfile artifact "$RUNNER_TEMP/artifact.json" --slurpfile storage "$RUNNER_TEMP/reconcile.json" \
-              --arg digest "$ARTIFACT_DIGEST" '
-              $source[0] + {cleanup_required:$storage[0].cleanup_required,storage:$storage[0],
-                scan:($source[0].scan + {source_artifact_created_at:$artifact[0].created_at}),
-                artifact:{id:$artifact[0].id,name:$artifact[0].name,server_digest:$digest,
-                  size_in_bytes:$artifact[0].size_in_bytes,created_at:$artifact[0].created_at,
-                  expires_at:$artifact[0].expires_at,retention_days:30,
-                  repository:$source[0].source.repository,run_id:$source[0].source.run_id,
-                  run_attempt:$source[0].source.run_attempt,status:"completed",conclusion:"success"}}
-            ' > "$RUNNER_TEMP/accepted-artifact-tuple.json"
-            pensyve-mcp-gateway/scripts/gateway-image-artifact.sh verify-local \
-              --tuple "$RUNNER_TEMP/accepted-artifact-tuple.json"
-            tuple_sha=$(sha256sum "$RUNNER_TEMP/accepted-artifact-tuple.json" | cut -d' ' -f1)
-            status=accepted
-          fi
-          jq -n --argjson id "$ARTIFACT_ID" --arg name "$expected_name" --arg digest "$ARTIFACT_DIGEST" \
-            --arg repository "$GITHUB_REPOSITORY" --argjson run "$GITHUB_RUN_ID" \
-            --argjson attempt "$GITHUB_RUN_ATTEMPT" --arg sha "$GITHUB_SHA" \
-            --arg status "$status" --arg tuple_sha "$tuple_sha" \
-            --arg seal_sha "$(sha256sum "$RUNNER_TEMP/source-post-upload-seal-reverify.log" | cut -d' ' -f1)" '
-            {schema_version:1,artifact_id:$id,artifact_name:$name,artifact_digest:$digest,
-             repository:$repository,run_id:$run,run_attempt:$attempt,reviewed_sha:$sha,
-             status:$status,tuple_sha256:(if $tuple_sha == "null" then null else $tuple_sha end),
-             seal_replay_sha256:$seal_sha}
-          ' > "$RUNNER_TEMP/build-custody-state.json"
-          [[ "$cleanup" == false ]]
-
-      - name: Resolve source artifact cleanup custody at terminal boundary
-        id: build-custody-resolver
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
-          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
-          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
-        run: |
-          set -euo pipefail
-          expected_name="gateway-image-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA}"
-          [[ "$UPLOAD_OUTCOME" =~ ^(success|failure|skipped)$ ]]
-          emit_source_custody() {
-            echo "artifact_id=${1}" >> "$GITHUB_OUTPUT"
-            echo "artifact_name=$expected_name" >> "$GITHUB_OUTPUT"
-            echo "repository=$GITHUB_REPOSITORY" >> "$GITHUB_OUTPUT"
-            echo "run_id=$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
-            echo "cleanup_status=${2}" >> "$GITHUB_OUTPUT"
-            echo "cleanup_required=${3}" >> "$GITHUB_OUTPUT"
-          }
-          if [[ ! "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]; then
-            # source-upload-name-lookup: an interrupted upload can lose action
-            # outputs even though GitHub retained the bytes.  Resolve custody by
-            # exact deterministic name in this repository and workflow run.
-            # source-upload-quiescence: retry a successful action whose output
-            # response was lost, and only call failure/skipped no-upload after
-            # the same bounded authenticated inventory quiescence.
-            matches=0
-            for attempt in 1 2 3; do
-              timeout 30 gh api --method GET --paginate --slurp \
-                "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
-                -f per_page=100 -f name="$expected_name" > "$RUNNER_TEMP/source-upload-name-lookup.json"
-              matches=$(jq --arg name "$expected_name" --argjson run "$GITHUB_RUN_ID" '
-                [.[] | .artifacts[] | select(.name == $name and .workflow_run.id == $run)] | length
-              ' "$RUNNER_TEMP/source-upload-name-lookup.json")
-              if [[ "$matches" == 1 ]]; then break; fi
-              if [[ "$matches" -gt 1 ]]; then
-                emit_source_custody "" post-upload-ambiguous true
-                echo "ambiguous source upload custody: matches=$matches" >&2
-                exit 1
-              fi
-              [[ "$attempt" == 3 ]] || sleep 2
-            done
-            if [[ "$matches" == 0 ]]; then
-              if [[ "$UPLOAD_OUTCOME" == success ]]; then
-                emit_source_custody "" post-upload-unresolved true
-              else
-                emit_source_custody "" no-upload false
-              fi
-              exit 0
-            fi
-            ARTIFACT_ID=$(jq -r --arg name "$expected_name" --argjson run "$GITHUB_RUN_ID" \
-              '.[] | .artifacts[] | select(.name == $name and .workflow_run.id == $run) | .id' \
-              "$RUNNER_TEMP/source-upload-name-lookup.json")
-            ARTIFACT_DIGEST=$(jq -r --arg name "$expected_name" --argjson run "$GITHUB_RUN_ID" \
-              '.[] | .artifacts[] | select(.name == $name and .workflow_run.id == $run) | .digest' \
-              "$RUNNER_TEMP/source-upload-name-lookup.json")
-            jq -e --argjson id "$ARTIFACT_ID" --arg name "$expected_name" \
-              --arg digest "$ARTIFACT_DIGEST" --argjson run "$GITHUB_RUN_ID" '
-              [.[] | .artifacts[] | select(.id == $id and .name == $name and .digest == $digest and
-                .workflow_run.id == $run and .expired == false and .size_in_bytes > 0 and
-                (.created_at | type == "string") and (.expires_at | type == "string"))] | length == 1
-            ' "$RUNNER_TEMP/source-upload-name-lookup.json" >/dev/null
-          fi
-          cleanup=true
-          status=post-upload-invalid
-          if [[ -s "$RUNNER_TEMP/build-custody-state.json" ]] &&
-             jq -e --argjson id "$ARTIFACT_ID" --arg name "$expected_name" --arg digest "$ARTIFACT_DIGEST" \
-               --arg repo "$GITHUB_REPOSITORY" --argjson run "$GITHUB_RUN_ID" \
-               --argjson attempt "$GITHUB_RUN_ATTEMPT" --arg sha "$GITHUB_SHA" '
-               .schema_version == 1 and .artifact_id == $id and .artifact_name == $name and
-               .artifact_digest == $digest and .repository == $repo and .run_id == $run and
-               .run_attempt == $attempt and .reviewed_sha == $sha and
-               (.seal_replay_sha256 | test("^[0-9a-f]{64}$")) and
-               (.status == "accepted" or .status == "over-ceiling") and
-               (if .status == "accepted" then (.tuple_sha256 | test("^[0-9a-f]{64}$")) else .tuple_sha256 == null end)
-             ' "$RUNNER_TEMP/build-custody-state.json" >/dev/null; then
-            status=$(jq -r '.status' "$RUNNER_TEMP/build-custody-state.json")
-            if [[ "$status" == accepted && "$UPLOAD_OUTCOME" == success ]]; then cleanup=false; fi
-          fi
-          emit_source_custody "$ARTIFACT_ID" "$status" "$cleanup"
-
-  artifact-promote-preflight:
-    name: Verify exact reviewed artifact without mutation authority
-    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'artifact-promote'
+  preflight:
+    name: Validate trusted-main custody without production authority
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: read
-      pull-requests: read
     outputs:
-      cleanup_required: ${{ steps.handoff-custody-resolver.outputs.cleanup_required }}
-      cleanup_artifact_id: ${{ steps.handoff-custody-resolver.outputs.artifact_id }}
-      cleanup_artifact_name: ${{ steps.handoff-custody-resolver.outputs.artifact_name }}
-      cleanup_artifact_digest: ${{ steps.handoff-custody-resolver.outputs.artifact_digest }}
-      cleanup_artifact_size: ${{ steps.handoff-custody-resolver.outputs.artifact_size }}
-      cleanup_artifact_created_at: ${{ steps.handoff-custody-resolver.outputs.artifact_created_at }}
-      cleanup_artifact_expires_at: ${{ steps.handoff-custody-resolver.outputs.artifact_expires_at }}
-      source_artifact_expires_at: ${{ steps.handoff-custody-resolver.outputs.source_artifact_expires_at }}
-      cleanup_repository: ${{ steps.handoff-custody-resolver.outputs.repository }}
-      cleanup_run_id: ${{ steps.handoff-custody-resolver.outputs.run_id }}
-      cleanup_run_attempt: ${{ steps.handoff-custody-resolver.outputs.run_attempt }}
-      cleanup_reviewed_sha: ${{ steps.handoff-custody-resolver.outputs.reviewed_sha }}
-      cleanup_status: ${{ steps.handoff-custody-resolver.outputs.cleanup_status }}
+      custody_sha256: ${{ steps.custody.outputs.custody_sha256 }}
+      source_sha: ${{ steps.custody.outputs.source_sha }}
+      source_tree: ${{ steps.custody.outputs.source_tree }}
+      manifest_digest: ${{ steps.custody.outputs.manifest_digest }}
+      account: ${{ steps.custody.outputs.account }}
     steps:
-      - name: Bind promotion run and exact Task 5 pull request before checkout
+      - name: Canonicalize and bind custody to exact current main
+        id: custody
         env:
+          CUSTODY_JSON: ${{ inputs.custody_json }}
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ inputs.pull_request_number }}
-          REVIEWED_PR_NUMBER: ${{ vars.TASK5_REVIEWED_PULL_REQUEST_NUMBER }}
-          REVIEWED_SHA: ${{ vars.TASK5_REVIEWED_SHA }}
-          REVIEWED_REF: ${{ vars.TASK5_REVIEWED_REF }}
-          REVIEWED_PR_STATE: ${{ vars.TASK5_REVIEWED_PR_STATE }}
-          REVIEWED_PR_DRAFT: ${{ vars.TASK5_REVIEWED_PR_DRAFT }}
+          EXPECTED_SHA: ${{ github.sha }}
+          EXPECTED_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
-          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ && "$PR_NUMBER" == "$REVIEWED_PR_NUMBER" && "$REVIEWED_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$REVIEWED_PR_STATE" == open && "$REVIEWED_PR_DRAFT" == false ]]
-          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_WORKFLOW" == "Build & Deploy Gateway" ]]
-          [[ "$GITHUB_WORKFLOW_REF" == "$GITHUB_REPOSITORY/.github/workflows/deploy-gateway.yml@refs/heads/$REVIEWED_REF" ]]
-          [[ "$GITHUB_REF" == "refs/heads/$REVIEWED_REF" && "$GITHUB_SHA" == "$REVIEWED_SHA" ]]
-          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ && "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
-          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" > "$RUNNER_TEMP/pr.json"
-          jq -e --arg repo "$GITHUB_REPOSITORY" --arg ref "$REVIEWED_REF" --arg sha "$REVIEWED_SHA" \
-            --arg reviewed_state "$REVIEWED_PR_STATE" --argjson reviewed_draft "$REVIEWED_PR_DRAFT" '
-            .state == $reviewed_state and .draft == $reviewed_draft and .base.ref == "main" and
-            .base.repo.full_name == $repo and .head.repo.full_name == $repo and
-            .head.ref == $ref and .head.sha == $sha
-          ' "$RUNNER_TEMP/pr.json" >/dev/null
-
-      - name: Fetch exact reviewed source artifact and run metadata
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_RUN_ID: ${{ vars.TASK5_REVIEWED_RUN_ID }}
-          SOURCE_RUN_ATTEMPT: ${{ vars.TASK5_REVIEWED_RUN_ATTEMPT }}
-          ARTIFACT_ID: ${{ vars.TASK5_REVIEWED_ARTIFACT_ID }}
-          ARTIFACT_NAME: ${{ vars.TASK5_REVIEWED_ARTIFACT_NAME }}
-          ARTIFACT_DIGEST: ${{ vars.TASK5_REVIEWED_ARTIFACT_DIGEST }}
-          ARTIFACT_SIZE: ${{ vars.TASK5_REVIEWED_ARTIFACT_SIZE }}
-          ARTIFACT_CREATED_AT: ${{ vars.TASK5_REVIEWED_ARTIFACT_CREATED_AT }}
-          ARTIFACT_EXPIRES_AT: ${{ vars.TASK5_REVIEWED_ARTIFACT_EXPIRES_AT }}
-          REVIEWED_REF: ${{ vars.TASK5_REVIEWED_REF }}
-        run: |
-          set -euo pipefail
-          for value in "$SOURCE_RUN_ID" "$SOURCE_RUN_ATTEMPT" "$ARTIFACT_ID" "$ARTIFACT_NAME" "$ARTIFACT_DIGEST" "$ARTIFACT_SIZE" "$ARTIFACT_CREATED_AT" "$ARTIFACT_EXPIRES_AT" "$REVIEWED_REF"; do [[ -n "$value" ]]; done
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" > "$RUNNER_TEMP/source-run.json"
-          jq -e --arg repo "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" --arg ref "$REVIEWED_REF" --argjson attempt "$SOURCE_RUN_ATTEMPT" '
-            .repository.full_name == $repo and .name == "Build & Deploy Gateway" and
-            .path == ".github/workflows/deploy-gateway.yml" and .event == "workflow_dispatch" and
-            .head_branch == $ref and .head_sha == $sha and .run_attempt == $attempt and
-            .status == "completed" and .conclusion == "success"
-          ' "$RUNNER_TEMP/source-run.json" >/dev/null
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" > "$RUNNER_TEMP/artifact.json"
-          jq -e --arg name "$ARTIFACT_NAME" --arg digest "$ARTIFACT_DIGEST" \
-            --arg created "$ARTIFACT_CREATED_AT" --arg expires "$ARTIFACT_EXPIRES_AT" \
-            --argjson size "$ARTIFACT_SIZE" --argjson run "$SOURCE_RUN_ID" '
-            .name == $name and .digest == $digest and .size_in_bytes == $size and
-            .created_at == $created and .expires_at == $expires and
-            .expired == false and .workflow_run.id == $run
-          ' "$RUNNER_TEMP/artifact.json" >/dev/null
-          mkdir -p /tmp/pensyve-reviewed-artifact
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" > "$RUNNER_TEMP/artifact.zip"
-          [[ "sha256:$(sha256sum "$RUNNER_TEMP/artifact.zip" | cut -d' ' -f1)" == "$ARTIFACT_DIGEST" ]]
-          [[ "$(stat -c '%s' "$RUNNER_TEMP/artifact.zip")" == "$ARTIFACT_SIZE" ]]
-          unzip -q "$RUNNER_TEMP/artifact.zip" -d /tmp/pensyve-reviewed-artifact
-          (cd /tmp/pensyve-reviewed-artifact && sha256sum --check sealed-files.sha256) \
-            | tee "$RUNNER_TEMP/source-seal-reverify.log"
-
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-
-      - name: Reconstruct and verify complete immutable tuple
-        id: verify
-        env:
-          PR_NUMBER: ${{ inputs.pull_request_number }}
-          SOURCE_RUN_ID: ${{ vars.TASK5_REVIEWED_RUN_ID }}
-          SOURCE_RUN_ATTEMPT: ${{ vars.TASK5_REVIEWED_RUN_ATTEMPT }}
-          ARTIFACT_DIGEST: ${{ vars.TASK5_REVIEWED_ARTIFACT_DIGEST }}
-          HANDOFF_BILLING_SNAPSHOT_AT: ${{ vars.GATEWAY_HANDOFF_BILLING_SNAPSHOT_AT }}
-          APPROVED_GB_HOURS: ${{ vars.GATEWAY_ARTIFACT_APPROVED_GB_HOURS }}
-          APPROVED_DOLLARS: ${{ vars.GATEWAY_ARTIFACT_APPROVED_DOLLARS }}
-          PRICE_PER_GB_MONTH: ${{ vars.GATEWAY_ARTIFACT_PRICE_PER_GB_MONTH }}
-          HANDOFF_CURRENT_BILLABLE_BYTES: ${{ vars.GATEWAY_HANDOFF_CURRENT_BILLABLE_BYTES }}
-          HANDOFF_OVERHEAD_BYTES: ${{ vars.GATEWAY_ARTIFACT_HANDOFF_OVERHEAD_BYTES }}
-          HANDOFF_ORGANIZATION_ACTIONS_ARTIFACT_BYTES: ${{ vars.GATEWAY_HANDOFF_ORG_ACTIONS_ARTIFACT_BYTES }}
-          HANDOFF_ORGANIZATION_PACKAGES_BYTES: ${{ vars.GATEWAY_HANDOFF_ORG_PACKAGES_BYTES }}
-          HANDOFF_INCLUDED_SOURCE_ARTIFACT_ID: ${{ vars.GATEWAY_HANDOFF_INCLUDED_SOURCE_ARTIFACT_ID }}
-          HANDOFF_INCLUDED_SOURCE_ARTIFACT_BYTES: ${{ vars.GATEWAY_HANDOFF_INCLUDED_SOURCE_ARTIFACT_BYTES }}
-          BILLING_UNIT: ${{ vars.GATEWAY_ARTIFACT_BILLING_UNIT }}
-          PAYMENT_STATUS: ${{ vars.GATEWAY_ARTIFACT_PAYMENT_STATUS }}
-          SPENDING_STATUS: ${{ vars.GATEWAY_ARTIFACT_SPENDING_STATUS }}
-          TASK8_SERVICE_SNAPSHOT: ${{ vars.TASK8_BASELINE_SERVICE_SNAPSHOT_JSON }}
-          TASK8_SERVICE_SNAPSHOT_SHA256: ${{ vars.TASK8_BASELINE_SERVICE_SNAPSHOT_SHA256 }}
-        run: |
-          set -euo pipefail
-          for value in "$HANDOFF_BILLING_SNAPSHOT_AT" "$APPROVED_GB_HOURS" "$APPROVED_DOLLARS" "$PRICE_PER_GB_MONTH" "$HANDOFF_CURRENT_BILLABLE_BYTES" "$HANDOFF_OVERHEAD_BYTES" "$HANDOFF_ORGANIZATION_ACTIONS_ARTIFACT_BYTES" "$HANDOFF_ORGANIZATION_PACKAGES_BYTES" "$HANDOFF_INCLUDED_SOURCE_ARTIFACT_ID" "$HANDOFF_INCLUDED_SOURCE_ARTIFACT_BYTES" "$BILLING_UNIT" "$PAYMENT_STATUS" "$SPENDING_STATUS" "$TASK8_SERVICE_SNAPSHOT" "$TASK8_SERVICE_SNAPSHOT_SHA256"; do [[ -n "$value" ]]; done
-          printf '%s\n' "$TASK8_SERVICE_SNAPSHOT" | jq -S -c . > "$RUNNER_TEMP/task8-service-snapshot.json"
-          [[ "$(sha256sum "$RUNNER_TEMP/task8-service-snapshot.json" | cut -d' ' -f1)" == "$TASK8_SERVICE_SNAPSHOT_SHA256" ]]
-          jq -n --slurpfile source /tmp/pensyve-reviewed-artifact/source-evidence.json \
-            --slurpfile artifact "$RUNNER_TEMP/artifact.json" --slurpfile reviewed_pr "$RUNNER_TEMP/pr.json" \
-            --arg digest "$ARTIFACT_DIGEST" '
-            $source[0] + {scan:($source[0].scan + {source_artifact_created_at:$artifact[0].created_at}),
-              artifact:{id:$artifact[0].id,name:$artifact[0].name,server_digest:$digest,
-              size_in_bytes:$artifact[0].size_in_bytes,created_at:$artifact[0].created_at,
-              expires_at:$artifact[0].expires_at,retention_days:30,
-              repository:$source[0].source.repository,run_id:$source[0].source.run_id,
-              run_attempt:$source[0].source.run_attempt,status:"completed",conclusion:"success"},
-              reviewed_pull_request:{number:$reviewed_pr[0].number,
-                repository:$reviewed_pr[0].base.repo.full_name,state:$reviewed_pr[0].state,
-                draft:$reviewed_pr[0].draft,base_ref:$reviewed_pr[0].base.ref,
-                head_repository:$reviewed_pr[0].head.repo.full_name,
-                head_ref:$reviewed_pr[0].head.ref,head_sha:$reviewed_pr[0].head.sha}}
-          ' > /tmp/pensyve-reviewed-artifact/artifact-tuple.json
-          source_archive=$(stat -c '%s' /tmp/pensyve-reviewed-artifact/gateway-image.tar)
-          source_uploaded_files=$(find /tmp/pensyve-reviewed-artifact -type f -printf '%s\n' | awk '{sum += $1} END {print sum+0}')
-          source_evidence=$((source_uploaded_files - source_archive))
-          jq --argjson archive "$source_archive" --argjson evidence "$source_evidence" \
-            '.archive_bytes=$archive | .evidence_bytes=$evidence' \
-            /tmp/pensyve-reviewed-artifact/storage-input.json > "$RUNNER_TEMP/source-replayed-storage-input.json"
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh storage-precheck \
-            --input "$RUNNER_TEMP/source-replayed-storage-input.json" \
-            --output "$RUNNER_TEMP/source-replayed-storage-precheck.json" \
-            --replay-reference "$(jq -r '.created_at' "$RUNNER_TEMP/artifact.json")"
-          jq -n --slurpfile storage "$RUNNER_TEMP/source-replayed-storage-precheck.json" \
-            --slurpfile artifact "$RUNNER_TEMP/artifact.json" '
-            $storage[0] + {rest_size_in_bytes:$artifact[0].size_in_bytes,
-              created_at:$artifact[0].created_at,expires_at:$artifact[0].expires_at}
-          ' > "$RUNNER_TEMP/reconcile-input.json"
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh storage-reconcile \
-            --input "$RUNNER_TEMP/reconcile-input.json" --output "$RUNNER_TEMP/reconcile.json"
-          jq --slurpfile storage "$RUNNER_TEMP/reconcile.json" \
-            '.storage=$storage[0] | .cleanup_required=$storage[0].cleanup_required' \
-            /tmp/pensyve-reviewed-artifact/artifact-tuple.json > "$RUNNER_TEMP/complete-tuple.json"
-          cleanup=$(jq -r '.cleanup_required' "$RUNNER_TEMP/complete-tuple.json")
-          [[ "$cleanup" == false ]]
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh verify-local --tuple "$RUNNER_TEMP/complete-tuple.json"
-          probe_nonce=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
-          [[ "$probe_nonce" =~ ^[0-9a-f]{16}$ ]]
-          probe_entity="task9-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${probe_nonce}"
-          jq -n --slurpfile tuple "$RUNNER_TEMP/complete-tuple.json" \
-            --argjson pr "$PR_NUMBER" --arg repo "$GITHUB_REPOSITORY" \
-            --argjson run "$SOURCE_RUN_ID" --argjson attempt "$SOURCE_RUN_ATTEMPT" \
-            --arg promotion_sha "$GITHUB_SHA" --arg region "us-east-2" \
-            --arg registry "${{ vars.TASK8_ECR_REGISTRY }}" \
-            --arg baseline_arn "${{ vars.TASK8_BASELINE_TASK_DEFINITION_ARN }}" \
-            --arg baseline_image "${{ vars.TASK8_BASELINE_IMAGE }}" \
-            --arg env_sha "${{ vars.TASK8_BASELINE_ENVIRONMENT_SHA256 }}" \
-            --slurpfile service_snapshot "$RUNNER_TEMP/task8-service-snapshot.json" \
-            --arg service_snapshot_sha "$TASK8_SERVICE_SNAPSHOT_SHA256" \
-            --arg probe_entity "$probe_entity" \
-            --argjson promotion_run "$GITHUB_RUN_ID" --argjson promotion_attempt "$GITHUB_RUN_ATTEMPT" '
-            {repository:$repo,workflow:$tuple[0].source.workflow,workflow_path:$tuple[0].source.workflow_path,
-             ref:$tuple[0].source.ref,event:$tuple[0].source.event,run_id:$run,run_attempt:$attempt,
-             head_sha:$tuple[0].source.head_sha,pull_request_number:$pr,
-             artifact_id:$tuple[0].artifact.id,artifact_name:$tuple[0].artifact.name,
-             promotion_event:"workflow_dispatch",promotion_head_sha:$promotion_sha,
-             reviewed_pull_request_number:$tuple[0].reviewed_pull_request.number,
-             reviewed_pull_request_repository:$tuple[0].reviewed_pull_request.repository,
-             reviewed_pull_request_state:$tuple[0].reviewed_pull_request.state,
-             reviewed_pull_request_draft:$tuple[0].reviewed_pull_request.draft,
-             reviewed_pull_request_base_ref:$tuple[0].reviewed_pull_request.base_ref,
-             reviewed_pull_request_head_repository:$tuple[0].reviewed_pull_request.head_repository,
-             reviewed_pull_request_head_ref:$tuple[0].reviewed_pull_request.head_ref,
-             reviewed_pull_request_head_sha:$tuple[0].reviewed_pull_request.head_sha,
-             deployment:{region:$region,ecr_registry:$registry,ecr_repository:"pensyve-gateway",
-               cluster:"pensyve-prod",service:"pensyve-prod-gateway",gateway_container:"gateway",
-               baseline_task_definition_arn:$baseline_arn,baseline_image:$baseline_image,
-               baseline_environment_sha256:$env_sha,baseline_service_snapshot:$service_snapshot[0],
-               baseline_service_snapshot_sha256:$service_snapshot_sha,
-               probe_entity:$probe_entity,
-               promotion_run_id:$promotion_run,promotion_run_attempt:$promotion_attempt,
-               cpu:"512",memory:"4096",
-               desired_count:2,running_count:2,pending_count:0}}
-          ' > "$RUNNER_TEMP/request.json"
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh fetch-verify \
-            --tuple "$RUNNER_TEMP/complete-tuple.json" --request "$RUNNER_TEMP/request.json" \
-            --output /tmp/pensyve-reviewed-artifact/verified-image.json
-          mkdir -p /tmp/pensyve-promotion-handoff
-          cp -- "$RUNNER_TEMP/complete-tuple.json" /tmp/pensyve-promotion-handoff/complete-tuple.json
-          cp -- /tmp/pensyve-reviewed-artifact/verified-image.json /tmp/pensyve-promotion-handoff/verified-image.json
-          source_snapshot=$(jq -r '.storage.snapshot_at' "$RUNNER_TEMP/complete-tuple.json")
-          source_id=$(jq -r '.artifact.id' "$RUNNER_TEMP/complete-tuple.json")
-          source_bytes=$(jq -r '.artifact.size_in_bytes' "$RUNNER_TEMP/complete-tuple.json")
-          available=$(df --output=avail -B1 /tmp | awk 'NR==2 {print $1}')
-          [[ "$HANDOFF_INCLUDED_SOURCE_ARTIFACT_ID" == "$source_id" && "$HANDOFF_INCLUDED_SOURCE_ARTIFACT_BYTES" == "$source_bytes" ]]
-          jq -n --arg snapshot "$HANDOFF_BILLING_SNAPSHOT_AT" --arg source_snapshot "$source_snapshot" \
-            --argjson ceiling_gbh "$APPROVED_GB_HOURS" --argjson ceiling_dollars "$APPROVED_DOLLARS" \
-            --argjson price "$PRICE_PER_GB_MONTH" --argjson current "$HANDOFF_CURRENT_BILLABLE_BYTES" \
-            --argjson handoff "$HANDOFF_OVERHEAD_BYTES" --argjson available "$available" \
-            --argjson org_actions "$HANDOFF_ORGANIZATION_ACTIONS_ARTIFACT_BYTES" \
-            --argjson org_packages "$HANDOFF_ORGANIZATION_PACKAGES_BYTES" \
-            --argjson retained_id "$HANDOFF_INCLUDED_SOURCE_ARTIFACT_ID" \
-            --argjson retained_bytes "$HANDOFF_INCLUDED_SOURCE_ARTIFACT_BYTES" --arg unit "$BILLING_UNIT" \
-            --arg payment "$PAYMENT_STATUS" --arg spending "$SPENDING_STATUS" \
-            '{schema_version:1,snapshot_at:$snapshot,approved_gb_hours_ceiling:$ceiling_gbh,
-              approved_dollar_ceiling:$ceiling_dollars,price_per_gb_month:$price,
-              current_billable_bytes:$current,archive_bytes:0,evidence_bytes:0,
-              container_overhead_bytes:0,handoff_overhead_bytes:$handoff,
-              runner_available_bytes:$available,organization_actions_artifact_bytes:$org_actions,
-              organization_packages_bytes:$org_packages,billing_unit:$unit,
-              snapshot_inclusion_mode:"source-included",retained_source_artifact_id:$retained_id,
-              retained_source_artifact_bytes:$retained_bytes,source_snapshot_at:$source_snapshot,
-              payment_status:$payment,spending_status:$spending}' \
-            > /tmp/pensyve-promotion-handoff/storage-approval.json
-          complete_sha=$(sha256sum /tmp/pensyve-promotion-handoff/complete-tuple.json | cut -d' ' -f1)
-          verified_sha=$(sha256sum /tmp/pensyve-reviewed-artifact/verified-image.json | cut -d' ' -f1)
-          storage_approval_sha=$(sha256sum /tmp/pensyve-promotion-handoff/storage-approval.json | cut -d' ' -f1)
-          jq -n --slurpfile tuple "$RUNNER_TEMP/complete-tuple.json" \
-            --arg repository "$GITHUB_REPOSITORY" --arg workflow "$GITHUB_WORKFLOW" \
-            --arg workflow_path ".github/workflows/deploy-gateway.yml" \
-            --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" \
-            --arg reviewed_sha "$GITHUB_SHA" --arg complete_sha "$complete_sha" \
-            --arg verified_sha "$verified_sha" --arg storage_approval_sha "$storage_approval_sha" \
-            --arg probe_entity "$probe_entity" '
-            {schema_version:1,repository:$repository,workflow:$workflow,workflow_path:$workflow_path,
-             run_id:$run,run_attempt:$attempt,reviewed_sha:$reviewed_sha,
-             source_artifact:$tuple[0].artifact,reviewed_pull_request:$tuple[0].reviewed_pull_request,
-             complete_tuple_sha256:$complete_sha,verified_image_sha256:$verified_sha,
-             storage_approval_sha256:$storage_approval_sha,probe_entity:$probe_entity}
-          ' > /tmp/pensyve-promotion-handoff/handoff-metadata.json
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh seal-tree \
-            --root /tmp/pensyve-promotion-handoff \
-            --manifest /tmp/pensyve-promotion-handoff/sealed-files.sha256 \
-            --transcript /tmp/pensyve-promotion-handoff/seal-reverify.log
-          actual_handoff=$(find /tmp/pensyve-promotion-handoff -type f -printf '%s\n' | awk '{sum += $1} END {print sum+0}')
-          jq --argjson evidence "$actual_handoff" '.evidence_bytes=$evidence' \
-            /tmp/pensyve-promotion-handoff/storage-approval.json > "$RUNNER_TEMP/handoff-storage-input.json"
-          # A near-ceiling result fails here, before the paid handoff upload is invoked.
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh storage-precheck \
-            --input "$RUNNER_TEMP/handoff-storage-input.json" --output "$RUNNER_TEMP/handoff-storage-precheck.json"
-
-      - name: Upload one immutable current-run promotion handoff
-        id: handoff-upload
-        # actions/upload-artifact v4
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: gateway-handoff-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
-          path: /tmp/pensyve-promotion-handoff/*
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 30
-
-      - name: Reconcile current-run handoff REST and storage ceilings
-        id: handoff-reconcile
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ARTIFACT_ID: ${{ steps.handoff-upload.outputs.artifact-id }}
-          ARTIFACT_DIGEST: ${{ steps.handoff-upload.outputs.artifact-digest }}
-        run: |
-          set -euo pipefail
-          expected_name="gateway-handoff-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA}"
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}" > "$RUNNER_TEMP/handoff-artifact.json"
-          jq -e --argjson id "$ARTIFACT_ID" --arg name "$expected_name" --arg digest "$ARTIFACT_DIGEST" \
-            --argjson run "$GITHUB_RUN_ID" '
-            .id == $id and .name == $name and .digest == $digest and .size_in_bytes > 0 and
-            .created_at != null and .expires_at != null and .expired == false and .workflow_run.id == $run
-          ' "$RUNNER_TEMP/handoff-artifact.json" >/dev/null
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh verify-tree \
-            --root /tmp/pensyve-promotion-handoff \
-            --input /tmp/pensyve-promotion-handoff/sealed-tree.json \
-            --transcript "$RUNNER_TEMP/handoff-post-upload-seal-reverify.log"
-          jq -n --slurpfile approved "$RUNNER_TEMP/handoff-storage-precheck.json" \
-            --slurpfile artifact "$RUNNER_TEMP/handoff-artifact.json" '
-            $approved[0] + {rest_size_in_bytes:$artifact[0].size_in_bytes,
-              created_at:$artifact[0].created_at,expires_at:$artifact[0].expires_at}
-          ' > "$RUNNER_TEMP/handoff-reconcile-input.json"
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh storage-reconcile \
-            --input "$RUNNER_TEMP/handoff-reconcile-input.json" --output "$RUNNER_TEMP/handoff-reconcile.json"
-          cleanup=$(jq -r '.cleanup_required' "$RUNNER_TEMP/handoff-reconcile.json")
-          status=$(jq -r '.status' "$RUNNER_TEMP/handoff-reconcile.json")
-          jq -n --argjson id "$ARTIFACT_ID" --arg name "$expected_name" --arg digest "$ARTIFACT_DIGEST" \
-            --argjson size "$(jq -r '.size_in_bytes' "$RUNNER_TEMP/handoff-artifact.json")" \
-            --arg created "$(jq -r '.created_at' "$RUNNER_TEMP/handoff-artifact.json")" \
-            --arg expires "$(jq -r '.expires_at' "$RUNNER_TEMP/handoff-artifact.json")" \
-            --arg repository "$GITHUB_REPOSITORY" --argjson run "$GITHUB_RUN_ID" \
-            --argjson attempt "$GITHUB_RUN_ATTEMPT" --arg sha "$GITHUB_SHA" --arg status "$status" \
-            --arg seal_sha "$(sha256sum "$RUNNER_TEMP/handoff-post-upload-seal-reverify.log" | cut -d' ' -f1)" '
-            {schema_version:1,artifact_id:$id,artifact_name:$name,artifact_digest:$digest,
-             artifact_size:$size,artifact_created_at:$created,artifact_expires_at:$expires,
-             repository:$repository,run_id:$run,run_attempt:$attempt,reviewed_sha:$sha,
-             status:$status,seal_replay_sha256:$seal_sha}
-          ' > "$RUNNER_TEMP/handoff-custody-state.json"
-          [[ "$cleanup" == false ]]
-
-      - name: Resolve handoff artifact cleanup custody at terminal boundary
-        id: handoff-custody-resolver
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ARTIFACT_ID: ${{ steps.handoff-upload.outputs.artifact-id }}
-          ARTIFACT_DIGEST: ${{ steps.handoff-upload.outputs.artifact-digest }}
-          UPLOAD_OUTCOME: ${{ steps.handoff-upload.outcome }}
-        run: |
-          set -euo pipefail
-          expected_name="gateway-handoff-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA}"
-          [[ "$UPLOAD_OUTCOME" =~ ^(success|failure|skipped)$ ]]
-          emit_handoff_custody() {
-            local id="$1" digest="$2" status="$3" cleanup="$4"
-            echo "artifact_id=$id" >> "$GITHUB_OUTPUT"
-            echo "artifact_name=$expected_name" >> "$GITHUB_OUTPUT"
-            echo "artifact_digest=$digest" >> "$GITHUB_OUTPUT"
-            for field in artifact_size artifact_created_at artifact_expires_at; do echo "$field=" >> "$GITHUB_OUTPUT"; done
-            echo "repository=$GITHUB_REPOSITORY" >> "$GITHUB_OUTPUT"
-            echo "run_id=$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
-            echo "run_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
-            echo "reviewed_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
-            if [[ -s /tmp/pensyve-promotion-handoff/handoff-metadata.json ]]; then
-              echo "source_artifact_expires_at=$(jq -r '.source_artifact.expires_at' /tmp/pensyve-promotion-handoff/handoff-metadata.json)" >> "$GITHUB_OUTPUT"
-            else
-              echo "source_artifact_expires_at=" >> "$GITHUB_OUTPUT"
-            fi
-            echo "cleanup_status=$status" >> "$GITHUB_OUTPUT"
-            echo "cleanup_required=$cleanup" >> "$GITHUB_OUTPUT"
-          }
-          if [[ ! "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]; then
-            # handoff-upload-name-lookup: resolve ambiguous upload custody from
-            # the authenticated current-repository/current-run REST inventory.
-            # handoff-upload-quiescence: preserve exact cleanup custody through
-            # lost action outputs and all terminal action outcomes.
-            matches=0
-            for attempt in 1 2 3; do
-              timeout 30 gh api --method GET --paginate --slurp \
-                "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
-                -f per_page=100 -f name="$expected_name" > "$RUNNER_TEMP/handoff-upload-name-lookup.json"
-              matches=$(jq --arg name "$expected_name" --argjson run "$GITHUB_RUN_ID" '
-                [.[] | .artifacts[] | select(.name == $name and .workflow_run.id == $run)] | length
-              ' "$RUNNER_TEMP/handoff-upload-name-lookup.json")
-              if [[ "$matches" == 1 ]]; then break; fi
-              if [[ "$matches" -gt 1 ]]; then
-                emit_handoff_custody "" "" post-upload-ambiguous true
-                echo "ambiguous handoff upload custody: matches=$matches" >&2
-                exit 1
-              fi
-              [[ "$attempt" == 3 ]] || sleep 2
-            done
-            if [[ "$matches" == 0 ]]; then
-              if [[ "$UPLOAD_OUTCOME" == success ]]; then
-                emit_handoff_custody "" "" post-upload-unresolved true
-              else
-                emit_handoff_custody "" "" no-upload false
-              fi
-              exit 0
-            fi
-            ARTIFACT_ID=$(jq -r --arg name "$expected_name" --argjson run "$GITHUB_RUN_ID" \
-              '.[] | .artifacts[] | select(.name == $name and .workflow_run.id == $run) | .id' \
-              "$RUNNER_TEMP/handoff-upload-name-lookup.json")
-            ARTIFACT_DIGEST=$(jq -r --arg name "$expected_name" --argjson run "$GITHUB_RUN_ID" \
-              '.[] | .artifacts[] | select(.name == $name and .workflow_run.id == $run) | .digest' \
-              "$RUNNER_TEMP/handoff-upload-name-lookup.json")
-            jq -e --argjson id "$ARTIFACT_ID" --arg name "$expected_name" \
-              --arg digest "$ARTIFACT_DIGEST" --argjson run "$GITHUB_RUN_ID" '
-              [.[] | .artifacts[] | select(.id == $id and .name == $name and .digest == $digest and
-                .workflow_run.id == $run and .expired == false and .size_in_bytes > 0 and
-                (.created_at | type == "string") and (.expires_at | type == "string"))] | length == 1
-            ' "$RUNNER_TEMP/handoff-upload-name-lookup.json" >/dev/null
-          fi
-          cleanup=true
-          status=post-upload-invalid
-          state="$RUNNER_TEMP/handoff-custody-state.json"
-          if [[ -s "$state" ]] &&
-             jq -e --argjson id "$ARTIFACT_ID" --arg name "$expected_name" --arg digest "$ARTIFACT_DIGEST" \
-               --arg repo "$GITHUB_REPOSITORY" --argjson run "$GITHUB_RUN_ID" \
-               --argjson attempt "$GITHUB_RUN_ATTEMPT" --arg sha "$GITHUB_SHA" '
-               .schema_version == 1 and .artifact_id == $id and .artifact_name == $name and
-               .artifact_digest == $digest and .artifact_size > 0 and
-               (.artifact_created_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
-               (.artifact_expires_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
-               ((.artifact_expires_at | fromdateiso8601) > (.artifact_created_at | fromdateiso8601)) and
-               .repository == $repo and .run_id == $run and .run_attempt == $attempt and
-               .reviewed_sha == $sha and (.seal_replay_sha256 | test("^[0-9a-f]{64}$")) and
-               (.status == "accepted" or .status == "over-ceiling")
-             ' "$state" >/dev/null; then
-            status=$(jq -r '.status' "$state")
-            if [[ "$status" == accepted && "$UPLOAD_OUTCOME" == success ]]; then cleanup=false; fi
-          fi
-          echo "artifact_id=$ARTIFACT_ID" >> "$GITHUB_OUTPUT"
-          echo "artifact_name=$expected_name" >> "$GITHUB_OUTPUT"
-          echo "artifact_digest=$ARTIFACT_DIGEST" >> "$GITHUB_OUTPUT"
-          if [[ -s "$state" ]] && jq -e '.artifact_size > 0' "$state" >/dev/null 2>&1; then
-            echo "artifact_size=$(jq -r '.artifact_size' "$state")" >> "$GITHUB_OUTPUT"
-            echo "artifact_created_at=$(jq -r '.artifact_created_at' "$state")" >> "$GITHUB_OUTPUT"
-            echo "artifact_expires_at=$(jq -r '.artifact_expires_at' "$state")" >> "$GITHUB_OUTPUT"
-          else
-            echo "artifact_size=" >> "$GITHUB_OUTPUT"
-            echo "artifact_created_at=" >> "$GITHUB_OUTPUT"
-            echo "artifact_expires_at=" >> "$GITHUB_OUTPUT"
-          fi
-          echo "repository=$GITHUB_REPOSITORY" >> "$GITHUB_OUTPUT"
-          echo "run_id=$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
-          echo "run_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
-          echo "reviewed_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
-          echo "source_artifact_expires_at=$(jq -r '.source_artifact.expires_at' /tmp/pensyve-promotion-handoff/handoff-metadata.json)" >> "$GITHUB_OUTPUT"
-          echo "cleanup_status=$status" >> "$GITHUB_OUTPUT"
-          echo "cleanup_required=$cleanup" >> "$GITHUB_OUTPUT"
-
-  artifact-promote-dispatch:
-    name: Dispatch the exact leased production custodian
-    if: needs.artifact-promote-preflight.result == 'success' && needs.artifact-promote-preflight.outputs.cleanup_required == 'false'
-    needs: [artifact-promote-preflight]
-    runs-on: ubuntu-latest
-    timeout-minutes: 70
-    permissions:
-      actions: write
-    outputs:
-      custodian_run_id: ${{ steps.custodian-ready.outputs.custodian_run_id }}
-      custody_lease_id: ${{ steps.custodian-ready.outputs.custody_lease_id }}
-    steps:
-      - name: Dispatch one exact-ref custodian and bind its exact run
-        id: custodian-ready
-        env:
-          GH_TOKEN: ${{ github.token }}
-          INPUT_MODE: ${{ inputs.mode }}
-          PR_NUMBER: ${{ inputs.pull_request_number }}
-          REVIEWED_REF: ${{ vars.TASK5_REVIEWED_REF }}
-          HANDOFF_ID: ${{ needs.artifact-promote-preflight.outputs.cleanup_artifact_id }}
-          HANDOFF_NAME: ${{ needs.artifact-promote-preflight.outputs.cleanup_artifact_name }}
-          HANDOFF_DIGEST: ${{ needs.artifact-promote-preflight.outputs.cleanup_artifact_digest }}
-          HANDOFF_SIZE: ${{ needs.artifact-promote-preflight.outputs.cleanup_artifact_size }}
-          HANDOFF_CREATED_AT: ${{ needs.artifact-promote-preflight.outputs.cleanup_artifact_created_at }}
-          HANDOFF_EXPIRES_AT: ${{ needs.artifact-promote-preflight.outputs.cleanup_artifact_expires_at }}
-          SOURCE_ARTIFACT_EXPIRES_AT: ${{ needs.artifact-promote-preflight.outputs.source_artifact_expires_at }}
-          HANDOFF_REPOSITORY: ${{ needs.artifact-promote-preflight.outputs.cleanup_repository }}
-          HANDOFF_RUN_ID: ${{ needs.artifact-promote-preflight.outputs.cleanup_run_id }}
-          HANDOFF_RUN_ATTEMPT: ${{ needs.artifact-promote-preflight.outputs.cleanup_run_attempt }}
-          HANDOFF_REVIEWED_SHA: ${{ needs.artifact-promote-preflight.outputs.cleanup_reviewed_sha }}
-        run: |
-          set -euo pipefail
-          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$INPUT_MODE" == artifact-promote ]]
-          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
-          [[ "$HANDOFF_REPOSITORY" == "$GITHUB_REPOSITORY" && "$HANDOFF_RUN_ID" == "$GITHUB_RUN_ID" &&
-             "$HANDOFF_RUN_ATTEMPT" == "$GITHUB_RUN_ATTEMPT" && "$HANDOFF_REVIEWED_SHA" == "$GITHUB_SHA" &&
-             "$HANDOFF_ID" =~ ^[1-9][0-9]*$ && "$HANDOFF_DIGEST" =~ ^sha256:[0-9a-f]{64}$ &&
-             "$HANDOFF_SIZE" =~ ^[1-9][0-9]*$ && "$REVIEWED_REF" == "$GITHUB_REF_NAME" ]]
-          expected_handoff="gateway-handoff-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA}"
-          [[ "$HANDOFF_NAME" == "$expected_handoff" ]]
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" > "$RUNNER_TEMP/parent-run.json"
-          jq -e --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" \
-            --arg repo "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" --arg ref "$GITHUB_REF_NAME" '
-            .id == $run and .run_attempt == $attempt and .repository.full_name == $repo and
-            .event == "workflow_dispatch" and .path == ".github/workflows/deploy-gateway.yml" and
-            .head_sha == $sha and .head_branch == $ref and
-            (.created_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
-          ' "$RUNNER_TEMP/parent-run.json" >/dev/null
-          parent_created_at=$(jq -r '.created_at' "$RUNNER_TEMP/parent-run.json")
-          dispatch_started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          readarray -t authorization_window < <(python3 - "$parent_created_at" "$dispatch_started_at" \
-            "$HANDOFF_CREATED_AT" "$HANDOFF_EXPIRES_AT" "$SOURCE_ARTIFACT_EXPIRES_AT" <<'PY'
-          import sys
-          from datetime import datetime, timedelta
-
-          def stamp(value):
-              return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-          parent, started, handoff_created, handoff_expires, source_expires = map(stamp, sys.argv[1:])
-          if started < parent:
-              raise SystemExit("dispatch start predates exact parent run creation")
-          if handoff_created > started or started > min(handoff_expires, source_expires):
-              raise SystemExit("dispatch start is outside immutable artifact lifetime")
-          print((parent - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ"))
-          print(min(handoff_expires, source_expires).strftime("%Y-%m-%dT%H:%M:%SZ"))
-          PY
-          )
-          [[ "${#authorization_window[@]}" == 2 ]]
-          authorization_start_at="${authorization_window[0]}"
-          authorization_end_at="${authorization_window[1]}"
-          custody_base=$(jq -S -n -c --arg repository "$GITHUB_REPOSITORY" \
-            --argjson parent_run_id "$GITHUB_RUN_ID" --argjson parent_run_attempt "$GITHUB_RUN_ATTEMPT" \
-            --arg parent_ref "$GITHUB_REF_NAME" --arg reviewed_sha "$GITHUB_SHA" \
-            --argjson pull_request_number "$PR_NUMBER" \
-            --argjson handoff_id "$HANDOFF_ID" --arg handoff_name "$HANDOFF_NAME" \
-            --arg handoff_digest "$HANDOFF_DIGEST" --argjson handoff_size "$HANDOFF_SIZE" \
-            --arg handoff_created_at "$HANDOFF_CREATED_AT" --arg handoff_expires_at "$HANDOFF_EXPIRES_AT" \
-            --arg source_artifact_expires_at "$SOURCE_ARTIFACT_EXPIRES_AT" \
-            --arg parent_created_at "$parent_created_at" --arg dispatch_started_at "$dispatch_started_at" \
-            --arg authorization_start_at "$authorization_start_at" --arg authorization_end_at "$authorization_end_at" '
-            {schema_version:2,repository:$repository,parent_run_id:$parent_run_id,
-              parent_run_attempt:$parent_run_attempt,parent_ref:$parent_ref,reviewed_sha:$reviewed_sha,
-              pull_request_number:$pull_request_number,handoff_id:$handoff_id,handoff_name:$handoff_name,
-              handoff_digest:$handoff_digest,handoff_size:$handoff_size,
-              handoff_created_at:$handoff_created_at,handoff_expires_at:$handoff_expires_at,
-              source_artifact_expires_at:$source_artifact_expires_at,
-              parent_created_at:$parent_created_at,dispatch_started_at:$dispatch_started_at,
-              authorization_start_at:$authorization_start_at,authorization_end_at:$authorization_end_at}')
-          lease=$(printf '%s' "$custody_base" | sha256sum | cut -d' ' -f1)
-          [[ "$lease" =~ ^[0-9a-f]{64}$ ]]
-          custody_request=$(jq -S -c --arg lease "$lease" '. + {custody_lease_id:$lease}' <<<"$custody_base")
-          jq -n --arg ref "$REVIEWED_REF" --arg pr "$PR_NUMBER" \
-            --arg lease "$lease" --arg request "$custody_request" \
-            '{ref:$ref,inputs:{mode:"artifact-custodian",pull_request_number:$pr,
-              custody_lease_id:$lease,custody_request:$request},return_run_details:true}' \
-            > "$RUNNER_TEMP/custodian-dispatch.json"
-          gh api --include --method POST \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-gateway.yml/dispatches" \
-            --input "$RUNNER_TEMP/custodian-dispatch.json" > "$RUNNER_TEMP/dispatch-response"
-          readarray -t dispatch_identity < <(python3 - "$RUNNER_TEMP/dispatch-response" "$RUNNER_TEMP/dispatch-body.json" <<'PY'
+          [[ "$EXPECTED_REF" == refs/heads/main ]]
+          python3 - "$RUNNER_TEMP/custody.json" <<'PY'
+          import hashlib
           import json
+          import os
           import re
           import sys
           from pathlib import Path
 
-          raw = Path(sys.argv[1]).read_bytes()
-          parts = raw.split(b"\r\n\r\n", 1) if b"\r\n\r\n" in raw else raw.split(b"\n\n", 1)
-          header = parts[0].decode(errors="replace").splitlines()[0] if parts and parts[0] else ""
-          match = re.fullmatch(r"HTTP/[^ ]+ ([0-9]{3})(?: .*)?", header)
-          if not match or match.group(1) not in {"200", "204"}:
-              raise SystemExit("dispatch response status is neither verified 200 nor 204")
-          status = match.group(1)
-          body = parts[1].strip() if len(parts) == 2 else b""
-          run_id = ""
-          if status == "204":
-              if body:
-                  raise SystemExit("204 dispatch response unexpectedly contained a body")
-          else:
-              try:
-                  response = json.loads(body)
-              except Exception as exc:
-                  raise SystemExit(f"200 dispatch response body is invalid: {exc}")
-              value = response.get("workflow_run_id", response.get("id"))
-              if not isinstance(value, int) or value <= 0:
-                  raise SystemExit("200 dispatch response omitted a positive run ID")
-              run_id = str(value)
-              Path(sys.argv[2]).write_bytes(body + b"\n")
-          print(status)
-          print(run_id)
-          PY
+          output = Path(sys.argv[1])
+          raw = os.environ["CUSTODY_JSON"]
+          if len(raw.encode()) > 8192:
+              raise SystemExit("custody input exceeds the small-record limit")
+          data = json.loads(raw)
+          if set(data) != {"source", "image", "evidence", "publisher"}:
+              raise SystemExit("custody top-level objects must be source/image/evidence/publisher")
+          source, image = data.get("source"), data.get("image")
+          evidence, publisher = data.get("evidence"), data.get("publisher")
+          if not all(isinstance(value, dict) for value in (source, image, evidence, publisher)):
+              raise SystemExit("custody top-level values must be objects")
+          hex40 = re.compile(r"[0-9a-f]{40}")
+          hex64 = re.compile(r"[0-9a-f]{64}")
+          if (set(source) != {"schema_version", "repository", "sha", "tree"} or
+                  type(source.get("schema_version")) is not int or source.get("schema_version") != 1 or
+                  source.get("repository") != "major7apps/pensyve" or
+                  not hex40.fullmatch(str(source.get("sha", ""))) or
+                  not hex40.fullmatch(str(source.get("tree", "")))):
+              raise SystemExit("source schema/repository/SHA/tree mismatch")
+          image_keys = {"account", "registry", "repository", "manifest_digest", "config_digest",
+                        "platform", "raw_manifest_media_type", "raw_manifest_sha256"}
+          if set(image) != image_keys:
+              raise SystemExit("image custody shape mismatch")
+          account = str(image.get("account", ""))
+          if (not re.fullmatch(r"[0-9]{12}", account) or
+                  image.get("registry") != f"{account}.dkr.ecr.us-east-2.amazonaws.com" or
+                  image.get("repository") != "pensyve-gateway" or
+                  image.get("platform") != "linux/arm64" or
+                  image.get("raw_manifest_media_type") !=
+                  "application/vnd.docker.distribution.manifest.v2+json" or
+                  not re.fullmatch(r"sha256:[0-9a-f]{64}", str(image.get("manifest_digest", ""))) or
+                  not re.fullmatch(r"sha256:[0-9a-f]{64}", str(image.get("config_digest", ""))) or
+                  not hex64.fullmatch(str(image.get("raw_manifest_sha256", "")))):
+              raise SystemExit("image registry/digest/config/platform/raw-manifest mismatch")
+          evidence_keys = {"archive_sha256", "evidence_tree_sha256", "scan_report_sha256",
+                           "scan_policy_sha256", "gate_summary_sha256"}
+          if set(evidence) != evidence_keys or not all(
+              hex64.fullmatch(str(value)) for value in evidence.values()
+          ):
+              raise SystemExit("evidence hash shape mismatch")
+          expected_publisher = (
+              f"arn:aws:sts::{account}:federated-user/pensyve-gateway-{source['sha']}"
           )
-          [[ "${#dispatch_identity[@]}" == 2 ]]
-          dispatch_status="${dispatch_identity[0]}"
-          dispatch_run_id="${dispatch_identity[1]}"
-          expected_title="gateway-custodian-${lease}"
-          found=0
-          for _ in $(seq 1 30); do
-            timeout 30 gh api --method GET --paginate --slurp \
-              "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-gateway.yml/runs" \
-              -f event=workflow_dispatch -f branch="$REVIEWED_REF" -f head_sha="$GITHUB_SHA" \
-              -f created="${authorization_start_at}..${authorization_end_at}" -f per_page=100 \
-              > "$RUNNER_TEMP/custodian-runs.json"
-            jq -e --arg start "$authorization_start_at" --arg end "$authorization_end_at" '
-              type == "array" and length > 0 and
-              ([.[].total_count] | unique | length) == 1 and .[0].total_count >= 0 and .[0].total_count <= 1000 and
-              (all(.[]; (.workflow_runs | type) == "array")) and
-              ([.[].workflow_runs[]] as $runs | ($runs | length) == .[0].total_count and
-                all($runs[]; (.created_at | type) == "string" and .created_at >= $start and .created_at <= $end))
-            ' "$RUNNER_TEMP/custodian-runs.json" >/dev/null || {
-              echo "malformed paginated custodian workflow runs" >&2
-              exit 1
-            }
-            found=$(jq --arg title "$expected_title" --arg repo "$GITHUB_REPOSITORY" \
-              --arg sha "$GITHUB_SHA" --arg ref "$REVIEWED_REF" '
-              [.[].workflow_runs[] | select(.display_title == $title and .repository.full_name == $repo and
-                .event == "workflow_dispatch" and .head_sha == $sha and .head_branch == $ref and
-                .path == ".github/workflows/deploy-gateway.yml" and .run_attempt == 1 and .id > 0)] | length
-            ' "$RUNNER_TEMP/custodian-runs.json")
-            [[ "$found" == 0 ]] || break
-            sleep 2
-          done
-          [[ "$found" == 1 ]] || { echo "exact custodian run identity is ambiguous: matches=$found" >&2; exit 1; }
-          jq --arg title "$expected_title" --arg repo "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" \
-            --arg ref "$REVIEWED_REF" '
-            [.[].workflow_runs[] | select(.display_title == $title and .repository.full_name == $repo and
-              .event == "workflow_dispatch" and .head_sha == $sha and .head_branch == $ref and
-              .path == ".github/workflows/deploy-gateway.yml" and .run_attempt == 1 and .id > 0)] | .[0]
-          ' "$RUNNER_TEMP/custodian-runs.json" > "$RUNNER_TEMP/custodian-run.json"
-          jq -e '.id > 0 and .run_attempt == 1 and (.status == "queued" or .status == "in_progress" or .status == "completed")' \
-            "$RUNNER_TEMP/custodian-run.json" >/dev/null
-          selected_run_id=$(jq -r '.id' "$RUNNER_TEMP/custodian-run.json")
-          if [[ "$dispatch_status" == 200 ]]; then [[ "$dispatch_run_id" == "$selected_run_id" ]]; fi
-          echo "custodian_run_id=$selected_run_id" >> "$GITHUB_OUTPUT"
-          echo "custody_lease_id=$lease" >> "$GITHUB_OUTPUT"
+          if (set(publisher) != {"arn", "inline_session_policy_sha256"} or
+                  publisher.get("arn") != expected_publisher or
+                  not hex64.fullmatch(str(publisher.get("inline_session_policy_sha256", "")))):
+              raise SystemExit("publisher ARN/policy hash mismatch")
+          if source["sha"] != os.environ["EXPECTED_SHA"]:
+              raise SystemExit("github.sha != source.sha")
+          canonical = json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+          output.write_text(canonical, encoding="utf-8")
+          digest = hashlib.sha256(canonical.encode()).hexdigest()
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
+              stream.write(f"custody_sha256={digest}\n")
+              stream.write(f"source_sha={source['sha']}\n")
+              stream.write(f"source_tree={source['tree']}\n")
+              stream.write(f"manifest_digest={image['manifest_digest']}\n")
+              stream.write(f"account={account}\n")
+          PY
+          source_tree=$(awk -F= '$1 == "source_tree" {print $2}' "$GITHUB_OUTPUT")
+          custody_sha=$(awk -F= '$1 == "custody_sha256" {print $2}' "$GITHUB_OUTPUT")
+          manifest_digest=$(awk -F= '$1 == "manifest_digest" {print $2}' "$GITHUB_OUTPUT")
+          gh api "repos/${GITHUB_REPOSITORY}/commits/main" > "$RUNNER_TEMP/current-main.json"
+          jq -e --arg sha "${{ github.sha }}" \
+            --arg tree "$source_tree" \
+            '.sha == $sha and .commit.tree.sha == $tree' "$RUNNER_TEMP/current-main.json" >/dev/null
+          {
+            echo "### Gateway custody preflight"
+            echo "- source: \`${{ github.sha }}\`"
+            echo "- manifest: \`$manifest_digest\`"
+            echo "- custody SHA-256: \`$custody_sha\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-  artifact-promote:
-    name: Observe the exact leased production custodian
-    if: needs.artifact-promote-dispatch.result == 'success'
-    needs: [artifact-promote-dispatch]
+  production:
+    name: Execute one reviewed gateway control-plane operation
+    needs: preflight
     runs-on: ubuntu-latest
-    timeout-minutes: 70
-    permissions:
-      actions: read
-    steps:
-      - name: Observe exact custodian terminal result without production authority
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CUSTODIAN_RUN_ID: ${{ needs.artifact-promote-dispatch.outputs.custodian_run_id }}
-          CUSTODY_LEASE_ID: ${{ needs.artifact-promote-dispatch.outputs.custody_lease_id }}
-        run: |
-          set -euo pipefail
-          for _ in $(seq 1 420); do
-            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CUSTODIAN_RUN_ID}" > "$RUNNER_TEMP/custodian-result.json"
-            jq -e --argjson run "$CUSTODIAN_RUN_ID" --arg repo "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" \
-              --arg ref "$GITHUB_REF_NAME" --arg title "gateway-custodian-${CUSTODY_LEASE_ID}" '
-              .id == $run and .repository.full_name == $repo and
-              .head_sha == $sha and .event == "workflow_dispatch" and .display_title == $title and
-              .head_branch == $ref and .path == ".github/workflows/deploy-gateway.yml" and .run_attempt == 1
-            ' "$RUNNER_TEMP/custodian-result.json" >/dev/null
-            status=$(jq -r '.status' "$RUNNER_TEMP/custodian-result.json")
-            [[ "$status" == completed ]] && break
-            sleep 10
-          done
-          [[ "$(jq -r '.status' "$RUNNER_TEMP/custodian-result.json")" == completed &&
-             "$(jq -r '.conclusion' "$RUNNER_TEMP/custodian-result.json")" == success ]]
-
-  artifact-custodian-producer:
-    name: Promote immutable bytes while owning the production lease
-    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'artifact-custodian'
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 45
     environment: production
     permissions:
       contents: read
-      actions: read
       id-token: write
     steps:
-      - name: Bind inline custodian self and parent authority before checkout
-        id: custodian-identity
+      - name: Recheck canonical custody, reviewed hash, and current main before OIDC
         env:
-          GH_TOKEN: ${{ github.token }}
-          CUSTODY_REQUEST: ${{ inputs.custody_request }}
-          CUSTODY_LEASE_ID: ${{ inputs.custody_lease_id }}
-          INPUT_PR_NUMBER: ${{ inputs.pull_request_number }}
-        run: |
-          set -euo pipefail
-          printf '%s\n' "$CUSTODY_REQUEST" > "$RUNNER_TEMP/custody-request.json"
-          jq -e --arg repo "$GITHUB_REPOSITORY" --arg ref "$GITHUB_REF_NAME" \
-            --arg sha "$GITHUB_SHA" --arg lease "$CUSTODY_LEASE_ID" --argjson pr "$INPUT_PR_NUMBER" '
-            keys == ["authorization_end_at","authorization_start_at","custody_lease_id",
-              "dispatch_started_at","handoff_created_at","handoff_digest","handoff_expires_at",
-              "handoff_id","handoff_name","handoff_size","parent_created_at","parent_ref",
-              "parent_run_attempt","parent_run_id","pull_request_number","repository","reviewed_sha",
-              "schema_version","source_artifact_expires_at"] and
-            .schema_version == 2 and .repository == $repo and .parent_ref == $ref and
-            .reviewed_sha == $sha and .custody_lease_id == $lease and .pull_request_number == $pr and
-            .parent_run_id > 0 and .parent_run_attempt > 0 and .handoff_id > 0 and .handoff_size > 0 and
-            (.handoff_name | test("^gateway-handoff-[1-9][0-9]*-[1-9][0-9]*-[0-9a-f]{40}$")) and
-            (.handoff_digest | test("^sha256:[0-9a-f]{64}$"))
-          ' "$RUNNER_TEMP/custody-request.json" >/dev/null
-          parent_run=$(jq -r '.parent_run_id' "$RUNNER_TEMP/custody-request.json")
-          parent_attempt=$(jq -r '.parent_run_attempt' "$RUNNER_TEMP/custody-request.json")
-          expected_lease=$(jq -S -c 'del(.custody_lease_id)' "$RUNNER_TEMP/custody-request.json" | \
-            tr -d '\n' | sha256sum | cut -d' ' -f1)
-          [[ "$CUSTODY_LEASE_ID" == "$expected_lease" ]]
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" > "$RUNNER_TEMP/custodian-self-run.json"
-          jq -e --argjson run "$GITHUB_RUN_ID" --arg repo "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" --arg ref "$GITHUB_REF_NAME" \
-            --arg title "gateway-custodian-${CUSTODY_LEASE_ID}" '
-            .id == $run and .run_attempt == 1 and .repository.full_name == $repo and
-            .event == "workflow_dispatch" and .path == ".github/workflows/deploy-gateway.yml" and
-            .head_sha == $sha and .head_branch == $ref and .display_title == $title
-          ' "$RUNNER_TEMP/custodian-self-run.json" >/dev/null
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${parent_run}" > "$RUNNER_TEMP/custodian-parent-run.json"
-          jq -e --argjson run "$parent_run" --arg repo "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" --arg ref "$GITHUB_REF_NAME" \
-            --argjson attempt "$parent_attempt" --arg parent_created "$(jq -r '.parent_created_at' "$RUNNER_TEMP/custody-request.json")" '
-            .id == $run and .run_attempt == $attempt and .repository.full_name == $repo and
-            .event == "workflow_dispatch" and .path == ".github/workflows/deploy-gateway.yml" and
-            .head_sha == $sha and .head_branch == $ref and
-            .created_at == $parent_created
-          ' "$RUNNER_TEMP/custodian-parent-run.json" >/dev/null
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${parent_run}/jobs?filter=latest&per_page=100" \
-            > "$RUNNER_TEMP/custodian-parent-jobs.json"
-          jq -e '
-            [.jobs[] | select(.name == "Dispatch the exact leased production custodian" and
-              ([.steps[] | select(.name == "Dispatch one exact-ref custodian and bind its exact run" and
-                .status == "completed" and .conclusion == "success")] | length) == 1)] | length == 1
-          ' "$RUNNER_TEMP/custodian-parent-jobs.json" >/dev/null
-          echo "custodian-ready lease=${CUSTODY_LEASE_ID} parent=${parent_run}/${parent_attempt}"
-
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-
-      - name: Bind global custodian uniqueness after checkout
-        env:
+          CUSTODY_JSON: ${{ inputs.custody_json }}
+          EXPECTED_SHA: ${{ needs.preflight.outputs.source_sha }}
+          EXPECTED_TREE: ${{ needs.preflight.outputs.source_tree }}
+          EXPECTED_HASH: ${{ needs.preflight.outputs.custody_sha256 }}
+          EXPECTED_ACCOUNT: ${{ needs.preflight.outputs.account }}
+          PENSYVE_REVIEWED_CUSTODY_SHA256: ${{ vars.PENSYVE_REVIEWED_CUSTODY_SHA256 }}
+          PENSYVE_TASK8_BASELINE_ARN: ${{ vars.PENSYVE_TASK8_BASELINE_ARN }}
+          OPERATION: ${{ inputs.operation }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          timeout 30 gh api --method GET --paginate --slurp \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-gateway.yml/runs" \
-            -f event=workflow_dispatch -f branch="$GITHUB_REF_NAME" -f head_sha="$GITHUB_SHA" \
-            -f created="$(jq -r '.authorization_start_at' "$RUNNER_TEMP/custody-request.json")..$(jq -r '.authorization_end_at' "$RUNNER_TEMP/custody-request.json")" \
-            -f per_page=100 \
-            > "$RUNNER_TEMP/custodian-lease-runs.json"
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh verify-custodian-runs \
-            --input "$RUNNER_TEMP/custodian-lease-runs.json" \
-            --request "$RUNNER_TEMP/custody-request.json" --output "$RUNNER_TEMP/custodian-lease-run.json"
-          [[ "$(jq -r '.id' "$RUNNER_TEMP/custodian-lease-run.json")" == "$GITHUB_RUN_ID" ]]
-
-      - name: Re-fetch exact current-run handoff and immutable source before credentials
-        env:
-          GH_TOKEN: ${{ github.token }}
-          HANDOFF_ID: ${{ fromJSON(inputs.custody_request).handoff_id }}
-          HANDOFF_NAME: ${{ fromJSON(inputs.custody_request).handoff_name }}
-          HANDOFF_DIGEST: ${{ fromJSON(inputs.custody_request).handoff_digest }}
-          HANDOFF_SIZE: ${{ fromJSON(inputs.custody_request).handoff_size }}
-          HANDOFF_CREATED_AT: ${{ fromJSON(inputs.custody_request).handoff_created_at }}
-          HANDOFF_EXPIRES_AT: ${{ fromJSON(inputs.custody_request).handoff_expires_at }}
-          HANDOFF_REPOSITORY: ${{ fromJSON(inputs.custody_request).repository }}
-          HANDOFF_RUN_ID: ${{ fromJSON(inputs.custody_request).parent_run_id }}
-          HANDOFF_RUN_ATTEMPT: ${{ fromJSON(inputs.custody_request).parent_run_attempt }}
-          HANDOFF_REVIEWED_SHA: ${{ fromJSON(inputs.custody_request).reviewed_sha }}
-          CURRENT_APPROVED_GB_HOURS: ${{ vars.GATEWAY_ARTIFACT_APPROVED_GB_HOURS }}
-          CURRENT_APPROVED_DOLLARS: ${{ vars.GATEWAY_ARTIFACT_APPROVED_DOLLARS }}
-          CURRENT_PRICE_PER_GB_MONTH: ${{ vars.GATEWAY_ARTIFACT_PRICE_PER_GB_MONTH }}
-          CURRENT_BILLING_UNIT: ${{ vars.GATEWAY_ARTIFACT_BILLING_UNIT }}
-          BILLING_SNAPSHOT_AT: ${{ vars.GATEWAY_HANDOFF_BILLING_SNAPSHOT_AT }}
-          CURRENT_BILLABLE_BYTES: ${{ vars.GATEWAY_HANDOFF_CURRENT_BILLABLE_BYTES }}
-          ORGANIZATION_ACTIONS_ARTIFACT_BYTES: ${{ vars.GATEWAY_HANDOFF_ORG_ACTIONS_ARTIFACT_BYTES }}
-          ORGANIZATION_PACKAGES_BYTES: ${{ vars.GATEWAY_HANDOFF_ORG_PACKAGES_BYTES }}
-          INCLUDED_SOURCE_ARTIFACT_ID: ${{ vars.GATEWAY_HANDOFF_INCLUDED_SOURCE_ARTIFACT_ID }}
-          INCLUDED_SOURCE_ARTIFACT_BYTES: ${{ vars.GATEWAY_HANDOFF_INCLUDED_SOURCE_ARTIFACT_BYTES }}
-          HANDOFF_OVERHEAD_BYTES: ${{ vars.GATEWAY_ARTIFACT_HANDOFF_OVERHEAD_BYTES }}
-          PAYMENT_STATUS: ${{ vars.GATEWAY_ARTIFACT_PAYMENT_STATUS }}
-          SPENDING_STATUS: ${{ vars.GATEWAY_ARTIFACT_SPENDING_STATUS }}
-        run: |
-          set -euo pipefail
-          expected_name="gateway-handoff-${HANDOFF_RUN_ID}-${HANDOFF_RUN_ATTEMPT}-${GITHUB_SHA}"
-          [[ "$HANDOFF_REPOSITORY" == "$GITHUB_REPOSITORY" &&
-             "$HANDOFF_RUN_ID" =~ ^[1-9][0-9]*$ && "$HANDOFF_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ &&
-             "$HANDOFF_REVIEWED_SHA" == "$GITHUB_SHA" &&
-             "$HANDOFF_NAME" == "$expected_name" && "$HANDOFF_ID" =~ ^[1-9][0-9]*$ &&
-             "$HANDOFF_DIGEST" =~ ^sha256:[0-9a-f]{64}$ && "$HANDOFF_SIZE" =~ ^[1-9][0-9]*$ ]]
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${HANDOFF_ID}" > "$RUNNER_TEMP/handoff-artifact.json"
-          jq -e --argjson id "$HANDOFF_ID" --arg name "$HANDOFF_NAME" --arg digest "$HANDOFF_DIGEST" \
-            --argjson size "$HANDOFF_SIZE" --arg created "$HANDOFF_CREATED_AT" \
-            --arg expires "$HANDOFF_EXPIRES_AT" --argjson run "$HANDOFF_RUN_ID" '
-            .id == $id and .name == $name and .digest == $digest and .size_in_bytes == $size and
-            .created_at == $created and .expires_at == $expires and .expired == false and
-            .workflow_run.id == $run
-          ' "$RUNNER_TEMP/handoff-artifact.json" >/dev/null
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${HANDOFF_ID}/zip" > "$RUNNER_TEMP/handoff.zip"
-          [[ "sha256:$(sha256sum "$RUNNER_TEMP/handoff.zip" | cut -d' ' -f1)" == "$HANDOFF_DIGEST" ]]
-          [[ "$(stat -c '%s' "$RUNNER_TEMP/handoff.zip")" == "$HANDOFF_SIZE" ]]
-          validate_minimal_handoff_tree() {
-            python3 - "$1" "$2" <<'PY'
+          [[ "$GITHUB_REF" == refs/heads/main && "$GITHUB_SHA" == "$EXPECTED_SHA" ]]
+          python3 - "$RUNNER_TEMP/custody.json" <<'PY'
+          import hashlib
+          import json
           import os
-          import stat
+          import re
           import sys
-          import zipfile
           from pathlib import Path
 
-          archive = Path(sys.argv[1])
-          root = Path(sys.argv[2])
-          expected = {"complete-tuple.json", "handoff-metadata.json", "seal-reverify.log", "sealed-files.sha256", "sealed-tree.json", "storage-approval.json", "verified-image.json"}
-          with zipfile.ZipFile(archive) as zf:
-              infos = zf.infolist()
-              if len(infos) != len(expected) or {info.filename for info in infos} != expected:
-                  raise SystemExit("handoff archive tree is not the exact minimal allow-list")
-              for info in infos:
-                  path = Path(info.filename)
-                  mode = info.external_attr >> 16
-                  if path.is_absolute() or ".." in path.parts or len(path.parts) != 1 or info.is_dir():
-                      raise SystemExit("handoff archive contains a directory or traversal")
-                  if stat.S_IFMT(mode) != stat.S_IFREG or mode & 0o133:
-                      raise SystemExit("handoff archive entry type or mode is unsafe")
-          if root.exists():
-              entries = list(root.iterdir())
-              if {entry.name for entry in entries} != expected or len(entries) != len(expected):
-                  raise SystemExit("extracted handoff tree is not exact")
-              for entry in entries:
-                  mode = entry.lstat().st_mode
-                  if not stat.S_ISREG(mode) or mode & 0o133:
-                      raise SystemExit("extracted handoff entry type or mode is unsafe")
+          data = json.loads(os.environ["CUSTODY_JSON"])
+          canonical = json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+          digest = hashlib.sha256(canonical.encode()).hexdigest()
+          if digest != os.environ["EXPECTED_HASH"]:
+              raise SystemExit("custody hash differs from preflight output")
+          if digest != os.environ["PENSYVE_REVIEWED_CUSTODY_SHA256"]:
+              raise SystemExit("custody hash lacks environment-scoped human review")
+          source = data.get("source", {})
+          if source.get("repository") != "major7apps/pensyve" or source.get("sha") != os.environ["EXPECTED_SHA"]:
+              raise SystemExit("source.sha/repository differs from preflight")
+          if source.get("tree") != os.environ["EXPECTED_TREE"]:
+              raise SystemExit("source.tree differs from preflight")
+          if data.get("image", {}).get("account") != os.environ["EXPECTED_ACCOUNT"]:
+              raise SystemExit("image account differs from preflight")
+          if os.environ["OPERATION"].startswith("task9-") and not re.fullmatch(
+              r"arn:aws:ecs:us-east-2:[0-9]{12}:task-definition/pensyve-prod-gateway:(?!157$)[0-9]+",
+              os.environ["PENSYVE_TASK8_BASELINE_ARN"],
+          ):
+              raise SystemExit("Task 9 requires canonical environment-scoped PENSYVE_TASK8_BASELINE_ARN")
+          Path(sys.argv[1]).write_text(canonical, encoding="utf-8")
           PY
-          }
-          validate_minimal_handoff_tree "$RUNNER_TEMP/handoff.zip" /tmp/pensyve-handoff-not-yet-extracted
-          rm -rf -- /tmp/pensyve-promotion-handoff
-          mkdir -p /tmp/pensyve-promotion-handoff
-          unzip -q "$RUNNER_TEMP/handoff.zip" -d /tmp/pensyve-promotion-handoff
-          validate_minimal_handoff_tree "$RUNNER_TEMP/handoff.zip" /tmp/pensyve-promotion-handoff
-          (cd /tmp/pensyve-promotion-handoff && sha256sum --check sealed-files.sha256) \
-            | tee "$RUNNER_TEMP/handoff-mutation-seal-reverify.log"
-          jq -e --arg repo "$GITHUB_REPOSITORY" --arg workflow "$GITHUB_WORKFLOW" \
-            --arg path ".github/workflows/deploy-gateway.yml" --argjson run "$HANDOFF_RUN_ID" \
-            --argjson attempt "$HANDOFF_RUN_ATTEMPT" --arg sha "$GITHUB_SHA" '
-            .schema_version == 1 and .repository == $repo and .workflow == $workflow and
-            .workflow_path == $path and .run_id == $run and .run_attempt == $attempt and
-            .reviewed_sha == $sha
-          ' /tmp/pensyve-promotion-handoff/handoff-metadata.json >/dev/null
-          verified_actual=$(sha256sum /tmp/pensyve-promotion-handoff/verified-image.json | cut -d' ' -f1)
-          complete_actual=$(sha256sum /tmp/pensyve-promotion-handoff/complete-tuple.json | cut -d' ' -f1)
-          jq -e --arg verified "$verified_actual" --arg complete "$complete_actual" \
-            --arg storage "$(sha256sum /tmp/pensyve-promotion-handoff/storage-approval.json | cut -d' ' -f1)" \
-            --slurpfile verified_image /tmp/pensyve-promotion-handoff/verified-image.json '
-            .verified_image_sha256 == $verified and .complete_tuple_sha256 == $complete and
-            .storage_approval_sha256 == $storage and
-            .probe_entity == $verified_image[0].deployment.probe_entity
-          ' \
-            /tmp/pensyve-promotion-handoff/handoff-metadata.json >/dev/null
-          jq -e --arg snapshot "$BILLING_SNAPSHOT_AT" --arg gbh "$CURRENT_APPROVED_GB_HOURS" \
-            --arg dollars "$CURRENT_APPROVED_DOLLARS" --arg price "$CURRENT_PRICE_PER_GB_MONTH" \
-            --argjson current "$CURRENT_BILLABLE_BYTES" --argjson org_actions "$ORGANIZATION_ACTIONS_ARTIFACT_BYTES" \
-            --argjson org_packages "$ORGANIZATION_PACKAGES_BYTES" --argjson retained_id "$INCLUDED_SOURCE_ARTIFACT_ID" \
-            --argjson retained_bytes "$INCLUDED_SOURCE_ARTIFACT_BYTES" --argjson overhead "$HANDOFF_OVERHEAD_BYTES" \
-            --arg payment "$PAYMENT_STATUS" --arg spending "$SPENDING_STATUS" --arg unit "$CURRENT_BILLING_UNIT" '
-            .snapshot_at == $snapshot and .current_billable_bytes == $current and
-            .organization_actions_artifact_bytes == $org_actions and
-            .organization_packages_bytes == $org_packages and
-            .retained_source_artifact_id == $retained_id and
-            .retained_source_artifact_bytes == $retained_bytes and
-            .handoff_overhead_bytes == $overhead and .payment_status == $payment and
-            .spending_status == $spending and
-            (.approved_gb_hours_ceiling | tostring) == $gbh and
-            (.approved_dollar_ceiling | tostring) == $dollars and
-            (.price_per_gb_month | tostring) == $price and .billing_unit == $unit
-          ' /tmp/pensyve-promotion-handoff/storage-approval.json >/dev/null || {
-            echo "repository storage variable drift" >&2
-            exit 1
-          }
-          handoff_files=$(find /tmp/pensyve-promotion-handoff -type f -printf '%s\n' | awk '{sum += $1} END {print sum+0}')
-          jq --argjson evidence "$handoff_files" '.evidence_bytes=$evidence' \
-            /tmp/pensyve-promotion-handoff/storage-approval.json > "$RUNNER_TEMP/handoff-replayed-storage-input.json"
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh storage-precheck \
-            --input "$RUNNER_TEMP/handoff-replayed-storage-input.json" \
-            --output "$RUNNER_TEMP/handoff-replayed-storage-precheck.json"
-          jq -n --slurpfile approved "$RUNNER_TEMP/handoff-replayed-storage-precheck.json" \
-            --slurpfile artifact "$RUNNER_TEMP/handoff-artifact.json" '
-            $approved[0] + {rest_size_in_bytes:$artifact[0].size_in_bytes,
-              created_at:$artifact[0].created_at,expires_at:$artifact[0].expires_at}
-          ' > "$RUNNER_TEMP/handoff-replayed-reconcile-input.json"
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh storage-reconcile \
-            --input "$RUNNER_TEMP/handoff-replayed-reconcile-input.json" \
-            --output "$RUNNER_TEMP/handoff-replayed-reconcile.json"
-          jq -e '.cleanup_required == false and .status == "accepted"' \
-            "$RUNNER_TEMP/handoff-replayed-reconcile.json" >/dev/null
+          gh api "repos/${GITHUB_REPOSITORY}/commits/main" > "$RUNNER_TEMP/current-main.json"
+          jq -e --arg sha "$EXPECTED_SHA" --arg tree "$EXPECTED_TREE" \
+            '.sha == $sha and .commit.tree.sha == $tree' "$RUNNER_TEMP/current-main.json" >/dev/null
 
-          SOURCE_ID=$(jq -r '.source_artifact.id' /tmp/pensyve-promotion-handoff/handoff-metadata.json)
-          SOURCE_NAME=$(jq -r '.source_artifact.name' /tmp/pensyve-promotion-handoff/handoff-metadata.json)
-          SOURCE_DIGEST=$(jq -r '.source_artifact.server_digest' /tmp/pensyve-promotion-handoff/handoff-metadata.json)
-          SOURCE_SIZE=$(jq -r '.source_artifact.size_in_bytes' /tmp/pensyve-promotion-handoff/handoff-metadata.json)
-          SOURCE_CREATED=$(jq -r '.source_artifact.created_at' /tmp/pensyve-promotion-handoff/handoff-metadata.json)
-          SOURCE_EXPIRES=$(jq -r '.source_artifact.expires_at' /tmp/pensyve-promotion-handoff/handoff-metadata.json)
-          SOURCE_RUN=$(jq -r '.source_artifact.run_id' /tmp/pensyve-promotion-handoff/handoff-metadata.json)
-          SOURCE_ATTEMPT=$(jq -r '.source_artifact.run_attempt' /tmp/pensyve-promotion-handoff/handoff-metadata.json)
-          [[ "$SOURCE_ID" =~ ^[1-9][0-9]*$ && "$SOURCE_RUN" =~ ^[1-9][0-9]*$ &&
-             "$SOURCE_ATTEMPT" =~ ^[1-9][0-9]*$ && "$SOURCE_NAME" =~ ^gateway-image-${SOURCE_RUN}-${SOURCE_ATTEMPT}-[0-9a-f]{40}$ &&
-             "$SOURCE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ && "$SOURCE_SIZE" =~ ^[1-9][0-9]*$ ]]
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${SOURCE_ID}" > "$RUNNER_TEMP/source-artifact.json"
-          jq -e --argjson id "$SOURCE_ID" --arg name "$SOURCE_NAME" --arg digest "$SOURCE_DIGEST" \
-            --argjson size "$SOURCE_SIZE" --arg created "$SOURCE_CREATED" --arg expires "$SOURCE_EXPIRES" \
-            --argjson run "$SOURCE_RUN" '
-            .id == $id and .name == $name and .digest == $digest and .size_in_bytes == $size and
-            .created_at == $created and .expires_at == $expires and .expired == false and .workflow_run.id == $run
-          ' "$RUNNER_TEMP/source-artifact.json" >/dev/null
-          mkdir -p /tmp/pensyve-reviewed-artifact
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${SOURCE_ID}/zip" > "$RUNNER_TEMP/source.zip"
-          [[ "sha256:$(sha256sum "$RUNNER_TEMP/source.zip" | cut -d' ' -f1)" == "$SOURCE_DIGEST" ]]
-          [[ "$(stat -c '%s' "$RUNNER_TEMP/source.zip")" == "$SOURCE_SIZE" ]]
-          unzip -q "$RUNNER_TEMP/source.zip" -d /tmp/pensyve-reviewed-artifact
-          (cd /tmp/pensyve-reviewed-artifact && sha256sum --check sealed-files.sha256) \
-            | tee "$RUNNER_TEMP/source-mutation-seal-reverify.log"
-          jq -e --slurpfile metadata /tmp/pensyve-promotion-handoff/handoff-metadata.json '
-            .artifact == $metadata[0].source_artifact and
-            .source.repository == $metadata[0].repository and
-            .source.head_sha == $metadata[0].reviewed_sha
-          ' /tmp/pensyve-promotion-handoff/complete-tuple.json >/dev/null
-      - name: Repeat tuple and scan verification before credentials
-        run: |
-          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
-          [[ "$(jq -r '.image.source_label' /tmp/pensyve-promotion-handoff/verified-image.json)" == "$GITHUB_SHA" ]]
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh verify-tree \
-            --root /tmp/pensyve-promotion-handoff \
-            --input /tmp/pensyve-promotion-handoff/sealed-tree.json \
-            --transcript "$RUNNER_TEMP/handoff-precredential-tree-replay.log"
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh verify-tree \
-            --root /tmp/pensyve-reviewed-artifact \
-            --input /tmp/pensyve-reviewed-artifact/sealed-tree.json \
-            --transcript "$RUNNER_TEMP/source-precredential-tree-replay.log"
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh verify-local --tuple /tmp/pensyve-promotion-handoff/complete-tuple.json
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh verify-handoff --input /tmp/pensyve-promotion-handoff/verified-image.json
-          pensyve-mcp-gateway/scripts/test-gateway-artifact-flow.sh structural
-      # aws-actions/configure-aws-credentials v6
-      - uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: us-east-2
-      # aws-actions/amazon-ecr-login v2
-      - uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd
-      - name: Push, byte-compare, register, update, and guarded rollback
-        env:
-          PROMOTION_CUSTODY: deferred
-        run: pensyve-mcp-gateway/scripts/promote-gateway-image.sh promote /tmp/pensyve-promotion-handoff/verified-image.json
-
-  artifact-custodian-finalize:
-    name: Finalize the leased custodian after every producer outcome
-    if: always() && github.event_name == 'workflow_dispatch' && inputs.mode == 'artifact-custodian'
-    needs: [artifact-custodian-producer]
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 20
-    environment: production
-    permissions:
-      contents: read
-      actions: read
-      id-token: write
-    steps:
-      - name: Bind inline finalizer self and parent authority before checkout
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CUSTODY_REQUEST: ${{ inputs.custody_request }}
-          CUSTODY_LEASE_ID: ${{ inputs.custody_lease_id }}
-          INPUT_PR_NUMBER: ${{ inputs.pull_request_number }}
-        run: |
-          set -euo pipefail
-          printf '%s\n' "$CUSTODY_REQUEST" > "$RUNNER_TEMP/finalizer-custody-request.json"
-          jq -e --arg repo "$GITHUB_REPOSITORY" --arg ref "$GITHUB_REF_NAME" --arg sha "$GITHUB_SHA" \
-            --arg lease "$CUSTODY_LEASE_ID" --argjson pr "$INPUT_PR_NUMBER" '
-            keys == ["authorization_end_at","authorization_start_at","custody_lease_id",
-              "dispatch_started_at","handoff_created_at","handoff_digest","handoff_expires_at",
-              "handoff_id","handoff_name","handoff_size","parent_created_at","parent_ref",
-              "parent_run_attempt","parent_run_id","pull_request_number","repository","reviewed_sha",
-              "schema_version","source_artifact_expires_at"] and
-            .schema_version == 2 and .repository == $repo and .parent_ref == $ref and
-            .reviewed_sha == $sha and .custody_lease_id == $lease and .pull_request_number == $pr and
-            .parent_run_id > 0 and .parent_run_attempt > 0 and .handoff_id > 0 and .handoff_size > 0
-          ' "$RUNNER_TEMP/finalizer-custody-request.json" >/dev/null
-          parent_run=$(jq -r '.parent_run_id' "$RUNNER_TEMP/finalizer-custody-request.json")
-          parent_attempt=$(jq -r '.parent_run_attempt' "$RUNNER_TEMP/finalizer-custody-request.json")
-          expected_lease=$(jq -S -c 'del(.custody_lease_id)' "$RUNNER_TEMP/finalizer-custody-request.json" | \
-            tr -d '\n' | sha256sum | cut -d' ' -f1)
-          [[ "$CUSTODY_LEASE_ID" == "$expected_lease" ]]
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" > "$RUNNER_TEMP/finalizer-self-run.json"
-          jq -e --argjson run "$GITHUB_RUN_ID" --arg repo "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" \
-            --arg ref "$GITHUB_REF_NAME" --arg title "gateway-custodian-${CUSTODY_LEASE_ID}" '
-            .id == $run and .run_attempt == 1 and .repository.full_name == $repo and
-            .event == "workflow_dispatch" and .path == ".github/workflows/deploy-gateway.yml" and
-            .head_sha == $sha and .head_branch == $ref and .display_title == $title
-          ' "$RUNNER_TEMP/finalizer-self-run.json" >/dev/null
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${parent_run}" > "$RUNNER_TEMP/finalizer-parent-run.json"
-          jq -e --argjson run "$parent_run" --argjson attempt "$parent_attempt" \
-            --arg repo "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" --arg ref "$GITHUB_REF_NAME" \
-            --arg parent_created "$(jq -r '.parent_created_at' "$RUNNER_TEMP/finalizer-custody-request.json")" '
-            .id == $run and .run_attempt == $attempt and .repository.full_name == $repo and
-            .event == "workflow_dispatch" and .path == ".github/workflows/deploy-gateway.yml" and
-            .head_sha == $sha and .head_branch == $ref and .created_at == $parent_created
-          ' "$RUNNER_TEMP/finalizer-parent-run.json" >/dev/null
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${parent_run}/jobs?filter=latest&per_page=100" \
-            > "$RUNNER_TEMP/finalizer-parent-jobs.json"
-          jq -e '
-            [.jobs[] | select(.name == "Dispatch the exact leased production custodian" and
-              ([.steps[] | select(.name == "Dispatch one exact-ref custodian and bind its exact run" and
-                .status == "completed" and .conclusion == "success")] | length) == 1)] | length == 1
-          ' "$RUNNER_TEMP/finalizer-parent-jobs.json" >/dev/null
-          echo "custodian-ready finalizer lease=${CUSTODY_LEASE_ID} parent=${parent_run}/${parent_attempt}"
-
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Check out exact trusted main source without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Bind global finalizer uniqueness after checkout
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          timeout 30 gh api --method GET --paginate --slurp \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy-gateway.yml/runs" \
-            -f event=workflow_dispatch -f branch="$GITHUB_REF_NAME" -f head_sha="$GITHUB_SHA" \
-            -f created="$(jq -r '.authorization_start_at' "$RUNNER_TEMP/finalizer-custody-request.json")..$(jq -r '.authorization_end_at' "$RUNNER_TEMP/finalizer-custody-request.json")" \
-            -f per_page=100 \
-            > "$RUNNER_TEMP/finalizer-custodian-lease-runs.json"
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh verify-custodian-runs \
-            --input "$RUNNER_TEMP/finalizer-custodian-lease-runs.json" \
-            --request "$RUNNER_TEMP/finalizer-custody-request.json" \
-            --output "$RUNNER_TEMP/finalizer-custodian-lease-run.json"
-          [[ "$(jq -r '.id' "$RUNNER_TEMP/finalizer-custodian-lease-run.json")" == "$GITHUB_RUN_ID" ]]
-
-      - name: Re-fetch exact sealed promotion-custody before credentials
-        env:
-          GH_TOKEN: ${{ github.token }}
-          HANDOFF_ID: ${{ fromJSON(inputs.custody_request).handoff_id }}
-          HANDOFF_NAME: ${{ fromJSON(inputs.custody_request).handoff_name }}
-          HANDOFF_DIGEST: ${{ fromJSON(inputs.custody_request).handoff_digest }}
-          HANDOFF_SIZE: ${{ fromJSON(inputs.custody_request).handoff_size }}
-          HANDOFF_CREATED_AT: ${{ fromJSON(inputs.custody_request).handoff_created_at }}
-          HANDOFF_EXPIRES_AT: ${{ fromJSON(inputs.custody_request).handoff_expires_at }}
-          HANDOFF_REPOSITORY: ${{ fromJSON(inputs.custody_request).repository }}
-          HANDOFF_RUN_ID: ${{ fromJSON(inputs.custody_request).parent_run_id }}
-          HANDOFF_RUN_ATTEMPT: ${{ fromJSON(inputs.custody_request).parent_run_attempt }}
-          HANDOFF_REVIEWED_SHA: ${{ fromJSON(inputs.custody_request).reviewed_sha }}
-          CURRENT_APPROVED_GB_HOURS: ${{ vars.GATEWAY_ARTIFACT_APPROVED_GB_HOURS }}
-          CURRENT_APPROVED_DOLLARS: ${{ vars.GATEWAY_ARTIFACT_APPROVED_DOLLARS }}
-          CURRENT_PRICE_PER_GB_MONTH: ${{ vars.GATEWAY_ARTIFACT_PRICE_PER_GB_MONTH }}
-          CURRENT_BILLING_UNIT: ${{ vars.GATEWAY_ARTIFACT_BILLING_UNIT }}
-          BILLING_SNAPSHOT_AT: ${{ vars.GATEWAY_HANDOFF_BILLING_SNAPSHOT_AT }}
-          CURRENT_BILLABLE_BYTES: ${{ vars.GATEWAY_HANDOFF_CURRENT_BILLABLE_BYTES }}
-          ORGANIZATION_ACTIONS_ARTIFACT_BYTES: ${{ vars.GATEWAY_HANDOFF_ORG_ACTIONS_ARTIFACT_BYTES }}
-          ORGANIZATION_PACKAGES_BYTES: ${{ vars.GATEWAY_HANDOFF_ORG_PACKAGES_BYTES }}
-          INCLUDED_SOURCE_ARTIFACT_ID: ${{ vars.GATEWAY_HANDOFF_INCLUDED_SOURCE_ARTIFACT_ID }}
-          INCLUDED_SOURCE_ARTIFACT_BYTES: ${{ vars.GATEWAY_HANDOFF_INCLUDED_SOURCE_ARTIFACT_BYTES }}
-          HANDOFF_OVERHEAD_BYTES: ${{ vars.GATEWAY_ARTIFACT_HANDOFF_OVERHEAD_BYTES }}
-          PAYMENT_STATUS: ${{ vars.GATEWAY_ARTIFACT_PAYMENT_STATUS }}
-          SPENDING_STATUS: ${{ vars.GATEWAY_ARTIFACT_SPENDING_STATUS }}
-        run: |
-          set -euo pipefail
-          expected_name="gateway-handoff-${HANDOFF_RUN_ID}-${HANDOFF_RUN_ATTEMPT}-${GITHUB_SHA}"
-          [[ "$HANDOFF_REPOSITORY" == "$GITHUB_REPOSITORY" &&
-             "$HANDOFF_RUN_ID" =~ ^[1-9][0-9]*$ && "$HANDOFF_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ &&
-             "$HANDOFF_REVIEWED_SHA" == "$GITHUB_SHA" &&
-             "$HANDOFF_NAME" == "$expected_name" && "$HANDOFF_ID" =~ ^[1-9][0-9]*$ &&
-             "$HANDOFF_DIGEST" =~ ^sha256:[0-9a-f]{64}$ && "$HANDOFF_SIZE" =~ ^[1-9][0-9]*$ ]]
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${HANDOFF_ID}" > "$RUNNER_TEMP/finalizer-handoff-rest.json"
-          jq -e --argjson id "$HANDOFF_ID" --arg name "$HANDOFF_NAME" --arg digest "$HANDOFF_DIGEST" \
-            --argjson size "$HANDOFF_SIZE" --arg created "$HANDOFF_CREATED_AT" \
-            --arg expires "$HANDOFF_EXPIRES_AT" --argjson run "$HANDOFF_RUN_ID" '
-            .id == $id and .name == $name and .digest == $digest and .size_in_bytes == $size and
-            .created_at == $created and .expires_at == $expires and .expired == false and
-            .workflow_run.id == $run
-          ' "$RUNNER_TEMP/finalizer-handoff-rest.json" >/dev/null
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${HANDOFF_ID}/zip" > "$RUNNER_TEMP/finalizer-handoff.zip"
-          [[ "sha256:$(sha256sum "$RUNNER_TEMP/finalizer-handoff.zip" | cut -d' ' -f1)" == "$HANDOFF_DIGEST" &&
-             "$(stat -c '%s' "$RUNNER_TEMP/finalizer-handoff.zip")" == "$HANDOFF_SIZE" ]]
-          mkdir -p /tmp/pensyve-promotion-custody
-          unzip -q "$RUNNER_TEMP/finalizer-handoff.zip" -d /tmp/pensyve-promotion-custody
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh verify-tree \
-            --root /tmp/pensyve-promotion-custody \
-            --input /tmp/pensyve-promotion-custody/sealed-tree.json \
-            --transcript "$RUNNER_TEMP/finalizer-handoff-tree-replay.log"
-          jq -e --arg repo "$GITHUB_REPOSITORY" --arg workflow "$GITHUB_WORKFLOW" \
-            --arg path ".github/workflows/deploy-gateway.yml" --argjson run "$HANDOFF_RUN_ID" \
-            --argjson attempt "$HANDOFF_RUN_ATTEMPT" --arg sha "$GITHUB_SHA" \
-            --arg verified "$(sha256sum /tmp/pensyve-promotion-custody/verified-image.json | cut -d' ' -f1)" \
-            --arg complete "$(sha256sum /tmp/pensyve-promotion-custody/complete-tuple.json | cut -d' ' -f1)" \
-            --arg storage "$(sha256sum /tmp/pensyve-promotion-custody/storage-approval.json | cut -d' ' -f1)" \
-            --slurpfile verified_image /tmp/pensyve-promotion-custody/verified-image.json '
-            .schema_version == 1 and .repository == $repo and .workflow == $workflow and
-            .workflow_path == $path and .run_id == $run and .run_attempt == $attempt and
-            .reviewed_sha == $sha and .verified_image_sha256 == $verified and
-            .complete_tuple_sha256 == $complete and .storage_approval_sha256 == $storage and
-            .probe_entity == $verified_image[0].deployment.probe_entity
-          ' /tmp/pensyve-promotion-custody/handoff-metadata.json >/dev/null
-          jq -e --arg snapshot "$BILLING_SNAPSHOT_AT" --arg gbh "$CURRENT_APPROVED_GB_HOURS" \
-            --arg dollars "$CURRENT_APPROVED_DOLLARS" --arg price "$CURRENT_PRICE_PER_GB_MONTH" \
-            --argjson current "$CURRENT_BILLABLE_BYTES" --argjson org_actions "$ORGANIZATION_ACTIONS_ARTIFACT_BYTES" \
-            --argjson org_packages "$ORGANIZATION_PACKAGES_BYTES" --argjson retained_id "$INCLUDED_SOURCE_ARTIFACT_ID" \
-            --argjson retained_bytes "$INCLUDED_SOURCE_ARTIFACT_BYTES" --argjson overhead "$HANDOFF_OVERHEAD_BYTES" \
-            --arg payment "$PAYMENT_STATUS" --arg spending "$SPENDING_STATUS" --arg unit "$CURRENT_BILLING_UNIT" '
-            .snapshot_at == $snapshot and .current_billable_bytes == $current and
-            .organization_actions_artifact_bytes == $org_actions and
-            .organization_packages_bytes == $org_packages and
-            .retained_source_artifact_id == $retained_id and
-            .retained_source_artifact_bytes == $retained_bytes and
-            .handoff_overhead_bytes == $overhead and .payment_status == $payment and
-            .spending_status == $spending and
-            (.approved_gb_hours_ceiling | tostring) == $gbh and
-            (.approved_dollar_ceiling | tostring) == $dollars and
-            (.price_per_gb_month | tostring) == $price and .billing_unit == $unit
-          ' /tmp/pensyve-promotion-custody/storage-approval.json >/dev/null || {
-            echo "repository storage variable drift" >&2
-            exit 1
-          }
-          handoff_files=$(find /tmp/pensyve-promotion-custody -type f -printf '%s\n' | awk '{sum += $1} END {print sum+0}')
-          jq --argjson evidence "$handoff_files" '.evidence_bytes=$evidence' \
-            /tmp/pensyve-promotion-custody/storage-approval.json \
-            > "$RUNNER_TEMP/finalizer-handoff-storage-input.json"
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh storage-precheck \
-            --input "$RUNNER_TEMP/finalizer-handoff-storage-input.json" \
-            --output "$RUNNER_TEMP/finalizer-handoff-storage-precheck.json"
-          jq -n --slurpfile approved "$RUNNER_TEMP/finalizer-handoff-storage-precheck.json" \
-            --slurpfile artifact "$RUNNER_TEMP/finalizer-handoff-rest.json" '
-            $approved[0] + {rest_size_in_bytes:$artifact[0].size_in_bytes,
-              created_at:$artifact[0].created_at,expires_at:$artifact[0].expires_at}
-          ' > "$RUNNER_TEMP/finalizer-handoff-reconcile-input.json"
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh storage-reconcile \
-            --input "$RUNNER_TEMP/finalizer-handoff-reconcile-input.json" \
-            --output "$RUNNER_TEMP/finalizer-handoff-reconcile.json"
-          jq -e '.cleanup_required == false and .status == "accepted"' \
-            "$RUNNER_TEMP/finalizer-handoff-reconcile.json" >/dev/null
-          SOURCE_ID=$(jq -r '.source_artifact.id' /tmp/pensyve-promotion-custody/handoff-metadata.json)
-          SOURCE_DIGEST=$(jq -r '.source_artifact.server_digest' /tmp/pensyve-promotion-custody/handoff-metadata.json)
-          SOURCE_SIZE=$(jq -r '.source_artifact.size_in_bytes' /tmp/pensyve-promotion-custody/handoff-metadata.json)
-          SOURCE_NAME=$(jq -r '.source_artifact.name' /tmp/pensyve-promotion-custody/handoff-metadata.json)
-          SOURCE_RUN=$(jq -r '.source_artifact.run_id' /tmp/pensyve-promotion-custody/handoff-metadata.json)
-          SOURCE_CREATED=$(jq -r '.source_artifact.created_at' /tmp/pensyve-promotion-custody/handoff-metadata.json)
-          SOURCE_EXPIRES=$(jq -r '.source_artifact.expires_at' /tmp/pensyve-promotion-custody/handoff-metadata.json)
-          [[ "$SOURCE_ID" =~ ^[1-9][0-9]*$ && "$SOURCE_SIZE" =~ ^[1-9][0-9]*$ &&
-             "$SOURCE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ && "$SOURCE_RUN" =~ ^[1-9][0-9]*$ ]]
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${SOURCE_ID}" > "$RUNNER_TEMP/finalizer-source-rest.json"
-          jq -e --argjson id "$SOURCE_ID" --arg name "$SOURCE_NAME" --arg digest "$SOURCE_DIGEST" \
-            --argjson size "$SOURCE_SIZE" --arg created "$SOURCE_CREATED" --arg expires "$SOURCE_EXPIRES" \
-            --argjson run "$SOURCE_RUN" '
-            .id == $id and .name == $name and .digest == $digest and .size_in_bytes == $size and
-            .created_at == $created and .expires_at == $expires and .expired == false and .workflow_run.id == $run
-          ' "$RUNNER_TEMP/finalizer-source-rest.json" >/dev/null
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${SOURCE_ID}/zip" > "$RUNNER_TEMP/finalizer-source.zip"
-          [[ "sha256:$(sha256sum "$RUNNER_TEMP/finalizer-source.zip" | cut -d' ' -f1)" == "$SOURCE_DIGEST" &&
-             "$(stat -c '%s' "$RUNNER_TEMP/finalizer-source.zip")" == "$SOURCE_SIZE" ]]
-          mkdir -p /tmp/pensyve-reviewed-artifact
-          unzip -q "$RUNNER_TEMP/finalizer-source.zip" -d /tmp/pensyve-reviewed-artifact
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh verify-tree \
-            --root /tmp/pensyve-reviewed-artifact --input /tmp/pensyve-reviewed-artifact/sealed-tree.json \
-            --transcript "$RUNNER_TEMP/finalizer-source-tree-replay.log"
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh verify-local \
-            --tuple /tmp/pensyve-promotion-custody/complete-tuple.json
-          pensyve-mcp-gateway/scripts/gateway-image-artifact.sh verify-handoff \
-            --input /tmp/pensyve-promotion-custody/verified-image.json
-      # aws-actions/configure-aws-credentials v6.2.3
-      - uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c
+      - name: Configure narrow production control-plane session
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-east-2
-      - name: Roll back if needed and forget the sealed synthetic entity exactly once
-        env:
-          PROMOTION_RESULT: ${{ needs.artifact-custodian-producer.result }}
-        run: >-
-          pensyve-mcp-gateway/scripts/promote-gateway-image.sh finalize
-          /tmp/pensyve-promotion-custody/verified-image.json
+          allowed-account-ids: ${{ needs.preflight.outputs.account }}
+          role-session-name: pensyve-gateway-${{ github.run_id }}-${{ github.run_attempt }}
+          inline-session-policy: >-
+            {"Version":"2012-10-17","Statement":[{"Sid":"ReadCandidateImage","Effect":"Allow","Action":["ecr:DescribeImages","ecr:BatchGetImage","ecr:GetDownloadUrlForLayer"],"Resource":"arn:aws:ecr:us-east-2:${{ needs.preflight.outputs.account }}:repository/pensyve-gateway"},{"Sid":"ReadTaskDefinitionsAndRegisterDerivedTask","Effect":"Allow","Action":["ecs:DescribeTaskDefinition","ecs:RegisterTaskDefinition"],"Resource":"*"},{"Sid":"ReadAndUpdateExactGatewayService","Effect":"Allow","Action":["ecs:DescribeServices","ecs:UpdateService"],"Resource":"arn:aws:ecs:us-east-2:${{ needs.preflight.outputs.account }}:service/pensyve-prod/pensyve-prod-gateway"},{"Sid":"ReadExactGatewayTargetHealth","Effect":"Allow","Action":"elasticloadbalancing:DescribeTargetHealth","Resource":"arn:aws:elasticloadbalancing:us-east-2:${{ needs.preflight.outputs.account }}:targetgroup/pensyve-prod-gw-tg/*"},{"Sid":"PassExactProjectRoles","Effect":"Allow","Action":"iam:PassRole","Resource":["arn:aws:iam::${{ needs.preflight.outputs.account }}:role/pensyve-prod-task","arn:aws:iam::${{ needs.preflight.outputs.account }}:role/pensyve-prod-task-execution"]}]}
 
-  artifact-cleanup:
-    name: Delete only current invalid over-ceiling artifact
-    if: >-
-      always() &&
-      ((needs.artifact-build.outputs.cleanup_required == 'true') ||
-       (needs.artifact-promote-preflight.outputs.cleanup_required == 'true'))
-    needs: [artifact-build, artifact-promote-preflight]
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write
-    steps:
-      - name: Delete exact failed current-run artifact once and prove 404
+      - name: Verify immutable ECR raw manifest, config blob, platform, and source
         env:
-          GH_TOKEN: ${{ github.token }}
-          BUILD_REQUIRED: ${{ needs.artifact-build.outputs.cleanup_required }}
-          BUILD_ID: ${{ needs.artifact-build.outputs.cleanup_artifact_id }}
-          BUILD_NAME: ${{ needs.artifact-build.outputs.cleanup_artifact_name }}
-          BUILD_REPOSITORY: ${{ needs.artifact-build.outputs.cleanup_repository }}
-          BUILD_RUN_ID: ${{ needs.artifact-build.outputs.cleanup_run_id }}
-          BUILD_STATUS: ${{ needs.artifact-build.outputs.cleanup_status }}
-          PREFLIGHT_REQUIRED: ${{ needs.artifact-promote-preflight.outputs.cleanup_required }}
-          PREFLIGHT_ID: ${{ needs.artifact-promote-preflight.outputs.cleanup_artifact_id }}
-          PREFLIGHT_NAME: ${{ needs.artifact-promote-preflight.outputs.cleanup_artifact_name }}
-          PREFLIGHT_REPOSITORY: ${{ needs.artifact-promote-preflight.outputs.cleanup_repository }}
-          PREFLIGHT_RUN_ID: ${{ needs.artifact-promote-preflight.outputs.cleanup_run_id }}
-          PREFLIGHT_STATUS: ${{ needs.artifact-promote-preflight.outputs.cleanup_status }}
-          PRICE_PER_GB_MONTH: ${{ vars.GATEWAY_ARTIFACT_PRICE_PER_GB_MONTH }}
-          BILLING_UNIT: ${{ vars.GATEWAY_ARTIFACT_BILLING_UNIT }}
+          SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+          EXPECTED_ACCOUNT: ${{ needs.preflight.outputs.account }}
         run: |
           set -euo pipefail
-          if [[ "$BUILD_REQUIRED" == true && "$PREFLIGHT_REQUIRED" == true ]]; then
-            echo "exactly one over-ceiling cleanup target is required" >&2
-            exit 1
-          elif [[ "$BUILD_REQUIRED" == true ]]; then
-            id="$BUILD_ID"; name="$BUILD_NAME"; repository="$BUILD_REPOSITORY"; run_id="$BUILD_RUN_ID"; status="$BUILD_STATUS"
-          elif [[ "$PREFLIGHT_REQUIRED" == true ]]; then
-            id="$PREFLIGHT_ID"; name="$PREFLIGHT_NAME"; repository="$PREFLIGHT_REPOSITORY"; run_id="$PREFLIGHT_RUN_ID"; status="$PREFLIGHT_STATUS"
-          else
-            echo "no exact over-ceiling cleanup target" >&2
-            exit 1
-          fi
-          if [[ "$repository" != "$GITHUB_REPOSITORY" || "$run_id" != "$GITHUB_RUN_ID" ||
-                ! "$status" =~ ^(over-ceiling|post-upload-invalid|post-upload-unresolved|post-upload-ambiguous)$ ||
-                ! "$run_id" =~ ^[1-9][0-9]*$ ||
-                ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ || ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "cleanup target binding mismatch" >&2
-            exit 1
-          fi
-          if [[ "$BUILD_REQUIRED" == true ]]; then
-            [[ "$name" == "gateway-image-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA}" ]] || {
-              echo "cleanup target binding mismatch" >&2
-              exit 1
-            }
-          else
-            [[ "$name" == "gateway-handoff-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA}" ]] || {
-              echo "cleanup target binding mismatch" >&2
-              exit 1
-            }
-          fi
-          if [[ ! "$id" =~ ^[1-9][0-9]*$ ]]; then
-            # cleanup-name-quiescence: a terminal resolver can lose an upload
-            # response and still retain exact name/run custody.  Independently
-            # bind that one current-run artifact before deletion.
-            matches=0
-            for attempt in 1 2 3; do
-              timeout 30 gh api --method GET --paginate --slurp \
-                "repos/${repository}/actions/runs/${run_id}/artifacts" \
-                -f per_page=100 -f name="$name" > "$RUNNER_TEMP/cleanup-name-inventory.json"
-              matches=$(jq --arg name "$name" --argjson run "$run_id" '
-                [.[] | .artifacts[] | select(.name == $name and .workflow_run.id == $run)] | length
-              ' "$RUNNER_TEMP/cleanup-name-inventory.json")
-              if [[ "$matches" == 1 ]]; then break; fi
-              if [[ "$matches" -gt 1 ]]; then
-                echo "cleanup-by-name inventory is ambiguous: matches=$matches" >&2
-                exit 1
-              fi
-              [[ "$attempt" == 3 ]] || sleep 2
-            done
-            [[ "$matches" == 1 ]] || {
-              echo "cleanup-by-name inventory remained empty after bounded quiescence" >&2
-              exit 1
-            }
-            id=$(jq -r --arg name "$name" --argjson run "$run_id" '
-              .[] | .artifacts[] | select(.name == $name and .workflow_run.id == $run) | .id
-            ' "$RUNNER_TEMP/cleanup-name-inventory.json")
-            jq -e --argjson id "$id" --arg name "$name" --argjson run "$run_id" '
-              [.[] | .artifacts[] | select(.id == $id and .name == $name and
-                .workflow_run.id == $run and .expired == false and .size_in_bytes > 0 and
-                (.created_at | type == "string") and (.expires_at | type == "string"))] | length == 1
-            ' "$RUNNER_TEMP/cleanup-name-inventory.json" >/dev/null || {
-              echo "cleanup-by-name REST binding mismatch" >&2
-              exit 1
-            }
-          fi
-          [[ "$id" =~ ^[1-9][0-9]*$ ]] || { echo "cleanup target binding mismatch" >&2; exit 1; }
-          gh api "repos/${repository}/actions/artifacts/${id}" > "$RUNNER_TEMP/pre-delete-artifact.json"
-          jq -e --argjson id "$id" --arg name "$name" --argjson run "$run_id" '
-            .id == $id and .name == $name and .expired == false and .workflow_run.id == $run
-          ' "$RUNNER_TEMP/pre-delete-artifact.json" >/dev/null || {
-            echo "cleanup pre-delete REST binding mismatch" >&2
-            exit 1
-          }
-          [[ "$PRICE_PER_GB_MONTH" =~ ^[0-9]+([.][0-9]+)?$ && "$BILLING_UNIT" == GB-month ]]
-          python3 - "$RUNNER_TEMP/pre-delete-artifact.json" "$PRICE_PER_GB_MONTH" "$GITHUB_STEP_SUMMARY" <<'PY'
+          registry=$(jq -r '.image.registry' "$RUNNER_TEMP/custody.json")
+          repository=$(jq -r '.image.repository' "$RUNNER_TEMP/custody.json")
+          digest=$(jq -r '.image.manifest_digest' "$RUNNER_TEMP/custody.json")
+          config=$(jq -r '.image.config_digest' "$RUNNER_TEMP/custody.json")
+          platform=$(jq -r '.image.platform' "$RUNNER_TEMP/custody.json")
+          media=$(jq -r '.image.raw_manifest_media_type' "$RUNNER_TEMP/custody.json")
+          raw_sha=$(jq -r '.image.raw_manifest_sha256' "$RUNNER_TEMP/custody.json")
+          account=$(jq -r '.image.account' "$RUNNER_TEMP/custody.json")
+          [[ "$platform" == linux/arm64 && "${registry}/${repository}@${digest}" != *:latest ]]
+          [[ "$account" == "$EXPECTED_ACCOUNT" ]]
+          assumed_account=$(aws sts get-caller-identity --query Account --output text)
+          [[ "$assumed_account" == "$account" ]]
+          aws ecr describe-images --region us-east-2 --registry-id "$account" \
+            --repository-name "$repository" \
+            --image-ids "imageDigest=$digest" --output json > "$RUNNER_TEMP/describe.json"
+          aws ecr batch-get-image --region us-east-2 --registry-id "$account" \
+            --repository-name "$repository" \
+            --image-ids "imageDigest=$digest" --accepted-media-types "$media" \
+            --output json > "$RUNNER_TEMP/batch.json"
+          python3 - "$RUNNER_TEMP/custody.json" "$RUNNER_TEMP/describe.json" \
+            "$RUNNER_TEMP/batch.json" "$RUNNER_TEMP/raw-manifest.json" <<'PY'
+          import hashlib
           import json
           import sys
-          from datetime import datetime, timezone
           from pathlib import Path
 
-          artifact = json.loads(Path(sys.argv[1]).read_text())
-          price = float(sys.argv[2])
-          created = datetime.fromisoformat(artifact["created_at"].replace("Z", "+00:00"))
-          expires = datetime.fromisoformat(artifact["expires_at"].replace("Z", "+00:00"))
-          now = datetime.now(timezone.utc)
-          hours = max(0.0, min(now, expires).timestamp() - created.timestamp()) / 3600
-          byte_hours = artifact["size_in_bytes"] * hours
-          gb_hours = byte_hours / 1_000_000_000
-          dollars = gb_hours / (24 * 30) * price
-          with Path(sys.argv[3]).open("a") as summary:
-              summary.write("### Invalid artifact pre-delete custody\n\n")
-              summary.write(f"- ID: `{artifact['id']}`\n- Name: `{artifact['name']}`\n")
-              summary.write(f"- Size bytes: `{artifact['size_in_bytes']}`\n")
-              summary.write(f"- Created: `{artifact['created_at']}`\n- Expires: `{artifact['expires_at']}`\n")
-              summary.write(f"- Incurred byte-hours: `{byte_hours:.6f}`\n")
-              summary.write(f"- Incurred GB-hours: `{gb_hours:.12f}`\n")
-              summary.write(f"- Incurred dollars: `{dollars:.12f}`\n")
+          custody, describe, batch = [json.loads(Path(path).read_text()) for path in sys.argv[1:4]]
+          image = custody["image"]
+          details = describe.get("imageDetails")
+          images = batch.get("images")
+          if not isinstance(details, list) or len(details) != 1 or details[0].get("imageDigest") != image["manifest_digest"]:
+              raise SystemExit("wrong ECR describe-images digest")
+          if not isinstance(images, list) or len(images) != 1 or batch.get("failures") not in (None, []):
+              raise SystemExit("wrong ECR batch-get-image cardinality")
+          record = images[0]
+          raw = record.get("imageManifest")
+          if (record.get("imageId", {}).get("imageDigest") != image["manifest_digest"] or
+                  record.get("imageManifestMediaType") != image["raw_manifest_media_type"] or
+                  not isinstance(raw, str)):
+              raise SystemExit("wrong ECR raw manifest identity/media")
+          raw_bytes = raw.encode("utf-8")
+          raw_digest = hashlib.sha256(raw_bytes).hexdigest()
+          manifest = json.loads(raw)
+          if (raw_digest != image["raw_manifest_sha256"] or "sha256:" + raw_digest != image["manifest_digest"] or
+                  manifest.get("mediaType") != image["raw_manifest_media_type"] or
+                  manifest.get("config", {}).get("digest") != image["config_digest"]):
+              raise SystemExit("wrong ECR raw manifest bytes/hash/config")
+          Path(sys.argv[4]).write_bytes(raw_bytes)
           PY
-          gh api --method DELETE "repos/${repository}/actions/artifacts/${id}"
-          set +e
-          response=$(gh api --include "repos/${repository}/actions/artifacts/${id}" 2>&1)
-          lookup_status=$?
-          set -e
-          if [[ "$lookup_status" -eq 0 ]] || ! grep -F "HTTP 404" <<<"$response" >/dev/null; then
-            echo "cleanup lookup did not return HTTP 404" >&2
-            exit 1
-          fi
-          echo "deleted invalid artifact id=$id name=$name; minimal incurred bytes only" >&2
-          exit 1
+          url=$(aws ecr get-download-url-for-layer --region us-east-2 \
+            --registry-id "$account" \
+            --repository-name "$repository" --layer-digest "$config" \
+            --query downloadUrl --output text)
+          curl --fail --silent --show-error --location --max-time 60 \
+            --output "$RUNNER_TEMP/config.json" "$url"
+          [[ "sha256:$(sha256sum "$RUNNER_TEMP/config.json" | cut -d' ' -f1)" == "$config" ]]
+          jq -e --arg source "$SOURCE_SHA" \
+            '.os == "linux" and .architecture == "arm64" and .config.Labels["org.opencontainers.image.revision"] == $source' \
+            "$RUNNER_TEMP/config.json" >/dev/null
 
-  push-main-test:
-    name: Test merge SHA before automatic deployment
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      # dtolnay/rust-toolchain stable resolved 2026-08-30
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
-      - name: Gateway source and artifact contracts
-        run: |
-          cargo test --locked -p pensyve-mcp-gateway -p pensyve-mcp-tools
-          pensyve-mcp-gateway/scripts/test-gateway-artifact-flow.sh structural
-
-  push-main-deploy:
-    name: Build and deploy exact merge SHA
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [push-main-test]
-    runs-on: ubuntu-24.04-arm
-    environment: production
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      # actions/checkout v7.0.1
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      # dtolnay/rust-toolchain stable resolved 2026-08-30
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
-      # aws-actions/configure-aws-credentials v6
-      - uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: us-east-2
-      - id: ecr
-        # aws-actions/amazon-ecr-login v2
-        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd
-      - name: Build and push exact merge SHA image once
+      - name: Invoke only the selected trusted-main promoter mode
         env:
-          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          OPERATION: ${{ inputs.operation }}
+          PENSYVE_TASK8_BASELINE_ARN: ${{ vars.PENSYVE_TASK8_BASELINE_ARN }}
         run: |
           set -euo pipefail
-          cargo build --locked --release -p pensyve-mcp-gateway
-          image="$REGISTRY/pensyve-gateway:$GITHUB_SHA"
-          docker build --build-arg "SOURCE_SHA=$GITHUB_SHA" --tag "$image" --file pensyve-mcp-gateway/Dockerfile .
-          docker push "$image" > "$RUNNER_TEMP/push.log"
-          digest=$(awk '/digest:/ {print $3; exit}' "$RUNNER_TEMP/push.log")
-          [[ "$digest" == sha256:* ]]
-          echo "IMAGE_URI=$REGISTRY/pensyve-gateway@$digest" >> "$GITHUB_ENV"
-      - name: Canonical image-only service update
-        run: |
-          set -euo pipefail
-          task_arn=$(aws ecs describe-services --region us-east-2 --cluster pensyve-prod \
-            --services pensyve-prod-gateway --query 'services[0].taskDefinition' --output text)
-          aws ecs describe-task-definition --region us-east-2 --task-definition "$task_arn" \
-            --query taskDefinition > "$RUNNER_TEMP/current-task.json"
-          jq 'del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy,.enableFaultInjection)' \
-            "$RUNNER_TEMP/current-task.json" > "$RUNNER_TEMP/register-before.json"
-          jq --arg image "$IMAGE_URI" '
-            if ([.containerDefinitions[] | select(.name == "gateway")] | length) != 1 then error("gateway cardinality")
-            else .containerDefinitions |= map(if .name == "gateway" then .image=$image else . end) end
-          ' "$RUNNER_TEMP/register-before.json" > "$RUNNER_TEMP/register.json"
-          new_arn=$(aws ecs register-task-definition --region us-east-2 \
-            --cli-input-json "file://$RUNNER_TEMP/register.json" \
-            --query 'taskDefinition.taskDefinitionArn' --output text)
-          aws ecs update-service --region us-east-2 --cluster pensyve-prod \
-            --service pensyve-prod-gateway --task-definition "$new_arn"
-          aws ecs wait services-stable --region us-east-2 --cluster pensyve-prod \
-            --services pensyve-prod-gateway
+          pensyve-mcp-gateway/scripts/promote-gateway-image.sh "$OPERATION" \
+            --custody "$RUNNER_TEMP/custody.json"
