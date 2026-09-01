@@ -177,7 +177,7 @@ impl EmbeddingSpace {
 fn hash_file(path: &std::path::Path) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
