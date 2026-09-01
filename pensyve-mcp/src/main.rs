@@ -153,7 +153,11 @@ fn eager_model_order(stored_dims: Option<usize>) -> [&'static str; 2] {
 /// existing embeddings' dimensionality — see `eager_model_order`.
 fn build_eager_embedder(stored_dims: Option<usize>) -> anyhow::Result<OnnxEmbedder> {
     let [first, second] = eager_model_order(stored_dims);
-    match OnnxEmbedder::new(first) {
+    match OnnxEmbedder::new_with_policy_and_pool_size(
+        first,
+        &NetworkPolicy::Permissive,
+        resolve_stdio_pool_size(),
+    ) {
         Ok(e) => {
             tracing::info!(
                 "Using real ONNX embedder ({first}, {} dims)",
@@ -163,7 +167,11 @@ fn build_eager_embedder(stored_dims: Option<usize>) -> anyhow::Result<OnnxEmbedd
         }
         Err(first_err) => {
             tracing::warn!("{first} unavailable ({first_err}), trying {second} fallback");
-            match OnnxEmbedder::new(second) {
+            match OnnxEmbedder::new_with_policy_and_pool_size(
+                second,
+                &NetworkPolicy::Permissive,
+                resolve_stdio_pool_size(),
+            ) {
                 Ok(e) => {
                     tracing::info!(
                         "Using fallback ONNX embedder ({second}, {} dims)",
@@ -300,6 +308,32 @@ mod tests {
     #[test]
     fn shipping_stdio_pool_is_one_session() {
         assert_eq!(resolve_stdio_pool_size(), 1);
+    }
+
+    #[test]
+    fn lazy_and_eager_stdio_embedders_use_the_single_session_policy() {
+        let source = include_str!("main.rs");
+        let lazy = source
+            .split_once("fn build_embedder(")
+            .expect("stdio embedder builder")
+            .1
+            .split_once("const GTE:")
+            .expect("stdio embedder builder terminator")
+            .0;
+        assert!(lazy.contains("new_lazy_with_options"));
+        assert!(lazy.contains("resolve_stdio_pool_size()"));
+
+        let eager = source
+            .split_once("fn build_eager_embedder(")
+            .expect("eager stdio embedder builder")
+            .1
+            .split_once("#[cfg(test)]\nfn stored_embedding_dims")
+            .expect("eager stdio embedder builder terminator")
+            .0;
+        assert_eq!(eager.matches("new_with_policy_and_pool_size").count(), 2);
+        assert_eq!(eager.matches("NetworkPolicy::Permissive").count(), 2);
+        assert_eq!(eager.matches("resolve_stdio_pool_size()").count(), 2);
+        assert!(!eager.contains("OnnxEmbedder::new("));
     }
 
     #[test]
