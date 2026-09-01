@@ -77,6 +77,23 @@ fn initialize_generation(storage: &SqliteBackend, embedder: &OnnxEmbedder, ns: U
         .unwrap();
 }
 
+fn save_active_semantic(
+    storage: &SqliteBackend,
+    embedder: &OnnxEmbedder,
+    semantic: &SemanticMemory,
+) {
+    let memory = Memory::Semantic(semantic.clone());
+    let source = pensyve_core::storage::bounded::embedding_source_text(&memory);
+    let record = embedding_record_for_memory(
+        &memory,
+        embedder.embedding_space().unwrap(),
+        embedder.embed(&source).unwrap(),
+    );
+    storage
+        .save_memory_with_embedding(&memory, Some(&record))
+        .unwrap();
+}
+
 /// The single `mentioned` row currently live in `ns`. Panics unless the
 /// namespace holds exactly one, so an unexpected extra row fails loudly here
 /// rather than silently steering a supersession onto the wrong row.
@@ -191,7 +208,7 @@ fn superseded_promotion_is_not_reminted_from_unchanged_evidence() {
     // Correct the fact: a new semantic row supersedes the promoted one.
     let promoted_id = active_mentioned_id(&storage, ns.id);
     let correction = SemanticMemory::new(ns.id, entity_id, "mentioned", "prefers light mode", 0.9);
-    storage.save_semantic(&correction).unwrap();
+    save_active_semantic(&storage, &embedder, &correction);
     assert!(
         storage
             .supersede_memory_in_namespace(promoted_id, ns.id, correction.id, corrected_at)
@@ -256,7 +273,7 @@ fn new_evidence_still_promotes_after_supersession() {
 
     let promoted_id = active_mentioned_id(&storage, ns.id);
     let correction = SemanticMemory::new(ns.id, entity_id, "mentioned", "uses bash", 0.9);
-    storage.save_semantic(&correction).unwrap();
+    save_active_semantic(&storage, &embedder, &correction);
     assert!(
         storage
             .supersede_memory_in_namespace(promoted_id, ns.id, correction.id, corrected_at)
@@ -331,7 +348,7 @@ fn new_evidence_reasserting_same_content_promotes_after_supersession() {
 
     let promoted_id = active_mentioned_id(&storage, ns.id);
     let correction = SemanticMemory::new(ns.id, entity_id, "mentioned", "prefers light mode", 0.9);
-    storage.save_semantic(&correction).unwrap();
+    save_active_semantic(&storage, &embedder, &correction);
     assert!(
         storage
             .supersede_memory_in_namespace(promoted_id, ns.id, correction.id, corrected_at)

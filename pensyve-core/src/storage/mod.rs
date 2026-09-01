@@ -58,9 +58,11 @@ pub(crate) fn memory_namespace_id(memory: &Memory) -> Uuid {
 /// independent of serialization and mutable memory metadata.
 #[must_use]
 pub fn canonical_embedding_source_sha256(memory: &Memory) -> String {
-    hex::encode(Sha256::digest(
-        bounded::embedding_source_text(memory).as_bytes(),
-    ))
+    canonical_embedding_source_text_sha256(&bounded::embedding_source_text(memory))
+}
+
+pub(crate) fn canonical_embedding_source_text_sha256(source: &str) -> String {
+    hex::encode(Sha256::digest(source.as_bytes()))
 }
 
 /// Construct one versioned embedding record from the exact runtime space and
@@ -163,6 +165,9 @@ pub struct CapturedMemory {
 pub(crate) enum BulkPageKind {
     SnapshotCapture,
     GdprExport,
+    EmbeddingMigrationStart,
+    EmbeddingMigrationVerify,
+    EmbeddingMigrationActivate,
 }
 
 pub(crate) fn bounded_bulk_page_size(

@@ -4269,7 +4269,7 @@ mod tests {
     use crate::storage::StorageTrait;
     use crate::storage::bounded::{MemoryRef, MemoryType};
     use crate::storage::sqlite::SqliteBackend;
-    use crate::types::{EpisodicMemory, Namespace, ObservationMemory};
+    use crate::types::{EpisodicMemory, Memory, Namespace, ObservationMemory};
     use tempfile::TempDir;
 
     /// Closure that pretends to embed — returns a fixed-size vector of 1.0s.
@@ -4316,7 +4316,11 @@ mod tests {
             "user: I played AC Odyssey",
         );
         mem.event_time = Some(Utc::now());
-        db.save_episodic(&mem).unwrap();
+        let memory = Memory::Episodic(mem);
+        let record =
+            crate::storage::embedding_record_for_memory(&memory, &space, vec![1.0; dimensions]);
+        db.save_memory_with_embedding(&memory, Some(&record))
+            .unwrap();
         (dir, db, ns, episode_id, space)
     }
 

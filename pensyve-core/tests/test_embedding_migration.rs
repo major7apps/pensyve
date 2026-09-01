@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use pensyve_core::embedding::{EmbeddingError, EmbeddingResult, OnnxEmbedder};
 use pensyve_core::embedding_migration::{
@@ -6,7 +7,10 @@ use pensyve_core::embedding_migration::{
 };
 use pensyve_core::embedding_space::{EmbeddingSpace, EmbeddingSpaceId};
 use pensyve_core::retrieval::SemanticStatus;
-use pensyve_core::storage::bounded::{MemoryRef, NamespaceEmbeddingPhase, SearchUnavailable};
+use pensyve_core::storage::bounded::{
+    MemoryRef, NamespaceEmbeddingPhase, SearchScope, SearchUnavailable, VectorSearchOutcome,
+    VectorSearchRequest,
+};
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::storage::{
     StorageTrait, canonical_embedding_source_sha256, embedding_record_for_memory,
@@ -15,7 +19,7 @@ use pensyve_core::types::{Entity, EntityKind, Memory, Namespace, SemanticMemory}
 use tempfile::TempDir;
 
 struct Fixture {
-    _dir: TempDir,
+    dir: TempDir,
     storage: SqliteBackend,
     namespace: Namespace,
     entity: Entity,
@@ -45,7 +49,7 @@ fn fixture(memory_count: usize) -> Fixture {
         storage.save_memory_with_embedding(memory, None).unwrap();
     }
     Fixture {
-        _dir: dir,
+        dir,
         storage,
         namespace,
         entity,
@@ -298,37 +302,145 @@ fn first_migration_can_roll_back_to_lexical_only() {
     );
 }
 
-#[cfg(feature = "postgres")]
-#[test]
-fn postgres_embedding_migration_state_machine() {
-    let Ok(database_url) = std::env::var("PENSYVE_TEST_DATABASE_URL") else {
-        eprintln!("skipped: PENSYVE_TEST_DATABASE_URL is unset");
-        return;
-    };
-    let storage = pensyve_core::storage::PostgresBackend::new(&database_url).unwrap();
-    let namespace = Namespace::new(format!("embedding-migration-{}", uuid::Uuid::new_v4()));
-    storage.save_namespace(&namespace).unwrap();
-    let mut entity = Entity::new("postgres-subject", EntityKind::Agent);
-    entity.namespace_id = namespace.id;
-    storage.save_entity(&entity).unwrap();
-    let memory = Memory::Semantic(SemanticMemory::new(
-        namespace.id,
-        entity.id,
-        "fact",
-        "postgres-value",
-        0.9,
-    ));
-    storage.save_memory_with_embedding(&memory, None).unwrap();
-    let embedder = OnnxEmbedder::new_mock(4);
-    let migration = EmbeddingMigration::new(&storage, &embedder, namespace.id);
+fn vector_search(
+    storage: &dyn StorageTrait,
+    namespace_id: uuid::Uuid,
+    embedder: &OnnxEmbedder,
+) -> VectorSearchOutcome {
+    let vector = embedder.embed("fact value-0").unwrap();
+    let request = VectorSearchRequest::new(
+        SearchScope::namespace(namespace_id),
+        embedder.embedding_space().unwrap().id(),
+        &vector,
+        5,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    storage.search_vector(&request).unwrap()
+}
 
+#[test]
+fn stale_active_handle_loses_vector_access_immediately_after_persisted_rollback() {
+    let fixture = fixture(1);
+    let stale_handle = SqliteBackend::open(fixture.dir.path()).unwrap();
+    let embedder = OnnxEmbedder::new_mock(4);
+    let migration = EmbeddingMigration::new(&fixture.storage, &embedder, fixture.namespace.id);
     migration.start().unwrap();
+    migration
+        .backfill(256, &BackfillCancellation::new())
+        .unwrap();
+    migration.verify().unwrap();
+    assert!(matches!(
+        vector_search(&stale_handle, fixture.namespace.id, &embedder),
+        VectorSearchOutcome::Unavailable(SearchUnavailable::NoActiveEmbeddingSpace)
+    ));
+    migration.activate().unwrap();
+    assert!(matches!(
+        vector_search(&stale_handle, fixture.namespace.id, &embedder),
+        VectorSearchOutcome::Complete(ref hits) if !hits.is_empty()
+    ));
+    migration.rollback_lexical().unwrap();
+
+    assert!(matches!(
+        vector_search(&stale_handle, fixture.namespace.id, &embedder),
+        VectorSearchOutcome::Unavailable(SearchUnavailable::NoActiveEmbeddingSpace)
+    ));
+    assert_eq!(
+        stale_handle
+            .load_embedding_records(
+                fixture.namespace.id,
+                &embedder.embedding_space().unwrap().id(),
+                &[MemoryRef::from_memory(&fixture.memories[0])],
+            )
+            .unwrap()
+            .len(),
+        1,
+        "rollback must retain the inert generation"
+    );
+}
+
+#[test]
+fn pre_activation_source_only_writer_cannot_break_active_coverage() {
+    let fixture = fixture(1);
+    let stale_writer = SqliteBackend::open(fixture.dir.path()).unwrap();
+    let embedder = OnnxEmbedder::new_mock(4);
+    let migration = EmbeddingMigration::new(&fixture.storage, &embedder, fixture.namespace.id);
+    migration.start().unwrap();
+    migration
+        .backfill(256, &BackfillCancellation::new())
+        .unwrap();
+    migration.verify().unwrap();
+    migration.activate().unwrap();
+
+    let mut changed = fixture.memories[0].clone();
+    let Memory::Semantic(ref mut semantic) = changed else {
+        unreachable!()
+    };
+    semantic.object = "stale-handle-update".into();
+    assert!(
+        stale_writer
+            .save_memory_with_embedding(&changed, None)
+            .is_err()
+    );
+
+    assert!(matches!(
+        vector_search(&fixture.storage, fixture.namespace.id, &embedder),
+        VectorSearchOutcome::Complete(ref hits) if !hits.is_empty()
+    ));
+    assert_eq!(
+        fixture
+            .storage
+            .get_semantic_in_namespace(changed.id(), fixture.namespace.id)
+            .unwrap()
+            .unwrap()
+            .object,
+        "value-0"
+    );
+}
+
+#[test]
+fn empty_first_migration_can_roll_back_but_later_generation_cannot() {
+    let empty = fixture(0);
+    let first_embedder = OnnxEmbedder::new_mock(4);
+    let first = EmbeddingMigration::new(&empty.storage, &first_embedder, empty.namespace.id);
+    first.start().unwrap();
+    first.verify().unwrap();
+    first.activate().unwrap();
+    assert_eq!(
+        first.rollback_lexical().unwrap().phase,
+        NamespaceEmbeddingPhase::LexicalOnly
+    );
+
+    let later = fixture(1);
+    let first = EmbeddingMigration::new(&later.storage, &first_embedder, later.namespace.id);
+    first.start().unwrap();
+    first.backfill(256, &BackfillCancellation::new()).unwrap();
+    first.verify().unwrap();
+    first.activate().unwrap();
+    let second_embedder = OnnxEmbedder::new_mock(5);
+    let second = EmbeddingMigration::new(&later.storage, &second_embedder, later.namespace.id);
+    second.start().unwrap();
+    second.backfill(256, &BackfillCancellation::new()).unwrap();
+    second.verify().unwrap();
+    second.activate().unwrap();
+    assert!(matches!(
+        second.rollback_lexical(),
+        Err(MigrationError::InvalidTransition { .. })
+    ));
+}
+
+#[test]
+fn migration_crosses_two_full_source_page_boundaries() {
+    let fixture = fixture(513);
+    let embedder = OnnxEmbedder::new_mock(4);
+    let migration = EmbeddingMigration::new(&fixture.storage, &embedder, fixture.namespace.id);
+    assert_eq!(migration.start().unwrap().barrier_sequence, 513);
     assert_eq!(
         migration
-            .backfill(256, &BackfillCancellation::new())
+            .backfill(513, &BackfillCancellation::new())
             .unwrap()
             .committed,
-        1
+        513
     );
     assert_eq!(
         migration.verify().unwrap().phase,
@@ -338,8 +450,146 @@ fn postgres_embedding_migration_state_machine() {
         migration.activate().unwrap().phase,
         NamespaceEmbeddingPhase::Active
     );
+}
+
+#[test]
+fn postgres_migration_static_contracts_are_bounded_scoped_and_lifecycle_authoritative() {
+    let source = include_str!("../src/storage/postgres.rs");
+    let migration = source
+        .split_once("fn begin_embedding_migration(")
+        .unwrap()
+        .1
+        .split_once("fn search_lexical_hits(")
+        .unwrap()
+        .0;
+    assert!(!migration.contains("LOCK TABLE"));
+    assert!(!migration.contains("live_memory_refs_for_pg_migration"));
+    assert!(migration.contains("MEMORY_PAGE_SIZE"));
+    assert!(migration.contains("REPEATABLE READ"));
+    let source_page = source
+        .split_once("async fn pg_migration_source_page(")
+        .unwrap()
+        .1
+        .split_once("async fn pg_migration_coverage(")
+        .unwrap()
+        .0;
+    assert!(source_page.contains("LEFT JOIN memory_embeddings"));
+    assert!(source_page.contains("type_order > $2"));
+    assert!(source_page.contains("sources.id > $3"));
+    assert!(source_page.contains("LIMIT $4"));
+    assert!(source_page.contains("generation.embedding_space_id = $5"));
+    assert!(source_page.contains("BulkPageGuard::new"));
+    let coverage = source
+        .split_once("async fn pg_migration_coverage(")
+        .unwrap()
+        .1
+        .split_once("async fn delete_pg_backfill_item(")
+        .unwrap()
+        .0;
+    assert!(!coverage.contains("load_memory_without_embedding_pg"));
+    assert!(!coverage.contains("fetch_all"));
+    let write_gate = source
+        .split_once("async fn validate_active_embedding_write_pg_tx(")
+        .unwrap()
+        .1
+        .split_once("async fn memory_page_from_pg_ids(")
+        .unwrap()
+        .0;
+    assert!(write_gate.contains("namespace_embedding_state"));
+    assert!(write_gate.contains("FOR UPDATE"));
+    let vector = source
+        .split_once("fn search_vector(")
+        .unwrap()
+        .1
+        .split_once("fn search_lexical_hits(")
+        .unwrap()
+        .0;
+    assert!(vector.contains("namespace_embedding_state"));
+    assert!(vector.contains("active_read_space_id"));
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_embedding_migration_state_machine() {
+    let Ok(database_url) = std::env::var("PENSYVE_TEST_DATABASE_URL") else {
+        eprintln!("skipped: PENSYVE_TEST_DATABASE_URL is unset");
+        return;
+    };
+    let storage = pensyve_core::storage::PostgresBackend::new(&database_url).unwrap();
+    let stale_handle = pensyve_core::storage::PostgresBackend::new(&database_url).unwrap();
+    let namespace = Namespace::new(format!("embedding-migration-{}", uuid::Uuid::new_v4()));
+    storage.save_namespace(&namespace).unwrap();
+    let mut entity = Entity::new("postgres-subject", EntityKind::Agent);
+    entity.namespace_id = namespace.id;
+    storage.save_entity(&entity).unwrap();
+    let memories = (0..257)
+        .map(|index| {
+            Memory::Semantic(SemanticMemory::new(
+                namespace.id,
+                entity.id,
+                "fact",
+                format!("postgres-value-{index}"),
+                0.9,
+            ))
+        })
+        .collect::<Vec<_>>();
+    for memory in &memories {
+        storage.save_memory_with_embedding(memory, None).unwrap();
+    }
+    let embedder = OnnxEmbedder::new_mock(4);
+    let migration = EmbeddingMigration::new(&storage, &embedder, namespace.id);
+
+    migration.start().unwrap();
+    let mut committed = 0;
+    while committed < 257 {
+        let progress = migration
+            .backfill(256, &BackfillCancellation::new())
+            .unwrap();
+        committed += progress.committed;
+    }
+    assert_eq!(committed, 257);
+    assert_eq!(
+        migration.verify().unwrap().phase,
+        NamespaceEmbeddingPhase::Ready
+    );
+    assert_eq!(
+        migration.activate().unwrap().phase,
+        NamespaceEmbeddingPhase::Active
+    );
+    assert!(matches!(
+        vector_search(&stale_handle, namespace.id, &embedder),
+        VectorSearchOutcome::Complete(ref hits) if !hits.is_empty()
+    ));
+    let mut changed = memories[0].clone();
+    let Memory::Semantic(ref mut semantic) = changed else {
+        unreachable!()
+    };
+    semantic.object = "postgres-stale-writer".into();
+    assert!(
+        stale_handle
+            .save_memory_with_embedding(&changed, None)
+            .is_err()
+    );
     assert_eq!(
         migration.rollback_lexical().unwrap().phase,
+        NamespaceEmbeddingPhase::LexicalOnly
+    );
+    assert!(matches!(
+        vector_search(&stale_handle, namespace.id, &embedder),
+        VectorSearchOutcome::Unavailable(SearchUnavailable::NoActiveEmbeddingSpace)
+    ));
+
+    let empty = Namespace::new(format!(
+        "embedding-migration-empty-{}",
+        uuid::Uuid::new_v4()
+    ));
+    storage.save_namespace(&empty).unwrap();
+    let empty_migration = EmbeddingMigration::new(&storage, &embedder, empty.id);
+    empty_migration.start().unwrap();
+    empty_migration.verify().unwrap();
+    empty_migration.activate().unwrap();
+    assert_eq!(
+        empty_migration.rollback_lexical().unwrap().phase,
         NamespaceEmbeddingPhase::LexicalOnly
     );
 }

@@ -1080,6 +1080,16 @@ fn seed_scan_budget_fixture(path: &Path, namespace_id: Uuid, count: usize) {
                 .execute(rusqlite::params![&namespace, &id, blob.as_slice()])
                 .unwrap();
         }
+        transaction
+            .execute(
+                "INSERT INTO namespace_embedding_state
+                 (namespace_id, active_read_space_id, target_space_id, state,
+                  barrier_sequence, updated_at)
+                 VALUES (?1, 'budget-space', NULL, 'active', 0,
+                         '2026-08-31T00:00:00Z')",
+                [&namespace],
+            )
+            .unwrap();
     }
     transaction.commit().unwrap();
 }
