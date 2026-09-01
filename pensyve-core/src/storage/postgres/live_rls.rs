@@ -3872,6 +3872,7 @@ fn register_sqlite_embedding_space(path: &std::path::Path, id: &str, dimension: 
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn bounded_reads_match_sqlite_and_isolate_forced_rls() {
     let Some(admin_opts) = skip_notice("bounded_reads_match_sqlite_and_isolate_forced_rls") else {
         return;
@@ -3887,6 +3888,7 @@ fn bounded_reads_match_sqlite_and_isolate_forced_rls() {
     let foreign = Namespace::new(format!("bounded-foreign-{}", Uuid::new_v4().simple()));
     let agent = Uuid::new_v4();
     let user = Uuid::new_v4();
+    let entity = Uuid::new_v4();
     let shared_id = Uuid::from_u128(71);
     for backend in backends {
         backend
@@ -3904,6 +3906,7 @@ fn bounded_reads_match_sqlite_and_isolate_forced_rls() {
             "boundedtoken own",
         );
         own.id = shared_id;
+        own.about_entity = entity;
         own.agent_id = Some(agent);
         own.user_id = Some(user);
         own.embedding = vec![99.0, 98.0];
@@ -3918,7 +3921,7 @@ fn bounded_reads_match_sqlite_and_isolate_forced_rls() {
         );
         wrong_scope.id = Uuid::from_u128(72);
         wrong_scope.agent_id = Some(agent);
-        wrong_scope.user_id = Some(Uuid::new_v4());
+        wrong_scope.user_id = Some(user);
         backend
             .save_semantic(&wrong_scope)
             .expect("save wrong-scope row");
@@ -3942,6 +3945,7 @@ fn bounded_reads_match_sqlite_and_isolate_forced_rls() {
         namespace_id: namespace.id,
         agent_id: Some(agent),
         user_id: Some(user),
+        entity_id: Some(entity),
     };
     let sqlite_hits = sqlite
         .search_lexical_hits("boundedtoken", &scope, 100)
@@ -4022,4 +4026,167 @@ fn bounded_reads_match_sqlite_and_isolate_forced_rls() {
             .load_embedding_records(namespace.id, &space, &refs[..1])
             .expect("load sqlite generation")
     );
+}
+
+#[test]
+fn bounded_lexical_stop_words_and_ranking_match_sqlite() {
+    let Some(admin_opts) = skip_notice("bounded_lexical_stop_words_and_ranking_match_sqlite")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let postgres = &fixture.backend;
+    let sqlite_dir = tempfile::tempdir().expect("sqlite tempdir");
+    let sqlite = crate::storage::sqlite::SqliteBackend::open(sqlite_dir.path())
+        .expect("open sqlite parity backend");
+    let namespace = Namespace::new(format!("lexical-parity-{}", Uuid::new_v4().simple()));
+
+    for backend in [postgres as &dyn StorageTrait, &sqlite] {
+        backend.save_namespace(&namespace).expect("save namespace");
+        for (id, content) in [(81_u128, "the alpha"), (82, "alpha alpha")] {
+            let mut memory = EpisodicMemory::new(
+                namespace.id,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                content,
+            );
+            memory.id = Uuid::from_u128(id);
+            backend.save_episodic(&memory).expect("save lexical row");
+        }
+    }
+    let scope = SearchScope::namespace(namespace.id);
+
+    let postgres_meaningful = postgres
+        .search_lexical_hits("alpha", &scope, 100)
+        .expect("postgres meaningful query");
+    let sqlite_meaningful = sqlite
+        .search_lexical_hits("alpha", &scope, 100)
+        .expect("sqlite meaningful query");
+    let postgres_with_stop = postgres
+        .search_lexical_hits("the alpha and", &scope, 100)
+        .expect("postgres stop-word query");
+    let sqlite_with_stop = sqlite
+        .search_lexical_hits("the alpha and", &scope, 100)
+        .expect("sqlite stop-word query");
+
+    assert_eq!(postgres_meaningful, sqlite_meaningful);
+    assert_eq!(postgres_with_stop, postgres_meaningful);
+    assert_eq!(sqlite_with_stop, sqlite_meaningful);
+    assert!(
+        postgres
+            .search_lexical_hits("the and of", &scope, 100)
+            .expect("postgres stop-only query")
+            .is_empty()
+    );
+    assert!(
+        sqlite
+            .search_lexical_hits("the and of", &scope, 100)
+            .expect("sqlite stop-only query")
+            .is_empty()
+    );
+}
+
+fn assert_memory_scope(memory: &Memory, agent_id: Uuid, user_id: Uuid) {
+    let (actual_agent, actual_user) = match memory {
+        Memory::Episodic(memory) => (memory.agent_id, memory.user_id),
+        Memory::Semantic(memory) => (memory.agent_id, memory.user_id),
+        Memory::Procedural(memory) => (memory.agent_id, memory.user_id),
+        Memory::Observation(memory) => (memory.agent_id, memory.user_id),
+    };
+    assert_eq!(actual_agent, Some(agent_id));
+    assert_eq!(actual_user, Some(user_id));
+}
+
+#[test]
+fn postgres_source_projections_round_trip_persisted_scope() {
+    let Some(admin_opts) = skip_notice("postgres_source_projections_round_trip_persisted_scope")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+    let namespace = Namespace::new(format!("scope-roundtrip-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&namespace).expect("save namespace");
+    let agent_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+
+    let mut episodic = EpisodicMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "scope episodic",
+    );
+    episodic.agent_id = Some(agent_id);
+    episodic.user_id = Some(user_id);
+    backend.save_episodic(&episodic).expect("save episodic");
+
+    let mut semantic = SemanticMemory::new(namespace.id, Uuid::new_v4(), "scope", "semantic", 1.0);
+    semantic.agent_id = Some(agent_id);
+    semantic.user_id = Some(user_id);
+    backend.save_semantic(&semantic).expect("save semantic");
+
+    let mut procedural = ProceduralMemory::new(
+        namespace.id,
+        "scope",
+        "procedural",
+        Outcome::Success,
+        HashMap::new(),
+    );
+    procedural.agent_id = Some(agent_id);
+    procedural.user_id = Some(user_id);
+    backend
+        .save_procedural(&procedural)
+        .expect("save procedural");
+
+    let mut observation = ObservationMemory::new(
+        namespace.id,
+        episodic.episode_id,
+        "scope",
+        "observation",
+        "round trip",
+        "scope observation",
+    );
+    observation.agent_id = Some(agent_id);
+    observation.user_id = Some(user_id);
+    backend
+        .save_observation(&observation)
+        .expect("save observation");
+
+    for memory in [
+        Memory::Episodic(
+            backend
+                .get_episodic_in_namespace(episodic.id, namespace.id)
+                .expect("get episodic")
+                .expect("episodic row"),
+        ),
+        Memory::Semantic(
+            backend
+                .get_semantic_in_namespace(semantic.id, namespace.id)
+                .expect("get semantic")
+                .expect("semantic row"),
+        ),
+        Memory::Procedural(
+            backend
+                .get_procedural_in_namespace(procedural.id, namespace.id)
+                .expect("get procedural")
+                .expect("procedural row"),
+        ),
+        Memory::Observation(
+            backend
+                .get_observation_in_namespace(observation.id, namespace.id)
+                .expect("get observation")
+                .expect("observation row"),
+        ),
+    ] {
+        assert_memory_scope(&memory, agent_id, user_id);
+    }
+    let bulk = backend
+        .get_all_memories_by_namespace(namespace.id)
+        .expect("bulk source projections");
+    assert_eq!(bulk.len(), 4);
+    for memory in &bulk {
+        assert_memory_scope(memory, agent_id, user_id);
+    }
 }

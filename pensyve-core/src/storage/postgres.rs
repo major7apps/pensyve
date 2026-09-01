@@ -31,7 +31,7 @@ use crate::graph::EdgeType;
 use crate::storage::bounded::{
     EmbeddingRecord, LexicalHit, MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS,
     MEMORY_PAGE_SIZE, MemoryPage, MemoryPageRequest, MemoryRef, MemoryType, PageCursor,
-    SearchScope,
+    SearchScope, lexical_query_tokens,
 };
 
 // ---------------------------------------------------------------------------
@@ -80,8 +80,8 @@ impl<'r> FromRow<'r, PgRow> for EpisodicRow {
             event_time: row.try_get("event_time")?,
             superseded_by: row.try_get("superseded_by")?,
             invalid_at: row.try_get("invalid_at")?,
-            agent_id: row.try_get("agent_id").unwrap_or(None),
-            user_id: row.try_get("user_id").unwrap_or(None),
+            agent_id: row.try_get("agent_id")?,
+            user_id: row.try_get("user_id")?,
         })
     }
 }
@@ -122,8 +122,8 @@ impl<'r> FromRow<'r, PgRow> for SemanticRow {
             stability: row.try_get("stability")?,
             retrievability: row.try_get("retrievability")?,
             superseded_by: row.try_get("superseded_by")?,
-            agent_id: row.try_get("agent_id").unwrap_or(None),
-            user_id: row.try_get("user_id").unwrap_or(None),
+            agent_id: row.try_get("agent_id")?,
+            user_id: row.try_get("user_id")?,
         })
     }
 }
@@ -166,8 +166,8 @@ impl<'r> FromRow<'r, PgRow> for ProceduralRow {
             last_used: row.try_get("last_used")?,
             superseded_by: row.try_get("superseded_by")?,
             invalid_at: row.try_get("invalid_at")?,
-            agent_id: row.try_get("agent_id").unwrap_or(None),
-            user_id: row.try_get("user_id").unwrap_or(None),
+            agent_id: row.try_get("agent_id")?,
+            user_id: row.try_get("user_id")?,
         })
     }
 }
@@ -214,8 +214,8 @@ impl<'r> FromRow<'r, PgRow> for ObservationRow {
             retrievability: row.try_get("retrievability")?,
             superseded_by: row.try_get("superseded_by")?,
             invalid_at: row.try_get("invalid_at")?,
-            agent_id: row.try_get("agent_id").unwrap_or(None),
-            user_id: row.try_get("user_id").unwrap_or(None),
+            agent_id: row.try_get("agent_id")?,
+            user_id: row.try_get("user_id")?,
         })
     }
 }
@@ -775,7 +775,7 @@ impl PostgresBackend {
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           summary, embedding::text AS embedding, context_intent, timestamp, stability,
                           retrievability, access_count, last_accessed, event_time,
-                          superseded_by, invalid_at
+                          superseded_by, invalid_at, agent_id, user_id
                    FROM episodic_memories
                    WHERE namespace_id = $1 AND ($2 OR superseded_by IS NULL)",
             )
@@ -789,7 +789,7 @@ impl PostgresBackend {
             let rows: Vec<SemanticRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
                           valid_at, invalid_at, source_episodes, embedding::text, stability,
-                          retrievability, superseded_by
+                          retrievability, superseded_by, agent_id, user_id
                    FROM semantic_memories
                    WHERE namespace_id = $1 AND ($2 OR superseded_by IS NULL)",
             )
@@ -803,7 +803,7 @@ impl PostgresBackend {
             let rows: Vec<ProceduralRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
                           trial_count, success_count, source_episodes, embedding::text, created_at,
-                          last_used, superseded_by, invalid_at
+                          last_used, superseded_by, invalid_at, agent_id, user_id
                    FROM procedural_memories
                    WHERE namespace_id = $1 AND ($2 OR superseded_by IS NULL)",
             )
@@ -821,7 +821,7 @@ impl PostgresBackend {
             let rows: Vec<ObservationRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
                           unit, content, embedding::text AS embedding, confidence, event_time, created_at,
-                          stability, retrievability, superseded_by, invalid_at
+                          stability, retrievability, superseded_by, invalid_at, agent_id, user_id
                    FROM observation_memories
                    WHERE namespace_id = $1 AND ($2 OR superseded_by IS NULL)",
             )
@@ -850,7 +850,7 @@ const SCHEMA: &str = include_str!("postgres_schema.sql");
 const LIST_OBSERVATIONS_BY_ENTITY_INSTANCE_SQL: &str = r"SELECT id, namespace_id, episode_id, entity_type, instance, action,
              quantity, unit, content, embedding::text AS embedding, confidence,
              event_time, created_at, stability, retrievability, superseded_by,
-             invalid_at
+             invalid_at, agent_id, user_id
       FROM observation_memories
       WHERE namespace_id = $1 AND instance = $2 AND superseded_by IS NULL
       ORDER BY created_at DESC LIMIT $3";
@@ -1305,26 +1305,6 @@ async fn load_memory_without_embedding_pg(
     }
 }
 
-fn ensure_hydrated_payload_fits(
-    memories: &[Memory],
-    requested_max_bytes: usize,
-) -> StorageResult<()> {
-    let max_bytes = requested_max_bytes.min(MAX_HYDRATED_BYTES);
-    let mut total = 0_usize;
-    for memory in memories {
-        let bytes = serde_json::to_vec(memory)?.len();
-        total = total.checked_add(bytes).ok_or_else(|| {
-            StorageError::BudgetExceeded("hydrated payload byte count overflowed usize".into())
-        })?;
-        if total > max_bytes {
-            return Err(StorageError::BudgetExceeded(format!(
-                "hydrated payload exceeds {max_bytes} bytes"
-            )));
-        }
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // StorageTrait implementation
 // ---------------------------------------------------------------------------
@@ -1336,22 +1316,19 @@ impl StorageTrait for PostgresBackend {
         scope: &SearchScope,
         limit: usize,
     ) -> StorageResult<Vec<LexicalHit>> {
-        let tokens = query_str
-            .split_whitespace()
-            .take(super::MAX_FTS_QUERY_TOKENS)
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
+        let tokens = lexical_query_tokens(query_str);
         let limit = limit.min(MAX_LEXICAL_HITS);
         if tokens.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let tsquery = or_tsquery_fragment(5, tokens.len());
+        let tsquery = or_tsquery_fragment(6, tokens.len());
         let sql = format!(
             "SELECT memory_type, id, score FROM ( \
                  SELECT 'episodic' AS memory_type, id, ts_rank(fts_content, {tsquery}) AS score \
                  FROM episodic_memories \
                  WHERE namespace_id = $1 AND ($3::uuid IS NULL OR agent_id = $3) \
                    AND ($4::uuid IS NULL OR user_id = $4) \
+                   AND ($5::uuid IS NULL OR about_entity = $5 OR source_entity = $5) \
                    AND superseded_by IS NULL AND invalid_at IS NULL \
                    AND fts_content @@ {tsquery} \
                  UNION ALL \
@@ -1359,6 +1336,7 @@ impl StorageTrait for PostgresBackend {
                  FROM semantic_memories \
                  WHERE namespace_id = $1 AND ($3::uuid IS NULL OR agent_id = $3) \
                    AND ($4::uuid IS NULL OR user_id = $4) \
+                   AND ($5::uuid IS NULL OR subject = $5 OR object_entity = $5) \
                    AND superseded_by IS NULL AND invalid_at IS NULL \
                    AND fts_content @@ {tsquery} \
                  UNION ALL \
@@ -1366,6 +1344,7 @@ impl StorageTrait for PostgresBackend {
                  FROM procedural_memories \
                  WHERE namespace_id = $1 AND ($3::uuid IS NULL OR agent_id = $3) \
                    AND ($4::uuid IS NULL OR user_id = $4) \
+                   AND $5::uuid IS NULL \
                    AND superseded_by IS NULL AND invalid_at IS NULL \
                    AND fts_content @@ {tsquery} \
                  UNION ALL \
@@ -1373,6 +1352,7 @@ impl StorageTrait for PostgresBackend {
                  FROM observation_memories \
                  WHERE namespace_id = $1 AND ($3::uuid IS NULL OR agent_id = $3) \
                    AND ($4::uuid IS NULL OR user_id = $4) \
+                   AND $5::uuid IS NULL \
                    AND superseded_by IS NULL AND invalid_at IS NULL \
                    AND fts_content @@ {tsquery} \
              ) AS ranked \
@@ -1387,7 +1367,8 @@ impl StorageTrait for PostgresBackend {
                 .bind(scope.namespace_id)
                 .bind(i64::try_from(limit).unwrap_or(i64::MAX))
                 .bind(scope.agent_id)
-                .bind(scope.user_id);
+                .bind(scope.user_id)
+                .bind(scope.entity_id);
             for token in &tokens {
                 query = query.bind(token);
             }
@@ -1421,14 +1402,26 @@ impl StorageTrait for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut memories = Vec::with_capacity(memory_refs.len());
+            let max_bytes = max_bytes.min(MAX_HYDRATED_BYTES);
+            let mut total_bytes = 0_usize;
             for memory_ref in memory_refs {
                 if let Some(memory) =
                     load_memory_without_embedding_pg(&mut conn, namespace_id, *memory_ref).await?
                 {
+                    let memory_bytes = serde_json::to_vec(&memory)?.len();
+                    total_bytes = total_bytes.checked_add(memory_bytes).ok_or_else(|| {
+                        StorageError::BudgetExceeded(
+                            "hydrated payload byte count overflowed usize".into(),
+                        )
+                    })?;
+                    if total_bytes > max_bytes {
+                        return Err(StorageError::BudgetExceeded(format!(
+                            "hydrated payload exceeds {max_bytes} bytes"
+                        )));
+                    }
                     memories.push(memory);
                 }
             }
-            ensure_hydrated_payload_fits(&memories, max_bytes)?;
             Ok(memories)
         })
     }
@@ -1439,12 +1432,12 @@ impl StorageTrait for PostgresBackend {
         embedding_space_id: &EmbeddingSpaceId,
         memory_refs: &[MemoryRef],
     ) -> StorageResult<Vec<EmbeddingRecord>> {
-        let unique_refs = memory_refs.iter().copied().collect::<BTreeSet<_>>();
-        if unique_refs.len() > MAX_FUSED_HITS {
+        if memory_refs.len() > MAX_FUSED_HITS {
             return Err(StorageError::BudgetExceeded(format!(
-                "embedding load accepts at most {MAX_FUSED_HITS} unique references"
+                "embedding load accepts at most {MAX_FUSED_HITS} references"
             )));
         }
+        let unique_refs = memory_refs.iter().copied().collect::<BTreeSet<_>>();
         if unique_refs.is_empty() {
             return Ok(Vec::new());
         }
@@ -1532,30 +1525,35 @@ impl StorageTrait for PostgresBackend {
                        FROM episodic_memories
                        WHERE namespace_id = $1 AND ($2::uuid IS NULL OR agent_id = $2)
                          AND ($3::uuid IS NULL OR user_id = $3)
-                         AND ($4 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                         AND ($4::uuid IS NULL OR about_entity = $4 OR source_entity = $4)
+                         AND ($5 OR (superseded_by IS NULL AND invalid_at IS NULL))
                        UNION ALL
                        SELECT 1, 'semantic', id FROM semantic_memories
                        WHERE namespace_id = $1 AND ($2::uuid IS NULL OR agent_id = $2)
                          AND ($3::uuid IS NULL OR user_id = $3)
-                         AND ($4 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                         AND ($4::uuid IS NULL OR subject = $4 OR object_entity = $4)
+                         AND ($5 OR (superseded_by IS NULL AND invalid_at IS NULL))
                        UNION ALL
                        SELECT 2, 'procedural', id FROM procedural_memories
                        WHERE namespace_id = $1 AND ($2::uuid IS NULL OR agent_id = $2)
                          AND ($3::uuid IS NULL OR user_id = $3)
-                         AND ($4 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                         AND $4::uuid IS NULL
+                         AND ($5 OR (superseded_by IS NULL AND invalid_at IS NULL))
                        UNION ALL
                        SELECT 3, 'observation', id FROM observation_memories
                        WHERE namespace_id = $1 AND ($2::uuid IS NULL OR agent_id = $2)
                          AND ($3::uuid IS NULL OR user_id = $3)
-                         AND ($4 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                         AND $4::uuid IS NULL
+                         AND ($5 OR (superseded_by IS NULL AND invalid_at IS NULL))
                    ) AS memories
-                   WHERE type_order > $5 OR (type_order = $5 AND id > $6)
+                   WHERE type_order > $6 OR (type_order = $6 AND id > $7)
                    ORDER BY type_order, id
-                   LIMIT $7",
+                   LIMIT $8",
             )
             .bind(request.scope.namespace_id)
             .bind(request.scope.agent_id)
             .bind(request.scope.user_id)
+            .bind(request.scope.entity_id)
             .bind(request.include_superseded)
             .bind(after_type)
             .bind(after_id)
@@ -1899,7 +1897,8 @@ impl StorageTrait for PostgresBackend {
             let row: Option<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed, event_time, superseded_by, invalid_at
+                          access_count, last_accessed, event_time, superseded_by, invalid_at,
+                          agent_id, user_id
                    FROM episodic_memories WHERE id = $1 AND namespace_id = $2",
             )
             .bind(id)
@@ -1924,7 +1923,8 @@ impl StorageTrait for PostgresBackend {
             let rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed, event_time, superseded_by, invalid_at
+                          access_count, last_accessed, event_time, superseded_by, invalid_at,
+                          agent_id, user_id
                    FROM episodic_memories
                    WHERE about_entity = $1 AND namespace_id = $2 AND superseded_by IS NULL
                    ORDER BY timestamp DESC LIMIT $3",
@@ -1953,7 +1953,8 @@ impl StorageTrait for PostgresBackend {
                 // chronological order across the episode.
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed, event_time, superseded_by, invalid_at
+                          access_count, last_accessed, event_time, superseded_by, invalid_at,
+                          agent_id, user_id
                    FROM episodic_memories
                    WHERE namespace_id = $1 AND episode_id = $2 AND superseded_by IS NULL
                    ORDER BY COALESCE(event_time, timestamp) ASC",
@@ -2014,7 +2015,7 @@ impl StorageTrait for PostgresBackend {
             let row: Option<SemanticRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
                           valid_at, invalid_at, source_episodes, embedding::text, stability,
-                          retrievability, superseded_by
+                          retrievability, superseded_by, agent_id, user_id
                    FROM semantic_memories WHERE id = $1 AND namespace_id = $2",
             )
             .bind(id)
@@ -2039,7 +2040,7 @@ impl StorageTrait for PostgresBackend {
             let rows: Vec<SemanticRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
                           valid_at, invalid_at, source_episodes, embedding::text, stability,
-                          retrievability, superseded_by
+                          retrievability, superseded_by, agent_id, user_id
                    FROM semantic_memories
                    WHERE subject = $1 AND namespace_id = $2 AND superseded_by IS NULL
                    ORDER BY valid_at DESC LIMIT $3",
@@ -2073,7 +2074,7 @@ impl StorageTrait for PostgresBackend {
             let row: Option<ProceduralRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
                           trial_count, success_count, source_episodes, embedding::text, created_at,
-                          last_used, superseded_by, invalid_at
+                          last_used, superseded_by, invalid_at, agent_id, user_id
                    FROM procedural_memories WHERE id = $1 AND namespace_id = $2",
             )
             .bind(id)
@@ -2133,7 +2134,7 @@ impl StorageTrait for PostgresBackend {
             let row: Option<ObservationRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
                           unit, content, embedding::text AS embedding, confidence, event_time, created_at,
-                          stability, retrievability, superseded_by, invalid_at
+                          stability, retrievability, superseded_by, invalid_at, agent_id, user_id
                    FROM observation_memories WHERE id = $1 AND namespace_id = $2",
             )
             .bind(id)
@@ -2185,7 +2186,7 @@ impl StorageTrait for PostgresBackend {
             let rows: Vec<ObservationRow> = query_as::<Postgres, ObservationRow>(
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
                           unit, content, embedding::text AS embedding, confidence, event_time, created_at,
-                          stability, retrievability, superseded_by, invalid_at
+                          stability, retrievability, superseded_by, invalid_at, agent_id, user_id
                    FROM observation_memories
                    WHERE episode_id = ANY($1) AND namespace_id = $2
                      AND superseded_by IS NULL
@@ -2275,7 +2276,7 @@ impl StorageTrait for PostgresBackend {
                 "SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                         summary, embedding::text AS embedding, context_intent, timestamp,
                         stability, retrievability, access_count, last_accessed, event_time,
-                        superseded_by, invalid_at
+                        superseded_by, invalid_at, agent_id, user_id
                    FROM episodic_memories
                    WHERE namespace_id = $1 AND superseded_by IS NULL
                      AND fts_content @@ {tsquery}
@@ -2298,7 +2299,7 @@ impl StorageTrait for PostgresBackend {
             let sql = format!(
                 "SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
                         valid_at, invalid_at, source_episodes, embedding::text, stability,
-                        retrievability, superseded_by
+                        retrievability, superseded_by, agent_id, user_id
                    FROM semantic_memories
                    WHERE namespace_id = $1 AND superseded_by IS NULL
                      AND fts_content @@ {tsquery}
@@ -2321,7 +2322,7 @@ impl StorageTrait for PostgresBackend {
             let sql = format!(
                 "SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
                         trial_count, success_count, source_episodes, embedding::text, created_at,
-                        last_used, superseded_by, invalid_at
+                        last_used, superseded_by, invalid_at, agent_id, user_id
                    FROM procedural_memories
                    WHERE namespace_id = $1 AND superseded_by IS NULL
                      AND fts_content @@ {tsquery}
@@ -2371,7 +2372,7 @@ impl StorageTrait for PostgresBackend {
             let sql = format!(
                 "SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
                         valid_at, invalid_at, source_episodes, embedding::text, stability,
-                        retrievability, superseded_by
+                        retrievability, superseded_by, agent_id, user_id
                    FROM semantic_memories
                    WHERE namespace_id = $1 AND subject = $2
                      AND superseded_by IS NULL
@@ -2400,7 +2401,7 @@ impl StorageTrait for PostgresBackend {
                 "SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                         summary, embedding::text AS embedding, context_intent, timestamp,
                         stability, retrievability, access_count, last_accessed, event_time,
-                        superseded_by, invalid_at
+                        superseded_by, invalid_at, agent_id, user_id
                    FROM episodic_memories
                    WHERE namespace_id = $1
                      AND (about_entity = $2 OR source_entity = $2)
@@ -2461,7 +2462,7 @@ impl StorageTrait for PostgresBackend {
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           summary, embedding::text AS embedding, context_intent, timestamp,
                           stability, retrievability, access_count, last_accessed, event_time,
-                          superseded_by, invalid_at
+                          superseded_by, invalid_at, agent_id, user_id
                    FROM episodic_memories
                    WHERE (about_entity = $1 OR source_entity = $1) AND namespace_id = $2",
             )
@@ -2476,7 +2477,7 @@ impl StorageTrait for PostgresBackend {
                 r"SELECT id, namespace_id, subject, predicate, object, object_entity,
                           confidence, valid_at, invalid_at, source_episodes,
                           embedding::text AS embedding, stability, retrievability,
-                          superseded_by
+                          superseded_by, agent_id, user_id
                    FROM semantic_memories
                    WHERE (subject = $1 OR object_entity = $1) AND namespace_id = $2",
             )
@@ -2620,7 +2621,7 @@ impl StorageTrait for PostgresBackend {
                    RETURNING id, namespace_id, episode_id, source_entity, about_entity, content,
                              summary, embedding::text AS embedding, context_intent, timestamp,
                              stability, retrievability, access_count, last_accessed, event_time,
-                             superseded_by, invalid_at",
+                             superseded_by, invalid_at, agent_id, user_id",
             )
             .bind(entity_id)
             .bind(namespace_id)
@@ -2635,7 +2636,7 @@ impl StorageTrait for PostgresBackend {
                    RETURNING id, namespace_id, subject, predicate, object, object_entity,
                              confidence, valid_at, invalid_at, source_episodes,
                              embedding::text AS embedding, stability, retrievability,
-                             superseded_by",
+                             superseded_by, agent_id, user_id",
             )
             .bind(entity_id)
             .bind(namespace_id)
@@ -2746,7 +2747,7 @@ impl StorageTrait for PostgresBackend {
                    RETURNING id, namespace_id, episode_id, entity_type, instance, action,
                              quantity, unit, content, embedding::text AS embedding, confidence,
                              event_time, created_at, stability, retrievability,
-                             superseded_by, invalid_at",
+                             superseded_by, invalid_at, agent_id, user_id",
             )
             .bind(entity_id)
             .bind(namespace_id)
@@ -2765,7 +2766,7 @@ impl StorageTrait for PostgresBackend {
                    RETURNING id, namespace_id, episode_id, source_entity, about_entity, content,
                              summary, embedding::text AS embedding, context_intent, timestamp,
                              stability, retrievability, access_count, last_accessed, event_time,
-                             superseded_by, invalid_at",
+                             superseded_by, invalid_at, agent_id, user_id",
             )
             .bind(entity_id)
             .bind(namespace_id)
@@ -2782,7 +2783,7 @@ impl StorageTrait for PostgresBackend {
                    RETURNING id, namespace_id, subject, predicate, object, object_entity,
                              confidence, valid_at, invalid_at, source_episodes,
                              embedding::text AS embedding, stability, retrievability,
-                             superseded_by",
+                             superseded_by, agent_id, user_id",
             )
             .bind(entity_id)
             .bind(namespace_id)
@@ -3574,6 +3575,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn postgres_row_mapping_round_trips_supersession_columns() {
         let now = Utc::now();
         let successor = Uuid::new_v4();

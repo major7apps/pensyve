@@ -21,7 +21,7 @@ use crate::graph::EdgeType;
 use crate::storage::bounded::{
     EmbeddingRecord, LexicalHit, MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS,
     MEMORY_PAGE_SIZE, MemoryPage, MemoryPageRequest, MemoryRef, MemoryType, PageCursor,
-    SearchScope,
+    SearchScope, lexical_query_tokens,
 };
 
 // ---------------------------------------------------------------------------
@@ -1297,26 +1297,6 @@ fn load_memory_without_embedding_in_conn(
     }
 }
 
-fn ensure_hydrated_payload_fits(
-    memories: &[Memory],
-    requested_max_bytes: usize,
-) -> StorageResult<()> {
-    let max_bytes = requested_max_bytes.min(MAX_HYDRATED_BYTES);
-    let mut total = 0_usize;
-    for memory in memories {
-        let bytes = serde_json::to_vec(memory)?.len();
-        total = total.checked_add(bytes).ok_or_else(|| {
-            StorageError::BudgetExceeded("hydrated payload byte count overflowed usize".into())
-        })?;
-        if total > max_bytes {
-            return Err(StorageError::BudgetExceeded(format!(
-                "hydrated payload exceeds {max_bytes} bytes"
-            )));
-        }
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // StorageTrait implementation
 // ---------------------------------------------------------------------------
@@ -1336,9 +1316,8 @@ impl StorageTrait for SqliteBackend {
         scope: &SearchScope,
         limit: usize,
     ) -> StorageResult<Vec<LexicalHit>> {
-        let escaped_query = query
-            .split_whitespace()
-            .take(super::MAX_FTS_QUERY_TOKENS)
+        let escaped_query = lexical_query_tokens(query)
+            .into_iter()
             .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" OR ");
@@ -1350,6 +1329,7 @@ impl StorageTrait for SqliteBackend {
         let namespace = scope.namespace_id.to_string();
         let agent = scope.agent_id.map(|value| value.to_string());
         let user = scope.user_id.map(|value| value.to_string());
+        let entity = scope.entity_id.map(|value| value.to_string());
         let conn = lock_conn!(self);
         let mut stmt = conn.prepare(
             r"SELECT f.memory_id, f.memory_type
@@ -1361,6 +1341,7 @@ impl StorageTrait for SqliteBackend {
                          WHERE e.id = f.memory_id AND e.namespace_id = ?2
                            AND (?3 IS NULL OR e.agent_id = ?3)
                            AND (?4 IS NULL OR e.user_id = ?4)
+                           AND (?5 IS NULL OR e.about_entity = ?5 OR e.source_entity = ?5)
                            AND e.superseded_by IS NULL AND e.invalid_at IS NULL
                      ))
                      OR (f.memory_type = 'semantic' AND EXISTS (
@@ -1368,6 +1349,7 @@ impl StorageTrait for SqliteBackend {
                          WHERE s.id = f.memory_id AND s.namespace_id = ?2
                            AND (?3 IS NULL OR s.agent_id = ?3)
                            AND (?4 IS NULL OR s.user_id = ?4)
+                           AND (?5 IS NULL OR s.subject = ?5 OR s.object_entity = ?5)
                            AND s.superseded_by IS NULL AND s.invalid_at IS NULL
                      ))
                      OR (f.memory_type = 'procedural' AND EXISTS (
@@ -1375,6 +1357,7 @@ impl StorageTrait for SqliteBackend {
                          WHERE p.id = f.memory_id AND p.namespace_id = ?2
                            AND (?3 IS NULL OR p.agent_id = ?3)
                            AND (?4 IS NULL OR p.user_id = ?4)
+                           AND ?5 IS NULL
                            AND p.superseded_by IS NULL AND p.invalid_at IS NULL
                      ))
                      OR (f.memory_type = 'observation' AND EXISTS (
@@ -1382,6 +1365,7 @@ impl StorageTrait for SqliteBackend {
                          WHERE o.id = f.memory_id AND o.namespace_id = ?2
                            AND (?3 IS NULL OR o.agent_id = ?3)
                            AND (?4 IS NULL OR o.user_id = ?4)
+                           AND ?5 IS NULL
                            AND o.superseded_by IS NULL AND o.invalid_at IS NULL
                      ))
                  )
@@ -1391,7 +1375,7 @@ impl StorageTrait for SqliteBackend {
                             WHEN 'procedural' THEN 2 ELSE 3
                         END,
                         f.memory_id
-               LIMIT ?5",
+               LIMIT ?6",
         )?;
         let rows = stmt
             .query_map(
@@ -1400,6 +1384,7 @@ impl StorageTrait for SqliteBackend {
                     namespace,
                     agent,
                     user,
+                    entity,
                     i64::try_from(limit).unwrap_or(i64::MAX)
                 ],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
@@ -1434,14 +1419,26 @@ impl StorageTrait for SqliteBackend {
         }
         let conn = lock_conn!(self);
         let mut memories = Vec::with_capacity(memory_refs.len());
+        let max_bytes = max_bytes.min(MAX_HYDRATED_BYTES);
+        let mut total_bytes = 0_usize;
         for memory_ref in memory_refs {
             if let Some(memory) =
                 load_memory_without_embedding_in_conn(&conn, namespace_id, *memory_ref)?
             {
+                let memory_bytes = serde_json::to_vec(&memory)?.len();
+                total_bytes = total_bytes.checked_add(memory_bytes).ok_or_else(|| {
+                    StorageError::BudgetExceeded(
+                        "hydrated payload byte count overflowed usize".into(),
+                    )
+                })?;
+                if total_bytes > max_bytes {
+                    return Err(StorageError::BudgetExceeded(format!(
+                        "hydrated payload exceeds {max_bytes} bytes"
+                    )));
+                }
                 memories.push(memory);
             }
         }
-        ensure_hydrated_payload_fits(&memories, max_bytes)?;
         Ok(memories)
     }
 
@@ -1451,12 +1448,12 @@ impl StorageTrait for SqliteBackend {
         embedding_space_id: &EmbeddingSpaceId,
         memory_refs: &[MemoryRef],
     ) -> StorageResult<Vec<EmbeddingRecord>> {
-        let unique_refs = memory_refs.iter().copied().collect::<BTreeSet<_>>();
-        if unique_refs.len() > MAX_FUSED_HITS {
+        if memory_refs.len() > MAX_FUSED_HITS {
             return Err(StorageError::BudgetExceeded(format!(
-                "embedding load accepts at most {MAX_FUSED_HITS} unique references"
+                "embedding load accepts at most {MAX_FUSED_HITS} references"
             )));
         }
+        let unique_refs = memory_refs.iter().copied().collect::<BTreeSet<_>>();
         if unique_refs.is_empty() {
             return Ok(Vec::new());
         }
@@ -1536,6 +1533,7 @@ impl StorageTrait for SqliteBackend {
         Ok(records)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn page_memories(&self, request: &MemoryPageRequest) -> StorageResult<MemoryPage> {
         if !(1..=MEMORY_PAGE_SIZE).contains(&request.limit) {
             return Err(StorageError::BudgetExceeded(format!(
@@ -1553,6 +1551,7 @@ impl StorageTrait for SqliteBackend {
         let namespace = request.scope.namespace_id.to_string();
         let agent = request.scope.agent_id.map(|value| value.to_string());
         let user = request.scope.user_id.map(|value| value.to_string());
+        let entity = request.scope.entity_id.map(|value| value.to_string());
         let conn = lock_conn!(self);
         let mut stmt = conn.prepare(
             r"SELECT memory_type, id FROM (
@@ -1560,26 +1559,30 @@ impl StorageTrait for SqliteBackend {
                    FROM episodic_memories
                    WHERE namespace_id = ?1 AND (?2 IS NULL OR agent_id = ?2)
                      AND (?3 IS NULL OR user_id = ?3)
-                     AND (?4 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                     AND (?4 IS NULL OR about_entity = ?4 OR source_entity = ?4)
+                     AND (?5 OR (superseded_by IS NULL AND invalid_at IS NULL))
                    UNION ALL
                    SELECT 1, 'semantic', id FROM semantic_memories
                    WHERE namespace_id = ?1 AND (?2 IS NULL OR agent_id = ?2)
                      AND (?3 IS NULL OR user_id = ?3)
-                     AND (?4 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                     AND (?4 IS NULL OR subject = ?4 OR object_entity = ?4)
+                     AND (?5 OR (superseded_by IS NULL AND invalid_at IS NULL))
                    UNION ALL
                    SELECT 2, 'procedural', id FROM procedural_memories
                    WHERE namespace_id = ?1 AND (?2 IS NULL OR agent_id = ?2)
                      AND (?3 IS NULL OR user_id = ?3)
-                     AND (?4 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                     AND ?4 IS NULL
+                     AND (?5 OR (superseded_by IS NULL AND invalid_at IS NULL))
                    UNION ALL
                    SELECT 3, 'observation', id FROM observation_memories
                    WHERE namespace_id = ?1 AND (?2 IS NULL OR agent_id = ?2)
                      AND (?3 IS NULL OR user_id = ?3)
-                     AND (?4 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                     AND ?4 IS NULL
+                     AND (?5 OR (superseded_by IS NULL AND invalid_at IS NULL))
                ) AS memories
-               WHERE type_order > ?5 OR (type_order = ?5 AND id > ?6)
+               WHERE type_order > ?6 OR (type_order = ?6 AND id > ?7)
                ORDER BY type_order, id
-               LIMIT ?7",
+               LIMIT ?8",
         )?;
         let rows = stmt
             .query_map(
@@ -1587,6 +1590,7 @@ impl StorageTrait for SqliteBackend {
                     namespace,
                     agent,
                     user,
+                    entity,
                     request.include_superseded,
                     after_type,
                     after_id,

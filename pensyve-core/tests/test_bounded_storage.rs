@@ -74,6 +74,7 @@ fn sqlite_fixture() -> (TempDir, SqliteBackend, Namespace) {
     (dir, db, namespace)
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn save(db: &SqliteBackend, memory: Memory) -> MemoryRef {
     let memory_ref = MemoryRef::from_memory(&memory);
     db.save_memory_with_embedding(&memory, None).unwrap();
@@ -189,6 +190,7 @@ fn lexical_scope_and_tie_order_are_deterministic() {
         namespace_id: namespace.id,
         agent_id: Some(agent),
         user_id: Some(user),
+        entity_id: None,
     };
     let first = db
         .search_lexical_hits("scoped-token", &scoped, 100)
@@ -208,6 +210,67 @@ fn lexical_scope_and_tie_order_are_deterministic() {
 }
 
 #[test]
+fn lexical_and_page_entity_scope_exclude_unrelated_memory_types_and_rows() {
+    let (_dir, db, namespace) = sqlite_fixture();
+    let entity = Uuid::from_u128(700);
+
+    let mut related_episodic = episodic(namespace.id, 1, "entity-token");
+    if let Memory::Episodic(memory) = &mut related_episodic {
+        memory.about_entity = entity;
+    }
+    let mut related_semantic = semantic(namespace.id, 2, "entity-token");
+    if let Memory::Semantic(memory) = &mut related_semantic {
+        memory.object_entity = Some(entity);
+    }
+    save(&db, related_episodic);
+    save(&db, related_semantic);
+    save(&db, procedural(namespace.id, 3, "entity-token"));
+    save(&db, observation(namespace.id, 4, "entity-token"));
+    save(&db, episodic(namespace.id, 5, "entity-token"));
+
+    let entity_scope = SearchScope::namespace(namespace.id).for_entity(entity);
+    let lexical = db
+        .search_lexical_hits("entity-token", &entity_scope, 100)
+        .unwrap();
+    let page = db
+        .page_memories(&MemoryPageRequest::new(entity_scope, None, 100, false).unwrap())
+        .unwrap();
+    let expected = vec![
+        (MemoryType::Episodic, Uuid::from_u128(1)),
+        (MemoryType::Semantic, Uuid::from_u128(2)),
+    ];
+
+    assert_eq!(
+        lexical
+            .iter()
+            .map(|hit| (hit.memory_ref.memory_type, hit.memory_ref.id))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        page.memories.iter().map(memory_key).collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
+fn lexical_stop_words_are_ignored_without_changing_rank_order() {
+    let (_dir, db, namespace) = sqlite_fixture();
+    save(&db, episodic(namespace.id, 1, "the alpha"));
+    save(&db, episodic(namespace.id, 2, "alpha alpha"));
+    let scope = SearchScope::namespace(namespace.id);
+
+    let meaningful = db.search_lexical_hits("alpha", &scope, 100).unwrap();
+    let with_stop_words = db
+        .search_lexical_hits("the alpha and", &scope, 100)
+        .unwrap();
+    let stop_words_only = db.search_lexical_hits("the and of", &scope, 100).unwrap();
+
+    assert_eq!(with_stop_words, meaningful);
+    assert!(stop_words_only.is_empty());
+}
+
+#[test]
 fn hydration_rejects_count_and_byte_overflow_before_returning_rows() {
     let (_dir, db, namespace) = sqlite_fixture();
     let memory_ref = save(&db, episodic(namespace.id, 1, &"large".repeat(64)));
@@ -219,6 +282,25 @@ fn hydration_rejects_count_and_byte_overflow_before_returning_rows() {
     ));
     assert!(matches!(
         db.hydrate_memories(namespace.id, &[memory_ref], 32),
+        Err(StorageError::BudgetExceeded(_))
+    ));
+}
+
+#[test]
+fn hydration_stops_on_budget_before_decoding_later_rows() {
+    let (dir, db, namespace) = sqlite_fixture();
+    let first = save(&db, episodic(namespace.id, 1, &"oversized".repeat(64)));
+    let second = save(&db, procedural(namespace.id, 2, "corrupt later row"));
+    let connection = rusqlite::Connection::open(dir.path().join("memories.db")).unwrap();
+    connection
+        .execute(
+            "UPDATE procedural_memories SET context = '{' WHERE id = ?1",
+            [second.id.to_string()],
+        )
+        .unwrap();
+
+    assert!(matches!(
+        db.hydrate_memories(namespace.id, &[first, second], 32),
         Err(StorageError::BudgetExceeded(_))
     ));
 }
@@ -305,12 +387,7 @@ fn embedding_batch_rejects_more_than_200_refs_and_never_reads_legacy_inline_vect
         memory.embedding = vec![9.0, 9.0];
     }
     let memory_ref = save(&db, memory);
-    let too_many = (1..=201)
-        .map(|id| MemoryRef {
-            memory_type: MemoryType::Episodic,
-            id: Uuid::from_u128(id),
-        })
-        .collect::<Vec<_>>();
+    let too_many = vec![memory_ref; 201];
 
     assert!(matches!(
         db.load_embedding_records(

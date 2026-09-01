@@ -15,6 +15,210 @@ pub const MEMORY_PAGE_SIZE: usize = 256;
 pub const CONSOLIDATION_COMPARISON_PAGE_SIZE: usize = 64;
 pub const MAX_PROMOTION_CLUSTER_MEMBERS: usize = 4_096;
 
+const ENGLISH_LEXICAL_STOP_WORDS: &[&str] = &[
+    "a",
+    "about",
+    "after",
+    "again",
+    "against",
+    "all",
+    "am",
+    "an",
+    "and",
+    "any",
+    "are",
+    "aren't",
+    "as",
+    "at",
+    "be",
+    "because",
+    "been",
+    "before",
+    "being",
+    "below",
+    "between",
+    "both",
+    "but",
+    "by",
+    "can't",
+    "cannot",
+    "could",
+    "couldn't",
+    "did",
+    "didn't",
+    "do",
+    "does",
+    "doesn't",
+    "doing",
+    "don't",
+    "don",
+    "down",
+    "during",
+    "each",
+    "few",
+    "for",
+    "from",
+    "further",
+    "had",
+    "hadn't",
+    "has",
+    "hasn't",
+    "have",
+    "haven't",
+    "having",
+    "he",
+    "he'd",
+    "he'll",
+    "he's",
+    "her",
+    "here",
+    "here's",
+    "hers",
+    "herself",
+    "him",
+    "himself",
+    "his",
+    "how",
+    "how's",
+    "i",
+    "i'd",
+    "i'll",
+    "i'm",
+    "i've",
+    "if",
+    "in",
+    "into",
+    "is",
+    "isn't",
+    "it",
+    "it's",
+    "its",
+    "itself",
+    "let's",
+    "me",
+    "more",
+    "most",
+    "mustn't",
+    "my",
+    "myself",
+    "just",
+    "no",
+    "nor",
+    "not",
+    "now",
+    "of",
+    "off",
+    "on",
+    "once",
+    "only",
+    "or",
+    "other",
+    "ought",
+    "our",
+    "ours",
+    "ourselves",
+    "out",
+    "over",
+    "own",
+    "same",
+    "shan't",
+    "she",
+    "she'd",
+    "she'll",
+    "she's",
+    "should",
+    "shouldn't",
+    "so",
+    "some",
+    "such",
+    "than",
+    "that",
+    "that's",
+    "the",
+    "their",
+    "theirs",
+    "them",
+    "themselves",
+    "then",
+    "there",
+    "there's",
+    "these",
+    "they",
+    "they'd",
+    "they'll",
+    "they're",
+    "they've",
+    "this",
+    "those",
+    "through",
+    "to",
+    "too",
+    "under",
+    "until",
+    "up",
+    "very",
+    "was",
+    "wasn't",
+    "we",
+    "we'd",
+    "we'll",
+    "we're",
+    "we've",
+    "were",
+    "weren't",
+    "what",
+    "what's",
+    "when",
+    "when's",
+    "where",
+    "where's",
+    "which",
+    "while",
+    "who",
+    "who's",
+    "whom",
+    "why",
+    "why's",
+    "with",
+    "won't",
+    "would",
+    "wouldn't",
+    "above",
+    "can",
+    "s",
+    "t",
+    "will",
+    "you",
+    "you'd",
+    "you'll",
+    "you're",
+    "you've",
+    "your",
+    "yours",
+    "yourself",
+    "yourselves",
+];
+
+/// Apply the shared bounded lexical query contract before either backend's
+/// native stemmer/parser sees tokens. This matches `PostgreSQL`'s English
+/// stop-word behavior on `SQLite` and makes stop-word-only queries uniformly
+/// empty rather than backend-dependent.
+pub(crate) fn lexical_query_tokens(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .take(crate::storage::MAX_FTS_QUERY_TOKENS)
+        .filter_map(|token| {
+            let normalized = token
+                .trim_matches(|character: char| {
+                    !character.is_alphanumeric() && character != '\'' && character != '-'
+                })
+                .to_lowercase();
+            (!normalized.is_empty() && !ENGLISH_LEXICAL_STOP_WORDS.contains(&normalized.as_str()))
+                .then_some(normalized)
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum MemoryType {
     Episodic,
@@ -60,12 +264,13 @@ pub struct EmbeddingRecord {
     pub embedding: Vec<f32>,
 }
 
-/// Namespace and optional agent/user constraints applied before retrieval.
+/// Namespace and optional agent/user/entity constraints applied before retrieval.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchScope {
     pub namespace_id: Uuid,
     pub agent_id: Option<Uuid>,
     pub user_id: Option<Uuid>,
+    pub entity_id: Option<Uuid>,
 }
 
 impl SearchScope {
@@ -75,7 +280,14 @@ impl SearchScope {
             namespace_id,
             agent_id: None,
             user_id: None,
+            entity_id: None,
         }
+    }
+
+    #[must_use]
+    pub fn for_entity(mut self, entity_id: Uuid) -> Self {
+        self.entity_id = Some(entity_id);
+        self
     }
 }
 
