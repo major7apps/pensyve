@@ -72,13 +72,13 @@ impl PensyveMcpServer {
         Self::with_scope_and_admission(
             state,
             "mcp".to_string(),
-            Arc::new(RecallAdmission::new(8, 64 * MIB)),
+            Arc::new(RecallAdmission::new(1, 8 * MIB)),
         )
     }
 
     /// Create a new server with an explicit scope for tool-level access control.
     pub fn with_scope(state: Arc<PensyveState>, scope: String) -> Self {
-        Self::with_scope_and_admission(state, scope, Arc::new(RecallAdmission::new(8, 64 * MIB)))
+        Self::with_scope_and_admission(state, scope, Arc::new(RecallAdmission::new(1, 8 * MIB)))
     }
 
     /// Create a server that shares the gateway's process-wide recall budget.
@@ -1200,6 +1200,24 @@ mod tests {
             "Retryable internal error: recall overloaded; retry after 1 second"
         );
         assert_eq!(admission.overload_count(), 1);
+    }
+
+    #[test]
+    fn local_server_constructors_allow_only_one_concurrent_recall() {
+        let snapshot_root = tempfile::tempdir().unwrap();
+        let fixture = forget_fixture(snapshot_root.path().join("snapshots"), false);
+        let servers = [
+            PensyveMcpServer::new(Arc::clone(&fixture.server.state)),
+            PensyveMcpServer::with_scope(Arc::clone(&fixture.server.state), "mcp".to_string()),
+        ];
+
+        for server in servers {
+            let first = server.admission.try_acquire(8 * MIB).unwrap();
+            assert!(server.admission.try_acquire(8 * MIB).is_err());
+            assert_eq!(server.admission.reserved_bytes(), 8 * MIB);
+            drop(first);
+            assert!(server.admission.try_acquire(8 * MIB).is_ok());
+        }
     }
 
     #[tokio::test]

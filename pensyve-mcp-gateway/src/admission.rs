@@ -47,5 +47,5 @@ pub async fn enforce_recall_admission(
 }
 
 fn is_recall_path(path: &str) -> bool {
-    matches!(path, "/v1/recall" | "/v1/recall_grouped" | "/v1/a2a/task")
+    matches!(path, "/v1/recall" | "/v1/recall_grouped")
 }

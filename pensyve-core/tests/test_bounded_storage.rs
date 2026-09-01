@@ -127,6 +127,70 @@ fn namespace_embedding_state_is_scoped_and_resolves_joined_spaces() {
     );
 }
 
+#[test]
+fn namespace_embedding_state_rejects_corrupt_active_space_identity() {
+    let (dir, db, namespace) = sqlite_fixture();
+    let active = EmbeddingSpace::mock(2, "canonical-active");
+    let connection = rusqlite::Connection::open(dir.path().join("memories.db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO embedding_spaces
+             (id, canonical_identity_json, class, dimension, created_at)
+             VALUES ('tampered-active-id', ?1, 'mock', 2, '2026-08-31T00:00:00Z')",
+            [active.canonical_json()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO namespace_embedding_state
+             (namespace_id, active_read_space_id, target_space_id, state,
+              barrier_sequence, updated_at)
+             VALUES (?1, 'tampered-active-id', NULL, 'active', 1,
+                     '2026-08-31T01:02:03Z')",
+            [namespace.id.to_string()],
+        )
+        .unwrap();
+
+    let error = db.get_namespace_embedding_state(namespace.id).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("active embedding space identity")
+    );
+}
+
+#[test]
+fn namespace_embedding_state_rejects_corrupt_target_space_identity() {
+    let (dir, db, namespace) = sqlite_fixture();
+    let target = EmbeddingSpace::mock(2, "canonical-target");
+    let connection = rusqlite::Connection::open(dir.path().join("memories.db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO embedding_spaces
+             (id, canonical_identity_json, class, dimension, created_at)
+             VALUES ('tampered-target-id', ?1, 'mock', 2, '2026-08-31T00:00:00Z')",
+            [target.canonical_json()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO namespace_embedding_state
+             (namespace_id, active_read_space_id, target_space_id, state,
+              barrier_sequence, updated_at)
+             VALUES (?1, NULL, 'tampered-target-id', 'backfilling', 2,
+                     '2026-08-31T01:02:03Z')",
+            [namespace.id.to_string()],
+        )
+        .unwrap();
+
+    let error = db.get_namespace_embedding_state(namespace.id).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("target embedding space identity")
+    );
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn save(db: &SqliteBackend, memory: Memory) -> MemoryRef {
     let memory_ref = MemoryRef::from_memory(&memory);

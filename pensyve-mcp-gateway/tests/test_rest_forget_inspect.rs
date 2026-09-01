@@ -87,6 +87,10 @@ fn app_state(dir: &TempDir) -> Arc<AppState> {
         usage_reporter: UsageReporter::new(None),
         usage_counter: UsageCounter::new(),
         tenant_mgr,
+        recall_admission: Arc::new(pensyve_mcp_gateway::admission::RecallAdmission::new(
+            8,
+            64 * pensyve_mcp_gateway::admission::MIB,
+        )),
         auth_required: false,
         admin_key: None,
         ct: CancellationToken::new(),

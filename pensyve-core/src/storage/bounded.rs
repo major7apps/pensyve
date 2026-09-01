@@ -325,6 +325,49 @@ pub struct NamespaceEmbeddingState {
     pub updated_at: DateTime<Utc>,
 }
 
+impl NamespaceEmbeddingState {
+    /// Fail closed when joined canonical provenance does not reproduce the ID
+    /// stored in the namespace lifecycle row. A relational join proves only
+    /// that a row exists under that key; it does not prove that the immutable
+    /// canonical identity in the row hashes back to the same key.
+    pub(crate) fn validate_joined_space_identities(&self) -> StorageResult<()> {
+        Self::validate_joined_space_identity(
+            "active",
+            self.active_read_space_id.as_ref(),
+            self.active_read_space.as_ref(),
+        )?;
+        Self::validate_joined_space_identity(
+            "target",
+            self.target_space_id.as_ref(),
+            self.target_space.as_ref(),
+        )
+    }
+
+    fn validate_joined_space_identity(
+        role: &str,
+        stored_id: Option<&EmbeddingSpaceId>,
+        joined_space: Option<&EmbeddingSpace>,
+    ) -> StorageResult<()> {
+        match (stored_id, joined_space) {
+            (None, None) => Ok(()),
+            (Some(stored_id), Some(joined_space)) if joined_space.id() == *stored_id => Ok(()),
+            (Some(stored_id), Some(joined_space)) => Err(StorageError::Context(format!(
+                "{role} embedding space identity mismatch: lifecycle row stores {}, canonical identity hashes to {}",
+                stored_id.0,
+                joined_space.id().0
+            ))),
+            (Some(stored_id), None) => Err(StorageError::Context(format!(
+                "{role} embedding space identity {} has no joined canonical provenance",
+                stored_id.0
+            ))),
+            (None, Some(joined_space)) => Err(StorageError::Context(format!(
+                "{role} embedding space identity unexpectedly joined canonical provenance {}",
+                joined_space.id().0
+            ))),
+        }
+    }
+}
+
 /// Identity predicate applied before every bounded retrieval limit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IdentityScope {

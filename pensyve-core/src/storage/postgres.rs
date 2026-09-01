@@ -1492,7 +1492,7 @@ impl StorageTrait for PostgresBackend {
                 json.map(|value| serde_json::from_str(&value).map_err(StorageError::from))
                     .transpose()
             };
-            Ok(Some(NamespaceEmbeddingState {
+            let state = NamespaceEmbeddingState {
                 namespace_id: stored_namespace,
                 active_read_space_id: active_id.map(EmbeddingSpaceId),
                 target_space_id: target_id.map(EmbeddingSpaceId),
@@ -1501,7 +1501,9 @@ impl StorageTrait for PostgresBackend {
                 phase: NamespaceEmbeddingPhase::parse(&phase)?,
                 barrier_sequence,
                 updated_at,
-            }))
+            };
+            state.validate_joined_space_identities()?;
+            Ok(Some(state))
         })
     }
 

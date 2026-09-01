@@ -403,6 +403,7 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
             }
         };
 
+    let recall_admission = Arc::new(RecallAdmission::new(8, 64 * MIB));
     let app_state = Arc::new(AppState {
         // Phase 23/C: AuthValidator wired with the auth circuit breaker so
         // validate_remote() trips on repeated upstream failures and falls back
@@ -423,6 +424,7 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         ),
         usage_counter,
         tenant_mgr,
+        recall_admission: Arc::clone(&recall_admission),
         auth_required,
         admin_key: config.admin_key.clone(),
         ct: ct.clone(),
@@ -433,7 +435,6 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
     // Create per-tenant MCP service factory. In stateless mode, a new service
     // is created per request. The tenant ID is passed via tokio::task_local
     // (safe across .await thread migrations, unlike std::thread_local).
-    let recall_admission = Arc::new(RecallAdmission::new(8, 64 * MIB));
     let state_for_factory = app_state.clone();
     let admission_for_factory = Arc::clone(&recall_admission);
     let mcp_service: StreamableHttpService<PensyveMcpServer, LocalSessionManager> =

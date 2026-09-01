@@ -532,6 +532,10 @@ fn register_embedding_space(fixture: &Fixture, id: &str, class: &str, dimension:
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one live fixture proves the scoped join and both provenance-corruption branches"
+)]
 fn namespace_embedding_state_read_is_scoped_by_explicit_postgres_predicate() {
     let Some(admin_opts) =
         skip_notice("namespace_embedding_state_read_is_scoped_by_explicit_postgres_predicate")
@@ -597,10 +601,70 @@ fn namespace_embedding_state_read_is_scoped_by_explicit_postgres_predicate() {
     assert_eq!(state.namespace_id, requested.id);
     assert_eq!(state.active_read_space_id, Some(active.id()));
     assert_eq!(state.target_space_id, Some(target.id()));
-    assert_eq!(state.active_read_space, Some(active));
-    assert_eq!(state.target_space, Some(target));
+    assert_eq!(state.active_read_space, Some(active.clone()));
+    assert_eq!(state.target_space, Some(target.clone()));
     assert_eq!(state.phase.as_str(), "backfilling");
     assert_eq!(state.barrier_sequence, 17);
+
+    let corrupt_active_id = format!("tampered-active-{}", Uuid::new_v4());
+    let corrupt_target_id = format!("tampered-target-{}", Uuid::new_v4());
+    fixture.rt.block_on(async {
+        for (stored_id, canonical) in [
+            (&corrupt_active_id, active.canonical_json()),
+            (&corrupt_target_id, target.canonical_json()),
+        ] {
+            query::<Postgres>(
+                "INSERT INTO embedding_spaces
+                 (id, canonical_identity_json, class, dimension, created_at)
+                 VALUES ($1, $2, 'mock', 2, NOW())",
+            )
+            .bind(stored_id)
+            .bind(canonical)
+            .execute(fixture.backend.pool())
+            .await
+            .expect("register corrupt canonical embedding space");
+        }
+        query::<Postgres>(
+            "UPDATE namespace_embedding_state SET active_read_space_id = $1 WHERE namespace_id = $2",
+        )
+        .bind(&corrupt_active_id)
+        .bind(requested.id)
+        .execute(fixture.backend.pool())
+        .await
+        .expect("point active read at corrupt provenance");
+    });
+    let active_error = fixture
+        .backend
+        .get_namespace_embedding_state(requested.id)
+        .expect_err("corrupt active provenance must fail closed");
+    assert!(
+        active_error
+            .to_string()
+            .contains("active embedding space identity")
+    );
+
+    fixture.rt.block_on(async {
+        query::<Postgres>(
+            "UPDATE namespace_embedding_state
+             SET active_read_space_id = $1, target_space_id = $2
+             WHERE namespace_id = $3",
+        )
+        .bind(active.id().0)
+        .bind(&corrupt_target_id)
+        .bind(requested.id)
+        .execute(fixture.backend.pool())
+        .await
+        .expect("point target at corrupt provenance");
+    });
+    let target_error = fixture
+        .backend
+        .get_namespace_embedding_state(requested.id)
+        .expect_err("corrupt target provenance must fail closed");
+    assert!(
+        target_error
+            .to_string()
+            .contains("target embedding space identity")
+    );
 }
 
 fn canonical_source_sha256(memory: &Memory) -> String {

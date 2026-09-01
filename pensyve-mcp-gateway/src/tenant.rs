@@ -22,6 +22,8 @@ type TenantClock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 #[derive(Clone)]
 struct TenantMetadata {
+    // Owned values only: no request-state Arc and no back-reference from a
+    // resolved PensyveState can retain this cache entry after eviction.
     namespace: Namespace,
     last_accessed: Instant,
 }
@@ -40,7 +42,13 @@ enum TenantRuntimeMode {
 /// Each API key (tenant) gets an isolated namespace so tenants cannot
 /// read, modify, or delete each other's memories. The storage backend,
 /// embedder, and retrieval config are shared; the bounded cache owns only
-/// namespace metadata and access timestamps.
+/// namespace metadata and access timestamps. In storage-backed shipping mode,
+/// every returned state is an ephemeral view containing the owned namespace
+/// value plus shared process-resource `Arc`s; it has no link back to its cache
+/// entry, owns no corpus, and does not copy a model session. Consequently an
+/// eviction leaves zero live evicted metadata contexts even if a request still
+/// holds its view. Recall work is separately bounded by process admission; the
+/// number of lightweight request views is not claimed to be admission-bounded.
 pub struct TenantStateManager {
     storage: Arc<dyn StorageTrait>,
     embedder: Arc<OnnxEmbedder>,
@@ -510,6 +518,57 @@ mod tests {
                 .is_none()
         );
         assert_eq!(manager.cached_tenant_count(), 1);
+    }
+
+    #[test]
+    fn held_request_view_cannot_retain_evicted_metadata_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(SqliteBackend::open(dir.path()).unwrap()) as Arc<dyn StorageTrait>;
+        let ns = Namespace::new("default");
+        storage.save_namespace(&ns).unwrap();
+        let fixed_now = std::time::Instant::now();
+        let manager = TenantStateManager::new_with_clock(
+            storage,
+            Arc::new(OnnxEmbedder::new_mock(8)),
+            RetrievalConfig {
+                default_limit: 5,
+                max_candidates: 100,
+                weights: [0.30, 0.15, 0.20, 0.10, 0.10, 0.05, 0.05, 0.05],
+                recall_timeout_secs: 5,
+                rrf_k: 60,
+                rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.0],
+                beam_width: 10,
+                max_depth: 4,
+            },
+            ns,
+            dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
+            Arc::new(move || fixed_now),
+        )
+        .unwrap();
+
+        let held = manager.get_tenant_state("tenant-0000").unwrap();
+        for tenant in 1..MAX_CACHED_TENANTS {
+            manager
+                .get_tenant_state(&format!("tenant-{tenant:04}"))
+                .unwrap();
+        }
+        assert_eq!(manager.cached_tenant_count(), MAX_CACHED_TENANTS);
+
+        manager.get_tenant_state("tenant-new").unwrap();
+
+        assert_eq!(manager.cached_tenant_count(), MAX_CACHED_TENANTS);
+        assert!(!manager.tenants.contains_key("tenant-0000"));
+        assert!(matches!(
+            &held.vector_runtime,
+            VectorRuntime::StorageBacked { .. }
+        ));
+        assert!(Arc::ptr_eq(&held.storage, &manager.default_state.storage));
+        assert!(Arc::ptr_eq(&held.embedder, &manager.default_state.embedder));
+        assert!(Arc::ptr_eq(
+            &held.reranker_cell,
+            &manager.default_state.reranker_cell
+        ));
     }
 
     #[test]

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::admission::MIB;
 use crate::auth::AuthContext;
 
 use pensyve_core::retrieval::RecallEngine;
@@ -2684,6 +2685,35 @@ async fn a2a_task(
     axum::Extension(auth_ctx): axum::Extension<AuthContext>,
     Json(body): Json<pensyve_core::a2a::A2ATaskRequest>,
 ) -> Result<impl IntoResponse, RestError> {
+    // A2A multiplexes recall and mutations on one path, so path middleware
+    // cannot reserve selectively. Acquire before tenant resolution: even the
+    // lightweight per-request state view must not be constructed for rejected
+    // recall work, and no entity lookup, embedding, or hydration can run.
+    let _recall_reservation = if body.capability == "memory.recall" {
+        let Ok(reservation) = state.recall_admission.try_acquire(8 * MIB) else {
+            tracing::warn!(
+                event = "recall_overload",
+                surface = "a2a",
+                reserved_bytes = state.recall_admission.reserved_bytes(),
+                "recall_overload"
+            );
+            return Ok(Json(
+                serde_json::to_value(pensyve_core::a2a::A2ATaskResponse {
+                    task_id: body.task_id,
+                    status: "failed".to_string(),
+                    output: json!({}),
+                    error: Some(
+                        "Retryable internal error: recall overload; retry after 1 second"
+                            .to_string(),
+                    ),
+                })
+                .unwrap_or_default(),
+            ));
+        };
+        Some(reservation)
+    } else {
+        None
+    };
     let ps = get_pensyve_state(&state, &auth_ctx)?;
 
     let input = body.input.as_object().cloned().unwrap_or_default();
