@@ -29,9 +29,10 @@ use crate::storage::bounded::{
     lexical_query_tokens, sort_vector_hits,
 };
 use crate::storage::consolidation_workspace::{
-    ClusterDecision, ClusterMember, ConsolidationWorkspace, NamespacePage, NamespacePageCursor,
-    RunId, WorkspaceAssignment, WorkspaceCandidatePage, WorkspaceCursor, WorkspaceEmbeddingSource,
-    WorkspaceSource, WorkspaceSourcePage,
+    ClusterDecision, ClusterProvenance, ConsolidationWorkspace, LatestClusterMember, NamespacePage,
+    NamespacePageCursor, PromotionAggregate, PromotionCommit, RunId, WorkspaceAssignment,
+    WorkspaceCandidatePage, WorkspaceCursor, WorkspaceEmbeddingSource, WorkspaceSource,
+    WorkspaceSourcePage,
 };
 
 // ---------------------------------------------------------------------------
@@ -5101,62 +5102,191 @@ impl ConsolidationWorkspace for SqliteBackend {
              WHERE run_id = ?1 AND assignment_anchor = ?2",
             params![&run, &anchor],
         )?;
-        let mut stmt = conn.prepare(
-            "SELECT workspace.memory_id, workspace.episode_id,
-                    workspace.source_timestamp, source.content
+        let latest: (String, String, String) = conn.query_row(
+            "SELECT workspace.episode_id, workspace.source_timestamp, source.content
              FROM consolidation_sources AS workspace
              JOIN episodic_memories AS source ON source.id = workspace.memory_id
              WHERE workspace.run_id = ?1 AND workspace.assignment_anchor = ?2
+             ORDER BY workspace.source_timestamp DESC, workspace.memory_id DESC
+             LIMIT 1",
+            params![&run, &anchor],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT workspace.episode_id, workspace.source_timestamp
+             FROM consolidation_sources AS workspace
+             WHERE workspace.run_id = ?1 AND workspace.assignment_anchor = ?2
              ORDER BY workspace.source_ordinal",
         )?;
-        let rows = stmt
+        let provenance = stmt
             .query_map(params![&run, &anchor], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
-            .collect::<Result<Vec<_>, _>>()?;
-        let members = rows
+            .collect::<Result<Vec<_>, _>>()?
             .into_iter()
-            .map(|(id, episode_id, timestamp, content)| {
-                Ok(ClusterMember {
-                    memory_ref: MemoryRef {
-                        memory_type: MemoryType::Episodic,
-                        id: parse_uuid(&id)?,
-                    },
+            .map(|(episode_id, timestamp)| {
+                Ok(ClusterProvenance {
                     episode_id: parse_uuid(&episode_id)?,
                     timestamp: str_to_dt(&timestamp),
-                    content,
                 })
             })
             .collect::<StorageResult<Vec<_>>>()?;
-        Ok(ClusterDecision::Finalized { members })
+        Ok(ClusterDecision::Finalized {
+            promotion: PromotionAggregate {
+                member_count: count,
+                latest: LatestClusterMember {
+                    episode_id: parse_uuid(&latest.0)?,
+                    timestamp: str_to_dt(&latest.1),
+                    content: latest.2,
+                },
+                provenance,
+            },
+        })
     }
 
-    fn promotion_is_admitted(
+    #[allow(
+        clippy::too_many_lines,
+        reason = "validation, invalidation, admission, write, and workspace completion share one SQLite transaction"
+    )]
+    fn commit_promotion(
         &self,
         run: RunId,
-        about_entity: Uuid,
-        content: &str,
-        episode_times: &[DateTime<Utc>],
-    ) -> StorageResult<bool> {
-        let conn = lock_conn!(self);
-        let namespace: String = conn.query_row(
-            "SELECT namespace_id FROM consolidation_runs WHERE run_id = ?1",
-            params![run.id.to_string()],
+        anchor: MemoryRef,
+        memory: &Memory,
+        embedding: &EmbeddingRecord,
+    ) -> StorageResult<PromotionCommit> {
+        validate_record_matches_memory(embedding, memory)?;
+        let Memory::Semantic(semantic) = memory else {
+            return Err(StorageError::Context(
+                "consolidation promotion must be semantic".into(),
+            ));
+        };
+        if semantic.namespace_id != run.namespace_id || anchor.memory_type != MemoryType::Episodic {
+            return Err(StorageError::Context(
+                "consolidation promotion identity does not match its run".into(),
+            ));
+        }
+
+        let mut conn = lock_conn!(self);
+        let tx = conn.transaction()?;
+        let run_text = run.id.to_string();
+        let namespace = run.namespace_id.to_string();
+        let anchor_text = anchor.id.to_string();
+        let space: String = tx.query_row(
+            "SELECT embedding_space_id FROM consolidation_runs
+             WHERE run_id = ?1 AND namespace_id = ?2",
+            params![&run_text, &namespace],
             |row| row.get(0),
         )?;
-        let mut stmt = conn.prepare(
+        if embedding.embedding_space_id.0 != space {
+            return Err(StorageError::Context(
+                "promotion embedding does not use the workspace generation".into(),
+            ));
+        }
+        let expected: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM consolidation_sources
+             WHERE run_id = ?1 AND namespace_id = ?2
+               AND assignment_anchor = ?3 AND assignment_state = 'finalized'",
+            params![&run_text, &namespace, &anchor_text],
+            |row| row.get(0),
+        )?;
+        if expected < 2 {
+            return Err(StorageError::Context(
+                "finalized promotion provenance does not match workspace membership".into(),
+            ));
+        }
+        let mut valid_stmt = tx.prepare(
+            "SELECT workspace.episode_id, workspace.source_timestamp
+             FROM consolidation_sources AS workspace
+             JOIN episodic_memories AS source
+               ON source.id = workspace.memory_id
+              AND source.namespace_id = workspace.namespace_id
+              AND source.about_entity = workspace.about_entity
+              AND source.episode_id = workspace.episode_id
+              AND source.timestamp = workspace.source_timestamp
+              AND source.superseded_by IS NULL AND source.invalid_at IS NULL
+             JOIN memory_embeddings AS source_embedding
+               ON source_embedding.namespace_id = workspace.namespace_id
+              AND source_embedding.memory_type = 'episodic'
+              AND source_embedding.memory_id = workspace.memory_id
+              AND source_embedding.embedding_space_id = ?4
+              AND source_embedding.source_sha256 = workspace.source_sha256
+             WHERE workspace.run_id = ?1 AND workspace.namespace_id = ?2
+               AND workspace.assignment_anchor = ?3
+               AND workspace.assignment_state = 'finalized'
+             ORDER BY workspace.source_ordinal",
+        )?;
+        let valid = valid_stmt
+            .query_map(
+                params![&run_text, &namespace, &anchor_text, &space],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(valid_stmt);
+        if usize::try_from(expected).ok() != Some(valid.len()) {
+            tx.execute(
+                "DELETE FROM consolidation_sources
+                 WHERE run_id = ?1 AND namespace_id = ?2",
+                params![&run_text, &namespace],
+            )?;
+            tx.execute(
+                "INSERT INTO consolidation_sources
+                    (run_id, namespace_id, memory_id, source_ordinal, about_entity, episode_id,
+                     source_timestamp, source_sha256, assignment_anchor,
+                     assignment_state, promotion_complete)
+                 SELECT ?1, ?2, source.id,
+                        ROW_NUMBER() OVER (
+                            ORDER BY source.about_entity, source.timestamp, source.id),
+                        source.about_entity, source.episode_id, source.timestamp,
+                        source_embedding.source_sha256, NULL, 'unassigned', 0
+                 FROM episodic_memories AS source
+                 JOIN memory_embeddings AS source_embedding
+                   ON source_embedding.namespace_id = source.namespace_id
+                  AND source_embedding.memory_type = 'episodic'
+                  AND source_embedding.memory_id = source.id
+                  AND source_embedding.embedding_space_id = ?3
+                 WHERE source.namespace_id = ?2
+                   AND source.superseded_by IS NULL AND source.invalid_at IS NULL
+                 ORDER BY source.about_entity, source.timestamp, source.id",
+                params![&run_text, &namespace, &space],
+            )?;
+            tx.execute(
+                "UPDATE consolidation_runs
+                 SET cursor_ordinal = 0, completed = 0, updated_at = ?3
+                 WHERE run_id = ?1 AND namespace_id = ?2",
+                params![&run_text, &namespace, Utc::now().to_rfc3339()],
+            )?;
+            tx.commit()?;
+            return Ok(PromotionCommit::Invalidated);
+        }
+        let valid_provenance = valid
+            .into_iter()
+            .map(|(episode_id, timestamp)| Ok((parse_uuid(&episode_id)?, str_to_dt(&timestamp))))
+            .collect::<StorageResult<Vec<_>>>()?;
+        if semantic.source_episodes
+            != valid_provenance
+                .iter()
+                .map(|(episode_id, _)| *episode_id)
+                .collect::<Vec<_>>()
+        {
+            return Err(StorageError::Context(
+                "semantic promotion provenance does not match locked workspace membership".into(),
+            ));
+        }
+        let latest_episode_time = valid_provenance
+            .iter()
+            .map(|(_, timestamp)| *timestamp)
+            .max()
+            .expect("a finalized promotion contains at least two members");
+
+        let mut stmt = tx.prepare(
             "SELECT superseded_by, invalid_at FROM semantic_memories
              WHERE namespace_id = ?1 AND subject = ?2 AND predicate = 'mentioned'
                AND object = ?3",
         )?;
         let rows = stmt
             .query_map(
-                params![namespace, about_entity.to_string(), content],
+                params![&namespace, semantic.subject.to_string(), &semantic.object],
                 |row| {
                     Ok((
                         row.get::<_, Option<String>>(0)?,
@@ -5165,32 +5295,42 @@ impl ConsolidationWorkspace for SqliteBackend {
                 },
             )?
             .collect::<Result<Vec<_>, _>>()?;
-        if rows.is_empty() {
-            return Ok(true);
-        }
+        drop(stmt);
         let mut latest_supersession = None;
-        for (superseded_by, invalid_at) in rows {
-            let (Some(_), Some(invalid_at)) = (superseded_by, invalid_at) else {
-                return Ok(false);
-            };
-            let invalid_at = str_to_dt(&invalid_at);
-            latest_supersession = Some(
-                latest_supersession.map_or(invalid_at, |at: DateTime<Utc>| at.max(invalid_at)),
-            );
+        let mut admitted = rows.is_empty();
+        if !rows.is_empty() {
+            admitted = true;
+            for (superseded_by, invalid_at) in rows {
+                let (Some(_), Some(invalid_at)) = (superseded_by, invalid_at) else {
+                    admitted = false;
+                    break;
+                };
+                let invalid_at = str_to_dt(&invalid_at);
+                latest_supersession = Some(
+                    latest_supersession.map_or(invalid_at, |at: DateTime<Utc>| at.max(invalid_at)),
+                );
+            }
+            if admitted {
+                admitted = latest_supersession.is_none_or(|at| latest_episode_time > at);
+            }
         }
-        Ok(latest_supersession
-            .is_none_or(|at| episode_times.iter().any(|timestamp| *timestamp > at)))
-    }
-
-    fn mark_promotion_complete(&self, run: RunId, anchor: MemoryRef) -> StorageResult<()> {
-        let conn = lock_conn!(self);
-        conn.execute(
+        if admitted {
+            save_memory_in_conn(&tx, memory)?;
+            reconcile_embedding_source_in_conn(&tx, memory)?;
+            insert_embedding_in_conn(&tx, embedding)?;
+        }
+        tx.execute(
             "UPDATE consolidation_sources
              SET assignment_state = 'promoted', promotion_complete = 1
-             WHERE run_id = ?1 AND assignment_anchor = ?2",
-            params![run.id.to_string(), anchor.id.to_string()],
+             WHERE run_id = ?1 AND namespace_id = ?2 AND assignment_anchor = ?3",
+            params![&run_text, &namespace, &anchor_text],
         )?;
-        Ok(())
+        tx.commit()?;
+        Ok(if admitted {
+            PromotionCommit::Committed
+        } else {
+            PromotionCommit::NotAdmitted
+        })
     }
 
     fn checkpoint(&self, run: RunId, cursor: WorkspaceCursor) -> StorageResult<()> {

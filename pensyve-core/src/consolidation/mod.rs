@@ -55,6 +55,7 @@ pub mod dmem;
 pub(crate) mod gate;
 pub mod typed_slots;
 
+use std::collections::BTreeSet;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -68,9 +69,11 @@ use crate::embedding::{OnnxEmbedder, cosine_similarity};
 use crate::network_policy::{NetworkPolicy, NetworkRequiredError};
 use crate::storage::bounded::{
     CONSOLIDATION_COMPARISON_PAGE_SIZE, MEMORY_PAGE_SIZE, MemoryPageRequest, SearchScope,
+    embedding_source_text,
 };
 use crate::storage::consolidation_workspace::{
-    ClusterDecision, ConsolidationWorkspace, RunId, WorkspaceCursor,
+    CONSOLIDATION_WORKING_STATE_BYTES, ClusterDecision, ConsolidationWorkspace, PromotionCommit,
+    RunId, WorkspaceCursor,
 };
 use crate::storage::{StorageError, StorageTrait, embedding_record_for_memory};
 use crate::types::{Memory, SemanticMemory, SlotKind};
@@ -126,7 +129,7 @@ pub enum ConsolidationError {
     Partial {
         /// Stats for the runs that completed before the failing one. Already
         /// written to storage — the error does not roll them back.
-        partial: ConsolidationStats,
+        partial: Box<ConsolidationStats>,
         /// The failure that ended the final run.
         #[source]
         source: Box<ConsolidationError>,
@@ -151,7 +154,7 @@ impl ConsolidationError {
             source
         } else {
             Self::Partial {
-                partial: committed,
+                partial: Box::new(committed),
                 source: Box::new(source),
             }
         }
@@ -172,6 +175,8 @@ pub enum ConsolidationIncomplete {
     Cancelled,
     DurationExceeded,
     ClusterMemberBudgetExceeded { member_count: usize },
+    SourceChanged,
+    CoalescedPending,
 }
 
 #[derive(Debug, Clone)]
@@ -222,9 +227,17 @@ pub struct ConsolidationStats {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ConsolidationMetrics {
     pub max_source_page_request: usize,
+    pub max_source_page_rows: usize,
+    pub max_source_page_bytes: usize,
     pub max_candidate_page_request: usize,
+    pub max_candidate_page_rows: usize,
+    pub max_candidate_page_bytes: usize,
     pub peak_candidate_pages: usize,
     pub candidate_pages: usize,
+    pub max_anchor_bytes: usize,
+    pub max_finalized_metadata_rows: usize,
+    pub max_finalized_metadata_bytes: usize,
+    pub peak_working_state_bytes: usize,
     pub max_decay_page_request: usize,
     pub decay_pages: usize,
 }
@@ -243,15 +256,47 @@ impl ConsolidationStats {
             .metrics
             .max_source_page_request
             .max(other.metrics.max_source_page_request);
+        self.metrics.max_source_page_rows = self
+            .metrics
+            .max_source_page_rows
+            .max(other.metrics.max_source_page_rows);
+        self.metrics.max_source_page_bytes = self
+            .metrics
+            .max_source_page_bytes
+            .max(other.metrics.max_source_page_bytes);
         self.metrics.max_candidate_page_request = self
             .metrics
             .max_candidate_page_request
             .max(other.metrics.max_candidate_page_request);
+        self.metrics.max_candidate_page_rows = self
+            .metrics
+            .max_candidate_page_rows
+            .max(other.metrics.max_candidate_page_rows);
+        self.metrics.max_candidate_page_bytes = self
+            .metrics
+            .max_candidate_page_bytes
+            .max(other.metrics.max_candidate_page_bytes);
         self.metrics.peak_candidate_pages = self
             .metrics
             .peak_candidate_pages
             .max(other.metrics.peak_candidate_pages);
         self.metrics.candidate_pages += other.metrics.candidate_pages;
+        self.metrics.max_anchor_bytes = self
+            .metrics
+            .max_anchor_bytes
+            .max(other.metrics.max_anchor_bytes);
+        self.metrics.max_finalized_metadata_rows = self
+            .metrics
+            .max_finalized_metadata_rows
+            .max(other.metrics.max_finalized_metadata_rows);
+        self.metrics.max_finalized_metadata_bytes = self
+            .metrics
+            .max_finalized_metadata_bytes
+            .max(other.metrics.max_finalized_metadata_bytes);
+        self.metrics.peak_working_state_bytes = self
+            .metrics
+            .peak_working_state_bytes
+            .max(other.metrics.peak_working_state_bytes);
         self.metrics.max_decay_page_request = self
             .metrics
             .max_decay_page_request
@@ -264,6 +309,7 @@ impl ConsolidationStats {
 struct PermitState {
     next_ticket: u64,
     serving: u64,
+    abandoned: BTreeSet<u64>,
 }
 
 struct FairPermit {
@@ -272,28 +318,67 @@ struct FairPermit {
 }
 
 impl FairPermit {
-    fn acquire(&'static self) -> FairPermitGuard {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(PermitState::default()),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn advance_abandoned(state: &mut PermitState) {
+        while state.abandoned.remove(&state.serving) {
+            state.serving = state.serving.wrapping_add(1);
+        }
+    }
+
+    fn abandon(&self, state: &mut PermitState, ticket: u64) {
+        state.abandoned.insert(ticket);
+        Self::advance_abandoned(state);
+        self.ready.notify_all();
+    }
+
+    fn acquire(
+        &self,
+        cancel: &CancellationToken,
+        start: Instant,
+        max_duration: Duration,
+    ) -> Result<FairPermitGuard<'_>, ConsolidationIncomplete> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let ticket = state.next_ticket;
         state.next_ticket = state.next_ticket.wrapping_add(1);
-        while state.serving != ticket {
-            state = self
+        loop {
+            if cancel.is_cancelled() {
+                self.abandon(&mut state, ticket);
+                return Err(ConsolidationIncomplete::Cancelled);
+            }
+            let elapsed = start.elapsed();
+            if elapsed >= max_duration {
+                self.abandon(&mut state, ticket);
+                return Err(ConsolidationIncomplete::DurationExceeded);
+            }
+            if state.serving == ticket {
+                return Ok(FairPermitGuard { permit: self });
+            }
+            let wait = max_duration
+                .saturating_sub(elapsed)
+                .min(Duration::from_millis(50));
+            let (next, _) = self
                 .ready
-                .wait(state)
+                .wait_timeout(state, wait)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
         }
-        FairPermitGuard { permit: self }
     }
 }
 
-struct FairPermitGuard {
-    permit: &'static FairPermit,
+struct FairPermitGuard<'a> {
+    permit: &'a FairPermit,
 }
 
-impl Drop for FairPermitGuard {
+impl Drop for FairPermitGuard<'_> {
     fn drop(&mut self) {
         let mut state = self
             .permit
@@ -301,16 +386,14 @@ impl Drop for FairPermitGuard {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.serving = state.serving.wrapping_add(1);
+        FairPermit::advance_abandoned(&mut state);
         self.permit.ready.notify_all();
     }
 }
 
 fn global_consolidation_permit() -> &'static FairPermit {
     static PERMIT: OnceLock<FairPermit> = OnceLock::new();
-    PERMIT.get_or_init(|| FairPermit {
-        state: Mutex::new(PermitState::default()),
-        ready: Condvar::new(),
-    })
+    PERMIT.get_or_init(FairPermit::new)
 }
 
 // ---------------------------------------------------------------------------
@@ -450,61 +533,34 @@ impl ConsolidationEngine {
         policy: &NetworkPolicy,
         cancel: &CancellationToken,
     ) -> BoundedConsolidationResult {
-        Self::run_bounded_internal(
-            storage,
-            embedder,
-            config,
-            namespace_id,
-            policy,
-            cancel,
-            || {},
-        )
+        Self::run_bounded_internal(storage, embedder, config, namespace_id, policy, cancel)
     }
 
-    /// Test-only-style public seam used by the cross-namespace integration
-    /// proof. The callback runs while the real process-global permit is held.
-    #[doc(hidden)]
-    pub fn run_bounded_with_permit_probe<F>(
+    fn run_bounded_internal(
         storage: &dyn StorageTrait,
         embedder: &OnnxEmbedder,
         config: &ConsolidationConfig,
         namespace_id: Uuid,
         policy: &NetworkPolicy,
         cancel: &CancellationToken,
-        probe: F,
-    ) -> BoundedConsolidationResult
-    where
-        F: FnMut(),
-    {
-        Self::run_bounded_internal(
-            storage,
-            embedder,
-            config,
-            namespace_id,
-            policy,
-            cancel,
-            probe,
-        )
-    }
-
-    fn run_bounded_internal<F>(
-        storage: &dyn StorageTrait,
-        embedder: &OnnxEmbedder,
-        config: &ConsolidationConfig,
-        namespace_id: Uuid,
-        policy: &NetworkPolicy,
-        cancel: &CancellationToken,
-        mut probe: F,
-    ) -> BoundedConsolidationResult
-    where
-        F: FnMut(),
-    {
+    ) -> BoundedConsolidationResult {
+        let start = Instant::now();
+        let max_duration = Duration::from_secs(config.max_duration_secs);
         let mut total = ConsolidationStats::default();
         let outcome = gate::dispatch(
             namespace_id,
             || {
-                let _global = global_consolidation_permit().acquire();
-                probe();
+                let _global =
+                    match global_consolidation_permit().acquire(cancel, start, max_duration) {
+                        Ok(guard) => guard,
+                        Err(reason) => {
+                            return Ok(ConsolidationOutcome::Incomplete {
+                                stats: ConsolidationStats::default(),
+                                cursor: WorkspaceCursor::default(),
+                                reason,
+                            });
+                        }
+                    };
                 let result = match injected_run_failure(namespace_id) {
                     Some(err) => Err(err),
                     None => Self::run_locked_bounded(
@@ -514,6 +570,8 @@ impl ConsolidationEngine {
                         namespace_id,
                         policy,
                         cancel,
+                        start,
+                        max_duration,
                     ),
                 };
                 if let Ok(outcome) = &result {
@@ -528,11 +586,13 @@ impl ConsolidationEngine {
         );
 
         match outcome {
-            gate::Dispatch::Coalesced => Ok(ConsolidationOutcome::Complete {
+            gate::Dispatch::Coalesced => Ok(ConsolidationOutcome::Incomplete {
                 stats: ConsolidationStats {
                     coalesced: true,
                     ..ConsolidationStats::default()
                 },
+                cursor: WorkspaceCursor::default(),
+                reason: ConsolidationIncomplete::CoalescedPending,
             }),
             gate::Dispatch::Ran(Ok(ConsolidationOutcome::Complete { .. })) => {
                 Ok(ConsolidationOutcome::Complete { stats: total })
@@ -557,9 +617,9 @@ impl ConsolidationEngine {
         namespace_id: Uuid,
         _policy: &NetworkPolicy,
         cancel: &CancellationToken,
+        start: Instant,
+        max_dur: Duration,
     ) -> BoundedConsolidationResult {
-        let start = Instant::now();
-        let max_dur = Duration::from_secs(config.max_duration_secs);
         let mut stats = ConsolidationStats::default();
         let lifecycle = storage
             .get_namespace_embedding_state(namespace_id)?
@@ -589,7 +649,6 @@ impl ConsolidationEngine {
         }
 
         if let Some(incomplete) = Self::promote_bounded(
-            storage,
             embedder,
             workspace,
             run,
@@ -628,13 +687,27 @@ impl ConsolidationEngine {
         Ok(ConsolidationOutcome::Complete { stats })
     }
 
+    fn observe_working_state(
+        stats: &mut ConsolidationStats,
+        bytes: usize,
+    ) -> Result<(), ConsolidationError> {
+        stats.metrics.peak_working_state_bytes = stats.metrics.peak_working_state_bytes.max(bytes);
+        if bytes > CONSOLIDATION_WORKING_STATE_BYTES {
+            return Err(StorageError::BudgetExceeded(format!(
+                "consolidation working state requires {bytes} bytes; maximum is \
+                 {CONSOLIDATION_WORKING_STATE_BYTES}"
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
         reason = "the bounded greedy loop keeps each checkpoint and ownership boundary visible"
     )]
     fn promote_bounded(
-        storage: &dyn StorageTrait,
         embedder: &OnnxEmbedder,
         workspace: &dyn ConsolidationWorkspace,
         run: RunId,
@@ -655,9 +728,16 @@ impl ConsolidationEngine {
                 workspace.checkpoint(run, *cursor)?;
                 return Ok(Some(ConsolidationIncomplete::DurationExceeded));
             }
-            stats.metrics.max_source_page_request =
-                stats.metrics.max_source_page_request.max(MEMORY_PAGE_SIZE);
             let page = workspace.next_sources(run, page_cursor, MEMORY_PAGE_SIZE)?;
+            let source_page_rows = page.records.len();
+            let source_page_bytes = page.application_bytes();
+            stats.metrics.max_source_page_request =
+                stats.metrics.max_source_page_request.max(source_page_rows);
+            stats.metrics.max_source_page_rows =
+                stats.metrics.max_source_page_rows.max(source_page_rows);
+            stats.metrics.max_source_page_bytes =
+                stats.metrics.max_source_page_bytes.max(source_page_bytes);
+            Self::observe_working_state(stats, source_page_bytes)?;
             if page.records.is_empty() {
                 return Ok(None);
             }
@@ -681,6 +761,9 @@ impl ConsolidationEngine {
                     continue;
                 }
                 let anchor = workspace.load_source(run, anchor_ref)?;
+                let anchor_bytes = anchor.application_bytes();
+                stats.metrics.max_anchor_bytes = stats.metrics.max_anchor_bytes.max(anchor_bytes);
+                Self::observe_working_state(stats, source_page_bytes.saturating_add(anchor_bytes))?;
                 let mut candidate_cursor = None;
                 loop {
                     if cancel.is_cancelled() {
@@ -691,18 +774,34 @@ impl ConsolidationEngine {
                         workspace.checkpoint(run, *cursor)?;
                         return Ok(Some(ConsolidationIncomplete::DurationExceeded));
                     }
-                    stats.metrics.max_candidate_page_request = stats
-                        .metrics
-                        .max_candidate_page_request
-                        .max(CONSOLIDATION_COMPARISON_PAGE_SIZE);
                     let candidates = workspace.page_later_unassigned(
                         run,
                         anchor_ref,
                         candidate_cursor,
                         CONSOLIDATION_COMPARISON_PAGE_SIZE,
                     )?;
+                    let candidate_page_rows = candidates.records.len();
+                    let candidate_page_bytes = candidates.application_bytes();
+                    stats.metrics.max_candidate_page_request = stats
+                        .metrics
+                        .max_candidate_page_request
+                        .max(candidate_page_rows);
+                    stats.metrics.max_candidate_page_rows = stats
+                        .metrics
+                        .max_candidate_page_rows
+                        .max(candidate_page_rows);
+                    stats.metrics.max_candidate_page_bytes = stats
+                        .metrics
+                        .max_candidate_page_bytes
+                        .max(candidate_page_bytes);
                     stats.metrics.candidate_pages += 1;
                     stats.metrics.peak_candidate_pages = stats.metrics.peak_candidate_pages.max(1);
+                    Self::observe_working_state(
+                        stats,
+                        source_page_bytes
+                            .saturating_add(anchor_bytes)
+                            .saturating_add(candidate_page_bytes),
+                    )?;
                     let next_candidates = candidates.next_cursor;
                     for candidate in candidates.records {
                         if cosine_similarity(
@@ -739,42 +838,85 @@ impl ConsolidationEngine {
                             member_count,
                         }));
                     }
-                    ClusterDecision::Finalized { members } => {
-                        let most_recent = members
-                            .iter()
-                            .max_by_key(|member| member.timestamp)
-                            .expect("a finalized cluster contains at least two members");
-                        let episode_times = members
-                            .iter()
-                            .map(|member| member.timestamp)
-                            .collect::<Vec<_>>();
-                        if workspace.promotion_is_admitted(
-                            run,
+                    ClusterDecision::Finalized { promotion } => {
+                        let promotion_bytes = promotion.application_bytes();
+                        stats.metrics.max_finalized_metadata_rows = stats
+                            .metrics
+                            .max_finalized_metadata_rows
+                            .max(promotion.provenance.len());
+                        stats.metrics.max_finalized_metadata_bytes = stats
+                            .metrics
+                            .max_finalized_metadata_bytes
+                            .max(promotion_bytes);
+                        Self::observe_working_state(
+                            stats,
+                            source_page_bytes
+                                .saturating_add(anchor_bytes)
+                                .saturating_add(promotion_bytes),
+                        )?;
+                        let confidence = (promotion.member_count as f32 * 0.3).min(1.0);
+                        let mut semantic = SemanticMemory::new(
+                            namespace_id,
                             source.about_entity,
-                            &most_recent.content,
-                            &episode_times,
-                        )? {
-                            let confidence = (members.len() as f32 * 0.3).min(1.0);
-                            let mut semantic = SemanticMemory::new(
-                                namespace_id,
-                                source.about_entity,
-                                "mentioned",
-                                most_recent.content.clone(),
-                                confidence,
-                            );
-                            semantic.source_episodes =
-                                members.iter().map(|member| member.episode_id).collect();
-                            let wrapped = Memory::Semantic(semantic);
-                            let embedding = embedder.embed(&most_recent.content)?;
-                            let record = embedding_record_for_memory(
-                                &wrapped,
-                                embedder.embedding_space()?,
-                                embedding,
-                            );
-                            storage.save_memory_with_embedding(&wrapped, Some(&record))?;
-                            stats.promoted += 1;
+                            "mentioned",
+                            promotion.latest.content.clone(),
+                            confidence,
+                        );
+                        semantic.source_episodes = promotion
+                            .provenance
+                            .iter()
+                            .map(|member| member.episode_id)
+                            .collect();
+                        let wrapped = Memory::Semantic(semantic);
+                        let semantic_bytes = match &wrapped {
+                            Memory::Semantic(semantic) => {
+                                std::mem::size_of::<Memory>()
+                                    + semantic.predicate.capacity()
+                                    + semantic.object.capacity()
+                                    + semantic.source_episodes.capacity()
+                                        * std::mem::size_of::<Uuid>()
+                                    + semantic.embedding.capacity() * std::mem::size_of::<f32>()
+                            }
+                            _ => unreachable!("consolidation promotion is semantic"),
+                        };
+                        let embedding = {
+                            let canonical_source = embedding_source_text(&wrapped);
+                            Self::observe_working_state(
+                                stats,
+                                source_page_bytes
+                                    .saturating_add(anchor_bytes)
+                                    .saturating_add(promotion_bytes)
+                                    .saturating_add(semantic_bytes)
+                                    .saturating_add(canonical_source.capacity()),
+                            )?;
+                            embedder.embed(&canonical_source)?
+                        };
+                        let record = embedding_record_for_memory(
+                            &wrapped,
+                            embedder.embedding_space()?,
+                            embedding,
+                        );
+                        let record_bytes = std::mem::size_of::<
+                            crate::storage::bounded::EmbeddingRecord,
+                        >() + record.embedding_space_id.0.capacity()
+                            + record.source_sha256.capacity()
+                            + record.embedding.capacity() * std::mem::size_of::<f32>();
+                        Self::observe_working_state(
+                            stats,
+                            source_page_bytes
+                                .saturating_add(anchor_bytes)
+                                .saturating_add(promotion_bytes)
+                                .saturating_add(semantic_bytes)
+                                .saturating_add(record_bytes),
+                        )?;
+                        match workspace.commit_promotion(run, anchor_ref, &wrapped, &record)? {
+                            PromotionCommit::Committed => stats.promoted += 1,
+                            PromotionCommit::NotAdmitted => {}
+                            PromotionCommit::Invalidated => {
+                                *cursor = WorkspaceCursor::default();
+                                return Ok(Some(ConsolidationIncomplete::SourceChanged));
+                            }
                         }
-                        workspace.mark_promotion_complete(run, anchor_ref)?;
                     }
                 }
                 *cursor = WorkspaceCursor {
@@ -1583,6 +1725,7 @@ pub fn replay_priority(salience: f32, retrievability: f32, is_superseded: bool) 
 mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
+    use std::time::Duration as StdDuration;
 
     use chrono::Duration;
 
@@ -1607,6 +1750,91 @@ mod tests {
         let entity_id = Uuid::new_v4();
         let source_entity = Uuid::new_v4();
         (ns, entity_id, source_entity)
+    }
+
+    #[test]
+    fn queued_global_permit_cancellation_returns_within_500ms() {
+        let permit = FairPermit::new();
+        let holder = permit
+            .acquire(
+                &CancellationToken::new(),
+                Instant::now(),
+                StdDuration::from_secs(5),
+            )
+            .expect("first permit");
+        let cancel = CancellationToken::new();
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            let waiting_cancel = cancel.clone();
+            let permit = &permit;
+            let waiter = scope.spawn(move || {
+                permit
+                    .acquire(&waiting_cancel, started, StdDuration::from_secs(5))
+                    .map(drop)
+            });
+            std::thread::sleep(StdDuration::from_millis(50));
+            cancel.cancel();
+            let result = waiter.join().unwrap();
+            assert!(matches!(result, Err(ConsolidationIncomplete::Cancelled)));
+        });
+        assert!(started.elapsed() < StdDuration::from_millis(500));
+        drop(holder);
+    }
+
+    #[test]
+    fn queued_global_permit_duration_includes_admission_wait() {
+        let permit = FairPermit::new();
+        let holder = permit
+            .acquire(
+                &CancellationToken::new(),
+                Instant::now(),
+                StdDuration::from_secs(5),
+            )
+            .expect("first permit");
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                permit
+                    .acquire(
+                        &CancellationToken::new(),
+                        started,
+                        StdDuration::from_millis(75),
+                    )
+                    .map(drop)
+            });
+            let result = waiter.join().unwrap();
+            assert!(matches!(
+                result,
+                Err(ConsolidationIncomplete::DurationExceeded)
+            ));
+        });
+        assert!(started.elapsed() < StdDuration::from_millis(500));
+        drop(holder);
+    }
+
+    #[test]
+    fn fair_permit_serializes_inline_private_occupancy_proof() {
+        let permit = FairPermit::new();
+        let occupancy = std::sync::atomic::AtomicUsize::new(0);
+        let peak = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    let _guard = permit
+                        .acquire(
+                            &CancellationToken::new(),
+                            Instant::now(),
+                            StdDuration::from_secs(5),
+                        )
+                        .unwrap();
+                    let now = occupancy.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(StdDuration::from_millis(30));
+                    occupancy.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
     }
 
     fn insert_episodic(

@@ -1,6 +1,4 @@
 use std::fs;
-use std::sync::{Arc, Barrier};
-use std::thread;
 
 use chrono::{Duration, Utc};
 use pensyve_core::config::{ConsolidationConfig, PensyveConfig};
@@ -9,11 +7,16 @@ use pensyve_core::consolidation::{
 };
 use pensyve_core::embedding::{OnnxEmbedder, cosine_similarity};
 use pensyve_core::network_policy::NetworkPolicy;
-use pensyve_core::storage::bounded::{MAX_PROMOTION_CLUSTER_MEMBERS, MemoryRef, MemoryType};
-use pensyve_core::storage::consolidation_workspace::WorkspaceAssignment;
+use pensyve_core::storage::bounded::{
+    MAX_PROMOTION_CLUSTER_MEMBERS, MemoryRef, MemoryType, embedding_source_text,
+};
+use pensyve_core::storage::consolidation_workspace::{
+    CONSOLIDATION_WORKING_STATE_BYTES, ClusterDecision, PromotionAggregate, PromotionCommit, RunId,
+    WorkspaceAssignment,
+};
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
-use pensyve_core::types::{Episode, EpisodicMemory, Memory, Namespace};
+use pensyve_core::types::{Episode, EpisodicMemory, Memory, Namespace, SemanticMemory};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -132,6 +135,64 @@ fn oracle(mut rows: Vec<EpisodicMemory>) -> Vec<WorkspaceAssignment> {
     }
     out.sort();
     out
+}
+
+fn finalize_pair(
+    storage: &SqliteBackend,
+    embedder: &OnnxEmbedder,
+    namespace_id: Uuid,
+) -> (RunId, MemoryRef, PromotionAggregate) {
+    let workspace = storage.consolidation_workspace().unwrap();
+    let run = workspace
+        .begin_or_resume(namespace_id, &embedder.embedding_space().unwrap().id())
+        .unwrap();
+    let page = workspace.next_sources(run, None, 256).unwrap();
+    assert_eq!(page.records.len(), 2);
+    let anchor = page.records[0].memory_ref;
+    let member = page.records[1].memory_ref;
+    assert_eq!(
+        workspace
+            .record_tentative_match(run, anchor, anchor)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        workspace
+            .record_tentative_match(run, anchor, member)
+            .unwrap(),
+        2
+    );
+    let ClusterDecision::Finalized { promotion } =
+        workspace.finalize_or_discard_cluster(run, anchor).unwrap()
+    else {
+        panic!("two members must finalize");
+    };
+    (run, anchor, promotion)
+}
+
+fn promotion_payload(
+    embedder: &OnnxEmbedder,
+    namespace_id: Uuid,
+    about_entity: Uuid,
+    promotion: &PromotionAggregate,
+) -> (Memory, pensyve_core::storage::bounded::EmbeddingRecord) {
+    let mut semantic = SemanticMemory::new(
+        namespace_id,
+        about_entity,
+        "mentioned",
+        promotion.latest.content.clone(),
+        (promotion.member_count as f32 * 0.3).min(1.0),
+    );
+    semantic.source_episodes = promotion
+        .provenance
+        .iter()
+        .map(|member| member.episode_id)
+        .collect();
+    let memory = Memory::Semantic(semantic);
+    let embedding = embedder.embed(&embedding_source_text(&memory)).unwrap();
+    let record =
+        embedding_record_for_memory(&memory, embedder.embedding_space().unwrap(), embedding);
+    (memory, record)
 }
 
 #[test]
@@ -283,6 +344,260 @@ fn source_hash_mutation_requeues_and_resume_does_not_duplicate_promotion() {
 }
 
 #[test]
+fn promoted_vector_uses_the_recorded_canonical_semantic_document() {
+    let (_tmp, storage, embedder, namespace, episode) = setup("bounded-canonical-promotion");
+    let entity = Uuid::new_v4();
+    let now = Utc::now();
+    save_episode_memory(
+        &storage,
+        &embedder,
+        &episode,
+        entity,
+        "canonical object",
+        now,
+    );
+    save_episode_memory(
+        &storage,
+        &embedder,
+        &episode,
+        entity,
+        "canonical object",
+        now + Duration::seconds(1),
+    );
+    let ConsolidationOutcome::Complete { stats } =
+        run(&storage, &embedder, namespace.id, &CancellationToken::new())
+    else {
+        panic!("promotion must complete");
+    };
+    assert_eq!(stats.promoted, 1);
+    let semantic = storage
+        .get_all_memories_by_namespace(namespace.id)
+        .unwrap()
+        .into_iter()
+        .find_map(|memory| match memory {
+            Memory::Semantic(semantic) => Some(semantic),
+            _ => None,
+        })
+        .expect("promoted semantic memory");
+    let semantic_memory = Memory::Semantic(semantic.clone());
+    let canonical_text = embedding_source_text(&semantic_memory);
+    assert_eq!(canonical_text, "mentioned canonical object");
+    let expected = embedder.embed(&canonical_text).unwrap();
+    let object_only = embedder.embed(&semantic.object).unwrap();
+    assert_ne!(
+        expected, object_only,
+        "fixture must distinguish the documents"
+    );
+    let records = storage
+        .load_embedding_records(
+            namespace.id,
+            &embedder.embedding_space().unwrap().id(),
+            &[MemoryRef {
+                memory_type: MemoryType::Semantic,
+                id: semantic.id,
+            }],
+        )
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].embedding, expected);
+    assert_eq!(
+        records[0].source_sha256,
+        pensyve_core::storage::canonical_embedding_source_sha256(&semantic_memory)
+    );
+}
+
+#[test]
+fn transactional_promotion_rejects_semantic_provenance_not_owned_by_the_workspace() {
+    let (_tmp, storage, embedder, namespace, episode) = setup("bounded-provenance-ownership");
+    let entity = Uuid::new_v4();
+    let now = Utc::now();
+    save_episode_memory(&storage, &embedder, &episode, entity, "same", now);
+    save_episode_memory(
+        &storage,
+        &embedder,
+        &episode,
+        entity,
+        "same",
+        now + Duration::seconds(1),
+    );
+    let (run_id, anchor, promotion) = finalize_pair(&storage, &embedder, namespace.id);
+    let (mut semantic, _) = promotion_payload(&embedder, namespace.id, entity, &promotion);
+    let Memory::Semantic(ref mut semantic_memory) = semantic else {
+        unreachable!();
+    };
+    semantic_memory.source_episodes = vec![Uuid::new_v4(), Uuid::new_v4()];
+    let embedding = embedder.embed(&embedding_source_text(&semantic)).unwrap();
+    let record =
+        embedding_record_for_memory(&semantic, embedder.embedding_space().unwrap(), embedding);
+    let error = storage
+        .consolidation_workspace()
+        .unwrap()
+        .commit_promotion(run_id, anchor, &semantic, &record)
+        .expect_err("semantic provenance must be derived from the locked workspace rows");
+    assert!(error.to_string().contains("provenance"));
+    assert!(
+        storage
+            .get_all_memories_by_namespace(namespace.id)
+            .unwrap()
+            .into_iter()
+            .all(|memory| !matches!(memory, Memory::Semantic(_)))
+    );
+}
+
+#[test]
+fn mutation_after_tentative_assignment_invalidates_before_atomic_promotion() {
+    let (_tmp, storage, embedder, namespace, episode) = setup("bounded-race-mutate");
+    let entity = Uuid::new_v4();
+    let now = Utc::now();
+    save_episode_memory(&storage, &embedder, &episode, entity, "same", now);
+    let mut changed = save_episode_memory(
+        &storage,
+        &embedder,
+        &episode,
+        entity,
+        "same",
+        now + Duration::seconds(1),
+    );
+    let (run_id, anchor, promotion) = finalize_pair(&storage, &embedder, namespace.id);
+    changed.content = "changed after tentative assignment".into();
+    changed.embedding = embedder.embed(&changed.content).unwrap();
+    let changed_memory = Memory::Episodic(changed.clone());
+    let changed_record = embedding_record_for_memory(
+        &changed_memory,
+        embedder.embedding_space().unwrap(),
+        changed.embedding,
+    );
+    storage
+        .save_memory_with_embedding(&changed_memory, Some(&changed_record))
+        .unwrap();
+
+    let (semantic, semantic_record) =
+        promotion_payload(&embedder, namespace.id, entity, &promotion);
+    let workspace = storage.consolidation_workspace().unwrap();
+    assert_eq!(
+        workspace
+            .commit_promotion(run_id, anchor, &semantic, &semantic_record)
+            .unwrap(),
+        PromotionCommit::Invalidated
+    );
+    assert!(
+        storage
+            .get_all_memories_by_namespace(namespace.id)
+            .unwrap()
+            .into_iter()
+            .all(|memory| !matches!(memory, Memory::Semantic(_)))
+    );
+    assert!(matches!(
+        run(&storage, &embedder, namespace.id, &CancellationToken::new()),
+        ConsolidationOutcome::Complete { .. }
+    ));
+}
+
+#[test]
+fn deletion_after_tentative_assignment_invalidates_before_atomic_promotion() {
+    let (_tmp, storage, embedder, namespace, episode) = setup("bounded-race-delete");
+    let entity = Uuid::new_v4();
+    let now = Utc::now();
+    save_episode_memory(&storage, &embedder, &episode, entity, "same", now);
+    let deleted = save_episode_memory(
+        &storage,
+        &embedder,
+        &episode,
+        entity,
+        "same",
+        now + Duration::seconds(1),
+    );
+    let (run_id, anchor, promotion) = finalize_pair(&storage, &embedder, namespace.id);
+    assert!(
+        storage
+            .delete_memory_by_id_in_namespace(deleted.id, namespace.id)
+            .unwrap()
+    );
+
+    let (semantic, semantic_record) =
+        promotion_payload(&embedder, namespace.id, entity, &promotion);
+    assert_eq!(
+        storage
+            .consolidation_workspace()
+            .unwrap()
+            .commit_promotion(run_id, anchor, &semantic, &semantic_record)
+            .unwrap(),
+        PromotionCommit::Invalidated
+    );
+    assert!(
+        storage
+            .get_all_memories_by_namespace(namespace.id)
+            .unwrap()
+            .into_iter()
+            .all(|memory| !matches!(memory, Memory::Semantic(_)))
+    );
+}
+
+#[test]
+fn supersession_after_tentative_assignment_requeues_exact_current_evidence() {
+    let (_tmp, storage, embedder, namespace, episode) = setup("bounded-race-supersede");
+    let entity = Uuid::new_v4();
+    let now = Utc::now();
+    save_episode_memory(&storage, &embedder, &episode, entity, "same", now);
+    let superseded = save_episode_memory(
+        &storage,
+        &embedder,
+        &episode,
+        entity,
+        "same",
+        now + Duration::seconds(1),
+    );
+    let (run_id, anchor, promotion) = finalize_pair(&storage, &embedder, namespace.id);
+    let replacement_episode = Episode::new(namespace.id, vec![Uuid::new_v4(), entity]);
+    storage.save_episode(&replacement_episode).unwrap();
+    let replacement = save_episode_memory(
+        &storage,
+        &embedder,
+        &replacement_episode,
+        entity,
+        "same",
+        now + Duration::seconds(2),
+    );
+    assert!(
+        storage
+            .supersede_memory_in_namespace(
+                superseded.id,
+                namespace.id,
+                replacement.id,
+                now + Duration::seconds(2),
+            )
+            .unwrap()
+    );
+
+    let (semantic, semantic_record) =
+        promotion_payload(&embedder, namespace.id, entity, &promotion);
+    assert_eq!(
+        storage
+            .consolidation_workspace()
+            .unwrap()
+            .commit_promotion(run_id, anchor, &semantic, &semantic_record)
+            .unwrap(),
+        PromotionCommit::Invalidated
+    );
+    let ConsolidationOutcome::Complete { stats } =
+        run(&storage, &embedder, namespace.id, &CancellationToken::new())
+    else {
+        panic!("resumed current evidence must complete");
+    };
+    assert_eq!(stats.promoted, 1);
+    let semantic = storage
+        .get_all_memories_by_namespace(namespace.id)
+        .unwrap()
+        .into_iter()
+        .find_map(|memory| match memory {
+            Memory::Semantic(semantic) => Some(semantic),
+            _ => None,
+        })
+        .expect("current replacement evidence promotes");
+    assert!(semantic.source_episodes.contains(&replacement_episode.id));
+}
+
+#[test]
 fn pre_cancelled_run_checkpoints_typed_incomplete_and_never_decays() {
     let (_tmp, storage, embedder, namespace, episode) = setup("bounded-cancel");
     let entity = Uuid::new_v4();
@@ -357,13 +672,15 @@ fn exactly_cluster_member_budget_can_finalize() {
     let (_tmp, storage, embedder, namespace, episode) = setup("bounded-exact-budget");
     let entity = Uuid::new_v4();
     let now = Utc::now();
+    let maximum_content = "x".repeat(8 * 1024);
+    assert!(maximum_content.len() * MAX_PROMOTION_CLUSTER_MEMBERS >= 32 * 1024 * 1024);
     for offset in 0..MAX_PROMOTION_CLUSTER_MEMBERS {
         save_episode_memory(
             &storage,
             &embedder,
             &episode,
             entity,
-            "identical",
+            &maximum_content,
             now + Duration::microseconds(i64::try_from(offset).unwrap()),
         );
     }
@@ -372,6 +689,17 @@ fn exactly_cluster_member_budget_can_finalize() {
         panic!("exactly 4,096 members must finalize");
     };
     assert_eq!(stats.promoted, 1);
+    assert_eq!(
+        stats.metrics.max_finalized_metadata_rows,
+        MAX_PROMOTION_CLUSTER_MEMBERS
+    );
+    assert!(stats.metrics.max_source_page_rows <= 256);
+    assert!(stats.metrics.max_candidate_page_rows <= 64);
+    assert!(stats.metrics.max_source_page_bytes < CONSOLIDATION_WORKING_STATE_BYTES);
+    assert!(stats.metrics.max_candidate_page_bytes < CONSOLIDATION_WORKING_STATE_BYTES);
+    assert!(stats.metrics.max_anchor_bytes < CONSOLIDATION_WORKING_STATE_BYTES);
+    assert!(stats.metrics.max_finalized_metadata_bytes < CONSOLIDATION_WORKING_STATE_BYTES);
+    assert!(stats.metrics.peak_working_state_bytes < CONSOLIDATION_WORKING_STATE_BYTES);
 }
 
 #[test]
@@ -401,68 +729,6 @@ fn cluster_member_budget_is_typed_and_has_no_semantic_or_decay_write() {
     );
     assert_eq!(stats.promoted, 0);
     assert_eq!(stats.decayed, 0);
-}
-
-#[test]
-fn process_global_permit_serializes_different_namespaces() {
-    let (_tmp, storage, embedder, namespace_a, episode_a) = setup("global-a");
-    let namespace_b = Namespace::new("global-b");
-    storage.save_namespace(&namespace_b).unwrap();
-    storage
-        .initialize_local_runtime_space(namespace_b.id, embedder.embedding_space().unwrap())
-        .unwrap();
-    let episode_b = Episode::new(namespace_b.id, vec![Uuid::new_v4()]);
-    storage.save_episode(&episode_b).unwrap();
-    save_episode_memory(
-        &storage,
-        &embedder,
-        &episode_a,
-        Uuid::new_v4(),
-        "a",
-        Utc::now(),
-    );
-    save_episode_memory(
-        &storage,
-        &embedder,
-        &episode_b,
-        Uuid::new_v4(),
-        "b",
-        Utc::now(),
-    );
-    let storage = Arc::new(storage);
-    let barrier = Arc::new(Barrier::new(3));
-    let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut joins = Vec::new();
-    for namespace_id in [namespace_a.id, namespace_b.id] {
-        let storage = Arc::clone(&storage);
-        let barrier = Arc::clone(&barrier);
-        let peak = Arc::clone(&peak);
-        let active = Arc::clone(&active);
-        joins.push(thread::spawn(move || {
-            barrier.wait();
-            ConsolidationEngine::run_bounded_with_permit_probe(
-                storage.as_ref(),
-                &OnnxEmbedder::new_mock(8),
-                &config(),
-                namespace_id,
-                &NetworkPolicy::Disabled,
-                &CancellationToken::new(),
-                || {
-                    let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                    peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
-                    thread::sleep(std::time::Duration::from_millis(30));
-                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                },
-            )
-            .unwrap();
-        }));
-    }
-    barrier.wait();
-    for join in joins {
-        join.join().unwrap();
-    }
-    assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[test]

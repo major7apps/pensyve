@@ -119,6 +119,9 @@ use crate::storage::bounded::{
     MemoryPageRequest, MemoryRef, MemoryType, SearchScope, SearchUnavailable, VectorHit,
     VectorSearchOutcome, VectorSearchRequest, embedding_source_text,
 };
+use crate::storage::consolidation_workspace::{
+    ClusterDecision, ConsolidationWorkspace, PromotionCommit, RunId, WorkspaceCursor,
+};
 use crate::storage::{StorageError, StorageTrait};
 use crate::types::{
     Edge, Entity, EntityKind, EpisodicMemory, Memory, Namespace, ObservationMemory, Outcome,
@@ -729,6 +732,356 @@ fn embedding_write_fixture(fixture: &Fixture) -> (Namespace, Memory) {
         "transactional postgres source",
     ));
     (namespace, memory)
+}
+
+fn save_workspace_episode(
+    fixture: &Fixture,
+    namespace_id: Uuid,
+    about_entity: Uuid,
+    content: &str,
+    timestamp: DateTime<Utc>,
+    space: &str,
+) -> Memory {
+    let mut episodic = EpisodicMemory::new(
+        namespace_id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        about_entity,
+        content,
+    );
+    episodic.timestamp = timestamp;
+    let memory = Memory::Episodic(episodic);
+    let record = embedding_record(&memory, space, vec![1.0, 0.0]);
+    fixture
+        .backend
+        .save_memory_with_embedding(&memory, Some(&record))
+        .expect("save workspace source and active-generation embedding");
+    memory
+}
+
+fn semantic_promotion(
+    namespace_id: Uuid,
+    subject: Uuid,
+    content: &str,
+    source_episodes: Vec<Uuid>,
+    space: &str,
+) -> (Memory, EmbeddingRecord) {
+    let mut semantic = SemanticMemory::new(namespace_id, subject, "mentioned", content, 1.0);
+    semantic.source_episodes = source_episodes;
+    let memory = Memory::Semantic(semantic);
+    let record = embedding_record(&memory, space, vec![1.0, 0.0]);
+    (memory, record)
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one disposable database proves the complete workspace lifecycle and RLS isolation"
+)]
+fn consolidation_workspace_lifecycle_is_transactional_resumable_and_rls_scoped() {
+    let Some(admin_opts) =
+        skip_notice("consolidation_workspace_lifecycle_is_transactional_resumable_and_rls_scoped")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let workspace: &dyn ConsolidationWorkspace = &fixture.backend;
+    let namespace = Namespace::new("workspace-owner");
+    let foreign = Namespace::new("workspace-foreign");
+    fixture.backend.save_namespace(&namespace).unwrap();
+    fixture.backend.save_namespace(&foreign).unwrap();
+    register_embedding_space(&fixture, "workspace-space", "mock", 2);
+    let space = EmbeddingSpaceId("workspace-space".to_string());
+    let about = Uuid::new_v4();
+    let base = Utc::now();
+    let mut sources = Vec::new();
+    for index in 0..4_i64 {
+        sources.push(save_workspace_episode(
+            &fixture,
+            namespace.id,
+            about,
+            &format!("owner source {index}"),
+            base + chrono::Duration::seconds(index),
+            &space.0,
+        ));
+    }
+    for index in 0..2_i64 {
+        save_workspace_episode(
+            &fixture,
+            foreign.id,
+            Uuid::new_v4(),
+            &format!("foreign source {index}"),
+            base + chrono::Duration::seconds(index),
+            &space.0,
+        );
+    }
+
+    let run = workspace.begin_or_resume(namespace.id, &space).unwrap();
+    assert_eq!(
+        workspace.begin_or_resume(namespace.id, &space).unwrap(),
+        run
+    );
+    let first_page = workspace.next_sources(run, None, 2).unwrap();
+    assert_eq!(first_page.records.len(), 2);
+    let page_cursor = first_page
+        .next_cursor
+        .expect("two of four has another page");
+    workspace.checkpoint(run, page_cursor).unwrap();
+    assert_eq!(
+        workspace.next_sources(run, None, 8).unwrap().records.len(),
+        2
+    );
+    workspace
+        .checkpoint(run, WorkspaceCursor::default())
+        .unwrap();
+    assert_eq!(
+        workspace.next_sources(run, None, 8).unwrap().records.len(),
+        4
+    );
+
+    let foreign_run_id = RunId {
+        id: run.id,
+        namespace_id: foreign.id,
+    };
+    assert!(workspace.next_sources(foreign_run_id, None, 8).is_err());
+    let foreign_run = workspace.begin_or_resume(foreign.id, &space).unwrap();
+    assert_ne!(foreign_run.id, run.id);
+    assert_eq!(
+        workspace
+            .next_sources(foreign_run, None, 8)
+            .unwrap()
+            .records
+            .len(),
+        2
+    );
+
+    let records = workspace
+        .next_sources(run, Some(WorkspaceCursor::default()), 8)
+        .unwrap()
+        .records;
+    let anchor = records[0].memory_ref;
+    assert_eq!(
+        workspace
+            .record_tentative_match(run, anchor, anchor)
+            .unwrap(),
+        1
+    );
+    let candidates = workspace
+        .page_later_unassigned(run, anchor, None, 8)
+        .unwrap();
+    assert_eq!(candidates.records.len(), 3);
+    for candidate in candidates.records {
+        workspace
+            .record_tentative_match(run, anchor, candidate.source.memory_ref)
+            .unwrap();
+    }
+    let ClusterDecision::Finalized { promotion } =
+        workspace.finalize_or_discard_cluster(run, anchor).unwrap()
+    else {
+        panic!("four matching rows must finalize");
+    };
+    assert_eq!(promotion.member_count, 4);
+    assert_eq!(promotion.provenance.len(), 4);
+    let (semantic, semantic_record) = semantic_promotion(
+        namespace.id,
+        about,
+        &promotion.latest.content,
+        promotion
+            .provenance
+            .iter()
+            .map(|source| source.episode_id)
+            .collect(),
+        &space.0,
+    );
+    assert_eq!(
+        workspace
+            .commit_promotion(run, anchor, &semantic, &semantic_record)
+            .unwrap(),
+        PromotionCommit::Committed
+    );
+    assert!(
+        fixture
+            .backend
+            .get_semantic_in_namespace(semantic.id(), namespace.id)
+            .unwrap()
+            .is_some()
+    );
+
+    let replacement_anchor = save_workspace_episode(
+        &fixture,
+        namespace.id,
+        about,
+        "replacement anchor",
+        base + chrono::Duration::seconds(10),
+        &space.0,
+    );
+    let replacement_member = save_workspace_episode(
+        &fixture,
+        namespace.id,
+        about,
+        "replacement member",
+        base + chrono::Duration::seconds(11),
+        &space.0,
+    );
+    assert_eq!(
+        workspace.begin_or_resume(namespace.id, &space).unwrap(),
+        run
+    );
+    let replacement_anchor_ref = MemoryRef::from_memory(&replacement_anchor);
+    workspace
+        .record_tentative_match(run, replacement_anchor_ref, replacement_anchor_ref)
+        .unwrap();
+    workspace
+        .record_tentative_match(
+            run,
+            replacement_anchor_ref,
+            MemoryRef::from_memory(&replacement_member),
+        )
+        .unwrap();
+    let ClusterDecision::Finalized {
+        promotion: replacement,
+    } = workspace
+        .finalize_or_discard_cluster(run, replacement_anchor_ref)
+        .unwrap()
+    else {
+        panic!("replacement pair must finalize");
+    };
+    let (stale_semantic, stale_record) = semantic_promotion(
+        namespace.id,
+        about,
+        &replacement.latest.content,
+        replacement
+            .provenance
+            .iter()
+            .map(|source| source.episode_id)
+            .collect(),
+        &space.0,
+    );
+    let Memory::Episodic(mut changed_member) = replacement_member else {
+        unreachable!();
+    };
+    changed_member.content = "changed after tentative assignment".to_string();
+    let changed_memory = Memory::Episodic(changed_member);
+    let changed_record = embedding_record(&changed_memory, &space.0, vec![0.0, 1.0]);
+    fixture
+        .backend
+        .save_memory_with_embedding(&changed_memory, Some(&changed_record))
+        .unwrap();
+    assert_eq!(
+        workspace
+            .commit_promotion(run, replacement_anchor_ref, &stale_semantic, &stale_record)
+            .unwrap(),
+        PromotionCommit::Invalidated
+    );
+    assert!(
+        fixture
+            .backend
+            .get_semantic_in_namespace(stale_semantic.id(), namespace.id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        workspace.next_sources(run, None, 16).unwrap().records.len(),
+        6
+    );
+}
+
+#[test]
+fn consolidation_workspace_rejects_a_4097_member_promotion() {
+    let Some(admin_opts) = skip_notice("consolidation_workspace_rejects_a_4097_member_promotion")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let namespace = Namespace::new("workspace-boundary");
+    fixture.backend.save_namespace(&namespace).unwrap();
+    register_embedding_space(&fixture, "workspace-boundary-space", "mock", 2);
+    fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace.id).await.unwrap();
+        let mut tx = (&mut *conn).begin().await.unwrap();
+        query::<Postgres>(
+            "INSERT INTO episodic_memories
+                (id, namespace_id, episode_id, source_entity, about_entity, content, timestamp)
+             SELECT md5('workspace-memory-' || ordinal)::uuid, $1,
+                    md5('workspace-episode-' || ordinal)::uuid, $2, $2,
+                    'boundary source ' || ordinal, NOW() + ordinal * INTERVAL '1 second'
+             FROM generate_series(1, 4097) AS ordinal",
+        )
+        .bind(namespace.id)
+        .bind(Uuid::new_v4())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        query::<Postgres>(
+            "INSERT INTO memory_embeddings
+                (namespace_id, memory_type, memory_id, embedding_space_id,
+                 source_sha256, embedding, created_at)
+             SELECT $1, 'episodic', id, 'workspace-boundary-space', repeat('a', 64),
+                    '[1,0]'::vector, NOW()
+             FROM episodic_memories WHERE namespace_id = $1",
+        )
+        .bind(namespace.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    });
+    let workspace: &dyn ConsolidationWorkspace = &fixture.backend;
+    let run = workspace
+        .begin_or_resume(
+            namespace.id,
+            &EmbeddingSpaceId("workspace-boundary-space".to_string()),
+        )
+        .unwrap();
+    let anchor_id = fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace.id).await.unwrap();
+        let anchor: (Uuid,) = query_as::<Postgres, _>(
+            "SELECT memory_id FROM consolidation_sources
+             WHERE run_id = $1 AND namespace_id = $2 ORDER BY source_ordinal LIMIT 1",
+        )
+        .bind(run.id)
+        .bind(namespace.id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        query::<Postgres>(
+            "UPDATE consolidation_sources
+             SET assignment_anchor = $3, assignment_state = 'tentative'
+             WHERE run_id = $1 AND namespace_id = $2",
+        )
+        .bind(run.id)
+        .bind(namespace.id)
+        .bind(anchor.0)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        anchor.0
+    });
+    assert!(matches!(
+        workspace
+            .finalize_or_discard_cluster(
+                run,
+                MemoryRef {
+                    memory_type: MemoryType::Episodic,
+                    id: anchor_id,
+                },
+            )
+            .unwrap(),
+        ClusterDecision::MemberBudgetExceeded { member_count: 4097 }
+    ));
+    let promoted: (i64,) = fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace.id).await.unwrap();
+        query_as::<Postgres, _>(
+            "SELECT COUNT(*) FROM consolidation_sources
+             WHERE run_id = $1 AND namespace_id = $2 AND promotion_complete = TRUE",
+        )
+        .bind(run.id)
+        .bind(namespace.id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+    });
+    assert_eq!(promoted.0, 0);
 }
 
 #[test]

@@ -35,9 +35,10 @@ use crate::storage::bounded::{
     VectorHit, VectorSearchOutcome, VectorSearchRequest, lexical_query_tokens,
 };
 use crate::storage::consolidation_workspace::{
-    ClusterDecision, ClusterMember, ConsolidationWorkspace, NamespacePage, NamespacePageCursor,
-    RunId, WorkspaceAssignment, WorkspaceCandidatePage, WorkspaceCursor, WorkspaceEmbeddingSource,
-    WorkspaceSource, WorkspaceSourcePage,
+    ClusterDecision, ClusterProvenance, ConsolidationWorkspace, LatestClusterMember, NamespacePage,
+    NamespacePageCursor, PromotionAggregate, PromotionCommit, RunId, WorkspaceAssignment,
+    WorkspaceCandidatePage, WorkspaceCursor, WorkspaceEmbeddingSource, WorkspaceSource,
+    WorkspaceSourcePage,
 };
 
 // ---------------------------------------------------------------------------
@@ -4916,13 +4917,26 @@ impl ConsolidationWorkspace for PostgresBackend {
             .execute(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
-            let rows: Vec<(Uuid, Uuid, DateTime<Utc>, String)> = query_as::<Postgres, _>(
-                "SELECT workspace.memory_id, workspace.episode_id,
-                        workspace.source_timestamp, source.content
+            let latest: (Uuid, DateTime<Utc>, String) = query_as::<Postgres, _>(
+                "SELECT workspace.episode_id, workspace.source_timestamp, source.content
                  FROM consolidation_sources AS workspace
                  JOIN episodic_memories AS source
                    ON source.id = workspace.memory_id
                   AND source.namespace_id = workspace.namespace_id
+                 WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                   AND workspace.assignment_anchor = $3
+                 ORDER BY workspace.source_timestamp DESC, workspace.memory_id DESC
+                 LIMIT 1",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let rows: Vec<(Uuid, DateTime<Utc>)> = query_as::<Postgres, _>(
+                "SELECT workspace.episode_id, workspace.source_timestamp
+                 FROM consolidation_sources AS workspace
                  WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
                    AND workspace.assignment_anchor = $3
                  ORDER BY workspace.source_ordinal",
@@ -4934,59 +4948,210 @@ impl ConsolidationWorkspace for PostgresBackend {
             .await
             .map_err(sqlx_to_io)?;
             Ok(ClusterDecision::Finalized {
-                members: rows
-                    .into_iter()
-                    .map(|(id, episode_id, timestamp, content)| ClusterMember {
-                        memory_ref: MemoryRef {
-                            memory_type: MemoryType::Episodic,
-                            id,
-                        },
-                        episode_id,
-                        timestamp,
-                        content,
-                    })
-                    .collect(),
+                promotion: PromotionAggregate {
+                    member_count: count,
+                    latest: LatestClusterMember {
+                        episode_id: latest.0,
+                        timestamp: latest.1,
+                        content: latest.2,
+                    },
+                    provenance: rows
+                        .into_iter()
+                        .map(|(episode_id, timestamp)| ClusterProvenance {
+                            episode_id,
+                            timestamp,
+                        })
+                        .collect(),
+                },
             })
         })
     }
 
-    fn promotion_is_admitted(
+    #[allow(
+        clippy::too_many_lines,
+        reason = "validation locks, invalidation, admission, write, and workspace completion share one PostgreSQL transaction"
+    )]
+    fn commit_promotion(
         &self,
         run: RunId,
-        about_entity: Uuid,
-        content: &str,
-        episode_times: &[DateTime<Utc>],
-    ) -> StorageResult<bool> {
+        anchor: MemoryRef,
+        memory: &Memory,
+        embedding: &EmbeddingRecord,
+    ) -> StorageResult<PromotionCommit> {
+        validate_record_matches_memory(embedding, memory)?;
+        let Memory::Semantic(semantic) = memory else {
+            return Err(StorageError::Context(
+                "consolidation promotion must be semantic".into(),
+            ));
+        };
+        if semantic.namespace_id != run.namespace_id || anchor.memory_type != MemoryType::Episodic {
+            return Err(StorageError::Context(
+                "consolidation promotion identity does not match its run".into(),
+            ));
+        }
+
         self.block_on(async {
             let mut conn = self.scoped_conn(run.namespace_id).await?;
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            let space: (String,) = query_as::<Postgres, _>(
+                "SELECT embedding_space_id FROM consolidation_runs
+                 WHERE run_id = $1 AND namespace_id = $2
+                 FOR UPDATE",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            if embedding.embedding_space_id.0 != space.0 {
+                return Err(StorageError::Context(
+                    "promotion embedding does not use the workspace generation".into(),
+                ));
+            }
+            let assigned: Vec<(Uuid,)> = query_as::<Postgres, _>(
+                "SELECT memory_id FROM consolidation_sources
+                 WHERE run_id = $1 AND namespace_id = $2
+                   AND assignment_anchor = $3 AND assignment_state = 'finalized'
+                 ORDER BY source_ordinal
+                 FOR UPDATE",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            if assigned.len() < 2 {
+                return Err(StorageError::Context(
+                    "finalized promotion provenance does not match workspace membership".into(),
+                ));
+            }
+            let valid: Vec<(Uuid, Uuid, DateTime<Utc>)> = query_as::<Postgres, _>(
+                "SELECT workspace.memory_id, workspace.episode_id,
+                        workspace.source_timestamp
+                 FROM consolidation_sources AS workspace
+                 JOIN episodic_memories AS source
+                   ON source.id = workspace.memory_id
+                  AND source.namespace_id = workspace.namespace_id
+                  AND source.about_entity = workspace.about_entity
+                  AND source.episode_id = workspace.episode_id
+                  AND source.timestamp = workspace.source_timestamp
+                  AND source.superseded_by IS NULL AND source.invalid_at IS NULL
+                 JOIN memory_embeddings AS source_embedding
+                   ON source_embedding.namespace_id = workspace.namespace_id
+                  AND source_embedding.memory_type = 'episodic'
+                  AND source_embedding.memory_id = workspace.memory_id
+                  AND source_embedding.embedding_space_id = $4
+                  AND source_embedding.source_sha256 = workspace.source_sha256
+                 WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                   AND workspace.assignment_anchor = $3
+                   AND workspace.assignment_state = 'finalized'
+                 ORDER BY workspace.source_ordinal
+                 FOR SHARE OF source, source_embedding",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .bind(&space.0)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            if valid.iter().map(|row| row.0).collect::<Vec<_>>()
+                != assigned.iter().map(|row| row.0).collect::<Vec<_>>()
+            {
+                query::<Postgres>(
+                    "DELETE FROM consolidation_sources
+                     WHERE run_id = $1 AND namespace_id = $2",
+                )
+                .bind(run.id)
+                .bind(run.namespace_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+                query::<Postgres>(
+                    "INSERT INTO consolidation_sources
+                        (run_id, namespace_id, memory_id, source_ordinal, about_entity,
+                         episode_id, source_timestamp, source_sha256, assignment_anchor,
+                         assignment_state, promotion_complete)
+                     SELECT $1, $2, source.id,
+                            ROW_NUMBER() OVER (
+                                ORDER BY source.about_entity, source.timestamp, source.id),
+                            source.about_entity, source.episode_id, source.timestamp,
+                            source_embedding.source_sha256, NULL, 'unassigned', FALSE
+                     FROM episodic_memories AS source
+                     JOIN memory_embeddings AS source_embedding
+                       ON source_embedding.namespace_id = source.namespace_id
+                      AND source_embedding.memory_type = 'episodic'
+                      AND source_embedding.memory_id = source.id
+                      AND source_embedding.embedding_space_id = $3
+                     WHERE source.namespace_id = $2
+                       AND source.superseded_by IS NULL AND source.invalid_at IS NULL
+                     ORDER BY source.about_entity, source.timestamp, source.id",
+                )
+                .bind(run.id)
+                .bind(run.namespace_id)
+                .bind(&space.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+                query::<Postgres>(
+                    "UPDATE consolidation_runs
+                     SET cursor_ordinal = 0, completed = FALSE, updated_at = NOW()
+                     WHERE run_id = $1 AND namespace_id = $2",
+                )
+                .bind(run.id)
+                .bind(run.namespace_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+                tx.commit().await.map_err(sqlx_to_io)?;
+                return Ok(PromotionCommit::Invalidated);
+            }
+            if semantic.source_episodes != valid.iter().map(|row| row.1).collect::<Vec<_>>() {
+                return Err(StorageError::Context(
+                    "semantic promotion provenance does not match locked workspace membership"
+                        .into(),
+                ));
+            }
+            let latest_episode_time = valid
+                .iter()
+                .map(|row| row.2)
+                .max()
+                .expect("a finalized promotion contains at least two members");
+
             let rows: Vec<(Option<Uuid>, Option<DateTime<Utc>>)> = query_as::<Postgres, _>(
                 "SELECT superseded_by, invalid_at FROM semantic_memories
                  WHERE namespace_id = $1 AND subject = $2 AND predicate = 'mentioned'
-                   AND object = $3",
+                   AND object = $3
+                 FOR SHARE",
             )
             .bind(run.namespace_id)
-            .bind(about_entity)
-            .bind(content)
-            .fetch_all(&mut *conn)
+            .bind(semantic.subject)
+            .bind(&semantic.object)
+            .fetch_all(&mut *tx)
             .await
             .map_err(sqlx_to_io)?;
-            if rows.is_empty() {
-                return Ok(true);
-            }
             let mut latest = None;
-            for (superseded_by, invalid_at) in rows {
-                let (Some(_), Some(invalid_at)) = (superseded_by, invalid_at) else {
-                    return Ok(false);
-                };
-                latest = Some(latest.map_or(invalid_at, |at: DateTime<Utc>| at.max(invalid_at)));
+            let mut admitted = rows.is_empty();
+            if !rows.is_empty() {
+                admitted = true;
+                for (superseded_by, invalid_at) in rows {
+                    let (Some(_), Some(invalid_at)) = (superseded_by, invalid_at) else {
+                        admitted = false;
+                        break;
+                    };
+                    latest =
+                        Some(latest.map_or(invalid_at, |at: DateTime<Utc>| at.max(invalid_at)));
+                }
+                if admitted {
+                    admitted = latest.is_none_or(|at| latest_episode_time > at);
+                }
             }
-            Ok(latest.is_none_or(|at| episode_times.iter().any(|time| *time > at)))
-        })
-    }
-
-    fn mark_promotion_complete(&self, run: RunId, anchor: MemoryRef) -> StorageResult<()> {
-        self.block_on(async {
-            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            if admitted {
+                save_memory_in_pg_tx(&mut tx, memory).await?;
+                reconcile_embedding_source_in_pg_tx(&mut tx, memory).await?;
+                insert_embedding_in_pg_tx(&mut tx, embedding).await?;
+            }
             query::<Postgres>(
                 "UPDATE consolidation_sources
                  SET assignment_state = 'promoted', promotion_complete = TRUE
@@ -4995,10 +5160,15 @@ impl ConsolidationWorkspace for PostgresBackend {
             .bind(run.id)
             .bind(run.namespace_id)
             .bind(anchor.id)
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await
             .map_err(sqlx_to_io)?;
-            Ok(())
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(if admitted {
+                PromotionCommit::Committed
+            } else {
+                PromotionCommit::NotAdmitted
+            })
         })
     }
 
@@ -5548,19 +5718,376 @@ mod tests {
         );
     }
 
-    #[test]
-    fn consolidation_workspace_queries_never_use_an_unbound_connection() {
-        let source = include_str!("postgres.rs");
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exhaustive ordered table pins every workspace SQL statement in one proof"
+    )]
+    fn assert_consolidation_workspace_sql_contracts(source: &str) {
+        struct Contract {
+            label: &'static str,
+            binds: usize,
+            required: &'static [&'static str],
+        }
+
+        fn query_blocks(source: &str) -> Vec<&str> {
+            let mut blocks = Vec::new();
+            let mut offset = 0;
+            while offset < source.len() {
+                let tail = &source[offset..];
+                let query = tail.find("query::<Postgres>(");
+                let query_as = tail.find("query_as::<Postgres,");
+                let Some(relative_start) = (match (query, query_as) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    (Some(start), None) | (None, Some(start)) => Some(start),
+                    (None, None) => None,
+                }) else {
+                    break;
+                };
+                let start = offset + relative_start;
+                let relative_end = source[start..]
+                    .find(".await")
+                    .expect("workspace query must be awaited");
+                let end = start + relative_end + ".await".len();
+                blocks.push(&source[start..end]);
+                offset = end;
+            }
+            blocks
+        }
+
         let start = source
             .find("impl ConsolidationWorkspace for PostgresBackend")
             .expect("workspace implementation");
         let end = source[start..]
-            .find("type PgWorkspaceEmbeddingRow")
+            .find("type PgWorkspaceSourceRow")
             .expect("workspace implementation end");
         let workspace = &source[start..start + end];
         assert!(!workspace.contains(&[".", "unbound()"].concat()));
-        assert!(workspace.matches("scoped_conn(run.namespace_id)").count() >= 9);
-        assert!(workspace.matches("namespace_id = $2").count() >= 12);
+        let contracts = [
+            Contract {
+                label: "resume run lock",
+                binds: 2,
+                required: &[
+                    "namespace_id = $1",
+                    "embedding_space_id = $2",
+                    "FOR UPDATE",
+                    "fetch_optional(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "insert run",
+                binds: 3,
+                required: &[
+                    "run_id, namespace_id, embedding_space_id",
+                    "VALUES ($1, $2, $3",
+                    "execute(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "detect changed snapshot",
+                binds: 3,
+                required: &[
+                    "workspace.run_id = $1 AND workspace.namespace_id = $2",
+                    "source.namespace_id = $2",
+                    "embedding.embedding_space_id = $3",
+                    "fetch_one(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "count snapshot",
+                binds: 2,
+                required: &["run_id = $1 AND namespace_id = $2", "fetch_one(&mut *tx)"],
+            },
+            Contract {
+                label: "delete stale snapshot",
+                binds: 2,
+                required: &["run_id = $1 AND namespace_id = $2", "execute(&mut *tx)"],
+            },
+            Contract {
+                label: "rebuild snapshot",
+                binds: 3,
+                required: &[
+                    "run_id, namespace_id, memory_id",
+                    "source.namespace_id = $2",
+                    "embedding.embedding_space_id = $3",
+                    "execute(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "reset run",
+                binds: 2,
+                required: &["run_id = $1 AND namespace_id = $2", "execute(&mut *tx)"],
+            },
+            Contract {
+                label: "read durable cursor",
+                binds: 2,
+                required: &["run_id = $1 AND namespace_id = $2", "fetch_one(&mut *conn)"],
+            },
+            Contract {
+                label: "page sources",
+                binds: 4,
+                required: &[
+                    "workspace.run_id = $1 AND workspace.namespace_id = $2",
+                    "workspace.source_ordinal > $3",
+                    "LIMIT $4",
+                    "fetch_all(&mut *conn)",
+                ],
+            },
+            Contract {
+                label: "read anchor ordinal",
+                binds: 3,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2 AND memory_id = $3",
+                    "fetch_one(&mut *conn)",
+                ],
+            },
+            Contract {
+                label: "page candidates",
+                binds: 5,
+                required: &[
+                    "workspace.run_id = $1 AND workspace.namespace_id = $2",
+                    "workspace.about_entity = $3",
+                    "workspace.source_ordinal > $4",
+                    "LIMIT $5",
+                    "fetch_all(&mut *conn)",
+                ],
+            },
+            Contract {
+                label: "record tentative",
+                binds: 4,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2 AND memory_id = $4",
+                    "assignment_anchor = $3",
+                    "execute(&mut *conn)",
+                ],
+            },
+            Contract {
+                label: "count tentative",
+                binds: 3,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
+                    "fetch_one(&mut *conn)",
+                ],
+            },
+            Contract {
+                label: "count finalized",
+                binds: 3,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
+                    "fetch_one(&mut *conn)",
+                ],
+            },
+            Contract {
+                label: "discard singleton",
+                binds: 3,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2 AND memory_id = $3",
+                    "execute(&mut *conn)",
+                ],
+            },
+            Contract {
+                label: "finalize cluster",
+                binds: 3,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
+                    "execute(&mut *conn)",
+                ],
+            },
+            Contract {
+                label: "load latest content",
+                binds: 3,
+                required: &[
+                    "workspace.run_id = $1 AND workspace.namespace_id = $2",
+                    "workspace.assignment_anchor = $3",
+                    "LIMIT 1",
+                    "fetch_one(&mut *conn)",
+                ],
+            },
+            Contract {
+                label: "load bounded provenance",
+                binds: 3,
+                required: &[
+                    "workspace.run_id = $1 AND workspace.namespace_id = $2",
+                    "workspace.assignment_anchor = $3",
+                    "fetch_all(&mut *conn)",
+                ],
+            },
+            Contract {
+                label: "lock run for promotion",
+                binds: 2,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2",
+                    "FOR UPDATE",
+                    "fetch_one(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "lock finalized assignments",
+                binds: 3,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2",
+                    "assignment_anchor = $3",
+                    "FOR UPDATE",
+                    "fetch_all(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "validate active sources",
+                binds: 4,
+                required: &[
+                    "workspace.run_id = $1 AND workspace.namespace_id = $2",
+                    "workspace.assignment_anchor = $3",
+                    "source_embedding.embedding_space_id = $4",
+                    "FOR SHARE OF source, source_embedding",
+                    "fetch_all(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "delete invalid snapshot",
+                binds: 2,
+                required: &["run_id = $1 AND namespace_id = $2", "execute(&mut *tx)"],
+            },
+            Contract {
+                label: "requeue invalid snapshot",
+                binds: 3,
+                required: &[
+                    "run_id, namespace_id, memory_id",
+                    "source.namespace_id = $2",
+                    "source_embedding.embedding_space_id = $3",
+                    "execute(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "reset invalid run",
+                binds: 2,
+                required: &["run_id = $1 AND namespace_id = $2", "execute(&mut *tx)"],
+            },
+            Contract {
+                label: "lock admission rows",
+                binds: 3,
+                required: &[
+                    "namespace_id = $1 AND subject = $2",
+                    "object = $3",
+                    "FOR SHARE",
+                    "fetch_all(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "complete promotion",
+                binds: 3,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
+                    "execute(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "checkpoint",
+                binds: 3,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2",
+                    "cursor_ordinal = $3",
+                    "execute(&mut *conn)",
+                ],
+            },
+            Contract {
+                label: "complete run",
+                binds: 2,
+                required: &["run_id = $1 AND namespace_id = $2", "execute(&mut *conn)"],
+            },
+            Contract {
+                label: "diagnostic assignments",
+                binds: 3,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2",
+                    "LIMIT $3",
+                    "fetch_all(&mut *conn)",
+                ],
+            },
+        ];
+        let blocks = query_blocks(workspace);
+        assert_eq!(
+            blocks.len(),
+            contracts.len(),
+            "every workspace query must have an explicit static contract"
+        );
+        for (block, contract) in blocks.iter().zip(&contracts) {
+            assert_eq!(
+                block.matches(".bind(").count(),
+                contract.binds,
+                "{} bind arity changed:\n{block}",
+                contract.label
+            );
+            for placeholder in 1..=contract.binds {
+                assert!(
+                    block.contains(&format!("${placeholder}")),
+                    "{} no longer uses placeholder ${placeholder}:\n{block}",
+                    contract.label
+                );
+            }
+            assert!(
+                !block.contains(&format!("${}", contract.binds + 1)),
+                "{} uses an unbound placeholder:\n{block}",
+                contract.label
+            );
+            for required in contract.required {
+                assert!(
+                    block.contains(required),
+                    "{} lost required SQL/lock/executor marker {required:?}:\n{block}",
+                    contract.label
+                );
+            }
+        }
+
+        for decode_shape in [
+            "let existing: Option<(Uuid,)>",
+            "let changed: (bool,)",
+            "let source_count: (i64,)",
+            "let rows: Vec<PgWorkspaceSourceRow>",
+            "let (entity, ordinal): (Uuid, i64)",
+            "let rows: Vec<PgWorkspaceEmbeddingRow>",
+            "let latest: (Uuid, DateTime<Utc>, String)",
+            "let rows: Vec<(Uuid, DateTime<Utc>)>",
+            "let space: (String,)",
+            "let assigned: Vec<(Uuid,)>",
+            "let valid: Vec<(Uuid, Uuid, DateTime<Utc>)>",
+            "let rows: Vec<(Option<Uuid>, Option<DateTime<Utc>>)>",
+            "let rows: Vec<(Uuid, Uuid)>",
+        ] {
+            assert!(
+                workspace.contains(decode_shape),
+                "workspace result decoding shape changed: {decode_shape}"
+            );
+        }
+        let promotion = &workspace[workspace
+            .find("fn commit_promotion")
+            .expect("promotion implementation")..];
+        assert!(promotion.contains("let mut tx = (&mut *conn).begin()"));
+        assert!(promotion.matches("tx.commit().await").count() >= 2);
+
+        let helper_start = source
+            .find("async fn pg_workspace_embedding_source")
+            .expect("single-source workspace loader");
+        let helper_end = source[helper_start..]
+            .find("// ---------------------------------------------------------------------------")
+            .expect("single-source loader end");
+        let helper = &source[helper_start..helper_start + helper_end];
+        let helper_blocks = query_blocks(helper);
+        assert_eq!(helper_blocks.len(), 1);
+        let helper_query = helper_blocks[0];
+        assert_eq!(helper_query.matches(".bind(").count(), 3);
+        for required in [
+            "workspace.run_id = $1 AND workspace.namespace_id = $2",
+            "workspace.memory_id = $3",
+            "fetch_one(&mut *conn)",
+        ] {
+            assert!(helper_query.contains(required));
+        }
+        assert!(helper.contains("let row: PgWorkspaceEmbeddingRow"));
+        assert!(helper.contains("pg_workspace_embedding_from_row(run.namespace_id, row)"));
+    }
+
+    #[test]
+    fn consolidation_workspace_statements_pin_scope_binds_locks_and_decoding() {
+        assert_consolidation_workspace_sql_contracts(include_str!("postgres.rs"));
     }
 
     #[test]

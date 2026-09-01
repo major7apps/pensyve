@@ -21,7 +21,9 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use pensyve_core::config::{ConsolidationConfig, PensyveConfig};
-use pensyve_core::consolidation::ConsolidationEngine;
+use pensyve_core::consolidation::{
+    ConsolidationEngine, ConsolidationIncomplete, ConsolidationOutcome,
+};
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::network_policy::NetworkPolicy;
 use pensyve_core::storage::sqlite::SqliteBackend;
@@ -320,4 +322,69 @@ fn evidence_arriving_mid_run_is_not_dropped_by_coalescing() {
         SEEDED + 1,
         "the owner's reported total should span both of its runs"
     );
+}
+
+#[test]
+fn coalesced_trigger_is_typed_pending_when_owner_becomes_incomplete() {
+    const SEEDED: usize = CLUSTERS * 4;
+
+    let tmp = TempDir::new().unwrap();
+    let storage = Arc::new(SqliteBackend::open(tmp.path()).expect("open storage"));
+    let embedder = Arc::new(OnnxEmbedder::new_mock(64));
+    let namespace = Namespace::new("coalesced-incomplete");
+    storage.save_namespace(&namespace).unwrap();
+    let ns = namespace.id;
+    storage
+        .initialize_local_runtime_space(ns, embedder.embedding_space().unwrap())
+        .unwrap();
+    seed_clusters(&storage, &embedder, ns, 0..SEEDED);
+
+    let owner_cancel = CancellationToken::new();
+    let owner = {
+        let storage = storage.clone();
+        let embedder = embedder.clone();
+        let cancel = owner_cancel.clone();
+        std::thread::spawn(move || {
+            ConsolidationEngine::run_bounded(
+                storage.as_ref(),
+                &embedder,
+                &make_config(),
+                ns,
+                &NetworkPolicy::Disabled,
+                &cancel,
+            )
+            .unwrap()
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while mentioned_rows(&storage, ns).is_empty() {
+        assert!(Instant::now() < deadline, "owner never began promoting");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let coalesced = ConsolidationEngine::run_bounded(
+        storage.as_ref(),
+        &embedder,
+        &make_config(),
+        ns,
+        &NetworkPolicy::Disabled,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    owner_cancel.cancel();
+
+    assert!(matches!(
+        coalesced,
+        ConsolidationOutcome::Incomplete {
+            reason: ConsolidationIncomplete::CoalescedPending,
+            ..
+        }
+    ));
+    assert!(matches!(
+        owner.join().unwrap(),
+        ConsolidationOutcome::Incomplete {
+            reason: ConsolidationIncomplete::Cancelled,
+            ..
+        }
+    ));
 }

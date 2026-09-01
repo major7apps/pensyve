@@ -616,6 +616,8 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                                     pensyve_core::consolidation::ConsolidationIncomplete::Cancelled => "cancelled",
                                     pensyve_core::consolidation::ConsolidationIncomplete::DurationExceeded => "duration_exceeded",
                                     pensyve_core::consolidation::ConsolidationIncomplete::ClusterMemberBudgetExceeded { .. } => "cluster_member_budget_exceeded",
+                                    pensyve_core::consolidation::ConsolidationIncomplete::SourceChanged => "source_changed",
+                                    pensyve_core::consolidation::ConsolidationIncomplete::CoalescedPending => "coalesced_pending",
                                 };
                                 let _ = storage.log_activity(
                                     ns_id,
