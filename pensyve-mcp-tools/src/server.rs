@@ -395,7 +395,10 @@ impl PensyveMcpServer {
             &serde_json::json!({"entity": params.entity, "preview": &params.fact[..params.fact.len().min(50)]}),
         );
 
-        let mut val = serde_json::to_value(&memory).unwrap_or_default();
+        let Memory::Semantic(stored) = &memory else {
+            unreachable!("remember always constructs a semantic memory")
+        };
+        let mut val = serde_json::to_value(stored).unwrap_or_default();
         strip_embedding(&mut val);
         serde_json::to_string(&val).map_err(|e| format!("Serialization error: {e}"))
     }
@@ -1617,6 +1620,26 @@ mod tests {
 
     #[tokio::test]
     async fn immediate_recall_uses_persisted_embedding() {
+        fn embedding_paths(value: &serde_json::Value, path: &str, found: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    for (name, value) in fields {
+                        let child_path = format!("{path}.{name}");
+                        if name == "embedding" {
+                            found.push(child_path.clone());
+                        }
+                        embedding_paths(value, &child_path, found);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for (index, value) in values.iter().enumerate() {
+                        embedding_paths(value, &format!("{path}[{index}]"), found);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let storage = Arc::new(SqliteBackend::open(dir.path()).unwrap());
         let namespace = Namespace::new("mcp-persisted-recall");
@@ -1640,7 +1663,7 @@ mod tests {
         });
         let server = PensyveMcpServer::new(state);
 
-        server
+        let response = server
             .remember(Parameters(RememberParams {
                 entity: "alice".into(),
                 fact: "Rust".into(),
@@ -1648,6 +1671,24 @@ mod tests {
             }))
             .await
             .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let mut leaked_embeddings = Vec::new();
+        embedding_paths(&response, "$", &mut leaked_embeddings);
+        assert!(
+            response.get("Semantic").is_none()
+                && response
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+                && response
+                    .get("subject")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+                && response.get("predicate") == Some(&serde_json::json!("knows"))
+                && response.get("object") == Some(&serde_json::json!("Rust"))
+                && leaked_embeddings.is_empty(),
+            "remember response must stay flat and embedding-free; response={response}; embedding_paths={leaked_embeddings:?}"
+        );
 
         let memory = storage
             .get_all_memories_by_namespace(namespace.id)

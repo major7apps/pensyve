@@ -1825,6 +1825,7 @@ impl PyPensyve {
 
         let entity_id = entity.uuid;
         let fact = fact.to_string();
+        drop(entity);
         let inner = self.inner.clone();
         let memory = py
             .detach(move || {
