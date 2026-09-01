@@ -5,10 +5,12 @@ use chrono::{DateTime, Utc};
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::snapshot::RetentionPolicy;
-use pensyve_core::storage::bounded::NamespaceEmbeddingState;
+use pensyve_core::storage::bounded::{
+    MemoryPage, MemoryPageRequest, MemoryType, NamespaceEmbeddingState, SearchScope,
+};
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::storage::{
-    ActivityAggregate, ActivityEvent, ErasedRows, StorageResult, StorageTrait,
+    ActivityAggregate, ActivityEvent, ErasedRows, StorageError, StorageResult, StorageTrait,
 };
 use pensyve_core::types::{
     Edge, Entity, Episode, EpisodicMemory, Memory, Namespace, ProceduralMemory, SemanticMemory,
@@ -25,6 +27,7 @@ struct CountingStorage {
     inner: Arc<SqliteBackend>,
     tenant_namespace_resolutions: AtomicUsize,
     namespace_bulk_loads: AtomicUsize,
+    memory_page_loads: AtomicUsize,
 }
 
 impl CountingStorage {
@@ -33,11 +36,17 @@ impl CountingStorage {
             inner,
             tenant_namespace_resolutions: AtomicUsize::new(0),
             namespace_bulk_loads: AtomicUsize::new(0),
+            memory_page_loads: AtomicUsize::new(0),
         }
     }
 }
 
 impl StorageTrait for CountingStorage {
+    fn page_memories(&self, request: &MemoryPageRequest) -> StorageResult<MemoryPage> {
+        self.memory_page_loads.fetch_add(1, Ordering::SeqCst);
+        self.inner.page_memories(request)
+    }
+
     fn get_namespace_embedding_state(
         &self,
         namespace_id: Uuid,
@@ -301,6 +310,27 @@ impl StorageTrait for CountingStorage {
     ) -> StorageResult<Vec<ActivityEvent>> {
         self.inner.get_recent_activity(namespace_id, limit)
     }
+}
+
+#[test]
+fn default_filtered_paging_preserves_unfiltered_custom_backends() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = Arc::new(SqliteBackend::open(dir.path()).unwrap());
+    let namespace = Namespace::new("filtered-page-compatibility");
+    inner.save_namespace(&namespace).unwrap();
+    let storage = CountingStorage::new(inner);
+    let request =
+        MemoryPageRequest::new(SearchScope::namespace(namespace.id), None, 1, false).unwrap();
+
+    let page = storage.page_memories_filtered(&request, None).unwrap();
+
+    assert!(page.memories.is_empty());
+    assert_eq!(storage.memory_page_loads.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        storage.page_memories_filtered(&request, Some(MemoryType::Semantic)),
+        Err(StorageError::Unsupported(_))
+    ));
+    assert_eq!(storage.memory_page_loads.load(Ordering::SeqCst), 1);
 }
 
 fn config() -> RetrievalConfig {

@@ -2649,9 +2649,9 @@ mod tests {
         assert!(persist_python_memory(&storage, Some(&active_space), &memory, vec![1.0]).is_err());
         assert!(
             storage
-                .get_all_memories_by_namespace(namespace.id)
+                .get_semantic_in_namespace(memory_ref.id, namespace.id)
                 .unwrap()
-                .is_empty()
+                .is_none()
         );
         assert!(
             storage

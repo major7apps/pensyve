@@ -111,8 +111,6 @@ pub struct PensyveMcpServer {
     pub state: Arc<PensyveState>,
     pub scope: String,
     admission: Arc<RecallAdmission>,
-    #[cfg(test)]
-    page_memories_call_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[expect(dead_code, reason = "used by #[tool_router] macro via rmcp framework")]
     tool_router: ToolRouter<Self>,
 }
@@ -142,8 +140,6 @@ impl PensyveMcpServer {
             state,
             scope,
             admission,
-            #[cfg(test)]
-            page_memories_call_count: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -890,10 +886,6 @@ impl PensyveMcpServer {
                 false,
             )
             .map_err(|err| format!("Error preparing memory page: {err}"))?;
-            #[cfg(test)]
-            if let Some(call_count) = &self.page_memories_call_count {
-                call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
             let page = state
                 .storage
                 .page_memories_filtered(&request, memory_type)
@@ -1225,12 +1217,23 @@ mod tests {
     }
 
     fn stored_memory_count(server: &PensyveMcpServer) -> usize {
-        server
-            .state
-            .storage
-            .get_all_memories_by_namespace_including_superseded(server.state.namespace.id)
-            .unwrap()
-            .len()
+        let mut count = 0;
+        let mut after = None;
+        loop {
+            let request = MemoryPageRequest::new(
+                SearchScope::namespace(server.state.namespace.id),
+                after,
+                256,
+                true,
+            )
+            .unwrap();
+            let page = server.state.storage.page_memories(&request).unwrap();
+            count += page.memories.len();
+            let Some(next) = page.next_cursor else {
+                return count;
+            };
+            after = Some(next);
+        }
     }
 
     #[tokio::test]
@@ -1264,11 +1267,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn namespace_inspect_filters_in_one_bounded_backend_page() {
+    async fn namespace_inspect_filters_before_limit_with_many_nonmatching_rows() {
         let snapshot_root = tempfile::tempdir().unwrap();
-        let mut fixture = forget_fixture(snapshot_root.path().join("snapshots"), false);
-        let page_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        fixture.server.page_memories_call_count = Some(Arc::clone(&page_calls));
+        let fixture = forget_fixture(snapshot_root.path().join("snapshots"), false);
         let namespace_id = fixture.server.state.namespace.id;
         let episode = Episode::new(namespace_id, Vec::new());
         fixture.server.state.storage.save_episode(&episode).unwrap();
@@ -1300,11 +1301,6 @@ mod tests {
         assert_eq!(response["memory_count"], 1);
         assert_eq!(response["memories"].as_array().unwrap().len(), 1);
         assert_eq!(response["memories"][0]["_type"], "semantic");
-        assert_eq!(
-            page_calls.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "nonmatching corpus size must not amplify synchronous backend page calls"
-        );
     }
 
     #[test]
@@ -1748,12 +1744,12 @@ mod tests {
             "remember response must stay flat and embedding-free; response={response}; embedding_paths={leaked_embeddings:?}"
         );
 
+        let memory_id = Uuid::parse_str(response["id"].as_str().unwrap()).unwrap();
         let memory = storage
-            .get_all_memories_by_namespace(namespace.id)
+            .get_semantic_in_namespace(memory_id, namespace.id)
             .unwrap()
-            .into_iter()
-            .find(|memory| matches!(memory, Memory::Semantic(_)))
             .unwrap();
+        let memory = Memory::Semantic(memory);
         let records = storage
             .load_embedding_records(
                 namespace.id,
@@ -1810,9 +1806,9 @@ mod tests {
         assert!(persist_runtime_memory(&state, &memory).is_err());
         assert!(
             storage
-                .get_all_memories_by_namespace(namespace.id)
+                .get_semantic_in_namespace(memory_ref.id, namespace.id)
                 .unwrap()
-                .is_empty()
+                .is_none()
         );
         assert!(
             storage

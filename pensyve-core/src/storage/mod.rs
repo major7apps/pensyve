@@ -537,12 +537,15 @@ pub trait StorageTrait: Send + Sync {
     /// before the backend page limit.
     fn page_memories_filtered(
         &self,
-        _request: &bounded::MemoryPageRequest,
-        _memory_type: Option<bounded::MemoryType>,
+        request: &bounded::MemoryPageRequest,
+        memory_type: Option<bounded::MemoryType>,
     ) -> StorageResult<bounded::MemoryPage> {
-        Err(StorageError::Unsupported(
-            "bounded filtered memory paging".into(),
-        ))
+        match memory_type {
+            None => self.page_memories(request),
+            Some(_) => Err(StorageError::Unsupported(
+                "bounded filtered memory paging".into(),
+            )),
+        }
     }
 
     /// Page the existing entity-oriented inspect relation in stable typed-key order:

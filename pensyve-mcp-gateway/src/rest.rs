@@ -2700,15 +2700,16 @@ mod tests {
             .unwrap()
             .clone();
 
-        a2a_remember(&state, &input)
+        let output = a2a_remember(&state, &input)
             .await
             .unwrap_or_else(|err| panic!("{}", err.1));
 
+        let memory_id = Uuid::parse_str(output["memory_id"].as_str().unwrap()).unwrap();
         let memory = storage
-            .get_all_memories_by_namespace(state.namespace.id)
+            .get_semantic_in_namespace(memory_id, state.namespace.id)
             .unwrap()
-            .pop()
             .unwrap();
+        let memory = Memory::Semantic(memory);
         let records = storage
             .load_embedding_records(
                 state.namespace.id,
@@ -2882,9 +2883,9 @@ mod tests {
         assert!(save_memory(&storage, Some(&space), &memory).is_err());
         assert!(
             storage
-                .get_all_memories_by_namespace(namespace.id)
+                .get_semantic_in_namespace(memory_ref.id, namespace.id)
                 .unwrap()
-                .is_empty()
+                .is_none()
         );
         assert!(
             storage

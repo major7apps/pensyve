@@ -1,18 +1,14 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum TokenKind {
-    Ident(String),
-    Punct(u8),
-}
-
 #[derive(Clone, Debug)]
 struct Token {
-    kind: TokenKind,
+    identifier: String,
     line: usize,
 }
 
@@ -175,7 +171,7 @@ fn lex(source: &str) -> Result<Vec<Token>, (usize, String)> {
                 index += 1;
             }
             tokens.push(Token {
-                kind: TokenKind::Ident(source[start..index].to_owned()),
+                identifier: source[start..index].to_owned(),
                 line: token_line,
             });
             continue;
@@ -211,175 +207,36 @@ fn lex(source: &str) -> Result<Vec<Token>, (usize, String)> {
                 index += 1;
             }
             tokens.push(Token {
-                kind: TokenKind::Ident(source[start..index].to_owned()),
+                identifier: source[start..index].to_owned(),
                 line: token_line,
             });
             continue;
         }
-        tokens.push(Token {
-            kind: TokenKind::Punct(bytes[index]),
-            line,
-        });
         index += 1;
     }
     Ok(tokens)
 }
 
-fn punct(token: &Token, expected: u8) -> bool {
-    token.kind == TokenKind::Punct(expected)
-}
-
-fn ident(token: &Token, expected: &str) -> bool {
-    matches!(&token.kind, TokenKind::Ident(value) if value == expected)
-}
-
-fn exact_cfg_test(tokens: &[Token], index: usize) -> bool {
-    tokens.get(index).is_some_and(|token| punct(token, b'#'))
-        && tokens
-            .get(index + 1)
-            .is_some_and(|token| punct(token, b'['))
-        && tokens
-            .get(index + 2)
-            .is_some_and(|token| ident(token, "cfg"))
-        && tokens
-            .get(index + 3)
-            .is_some_and(|token| punct(token, b'('))
-        && tokens
-            .get(index + 4)
-            .is_some_and(|token| ident(token, "test"))
-        && tokens
-            .get(index + 5)
-            .is_some_and(|token| punct(token, b')'))
-        && tokens
-            .get(index + 6)
-            .is_some_and(|token| punct(token, b']'))
-}
-
-fn delimiter_end(tokens: &[Token], start: usize, open: u8, close: u8) -> Option<usize> {
-    let mut depth = 0_usize;
-    for (offset, token) in tokens[start..].iter().enumerate() {
-        if punct(token, open) {
-            depth += 1;
-        } else if punct(token, close) {
-            depth = depth.checked_sub(1)?;
-            if depth == 0 {
-                return Some(start + offset + 1);
-            }
-        }
-    }
-    None
-}
-
-fn skip_attributes(tokens: &[Token], mut index: usize) -> Result<usize, String> {
-    while tokens.get(index).is_some_and(|token| punct(token, b'#'))
-        && tokens
-            .get(index + 1)
-            .is_some_and(|token| punct(token, b'['))
-    {
-        index = delimiter_end(tokens, index + 1, b'[', b']')
-            .ok_or_else(|| "unterminated attribute after #[cfg(test)]".to_string())?;
-    }
-    Ok(index)
-}
-
-fn declaration_uses_semicolon(tokens: &[Token], start: usize) -> bool {
-    let mut index = start;
-    if tokens.get(index).is_some_and(|token| ident(token, "pub")) {
-        index += 1;
-        if tokens.get(index).is_some_and(|token| punct(token, b'(')) {
-            index = delimiter_end(tokens, index, b'(', b')').unwrap_or(index);
-        }
-    }
-    while tokens.get(index).is_some_and(|token| {
-        matches!(&token.kind, TokenKind::Ident(value) if matches!(value.as_str(), "unsafe" | "async" | "default" | "extern"))
-    }) {
-        index += 1;
-    }
-    if tokens.get(index).is_some_and(|token| ident(token, "const")) {
-        return !tokens[index + 1..tokens.len().min(index + 6)]
-            .iter()
-            .any(|token| ident(token, "fn"));
-    }
-    tokens.get(index).is_some_and(|token| {
-        matches!(&token.kind, TokenKind::Ident(value) if matches!(value.as_str(), "use" | "type" | "static" | "let"))
-    })
-}
-
-fn declaration_uses_comma(tokens: &[Token], start: usize) -> bool {
-    let mut index = start;
-    if tokens.get(index).is_some_and(|token| ident(token, "pub")) {
-        index += 1;
-        if tokens.get(index).is_some_and(|token| punct(token, b'(')) {
-            index = delimiter_end(tokens, index, b'(', b')').unwrap_or(index);
-        }
-    }
-    matches!(
-        tokens.get(index).map(|token| &token.kind),
-        Some(TokenKind::Ident(_))
-    ) && tokens
-        .get(index + 1)
-        .is_some_and(|token| punct(token, b':'))
-}
-
-fn cfg_item_end(tokens: &[Token], after_cfg: usize) -> Result<usize, String> {
-    let start = skip_attributes(tokens, after_cfg)?;
-    if start >= tokens.len() {
-        return Err("#[cfg(test)] has no attached item".into());
-    }
-    let semicolon_item = declaration_uses_semicolon(tokens, start);
-    let comma_item = declaration_uses_comma(tokens, start);
-    let mut stack = Vec::new();
-    let mut angle_depth = 0_usize;
-    for (offset, token) in tokens[start..].iter().enumerate() {
-        let index = start + offset;
-        match token.kind {
-            TokenKind::Punct(b'(') => stack.push(b')'),
-            TokenKind::Punct(b'[') => stack.push(b']'),
-            TokenKind::Punct(b'{') if semicolon_item || !stack.is_empty() || angle_depth > 0 => {
-                stack.push(b'}');
-            }
-            TokenKind::Punct(b'{') => {
-                return delimiter_end(tokens, index, b'{', b'}')
-                    .ok_or_else(|| "unterminated #[cfg(test)] item body".into());
-            }
-            TokenKind::Punct(close @ (b')' | b']' | b'}')) => {
-                if stack.pop() != Some(close) {
-                    return Err("unbalanced delimiter in #[cfg(test)] item".into());
-                }
-            }
-            TokenKind::Punct(b'<') if stack.is_empty() && !semicolon_item => angle_depth += 1,
-            TokenKind::Punct(b'>') if stack.is_empty() && angle_depth > 0 => angle_depth -= 1,
-            TokenKind::Punct(b';') if stack.is_empty() && angle_depth == 0 => return Ok(index + 1),
-            TokenKind::Punct(b',') if comma_item && stack.is_empty() && angle_depth == 0 => {
-                return Ok(index + 1);
-            }
-            _ => {}
-        }
-    }
-    Err("unterminated #[cfg(test)] item".into())
-}
-
 fn scan_file(source: &str) -> Result<Vec<(usize, String)>, (usize, String)> {
     let tokens = lex(source)?;
     let mut violations = Vec::new();
-    let mut index = 0;
-    while index < tokens.len() {
-        if exact_cfg_test(&tokens, index) {
-            index =
-                cfg_item_end(&tokens, index + 7).map_err(|error| (tokens[index].line, error))?;
-            continue;
+    for token in tokens {
+        if token.identifier == "VectorIndex"
+            || token.identifier == "get_all_memories_by_namespace"
+            || token.identifier == "get_all_memories_by_namespace_including_superseded"
+        {
+            violations.push((token.line, token.identifier));
         }
-        if let TokenKind::Ident(value) = &tokens[index].kind {
-            if value == "VectorIndex"
-                || value == "get_all_memories_by_namespace"
-                || value == "get_all_memories_by_namespace_including_superseded"
-            {
-                violations.push((tokens[index].line, value.clone()));
-            }
-        }
-        index += 1;
     }
     Ok(violations)
+}
+
+fn require_readable(path: &Path, metadata: &fs::Metadata) -> Result<(), String> {
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o444 == 0 {
+        return Err(format!("input is not readable: {}", path.display()));
+    }
+    Ok(())
 }
 
 fn collect_rust_files(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -388,10 +245,14 @@ fn collect_rust_files(root: &Path) -> Result<Vec<PathBuf>, String> {
     if !metadata.is_dir() {
         return Err(format!("input is not a directory: {}", root.display()));
     }
+    require_readable(root, &metadata)?;
     let mut files = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     let mut visited = HashSet::new();
     while let Some(directory) = pending.pop() {
+        let metadata = fs::metadata(&directory)
+            .map_err(|error| format!("cannot access {}: {error}", directory.display()))?;
+        require_readable(&directory, &metadata)?;
         let canonical = fs::canonicalize(&directory)
             .map_err(|error| format!("cannot resolve {}: {error}", directory.display()))?;
         if !visited.insert(canonical) {
@@ -413,6 +274,7 @@ fn collect_rust_files(root: &Path) -> Result<Vec<PathBuf>, String> {
             if metadata.is_dir() {
                 pending.push(path);
             } else if metadata.is_file() && path.extension().is_some_and(|value| value == "rs") {
+                require_readable(&path, &metadata)?;
                 files.push(path);
             }
         }
