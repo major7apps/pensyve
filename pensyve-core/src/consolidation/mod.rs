@@ -1399,6 +1399,10 @@ pub fn g3_typed_slots_enabled() -> bool {
 /// typed-slot enrichment for this observation. Distinguished from the
 /// cancel path which returns `Err(_)` so callers can route the two
 /// outcomes to different log streams.
+#[allow(
+    clippy::result_large_err,
+    reason = "public ConsolidationError::Partial compatibility requires unboxed committed stats"
+)]
 pub async fn run_typed_slots_hook<L: TypedSlotLlm + ?Sized>(
     observation_action: &str,
     observation_content: &str,
@@ -1499,6 +1503,10 @@ pub async fn run_typed_slots_hook<L: TypedSlotLlm + ?Sized>(
 /// 5-slot prompt — the underlying HTTP shape is identical (single
 /// system-prompt + user-content pair), so reusing the trait avoids
 /// duplicating the OpenAI-compatible request plumbing.
+#[allow(
+    clippy::result_large_err,
+    reason = "public ConsolidationError::Partial compatibility requires unboxed committed stats"
+)]
 pub async fn run_supersession_summarizer_hook<L: TypedSlotLlm + ?Sized>(
     chain_text: &str,
     extractor: &L,
