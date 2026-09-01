@@ -548,10 +548,7 @@ struct Seeded {
     racer: Uuid,
 }
 
-async fn app_state(
-    dir: &TempDir,
-    snapshot_root: PathBuf,
-) -> (Arc<AppState>, Seeded, Arc<RacingStorage>) {
+fn app_state(dir: &TempDir, snapshot_root: PathBuf) -> (Arc<AppState>, Seeded, Arc<RacingStorage>) {
     let inner = Arc::new(SqliteBackend::open(dir.path()).expect("open storage"));
     let default_namespace = Namespace::new("default");
     inner
@@ -662,7 +659,7 @@ async fn app_state(
 #[tokio::test]
 async fn gdpr_erase_strips_the_generation_of_a_row_written_during_the_erase() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (state, seeded, _racing) = app_state(&dir, dir.path().join("snapshots")).await;
+    let (state, seeded, _racing) = app_state(&dir, dir.path().join("snapshots"));
 
     let (url, cancellation) = start_test_server(state.clone()).await;
     let client = reqwest::Client::new();
@@ -723,7 +720,7 @@ async fn gdpr_erase_strips_the_generation_of_a_row_written_during_the_erase() {
 #[tokio::test]
 async fn gdpr_erase_finishes_after_the_client_disconnects() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (state, seeded, racing) = app_state(&dir, dir.path().join("snapshots")).await;
+    let (state, seeded, racing) = app_state(&dir, dir.path().join("snapshots"));
     let (mut committed, release_after_commit) = racing.signal_on_commit();
 
     let ps = state

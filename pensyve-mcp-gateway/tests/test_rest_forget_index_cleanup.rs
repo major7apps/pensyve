@@ -174,7 +174,7 @@ fn save_with_generation(ps: &pensyve_mcp_tools::PensyveState, memory: &Memory) {
 }
 
 /// Seed one row of every shape the entity-wide delete removes, plus a control.
-async fn seed(state: &AppState) -> Seeded {
+fn seed(state: &AppState) -> Seeded {
     let ps = state
         .tenant_mgr
         .get_tenant_state(TEST_TENANT)
@@ -315,7 +315,7 @@ fn assert_deletable_generations_gone(state: &AppState, seeded: &Seeded) {
 async fn rest_forget_strips_generations_for_every_deleted_row_shape() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = app_state(&dir, dir.path().join("snapshots"));
-    let seeded = seed(&state).await;
+    let seeded = seed(&state);
     assert_generation_state_before_forget(&state, &seeded);
 
     let (url, cancellation) = start_test_server(state.clone()).await;
@@ -341,7 +341,7 @@ async fn rest_forget_strips_generations_for_every_deleted_row_shape() {
 async fn gdpr_erase_strips_generations_for_every_deleted_row_shape() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = app_state(&dir, dir.path().join("snapshots"));
-    let seeded = seed(&state).await;
+    let seeded = seed(&state);
     assert_generation_state_before_forget(&state, &seeded);
 
     let (url, cancellation) = start_test_server(state.clone()).await;
