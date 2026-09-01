@@ -697,9 +697,10 @@ pub trait StorageTrait: Send + Sync {
             .collect())
     }
 
-    /// Mark a live memory as superseded, but only when it belongs to
-    /// `namespace_id`. Returns `false` when no live row in that namespace
-    /// matched.
+    /// Atomically insert a replacement source and optional embedding, mark a
+    /// live old source as superseded, and delete the old source's embeddings.
+    /// Returns `false` when the old source compare-and-set loses; in that case
+    /// the replacement source and embedding must not remain visible.
     ///
     /// There is deliberately no unscoped `supersede_memory`. Memory ids are not
     /// globally unique in this schema, so an id-only `UPDATE` stamps whichever
@@ -710,6 +711,22 @@ pub trait StorageTrait: Send + Sync {
     /// Backends must put both predicates in the SQL rather than leave the
     /// namespace to row-level security, which is defence in depth and inert in
     /// every deployment shipping today.
+    fn save_superseding_memory_with_embedding(
+        &self,
+        _old: bounded::MemoryRef,
+        _namespace_id: Uuid,
+        _replacement: &Memory,
+        _embedding: Option<&bounded::EmbeddingRecord>,
+        _invalid_at: DateTime<Utc>,
+    ) -> StorageResult<bool> {
+        Err(StorageError::Unsupported(
+            "transactional memory supersession".into(),
+        ))
+    }
+
+    /// Mark a live memory as superseded, but only when it belongs to
+    /// `namespace_id`. Returns `false` when no live row in that namespace
+    /// matched.
     fn supersede_memory_in_namespace(
         &self,
         id: Uuid,

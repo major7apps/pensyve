@@ -1092,6 +1092,27 @@ fn memory_type_str(memory_type: MemoryType) -> &'static str {
     }
 }
 
+fn supersede_update_sql(memory_type: MemoryType) -> &'static str {
+    match memory_type {
+        MemoryType::Episodic => {
+            "UPDATE episodic_memories SET superseded_by = $1, invalid_at = $2 \
+             WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL"
+        }
+        MemoryType::Semantic => {
+            "UPDATE semantic_memories SET superseded_by = $1, invalid_at = $2 \
+             WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL"
+        }
+        MemoryType::Procedural => {
+            "UPDATE procedural_memories SET superseded_by = $1, invalid_at = $2 \
+             WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL"
+        }
+        MemoryType::Observation => {
+            "UPDATE observation_memories SET superseded_by = $1, invalid_at = $2 \
+             WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL"
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one exhaustive source write keeps all four Memory variants on the same scoped SQL transaction"
@@ -2916,6 +2937,67 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    fn save_superseding_memory_with_embedding(
+        &self,
+        old: MemoryRef,
+        namespace_id: Uuid,
+        replacement: &Memory,
+        embedding: Option<&EmbeddingRecord>,
+        invalid_at: DateTime<Utc>,
+    ) -> StorageResult<bool> {
+        if memory_namespace_id(replacement) != namespace_id {
+            return Err(StorageError::Context(
+                "replacement memory namespace does not match supersession namespace".into(),
+            ));
+        }
+        if MemoryType::of(replacement) != old.memory_type {
+            return Err(StorageError::Context(
+                "replacement memory type does not match superseded memory type".into(),
+            ));
+        }
+        if replacement.id() == old.id {
+            return Err(StorageError::Context(
+                "replacement memory must have a distinct id".into(),
+            ));
+        }
+        if let Some(record) = embedding {
+            validate_record_matches_memory(record, replacement)?;
+        }
+
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            save_memory_in_pg_tx(&mut transaction, replacement).await?;
+            reconcile_embedding_source_in_pg_tx(&mut transaction, replacement).await?;
+            if let Some(record) = embedding {
+                insert_embedding_in_pg_tx(&mut transaction, record).await?;
+            }
+            let updated = query::<Postgres>(supersede_update_sql(old.memory_type))
+                .bind(replacement.id())
+                .bind(invalid_at)
+                .bind(old.id)
+                .bind(namespace_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
+            if updated.rows_affected() == 0 {
+                return Ok(false);
+            }
+            query::<Postgres>(
+                "DELETE FROM memory_embeddings
+                 WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3",
+            )
+            .bind(namespace_id)
+            .bind(memory_type_str(old.memory_type))
+            .bind(old.id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            Ok(true)
+        })
+    }
+
     fn supersede_memory_in_namespace(
         &self,
         id: Uuid,
@@ -4305,5 +4387,20 @@ mod tests {
         );
         let instances = run_observation_instance_query(&["alice", "alice", "alice"], "alice", 2);
         assert_eq!(instances.len(), 2);
+    }
+
+    #[test]
+    fn atomic_supersession_queries_are_type_and_namespace_scoped() {
+        for (memory_type, table) in [
+            (MemoryType::Episodic, "episodic_memories"),
+            (MemoryType::Semantic, "semantic_memories"),
+            (MemoryType::Procedural, "procedural_memories"),
+            (MemoryType::Observation, "observation_memories"),
+        ] {
+            let sql = supersede_update_sql(memory_type);
+            assert!(sql.starts_with(&format!("UPDATE {table} SET superseded_by")));
+            assert!(sql.contains("id = $3 AND namespace_id = $4"));
+            assert!(sql.contains("superseded_by IS NULL"));
+        }
     }
 }

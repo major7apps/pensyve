@@ -383,13 +383,12 @@ async fn test_recall_returns_stored_semantic_memory() {
         .recall("hiking mountains", state.namespace.id, 5)
         .expect("recall");
 
-    // With the mock embedder the semantic similarity between "hiking mountains"
-    // and "likes hiking in the mountains" may not score highest, but the FTS
-    // engine should still surface it.
     assert!(
-        !result.memories.is_empty() || result.memories.is_empty(),
-        "recall should not panic; result count: {}",
-        result.memories.len()
+        result
+            .memories
+            .iter()
+            .any(|candidate| candidate.memory_id == mem.id),
+        "recall must return the stored semantic memory"
     );
 }
 

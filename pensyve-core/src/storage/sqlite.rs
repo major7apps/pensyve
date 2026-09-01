@@ -3306,6 +3306,70 @@ impl StorageTrait for SqliteBackend {
         Ok(false)
     }
 
+    fn save_superseding_memory_with_embedding(
+        &self,
+        old: MemoryRef,
+        namespace_id: Uuid,
+        replacement: &Memory,
+        embedding: Option<&EmbeddingRecord>,
+        invalid_at: DateTime<Utc>,
+    ) -> StorageResult<bool> {
+        if memory_namespace_id(replacement) != namespace_id {
+            return Err(StorageError::Context(
+                "replacement memory namespace does not match supersession namespace".into(),
+            ));
+        }
+        if MemoryType::of(replacement) != old.memory_type {
+            return Err(StorageError::Context(
+                "replacement memory type does not match superseded memory type".into(),
+            ));
+        }
+        if replacement.id() == old.id {
+            return Err(StorageError::Context(
+                "replacement memory must have a distinct id".into(),
+            ));
+        }
+        if let Some(record) = embedding {
+            validate_record_matches_memory(record, replacement)?;
+        }
+
+        let (table, memory_type) = match old.memory_type {
+            MemoryType::Episodic => ("episodic_memories", "episodic"),
+            MemoryType::Semantic => ("semantic_memories", "semantic"),
+            MemoryType::Procedural => ("procedural_memories", "procedural"),
+            MemoryType::Observation => ("observation_memories", "observation"),
+        };
+        let conn = lock_conn!(self);
+        let transaction = conn.unchecked_transaction()?;
+        save_memory_in_conn(&transaction, replacement)?;
+        reconcile_embedding_source_in_conn(&transaction, replacement)?;
+        if let Some(record) = embedding {
+            insert_embedding_in_conn(&transaction, record)?;
+        }
+        let updated = transaction.execute(
+            &format!(
+                "UPDATE {table} SET superseded_by = ?1, invalid_at = ?2
+                 WHERE id = ?3 AND namespace_id = ?4 AND superseded_by IS NULL"
+            ),
+            params![
+                replacement.id().to_string(),
+                invalid_at.to_rfc3339(),
+                old.id.to_string(),
+                namespace_id.to_string(),
+            ],
+        )?;
+        if updated == 0 {
+            return Ok(false);
+        }
+        transaction.execute(
+            "DELETE FROM memory_embeddings
+             WHERE namespace_id = ?1 AND memory_type = ?2 AND memory_id = ?3",
+            params![namespace_id.to_string(), memory_type, old.id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     // -----------------------------------------------------------------------
     // G1: scope-aware variants (SQL-layer override of the default trait
     // impls in `storage::mod`). These are the multi-tenant read paths.
@@ -4848,6 +4912,15 @@ mod tests {
             .unwrap()
     }
 
+    fn memory_superseded_by_for_test(memory: &Memory) -> Option<Uuid> {
+        match memory {
+            Memory::Episodic(memory) => memory.superseded_by,
+            Memory::Semantic(memory) => memory.superseded_by,
+            Memory::Procedural(memory) => memory.superseded_by,
+            Memory::Observation(memory) => memory.superseded_by,
+        }
+    }
+
     #[test]
     fn canonical_embedding_record_uses_runtime_space_and_source_text() {
         let (_db, namespace, memory) = fixture_memory();
@@ -4906,6 +4979,78 @@ mod tests {
             )
             .unwrap();
         assert_eq!(registered, 1);
+    }
+
+    #[test]
+    fn local_runtime_space_rejects_immutable_identity_conflict_without_lifecycle_mutation() {
+        let (_dir, db) = setup();
+        let namespace = make_namespace(&db);
+        let space = EmbeddingSpace::mock(2, "identity-conflict-runtime");
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO embedding_spaces
+                 (id, canonical_identity_json, class, dimension, created_at)
+                 VALUES (?1, ?2, 'mock', 2, ?3)",
+                params![space.id().0, "{\"corrupt\":true}", Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        assert!(
+            db.initialize_local_runtime_space(namespace.id, &space)
+                .is_err()
+        );
+
+        let conn = db.conn.lock().unwrap();
+        let canonical: String = conn
+            .query_row(
+                "SELECT canonical_identity_json FROM embedding_spaces WHERE id = ?1",
+                [space.id().0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let lifecycle_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM namespace_embedding_state WHERE namespace_id = ?1",
+                [namespace.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(canonical, "{\"corrupt\":true}");
+        assert_eq!(lifecycle_rows, 0);
+    }
+
+    #[test]
+    fn local_runtime_space_lifecycle_conflict_rolls_back_new_registration() {
+        let (_dir, db) = setup();
+        let namespace = make_namespace(&db);
+        let active_space = EmbeddingSpace::mock(2, "existing-active-runtime");
+        let conflicting_space = EmbeddingSpace::mock(2, "conflicting-runtime");
+        let active_state = db
+            .initialize_local_runtime_space(namespace.id, &active_space)
+            .unwrap();
+
+        assert!(
+            db.initialize_local_runtime_space(namespace.id, &conflicting_space)
+                .is_err()
+        );
+
+        assert_eq!(
+            db.get_namespace_embedding_state(namespace.id).unwrap(),
+            Some(active_state)
+        );
+        let conflicting_registrations: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM embedding_spaces WHERE id = ?1",
+                [conflicting_space.id().0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(conflicting_registrations, 0);
     }
 
     #[test]
@@ -7712,6 +7857,166 @@ mod tests {
         let current_hits = db.search_fts("currenttoken", ns.id, 10).unwrap();
         assert_eq!(current_hits.len(), 1);
         assert_eq!(current_hits[0].id(), new.id);
+    }
+
+    #[test]
+    fn atomic_supersession_rolls_back_replacement_when_old_stamp_fails() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let space = EmbeddingSpace::mock(2, "atomic-supersession-failure");
+        db.initialize_local_runtime_space(ns.id, &space).unwrap();
+        let old = Memory::Semantic(SemanticMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            "old",
+            "value",
+            0.8,
+        ));
+        let old_record = embedding_record_for_memory(&old, &space, vec![1.0, 0.0]);
+        db.save_memory_with_embedding(&old, Some(&old_record))
+            .unwrap();
+        let replacement = Memory::Semantic(SemanticMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            "new",
+            "value",
+            0.9,
+        ));
+        let replacement_record = embedding_record_for_memory(&replacement, &space, vec![0.0, 1.0]);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_old_stamp
+                 BEFORE UPDATE OF superseded_by ON semantic_memories
+                 WHEN OLD.id = '{}'
+                 BEGIN SELECT RAISE(ABORT, 'injected old stamp failure'); END;",
+                old.id()
+            ))
+            .unwrap();
+
+        assert!(
+            db.save_superseding_memory_with_embedding(
+                MemoryRef::from_memory(&old),
+                ns.id,
+                &replacement,
+                Some(&replacement_record),
+                Utc::now(),
+            )
+            .is_err()
+        );
+
+        let history = db
+            .get_all_memories_by_namespace_including_superseded(ns.id)
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id(), old.id());
+        assert_eq!(memory_superseded_by_for_test(&history[0]), None);
+        let records = db
+            .load_embedding_records(
+                ns.id,
+                &space.id(),
+                &[
+                    MemoryRef::from_memory(&old),
+                    MemoryRef::from_memory(&replacement),
+                ],
+            )
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].memory_ref, MemoryRef::from_memory(&old));
+    }
+
+    #[test]
+    fn atomic_supersession_racers_leave_exactly_one_successor() {
+        let (_dir, db) = setup();
+        let db = std::sync::Arc::new(db);
+        let ns = make_namespace(&db);
+        let space = EmbeddingSpace::mock(2, "atomic-supersession-race");
+        db.initialize_local_runtime_space(ns.id, &space).unwrap();
+        let old = Memory::Semantic(SemanticMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            "old",
+            "value",
+            0.8,
+        ));
+        let old_record = embedding_record_for_memory(&old, &space, vec![1.0, 0.0]);
+        db.save_memory_with_embedding(&old, Some(&old_record))
+            .unwrap();
+        let successors = [
+            Memory::Semantic(SemanticMemory::new(
+                ns.id,
+                Uuid::new_v4(),
+                "new-a",
+                "value",
+                0.9,
+            )),
+            Memory::Semantic(SemanticMemory::new(
+                ns.id,
+                Uuid::new_v4(),
+                "new-b",
+                "value",
+                0.9,
+            )),
+        ];
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let handles = successors
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, successor)| {
+                let db = db.clone();
+                let barrier = barrier.clone();
+                let old_ref = MemoryRef::from_memory(&old);
+                let space = space.clone();
+                std::thread::spawn(move || {
+                    let record = embedding_record_for_memory(
+                        &successor,
+                        &space,
+                        if index == 0 {
+                            vec![0.0, 1.0]
+                        } else {
+                            vec![-1.0, 0.0]
+                        },
+                    );
+                    barrier.wait();
+                    let won = db
+                        .save_superseding_memory_with_embedding(
+                            old_ref,
+                            ns.id,
+                            &successor,
+                            Some(&record),
+                            Utc::now(),
+                        )
+                        .unwrap();
+                    (won, successor)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let outcomes = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(outcomes.iter().filter(|(won, _)| *won).count(), 1);
+        let winner = outcomes.iter().find(|(won, _)| *won).unwrap().1.id();
+        let history = db
+            .get_all_memories_by_namespace_including_superseded(ns.id)
+            .unwrap();
+        assert_eq!(history.len(), 2);
+        let stored_old = history
+            .iter()
+            .find(|memory| memory.id() == old.id())
+            .unwrap();
+        assert_eq!(memory_superseded_by_for_test(stored_old), Some(winner));
+        assert_eq!(db.get_all_memories_by_namespace(ns.id).unwrap().len(), 1);
+        let successor_refs = successors.map(|memory| MemoryRef::from_memory(&memory));
+        let records = db
+            .load_embedding_records(ns.id, &space.id(), &successor_refs)
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].memory_ref.id, winner);
     }
 
     // -----------------------------------------------------------------------

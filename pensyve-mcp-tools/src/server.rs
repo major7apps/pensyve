@@ -8,6 +8,7 @@ use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use uuid::Uuid;
 
 use pensyve_core::retrieval::RecallEngine;
+use pensyve_core::storage::bounded::embedding_source_text;
 use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{
     ContentType, Entity, EntityKind, Episode, EpisodicMemory, Memory, Outcome, SemanticMemory,
@@ -71,6 +72,15 @@ async fn add_compatibility_index(state: &PensyveState, memory: &Memory) {
 
 fn runtime_wants_embedding(runtime: &VectorRuntime) -> bool {
     runtime.semantic_space().is_some() || matches!(runtime, VectorRuntime::InMemory(_))
+}
+
+fn set_memory_embedding(memory: &mut Memory, embedding: Vec<f32>) {
+    match memory {
+        Memory::Episodic(memory) => memory.embedding = embedding,
+        Memory::Semantic(memory) => memory.embedding = embedding,
+        Memory::Procedural(memory) => memory.embedding = embedding,
+        Memory::Observation(memory) => memory.embedding = embedding,
+    }
 }
 
 /// Look up an entity by name, creating it if it doesn't exist.
@@ -347,18 +357,23 @@ impl PensyveMcpServer {
             ("knows".to_string(), params.fact.clone())
         };
 
-        let mut mem =
-            SemanticMemory::new(state.namespace.id, entity.id, predicate, object, confidence);
+        let mut memory = Memory::Semantic(SemanticMemory::new(
+            state.namespace.id,
+            entity.id,
+            predicate,
+            object,
+            confidence,
+        ));
 
         if runtime_wants_embedding(&state.vector_runtime) {
             // Run ONNX inference on the blocking thread pool to avoid stalling the async runtime.
             let embedder = state.embedder.clone();
-            let fact = params.fact.clone();
-            let embed_result = tokio::task::spawn_blocking(move || embedder.embed(&fact)).await;
+            let source = embedding_source_text(&memory);
+            let embed_result = tokio::task::spawn_blocking(move || embedder.embed(&source)).await;
 
             match embed_result {
                 Ok(Ok(embedding)) => {
-                    mem.embedding = embedding;
+                    set_memory_embedding(&mut memory, embedding);
                 }
                 Ok(Err(err)) if state.vector_runtime.semantic_space().is_some() => {
                     return Err(format!("Embedding failed: {err}"));
@@ -371,7 +386,6 @@ impl PensyveMcpServer {
             }
         }
 
-        let memory = Memory::Semantic(mem.clone());
         persist_runtime_memory(state, &memory)?;
         add_compatibility_index(state, &memory).await;
 
@@ -381,7 +395,7 @@ impl PensyveMcpServer {
             &serde_json::json!({"entity": params.entity, "preview": &params.fact[..params.fact.len().min(50)]}),
         );
 
-        let mut val = serde_json::to_value(&mem).unwrap_or_default();
+        let mut val = serde_json::to_value(&memory).unwrap_or_default();
         strip_embedding(&mut val);
         serde_json::to_string(&val).map_err(|e| format!("Serialization error: {e}"))
     }
@@ -612,28 +626,29 @@ impl PensyveMcpServer {
         )?;
 
         // Build the episodic memory.
-        let mut mem = EpisodicMemory::new(
+        let mut episodic = EpisodicMemory::new(
             state.namespace.id,
             episode_id,
             source_entity.id,
             about_entity.id,
             &params.content,
         );
-        mem.content_type = match params.content_type.as_deref() {
+        episodic.content_type = match params.content_type.as_deref() {
             Some("code") => ContentType::Code,
             Some("tool_output") => ContentType::ToolOutput,
             _ => ContentType::Text,
         };
+        let mut memory = Memory::Episodic(episodic);
 
         if runtime_wants_embedding(&state.vector_runtime) {
             // Embed content on the blocking thread pool.
             let embedder = state.embedder.clone();
-            let content = params.content.clone();
-            let embed_result = tokio::task::spawn_blocking(move || embedder.embed(&content)).await;
+            let source = embedding_source_text(&memory);
+            let embed_result = tokio::task::spawn_blocking(move || embedder.embed(&source)).await;
 
             match embed_result {
                 Ok(Ok(embedding)) => {
-                    mem.embedding = embedding;
+                    set_memory_embedding(&mut memory, embedding);
                 }
                 Ok(Err(err)) if state.vector_runtime.semantic_space().is_some() => {
                     return Err(format!("Embedding failed: {err}"));
@@ -646,9 +661,11 @@ impl PensyveMcpServer {
             }
         }
 
-        let memory = Memory::Episodic(mem.clone());
         persist_runtime_memory(state, &memory)?;
         add_compatibility_index(state, &memory).await;
+        let Memory::Episodic(stored) = &memory else {
+            unreachable!("observe builds episodic memory")
+        };
 
         let _ = state.storage.log_activity(
             state.namespace.id,
@@ -657,16 +674,16 @@ impl PensyveMcpServer {
                 "episode_id": episode_id.to_string(),
                 "source_entity": params.source_entity,
                 "about_entity": params.about_entity,
-                "content_type": mem.content_type.as_str(),
+                "content_type": stored.content_type.as_str(),
                 "content_len": params.content.len(),
             }),
         );
 
         let mut val = serde_json::to_value(serde_json::json!({
-            "id": mem.id.to_string(),
+            "id": stored.id.to_string(),
             "episode_id": episode_id.to_string(),
-            "content_type": mem.content_type.as_str(),
-            "timestamp": mem.timestamp.to_rfc3339(),
+            "content_type": stored.content_type.as_str(),
+            "timestamp": stored.timestamp.to_rfc3339(),
         }))
         .unwrap_or_default();
         strip_embedding(&mut val);
@@ -1612,7 +1629,7 @@ mod tests {
         let runtime = VectorRuntime::storage_backed(space.clone(), Some(&lifecycle)).unwrap();
         let state = Arc::new(PensyveState {
             storage: storage.clone() as Arc<dyn StorageTrait>,
-            embedder,
+            embedder: embedder.clone(),
             vector_runtime: runtime,
             namespace: namespace.clone(),
             retrieval_config: test_retrieval_config(),
@@ -1626,7 +1643,7 @@ mod tests {
         server
             .remember(Parameters(RememberParams {
                 entity: "alice".into(),
-                fact: "likes Rust".into(),
+                fact: "Rust".into(),
                 confidence: Some(0.9),
             }))
             .await
@@ -1646,6 +1663,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].source_sha256,
+            "75c679d02b41dc063f0d3ea825cdfe9d462741aee819269256e7df313e6a967a"
+        );
+        assert_eq!(records[0].embedding, embedder.embed("knows Rust").unwrap());
         let recalled = server
             .recall(Parameters(RecallParams {
                 query: "likes Rust".into(),

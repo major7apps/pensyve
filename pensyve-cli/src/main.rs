@@ -7,7 +7,7 @@ use pensyve_core::{
     embedding_space::EmbeddingSpace,
     reranker::Reranker,
     retrieval::RecallEngine,
-    storage::bounded::NamespaceEmbeddingPhase,
+    storage::bounded::{NamespaceEmbeddingPhase, embedding_source_text},
     storage::{
         StorageError, StorageResult, StorageTrait, embedding_record_for_memory,
         sqlite::SqliteBackend,
@@ -228,6 +228,33 @@ fn persist_local_memory(
 ) -> StorageResult<()> {
     let record = active_space.map(|space| embedding_record_for_memory(memory, space, embedding));
     storage.save_memory_with_embedding(memory, record.as_ref())
+}
+
+fn remember_local_memory(
+    storage: &SqliteBackend,
+    embedder: &OnnxEmbedder,
+    namespace_id: uuid::Uuid,
+    entity_id: uuid::Uuid,
+    fact: &str,
+    confidence: f32,
+) -> StorageResult<Memory> {
+    let (predicate, object) = fact
+        .split_once(' ')
+        .map_or(("is", fact), |(predicate, object)| (predicate, object));
+    let semantic = SemanticMemory::new(namespace_id, entity_id, predicate, object, confidence);
+    let mut memory = Memory::Semantic(semantic);
+    let active_space = resolve_local_semantic_space(storage, embedder, namespace_id)?;
+    let embedding = active_space
+        .as_ref()
+        .map(|_| embedder.embed(&embedding_source_text(&memory)))
+        .transpose()
+        .map_err(|error| StorageError::Context(format!("embedding failed: {error}")))?
+        .unwrap_or_default();
+    if let Memory::Semantic(semantic) = &mut memory {
+        semantic.embedding.clone_from(&embedding);
+    }
+    persist_local_memory(storage, active_space.as_ref(), &memory, embedding)?;
+    Ok(memory)
 }
 
 // ---------------------------------------------------------------------------
@@ -651,16 +678,6 @@ fn cmd_remember(
     let ns = ensure_namespace(&storage, namespace_name)?;
     let entity = ensure_entity(&storage, entity_name, ns.id)?;
 
-    // Parse "predicate object" from the fact string. Split on the first space;
-    // if there's no space, use "is" as the predicate and the full string as the object.
-    let (predicate, object) = if let Some(idx) = fact.find(' ') {
-        (&fact[..idx], &fact[idx + 1..])
-    } else {
-        ("is", fact)
-    };
-
-    let mut mem = SemanticMemory::new(ns.id, entity.id, predicate, object, confidence as f32);
-
     // Embed using real ONNX embedder with fallback to mock.
     let embedder = OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5")
         .or_else(|_| OnnxEmbedder::new("all-MiniLM-L6-v2"))
@@ -670,18 +687,13 @@ fn cmd_remember(
             );
             OnnxEmbedder::new_mock(768)
         });
-    let active_space = resolve_local_semantic_space(&storage, &embedder, ns.id)?;
-    let embedding = active_space
-        .as_ref()
-        .map(|_| embedder.embed(fact))
-        .transpose()?
-        .unwrap_or_default();
-    mem.embedding.clone_from(&embedding);
-    persist_local_memory(
+    remember_local_memory(
         &storage,
-        active_space.as_ref(),
-        &Memory::Semantic(mem),
-        embedding,
+        &embedder,
+        ns.id,
+        entity.id,
+        fact,
+        confidence as f32,
     )?;
 
     match format {
@@ -830,27 +842,27 @@ mod tests {
         entity.namespace_id = namespace.id;
         storage.save_entity(&entity).unwrap();
         let embedder = OnnxEmbedder::new_mock(2);
-        let active_space = resolve_local_semantic_space(&storage, &embedder, namespace.id)
-            .unwrap()
+        let memory =
+            remember_local_memory(&storage, &embedder, namespace.id, entity.id, "Rust", 0.9)
+                .unwrap();
+        let Memory::Semantic(semantic) = &memory else {
+            panic!("remember must create a semantic memory")
+        };
+        let active_space = embedder.embedding_space().unwrap();
+
+        let records = storage
+            .load_embedding_records(
+                namespace.id,
+                &active_space.id(),
+                &[MemoryRef::from_memory(&memory)],
+            )
             .unwrap();
-        let mut semantic = SemanticMemory::new(namespace.id, entity.id, "likes", "Rust", 0.9);
-        let embedding = embedder.embed("likes Rust").unwrap();
-        semantic.embedding.clone_from(&embedding);
-        let memory = Memory::Semantic(semantic.clone());
-
-        persist_local_memory(&storage, Some(&active_space), &memory, embedding).unwrap();
-
+        assert_eq!(records.len(), 1);
         assert_eq!(
-            storage
-                .load_embedding_records(
-                    namespace.id,
-                    &active_space.id(),
-                    &[MemoryRef::from_memory(&memory)],
-                )
-                .unwrap()
-                .len(),
-            1
+            records[0].source_sha256,
+            "ca9f6dc180a9be2b83ec0f43c539a37e9483eb4e03f907689b6856f185b773d6"
         );
+        assert_eq!(records[0].embedding, embedder.embed("is Rust").unwrap());
         let config = RetrievalConfig {
             default_limit: 5,
             max_candidates: 100,
@@ -861,16 +873,15 @@ mod tests {
             beam_width: 10,
             max_depth: 4,
         };
-        let recalled =
-            RecallEngine::new_storage_backed(&storage, &embedder, &active_space, &config)
-                .recall_with_embedding(
-                    "likes Rust",
-                    Some(&semantic.embedding),
-                    namespace.id,
-                    5,
-                    None,
-                )
-                .unwrap();
+        let recalled = RecallEngine::new_storage_backed(&storage, &embedder, active_space, &config)
+            .recall_with_embedding(
+                "likes Rust",
+                Some(&semantic.embedding),
+                namespace.id,
+                5,
+                None,
+            )
+            .unwrap();
         assert_eq!(recalled.semantic_status, SemanticStatus::Complete);
         assert!(
             recalled
