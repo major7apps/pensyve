@@ -4043,7 +4043,7 @@ fn bounded_lexical_stop_words_and_ranking_match_sqlite() {
 
     for backend in [postgres as &dyn StorageTrait, &sqlite] {
         backend.save_namespace(&namespace).expect("save namespace");
-        for (id, content) in [(81_u128, "the alpha"), (82, "alpha alpha")] {
+        for (id, content) in [(81_u128, "the alpha"), (82, "alpha alpha"), (83, "re")] {
             let mut memory = EpisodicMemory::new(
                 namespace.id,
                 Uuid::new_v4(),
@@ -4085,6 +4085,20 @@ fn bounded_lexical_stop_words_and_ranking_match_sqlite() {
                 .search_lexical_hits(punctuated_query, &scope, 100)
                 .expect("sqlite punctuated query"),
             sqlite_meaningful
+        );
+    }
+    for contraction in ["you're", "you’re"] {
+        assert!(
+            postgres
+                .search_lexical_hits(contraction, &scope, 100)
+                .expect("postgres contraction query")
+                .is_empty()
+        );
+        assert!(
+            sqlite
+                .search_lexical_hits(contraction, &scope, 100)
+                .expect("sqlite contraction query")
+                .is_empty()
         );
     }
     assert!(

@@ -203,17 +203,28 @@ const ENGLISH_LEXICAL_STOP_WORDS: &[&str] = &[
 /// native stemmer/parser sees tokens. This matches `PostgreSQL`'s English
 /// stop-word behavior on `SQLite` and makes stop-word-only queries uniformly
 /// empty rather than backend-dependent. Every non-alphanumeric Unicode scalar
-/// is a separator, so backend parsers never reinterpret internal punctuation.
+/// except an apostrophe is a separator, so backend parsers never reinterpret
+/// internal punctuation. Apostrophes are retained just long enough to discard
+/// registered contractions as a unit, then separate any remaining terms.
 pub(crate) fn lexical_query_tokens(query: &str) -> Vec<String> {
     query
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .take(crate::storage::MAX_FTS_QUERY_TOKENS)
-        .filter_map(|token| {
-            let normalized = token.to_lowercase();
-            (!normalized.is_empty() && !ENGLISH_LEXICAL_STOP_WORDS.contains(&normalized.as_str()))
-                .then_some(normalized)
+        .split(|character: char| {
+            !character.is_alphanumeric() && character != '\'' && character != '’'
         })
+        .filter(|token| !token.is_empty())
+        .flat_map(|token| {
+            let normalized = token.replace('’', "'").to_lowercase();
+            if ENGLISH_LEXICAL_STOP_WORDS.contains(&normalized.as_str()) {
+                Vec::new()
+            } else {
+                normalized
+                    .split('\'')
+                    .filter(|term| !term.is_empty() && !ENGLISH_LEXICAL_STOP_WORDS.contains(term))
+                    .map(str::to_owned)
+                    .collect()
+            }
+        })
+        .take(crate::storage::MAX_FTS_QUERY_TOKENS)
         .collect()
 }
 

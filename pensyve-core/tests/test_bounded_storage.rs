@@ -297,6 +297,32 @@ fn lexical_unicode_punctuation_separates_stop_words_from_terms() {
 }
 
 #[test]
+fn lexical_ascii_contraction_stop_word_does_not_emit_residue() {
+    let (_dir, db, namespace) = sqlite_fixture();
+    save(&db, episodic(namespace.id, 1, "re"));
+    let scope = SearchScope::namespace(namespace.id);
+
+    assert!(
+        db.search_lexical_hits("you're", &scope, 100)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn lexical_typographic_apostrophe_contraction_does_not_emit_residue() {
+    let (_dir, db, namespace) = sqlite_fixture();
+    save(&db, episodic(namespace.id, 1, "re"));
+    let scope = SearchScope::namespace(namespace.id);
+
+    assert!(
+        db.search_lexical_hits("you’re", &scope, 100)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn hydration_rejects_count_and_byte_overflow_before_returning_rows() {
     let (_dir, db, namespace) = sqlite_fixture();
     let memory_ref = save(&db, episodic(namespace.id, 1, &"large".repeat(64)));
