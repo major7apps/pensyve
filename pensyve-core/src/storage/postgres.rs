@@ -905,14 +905,12 @@ const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH candidates AS (
 ), ranked AS (
     SELECT memory_type, memory_id,
            CASE
-             WHEN vector_dims(embedding) = vector_dims($1::vector)
-              AND vector_norm(embedding) > 0
-             THEN embedding <=> $1::vector
-             ELSE NULL
+             WHEN vector_dims(embedding) <> vector_dims($1::vector) THEN NULL
+             WHEN vector_norm(embedding) = 0 THEN 1.0
+             ELSE embedding <=> $1::vector
            END AS distance,
            bool_or(
                vector_dims(embedding) <> vector_dims($1::vector)
-               OR vector_norm(embedding) <= 0
            ) OVER () AS invalid_stored_vector
     FROM candidates
 )
@@ -935,10 +933,29 @@ fn sqlx_to_io(e: sqlx_core::error::Error) -> super::StorageError {
     super::StorageError::Io(std::io::Error::other(e.to_string()))
 }
 
-fn remaining_statement_timeout_ms(deadline: std::time::Instant) -> Option<u64> {
-    let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
-    let millis = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
-    (millis > 0).then(|| millis.min(i32::MAX as u64))
+#[derive(Clone, Copy)]
+struct StatementTimeoutBudget {
+    deadline: std::time::Instant,
+}
+
+impl StatementTimeoutBudget {
+    fn new(deadline: std::time::Instant) -> Self {
+        Self { deadline }
+    }
+
+    fn remaining_ms(self) -> Option<u64> {
+        self.remaining_ms_at(std::time::Instant::now())
+    }
+
+    fn remaining_ms_at(self, now: std::time::Instant) -> Option<u64> {
+        let remaining = self.deadline.checked_duration_since(now)?;
+        let millis = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+        (millis > 0).then(|| millis.min(i32::MAX as u64))
+    }
+}
+
+fn statement_timeout_value(timeout_ms: u64) -> String {
+    format!("{timeout_ms}ms")
 }
 
 fn postgres_vector_error_reason(code: Option<&str>, message: &str) -> Option<SearchUnavailable> {
@@ -1415,7 +1432,8 @@ impl StorageTrait for PostgresBackend {
                 request.k
             )));
         }
-        if remaining_statement_timeout_ms(request.deadline).is_none() {
+        let timeout_budget = StatementTimeoutBudget::new(request.deadline);
+        if timeout_budget.remaining_ms().is_none() {
             return Ok(VectorSearchOutcome::Unavailable(
                 SearchUnavailable::DeadlineExceeded,
             ));
@@ -1424,16 +1442,22 @@ impl StorageTrait for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(request.scope.namespace_id).await?;
             let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
-            let Some(timeout_ms) = remaining_statement_timeout_ms(request.deadline) else {
+            let Some(timeout_ms) = timeout_budget.remaining_ms() else {
                 return Ok(VectorSearchOutcome::Unavailable(
                     SearchUnavailable::DeadlineExceeded,
                 ));
             };
-            query::<Postgres>("SELECT set_config('statement_timeout', $1, true)")
-                .bind(format!("{timeout_ms}ms"))
-                .execute(&mut *transaction)
-                .await
-                .map_err(sqlx_to_io)?;
+            if let Err(error) =
+                query::<Postgres>("SELECT set_config('statement_timeout', $1, true)")
+                    .bind(statement_timeout_value(timeout_ms))
+                    .execute(&mut *transaction)
+                    .await
+            {
+                if let Some(reason) = vector_error_reason(&error) {
+                    return Ok(VectorSearchOutcome::Unavailable(reason));
+                }
+                return Err(sqlx_to_io(error));
+            }
 
             let expected_dimension = match query_as::<Postgres, (i32,)>(
                 "SELECT dimension FROM embedding_spaces WHERE id = $1",
@@ -1471,7 +1495,7 @@ impl StorageTrait for PostgresBackend {
                 )));
             }
             if request.query_embedding.iter().all(|value| *value == 0.0) {
-                if remaining_statement_timeout_ms(request.deadline).is_none() {
+                if timeout_budget.remaining_ms().is_none() {
                     return Ok(VectorSearchOutcome::Unavailable(
                         SearchUnavailable::DeadlineExceeded,
                     ));
@@ -1482,6 +1506,22 @@ impl StorageTrait for PostgresBackend {
 
             let query_embedding = embedding_to_pgtext(request.query_embedding)
                 .expect("a dimension-validated query embedding is non-empty");
+            let Some(timeout_ms) = timeout_budget.remaining_ms() else {
+                return Ok(VectorSearchOutcome::Unavailable(
+                    SearchUnavailable::DeadlineExceeded,
+                ));
+            };
+            if let Err(error) =
+                query::<Postgres>("SELECT set_config('statement_timeout', $1, true)")
+                    .bind(statement_timeout_value(timeout_ms))
+                    .execute(&mut *transaction)
+                    .await
+            {
+                if let Some(reason) = vector_error_reason(&error) {
+                    return Ok(VectorSearchOutcome::Unavailable(reason));
+                }
+                return Err(sqlx_to_io(error));
+            }
             let rows: Vec<(i16, Uuid, Option<f64>, bool)> =
                 match query_as::<Postgres, _>(POSTGRES_VECTOR_SEARCH_SQL)
                     .bind(query_embedding)
@@ -1535,7 +1575,7 @@ impl StorageTrait for PostgresBackend {
                     score,
                 });
             }
-            if remaining_statement_timeout_ms(request.deadline).is_none() {
+            if timeout_budget.remaining_ms().is_none() {
                 return Ok(VectorSearchOutcome::Unavailable(
                     SearchUnavailable::DeadlineExceeded,
                 ));
@@ -3827,15 +3867,34 @@ mod tests {
     }
 
     #[test]
+    fn exact_pgvector_stored_zero_norm_is_neutral_not_invalid() {
+        assert!(
+            POSTGRES_VECTOR_SEARCH_SQL.contains("WHEN vector_norm(embedding) = 0 THEN 1.0"),
+            "a stored zero vector must produce cosine distance 1.0 / score 0.0"
+        );
+        let invalid_flag = POSTGRES_VECTOR_SEARCH_SQL
+            .split_once("bool_or(")
+            .and_then(|(_, rest)| rest.split_once(") OVER ()"))
+            .map(|(flag, _)| flag)
+            .expect("query must expose one global invalid-vector flag");
+        assert!(invalid_flag.contains("vector_dims(embedding) <> vector_dims($1::vector)"));
+        assert!(
+            !invalid_flag.contains("vector_norm"),
+            "zero norm is valid and must not poison the whole result"
+        );
+    }
+
+    #[test]
     fn exact_pgvector_timeout_is_positive_bounded_and_query_cancel_maps_to_deadline() {
         let expired = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_millis(1))
             .unwrap();
-        assert_eq!(remaining_statement_timeout_ms(expired), None);
+        assert_eq!(StatementTimeoutBudget::new(expired).remaining_ms(), None);
 
         let one_second = std::time::Instant::now() + std::time::Duration::from_secs(1);
         assert!(
-            remaining_statement_timeout_ms(one_second)
+            StatementTimeoutBudget::new(one_second)
+                .remaining_ms()
                 .is_some_and(|timeout_ms| (1..=1_000).contains(&timeout_ms))
         );
 
@@ -3851,6 +3910,27 @@ mod tests {
             postgres_vector_error_reason(Some("08006"), "connection failure"),
             None
         );
+    }
+
+    #[test]
+    fn exact_pgvector_timeout_budget_recomputes_after_registry_lookup_work() {
+        let start = std::time::Instant::now();
+        let deadline = start
+            .checked_add(std::time::Duration::from_millis(100))
+            .unwrap();
+        let budget = StatementTimeoutBudget::new(deadline);
+
+        assert_eq!(budget.remaining_ms_at(start), Some(100));
+        assert_eq!(
+            budget.remaining_ms_at(
+                start
+                    .checked_add(std::time::Duration::from_millis(40))
+                    .unwrap()
+            ),
+            Some(60),
+            "ranking must receive the post-lookup remainder, not the initial 100 ms"
+        );
+        assert_eq!(budget.remaining_ms_at(deadline), None);
     }
 
     #[test]

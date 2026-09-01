@@ -103,6 +103,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
+use sqlx_core::acquire::Acquire;
 use sqlx_core::query::query;
 use sqlx_core::query_as::query_as;
 use sqlx_core::raw_sql::raw_sql;
@@ -4494,6 +4495,10 @@ fn exact_pgvector_matches_sqlite_oracle_with_scope_ties_and_cross_type_ids() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one live fixture compares zero-vector parity before checking every query-validation exit"
+)]
 fn exact_pgvector_validates_query_space_deadline_and_stored_zero_norm() {
     let Some(admin_opts) =
         skip_notice("exact_pgvector_validates_query_space_deadline_and_stored_zero_norm")
@@ -4502,26 +4507,28 @@ fn exact_pgvector_validates_query_space_deadline_and_stored_zero_norm() {
     };
     let fixture = Fixture::provision(&admin_opts);
     let backend = &fixture.backend;
+    let sqlite_dir = tempfile::tempdir().expect("sqlite zero-vector parity tempdir");
+    let sqlite = crate::storage::sqlite::SqliteBackend::open(sqlite_dir.path())
+        .expect("open sqlite zero-vector parity oracle");
     let namespace = Namespace::new(format!("exact-validation-{}", Uuid::new_v4().simple()));
     backend.save_namespace(&namespace).unwrap();
+    sqlite.save_namespace(&namespace).unwrap();
     register_embedding_space(&fixture, "validation-space", "real", 2);
+    register_sqlite_embedding_space(sqlite_dir.path(), "validation-space", 2);
     let memory = Memory::Episodic(EpisodicMemory::new(
         namespace.id,
         Uuid::new_v4(),
         Uuid::new_v4(),
         Uuid::new_v4(),
-        "invalid stored zero vector",
+        "valid stored zero vector",
     ));
-    backend
-        .save_memory_with_embedding(
-            &memory,
-            Some(&embedding_record(
-                &memory,
-                "validation-space",
-                vec![0.0, 0.0],
-            )),
-        )
-        .unwrap();
+    save_exact_vector(
+        backend,
+        &sqlite,
+        &memory,
+        "validation-space",
+        vec![0.0, 0.0],
+    );
     let scope = SearchScope::namespace(namespace.id);
     let finite = [1.0, 0.0];
     let request = VectorSearchRequest::new(
@@ -4532,10 +4539,14 @@ fn exact_pgvector_validates_query_space_deadline_and_stored_zero_norm() {
         Instant::now() + Duration::from_secs(5),
     )
     .unwrap();
-    assert_eq!(
-        backend.search_vector(&request).unwrap(),
-        VectorSearchOutcome::Unavailable(SearchUnavailable::InvalidStoredVector)
-    );
+    let postgres_zero_stored = backend.search_vector(&request).unwrap();
+    let sqlite_zero_stored = sqlite.search_vector(&request).unwrap();
+    assert_eq!(postgres_zero_stored, sqlite_zero_stored);
+    assert!(matches!(
+        postgres_zero_stored,
+        VectorSearchOutcome::Complete(ref hits)
+            if hits.len() == 1 && hits[0].score == 0.0
+    ));
 
     let zero = [0.0, 0.0];
     let zero_request = VectorSearchRequest::new(
@@ -4548,7 +4559,7 @@ fn exact_pgvector_validates_query_space_deadline_and_stored_zero_norm() {
     .unwrap();
     assert_eq!(
         backend.search_vector(&zero_request).unwrap(),
-        VectorSearchOutcome::Complete(Vec::new())
+        sqlite.search_vector(&zero_request).unwrap()
     );
 
     let missing_request = VectorSearchRequest::new(
@@ -4678,6 +4689,76 @@ fn sum_plan_metric(value: &serde_json::Value, key: &str) -> u64 {
     }
 }
 
+const REPRESENTATIVE_EXACT_PLAN_CANDIDATES: i64 = 18_076;
+
+fn seed_representative_exact_plan(fixture: &Fixture, namespace_id: Uuid, embedding_space_id: &str) {
+    fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace_id).await.unwrap();
+        let mut transaction = (&mut *conn).begin().await.unwrap();
+        query::<Postgres>(
+            r"INSERT INTO episodic_memories
+               (id, namespace_id, episode_id, source_entity, about_entity, content)
+               SELECT md5('plan-episodic-' || candidate)::uuid, $1,
+                      md5('plan-episode-' || candidate)::uuid,
+                      md5('plan-source-' || candidate)::uuid,
+                      md5('plan-about-' || candidate)::uuid,
+                      'representative episodic ' || candidate
+               FROM generate_series(1, $2::integer) AS candidate",
+        )
+        .bind(namespace_id)
+        .bind(6_026_i32)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        query::<Postgres>(
+            r"INSERT INTO semantic_memories
+               (id, namespace_id, subject, predicate, object, confidence)
+               SELECT md5('plan-semantic-' || candidate)::uuid, $1,
+                      md5('plan-subject-' || candidate)::uuid,
+                      'representative', 'semantic ' || candidate, 1.0
+               FROM generate_series(1, $2::integer) AS candidate",
+        )
+        .bind(namespace_id)
+        .bind(6_025_i32)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        query::<Postgres>(
+            r"INSERT INTO procedural_memories
+               (id, namespace_id, trigger_text, action, outcome)
+               SELECT md5('plan-procedural-' || candidate)::uuid, $1,
+                      'representative ' || candidate, 'procedural action', 'Success'
+               FROM generate_series(1, $2::integer) AS candidate",
+        )
+        .bind(namespace_id)
+        .bind(6_025_i32)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        query::<Postgres>(
+            r"INSERT INTO memory_embeddings
+               (namespace_id, memory_type, memory_id, embedding_space_id,
+                source_sha256, embedding, created_at)
+               SELECT $1, source.memory_type, source.memory_id, $2,
+                      repeat('a', 64), '[1,0]'::vector, NOW()
+               FROM (
+                   SELECT 'episodic'::text AS memory_type, id AS memory_id
+                   FROM episodic_memories WHERE namespace_id = $1
+                   UNION ALL
+                   SELECT 'semantic', id FROM semantic_memories WHERE namespace_id = $1
+                   UNION ALL
+                   SELECT 'procedural', id FROM procedural_memories WHERE namespace_id = $1
+               ) AS source",
+        )
+        .bind(namespace_id)
+        .bind(embedding_space_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+    });
+}
+
 #[test]
 fn exact_pgvector_explain_is_bounded_scoped_and_does_not_spill() {
     let Some(admin_opts) =
@@ -4690,19 +4771,21 @@ fn exact_pgvector_explain_is_bounded_scoped_and_does_not_spill() {
     let namespace = Namespace::new(format!("exact-plan-{}", Uuid::new_v4().simple()));
     backend.save_namespace(&namespace).unwrap();
     register_embedding_space(&fixture, "plan-space", "real", 2);
-    let memory = Memory::Episodic(EpisodicMemory::new(
-        namespace.id,
-        Uuid::new_v4(),
-        Uuid::new_v4(),
-        Uuid::new_v4(),
-        "representative exact plan",
-    ));
-    backend
-        .save_memory_with_embedding(
-            &memory,
-            Some(&embedding_record(&memory, "plan-space", vec![1.0, 0.0])),
+    seed_representative_exact_plan(&fixture, namespace.id, "plan-space");
+    let candidate_count: i64 = fixture.rt.block_on(async {
+        let mut conn = backend.scoped_conn(namespace.id).await.unwrap();
+        query_as::<Postgres, (i64,)>(
+            "SELECT COUNT(*) FROM memory_embeddings
+             WHERE namespace_id = $1 AND embedding_space_id = $2",
         )
-        .unwrap();
+        .bind(namespace.id)
+        .bind("plan-space")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+        .0
+    });
+    assert_eq!(candidate_count, REPRESENTATIVE_EXACT_PLAN_CANDIDATES);
 
     let explain_sql =
         format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {POSTGRES_VECTOR_SEARCH_SQL}");
@@ -4722,11 +4805,27 @@ fn exact_pgvector_explain_is_bounded_scoped_and_does_not_spill() {
             .0
     });
     let rendered = plan.to_string();
-    assert!(rendered.contains("namespace_id"));
-    assert!(rendered.contains("embedding_space_id"));
+    for relation in [
+        "episodic_memories",
+        "semantic_memories",
+        "procedural_memories",
+    ] {
+        assert!(rendered.contains(relation), "plan omitted {relation}");
+    }
+    assert!(
+        rendered.contains("Append"),
+        "UNION ALL branches were not preserved"
+    );
+    assert!(
+        rendered.contains("WindowAgg"),
+        "global validation window was not planned"
+    );
+    assert!(rendered.matches("namespace_id").count() >= 3);
+    assert!(rendered.matches("embedding_space_id").count() >= 3);
     assert!(plan[0]["Plan"]["Actual Rows"].as_u64().unwrap_or(101) <= 100);
     assert_eq!(sum_plan_metric(&plan, "Temp Read Blocks"), 0);
     assert_eq!(sum_plan_metric(&plan, "Temp Written Blocks"), 0);
+    assert!(!rendered.contains("\"Sort Space Type\":\"Disk\""));
     eprintln!(
         "exact pgvector representative execution time: {:?} ms",
         plan[0]["Execution Time"]
