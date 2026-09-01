@@ -11,6 +11,10 @@ pub const MAX_VECTOR_HITS: usize = 100;
 pub const MAX_LEXICAL_HITS: usize = 100;
 pub const MAX_FUSED_HITS: usize = 200;
 pub const MAX_HYDRATED_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum JSON bytes in one streamed snapshot frame.
+pub const SNAPSHOT_MAX_FRAME_BYTES: usize = MAX_HYDRATED_BYTES;
+/// Maximum aggregate JSON bytes in one streamed snapshot row page.
+pub const SNAPSHOT_MAX_PAGE_BYTES: usize = MAX_HYDRATED_BYTES;
 pub const SQLITE_MAX_SCANNED_VECTORS: usize = 50_000;
 pub const MEMORY_PAGE_SIZE: usize = 256;
 pub const CONSOLIDATION_COMPARISON_PAGE_SIZE: usize = 64;

@@ -54,7 +54,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -62,7 +62,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::embedding_space::EmbeddingSpaceId;
-use crate::storage::bounded::{EmbeddingRecord, MemoryRef, MemoryType};
+use crate::storage::bounded::{
+    EmbeddingRecord, MEMORY_PAGE_SIZE, MemoryRef, MemoryType, SNAPSHOT_MAX_FRAME_BYTES,
+    SNAPSHOT_MAX_PAGE_BYTES,
+};
 use crate::storage::{
     CapturedMemory, StorageError, StorageResult, StorageTrait, canonical_embedding_source_sha256,
     validate_record_matches_memory,
@@ -428,6 +431,12 @@ impl SnapshotStreamWriter {
     }
 
     fn write_hashed_frame(&mut self, bytes: &[u8]) -> StorageResult<()> {
+        if bytes.len() > SNAPSHOT_MAX_FRAME_BYTES {
+            return Err(StorageError::BudgetExceeded(format!(
+                "snapshot frame contains {} serialized bytes; maximum is {SNAPSHOT_MAX_FRAME_BYTES}",
+                bytes.len()
+            )));
+        }
         let file = self
             .file
             .as_mut()
@@ -440,11 +449,11 @@ impl SnapshotStreamWriter {
     }
 
     fn write_page(&mut self, page: &[CapturedMemory]) -> StorageResult<()> {
-        if page.len() > crate::storage::bounded::MEMORY_PAGE_SIZE {
+        if page.len() > MEMORY_PAGE_SIZE {
             return Err(StorageError::BudgetExceeded(format!(
                 "snapshot page contains {} rows; maximum is {}",
                 page.len(),
-                crate::storage::bounded::MEMORY_PAGE_SIZE
+                MEMORY_PAGE_SIZE
             )));
         }
         if !page.is_empty() && self.file.is_none() {
@@ -462,6 +471,7 @@ impl SnapshotStreamWriter {
             let header = serde_json::to_vec(&self.header)?;
             self.write_hashed_frame(&header)?;
         }
+        let mut page_bytes = 0_usize;
         for captured in page {
             if memory_namespace(&captured.memory) != self.header.namespace_id {
                 return Err(StorageError::Context(format!(
@@ -490,6 +500,14 @@ impl SnapshotStreamWriter {
                 embedding_records: captured.embeddings.clone(),
             };
             let bytes = serde_json::to_vec(&entry)?;
+            page_bytes = page_bytes.checked_add(bytes.len()).ok_or_else(|| {
+                StorageError::BudgetExceeded("snapshot page byte count overflow".into())
+            })?;
+            if page_bytes > SNAPSHOT_MAX_PAGE_BYTES {
+                return Err(StorageError::BudgetExceeded(format!(
+                    "snapshot page contains {page_bytes} serialized bytes; maximum is {SNAPSHOT_MAX_PAGE_BYTES}"
+                )));
+            }
             self.write_hashed_frame(&bytes)?;
             self.last_ref = Some(memory_ref);
             self.embedding_records += entry.embedding_records.len();
@@ -910,16 +928,36 @@ fn prune_namespace_dir_with(
 /// per namespace) instead. Nothing ships that shape today, so nothing here
 /// builds one.
 ///
-/// The registry keeps one small entry per namespace that has ever run a forget
-/// and never drops one: that is bounded by the tenant count, and dropping
-/// entries would need reference counting to avoid handing out a lock another
-/// thread is about to acquire.
+/// The registry holds weak references, so tenant churn cannot retain historical
+/// namespace metadata after the final forget lease is dropped. Upgrade or
+/// replacement happens while the registry lock is held, preserving one live
+/// mutex per namespace.
 fn namespace_lock(namespace_id: Uuid) -> Arc<Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = namespace_lock_registry()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&namespace_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(namespace_id, Arc::downgrade(&lock));
+    lock
+}
 
-    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks.lock().unwrap_or_else(PoisonError::into_inner);
-    Arc::clone(locks.entry(namespace_id).or_default())
+fn namespace_lock_registry() -> &'static Mutex<HashMap<Uuid, Weak<Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<Uuid, Weak<Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn namespace_lock_registry_ids() -> Vec<Uuid> {
+    namespace_lock_registry()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .keys()
+        .copied()
+        .collect()
 }
 
 /// Per-namespace snapshot directory. Keeps one gateway tenant's memory dumps
@@ -1138,23 +1176,35 @@ fn restore_opened_file_with(
     let manifest = validate_stream_reader(file)?;
     after_validation();
     file.rewind()?;
-    let mut page = Vec::with_capacity(crate::storage::bounded::MEMORY_PAGE_SIZE);
+    let mut page = Vec::with_capacity(MEMORY_PAGE_SIZE);
+    let mut page_bytes = 0_usize;
     let mut outcome = RestoreOutcome::default();
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        let value: serde_json::Value = serde_json::from_str(&line)?;
+    let mut reader = BufReader::new(file);
+    let mut bytes = Vec::new();
+    while read_bounded_snapshot_frame(&mut reader, &mut bytes)? {
+        let frame_bytes = &bytes[..bytes.len() - 1];
+        let value: serde_json::Value = serde_json::from_slice(frame_bytes)?;
         match value.get("kind").and_then(serde_json::Value::as_str) {
             Some("header" | "footer") => {}
             Some("entry") => {
+                page_bytes = page_bytes.checked_add(frame_bytes.len()).ok_or_else(|| {
+                    StorageError::BudgetExceeded("snapshot restore page byte count overflow".into())
+                })?;
+                if page_bytes > SNAPSHOT_MAX_PAGE_BYTES {
+                    return Err(StorageError::BudgetExceeded(format!(
+                        "snapshot restore page contains {page_bytes} serialized bytes; maximum is {SNAPSHOT_MAX_PAGE_BYTES}"
+                    )));
+                }
                 let entry: SnapshotStreamEntry = serde_json::from_value(value)?;
                 page.push(CapturedMemory {
                     memory: entry.memory,
                     embeddings: entry.embedding_records,
                 });
-                if page.len() == crate::storage::bounded::MEMORY_PAGE_SIZE {
+                if page.len() == MEMORY_PAGE_SIZE {
                     storage.restore_memory_page(&page)?;
                     outcome.restored += page.len();
                     page.clear();
+                    page_bytes = 0;
                 }
             }
             _ => {
@@ -1194,9 +1244,10 @@ fn for_each_memory_id_in_opened_file_with(
     validate_stream_reader(file)?;
     after_validation();
     file.rewind()?;
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        let value: serde_json::Value = serde_json::from_str(&line)?;
+    let mut reader = BufReader::new(file);
+    let mut bytes = Vec::new();
+    while read_bounded_snapshot_frame(&mut reader, &mut bytes)? {
+        let value: serde_json::Value = serde_json::from_slice(&bytes[..bytes.len() - 1])?;
         if value.get("kind").and_then(serde_json::Value::as_str) == Some("entry") {
             let entry: SnapshotStreamEntry = serde_json::from_value(value)?;
             visit(entry.memory.id())?;
@@ -1225,16 +1276,9 @@ fn validate_stream_reader(file: &mut std::fs::File) -> StorageResult<SnapshotMan
     let mut counts = SnapshotCounts::default();
     let mut embedding_records = 0_usize;
     let mut last_ref: Option<MemoryRef> = None;
-    loop {
-        bytes.clear();
-        if reader.read_until(b'\n', &mut bytes)? == 0 {
-            break;
-        }
-        if bytes.last() != Some(&b'\n') {
-            return Err(StorageError::Context(
-                "truncated streamed snapshot frame".into(),
-            ));
-        }
+    let mut page_rows = 0_usize;
+    let mut page_bytes = 0_usize;
+    while read_bounded_snapshot_frame(&mut reader, &mut bytes)? {
         let frame_bytes = &bytes[..bytes.len() - 1];
         let value: serde_json::Value = serde_json::from_slice(frame_bytes)?;
         let kind = value
@@ -1267,6 +1311,16 @@ fn validate_stream_reader(file: &mut std::fs::File) -> StorageResult<SnapshotMan
                         "snapshot entry follows footer".into(),
                     ));
                 }
+                page_bytes = page_bytes.checked_add(frame_bytes.len()).ok_or_else(|| {
+                    StorageError::BudgetExceeded(
+                        "snapshot validation page byte count overflow".into(),
+                    )
+                })?;
+                if page_bytes > SNAPSHOT_MAX_PAGE_BYTES {
+                    return Err(StorageError::BudgetExceeded(format!(
+                        "snapshot validation page contains {page_bytes} serialized bytes; maximum is {SNAPSHOT_MAX_PAGE_BYTES}"
+                    )));
+                }
                 let entry: SnapshotStreamEntry = serde_json::from_value(value)?;
                 if memory_namespace(&entry.memory) != header.namespace_id {
                     return Err(StorageError::Context(
@@ -1292,6 +1346,11 @@ fn validate_stream_reader(file: &mut std::fs::File) -> StorageResult<SnapshotMan
                 increment_counts(&mut counts, &entry.memory);
                 last_ref = Some(memory_ref);
                 digest.update(&bytes);
+                page_rows += 1;
+                if page_rows == MEMORY_PAGE_SIZE {
+                    page_rows = 0;
+                    page_bytes = 0;
+                }
             }
             "footer" => {
                 if header.is_none() || footer.is_some() {
@@ -1331,6 +1390,46 @@ fn validate_stream_reader(file: &mut std::fs::File) -> StorageResult<SnapshotMan
         embedding_records,
         stream_sha256: actual_sha256,
     })
+}
+
+fn read_bounded_snapshot_frame(
+    reader: &mut impl BufRead,
+    bytes: &mut Vec<u8>,
+) -> StorageResult<bool> {
+    bytes.clear();
+    loop {
+        let (take, complete) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                if bytes.is_empty() {
+                    return Ok(false);
+                }
+                return Err(StorageError::Context(
+                    "truncated streamed snapshot frame".into(),
+                ));
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let take = newline.map_or(available.len(), |index| index + 1);
+            let serialized_bytes = bytes
+                .len()
+                .checked_add(take)
+                .and_then(|total| total.checked_sub(usize::from(newline.is_some())))
+                .ok_or_else(|| {
+                    StorageError::BudgetExceeded("snapshot frame byte count overflow".into())
+                })?;
+            if serialized_bytes > SNAPSHOT_MAX_FRAME_BYTES {
+                return Err(StorageError::BudgetExceeded(format!(
+                    "snapshot frame exceeds {SNAPSHOT_MAX_FRAME_BYTES} serialized bytes"
+                )));
+            }
+            bytes.extend_from_slice(&available[..take]);
+            (take, newline.is_some())
+        };
+        reader.consume(take);
+        if complete {
+            return Ok(true);
+        }
+    }
 }
 
 /// Timestamp format inside a snapshot file name: safe on every filesystem (no
@@ -1445,6 +1544,55 @@ mod tests {
             memories,
             embedding_records: Vec::new(),
         }
+    }
+
+    fn write_stream_archive(f: &Fixture, mut memories: Vec<Memory>, name: &str) -> PathBuf {
+        memories.sort_by_key(MemoryRef::from_memory);
+        let header = SnapshotStreamHeader {
+            kind: "header".into(),
+            format_version: STREAM_FORMAT_VERSION,
+            snapshot_id: Uuid::new_v4(),
+            entity_id: f.entity.id,
+            entity_name: Some(f.entity.name.clone()),
+            namespace_id: f.namespace.id,
+            captured_at: Utc::now(),
+            owner_only: OWNER_ONLY_SUPPORTED,
+        };
+        let mut frames = vec![serde_json::to_vec(&header).unwrap()];
+        let mut counts = SnapshotCounts::default();
+        for memory in memories {
+            increment_counts(&mut counts, &memory);
+            frames.push(
+                serde_json::to_vec(&SnapshotStreamEntry {
+                    kind: "entry".into(),
+                    source_sha256: canonical_embedding_source_sha256(&memory),
+                    memory,
+                    embedding_records: Vec::new(),
+                })
+                .unwrap(),
+            );
+        }
+        let mut digest = Sha256::new();
+        for frame in &frames {
+            digest.update(frame);
+            digest.update(b"\n");
+        }
+        frames.push(
+            serde_json::to_vec(&SnapshotStreamFooter {
+                kind: "footer".into(),
+                counts,
+                embedding_records: 0,
+                stream_sha256: hex::encode(digest.finalize()),
+            })
+            .unwrap(),
+        );
+        let path = f.dir.path().join(name);
+        let mut file = std::fs::File::create(&path).unwrap();
+        for frame in frames {
+            file.write_all(&frame).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        path
     }
 
     fn seed_one_of_each(f: &Fixture) {
@@ -1944,6 +2092,26 @@ mod tests {
                 .expect("the forget must complete once the lock is released");
             assert!(outcome.path.expect("a snapshot was written").exists());
         });
+    }
+
+    #[test]
+    fn namespace_lock_registry_drops_historical_tenants() {
+        let historical = (0..2_048)
+            .map(|_| {
+                let namespace_id = Uuid::new_v4();
+                drop(namespace_lock(namespace_id));
+                namespace_id
+            })
+            .collect::<Vec<_>>();
+        let live_namespace = Uuid::new_v4();
+        let _live = namespace_lock(live_namespace);
+
+        let retained = namespace_lock_registry_ids();
+        assert!(retained.contains(&live_namespace));
+        assert!(
+            historical.iter().all(|id| !retained.contains(id)),
+            "dropped namespace leases must not remain in the process registry"
+        );
     }
 
     /// Concurrent forgets in one namespace all succeed, evict only what the cap
@@ -2470,6 +2638,114 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "validation must finish before the first restore-page commit"
+        );
+    }
+
+    #[test]
+    fn snapshot_writer_rejects_an_oversized_serialized_frame() {
+        let f = fixture();
+        let memory = Memory::Semantic(SemanticMemory::new(
+            f.namespace.id,
+            f.entity.id,
+            "predicate",
+            "x".repeat(crate::storage::bounded::MAX_HYDRATED_BYTES),
+            1.0,
+        ));
+        let header = SnapshotStreamHeader {
+            kind: "header".into(),
+            format_version: STREAM_FORMAT_VERSION,
+            snapshot_id: Uuid::new_v4(),
+            entity_id: f.entity.id,
+            entity_name: None,
+            namespace_id: f.namespace.id,
+            captured_at: Utc::now(),
+            owner_only: OWNER_ONLY_SUPPORTED,
+        };
+        let mut writer = SnapshotStreamWriter::new(f.dir.path(), header);
+
+        let error = writer
+            .write_page(&[CapturedMemory {
+                memory,
+                embeddings: Vec::new(),
+            }])
+            .unwrap_err();
+
+        assert!(matches!(error, StorageError::BudgetExceeded(_)));
+    }
+
+    #[test]
+    fn restore_rejects_an_oversized_valid_frame_without_mutation() {
+        let f = fixture();
+        let memory = Memory::Semantic(SemanticMemory::new(
+            f.namespace.id,
+            f.entity.id,
+            "predicate",
+            "x".repeat(crate::storage::bounded::MAX_HYDRATED_BYTES),
+            1.0,
+        ));
+        let path = write_stream_archive(&f, vec![memory], "oversized-valid.json");
+
+        let error = restore_file(&f.storage, &path).unwrap_err();
+
+        assert!(matches!(error, StorageError::BudgetExceeded(_)));
+        assert!(
+            f.storage
+                .get_all_memories_by_namespace(f.namespace.id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn restore_rejects_a_page_over_the_serialized_byte_budget_without_mutation() {
+        let f = fixture();
+        let content = "x".repeat(crate::storage::bounded::MAX_HYDRATED_BYTES / 2);
+        let memories = vec![
+            Memory::Semantic(SemanticMemory::new(
+                f.namespace.id,
+                f.entity.id,
+                "predicate-a",
+                &content,
+                1.0,
+            )),
+            Memory::Semantic(SemanticMemory::new(
+                f.namespace.id,
+                f.entity.id,
+                "predicate-b",
+                &content,
+                1.0,
+            )),
+        ];
+        let path = write_stream_archive(&f, memories, "oversized-page.json");
+
+        let error = restore_file(&f.storage, &path).unwrap_err();
+
+        assert!(matches!(error, StorageError::BudgetExceeded(_)));
+        assert!(
+            f.storage
+                .get_all_memories_by_namespace(f.namespace.id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn restore_stops_reading_an_oversized_malformed_frame_without_mutation() {
+        let f = fixture();
+        let path = f.dir.path().join("oversized-malformed.json");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&vec![b'['; crate::storage::bounded::MAX_HYDRATED_BYTES + 1])
+            .unwrap();
+        file.write_all(b"\n").unwrap();
+
+        let error = restore_file(&f.storage, &path).unwrap_err();
+
+        assert!(matches!(error, StorageError::BudgetExceeded(_)));
+        assert!(
+            f.storage
+                .get_all_memories_by_namespace(f.namespace.id)
+                .unwrap()
+                .is_empty()
         );
     }
 

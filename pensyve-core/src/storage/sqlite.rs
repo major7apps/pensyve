@@ -32,8 +32,9 @@ use crate::storage::bounded::{
     EmbeddingRecord, LexicalHit, MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS,
     MAX_VECTOR_HITS, MEMORY_PAGE_SIZE, MemoryFilter, MemoryPage, MemoryPageRequest, MemoryRef,
     MemoryType, NamespaceEmbeddingPhase, NamespaceEmbeddingState, PageCursor,
-    SQLITE_MAX_SCANNED_VECTORS, SearchScope, SearchUnavailable, VectorHit, VectorSearchOutcome,
-    VectorSearchRequest, lexical_query_tokens, sort_vector_hits,
+    SNAPSHOT_MAX_FRAME_BYTES, SNAPSHOT_MAX_PAGE_BYTES, SQLITE_MAX_SCANNED_VECTORS, SearchScope,
+    SearchUnavailable, VectorHit, VectorSearchOutcome, VectorSearchRequest, lexical_query_tokens,
+    sort_vector_hits,
 };
 use crate::storage::consolidation_workspace::{
     ClusterDecision, ClusterProvenance, ConsolidationWorkspace, DecayPage, DecayRecord,
@@ -1529,6 +1530,54 @@ fn take_embedding_records_in_conn(
     Ok(records)
 }
 
+fn capture_payload_bytes_in_conn(
+    conn: &Connection,
+    namespace_id: Uuid,
+    memory_ref: MemoryRef,
+) -> StorageResult<usize> {
+    let source_sql = match memory_ref.memory_type {
+        MemoryType::Episodic => {
+            "SELECT LENGTH(content) + COALESCE(LENGTH(summary), 0)
+                    + COALESCE(LENGTH(embedding), 0)
+             FROM episodic_memories WHERE namespace_id = ?1 AND id = ?2"
+        }
+        MemoryType::Semantic => {
+            "SELECT LENGTH(predicate) + LENGTH(object)
+                    + COALESCE(LENGTH(embedding), 0)
+             FROM semantic_memories WHERE namespace_id = ?1 AND id = ?2"
+        }
+        MemoryType::Procedural | MemoryType::Observation => {
+            return Err(StorageError::Context(
+                "entity snapshot selected a non-entity memory type".into(),
+            ));
+        }
+    };
+    let source_bytes: i64 = conn.query_row(
+        source_sql,
+        params![namespace_id.to_string(), memory_ref.id.to_string()],
+        |row| row.get(0),
+    )?;
+    let generation_bytes: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(LENGTH(embedding) + LENGTH(embedding_space_id)
+                + LENGTH(source_sha256)), 0)
+         FROM memory_embeddings
+         WHERE namespace_id = ?1 AND memory_type = ?2 AND memory_id = ?3",
+        params![
+            namespace_id.to_string(),
+            memory_type_str(memory_ref.memory_type),
+            memory_ref.id.to_string(),
+        ],
+        |row| row.get(0),
+    )?;
+    let source_bytes = usize::try_from(source_bytes)
+        .map_err(|_| StorageError::BudgetExceeded("negative snapshot source bytes".into()))?;
+    let generation_bytes = usize::try_from(generation_bytes)
+        .map_err(|_| StorageError::BudgetExceeded("negative snapshot generation bytes".into()))?;
+    source_bytes
+        .checked_add(generation_bytes)
+        .ok_or_else(|| StorageError::BudgetExceeded("snapshot source byte count overflow".into()))
+}
+
 fn capture_and_delete_entity_page_in_conn(
     conn: &Connection,
     entity_id: Uuid,
@@ -1567,6 +1616,25 @@ fn capture_and_delete_entity_page_in_conn(
         })
         .collect::<StorageResult<Vec<_>>>()?;
     drop(stmt);
+
+    let mut page_bytes = 0_usize;
+    for memory_ref in &refs {
+        let source_bytes = capture_payload_bytes_in_conn(conn, namespace_id, *memory_ref)?;
+        if source_bytes > SNAPSHOT_MAX_FRAME_BYTES {
+            return Err(StorageError::BudgetExceeded(format!(
+                "snapshot source {:?}/{} contains {source_bytes} payload bytes; maximum is {SNAPSHOT_MAX_FRAME_BYTES}",
+                memory_ref.memory_type, memory_ref.id
+            )));
+        }
+        page_bytes = page_bytes.checked_add(source_bytes).ok_or_else(|| {
+            StorageError::BudgetExceeded("snapshot page byte count overflow".into())
+        })?;
+        if page_bytes > SNAPSHOT_MAX_PAGE_BYTES {
+            return Err(StorageError::BudgetExceeded(format!(
+                "snapshot page contains {page_bytes} payload bytes; maximum is {SNAPSHOT_MAX_PAGE_BYTES}"
+            )));
+        }
+    }
 
     let mut captured = Vec::with_capacity(refs.len());
     for memory_ref in refs {
@@ -12136,6 +12204,108 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn bulk_entity_capture_rejects_large_content_before_delete() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let mut entity = Entity::new("large-capture", EntityKind::User);
+        entity.namespace_id = ns.id;
+        db.save_entity(&entity).unwrap();
+        let memory = SemanticMemory::new(
+            ns.id,
+            entity.id,
+            "predicate",
+            "x".repeat(MAX_HYDRATED_BYTES + 1),
+            1.0,
+        );
+        db.save_semantic(&memory).unwrap();
+
+        let error = db
+            .delete_memories_by_entity_paged(
+                entity.id,
+                ns.id,
+                MEMORY_PAGE_SIZE,
+                &mut |_| Ok(()),
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, StorageError::BudgetExceeded(_)));
+        assert!(
+            db.get_semantic_in_namespace(memory.id, ns.id)
+                .unwrap()
+                .is_some(),
+            "capture rejection must roll back the source delete"
+        );
+    }
+
+    #[test]
+    fn bulk_entity_capture_rejects_many_embedding_generations_before_delete() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let mut entity = Entity::new("generation-capture", EntityKind::User);
+        entity.namespace_id = ns.id;
+        db.save_entity(&entity).unwrap();
+        let memory = Memory::Semantic(SemanticMemory::new(
+            ns.id,
+            entity.id,
+            "predicate",
+            "small source",
+            1.0,
+        ));
+        db.save_memory_with_embedding(&memory, None).unwrap();
+        let generation_count = 1_025;
+        {
+            let mut conn = db.conn.lock().unwrap();
+            let transaction = conn.transaction().unwrap();
+            for index in 0..generation_count {
+                let space = format!("retained-{index:04}");
+                transaction
+                    .execute(
+                        "INSERT INTO embedding_spaces
+                         (id, canonical_identity_json, class, dimension, created_at)
+                         VALUES (?1, '{}', 'mock', 1024, ?2)",
+                        params![space, Utc::now().to_rfc3339()],
+                    )
+                    .unwrap();
+                transaction
+                    .execute(
+                        "INSERT INTO memory_embeddings
+                         (namespace_id, memory_type, memory_id, embedding_space_id,
+                          source_sha256, embedding, created_at)
+                         VALUES (?1, 'semantic', ?2, ?3, ?4, zeroblob(4096), ?5)",
+                        params![
+                            ns.id.to_string(),
+                            memory.id().to_string(),
+                            space,
+                            canonical_embedding_source_sha256(&memory),
+                            Utc::now().to_rfc3339(),
+                        ],
+                    )
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+
+        let error = db
+            .delete_memories_by_entity_paged(
+                entity.id,
+                ns.id,
+                MEMORY_PAGE_SIZE,
+                &mut |_| Ok(()),
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, StorageError::BudgetExceeded(_)));
+        assert!(
+            db.get_semantic_in_namespace(memory.id(), ns.id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(embedding_count(&db, ns.id), generation_count);
     }
 
     #[test]

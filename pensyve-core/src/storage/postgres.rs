@@ -38,8 +38,9 @@ use crate::graph::EdgeType;
 use crate::storage::bounded::{
     EmbeddingRecord, LexicalHit, MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS,
     MAX_VECTOR_HITS, MEMORY_PAGE_SIZE, MemoryFilter, MemoryPage, MemoryPageRequest, MemoryRef,
-    MemoryType, NamespaceEmbeddingPhase, NamespaceEmbeddingState, PageCursor, SearchScope,
-    SearchUnavailable, VectorHit, VectorSearchOutcome, VectorSearchRequest, lexical_query_tokens,
+    MemoryType, NamespaceEmbeddingPhase, NamespaceEmbeddingState, PageCursor,
+    SNAPSHOT_MAX_FRAME_BYTES, SNAPSHOT_MAX_PAGE_BYTES, SearchScope, SearchUnavailable, VectorHit,
+    VectorSearchOutcome, VectorSearchRequest, lexical_query_tokens,
 };
 use crate::storage::consolidation_workspace::{
     ClusterDecision, ClusterProvenance, ConsolidationWorkspace, DecayPage, DecayRecord,
@@ -1566,6 +1567,55 @@ async fn lock_typed_source_for_capture(
     memory_ref: MemoryRef,
 ) -> StorageResult<bool> {
     lock_typed_source(conn, namespace_id, memory_ref, SourceLockMode::Capture).await
+}
+
+async fn capture_payload_bytes_pg_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    namespace_id: Uuid,
+    memory_ref: MemoryRef,
+) -> StorageResult<usize> {
+    let source_sql = match memory_ref.memory_type {
+        MemoryType::Episodic => {
+            "SELECT (octet_length(content) + COALESCE(octet_length(summary), 0)
+                    + COALESCE(octet_length(embedding::text), 0))::bigint
+             FROM episodic_memories WHERE namespace_id = $1 AND id = $2"
+        }
+        MemoryType::Semantic => {
+            "SELECT (octet_length(predicate) + octet_length(object)
+                    + COALESCE(octet_length(embedding::text), 0))::bigint
+             FROM semantic_memories WHERE namespace_id = $1 AND id = $2"
+        }
+        MemoryType::Procedural | MemoryType::Observation => {
+            return Err(StorageError::Context(
+                "entity snapshot selected a non-entity memory type".into(),
+            ));
+        }
+    };
+    let (source_bytes,): (i64,) = query_as::<Postgres, _>(source_sql)
+        .bind(namespace_id)
+        .bind(memory_ref.id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(sqlx_to_io)?;
+    let (generation_bytes,): (i64,) = query_as::<Postgres, _>(
+        "SELECT COALESCE(SUM(octet_length(embedding::text)
+                + octet_length(embedding_space_id) + octet_length(source_sha256)), 0)::bigint
+         FROM memory_embeddings
+         WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3",
+    )
+    .bind(namespace_id)
+    .bind(memory_type_str(memory_ref.memory_type))
+    .bind(memory_ref.id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?;
+    let source_bytes = usize::try_from(source_bytes)
+        .map_err(|_| StorageError::BudgetExceeded("negative snapshot source bytes".into()))?;
+    let generation_bytes = usize::try_from(generation_bytes)
+        .map_err(|_| StorageError::BudgetExceeded("negative snapshot generation bytes".into()))?;
+    source_bytes
+        .checked_add(generation_bytes)
+        .ok_or_else(|| StorageError::BudgetExceeded("snapshot source byte count overflow".into()))
 }
 
 #[cfg(test)]
@@ -5007,17 +5057,46 @@ impl StorageTrait for PostgresBackend {
                 if refs.is_empty() {
                     break;
                 }
-                let mut page = Vec::with_capacity(refs.len());
-                for (memory_type, id) in refs {
-                    let memory_ref = MemoryRef {
-                        memory_type: memory_type_from_str(&memory_type)?,
-                        id,
-                    };
-                    if !lock_typed_source_for_capture(&mut tx, namespace_id, memory_ref).await? {
+                let refs = refs
+                    .into_iter()
+                    .map(|(memory_type, id)| {
+                        Ok((
+                            memory_type.clone(),
+                            MemoryRef {
+                                memory_type: memory_type_from_str(&memory_type)?,
+                                id,
+                            },
+                        ))
+                    })
+                    .collect::<StorageResult<Vec<_>>>()?;
+                let mut page_bytes = 0_usize;
+                for (_, memory_ref) in &refs {
+                    if !lock_typed_source_for_capture(&mut tx, namespace_id, *memory_ref).await? {
                         return Err(StorageError::Context(format!(
-                            "selected memory {memory_type}/{id} disappeared before capture lock"
+                            "selected memory {:?}/{} disappeared before capture lock",
+                            memory_ref.memory_type, memory_ref.id
                         )));
                     }
+                    let source_bytes =
+                        capture_payload_bytes_pg_tx(&mut tx, namespace_id, *memory_ref).await?;
+                    if source_bytes > SNAPSHOT_MAX_FRAME_BYTES {
+                        return Err(StorageError::BudgetExceeded(format!(
+                            "snapshot source {:?}/{} contains {source_bytes} payload bytes; maximum is {SNAPSHOT_MAX_FRAME_BYTES}",
+                            memory_ref.memory_type, memory_ref.id
+                        )));
+                    }
+                    page_bytes = page_bytes.checked_add(source_bytes).ok_or_else(|| {
+                        StorageError::BudgetExceeded("snapshot page byte count overflow".into())
+                    })?;
+                    if page_bytes > SNAPSHOT_MAX_PAGE_BYTES {
+                        return Err(StorageError::BudgetExceeded(format!(
+                            "snapshot page contains {page_bytes} payload bytes; maximum is {SNAPSHOT_MAX_PAGE_BYTES}"
+                        )));
+                    }
+                }
+                let mut page = Vec::with_capacity(refs.len());
+                for (memory_type, memory_ref) in refs {
+                    let id = memory_ref.id;
                     let memory = load_memory_without_embedding_pg(
                         &mut tx,
                         namespace_id,
@@ -8628,6 +8707,10 @@ mod tests {
         let lock = body
             .find("lock_typed_source_for_capture")
             .expect("source lock");
+        let preflight = body[lock..]
+            .find("capture_payload_bytes_pg_tx")
+            .map(|offset| lock + offset)
+            .expect("bounded payload preflight");
         let reread = body[lock..]
             .find("load_memory_without_embedding_pg")
             .map(|offset| lock + offset)
@@ -8640,7 +8723,18 @@ mod tests {
             .find("DELETE FROM memory_embeddings")
             .map(|offset| generations + offset)
             .expect("generation delete");
-        assert!(lock < reread && reread < generations && generations < delete);
+        assert!(lock < preflight && preflight < reread);
+        assert!(reread < generations && generations < delete);
+
+        let preflight_helper = source
+            .split_once("async fn capture_payload_bytes_pg_tx(")
+            .expect("payload preflight helper")
+            .1
+            .split_once("#[cfg(test)]")
+            .expect("payload preflight helper terminator")
+            .0;
+        assert!(preflight_helper.contains("octet_length(content)"));
+        assert!(preflight_helper.contains("SUM(octet_length(embedding::text)"));
     }
 
     #[test]
