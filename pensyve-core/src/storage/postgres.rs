@@ -7759,6 +7759,15 @@ mod tests {
         assert!(!workspace.contains(&[".", "unbound()"].concat()));
         let contracts = [
             Contract {
+                label: "lock active lifecycle",
+                binds: 1,
+                required: &[
+                    "SELECT state, active_read_space_id FROM namespace_embedding_state",
+                    "namespace_id = $1 FOR UPDATE",
+                    "fetch_optional(&mut *tx)",
+                ],
+            },
+            Contract {
                 label: "resume run lock",
                 binds: 2,
                 required: &[
