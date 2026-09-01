@@ -161,6 +161,10 @@ enum Command {
 
     /// Inspect or advance a namespace's bounded embedding migration.
     EmbeddingSpace {
+        /// Namespace storage directory containing memories.db
+        #[arg(long)]
+        storage_path: PathBuf,
+
         #[command(subcommand)]
         command: EmbeddingSpaceCommand,
     },
@@ -822,29 +826,21 @@ fn cmd_forget(
 }
 
 fn open_embedding_space_storage(
+    storage_path: &std::path::Path,
     namespace_id: uuid::Uuid,
 ) -> Result<SqliteBackend, Box<dyn std::error::Error>> {
-    let root = storage_root();
-    let mut namespace_paths = if root.is_dir() {
-        std::fs::read_dir(root)?
-            .map(|entry| entry.map(|value| value.path()))
-            .collect::<Result<Vec<_>, _>>()?
-    } else {
-        Vec::new()
-    };
-    namespace_paths.sort();
-
-    for path in namespace_paths {
-        if !path.join("memories.db").is_file() {
-            continue;
-        }
-        let storage = open_storage(&path)?;
-        if storage.get_namespace(namespace_id)?.is_some() {
-            return Ok(storage);
-        }
+    if !storage_path.join("memories.db").is_file() {
+        return Err(StorageError::NotFound(format!(
+            "storage database {}",
+            storage_path.join("memories.db").display()
+        ))
+        .into());
     }
-
-    Err(StorageError::NotFound(format!("namespace {namespace_id}")).into())
+    let storage = open_storage(storage_path)?;
+    storage
+        .get_namespace(namespace_id)?
+        .ok_or_else(|| StorageError::NotFound(format!("namespace {namespace_id}")))?;
+    Ok(storage)
 }
 
 fn approved_manifest_embedder(
@@ -908,12 +904,13 @@ fn print_embedding_state(
 }
 
 fn cmd_embedding_space(
+    storage_path: &std::path::Path,
     command: &EmbeddingSpaceCommand,
     format: OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         EmbeddingSpaceCommand::Inspect { namespace } => {
-            let storage = open_embedding_space_storage(*namespace)?;
+            let storage = open_embedding_space_storage(storage_path, *namespace)?;
             let state = storage
                 .get_namespace_embedding_state(*namespace)?
                 .ok_or_else(|| StorageError::NotFound(format!("embedding state {namespace}")))?;
@@ -927,7 +924,7 @@ fn cmd_embedding_space(
             let manifest: EmbeddingSpace =
                 serde_json::from_str(&std::fs::read_to_string(space_manifest)?)?;
             let embedder = approved_manifest_embedder(&manifest)?;
-            let storage = open_embedding_space_storage(*namespace)?;
+            let storage = open_embedding_space_storage(storage_path, *namespace)?;
             let migration = EmbeddingMigration::new(&storage, &embedder, *namespace);
             migration.start()?;
             let outcome = migration.backfill(*max_items, &BackfillCancellation::new())?;
@@ -957,7 +954,7 @@ fn cmd_embedding_space(
             namespace,
             space_id,
         } => {
-            let storage = open_embedding_space_storage(*namespace)?;
+            let storage = open_embedding_space_storage(storage_path, *namespace)?;
             let (coverage, state) = storage
                 .verify_embedding_migration(*namespace, &EmbeddingSpaceId(space_id.clone()))?;
             if !coverage.complete() {
@@ -971,7 +968,7 @@ fn cmd_embedding_space(
             namespace,
             space_id,
         } => {
-            let storage = open_embedding_space_storage(*namespace)?;
+            let storage = open_embedding_space_storage(storage_path, *namespace)?;
             let state = storage
                 .get_namespace_embedding_state(*namespace)?
                 .ok_or_else(|| StorageError::NotFound(format!("embedding state {namespace}")))?;
@@ -994,7 +991,7 @@ fn cmd_embedding_space(
             print_embedding_state(&active, format)
         }
         EmbeddingSpaceCommand::RollbackLexical { namespace } => {
-            let storage = open_embedding_space_storage(*namespace)?;
+            let storage = open_embedding_space_storage(storage_path, *namespace)?;
             let state = storage.rollback_embedding_migration_to_lexical(*namespace)?;
             print_embedding_state(&state, format)
         }
@@ -1053,7 +1050,10 @@ fn main() {
             namespace,
         } => cmd_forget(entity, *hard, namespace, format),
 
-        Command::EmbeddingSpace { command } => cmd_embedding_space(command, format),
+        Command::EmbeddingSpace {
+            storage_path,
+            command,
+        } => cmd_embedding_space(storage_path, command, format),
     };
 
     if let Err(e) = result {
@@ -1080,6 +1080,8 @@ mod tests {
             vec![
                 "pensyve",
                 "embedding-space",
+                "--storage-path",
+                "/namespace/storage",
                 "inspect",
                 "--namespace",
                 "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
@@ -1087,6 +1089,8 @@ mod tests {
             vec![
                 "pensyve",
                 "embedding-space",
+                "--storage-path",
+                "/namespace/storage",
                 "backfill",
                 "--namespace",
                 "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
@@ -1098,6 +1102,8 @@ mod tests {
             vec![
                 "pensyve",
                 "embedding-space",
+                "--storage-path",
+                "/namespace/storage",
                 "verify",
                 "--namespace",
                 "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
@@ -1107,6 +1113,8 @@ mod tests {
             vec![
                 "pensyve",
                 "embedding-space",
+                "--storage-path",
+                "/namespace/storage",
                 "activate",
                 "--namespace",
                 "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
@@ -1116,6 +1124,8 @@ mod tests {
             vec![
                 "pensyve",
                 "embedding-space",
+                "--storage-path",
+                "/namespace/storage",
                 "rollback-lexical",
                 "--namespace",
                 "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
@@ -1124,6 +1134,20 @@ mod tests {
         for command in commands {
             assert!(Cli::try_parse_from(command).is_ok());
         }
+    }
+
+    #[test]
+    fn embedding_space_storage_resolver_never_enumerates_sibling_directories() {
+        let source = include_str!("main.rs");
+        let resolver = source
+            .split_once("fn open_embedding_space_storage(")
+            .expect("maintenance storage resolver")
+            .1
+            .split_once("fn approved_manifest_embedder(")
+            .expect("maintenance storage resolver terminator")
+            .0;
+
+        assert!(!resolver.contains("read_dir"));
     }
 
     #[test]

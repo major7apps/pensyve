@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -27,11 +29,28 @@ fn maintenance_inspect_finds_a_normal_name_based_namespace() {
         .unwrap();
     drop(storage);
 
+    let corrupt_decoy = home.join(".pensyve").join("00-corrupt");
+    let unreadable_decoy = home.join(".pensyve").join("01-unreadable");
+    std::fs::create_dir_all(&corrupt_decoy).unwrap();
+    std::fs::create_dir_all(&unreadable_decoy).unwrap();
+    let corrupt_marker = b"not a sqlite database";
+    let unreadable_marker = b"must remain unopened";
+    std::fs::write(corrupt_decoy.join("memories.db"), corrupt_marker).unwrap();
+    std::fs::write(unreadable_decoy.join("memories.db"), unreadable_marker).unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = std::fs::metadata(&unreadable_decoy).unwrap().permissions();
+        permissions.set_mode(0o000);
+        std::fs::set_permissions(&unreadable_decoy, permissions).unwrap();
+    }
+
     let inspect = run_cli(
         &home,
         [
             "--json",
             "embedding-space",
+            "--storage-path",
+            home.join(".pensyve").join(namespace_name).to_str().unwrap(),
             "inspect",
             "--namespace",
             &namespace_id.to_string(),
@@ -45,6 +64,22 @@ fn maintenance_inspect_finds_a_normal_name_based_namespace() {
     );
     let inspect_json: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
     assert_eq!(inspect_json["namespace_id"], namespace_id.to_string());
+
+    #[cfg(unix)]
+    {
+        let mut permissions = std::fs::metadata(&unreadable_decoy).unwrap().permissions();
+        assert_eq!(permissions.mode() & 0o777, 0o000);
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&unreadable_decoy, permissions).unwrap();
+    }
+    assert_eq!(
+        std::fs::read(corrupt_decoy.join("memories.db")).unwrap(),
+        corrupt_marker
+    );
+    assert_eq!(
+        std::fs::read(unreadable_decoy.join("memories.db")).unwrap(),
+        unreadable_marker
+    );
 
     std::fs::remove_dir_all(home).unwrap();
 }
