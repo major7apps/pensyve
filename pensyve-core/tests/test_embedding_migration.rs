@@ -479,7 +479,45 @@ fn postgres_migration_static_contracts_are_bounded_scoped_and_lifecycle_authorit
     assert!(!migration.contains("LOCK TABLE"));
     assert!(!migration.contains("live_memory_refs_for_pg_migration"));
     assert!(migration.contains("MEMORY_PAGE_SIZE"));
-    assert!(migration.contains("REPEATABLE READ"));
+    for (start, end, first_coverage_read) in [
+        (
+            "fn begin_embedding_migration(",
+            "fn page_embedding_backfill(",
+            "DELETE FROM embedding_backfill_queue",
+        ),
+        (
+            "fn verify_embedding_migration(",
+            "fn activate_embedding_migration(",
+            "pg_migration_coverage",
+        ),
+        (
+            "fn activate_embedding_migration(",
+            "fn rollback_embedding_migration_to_lexical(",
+            "pg_migration_coverage",
+        ),
+    ] {
+        let operation = source
+            .split_once(start)
+            .unwrap()
+            .1
+            .split_once(end)
+            .unwrap()
+            .0;
+        assert!(
+            !operation.contains("SET TRANSACTION ISOLATION LEVEL"),
+            "{start} must use READ COMMITTED so predecessor writes are visible"
+        );
+        let namespace = operation
+            .find("lock_namespace_embedding_serialization_pg_tx")
+            .unwrap_or_else(|| panic!("{start} does not lock the durable namespace row"));
+        let coverage = operation
+            .find(first_coverage_read)
+            .unwrap_or_else(|| panic!("{start} lost its coverage read"));
+        assert!(
+            namespace < coverage,
+            "{start} must lock the namespace before coverage state"
+        );
+    }
     let source_page = source
         .split_once("async fn pg_migration_source_page(")
         .unwrap()
@@ -788,7 +826,7 @@ fn postgres_rollback_between_eligibility_and_vector_fetch_returns_unavailable() 
 
 #[cfg(feature = "postgres")]
 #[test]
-fn postgres_source_only_writer_serializes_before_absent_state_first_activation() {
+fn postgres_source_only_writer_precedes_first_activation_without_stale_coverage() {
     use sqlx_core::acquire::Acquire;
     use sqlx_core::query::query;
     use sqlx_postgres::Postgres;
@@ -812,6 +850,13 @@ fn postgres_source_only_writer_serializes_before_absent_state_first_activation()
         "first activation",
         0.9,
     ));
+    let embedder = OnnxEmbedder::new_mock(4);
+    let migration = EmbeddingMigration::new(&storage, &embedder, namespace.id);
+    migration.start().unwrap();
+    assert_eq!(
+        migration.verify().unwrap().phase,
+        NamespaceEmbeddingPhase::Ready
+    );
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let mut coordinator = runtime.block_on(storage.pool().acquire()).unwrap();
@@ -836,26 +881,19 @@ fn postgres_source_only_writer_serializes_before_absent_state_first_activation()
     wait_for_postgres_lock_wait(&storage, "INSERT INTO semantic_memories");
 
     let namespace_id = namespace.id;
-    let (migration_tx, migration_rx) = std::sync::mpsc::channel();
-    let migration_thread = std::thread::spawn(move || {
+    let target_space_id = embedder.embedding_space().unwrap().id();
+    let (activation_tx, activation_rx) = std::sync::mpsc::channel();
+    let activation_thread = std::thread::spawn(move || {
         let embedder = OnnxEmbedder::new_mock(4);
         let migration = EmbeddingMigration::new(&migrator, &embedder, namespace_id);
-        let result = (|| {
-            migration.start()?;
-            migration.backfill(256, &BackfillCancellation::new())?;
-            migration.verify()?;
-            migration.activate()
-        })()
-        .map(|state| state.phase)
-        .map_err(|error: MigrationError| error.to_string());
-        migration_tx.send(result).unwrap();
+        activation_tx.send(migration.activate()).unwrap();
     });
     wait_for_postgres_lock_wait(
         &storage,
         "SELECT id FROM namespaces WHERE id = $1 FOR UPDATE",
     );
     assert!(matches!(
-        migration_rx.try_recv(),
+        activation_rx.try_recv(),
         Err(std::sync::mpsc::TryRecvError::Empty)
     ));
 
@@ -864,19 +902,35 @@ fn postgres_source_only_writer_serializes_before_absent_state_first_activation()
         .recv_timeout(Duration::from_secs(5))
         .unwrap()
         .unwrap();
-    assert_eq!(
-        migration_rx
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap(),
-        NamespaceEmbeddingPhase::Active
-    );
-    writer_thread.join().unwrap();
-    migration_thread.join().unwrap();
     assert!(matches!(
-        vector_search(&storage, namespace.id, &OnnxEmbedder::new_mock(4)),
-        VectorSearchOutcome::Complete(ref hits) if !hits.is_empty()
+        activation_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Err(MigrationError::CoverageIncomplete {
+            total: 1,
+            missing: 1,
+            stale: 0,
+            pending: 0,
+        })
     ));
+    writer_thread.join().unwrap();
+    activation_thread.join().unwrap();
+    assert_eq!(
+        storage
+            .get_namespace_embedding_state(namespace.id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        NamespaceEmbeddingPhase::Ready
+    );
+    assert_eq!(
+        storage
+            .load_embedding_records(
+                namespace.id,
+                &target_space_id,
+                &[MemoryRef::from_memory(&memory)],
+            )
+            .unwrap(),
+        Vec::new()
+    );
 }
 
 #[cfg(feature = "postgres")]

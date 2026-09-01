@@ -2265,10 +2265,6 @@ impl StorageTrait for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
-            query::<Postgres>("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-                .execute(&mut *transaction)
-                .await
-                .map_err(sqlx_to_io)?;
             lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
             let target_id = target_space.id();
             let canonical_json = target_space.canonical_json();
@@ -2655,10 +2651,6 @@ impl StorageTrait for PostgresBackend {
         let coverage = self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
-            query::<Postgres>("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-                .execute(&mut *transaction)
-                .await
-                .map_err(sqlx_to_io)?;
             lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
             let phase = query_as::<Postgres, (String, Option<String>)>(
                 "SELECT state, target_space_id FROM namespace_embedding_state
@@ -2740,10 +2732,6 @@ impl StorageTrait for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
-            query::<Postgres>("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-                .execute(&mut *transaction)
-                .await
-                .map_err(sqlx_to_io)?;
             lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
             let phase = query_as::<Postgres, (String, Option<String>, Option<String>)>(
                 "SELECT state, active_read_space_id, target_space_id FROM namespace_embedding_state
