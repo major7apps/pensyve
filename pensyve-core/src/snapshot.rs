@@ -277,7 +277,7 @@ pub struct RestoreOutcome {
 }
 
 /// Result of a [`forget_entity_bounded`] call.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ForgetOutcome {
     /// Constant-size manifest for exactly the rows the delete removed.
     pub snapshot: SnapshotManifest,
@@ -298,19 +298,22 @@ pub struct ForgetOutcome {
 }
 
 /// An already-open streamed snapshot, pinned independently of its directory entry.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SnapshotArtifact {
     path: PathBuf,
-    file: std::fs::File,
+    file: Arc<Mutex<std::fs::File>>,
 }
 
 impl SnapshotArtifact {
     /// Stream IDs from the validated artifact through the same open file handle.
     pub fn for_each_memory_id(
-        &mut self,
+        &self,
         visit: impl FnMut(Uuid) -> StorageResult<()>,
     ) -> StorageResult<()> {
-        for_each_memory_id_in_opened_file_with(&mut self.file, visit, || {})
+        let mut file = self.file.lock().map_err(|error| {
+            StorageError::LockPoisoned(format!("snapshot artifact file: {error}"))
+        })?;
+        for_each_memory_id_in_opened_file_with(&mut file, visit, || {})
     }
 }
 
@@ -525,7 +528,7 @@ impl SnapshotStreamWriter {
                 self.published = true;
                 Some(SnapshotArtifact {
                     path: self.path.clone(),
-                    file,
+                    file: Arc::new(Mutex::new(file)),
                 })
             };
         Ok((
@@ -2610,6 +2613,81 @@ mod tests {
         });
 
         assert!(index.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn forget_outcome_and_pinned_artifact_remain_clone_compatible() {
+        fn assert_clone<T: Clone>() {}
+
+        assert_clone::<ForgetOutcome>();
+        assert_clone::<SnapshotArtifact>();
+
+        let f = fixture();
+        seed_one_of_each(&f);
+        let outcome = forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            Some("subject"),
+            f.namespace.id,
+            &f.dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap();
+        let cloned = outcome.clone();
+
+        assert_eq!(cloned.snapshot.snapshot_id, outcome.snapshot.snapshot_id);
+        assert_eq!(cloned.path, outcome.path);
+        assert!(cloned.artifact.is_some());
+    }
+
+    #[test]
+    fn cloned_artifact_leases_serialize_complete_cursor_passes() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let outcome = forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            Some("subject"),
+            f.namespace.id,
+            &f.dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap();
+        let path = outcome.path.clone().unwrap();
+        let first = outcome.artifact.unwrap();
+        let second = first.clone();
+        #[cfg(unix)]
+        std::fs::remove_file(path).unwrap();
+        let start = std::sync::Barrier::new(2);
+
+        let (first_ids, second_ids) = std::thread::scope(|scope| {
+            let first_pass = scope.spawn(|| {
+                start.wait();
+                let mut ids = Vec::new();
+                first
+                    .for_each_memory_id(|id| {
+                        ids.push(id);
+                        Ok(())
+                    })
+                    .unwrap();
+                ids
+            });
+            let second_pass = scope.spawn(|| {
+                start.wait();
+                let mut ids = Vec::new();
+                second
+                    .for_each_memory_id(|id| {
+                        ids.push(id);
+                        Ok(())
+                    })
+                    .unwrap();
+                ids
+            });
+            (first_pass.join().unwrap(), second_pass.join().unwrap())
+        });
+
+        assert_eq!(first_ids, second_ids);
+        assert_eq!(first_ids.len(), outcome.snapshot.counts.total);
     }
 
     #[test]

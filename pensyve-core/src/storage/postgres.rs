@@ -5066,6 +5066,51 @@ mod tests {
     }
 
     #[test]
+    fn production_embedding_writes_and_capture_use_their_conflicting_locks_before_work() {
+        let source = include_str!("postgres.rs");
+        let production = source
+            .split_once("/// Live-Postgres coverage")
+            .expect("production PostgreSQL source terminator")
+            .0;
+
+        let capture_lock = production
+            .split_once("async fn lock_typed_source_for_capture(")
+            .expect("capture lock helper")
+            .1
+            .split_once("#[cfg(test)]")
+            .expect("capture lock helper terminator")
+            .0;
+        assert!(capture_lock.contains("lock_typed_source("));
+        assert!(capture_lock.contains("SourceLockMode::Capture"));
+        assert!(!capture_lock.contains("SourceLockMode::Generation"));
+
+        let insert = production
+            .split_once("async fn insert_embedding_in_pg_tx(")
+            .expect("central generation insert helper")
+            .1
+            .split_once("fn memory_type_from_str(")
+            .expect("central generation insert helper terminator")
+            .0;
+        let lock_call = insert
+            .find("lock_typed_source(")
+            .expect("generation source lock");
+        let lock_mode = insert
+            .find("SourceLockMode::Generation")
+            .expect("generation KEY SHARE mode");
+        let insert_statement = insert
+            .find("INSERT INTO memory_embeddings")
+            .expect("generation insert statement");
+        assert!(lock_call < lock_mode && lock_mode < insert_statement);
+        assert!(!insert[..insert_statement].contains("SourceLockMode::Capture"));
+        assert_eq!(insert.matches("INSERT INTO memory_embeddings").count(), 1);
+        assert_eq!(
+            production.matches("INSERT INTO memory_embeddings").count(),
+            1,
+            "every production generation insert must stay centralized behind the source lock"
+        );
+    }
+
+    #[test]
     fn postgres_bulk_paths_keep_the_page_bound_and_real_page_guard_in_control_flow() {
         let source = include_str!("postgres.rs");
         let forget = source
