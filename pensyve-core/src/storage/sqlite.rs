@@ -11,6 +11,9 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
+use crate::embedding_migration::{
+    BackfillCommit, BackfillItem, BackfillOutcome, MigrationCoverage, MigrationError,
+};
 use crate::embedding_space::{EmbeddingClass, EmbeddingSpace, EmbeddingSpaceId};
 use crate::types::{
     ContentType, Edge, Entity, EntityKind, Episode, EpisodicMemory, Memory, Namespace,
@@ -1680,6 +1683,178 @@ fn memory_type_order(memory_type: MemoryType) -> i64 {
     }
 }
 
+fn live_memory_refs_for_migration(
+    conn: &Connection,
+    namespace_id: Uuid,
+) -> StorageResult<Vec<MemoryRef>> {
+    let mut statement = conn.prepare(
+        "SELECT memory_type, id FROM (
+             SELECT 0 AS type_order, 'episodic' AS memory_type, id
+               FROM episodic_memories
+              WHERE namespace_id = ?1 AND superseded_by IS NULL AND invalid_at IS NULL
+             UNION ALL
+             SELECT 1, 'semantic', id FROM semantic_memories
+              WHERE namespace_id = ?1 AND superseded_by IS NULL AND invalid_at IS NULL
+             UNION ALL
+             SELECT 2, 'procedural', id FROM procedural_memories
+              WHERE namespace_id = ?1 AND superseded_by IS NULL AND invalid_at IS NULL
+             UNION ALL
+             SELECT 3, 'observation', id FROM observation_memories
+              WHERE namespace_id = ?1 AND superseded_by IS NULL AND invalid_at IS NULL
+         ) ORDER BY type_order, id",
+    )?;
+    statement
+        .query_map([namespace_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .map(|row| {
+            let (memory_type, id) = row?;
+            Ok(MemoryRef {
+                memory_type: memory_type_from_str(&memory_type)?,
+                id: Uuid::parse_str(&id).map_err(|error| {
+                    StorageError::Context(format!("invalid migration memory UUID: {error}"))
+                })?,
+            })
+        })
+        .collect()
+}
+
+fn migration_coverage_in_conn(
+    conn: &Connection,
+    namespace_id: Uuid,
+    target_space_id: &EmbeddingSpaceId,
+) -> StorageResult<MigrationCoverage> {
+    let refs = live_memory_refs_for_migration(conn, namespace_id)?;
+    let mut coverage = MigrationCoverage {
+        total: refs.len(),
+        ..MigrationCoverage::default()
+    };
+    for memory_ref in refs {
+        let memory = load_memory_without_embedding_in_conn(conn, namespace_id, memory_ref)?
+            .ok_or_else(|| {
+                StorageError::Context(format!(
+                    "migration source {} disappeared inside one transaction",
+                    memory_ref.id
+                ))
+            })?;
+        let stored_hash = conn
+            .query_row(
+                "SELECT source_sha256 FROM memory_embeddings
+                 WHERE namespace_id = ?1 AND memory_type = ?2 AND memory_id = ?3
+                   AND embedding_space_id = ?4",
+                params![
+                    namespace_id.to_string(),
+                    memory_type_str(memory_ref.memory_type),
+                    memory_ref.id.to_string(),
+                    &target_space_id.0,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match stored_hash {
+            None => coverage.missing += 1,
+            Some(hash) if hash != canonical_embedding_source_sha256(&memory) => {
+                coverage.stale += 1;
+            }
+            Some(_) => {}
+        }
+    }
+    let pending: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM embedding_backfill_queue
+         WHERE namespace_id = ?1 AND status = 'pending'",
+        [namespace_id.to_string()],
+        |row| row.get(0),
+    )?;
+    coverage.pending = usize::try_from(pending).map_err(|error| {
+        StorageError::Context(format!("invalid pending backfill count: {error}"))
+    })?;
+    Ok(coverage)
+}
+
+fn enqueue_uncovered_sqlite_sources(
+    conn: &Connection,
+    namespace_id: Uuid,
+    target_space_id: &EmbeddingSpaceId,
+) -> StorageResult<()> {
+    for memory_ref in live_memory_refs_for_migration(conn, namespace_id)? {
+        let Some(memory) = load_memory_without_embedding_in_conn(conn, namespace_id, memory_ref)?
+        else {
+            continue;
+        };
+        let source_sha256 = canonical_embedding_source_sha256(&memory);
+        let fresh: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM memory_embeddings
+                  WHERE namespace_id = ?1 AND memory_type = ?2 AND memory_id = ?3
+                    AND embedding_space_id = ?4 AND source_sha256 = ?5
+             )",
+            params![
+                namespace_id.to_string(),
+                memory_type_str(memory_ref.memory_type),
+                memory_ref.id.to_string(),
+                &target_space_id.0,
+                &source_sha256,
+            ],
+            |row| row.get(0),
+        )?;
+        if fresh {
+            continue;
+        }
+        let already_queued: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM embedding_backfill_queue
+                  WHERE namespace_id = ?1 AND memory_type = ?2 AND memory_id = ?3
+                    AND source_sha256 = ?4 AND status = 'pending'
+             )",
+            params![
+                namespace_id.to_string(),
+                memory_type_str(memory_ref.memory_type),
+                memory_ref.id.to_string(),
+                &source_sha256,
+            ],
+            |row| row.get(0),
+        )?;
+        if already_queued {
+            continue;
+        }
+        conn.execute(
+            "DELETE FROM embedding_backfill_queue
+             WHERE namespace_id = ?1 AND memory_type = ?2 AND memory_id = ?3
+               AND status = 'pending'",
+            params![
+                namespace_id.to_string(),
+                memory_type_str(memory_ref.memory_type),
+                memory_ref.id.to_string(),
+            ],
+        )?;
+        let next_sequence: i64 = conn.query_row(
+            "SELECT MAX(maximum) + 1 FROM (
+                 SELECT COALESCE(MAX(sequence), 0) AS maximum
+                   FROM embedding_backfill_queue WHERE namespace_id = ?1
+                 UNION ALL
+                 SELECT barrier_sequence FROM namespace_embedding_state
+                  WHERE namespace_id = ?1
+             )",
+            [namespace_id.to_string()],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "INSERT INTO embedding_backfill_queue
+             (namespace_id, memory_type, memory_id, source_sha256, sequence,
+              status, last_error)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', NULL)",
+            params![
+                namespace_id.to_string(),
+                memory_type_str(memory_ref.memory_type),
+                memory_ref.id.to_string(),
+                source_sha256,
+                next_sequence,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn load_memory_without_embedding_in_conn(
     conn: &Connection,
     namespace_id: Uuid,
@@ -2052,6 +2227,571 @@ impl StorageTrait for SqliteBackend {
         drop(conn);
         self.get_namespace_embedding_state(namespace_id)?
             .ok_or_else(|| StorageError::Context("embedding state commit disappeared".into()))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "space registration, snapshot queueing, and lifecycle transition share one transaction"
+    )]
+    fn begin_embedding_migration(
+        &self,
+        namespace_id: Uuid,
+        target_space: &EmbeddingSpace,
+    ) -> Result<NamespaceEmbeddingState, MigrationError> {
+        let mut conn = lock_conn!(self);
+        let transaction = conn.transaction()?;
+        let namespace = namespace_id.to_string();
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM namespaces WHERE id = ?1)",
+            [&namespace],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StorageError::NotFound(format!("namespace {namespace_id}")).into());
+        }
+
+        let target_id = target_space.id();
+        let canonical_json = target_space.canonical_json();
+        let class = match target_space.class {
+            EmbeddingClass::Real => "real",
+            EmbeddingClass::Mock => "mock",
+            EmbeddingClass::LegacyUnknown => "legacy_unknown",
+        };
+        transaction.execute(
+            "INSERT OR IGNORE INTO embedding_spaces
+             (id, canonical_identity_json, class, dimension, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                &target_id.0,
+                &canonical_json,
+                class,
+                i64::try_from(target_space.dimensions).map_err(|error| {
+                    StorageError::Context(format!(
+                        "embedding dimension {} is not representable: {error}",
+                        target_space.dimensions
+                    ))
+                })?,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        let registered: String = transaction.query_row(
+            "SELECT canonical_identity_json FROM embedding_spaces WHERE id = ?1",
+            [&target_id.0],
+            |row| row.get(0),
+        )?;
+        if registered != canonical_json {
+            return Err(StorageError::Context(format!(
+                "embedding space {} conflicts with registered canonical provenance",
+                target_id.0
+            ))
+            .into());
+        }
+
+        let existing = transaction
+            .query_row(
+                "SELECT state, active_read_space_id, target_space_id
+                 FROM namespace_embedding_state WHERE namespace_id = ?1",
+                [&namespace],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((phase, _, target)) = &existing
+            && phase == "backfilling"
+            && target.as_deref() == Some(target_id.0.as_str())
+        {
+            transaction.commit()?;
+            drop(conn);
+            return self
+                .get_namespace_embedding_state(namespace_id)?
+                .ok_or_else(|| StorageError::Context("migration state disappeared".into()).into());
+        }
+        let phase =
+            existing
+                .as_ref()
+                .map_or(NamespaceEmbeddingPhase::LexicalOnly, |(phase, _, _)| {
+                    NamespaceEmbeddingPhase::parse(phase)
+                        .unwrap_or(NamespaceEmbeddingPhase::LexicalOnly)
+                });
+        if phase != NamespaceEmbeddingPhase::LexicalOnly
+            || existing
+                .as_ref()
+                .is_some_and(|(_, active, target)| active.is_some() || target.is_some())
+        {
+            return Err(MigrationError::InvalidTransition {
+                current: phase,
+                requested: "start backfill",
+            });
+        }
+
+        transaction.execute(
+            "DELETE FROM embedding_backfill_queue WHERE namespace_id = ?1",
+            [&namespace],
+        )?;
+        let refs = live_memory_refs_for_migration(&transaction, namespace_id)?;
+        for (index, memory_ref) in refs.iter().copied().enumerate() {
+            let memory =
+                load_memory_without_embedding_in_conn(&transaction, namespace_id, memory_ref)?
+                    .ok_or_else(|| {
+                        StorageError::Context(format!(
+                            "migration source {} disappeared inside start transaction",
+                            memory_ref.id
+                        ))
+                    })?;
+            transaction.execute(
+                "INSERT INTO embedding_backfill_queue
+                 (namespace_id, memory_type, memory_id, source_sha256, sequence, status, last_error)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', NULL)",
+                params![
+                    &namespace,
+                    memory_type_str(memory_ref.memory_type),
+                    memory_ref.id.to_string(),
+                    canonical_embedding_source_sha256(&memory),
+                    i64::try_from(index + 1).map_err(|error| {
+                        StorageError::Context(format!("backfill sequence overflow: {error}"))
+                    })?,
+                ],
+            )?;
+        }
+        let barrier = i64::try_from(refs.len()).map_err(|error| {
+            StorageError::Context(format!("backfill barrier overflow: {error}"))
+        })?;
+        transaction.execute(
+            "INSERT INTO namespace_embedding_state
+             (namespace_id, active_read_space_id, target_space_id, state,
+              barrier_sequence, updated_at)
+             VALUES (?1, NULL, ?2, 'backfilling', ?3, ?4)
+             ON CONFLICT(namespace_id) DO UPDATE SET
+                 active_read_space_id = NULL,
+                 target_space_id = excluded.target_space_id,
+                 state = 'backfilling',
+                 barrier_sequence = excluded.barrier_sequence,
+                 updated_at = excluded.updated_at",
+            params![&namespace, &target_id.0, barrier, Utc::now().to_rfc3339()],
+        )?;
+        transaction.commit()?;
+        drop(conn);
+        self.get_namespace_embedding_state(namespace_id)?
+            .ok_or_else(|| {
+                StorageError::Context("migration state commit disappeared".into()).into()
+            })
+    }
+
+    fn page_embedding_backfill(
+        &self,
+        namespace_id: Uuid,
+        target_space_id: &EmbeddingSpaceId,
+        limit: usize,
+    ) -> Result<Vec<BackfillItem>, MigrationError> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "embedding backfill page size must be within 1..={MEMORY_PAGE_SIZE}"
+            ))
+            .into());
+        }
+        let conn = lock_conn!(self);
+        let target: Option<String> = conn
+            .query_row(
+                "SELECT target_space_id FROM namespace_embedding_state
+                 WHERE namespace_id = ?1 AND state = 'backfilling'",
+                [namespace_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if target.as_deref() != Some(target_space_id.0.as_str()) {
+            drop(conn);
+            let phase = self
+                .get_namespace_embedding_state(namespace_id)?
+                .map_or(NamespaceEmbeddingPhase::LexicalOnly, |state| state.phase);
+            return Err(MigrationError::InvalidTransition {
+                current: phase,
+                requested: "page backfill",
+            });
+        }
+        let mut statement = conn.prepare(
+            "SELECT memory_type, memory_id, source_sha256, sequence
+             FROM embedding_backfill_queue
+             WHERE namespace_id = ?1 AND status = 'pending'
+             ORDER BY sequence, memory_type, memory_id LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    namespace_id.to_string(),
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(memory_type, memory_id, source_sha256, sequence)| {
+                let memory_ref = MemoryRef {
+                    memory_type: memory_type_from_str(&memory_type)?,
+                    id: Uuid::parse_str(&memory_id).map_err(|error| {
+                        StorageError::Context(format!("invalid queued memory UUID: {error}"))
+                    })?,
+                };
+                Ok(BackfillItem {
+                    namespace_id,
+                    memory: load_memory_without_embedding_in_conn(&conn, namespace_id, memory_ref)?,
+                    memory_ref,
+                    source_sha256,
+                    sequence,
+                })
+            })
+            .collect::<StorageResult<Vec<_>>>()
+            .map_err(MigrationError::from)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "source reread, stale requeue, generation write, and queue drain share one transaction"
+    )]
+    fn commit_embedding_backfill_page(
+        &self,
+        namespace_id: Uuid,
+        target_space_id: &EmbeddingSpaceId,
+        commits: &[BackfillCommit],
+    ) -> Result<BackfillOutcome, MigrationError> {
+        if commits.len() > MEMORY_PAGE_SIZE {
+            return Err(StorageError::BudgetExceeded(format!(
+                "embedding backfill commit contains more than {MEMORY_PAGE_SIZE} items"
+            ))
+            .into());
+        }
+        let mut conn = lock_conn!(self);
+        let transaction =
+            conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let state: Option<(String, Option<String>)> = transaction
+            .query_row(
+                "SELECT state, target_space_id FROM namespace_embedding_state
+                 WHERE namespace_id = ?1",
+                [namespace_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if state
+            .as_ref()
+            .map(|(phase, target)| (phase.as_str(), target.as_deref()))
+            != Some(("backfilling", Some(target_space_id.0.as_str())))
+        {
+            let current = state
+                .as_ref()
+                .map_or(NamespaceEmbeddingPhase::LexicalOnly, |state| {
+                    NamespaceEmbeddingPhase::parse(&state.0)
+                        .unwrap_or(NamespaceEmbeddingPhase::LexicalOnly)
+                });
+            return Err(MigrationError::InvalidTransition {
+                current,
+                requested: "commit backfill page",
+            });
+        }
+
+        let mut outcome = BackfillOutcome::default();
+        for commit in commits {
+            if commit.item.namespace_id != namespace_id {
+                return Err(StorageError::Context(
+                    "backfill commit contains an item from another namespace".into(),
+                )
+                .into());
+            }
+            outcome.attempted += 1;
+            let current = load_memory_without_embedding_in_conn(
+                &transaction,
+                namespace_id,
+                commit.item.memory_ref,
+            )?;
+            let queue_key = params![
+                namespace_id.to_string(),
+                memory_type_str(commit.item.memory_ref.memory_type),
+                commit.item.memory_ref.id.to_string(),
+                commit.item.sequence,
+            ];
+            let Some(memory) = current else {
+                transaction.execute(
+                    "DELETE FROM embedding_backfill_queue
+                     WHERE namespace_id = ?1 AND memory_type = ?2
+                       AND memory_id = ?3 AND sequence = ?4",
+                    queue_key,
+                )?;
+                outcome.deleted += 1;
+                continue;
+            };
+            let current_hash = canonical_embedding_source_sha256(&memory);
+            if current_hash != commit.item.source_sha256 {
+                transaction.execute(
+                    "DELETE FROM embedding_backfill_queue
+                     WHERE namespace_id = ?1 AND memory_type = ?2
+                       AND memory_id = ?3 AND sequence = ?4",
+                    queue_key,
+                )?;
+                let next_sequence: i64 = transaction.query_row(
+                    "SELECT MAX(maximum) + 1 FROM (
+                         SELECT COALESCE(MAX(sequence), 0) AS maximum
+                           FROM embedding_backfill_queue WHERE namespace_id = ?1
+                         UNION ALL
+                         SELECT barrier_sequence FROM namespace_embedding_state
+                          WHERE namespace_id = ?1
+                     )",
+                    [namespace_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                transaction.execute(
+                    "INSERT INTO embedding_backfill_queue
+                     (namespace_id, memory_type, memory_id, source_sha256, sequence,
+                      status, last_error)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'pending', NULL)",
+                    params![
+                        namespace_id.to_string(),
+                        memory_type_str(commit.item.memory_ref.memory_type),
+                        commit.item.memory_ref.id.to_string(),
+                        current_hash,
+                        next_sequence,
+                    ],
+                )?;
+                outcome.requeued += 1;
+                continue;
+            }
+            let record = commit.record.as_ref().ok_or_else(|| {
+                StorageError::Context("live backfill source has no embedding record".into())
+            })?;
+            if record.embedding_space_id != *target_space_id {
+                return Err(StorageError::Context(
+                    "backfill record belongs to a different embedding space".into(),
+                )
+                .into());
+            }
+            validate_record_matches_memory(record, &memory)?;
+            insert_embedding_in_conn(&transaction, record)?;
+            transaction.execute(
+                "DELETE FROM embedding_backfill_queue
+                 WHERE namespace_id = ?1 AND memory_type = ?2
+                   AND memory_id = ?3 AND sequence = ?4",
+                queue_key,
+            )?;
+            outcome.committed += 1;
+        }
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    fn record_embedding_backfill_failure(
+        &self,
+        namespace_id: Uuid,
+        item: &BackfillItem,
+        error: &str,
+    ) -> Result<(), MigrationError> {
+        let conn = lock_conn!(self);
+        conn.execute(
+            "UPDATE embedding_backfill_queue SET last_error = ?1
+             WHERE namespace_id = ?2 AND memory_type = ?3 AND memory_id = ?4
+               AND sequence = ?5 AND status = 'pending'",
+            params![
+                error,
+                namespace_id.to_string(),
+                memory_type_str(item.memory_ref.memory_type),
+                item.memory_ref.id.to_string(),
+                item.sequence,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn inspect_embedding_migration_coverage(
+        &self,
+        namespace_id: Uuid,
+        target_space_id: &EmbeddingSpaceId,
+    ) -> Result<(MigrationCoverage, NamespaceEmbeddingState), MigrationError> {
+        let conn = lock_conn!(self);
+        let coverage = migration_coverage_in_conn(&conn, namespace_id, target_space_id)?;
+        drop(conn);
+        let state = self
+            .get_namespace_embedding_state(namespace_id)?
+            .ok_or_else(|| StorageError::NotFound(format!("embedding state {namespace_id}")))?;
+        Ok((coverage, state))
+    }
+
+    fn verify_embedding_migration(
+        &self,
+        namespace_id: Uuid,
+        target_space_id: &EmbeddingSpaceId,
+    ) -> Result<(MigrationCoverage, NamespaceEmbeddingState), MigrationError> {
+        let mut conn = lock_conn!(self);
+        let transaction = conn.transaction()?;
+        let phase: Option<(String, Option<String>)> = transaction
+            .query_row(
+                "SELECT state, target_space_id FROM namespace_embedding_state
+                 WHERE namespace_id = ?1",
+                [namespace_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let current = phase
+            .as_ref()
+            .map_or(NamespaceEmbeddingPhase::LexicalOnly, |value| {
+                NamespaceEmbeddingPhase::parse(&value.0)
+                    .unwrap_or(NamespaceEmbeddingPhase::LexicalOnly)
+            });
+        if !matches!(
+            current,
+            NamespaceEmbeddingPhase::Backfilling | NamespaceEmbeddingPhase::Ready
+        ) || phase.as_ref().and_then(|value| value.1.as_deref())
+            != Some(target_space_id.0.as_str())
+        {
+            return Err(MigrationError::InvalidTransition {
+                current,
+                requested: "verify coverage",
+            });
+        }
+        let coverage = migration_coverage_in_conn(&transaction, namespace_id, target_space_id)?;
+        if coverage.complete() {
+            transaction.execute(
+                "UPDATE namespace_embedding_state SET state = 'ready', updated_at = ?1
+                 WHERE namespace_id = ?2 AND target_space_id = ?3",
+                params![
+                    Utc::now().to_rfc3339(),
+                    namespace_id.to_string(),
+                    &target_space_id.0,
+                ],
+            )?;
+        } else {
+            enqueue_uncovered_sqlite_sources(&transaction, namespace_id, target_space_id)?;
+            transaction.execute(
+                "UPDATE namespace_embedding_state SET state = 'backfilling', updated_at = ?1
+                 WHERE namespace_id = ?2 AND target_space_id = ?3",
+                params![
+                    Utc::now().to_rfc3339(),
+                    namespace_id.to_string(),
+                    &target_space_id.0,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        drop(conn);
+        let state = self
+            .get_namespace_embedding_state(namespace_id)?
+            .ok_or_else(|| StorageError::Context("verified migration state disappeared".into()))?;
+        Ok((coverage, state))
+    }
+
+    fn activate_embedding_migration(
+        &self,
+        namespace_id: Uuid,
+        target_space_id: &EmbeddingSpaceId,
+        runtime_space_id: &EmbeddingSpaceId,
+    ) -> Result<NamespaceEmbeddingState, MigrationError> {
+        if runtime_space_id != target_space_id {
+            return Err(MigrationError::RuntimeSpaceMismatch {
+                runtime: runtime_space_id.0.clone(),
+                target: target_space_id.0.clone(),
+            });
+        }
+        let mut conn = lock_conn!(self);
+        let transaction =
+            conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let phase: Option<(String, Option<String>)> = transaction
+            .query_row(
+                "SELECT state, target_space_id FROM namespace_embedding_state
+                 WHERE namespace_id = ?1",
+                [namespace_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let current = phase
+            .as_ref()
+            .map_or(NamespaceEmbeddingPhase::LexicalOnly, |value| {
+                NamespaceEmbeddingPhase::parse(&value.0)
+                    .unwrap_or(NamespaceEmbeddingPhase::LexicalOnly)
+            });
+        if current != NamespaceEmbeddingPhase::Ready
+            || phase.as_ref().and_then(|value| value.1.as_deref())
+                != Some(target_space_id.0.as_str())
+        {
+            return Err(MigrationError::InvalidTransition {
+                current,
+                requested: "activate",
+            });
+        }
+        let coverage = migration_coverage_in_conn(&transaction, namespace_id, target_space_id)?;
+        if !coverage.complete() {
+            return Err(coverage.into());
+        }
+        transaction.execute(
+            "UPDATE namespace_embedding_state
+             SET active_read_space_id = ?1, target_space_id = NULL, state = 'active',
+                 updated_at = ?2
+             WHERE namespace_id = ?3 AND state = 'ready' AND target_space_id = ?1",
+            params![
+                &target_space_id.0,
+                Utc::now().to_rfc3339(),
+                namespace_id.to_string(),
+            ],
+        )?;
+        transaction.commit()?;
+        drop(conn);
+        self.get_namespace_embedding_state(namespace_id)?
+            .ok_or_else(|| {
+                StorageError::Context("activated migration state disappeared".into()).into()
+            })
+    }
+
+    fn rollback_embedding_migration_to_lexical(
+        &self,
+        namespace_id: Uuid,
+    ) -> Result<NamespaceEmbeddingState, MigrationError> {
+        let mut conn = lock_conn!(self);
+        let transaction = conn.transaction()?;
+        let state: Option<(String, i64)> = transaction
+            .query_row(
+                "SELECT state, barrier_sequence FROM namespace_embedding_state
+                 WHERE namespace_id = ?1",
+                [namespace_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let current = state
+            .as_ref()
+            .map_or(NamespaceEmbeddingPhase::LexicalOnly, |value| {
+                NamespaceEmbeddingPhase::parse(&value.0)
+                    .unwrap_or(NamespaceEmbeddingPhase::LexicalOnly)
+            });
+        if current != NamespaceEmbeddingPhase::Active
+            || state.as_ref().is_none_or(|(_, barrier)| *barrier <= 0)
+        {
+            return Err(MigrationError::InvalidTransition {
+                current,
+                requested: "rollback first migration",
+            });
+        }
+        transaction.execute(
+            "UPDATE namespace_embedding_state
+             SET active_read_space_id = NULL, target_space_id = NULL,
+                 state = 'lexical_only', updated_at = ?1
+             WHERE namespace_id = ?2",
+            params![Utc::now().to_rfc3339(), namespace_id.to_string()],
+        )?;
+        transaction.execute(
+            "DELETE FROM embedding_backfill_queue WHERE namespace_id = ?1",
+            [namespace_id.to_string()],
+        )?;
+        transaction.commit()?;
+        drop(conn);
+        self.get_namespace_embedding_state(namespace_id)?
+            .ok_or_else(|| {
+                StorageError::Context("rolled back migration state disappeared".into()).into()
+            })
     }
 
     // -----------------------------------------------------------------------

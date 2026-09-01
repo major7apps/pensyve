@@ -18,6 +18,9 @@ use sqlx_postgres::{PgConnection, PgPool, PgPoolOptions, PgRow, Postgres};
 use tokio::runtime::{Handle, Runtime};
 use uuid::Uuid;
 
+use crate::embedding_migration::{
+    BackfillCommit, BackfillItem, BackfillOutcome, MigrationCoverage, MigrationError,
+};
 use crate::embedding_space::{EmbeddingSpace, EmbeddingSpaceId};
 use crate::types::{
     Edge, Entity, EntityKind, Episode, EpisodicMemory, Memory, Namespace, ObservationMemory,
@@ -1680,6 +1683,206 @@ async fn load_memory_without_embedding_pg(
     }
 }
 
+async fn live_memory_refs_for_pg_migration(
+    conn: &mut PgConnection,
+    namespace_id: Uuid,
+) -> StorageResult<Vec<MemoryRef>> {
+    query_as::<Postgres, (String, Uuid)>(
+        "SELECT memory_type, id FROM (
+             SELECT 0 AS type_order, 'episodic'::text AS memory_type, id
+               FROM episodic_memories
+              WHERE namespace_id = $1 AND superseded_by IS NULL AND invalid_at IS NULL
+             UNION ALL
+             SELECT 1, 'semantic', id FROM semantic_memories
+              WHERE namespace_id = $1 AND superseded_by IS NULL AND invalid_at IS NULL
+             UNION ALL
+             SELECT 2, 'procedural', id FROM procedural_memories
+              WHERE namespace_id = $1 AND superseded_by IS NULL AND invalid_at IS NULL
+             UNION ALL
+             SELECT 3, 'observation', id FROM observation_memories
+              WHERE namespace_id = $1 AND superseded_by IS NULL AND invalid_at IS NULL
+         ) AS sources ORDER BY type_order, id",
+    )
+    .bind(namespace_id)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(sqlx_to_io)?
+    .into_iter()
+    .map(|(memory_type, id)| {
+        Ok(MemoryRef {
+            memory_type: memory_type_from_str(&memory_type)?,
+            id,
+        })
+    })
+    .collect()
+}
+
+async fn pg_migration_coverage(
+    conn: &mut PgConnection,
+    namespace_id: Uuid,
+    target_space_id: &EmbeddingSpaceId,
+) -> StorageResult<MigrationCoverage> {
+    let refs = live_memory_refs_for_pg_migration(conn, namespace_id).await?;
+    let mut coverage = MigrationCoverage {
+        total: refs.len(),
+        ..MigrationCoverage::default()
+    };
+    for memory_ref in refs {
+        let memory = load_memory_without_embedding_pg(conn, namespace_id, memory_ref)
+            .await?
+            .ok_or_else(|| {
+                StorageError::Context(format!(
+                    "migration source {} disappeared inside one transaction",
+                    memory_ref.id
+                ))
+            })?;
+        let stored_hash = query_as::<Postgres, (String,)>(
+            "SELECT source_sha256 FROM memory_embeddings
+             WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3
+               AND embedding_space_id = $4",
+        )
+        .bind(namespace_id)
+        .bind(memory_type_str(memory_ref.memory_type))
+        .bind(memory_ref.id)
+        .bind(&target_space_id.0)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(sqlx_to_io)?
+        .map(|row| row.0);
+        match stored_hash {
+            None => coverage.missing += 1,
+            Some(hash) if hash != canonical_embedding_source_sha256(&memory) => {
+                coverage.stale += 1;
+            }
+            Some(_) => {}
+        }
+    }
+    let pending = query_as::<Postgres, (i64,)>(
+        "SELECT COUNT(*) FROM embedding_backfill_queue
+         WHERE namespace_id = $1 AND status = 'pending'",
+    )
+    .bind(namespace_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(sqlx_to_io)?
+    .0;
+    coverage.pending = usize::try_from(pending).map_err(|error| {
+        StorageError::Context(format!("invalid pending backfill count: {error}"))
+    })?;
+    Ok(coverage)
+}
+
+async fn delete_pg_backfill_item(
+    transaction: &mut Transaction<'_, Postgres>,
+    namespace_id: Uuid,
+    item: &BackfillItem,
+) -> StorageResult<()> {
+    query::<Postgres>(
+        "DELETE FROM embedding_backfill_queue
+         WHERE namespace_id = $1 AND memory_type = $2
+           AND memory_id = $3 AND sequence = $4",
+    )
+    .bind(namespace_id)
+    .bind(memory_type_str(item.memory_ref.memory_type))
+    .bind(item.memory_ref.id)
+    .bind(item.sequence)
+    .execute(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?;
+    Ok(())
+}
+
+async fn enqueue_uncovered_pg_sources(
+    conn: &mut PgConnection,
+    namespace_id: Uuid,
+    target_space_id: &EmbeddingSpaceId,
+) -> StorageResult<()> {
+    for memory_ref in live_memory_refs_for_pg_migration(conn, namespace_id).await? {
+        let Some(memory) = load_memory_without_embedding_pg(conn, namespace_id, memory_ref).await?
+        else {
+            continue;
+        };
+        let source_sha256 = canonical_embedding_source_sha256(&memory);
+        let fresh = query_as::<Postgres, (bool,)>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM memory_embeddings
+                  WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3
+                    AND embedding_space_id = $4 AND source_sha256 = $5
+             )",
+        )
+        .bind(namespace_id)
+        .bind(memory_type_str(memory_ref.memory_type))
+        .bind(memory_ref.id)
+        .bind(&target_space_id.0)
+        .bind(&source_sha256)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(sqlx_to_io)?
+        .0;
+        if fresh {
+            continue;
+        }
+        let already_queued = query_as::<Postgres, (bool,)>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM embedding_backfill_queue
+                  WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3
+                    AND source_sha256 = $4 AND status = 'pending'
+             )",
+        )
+        .bind(namespace_id)
+        .bind(memory_type_str(memory_ref.memory_type))
+        .bind(memory_ref.id)
+        .bind(&source_sha256)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(sqlx_to_io)?
+        .0;
+        if already_queued {
+            continue;
+        }
+        query::<Postgres>(
+            "DELETE FROM embedding_backfill_queue
+             WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3
+               AND status = 'pending'",
+        )
+        .bind(namespace_id)
+        .bind(memory_type_str(memory_ref.memory_type))
+        .bind(memory_ref.id)
+        .execute(&mut *conn)
+        .await
+        .map_err(sqlx_to_io)?;
+        let next_sequence = query_as::<Postgres, (i64,)>(
+            "SELECT MAX(maximum) + 1 FROM (
+                 SELECT COALESCE(MAX(sequence), 0) AS maximum
+                   FROM embedding_backfill_queue WHERE namespace_id = $1
+                 UNION ALL
+                 SELECT barrier_sequence FROM namespace_embedding_state
+                  WHERE namespace_id = $1
+             ) AS bounds",
+        )
+        .bind(namespace_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(sqlx_to_io)?
+        .0;
+        query::<Postgres>(
+            "INSERT INTO embedding_backfill_queue
+             (namespace_id, memory_type, memory_id, source_sha256, sequence,
+              status, last_error)
+             VALUES ($1, $2, $3, $4, $5, 'pending', NULL)",
+        )
+        .bind(namespace_id)
+        .bind(memory_type_str(memory_ref.memory_type))
+        .bind(memory_ref.id)
+        .bind(source_sha256)
+        .bind(next_sequence)
+        .execute(&mut *conn)
+        .await
+        .map_err(sqlx_to_io)?;
+    }
+    Ok(())
+}
+
 async fn memory_page_from_pg_ids(
     conn: &mut PgConnection,
     namespace_id: Uuid,
@@ -1831,6 +2034,577 @@ impl StorageTrait for PostgresBackend {
             };
             state.validate_joined_space_identities()?;
             Ok(Some(state))
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "space registration, snapshot queueing, and lifecycle transition share one transaction"
+    )]
+    fn begin_embedding_migration(
+        &self,
+        namespace_id: Uuid,
+        target_space: &EmbeddingSpace,
+    ) -> Result<NamespaceEmbeddingState, MigrationError> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            let exists = query_as::<Postgres, (bool,)>(
+                "SELECT EXISTS(SELECT 1 FROM namespaces WHERE id = $1)",
+            )
+            .bind(namespace_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?
+            .0;
+            if !exists {
+                return Err(StorageError::NotFound(format!("namespace {namespace_id}")).into());
+            }
+            let target_id = target_space.id();
+            let canonical_json = target_space.canonical_json();
+            let class = match target_space.class {
+                crate::embedding_space::EmbeddingClass::Real => "real",
+                crate::embedding_space::EmbeddingClass::Mock => "mock",
+                crate::embedding_space::EmbeddingClass::LegacyUnknown => "legacy_unknown",
+            };
+            query::<Postgres>(
+                "INSERT INTO embedding_spaces
+                 (id, canonical_identity_json, class, dimension, created_at)
+                 VALUES ($1, $2, $3, $4, NOW()) ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(&target_id.0)
+            .bind(&canonical_json)
+            .bind(class)
+            .bind(i32::try_from(target_space.dimensions).map_err(|error| {
+                StorageError::Context(format!(
+                    "embedding dimension {} is not representable: {error}",
+                    target_space.dimensions
+                ))
+            })?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            let registered = query_as::<Postgres, (String,)>(
+                "SELECT canonical_identity_json FROM embedding_spaces WHERE id = $1",
+            )
+            .bind(&target_id.0)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?
+            .0;
+            if registered != canonical_json {
+                return Err(StorageError::Context(format!(
+                    "embedding space {} conflicts with registered canonical provenance",
+                    target_id.0
+                ))
+                .into());
+            }
+            let existing = query_as::<Postgres, (String, Option<String>, Option<String>)>(
+                "SELECT state, active_read_space_id, target_space_id
+                 FROM namespace_embedding_state WHERE namespace_id = $1 FOR UPDATE",
+            )
+            .bind(namespace_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            if let Some((phase, _, target)) = &existing
+                && phase == "backfilling"
+                && target.as_deref() == Some(target_id.0.as_str())
+            {
+                transaction.commit().await.map_err(sqlx_to_io)?;
+                return self
+                    .get_namespace_embedding_state(namespace_id)?
+                    .ok_or_else(|| {
+                        StorageError::Context("migration state disappeared".into()).into()
+                    });
+            }
+            let phase =
+                existing
+                    .as_ref()
+                    .map_or(NamespaceEmbeddingPhase::LexicalOnly, |(phase, _, _)| {
+                        NamespaceEmbeddingPhase::parse(phase)
+                            .unwrap_or(NamespaceEmbeddingPhase::LexicalOnly)
+                    });
+            if phase != NamespaceEmbeddingPhase::LexicalOnly
+                || existing
+                    .as_ref()
+                    .is_some_and(|(_, active, target)| active.is_some() || target.is_some())
+            {
+                return Err(MigrationError::InvalidTransition {
+                    current: phase,
+                    requested: "start backfill",
+                });
+            }
+            query::<Postgres>("DELETE FROM embedding_backfill_queue WHERE namespace_id = $1")
+                .bind(namespace_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
+            let refs = live_memory_refs_for_pg_migration(&mut transaction, namespace_id).await?;
+            let mut sequence = 0_i64;
+            for memory_ref in refs {
+                let Some(memory) =
+                    load_memory_without_embedding_pg(&mut transaction, namespace_id, memory_ref)
+                        .await?
+                else {
+                    continue;
+                };
+                sequence = sequence
+                    .checked_add(1)
+                    .ok_or_else(|| StorageError::Context("backfill sequence overflow".into()))?;
+                query::<Postgres>(
+                    "INSERT INTO embedding_backfill_queue
+                     (namespace_id, memory_type, memory_id, source_sha256, sequence,
+                      status, last_error)
+                     VALUES ($1, $2, $3, $4, $5, 'pending', NULL)",
+                )
+                .bind(namespace_id)
+                .bind(memory_type_str(memory_ref.memory_type))
+                .bind(memory_ref.id)
+                .bind(canonical_embedding_source_sha256(&memory))
+                .bind(sequence)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
+            }
+            query::<Postgres>(
+                "INSERT INTO namespace_embedding_state
+                 (namespace_id, active_read_space_id, target_space_id, state,
+                  barrier_sequence, updated_at)
+                 VALUES ($1, NULL, $2, 'backfilling', $3, NOW())
+                 ON CONFLICT(namespace_id) DO UPDATE SET
+                     active_read_space_id = NULL,
+                     target_space_id = EXCLUDED.target_space_id,
+                     state = 'backfilling',
+                     barrier_sequence = EXCLUDED.barrier_sequence,
+                     updated_at = EXCLUDED.updated_at",
+            )
+            .bind(namespace_id)
+            .bind(&target_id.0)
+            .bind(sequence)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            self.get_namespace_embedding_state(namespace_id)?
+                .ok_or_else(|| {
+                    StorageError::Context("migration state commit disappeared".into()).into()
+                })
+        })
+    }
+
+    fn page_embedding_backfill(
+        &self,
+        namespace_id: Uuid,
+        target_space_id: &EmbeddingSpaceId,
+        limit: usize,
+    ) -> Result<Vec<BackfillItem>, MigrationError> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "embedding backfill page size must be within 1..={MEMORY_PAGE_SIZE}"
+            ))
+            .into());
+        }
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let target = query_as::<Postgres, (Option<String>,)>(
+                "SELECT target_space_id FROM namespace_embedding_state
+                 WHERE namespace_id = $1 AND state = 'backfilling'",
+            )
+            .bind(namespace_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            if target.and_then(|row| row.0).as_deref() != Some(target_space_id.0.as_str()) {
+                return Err(MigrationError::InvalidTransition {
+                    current: NamespaceEmbeddingPhase::LexicalOnly,
+                    requested: "page backfill",
+                });
+            }
+            let rows = query_as::<Postgres, (String, Uuid, String, i64)>(
+                "SELECT memory_type, memory_id, source_sha256, sequence
+                 FROM embedding_backfill_queue
+                 WHERE namespace_id = $1 AND status = 'pending'
+                 ORDER BY sequence, memory_type, memory_id LIMIT $2",
+            )
+            .bind(namespace_id)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let mut page = Vec::with_capacity(rows.len());
+            for (memory_type, id, source_sha256, sequence) in rows {
+                let memory_ref = MemoryRef {
+                    memory_type: memory_type_from_str(&memory_type)?,
+                    id,
+                };
+                page.push(BackfillItem {
+                    namespace_id,
+                    memory: load_memory_without_embedding_pg(&mut conn, namespace_id, memory_ref)
+                        .await?,
+                    memory_ref,
+                    source_sha256,
+                    sequence,
+                });
+            }
+            Ok(page)
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "source lock, stale requeue, generation write, and queue drain share one transaction"
+    )]
+    fn commit_embedding_backfill_page(
+        &self,
+        namespace_id: Uuid,
+        target_space_id: &EmbeddingSpaceId,
+        commits: &[BackfillCommit],
+    ) -> Result<BackfillOutcome, MigrationError> {
+        if commits.len() > MEMORY_PAGE_SIZE {
+            return Err(StorageError::BudgetExceeded(format!(
+                "embedding backfill commit contains more than {MEMORY_PAGE_SIZE} items"
+            ))
+            .into());
+        }
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            let state = query_as::<Postgres, (String, Option<String>)>(
+                "SELECT state, target_space_id FROM namespace_embedding_state
+                 WHERE namespace_id = $1 FOR UPDATE",
+            )
+            .bind(namespace_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            if state
+                .as_ref()
+                .map(|value| (value.0.as_str(), value.1.as_deref()))
+                != Some(("backfilling", Some(target_space_id.0.as_str())))
+            {
+                return Err(MigrationError::InvalidTransition {
+                    current: NamespaceEmbeddingPhase::LexicalOnly,
+                    requested: "commit backfill page",
+                });
+            }
+            let mut outcome = BackfillOutcome::default();
+            for commit in commits {
+                if commit.item.namespace_id != namespace_id {
+                    return Err(StorageError::Context(
+                        "backfill commit contains an item from another namespace".into(),
+                    )
+                    .into());
+                }
+                outcome.attempted += 1;
+                let source_exists = lock_typed_source(
+                    &mut transaction,
+                    namespace_id,
+                    commit.item.memory_ref,
+                    SourceLockMode::Generation,
+                )
+                .await?;
+                let current = if source_exists {
+                    load_memory_without_embedding_pg(
+                        &mut transaction,
+                        namespace_id,
+                        commit.item.memory_ref,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+                let Some(memory) = current else {
+                    delete_pg_backfill_item(&mut transaction, namespace_id, &commit.item).await?;
+                    outcome.deleted += 1;
+                    continue;
+                };
+                let current_hash = canonical_embedding_source_sha256(&memory);
+                if current_hash != commit.item.source_sha256 {
+                    delete_pg_backfill_item(&mut transaction, namespace_id, &commit.item).await?;
+                    let next_sequence = query_as::<Postgres, (i64,)>(
+                        "SELECT MAX(maximum) + 1 FROM (
+                             SELECT COALESCE(MAX(sequence), 0) AS maximum
+                               FROM embedding_backfill_queue WHERE namespace_id = $1
+                             UNION ALL
+                             SELECT barrier_sequence FROM namespace_embedding_state
+                              WHERE namespace_id = $1
+                         ) AS bounds",
+                    )
+                    .bind(namespace_id)
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .map_err(sqlx_to_io)?
+                    .0;
+                    query::<Postgres>(
+                        "INSERT INTO embedding_backfill_queue
+                         (namespace_id, memory_type, memory_id, source_sha256, sequence,
+                          status, last_error)
+                         VALUES ($1, $2, $3, $4, $5, 'pending', NULL)",
+                    )
+                    .bind(namespace_id)
+                    .bind(memory_type_str(commit.item.memory_ref.memory_type))
+                    .bind(commit.item.memory_ref.id)
+                    .bind(current_hash)
+                    .bind(next_sequence)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(sqlx_to_io)?;
+                    outcome.requeued += 1;
+                    continue;
+                }
+                let record = commit.record.as_ref().ok_or_else(|| {
+                    StorageError::Context("live backfill source has no embedding record".into())
+                })?;
+                if record.embedding_space_id != *target_space_id {
+                    return Err(StorageError::Context(
+                        "backfill record belongs to a different embedding space".into(),
+                    )
+                    .into());
+                }
+                validate_record_matches_memory(record, &memory)?;
+                insert_embedding_in_pg_tx(&mut transaction, record).await?;
+                delete_pg_backfill_item(&mut transaction, namespace_id, &commit.item).await?;
+                outcome.committed += 1;
+            }
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            Ok(outcome)
+        })
+    }
+
+    fn record_embedding_backfill_failure(
+        &self,
+        namespace_id: Uuid,
+        item: &BackfillItem,
+        error: &str,
+    ) -> Result<(), MigrationError> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            query::<Postgres>(
+                "UPDATE embedding_backfill_queue SET last_error = $1
+                 WHERE namespace_id = $2 AND memory_type = $3 AND memory_id = $4
+                   AND sequence = $5 AND status = 'pending'",
+            )
+            .bind(error)
+            .bind(namespace_id)
+            .bind(memory_type_str(item.memory_ref.memory_type))
+            .bind(item.memory_ref.id)
+            .bind(item.sequence)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(())
+        })
+    }
+
+    fn inspect_embedding_migration_coverage(
+        &self,
+        namespace_id: Uuid,
+        target_space_id: &EmbeddingSpaceId,
+    ) -> Result<(MigrationCoverage, NamespaceEmbeddingState), MigrationError> {
+        let coverage = self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            pg_migration_coverage(&mut conn, namespace_id, target_space_id).await
+        })?;
+        let state = self
+            .get_namespace_embedding_state(namespace_id)?
+            .ok_or_else(|| StorageError::NotFound(format!("embedding state {namespace_id}")))?;
+        Ok((coverage, state))
+    }
+
+    fn verify_embedding_migration(
+        &self,
+        namespace_id: Uuid,
+        target_space_id: &EmbeddingSpaceId,
+    ) -> Result<(MigrationCoverage, NamespaceEmbeddingState), MigrationError> {
+        let coverage = self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            query::<Postgres>(
+                "LOCK TABLE episodic_memories, semantic_memories,
+                            procedural_memories, observation_memories IN SHARE MODE",
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            let phase = query_as::<Postgres, (String, Option<String>)>(
+                "SELECT state, target_space_id FROM namespace_embedding_state
+                 WHERE namespace_id = $1 FOR UPDATE",
+            )
+            .bind(namespace_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            let current = phase
+                .as_ref()
+                .map_or(NamespaceEmbeddingPhase::LexicalOnly, |value| {
+                    NamespaceEmbeddingPhase::parse(&value.0)
+                        .unwrap_or(NamespaceEmbeddingPhase::LexicalOnly)
+                });
+            if !matches!(
+                current,
+                NamespaceEmbeddingPhase::Backfilling | NamespaceEmbeddingPhase::Ready
+            ) || phase.as_ref().and_then(|value| value.1.as_deref())
+                != Some(target_space_id.0.as_str())
+            {
+                return Err(MigrationError::InvalidTransition {
+                    current,
+                    requested: "verify coverage",
+                });
+            }
+            let coverage =
+                pg_migration_coverage(&mut transaction, namespace_id, target_space_id).await?;
+            if coverage.complete() {
+                query::<Postgres>(
+                    "UPDATE namespace_embedding_state SET state = 'ready', updated_at = NOW()
+                     WHERE namespace_id = $1 AND target_space_id = $2",
+                )
+                .bind(namespace_id)
+                .bind(&target_space_id.0)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
+            } else {
+                enqueue_uncovered_pg_sources(&mut transaction, namespace_id, target_space_id)
+                    .await?;
+                query::<Postgres>(
+                    "UPDATE namespace_embedding_state
+                     SET state = 'backfilling', updated_at = NOW()
+                     WHERE namespace_id = $1 AND target_space_id = $2",
+                )
+                .bind(namespace_id)
+                .bind(&target_space_id.0)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
+            }
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            Ok(coverage)
+        })?;
+        let state = self
+            .get_namespace_embedding_state(namespace_id)?
+            .ok_or_else(|| StorageError::Context("verified migration state disappeared".into()))?;
+        Ok((coverage, state))
+    }
+
+    fn activate_embedding_migration(
+        &self,
+        namespace_id: Uuid,
+        target_space_id: &EmbeddingSpaceId,
+        runtime_space_id: &EmbeddingSpaceId,
+    ) -> Result<NamespaceEmbeddingState, MigrationError> {
+        if runtime_space_id != target_space_id {
+            return Err(MigrationError::RuntimeSpaceMismatch {
+                runtime: runtime_space_id.0.clone(),
+                target: target_space_id.0.clone(),
+            });
+        }
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            query::<Postgres>(
+                "LOCK TABLE episodic_memories, semantic_memories,
+                            procedural_memories, observation_memories IN SHARE MODE",
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            let phase = query_as::<Postgres, (String, Option<String>)>(
+                "SELECT state, target_space_id FROM namespace_embedding_state
+                 WHERE namespace_id = $1 FOR UPDATE",
+            )
+            .bind(namespace_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            let current = phase
+                .as_ref()
+                .map_or(NamespaceEmbeddingPhase::LexicalOnly, |value| {
+                    NamespaceEmbeddingPhase::parse(&value.0)
+                        .unwrap_or(NamespaceEmbeddingPhase::LexicalOnly)
+                });
+            if current != NamespaceEmbeddingPhase::Ready
+                || phase.as_ref().and_then(|value| value.1.as_deref())
+                    != Some(target_space_id.0.as_str())
+            {
+                return Err(MigrationError::InvalidTransition {
+                    current,
+                    requested: "activate",
+                });
+            }
+            let coverage =
+                pg_migration_coverage(&mut transaction, namespace_id, target_space_id).await?;
+            if !coverage.complete() {
+                return Err(coverage.into());
+            }
+            query::<Postgres>(
+                "UPDATE namespace_embedding_state
+                 SET active_read_space_id = $1, target_space_id = NULL,
+                     state = 'active', updated_at = NOW()
+                 WHERE namespace_id = $2 AND state = 'ready' AND target_space_id = $1",
+            )
+            .bind(&target_space_id.0)
+            .bind(namespace_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            self.get_namespace_embedding_state(namespace_id)?
+                .ok_or_else(|| {
+                    StorageError::Context("activated migration state disappeared".into()).into()
+                })
+        })
+    }
+
+    fn rollback_embedding_migration_to_lexical(
+        &self,
+        namespace_id: Uuid,
+    ) -> Result<NamespaceEmbeddingState, MigrationError> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            let state = query_as::<Postgres, (String, i64)>(
+                "SELECT state, barrier_sequence FROM namespace_embedding_state
+                 WHERE namespace_id = $1 FOR UPDATE",
+            )
+            .bind(namespace_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            let current = state
+                .as_ref()
+                .map_or(NamespaceEmbeddingPhase::LexicalOnly, |value| {
+                    NamespaceEmbeddingPhase::parse(&value.0)
+                        .unwrap_or(NamespaceEmbeddingPhase::LexicalOnly)
+                });
+            if current != NamespaceEmbeddingPhase::Active
+                || state.as_ref().is_none_or(|(_, barrier)| *barrier <= 0)
+            {
+                return Err(MigrationError::InvalidTransition {
+                    current,
+                    requested: "rollback first migration",
+                });
+            }
+            query::<Postgres>(
+                "UPDATE namespace_embedding_state
+                 SET active_read_space_id = NULL, target_space_id = NULL,
+                     state = 'lexical_only', updated_at = NOW()
+                 WHERE namespace_id = $1",
+            )
+            .bind(namespace_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            query::<Postgres>("DELETE FROM embedding_backfill_queue WHERE namespace_id = $1")
+                .bind(namespace_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            self.get_namespace_embedding_state(namespace_id)?
+                .ok_or_else(|| {
+                    StorageError::Context("rolled back migration state disappeared".into()).into()
+                })
         })
     }
 

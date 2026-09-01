@@ -377,6 +377,91 @@ pub trait StorageTrait: Send + Sync {
         ))
     }
 
+    fn begin_embedding_migration(
+        &self,
+        _namespace_id: Uuid,
+        _target_space: &crate::embedding_space::EmbeddingSpace,
+    ) -> Result<bounded::NamespaceEmbeddingState, crate::embedding_migration::MigrationError> {
+        Err(StorageError::Unsupported("embedding migration start".into()).into())
+    }
+
+    fn page_embedding_backfill(
+        &self,
+        _namespace_id: Uuid,
+        _target_space_id: &crate::embedding_space::EmbeddingSpaceId,
+        _limit: usize,
+    ) -> Result<
+        Vec<crate::embedding_migration::BackfillItem>,
+        crate::embedding_migration::MigrationError,
+    > {
+        Err(StorageError::Unsupported("embedding migration paging".into()).into())
+    }
+
+    fn commit_embedding_backfill_page(
+        &self,
+        _namespace_id: Uuid,
+        _target_space_id: &crate::embedding_space::EmbeddingSpaceId,
+        _commits: &[crate::embedding_migration::BackfillCommit],
+    ) -> Result<
+        crate::embedding_migration::BackfillOutcome,
+        crate::embedding_migration::MigrationError,
+    > {
+        Err(StorageError::Unsupported("embedding migration commit".into()).into())
+    }
+
+    fn record_embedding_backfill_failure(
+        &self,
+        _namespace_id: Uuid,
+        _item: &crate::embedding_migration::BackfillItem,
+        _error: &str,
+    ) -> Result<(), crate::embedding_migration::MigrationError> {
+        Err(StorageError::Unsupported("embedding migration retry".into()).into())
+    }
+
+    fn inspect_embedding_migration_coverage(
+        &self,
+        _namespace_id: Uuid,
+        _target_space_id: &crate::embedding_space::EmbeddingSpaceId,
+    ) -> Result<
+        (
+            crate::embedding_migration::MigrationCoverage,
+            bounded::NamespaceEmbeddingState,
+        ),
+        crate::embedding_migration::MigrationError,
+    > {
+        Err(StorageError::Unsupported("embedding migration coverage".into()).into())
+    }
+
+    fn verify_embedding_migration(
+        &self,
+        _namespace_id: Uuid,
+        _target_space_id: &crate::embedding_space::EmbeddingSpaceId,
+    ) -> Result<
+        (
+            crate::embedding_migration::MigrationCoverage,
+            bounded::NamespaceEmbeddingState,
+        ),
+        crate::embedding_migration::MigrationError,
+    > {
+        Err(StorageError::Unsupported("embedding migration verify".into()).into())
+    }
+
+    fn activate_embedding_migration(
+        &self,
+        _namespace_id: Uuid,
+        _target_space_id: &crate::embedding_space::EmbeddingSpaceId,
+        _runtime_space_id: &crate::embedding_space::EmbeddingSpaceId,
+    ) -> Result<bounded::NamespaceEmbeddingState, crate::embedding_migration::MigrationError> {
+        Err(StorageError::Unsupported("embedding migration activation".into()).into())
+    }
+
+    fn rollback_embedding_migration_to_lexical(
+        &self,
+        _namespace_id: Uuid,
+    ) -> Result<bounded::NamespaceEmbeddingState, crate::embedding_migration::MigrationError> {
+        Err(StorageError::Unsupported("embedding migration rollback".into()).into())
+    }
+
     /// Bounded vector retrieval. Backends must opt in explicitly; the
     /// fail-closed default never falls back to a namespace-wide bulk load.
     fn search_vector(

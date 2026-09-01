@@ -4,7 +4,9 @@ use clap::{Parser, Subcommand};
 use pensyve_core::{
     config::RetrievalConfig,
     embedding::OnnxEmbedder,
-    embedding_space::EmbeddingSpace,
+    embedding_migration::{BackfillCancellation, EmbeddingMigration},
+    embedding_space::{EmbeddingClass, EmbeddingSpace, EmbeddingSpaceId},
+    network_policy::NetworkPolicy,
     reranker::Reranker,
     retrieval::RecallEngine,
     storage::bounded::{NamespaceEmbeddingPhase, embedding_source_text},
@@ -153,6 +155,44 @@ enum Command {
         /// Namespace to forget memories in
         #[arg(long, default_value = "default")]
         namespace: String,
+    },
+
+    /// Inspect or advance a namespace's bounded embedding migration.
+    EmbeddingSpace {
+        #[command(subcommand)]
+        command: EmbeddingSpaceCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum EmbeddingSpaceCommand {
+    Inspect {
+        #[arg(long)]
+        namespace: uuid::Uuid,
+    },
+    Backfill {
+        #[arg(long)]
+        namespace: uuid::Uuid,
+        #[arg(long)]
+        space_manifest: PathBuf,
+        #[arg(long)]
+        max_items: usize,
+    },
+    Verify {
+        #[arg(long)]
+        namespace: uuid::Uuid,
+        #[arg(long)]
+        space_id: String,
+    },
+    Activate {
+        #[arg(long)]
+        namespace: uuid::Uuid,
+        #[arg(long)]
+        space_id: String,
+    },
+    RollbackLexical {
+        #[arg(long)]
+        namespace: uuid::Uuid,
     },
 }
 
@@ -767,6 +807,166 @@ fn cmd_forget(
     Ok(())
 }
 
+fn open_embedding_space_storage(
+    namespace_id: uuid::Uuid,
+) -> Result<SqliteBackend, Box<dyn std::error::Error>> {
+    let storage = open_storage(&storage_path(&namespace_id.to_string()))?;
+    if storage.get_namespace(namespace_id)?.is_none() {
+        return Err(StorageError::NotFound(format!("namespace {namespace_id}")).into());
+    }
+    Ok(storage)
+}
+
+fn approved_manifest_embedder(
+    manifest: &EmbeddingSpace,
+) -> Result<OnnxEmbedder, Box<dyn std::error::Error>> {
+    if manifest.class != EmbeddingClass::Real {
+        return Err(StorageError::Context(
+            "maintenance CLI requires an approved real embedding-space manifest".into(),
+        )
+        .into());
+    }
+    let embedder = OnnxEmbedder::new_with_policy(&manifest.model_name, &NetworkPolicy::Disabled)?;
+    let runtime_id = embedder.embedding_space()?.id();
+    let manifest_id = manifest.id();
+    if runtime_id != manifest_id {
+        return Err(StorageError::Context(format!(
+            "local runtime space {} does not match approved manifest {}",
+            runtime_id.0, manifest_id.0
+        ))
+        .into());
+    }
+    Ok(embedder)
+}
+
+fn print_embedding_state(
+    state: &pensyve_core::storage::bounded::NamespaceEmbeddingState,
+    format: OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "namespace_id": state.namespace_id,
+                "state": state.phase.as_str(),
+                "active_space_id": state.active_read_space_id.as_ref().map(|id| &id.0),
+                "target_space_id": state.target_space_id.as_ref().map(|id| &id.0),
+                "barrier_sequence": state.barrier_sequence,
+                "updated_at": state.updated_at,
+            }))?
+        ),
+        OutputFormat::Text => println!(
+            "namespace={} state={} active={} target={} barrier={}",
+            state.namespace_id,
+            state.phase.as_str(),
+            state
+                .active_read_space_id
+                .as_ref()
+                .map_or("-", |id| id.0.as_str()),
+            state
+                .target_space_id
+                .as_ref()
+                .map_or("-", |id| id.0.as_str()),
+            state.barrier_sequence,
+        ),
+    }
+    Ok(())
+}
+
+fn cmd_embedding_space(
+    command: &EmbeddingSpaceCommand,
+    format: OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        EmbeddingSpaceCommand::Inspect { namespace } => {
+            let storage = open_embedding_space_storage(*namespace)?;
+            let state = storage
+                .get_namespace_embedding_state(*namespace)?
+                .ok_or_else(|| StorageError::NotFound(format!("embedding state {namespace}")))?;
+            print_embedding_state(&state, format)
+        }
+        EmbeddingSpaceCommand::Backfill {
+            namespace,
+            space_manifest,
+            max_items,
+        } => {
+            let manifest: EmbeddingSpace =
+                serde_json::from_str(&std::fs::read_to_string(space_manifest)?)?;
+            let embedder = approved_manifest_embedder(&manifest)?;
+            let storage = open_embedding_space_storage(*namespace)?;
+            let migration = EmbeddingMigration::new(&storage, &embedder, *namespace);
+            migration.start()?;
+            let outcome = migration.backfill(*max_items, &BackfillCancellation::new())?;
+            match format {
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "attempted": outcome.attempted,
+                        "committed": outcome.committed,
+                        "requeued": outcome.requeued,
+                        "deleted": outcome.deleted,
+                        "cancelled": outcome.cancelled,
+                    }))?
+                ),
+                OutputFormat::Text => println!(
+                    "attempted={} committed={} requeued={} deleted={} cancelled={}",
+                    outcome.attempted,
+                    outcome.committed,
+                    outcome.requeued,
+                    outcome.deleted,
+                    outcome.cancelled,
+                ),
+            }
+            Ok(())
+        }
+        EmbeddingSpaceCommand::Verify {
+            namespace,
+            space_id,
+        } => {
+            let storage = open_embedding_space_storage(*namespace)?;
+            let (coverage, state) = storage
+                .verify_embedding_migration(*namespace, &EmbeddingSpaceId(space_id.clone()))?;
+            if !coverage.complete() {
+                return Err(
+                    pensyve_core::embedding_migration::MigrationError::from(coverage).into(),
+                );
+            }
+            print_embedding_state(&state, format)
+        }
+        EmbeddingSpaceCommand::Activate {
+            namespace,
+            space_id,
+        } => {
+            let storage = open_embedding_space_storage(*namespace)?;
+            let state = storage
+                .get_namespace_embedding_state(*namespace)?
+                .ok_or_else(|| StorageError::NotFound(format!("embedding state {namespace}")))?;
+            let manifest = state.target_space.ok_or_else(|| {
+                StorageError::Context("namespace has no target embedding-space manifest".into())
+            })?;
+            if manifest.id().0 != *space_id {
+                return Err(StorageError::Context(
+                    "requested activation space does not match persisted target".into(),
+                )
+                .into());
+            }
+            let embedder = approved_manifest_embedder(&manifest)?;
+            let runtime_id = embedder.embedding_space()?.id();
+            let active = storage.activate_embedding_migration(
+                *namespace,
+                &EmbeddingSpaceId(space_id.clone()),
+                &runtime_id,
+            )?;
+            print_embedding_state(&active, format)
+        }
+        EmbeddingSpaceCommand::RollbackLexical { namespace } => {
+            let storage = open_embedding_space_storage(*namespace)?;
+            let state = storage.rollback_embedding_migration_to_lexical(*namespace)?;
+            print_embedding_state(&state, format)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -818,6 +1018,8 @@ fn main() {
             hard,
             namespace,
         } => cmd_forget(entity, *hard, namespace, format),
+
+        Command::EmbeddingSpace { command } => cmd_embedding_space(command, format),
     };
 
     if let Err(e) = result {
@@ -831,6 +1033,58 @@ mod tests {
     use super::*;
     use pensyve_core::retrieval::SemanticStatus;
     use pensyve_core::storage::bounded::MemoryRef;
+
+    #[test]
+    fn embedding_space_commands_parse_without_a_model_selector() {
+        let commands = [
+            vec![
+                "pensyve",
+                "embedding-space",
+                "inspect",
+                "--namespace",
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            ],
+            vec![
+                "pensyve",
+                "embedding-space",
+                "backfill",
+                "--namespace",
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                "--space-manifest",
+                "/approved/space.json",
+                "--max-items",
+                "256",
+            ],
+            vec![
+                "pensyve",
+                "embedding-space",
+                "verify",
+                "--namespace",
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                "--space-id",
+                "abc123",
+            ],
+            vec![
+                "pensyve",
+                "embedding-space",
+                "activate",
+                "--namespace",
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                "--space-id",
+                "abc123",
+            ],
+            vec![
+                "pensyve",
+                "embedding-space",
+                "rollback-lexical",
+                "--namespace",
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            ],
+        ];
+        for command in commands {
+            assert!(Cli::try_parse_from(command).is_ok());
+        }
+    }
 
     #[test]
     fn immediate_recall_uses_persisted_embedding() {
