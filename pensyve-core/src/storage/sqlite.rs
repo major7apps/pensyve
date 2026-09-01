@@ -3408,8 +3408,16 @@ impl StorageTrait for SqliteBackend {
         Ok(records)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn page_memories(&self, request: &MemoryPageRequest) -> StorageResult<MemoryPage> {
+        self.page_memories_filtered(request, None)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn page_memories_filtered(
+        &self,
+        request: &MemoryPageRequest,
+        memory_type: Option<MemoryType>,
+    ) -> StorageResult<MemoryPage> {
         if !(1..=MEMORY_PAGE_SIZE).contains(&request.limit) {
             return Err(StorageError::BudgetExceeded(format!(
                 "memory page limit must be within 1..={MEMORY_PAGE_SIZE}"
@@ -3463,9 +3471,10 @@ impl StorageTrait for SqliteBackend {
                      AND (?5 = 0 OR ?5 = 2)
                      AND (?7 OR (superseded_by IS NULL AND invalid_at IS NULL))
                ) AS memories
-               WHERE type_order > ?8 OR (type_order = ?8 AND id > ?9)
+               WHERE (?10 IS NULL OR type_order = ?10)
+                 AND (type_order > ?8 OR (type_order = ?8 AND id > ?9))
                ORDER BY type_order, id
-               LIMIT ?10",
+               LIMIT ?11",
         )?;
         let rows = stmt
             .query_map(
@@ -3479,6 +3488,7 @@ impl StorageTrait for SqliteBackend {
                     request.include_superseded,
                     after_type,
                     after_id,
+                    memory_type.map(memory_type_order),
                     i64::try_from(request.limit + 1).unwrap_or(i64::MAX),
                 ],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),

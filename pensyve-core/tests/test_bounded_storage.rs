@@ -1284,6 +1284,46 @@ fn page_memories_uses_typed_cursor_order_and_omits_inline_embeddings() {
 }
 
 #[test]
+fn page_memories_filters_type_before_limit_and_keeps_typed_cursor_order() {
+    let (_dir, db, namespace) = sqlite_fixture();
+    for id in 1..=300 {
+        save(&db, episodic(namespace.id, id, "nonmatching"));
+    }
+    save(&db, semantic(namespace.id, 20, "semantic-20"));
+    save(&db, semantic(namespace.id, 10, "semantic-10"));
+
+    let first = db
+        .page_memories_filtered(
+            &MemoryPageRequest::new(SearchScope::namespace(namespace.id), None, 1, false).unwrap(),
+            Some(MemoryType::Semantic),
+        )
+        .unwrap();
+    let second = db
+        .page_memories_filtered(
+            &MemoryPageRequest::new(
+                SearchScope::namespace(namespace.id),
+                first.next_cursor.clone(),
+                1,
+                false,
+            )
+            .unwrap(),
+            Some(MemoryType::Semantic),
+        )
+        .unwrap();
+
+    assert_eq!(
+        first.memories.iter().map(memory_key).collect::<Vec<_>>(),
+        vec![(MemoryType::Semantic, Uuid::from_u128(10))]
+    );
+    assert_eq!(
+        second.memories.iter().map(memory_key).collect::<Vec<_>>(),
+        vec![(MemoryType::Semantic, Uuid::from_u128(20))]
+    );
+    assert!(first.next_cursor.is_some());
+    assert!(second.next_cursor.is_none());
+}
+
+#[test]
 fn page_memories_rejects_bypassed_invalid_limits() {
     let (_dir, db, namespace) = sqlite_fixture();
     for limit in [0, 257] {

@@ -3303,11 +3303,19 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    fn page_memories(&self, request: &MemoryPageRequest) -> StorageResult<MemoryPage> {
+        self.page_memories_filtered(request, None)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "one typed union applies every scope mode before cursor order and the page limit"
     )]
-    fn page_memories(&self, request: &MemoryPageRequest) -> StorageResult<MemoryPage> {
+    fn page_memories_filtered(
+        &self,
+        request: &MemoryPageRequest,
+        memory_type: Option<MemoryType>,
+    ) -> StorageResult<MemoryPage> {
         if !(1..=MEMORY_PAGE_SIZE).contains(&request.limit) {
             return Err(StorageError::BudgetExceeded(format!(
                 "memory page limit must be within 1..={MEMORY_PAGE_SIZE}"
@@ -3366,9 +3374,10 @@ impl StorageTrait for PostgresBackend {
                          AND ($5::smallint = 0 OR $5 = 2)
                          AND ($7 OR (superseded_by IS NULL AND invalid_at IS NULL))
                    ) AS memories
-                   WHERE type_order > $8 OR (type_order = $8 AND id > $9)
+                   WHERE ($10::smallint IS NULL OR type_order = $10)
+                     AND (type_order > $8 OR (type_order = $8 AND id > $9))
                    ORDER BY type_order, id
-                   LIMIT $10",
+                   LIMIT $11",
             )
             .bind(request.scope.namespace_id)
             .bind(identity_mode)
@@ -3379,6 +3388,7 @@ impl StorageTrait for PostgresBackend {
             .bind(request.include_superseded)
             .bind(after_type)
             .bind(after_id)
+            .bind(memory_type.map(memory_type_order))
             .bind(i64::try_from(request.limit + 1).unwrap_or(i64::MAX))
             .fetch_all(&mut *conn)
             .await
@@ -7197,6 +7207,30 @@ mod tests {
         assert!(body.contains("namespace_id = $1"));
         assert!(body.contains("superseded_by IS NULL"));
         assert!(body.contains(".bind(namespace_id)"));
+    }
+
+    #[test]
+    fn namespace_page_type_filter_precedes_limit_and_preserves_cursor_order() {
+        let source = include_str!("postgres.rs");
+        let body = source
+            .split_once("fn page_memories_filtered(")
+            .expect("namespace page method")
+            .1
+            .split_once("fn page_entity_memories(")
+            .expect("namespace page terminator")
+            .0;
+        let filter = body
+            .find("type_order = $10")
+            .expect("type filter must be in the SQL relation");
+        let order = body
+            .find("ORDER BY type_order, id")
+            .expect("typed-key order must remain stable");
+        let limit = body
+            .find("LIMIT $11")
+            .expect("page limit must remain bound");
+        assert!(filter < order && order < limit);
+        assert!(body.contains(".bind(memory_type.map(memory_type_order))"));
+        assert!(body.contains(".bind(i64::try_from(request.limit + 1)"));
     }
 
     #[test]

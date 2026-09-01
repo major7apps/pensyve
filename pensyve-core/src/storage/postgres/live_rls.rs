@@ -5326,6 +5326,23 @@ fn bounded_reads_match_sqlite_and_isolate_forced_rls() {
     );
     assert_eq!(postgres_page.next_cursor, sqlite_page.next_cursor);
 
+    let sqlite_filtered = sqlite
+        .page_memories_filtered(&request, Some(MemoryType::Episodic))
+        .expect("sqlite filtered page");
+    let postgres_filtered = postgres
+        .page_memories_filtered(&request, Some(MemoryType::Episodic))
+        .expect("postgres filtered page");
+    assert_eq!(
+        bounded_memory_keys(&postgres_filtered.memories),
+        bounded_memory_keys(&sqlite_filtered.memories)
+    );
+    assert!(
+        postgres_filtered
+            .memories
+            .iter()
+            .all(|memory| MemoryType::of(memory) == MemoryType::Episodic)
+    );
+
     register_embedding_space(&fixture, "bounded-space", "real", 2);
     register_sqlite_embedding_space(sqlite_dir.path(), "bounded-space", 2);
     let source = Memory::Episodic(EpisodicMemory {

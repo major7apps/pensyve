@@ -533,6 +533,18 @@ pub trait StorageTrait: Send + Sync {
         Err(StorageError::Unsupported("bounded memory paging".into()))
     }
 
+    /// Page source memories with an optional memory-type predicate applied
+    /// before the backend page limit.
+    fn page_memories_filtered(
+        &self,
+        _request: &bounded::MemoryPageRequest,
+        _memory_type: Option<bounded::MemoryType>,
+    ) -> StorageResult<bounded::MemoryPage> {
+        Err(StorageError::Unsupported(
+            "bounded filtered memory paging".into(),
+        ))
+    }
+
     /// Page the existing entity-oriented inspect relation in stable typed-key order:
     /// episodic `about_entity`, semantic `subject`, and observation `instance`.
     /// This preserves the public inspect contract without post-filtering a

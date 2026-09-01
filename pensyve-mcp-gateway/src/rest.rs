@@ -26,7 +26,6 @@ use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{
     ContentType, Entity, EntityKind, Episode, EpisodicMemory, Memory, Outcome, SemanticMemory,
 };
-use pensyve_core::vector::VectorIndex;
 use pensyve_mcp_tools::{PensyveState, VectorRuntime};
 
 use crate::AppState;
@@ -554,20 +553,18 @@ async fn memory_with_runtime_embedding(
     .await;
     match result {
         Ok(Ok(embedding)) => set_memory_embedding(&mut memory, embedding),
-        Ok(Err(error)) if ps.vector_runtime.semantic_space().is_some() => {
+        Ok(Err(error)) => {
             return Err(RestError(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Embedding failed: {error}"),
             ));
         }
-        Err(error) if ps.vector_runtime.semantic_space().is_some() => {
+        Err(error) => {
             return Err(RestError(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Embedding task failed: {error}"),
             ));
         }
-        Ok(Err(error)) => tracing::warn!("Compatibility embedding failed: {error}"),
-        Err(error) => tracing::warn!("Compatibility embedding task panicked: {error}"),
     }
     Ok(memory)
 }
@@ -610,10 +607,6 @@ async fn remember_in_state(
         ps.vector_runtime.semantic_space(),
         &memory,
     )?;
-    if let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime {
-        let mut index = vector_index.write().await;
-        add_compatibility_index(&memory, &mut index);
-    }
     Ok(memory)
 }
 
@@ -633,24 +626,8 @@ fn save_memory(
     })
 }
 
-fn add_compatibility_index(memory: &Memory, vector_index: &mut VectorIndex) {
-    let result = match memory {
-        Memory::Semantic(memory) => {
-            vector_index.add_with_entity(memory.id, &memory.embedding, memory.subject)
-        }
-        Memory::Episodic(memory) => {
-            vector_index.add_with_entity(memory.id, &memory.embedding, memory.about_entity)
-        }
-        Memory::Procedural(memory) => vector_index.add(memory.id, &memory.embedding),
-        Memory::Observation(_) => Ok(()),
-    };
-    if let Err(error) = result {
-        tracing::warn!("Failed to update compatibility vector index: {error}");
-    }
-}
-
 fn runtime_wants_embedding(runtime: &VectorRuntime) -> bool {
-    runtime.semantic_space().is_some() || matches!(runtime, VectorRuntime::InMemory(_))
+    runtime.semantic_space().is_some()
 }
 
 /// Extract the optional `event_time` from a memory as an ISO 8601 string.
@@ -794,12 +771,6 @@ async fn perform_supersession(
         ));
     }
 
-    if let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime {
-        let mut vector_index = vector_index.write().await;
-        add_compatibility_index(&new, &mut vector_index);
-        let _ = vector_index.remove(memory_id);
-    }
-
     let _ = ps.storage.log_activity(
         ps.namespace.id,
         "supersede",
@@ -925,10 +896,7 @@ async fn recall(
         None
     };
 
-    // Embed the query BEFORE acquiring the read lock — embedding serializes on
-    // a Mutex, so holding the vector index lock while waiting would block reads.
-    let semantic_enabled = matches!(ps.vector_runtime, VectorRuntime::InMemory(_))
-        || ps.vector_runtime.semantic_space().is_some();
+    let semantic_enabled = ps.vector_runtime.semantic_space().is_some();
     let query_embedding = if semantic_enabled {
         let embedder = ps.embedder.clone();
         let query_text = body.query.clone();
@@ -940,13 +908,11 @@ async fn recall(
         None
     };
 
-    // Resolve the reranker off the runtime too, and before the read lock:
-    // first resolution synchronously loads a ~280MB ONNX model (or blocks on
-    // a failed network attempt), and `OnceLock::get_or_init` blocks every
-    // concurrent caller until it completes — see `PensyveState::reranker`'s
-    // docs. Running it on a tokio worker thread would stall the runtime;
-    // running it under the vector index lock would stall every other recall
-    // on this tenant.
+    // Resolve the reranker off the runtime too: first resolution synchronously
+    // loads a ~280MB ONNX model (or blocks on a failed network attempt), and
+    // `OnceLock::get_or_init` blocks every concurrent caller until it completes
+    // — see `PensyveState::reranker`'s docs. Running it on a tokio worker thread
+    // would stall the runtime.
     let reranker_cell = ps.reranker_cell.clone();
     let reranker =
         tokio::task::spawn_blocking(move || PensyveState::resolve_reranker_cell(&reranker_cell))
@@ -958,46 +924,22 @@ async fn recall(
                 None
             });
 
-    // Hold read lock only for retrieval — allows concurrent recalls.
-    let result = match &ps.vector_runtime {
-        VectorRuntime::InMemory(vector_index) => {
-            let vector_index = vector_index.read().await;
-            let mut engine = RecallEngine::new(
-                ps.storage.as_ref(),
-                &ps.embedder,
-                &vector_index,
-                &ps.retrieval_config,
-            );
-            if let Some(r) = reranker.as_deref() {
-                engine = engine.with_reranker(r);
-            }
-            engine.recall_with_embedding(
-                &body.query,
-                query_embedding.as_deref(),
-                ps.namespace.id,
-                limit,
-                entity_id,
-            )
-        }
-        VectorRuntime::StorageBacked { .. } => {
-            let mut engine = RecallEngine::new_storage_backed_with_vector_space(
-                ps.storage.as_ref(),
-                &ps.embedder,
-                ps.vector_runtime.semantic_space(),
-                &ps.retrieval_config,
-            );
-            if let Some(r) = reranker.as_deref() {
-                engine = engine.with_reranker(r);
-            }
-            engine.recall_with_embedding(
-                &body.query,
-                query_embedding.as_deref(),
-                ps.namespace.id,
-                limit,
-                entity_id,
-            )
-        }
-    };
+    let mut engine = RecallEngine::new_storage_backed_with_vector_space(
+        ps.storage.as_ref(),
+        &ps.embedder,
+        ps.vector_runtime.semantic_space(),
+        &ps.retrieval_config,
+    );
+    if let Some(r) = reranker.as_deref() {
+        engine = engine.with_reranker(r);
+    }
+    let result = engine.recall_with_embedding(
+        &body.query,
+        query_embedding.as_deref(),
+        ps.namespace.id,
+        limit,
+        entity_id,
+    );
     let result = result.map_err(|e| {
         RestError(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1061,10 +1003,7 @@ async fn recall_grouped(
     let order = parse_recall_grouped_order(body.order.as_deref())?;
     let max_groups = body.max_groups;
 
-    // Embed the query off the lock — embedding serializes on a Mutex, so
-    // holding the vector index lock during embedding would block reads.
-    let semantic_enabled = matches!(ps.vector_runtime, VectorRuntime::InMemory(_))
-        || ps.vector_runtime.semantic_space().is_some();
+    let semantic_enabled = ps.vector_runtime.semantic_space().is_some();
     let query_embedding = if semantic_enabled {
         let embedder = ps.embedder.clone();
         let query_text = body.query.clone();
@@ -1076,8 +1015,7 @@ async fn recall_grouped(
         None
     };
 
-    // Resolve the reranker off the runtime too, and before the read lock —
-    // see the identical rationale in `recall` above.
+    // Resolve the reranker off the runtime too — see `recall` above.
     let reranker_cell = ps.reranker_cell.clone();
     let reranker =
         tokio::task::spawn_blocking(move || PensyveState::resolve_reranker_cell(&reranker_cell))
@@ -1089,52 +1027,29 @@ async fn recall_grouped(
                 None
             });
 
-    // Hold the read lock only for the actual retrieval call.
-    let flat = match &ps.vector_runtime {
-        VectorRuntime::InMemory(vector_index) => {
-            let vector_index = vector_index.read().await;
-            let mut engine = RecallEngine::new(
-                ps.storage.as_ref(),
-                &ps.embedder,
-                &vector_index,
-                &ps.retrieval_config,
-            );
-            if let Some(r) = reranker.as_deref() {
-                engine = engine.with_reranker(r);
-            }
-            engine.recall_with_embedding(
-                &body.query,
-                query_embedding.as_deref(),
-                ps.namespace.id,
-                limit,
-                None,
-            )
-        }
-        VectorRuntime::StorageBacked { .. } => {
-            let mut engine = RecallEngine::new_storage_backed_with_vector_space(
-                ps.storage.as_ref(),
-                &ps.embedder,
-                ps.vector_runtime.semantic_space(),
-                &ps.retrieval_config,
-            );
-            if let Some(r) = reranker.as_deref() {
-                engine = engine.with_reranker(r);
-            }
-            engine.recall_with_embedding(
-                &body.query,
-                query_embedding.as_deref(),
-                ps.namespace.id,
-                limit,
-                None,
-            )
-        }
+    let mut engine = RecallEngine::new_storage_backed_with_vector_space(
+        ps.storage.as_ref(),
+        &ps.embedder,
+        ps.vector_runtime.semantic_space(),
+        &ps.retrieval_config,
+    );
+    if let Some(r) = reranker.as_deref() {
+        engine = engine.with_reranker(r);
     }
-    .map_err(|e| {
-        RestError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Recall error: {e}"),
+    let flat = engine
+        .recall_with_embedding(
+            &body.query,
+            query_embedding.as_deref(),
+            ps.namespace.id,
+            limit,
+            None,
         )
-    })?;
+        .map_err(|e| {
+            RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Recall error: {e}"),
+            )
+        })?;
     let result = {
         let groups =
             pensyve_core::recall_grouped::group_by_session(flat.memories, order, max_groups);
@@ -1329,12 +1244,12 @@ async fn forget_entity(
             )
         })?;
 
-    // The delete and everything downstream of it — vector-index cleanup, the
-    // activity record, the recall-cache invalidation — run on a spawned task
+    // The delete and everything downstream of it — the activity record and
+    // recall-cache invalidation — run on a spawned task
     // the handler only observes. axum drops handler futures when the client
     // disconnects, and a drop between the committed delete and its bookkeeping
-    // would leave forgotten memories visible in the recall cache and stale
-    // entries in the index; a spawned task is detached from the request, so
+    // would leave forgotten memories visible in the recall cache; a spawned
+    // task is detached from the request, so
     // once the delete starts, its bookkeeping runs to completion regardless.
     let ps_task = ps.clone();
     let redis = state.redis.clone();
@@ -1342,27 +1257,9 @@ async fn forget_entity(
     let entity_id = entity.id;
     let owned_name = entity.name;
     let task = tokio::spawn(async move {
-        let mut outcome = forget_entity_blocking(&ps_task, entity_id, owned_name).await?;
+        let outcome = forget_entity_blocking(&ps_task, entity_id, owned_name).await?;
         let snapshot = &outcome.snapshot;
         let forgotten_count = snapshot.counts.total;
-
-        // The snapshot holds exactly the rows the delete removed, so it is
-        // also the authoritative list for vector-index cleanup — O(1) per
-        // entry, not O(n) rebuild.
-        if forgotten_count > 0
-            && let VectorRuntime::InMemory(vector_index) = &ps_task.vector_runtime
-        {
-            let mut vi = vector_index.write().await;
-            outcome
-                .artifact
-                .as_mut()
-                .ok_or_else(|| "non-empty snapshot has no pinned artifact".to_string())?
-                .for_each_memory_id(|id| {
-                    let _ = vi.remove(id);
-                    Ok(())
-                })
-                .map_err(|error| error.to_string())?;
-        }
 
         let snapshot_path = outcome
             .path
@@ -1436,12 +1333,6 @@ async fn delete_memory(
             StatusCode::NOT_FOUND,
             format!("Memory {id} not found"),
         ));
-    }
-
-    // Remove single entry from vector index — O(1).
-    if let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime {
-        let mut vi = vector_index.write().await;
-        let _ = vi.remove(memory_id);
     }
 
     let _ = ps.storage.log_activity(
@@ -1774,11 +1665,6 @@ async fn observe(
         ps.vector_runtime.semantic_space(),
         &memory,
     )?;
-    if let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime {
-        let mut index = vector_index.write().await;
-        add_compatibility_index(&memory, &mut index);
-    }
-
     let _ = ps.storage.log_activity(
         ps.namespace.id,
         "observe",
@@ -2041,11 +1927,6 @@ async fn episode_message(
         ps.vector_runtime.semantic_space(),
         &memory,
     )?;
-    if let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime {
-        let mut index = vector_index.write().await;
-        add_compatibility_index(&memory, &mut index);
-    }
-
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -2416,8 +2297,7 @@ async fn feedback(
 // GDPR handler
 // ---------------------------------------------------------------------------
 
-/// Run GDPR erase on the blocking pool. In-memory compatibility states capture
-/// deleted rows for index cleanup; storage-backed states return bounded counts.
+/// Run GDPR erase on the blocking pool.
 ///
 /// The call is synchronous the whole way down — a rusqlite transaction behind a
 /// mutex on `SQLite`, a `block_on` of an sqlx transaction on Postgres — so it
@@ -2429,24 +2309,12 @@ async fn feedback(
 async fn erase_entity_blocking(
     ps: &PensyveState,
     entity_id: Uuid,
-) -> Result<
-    (
-        pensyve_core::gdpr::ErasureResult,
-        pensyve_core::storage::ErasedRows,
-    ),
-    String,
-> {
+) -> Result<pensyve_core::gdpr::ErasureResult, String> {
     let storage = ps.storage.clone();
     let namespace_id = ps.namespace.id;
-    let needs_captured_rows = matches!(&ps.vector_runtime, VectorRuntime::InMemory(_));
 
     tokio::task::spawn_blocking(move || {
-        if needs_captured_rows {
-            pensyve_core::gdpr::erase_entity_captured(storage.as_ref(), entity_id, namespace_id)
-        } else {
-            pensyve_core::gdpr::erase_entity(storage.as_ref(), entity_id, namespace_id)
-                .map(|result| (result, pensyve_core::storage::ErasedRows::default()))
-        }
+        pensyve_core::gdpr::erase_entity(storage.as_ref(), entity_id, namespace_id)
     })
     .await
     .map_err(|err| format!("GDPR erasure task failed: {err}"))
@@ -2476,37 +2344,12 @@ async fn gdpr_erase(
         }
     };
 
-    // The erase and its vector-index cleanup run on a spawned task the handler
-    // only observes. axum drops handler futures when the client disconnects,
-    // and the cleanup waits on the index write lock *after* the transaction has
-    // committed — a drop in that window leaves index entries pointing at rows
-    // the erase destroyed. That is #268's failure mode with the concurrent
-    // writer replaced by a hang-up, and it needs no writer at all. A spawned
-    // task is detached from the request, so once the erase starts its
-    // bookkeeping runs to completion. Same reasoning and same shape as
-    // `forget_entity` above.
+    // The erase runs on a spawned task the handler only observes. axum drops
+    // handler futures when the client disconnects; detaching the task lets an
+    // erase that has started run to completion. Same shape as `forget_entity`.
     let ps_task = ps.clone();
     let entity_id = entity.id;
-    let task = tokio::spawn(async move {
-        let (result, erased) = erase_entity_blocking(&ps_task, entity_id).await?;
-
-        // The captured rows are exactly what the transaction removed, so they
-        // are also the authoritative list for index cleanup. Listing the ids
-        // beforehand — which this handler used to do — leaves a window in which
-        // a concurrent writer inserts a matching row: the erase deletes it, the
-        // pre-list never saw it, and its index entry survives the request that
-        // was supposed to destroy its content (#268).
-        if !erased.memories.is_empty()
-            && let VectorRuntime::InMemory(vector_index) = &ps_task.vector_runtime
-        {
-            let mut vi = vector_index.write().await;
-            for memory in &erased.memories {
-                let _ = vi.remove(memory.id());
-            }
-        }
-
-        Ok::<_, String>(result)
-    });
+    let task = tokio::spawn(async move { erase_entity_blocking(&ps_task, entity_id).await });
 
     // A panicked task cannot claim "nothing was erased" — the transaction may
     // have committed before the bookkeeping panicked — so the message stays
@@ -2548,8 +2391,7 @@ async fn a2a_recall(
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(5) as usize;
 
-    let semantic_enabled = matches!(ps.vector_runtime, VectorRuntime::InMemory(_))
-        || ps.vector_runtime.semantic_space().is_some();
+    let semantic_enabled = ps.vector_runtime.semantic_space().is_some();
     let query_embedding = if semantic_enabled {
         let embedder = ps.embedder.clone();
         let query_text = query.clone();
@@ -2561,8 +2403,7 @@ async fn a2a_recall(
         None
     };
 
-    // Resolve the reranker off the runtime too, and before the read lock —
-    // see the identical rationale in `recall` above.
+    // Resolve the reranker off the runtime too — see `recall` above.
     let reranker_cell = ps.reranker_cell.clone();
     let reranker =
         tokio::task::spawn_blocking(move || PensyveState::resolve_reranker_cell(&reranker_cell))
@@ -2574,46 +2415,24 @@ async fn a2a_recall(
                 None
             });
 
-    let result = match &ps.vector_runtime {
-        VectorRuntime::InMemory(vector_index) => {
-            let vector_index = vector_index.read().await;
-            let mut engine = RecallEngine::new(
-                ps.storage.as_ref(),
-                &ps.embedder,
-                &vector_index,
-                &ps.retrieval_config,
-            );
-            if let Some(r) = reranker.as_deref() {
-                engine = engine.with_reranker(r);
-            }
-            engine.recall_with_embedding(
-                &query,
-                query_embedding.as_deref(),
-                ps.namespace.id,
-                limit,
-                None,
-            )
-        }
-        VectorRuntime::StorageBacked { .. } => {
-            let mut engine = RecallEngine::new_storage_backed_with_vector_space(
-                ps.storage.as_ref(),
-                &ps.embedder,
-                ps.vector_runtime.semantic_space(),
-                &ps.retrieval_config,
-            );
-            if let Some(r) = reranker.as_deref() {
-                engine = engine.with_reranker(r);
-            }
-            engine.recall_with_embedding(
-                &query,
-                query_embedding.as_deref(),
-                ps.namespace.id,
-                limit,
-                None,
-            )
-        }
+    let mut engine = RecallEngine::new_storage_backed_with_vector_space(
+        ps.storage.as_ref(),
+        &ps.embedder,
+        ps.vector_runtime.semantic_space(),
+        &ps.retrieval_config,
+    );
+    if let Some(r) = reranker.as_deref() {
+        engine = engine.with_reranker(r);
     }
-    .map_err(|error| format!("Recall error: {error}"))?;
+    let result = engine
+        .recall_with_embedding(
+            &query,
+            query_embedding.as_deref(),
+            ps.namespace.id,
+            limit,
+            None,
+        )
+        .map_err(|error| format!("Recall error: {error}"))?;
     let memories: Vec<serde_json::Value> = result
         .memories
         .iter()
@@ -2675,32 +2494,12 @@ async fn a2a_forget(
     // Same fail-closed contract as the REST route and the MCP tool: the
     // snapshot is written inside the delete's transaction, so a snapshot that
     // cannot be written aborts the delete instead of losing rows silently.
-    // Delete plus index cleanup run on a spawned task so a dropped request
-    // cannot abandon the cleanup after the delete commits — same reasoning as
-    // the REST handler above.
+    // Run the delete on a spawned task so a dropped request cannot interrupt it
+    // after it starts — same reasoning as the REST handler above.
     let entity_id = entity.id;
     let owned_name = entity.name;
-    let task = tokio::spawn(async move {
-        let mut outcome = forget_entity_blocking(&ps, entity_id, owned_name).await?;
-        let snapshot = &outcome.snapshot;
-
-        if !snapshot.is_empty()
-            && let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime
-        {
-            let mut vi = vector_index.write().await;
-            outcome
-                .artifact
-                .as_mut()
-                .ok_or_else(|| "non-empty snapshot has no pinned artifact".to_string())?
-                .for_each_memory_id(|id| {
-                    let _ = vi.remove(id);
-                    Ok(())
-                })
-                .map_err(|error| error.to_string())?;
-        }
-
-        Ok::<_, String>(outcome)
-    });
+    let task =
+        tokio::spawn(async move { forget_entity_blocking(&ps, entity_id, owned_name).await });
     let outcome = task
         .await
         .map_err(|err| format!("forget task failed: {err}"))??;
@@ -3098,17 +2897,21 @@ mod tests {
     #[test]
     fn inspect_requires_a_bounded_page() {
         let dir = tempfile::tempdir().unwrap();
-        let (storage, state, _space) = active_rest_state(&dir, "bounded-inspect");
+        let (storage, state, space) = active_rest_state(&dir, "bounded-inspect");
         for index in 0..101 {
-            storage
-                .save_procedural(&ProceduralMemory::new(
-                    state.namespace.id,
-                    format!("trigger {index}"),
-                    format!("action {index}"),
-                    pensyve_core::types::Outcome::Success,
-                    std::collections::HashMap::new(),
-                ))
+            let mut memory = Memory::Procedural(ProceduralMemory::new(
+                state.namespace.id,
+                format!("trigger {index}"),
+                format!("action {index}"),
+                pensyve_core::types::Outcome::Success,
+                std::collections::HashMap::new(),
+            ));
+            let embedding = state
+                .embedder
+                .embed(&embedding_source_text(&memory))
                 .unwrap();
+            set_memory_embedding(&mut memory, embedding);
+            assert!(save_memory(storage.as_ref(), Some(&space), &memory).is_ok());
         }
 
         for invalid_limit in [0, 201] {

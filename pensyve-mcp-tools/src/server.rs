@@ -8,7 +8,9 @@ use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use uuid::Uuid;
 
 use pensyve_core::retrieval::RecallEngine;
-use pensyve_core::storage::bounded::{MemoryPageRequest, SearchScope, embedding_source_text};
+use pensyve_core::storage::bounded::{
+    MemoryPageRequest, MemoryType, SearchScope, embedding_source_text,
+};
 use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{
     ContentType, Entity, EntityKind, Episode, EpisodicMemory, Memory, Outcome, SemanticMemory,
@@ -72,28 +74,8 @@ fn persist_runtime_memory(state: &PensyveState, memory: &Memory) -> Result<(), S
         .map_err(|error| format!("Error saving memory: {error}"))
 }
 
-async fn add_compatibility_index(state: &PensyveState, memory: &Memory) {
-    let VectorRuntime::InMemory(vector_index) = &state.vector_runtime else {
-        return;
-    };
-    let mut vector_index = vector_index.write().await;
-    let result = match memory {
-        Memory::Semantic(memory) => {
-            vector_index.add_with_entity(memory.id, &memory.embedding, memory.subject)
-        }
-        Memory::Episodic(memory) => {
-            vector_index.add_with_entity(memory.id, &memory.embedding, memory.about_entity)
-        }
-        Memory::Procedural(memory) => vector_index.add(memory.id, &memory.embedding),
-        Memory::Observation(_) => Ok(()),
-    };
-    if let Err(error) = result {
-        tracing::warn!("Failed to update compatibility vector index: {error}");
-    }
-}
-
 fn runtime_wants_embedding(runtime: &VectorRuntime) -> bool {
-    runtime.semantic_space().is_some() || matches!(runtime, VectorRuntime::InMemory(_))
+    runtime.semantic_space().is_some()
 }
 
 fn set_memory_embedding(memory: &mut Memory, embedding: Vec<f32>) {
@@ -129,6 +111,8 @@ pub struct PensyveMcpServer {
     pub state: Arc<PensyveState>,
     pub scope: String,
     admission: Arc<RecallAdmission>,
+    #[cfg(test)]
+    page_memories_call_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[expect(dead_code, reason = "used by #[tool_router] macro via rmcp framework")]
     tool_router: ToolRouter<Self>,
 }
@@ -158,6 +142,8 @@ impl PensyveMcpServer {
             state,
             scope,
             admission,
+            #[cfg(test)]
+            page_memories_call_count: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -230,10 +216,8 @@ impl PensyveMcpServer {
             None
         };
 
-        // Embed the query BEFORE acquiring the read lock — avoids holding the
-        // vector index lock while waiting on the embedding Mutex.
-        let semantic_enabled = matches!(state.vector_runtime, VectorRuntime::InMemory(_))
-            || state.vector_runtime.semantic_space().is_some();
+        // Run embedding off the async worker because ONNX inference is blocking.
+        let semantic_enabled = state.vector_runtime.semantic_space().is_some();
         let query_embedding = if semantic_enabled {
             let embedder = state.embedder.clone();
             let query_text = params.query.clone();
@@ -245,13 +229,12 @@ impl PensyveMcpServer {
             None
         };
 
-        // Resolve the reranker off the runtime too, and before the read
-        // lock: first resolution synchronously loads a ~280MB ONNX model
-        // (or blocks on a failed network attempt), and
+        // Resolve the reranker off the runtime too: first resolution
+        // synchronously loads a ~280MB ONNX model (or blocks on a failed
+        // network attempt), and
         // `OnceLock::get_or_init` blocks every concurrent caller until it
         // completes — see `PensyveState::reranker`'s docs. Running it on a
-        // tokio worker thread would stall the runtime; running it under the
-        // vector index lock would stall every other recall on this tenant.
+        // tokio worker thread would stall the runtime.
         let reranker_cell = state.reranker_cell.clone();
         let reranker = tokio::task::spawn_blocking(move || {
             PensyveState::resolve_reranker_cell(&reranker_cell)
@@ -262,46 +245,22 @@ impl PensyveMcpServer {
             None
         });
 
-        // Hold the read lock only for the retrieval phase, not embedding or serialization.
-        let result = match &state.vector_runtime {
-            VectorRuntime::InMemory(vector_index) => {
-                let vector_index = vector_index.read().await;
-                let mut engine = RecallEngine::new(
-                    state.storage.as_ref(),
-                    &state.embedder,
-                    &vector_index,
-                    &state.retrieval_config,
-                );
-                if let Some(r) = reranker.as_deref() {
-                    engine = engine.with_reranker(r);
-                }
-                engine.recall_with_embedding(
-                    &params.query,
-                    query_embedding.as_deref(),
-                    state.namespace.id,
-                    limit,
-                    target_entity,
-                )
-            }
-            VectorRuntime::StorageBacked { .. } => {
-                let mut engine = RecallEngine::new_storage_backed_with_vector_space(
-                    state.storage.as_ref(),
-                    &state.embedder,
-                    state.vector_runtime.semantic_space(),
-                    &state.retrieval_config,
-                );
-                if let Some(r) = reranker.as_deref() {
-                    engine = engine.with_reranker(r);
-                }
-                engine.recall_with_embedding(
-                    &params.query,
-                    query_embedding.as_deref(),
-                    state.namespace.id,
-                    limit,
-                    target_entity,
-                )
-            }
-        };
+        let mut engine = RecallEngine::new_storage_backed_with_vector_space(
+            state.storage.as_ref(),
+            &state.embedder,
+            state.vector_runtime.semantic_space(),
+            &state.retrieval_config,
+        );
+        if let Some(r) = reranker.as_deref() {
+            engine = engine.with_reranker(r);
+        }
+        let result = engine.recall_with_embedding(
+            &params.query,
+            query_embedding.as_deref(),
+            state.namespace.id,
+            limit,
+            target_entity,
+        );
         let result = result.map_err(|e| format!("Error recalling memories: {e}"))?;
 
         let memories: Vec<serde_json::Value> = result
@@ -397,19 +356,16 @@ impl PensyveMcpServer {
                 Ok(Ok(embedding)) => {
                     set_memory_embedding(&mut memory, embedding);
                 }
-                Ok(Err(err)) if state.vector_runtime.semantic_space().is_some() => {
+                Ok(Err(err)) => {
                     return Err(format!("Embedding failed: {err}"));
                 }
-                Err(err) if state.vector_runtime.semantic_space().is_some() => {
+                Err(err) => {
                     return Err(format!("Embedding task failed: {err}"));
                 }
-                Ok(Err(err)) => tracing::warn!("Compatibility embedding failed: {err}"),
-                Err(err) => tracing::warn!("Compatibility embedding task panicked: {err}"),
             }
         }
 
         persist_runtime_memory(state, &memory)?;
-        add_compatibility_index(state, &memory).await;
 
         let _ = state.storage.log_activity(
             state.namespace.id,
@@ -683,19 +639,16 @@ impl PensyveMcpServer {
                 Ok(Ok(embedding)) => {
                     set_memory_embedding(&mut memory, embedding);
                 }
-                Ok(Err(err)) if state.vector_runtime.semantic_space().is_some() => {
+                Ok(Err(err)) => {
                     return Err(format!("Embedding failed: {err}"));
                 }
-                Err(err) if state.vector_runtime.semantic_space().is_some() => {
+                Err(err) => {
                     return Err(format!("Embedding task failed: {err}"));
                 }
-                Ok(Err(err)) => tracing::warn!("Compatibility embedding failed: {err}"),
-                Err(err) => tracing::warn!("Compatibility embedding task panicked: {err}"),
             }
         }
 
         persist_runtime_memory(state, &memory)?;
-        add_compatibility_index(state, &memory).await;
         let Memory::Episodic(stored) = &memory else {
             unreachable!("observe builds episodic memory")
         };
@@ -762,10 +715,10 @@ impl PensyveMcpServer {
         // #251: the call is synchronous throughout — a rusqlite delete behind
         // a mutex, a serialize that runs to megabytes at #217's scale, and two
         // `sync_all`s — so it goes to the blocking pool rather than parking a
-        // runtime worker. The delete and its bookkeeping (index cleanup, the
-        // activity record) share one spawned task the handler only observes:
-        // a dropped request future cannot abandon the cleanup after the delete
-        // commits. A panicked or cancelled blocking task takes the same
+        // runtime worker. The delete and its activity record share one spawned
+        // task the handler only observes: a dropped request future cannot
+        // abandon the bookkeeping after the delete commits. A panicked or
+        // cancelled blocking task takes the same
         // fail-closed path as a snapshot failure — nothing about the delete
         // can be confirmed, and a panic must not be reported as a successful
         // forget.
@@ -778,7 +731,7 @@ impl PensyveMcpServer {
             let retention = task_state.snapshot_retention;
             let namespace_id = task_state.namespace.id;
             let blocking_name = entity_name.clone();
-            let mut outcome = tokio::task::spawn_blocking(move || {
+            let outcome = tokio::task::spawn_blocking(move || {
                 pensyve_core::snapshot::forget_entity_bounded(
                     storage.as_ref(),
                     entity_id,
@@ -794,26 +747,6 @@ impl PensyveMcpServer {
             .map_err(|err| {
                 format!("Aborted: pre-delete snapshot failed, nothing was deleted: {err}")
             })?;
-
-            let snapshot = &outcome.snapshot;
-
-            // The snapshot holds exactly the rows the delete removed, so it is
-            // also the authoritative list for vector-index cleanup — O(1) per
-            // entry, not an O(n) rebuild.
-            if !snapshot.is_empty()
-                && let VectorRuntime::InMemory(vector_index) = &task_state.vector_runtime
-            {
-                let mut vi = vector_index.write().await;
-                outcome
-                    .artifact
-                    .as_mut()
-                    .ok_or_else(|| "non-empty snapshot has no pinned artifact".to_string())?
-                    .for_each_memory_id(|id| {
-                        let _ = vi.remove(id);
-                        Ok(())
-                    })
-                    .map_err(|error| error.to_string())?;
-            }
 
             let snapshot_path = outcome
                 .path
@@ -907,11 +840,6 @@ impl PensyveMcpServer {
             .delete_memory_by_id_in_namespace(memory_id, state.namespace.id)
             .map_err(|err| format!("Error deleting memory: {err}"))?;
 
-        if deleted && let VectorRuntime::InMemory(vector_index) = &state.vector_runtime {
-            let mut vi = vector_index.write().await;
-            let _ = vi.remove(memory_id);
-        }
-
         let _ = state.storage.log_activity(
             state.namespace.id,
             "forget_memory",
@@ -940,25 +868,41 @@ impl PensyveMcpServer {
         let type_filter = params.memory_type.as_deref();
 
         if params.entity.is_empty() {
-            let mut memories = Vec::new();
-            let mut after = None;
-            loop {
-                let request = MemoryPageRequest::new(
-                    SearchScope::namespace(state.namespace.id),
-                    after,
-                    limit - memories.len(),
-                    false,
-                )
-                .map_err(|err| format!("Error preparing memory page: {err}"))?;
-                let page = state
-                    .storage
-                    .page_memories(&request)
-                    .map_err(|err| format!("Error listing memories: {err}"))?;
-                for memory in page.memories {
+            let memory_type = match type_filter {
+                None => None,
+                Some("episodic") => Some(MemoryType::Episodic),
+                Some("semantic") => Some(MemoryType::Semantic),
+                Some("procedural") => Some(MemoryType::Procedural),
+                Some("observation") => Some(MemoryType::Observation),
+                Some(_) => {
+                    return serde_json::to_string(&serde_json::json!({
+                        "entity": "",
+                        "memory_count": 0,
+                        "memories": [],
+                    }))
+                    .map_err(|e| format!("Serialization error: {e}"));
+                }
+            };
+            let request = MemoryPageRequest::new(
+                SearchScope::namespace(state.namespace.id),
+                None,
+                limit,
+                false,
+            )
+            .map_err(|err| format!("Error preparing memory page: {err}"))?;
+            #[cfg(test)]
+            if let Some(call_count) = &self.page_memories_call_count {
+                call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let page = state
+                .storage
+                .page_memories_filtered(&request, memory_type)
+                .map_err(|err| format!("Error listing memories: {err}"))?;
+            let memories = page
+                .memories
+                .into_iter()
+                .map(|memory| {
                     let type_name = memory_type_name(&memory);
-                    if type_filter.is_some_and(|filter| filter != type_name) {
-                        continue;
-                    }
                     let mut val = match memory {
                         Memory::Episodic(mem) => serde_json::to_value(mem),
                         Memory::Semantic(mem) => serde_json::to_value(mem),
@@ -970,16 +914,9 @@ impl PensyveMcpServer {
                     if let serde_json::Value::Object(ref mut map) = val {
                         map.insert("_type".to_string(), serde_json::json!(type_name));
                     }
-                    memories.push(val);
-                    if memories.len() == limit {
-                        break;
-                    }
-                }
-                if memories.len() == limit || page.next_cursor.is_none() {
-                    break;
-                }
-                after = page.next_cursor;
-            }
+                    val
+                })
+                .collect::<Vec<_>>();
 
             return serde_json::to_string(&serde_json::json!({
                 "entity": "",
@@ -1125,10 +1062,7 @@ impl PensyveMcpServer {
             }
         }
 
-        let vector_count = match &state.vector_runtime {
-            VectorRuntime::InMemory(vector_index) => vector_index.read().await.len(),
-            VectorRuntime::StorageBacked { .. } => 0,
-        };
+        let vector_count = 0;
 
         serde_json::to_string(&serde_json::json!({
             "mode": if state.is_remote { "remote" } else { "local" },
@@ -1268,11 +1202,14 @@ mod tests {
         storage.save_semantic(&object_side).unwrap();
 
         let embedder = OnnxEmbedder::new_mock(64);
-        let dimensions = embedder.dimensions();
+        let space = embedder.embedding_space().unwrap().clone();
+        let lifecycle = storage
+            .initialize_local_runtime_space(namespace.id, &space)
+            .unwrap();
         let state = Arc::new(PensyveState {
             storage: Arc::new(storage) as Arc<dyn StorageTrait>,
             embedder: Arc::new(embedder),
-            vector_runtime: VectorRuntime::InMemory(RwLock::new(VectorIndex::new(dimensions, 16))),
+            vector_runtime: VectorRuntime::storage_backed(space, Some(&lifecycle)).unwrap(),
             namespace,
             retrieval_config: test_retrieval_config(),
             is_remote,
@@ -1327,9 +1264,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn namespace_inspect_pages_past_nonmatching_types_without_exceeding_the_limit() {
+    async fn namespace_inspect_filters_in_one_bounded_backend_page() {
         let snapshot_root = tempfile::tempdir().unwrap();
-        let fixture = forget_fixture(snapshot_root.path().join("snapshots"), false);
+        let mut fixture = forget_fixture(snapshot_root.path().join("snapshots"), false);
+        let page_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        fixture.server.page_memories_call_count = Some(Arc::clone(&page_calls));
         let namespace_id = fixture.server.state.namespace.id;
         let episode = Episode::new(namespace_id, Vec::new());
         fixture.server.state.storage.save_episode(&episode).unwrap();
@@ -1361,6 +1300,11 @@ mod tests {
         assert_eq!(response["memory_count"], 1);
         assert_eq!(response["memories"].as_array().unwrap().len(), 1);
         assert_eq!(response["memories"][0]["_type"], "semantic");
+        assert_eq!(
+            page_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "nonmatching corpus size must not amplify synchronous backend page calls"
+        );
     }
 
     #[test]
@@ -1717,9 +1661,7 @@ mod tests {
     use pensyve_core::storage::bounded::MemoryRef;
     use pensyve_core::storage::sqlite::SqliteBackend;
     use pensyve_core::types::{Episode, Namespace};
-    use pensyve_core::vector::VectorIndex;
     use std::sync::OnceLock;
-    use tokio::sync::RwLock;
 
     fn test_retrieval_config() -> RetrievalConfig {
         RetrievalConfig {
@@ -1904,10 +1846,15 @@ mod tests {
         for name in ["tenant-attacker", "tenant-victim"] {
             let namespace = Namespace::new(name);
             storage.save_namespace(&namespace).expect("save namespace");
+            let space = embedder.embedding_space().unwrap().clone();
+            let lifecycle = storage
+                .initialize_local_runtime_space(namespace.id, &space)
+                .expect("initialize runtime space");
             servers.push(PensyveMcpServer::new(Arc::new(PensyveState {
                 storage: storage.clone(),
                 embedder: embedder.clone(),
-                vector_runtime: VectorRuntime::InMemory(RwLock::new(VectorIndex::new(768, 1024))),
+                vector_runtime: VectorRuntime::storage_backed(space, Some(&lifecycle))
+                    .expect("storage-backed runtime"),
                 namespace,
                 retrieval_config: test_retrieval_config(),
                 is_remote: true,

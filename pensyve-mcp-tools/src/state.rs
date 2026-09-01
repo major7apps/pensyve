@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
@@ -12,7 +12,6 @@ use pensyve_core::snapshot::RetentionPolicy;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::bounded::{NamespaceEmbeddingPhase, NamespaceEmbeddingState};
 use pensyve_core::types::Namespace;
-use pensyve_core::vector::VectorIndex;
 
 pub const MIB: usize = 1024 * 1024;
 static RECALL_OVERLOAD_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -127,14 +126,11 @@ pub struct RecallReservation {
     bytes: usize,
 }
 
-/// Vector retrieval mode. Shipping constructors use `StorageBacked`; the
-/// in-memory branch remains only while compatibility callers are converted.
 pub enum VectorRuntime {
     StorageBacked {
         space: Arc<EmbeddingSpace>,
         semantic_active: bool,
     },
-    InMemory(RwLock<VectorIndex>),
 }
 
 impl VectorRuntime {
@@ -198,8 +194,7 @@ impl VectorRuntime {
             Self::StorageBacked {
                 semantic_active: false,
                 ..
-            }
-            | Self::InMemory(_) => None,
+            } => None,
         }
     }
 
@@ -207,7 +202,6 @@ impl VectorRuntime {
     pub fn space(&self) -> &EmbeddingSpace {
         match self {
             Self::StorageBacked { space, .. } => space,
-            Self::InMemory(_) => panic!("in-memory vector runtime has no immutable space"),
         }
     }
 }
