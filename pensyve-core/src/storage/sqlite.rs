@@ -4012,6 +4012,11 @@ impl StorageTrait for SqliteBackend {
                 if page.is_empty() {
                     break;
                 }
+                let page = super::BulkPageGuard::new(
+                    page,
+                    namespace_id,
+                    super::BulkPageKind::SnapshotCapture,
+                );
                 persist_page(&page)?;
                 summary.memories += page.len();
                 summary.embedding_records += page

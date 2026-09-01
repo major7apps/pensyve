@@ -158,6 +158,147 @@ pub struct CapturedMemory {
     pub embeddings: Vec<bounded::EmbeddingRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum BulkPageKind {
+    SnapshotCapture,
+    GdprExport,
+}
+
+pub(crate) fn bounded_bulk_page_size(
+    namespace_id: Uuid,
+    kind: BulkPageKind,
+    requested: usize,
+) -> StorageResult<usize> {
+    #[cfg(test)]
+    bulk_page_probe::record_request(namespace_id, kind, requested);
+    #[cfg(not(test))]
+    let _ = (namespace_id, kind);
+    if !(1..=bounded::MEMORY_PAGE_SIZE).contains(&requested) {
+        return Err(StorageError::BudgetExceeded(format!(
+            "bulk page size must be within 1..={}, got {requested}",
+            bounded::MEMORY_PAGE_SIZE
+        )));
+    }
+    Ok(requested)
+}
+
+pub(crate) struct BulkPageGuard<T> {
+    value: T,
+    #[cfg(test)]
+    _ownership: bulk_page_probe::PageOwnership,
+}
+
+impl<T> BulkPageGuard<T> {
+    pub(crate) fn new(value: T, namespace_id: Uuid, kind: BulkPageKind) -> Self {
+        #[cfg(not(test))]
+        let _ = (namespace_id, kind);
+        Self {
+            value,
+            #[cfg(test)]
+            _ownership: bulk_page_probe::PageOwnership::new(namespace_id, kind),
+        }
+    }
+}
+
+impl<T> std::ops::Deref for BulkPageGuard<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod bulk_page_probe {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    use uuid::Uuid;
+
+    use super::BulkPageKind;
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub(crate) struct Observed {
+        pub(crate) max_requested: usize,
+        pub(crate) live_pages: usize,
+        pub(crate) peak_live_pages: usize,
+        pub(crate) created_pages: usize,
+    }
+
+    type Key = (Uuid, BulkPageKind);
+
+    fn probes() -> &'static Mutex<HashMap<Key, Observed>> {
+        static PROBES: OnceLock<Mutex<HashMap<Key, Observed>>> = OnceLock::new();
+        PROBES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(crate) struct Probe {
+        key: Key,
+    }
+
+    pub(crate) fn start(namespace_id: Uuid, kind: BulkPageKind) -> Probe {
+        let key = (namespace_id, kind);
+        let old = probes().lock().unwrap().insert(key, Observed::default());
+        assert!(old.is_none(), "bulk page probe already active for {key:?}");
+        Probe { key }
+    }
+
+    impl Probe {
+        pub(crate) fn observed(&self) -> Observed {
+            *probes()
+                .lock()
+                .unwrap()
+                .get(&self.key)
+                .expect("bulk page probe is active")
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let observed = probes()
+                .lock()
+                .unwrap()
+                .remove(&self.key)
+                .expect("bulk page probe is active");
+            assert_eq!(observed.live_pages, 0, "a bulk page guard leaked");
+        }
+    }
+
+    pub(crate) fn record_request(namespace_id: Uuid, kind: BulkPageKind, requested: usize) {
+        if let Some(observed) = probes().lock().unwrap().get_mut(&(namespace_id, kind)) {
+            observed.max_requested = observed.max_requested.max(requested);
+        }
+    }
+
+    pub(crate) struct PageOwnership {
+        key: Option<Key>,
+    }
+
+    impl PageOwnership {
+        pub(crate) fn new(namespace_id: Uuid, kind: BulkPageKind) -> Self {
+            let key = (namespace_id, kind);
+            let mut probes = probes().lock().unwrap();
+            let Some(observed) = probes.get_mut(&key) else {
+                return Self { key: None };
+            };
+            observed.live_pages += 1;
+            observed.created_pages += 1;
+            observed.peak_live_pages = observed.peak_live_pages.max(observed.live_pages);
+            Self { key: Some(key) }
+        }
+    }
+
+    impl Drop for PageOwnership {
+        fn drop(&mut self) {
+            if let Some(key) = self.key {
+                let mut probes = probes().lock().unwrap();
+                let observed = probes.get_mut(&key).expect("bulk page probe is active");
+                observed.live_pages -= 1;
+            }
+        }
+    }
+}
+
 /// Constant-size result of a streamed bulk mutation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BulkMutationSummary {

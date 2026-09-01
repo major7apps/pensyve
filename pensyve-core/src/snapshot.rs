@@ -52,7 +52,7 @@
 //! different answer — the two are intentionally separate.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
@@ -277,7 +277,7 @@ pub struct RestoreOutcome {
 }
 
 /// Result of a [`forget_entity_bounded`] call.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ForgetOutcome {
     /// Constant-size manifest for exactly the rows the delete removed.
     pub snapshot: SnapshotManifest,
@@ -285,10 +285,33 @@ pub struct ForgetOutcome {
     /// empty snapshot has nothing to recover, and writing one per call would
     /// let a caller fill the disk by invoking `pensyve_forget` in a loop.
     pub path: Option<PathBuf>,
+    /// Already-open handle for streaming post-commit compatibility cleanup.
+    ///
+    /// Retention may remove `path` after this forget releases its namespace
+    /// lock. Keeping this handle alive pins the exact validated artifact until
+    /// the caller finishes cleanup, without retaining any memory IDs.
+    pub artifact: Option<SnapshotArtifact>,
     /// What retention evicted from this namespace's directory afterwards, and
     /// anything that went wrong doing it. Never affects whether the delete
     /// happened — see [`prune_namespace_dir`].
     pub pruned: PruneOutcome,
+}
+
+/// An already-open streamed snapshot, pinned independently of its directory entry.
+#[derive(Debug)]
+pub struct SnapshotArtifact {
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+impl SnapshotArtifact {
+    /// Stream IDs from the validated artifact through the same open file handle.
+    pub fn for_each_memory_id(
+        &mut self,
+        visit: impl FnMut(Uuid) -> StorageResult<()>,
+    ) -> StorageResult<()> {
+        for_each_memory_id_in_opened_file_with(&mut self.file, visit, || {})
+    }
 }
 
 /// How much snapshot history one namespace directory keeps.
@@ -474,7 +497,7 @@ impl SnapshotStreamWriter {
         Ok(())
     }
 
-    fn finish(mut self) -> StorageResult<(SnapshotManifest, Option<PathBuf>)> {
+    fn finish(mut self) -> StorageResult<(SnapshotManifest, Option<SnapshotArtifact>)> {
         let stream_sha256 = hex::encode(self.digest.clone().finalize());
         let footer = SnapshotStreamFooter {
             kind: "footer".into(),
@@ -482,23 +505,29 @@ impl SnapshotStreamWriter {
             embedding_records: self.embedding_records,
             stream_sha256: stream_sha256.clone(),
         };
-        if self.counts.total == 0 {
-            drop(self.file.take());
-        } else {
-            let footer_bytes = serde_json::to_vec(&footer)?;
-            let file = self
-                .file
-                .as_mut()
-                .ok_or_else(|| StorageError::Context("snapshot writer already finalized".into()))?;
-            file.write_all(&footer_bytes)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            drop(self.file.take());
-            std::fs::rename(&self.temp_path, &self.path)?;
-            sync_dir(&self.dir)?;
-            self.published = true;
-        }
-        let path = (self.counts.total > 0).then(|| self.path.clone());
+        let artifact =
+            if self.counts.total == 0 {
+                drop(self.file.take());
+                None
+            } else {
+                let footer_bytes = serde_json::to_vec(&footer)?;
+                let file = self.file.as_mut().ok_or_else(|| {
+                    StorageError::Context("snapshot writer already finalized".into())
+                })?;
+                file.write_all(&footer_bytes)?;
+                file.write_all(b"\n")?;
+                file.sync_all()?;
+                let file = self.file.take().ok_or_else(|| {
+                    StorageError::Context("snapshot writer already finalized".into())
+                })?;
+                std::fs::rename(&self.temp_path, &self.path)?;
+                sync_dir(&self.dir)?;
+                self.published = true;
+                Some(SnapshotArtifact {
+                    path: self.path.clone(),
+                    file,
+                })
+            };
         Ok((
             SnapshotManifest {
                 format_version: STREAM_FORMAT_VERSION,
@@ -512,7 +541,7 @@ impl SnapshotStreamWriter {
                 embedding_records: self.embedding_records,
                 stream_sha256,
             },
-            path,
+            artifact,
         ))
     }
 }
@@ -610,6 +639,11 @@ fn forget_entity_bounded_with(
     remove_file: fn(&Path) -> std::io::Result<()>,
 ) -> StorageResult<ForgetOutcome> {
     let dir = namespace_dir(snapshot_root, namespace_id);
+    let page_size = crate::storage::bounded_bulk_page_size(
+        namespace_id,
+        crate::storage::BulkPageKind::SnapshotCapture,
+        crate::storage::bounded::MEMORY_PAGE_SIZE,
+    )?;
 
     // Held across the delete, the snapshot write, and the prune that follows —
     // see [`namespace_lock`]. Poisoning is ignored deliberately: the guarded
@@ -657,13 +691,14 @@ fn forget_entity_bounded_with(
     storage.delete_memories_by_entity_paged(
         entity_id,
         namespace_id,
-        crate::storage::bounded::MEMORY_PAGE_SIZE,
+        page_size,
         &mut persist_page,
         &mut finalize,
     )?;
-    let (snapshot, path) = finalized.into_inner().ok_or_else(|| {
+    let (snapshot, artifact) = finalized.into_inner().ok_or_else(|| {
         StorageError::Context("storage backend committed without finalizing snapshot".into())
     })?;
+    let path = artifact.as_ref().map(|artifact| artifact.path.clone());
 
     // Only after the delete committed, and only when it actually left a new
     // file behind: pruning a directory this call did not add to would be
@@ -691,6 +726,7 @@ fn forget_entity_bounded_with(
     Ok(ForgetOutcome {
         snapshot,
         path,
+        artifact,
         pruned,
     })
 }
@@ -1000,6 +1036,7 @@ fn create_owner_only_file(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let file = std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
         .mode(0o600)
@@ -1014,6 +1051,7 @@ fn create_owner_only_file(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(not(unix))]
 fn create_owner_only_file(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
         .open(path)
@@ -1083,12 +1121,22 @@ pub fn restore(
 /// Restore a streamed v2 artifact with bounded memory.
 ///
 /// Pass one validates every frame, canonical source hash, embedding record, count, and the
-/// complete-stream checksum without mutating storage. Pass two reopens the artifact and commits
-/// source/embedding units in atomic pages of at most 256. If a later storage page fails, the
+/// complete-stream checksum without mutating storage. Pass two rewinds that same opened artifact
+/// and commits source/embedding units in atomic pages of at most 256. If a later storage page fails, the
 /// returned error never claims completion and an idempotent retry converges.
 pub fn restore_file(storage: &dyn StorageTrait, path: &Path) -> StorageResult<RestoreOutcome> {
-    let manifest = validate_stream_file(path)?;
-    let file = std::fs::File::open(path)?;
+    let mut file = std::fs::File::open(path)?;
+    restore_opened_file_with(storage, &mut file, || {})
+}
+
+fn restore_opened_file_with(
+    storage: &dyn StorageTrait,
+    file: &mut std::fs::File,
+    after_validation: impl FnOnce(),
+) -> StorageResult<RestoreOutcome> {
+    let manifest = validate_stream_reader(file)?;
+    after_validation();
+    file.rewind()?;
     let mut page = Vec::with_capacity(crate::storage::bounded::MEMORY_PAGE_SIZE);
     let mut outcome = RestoreOutcome::default();
     for line in BufReader::new(file).lines() {
@@ -1131,10 +1179,20 @@ pub fn restore_file(storage: &dyn StorageTrait, path: &Path) -> StorageResult<Re
 /// Stream memory ids from a validated v2 artifact without retaining the corpus.
 pub fn for_each_memory_id(
     path: &Path,
-    mut visit: impl FnMut(Uuid) -> StorageResult<()>,
+    visit: impl FnMut(Uuid) -> StorageResult<()>,
 ) -> StorageResult<()> {
-    validate_stream_file(path)?;
-    let file = std::fs::File::open(path)?;
+    let mut file = std::fs::File::open(path)?;
+    for_each_memory_id_in_opened_file_with(&mut file, visit, || {})
+}
+
+fn for_each_memory_id_in_opened_file_with(
+    file: &mut std::fs::File,
+    mut visit: impl FnMut(Uuid) -> StorageResult<()>,
+    after_validation: impl FnOnce(),
+) -> StorageResult<()> {
+    validate_stream_reader(file)?;
+    after_validation();
+    file.rewind()?;
     for line in BufReader::new(file).lines() {
         let line = line?;
         let value: serde_json::Value = serde_json::from_str(&line)?;
@@ -1146,12 +1204,18 @@ pub fn for_each_memory_id(
     Ok(())
 }
 
+#[cfg(test)]
+fn validate_stream_file(path: &Path) -> StorageResult<SnapshotManifest> {
+    let mut file = std::fs::File::open(path)?;
+    validate_stream_reader(&mut file)
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "framing, order, provenance, count, and checksum validation stay in one linear pass"
 )]
-fn validate_stream_file(path: &Path) -> StorageResult<SnapshotManifest> {
-    let file = std::fs::File::open(path)?;
+fn validate_stream_reader(file: &mut std::fs::File) -> StorageResult<SnapshotManifest> {
+    file.rewind()?;
     let mut reader = BufReader::new(file);
     let mut bytes = Vec::new();
     let mut header: Option<SnapshotStreamHeader> = None;
@@ -1337,6 +1401,7 @@ mod tests {
     use super::*;
     use crate::storage::sqlite::SqliteBackend;
     use crate::types::{Entity, EntityKind, Episode, EpisodicMemory, Namespace, SemanticMemory};
+    use crate::vector::VectorIndex;
     use chrono::{Duration, TimeZone};
 
     struct Fixture {
@@ -2278,6 +2343,56 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_page_guard_owns_at_most_one_real_callback_page() {
+        let f = fixture();
+        let episode = Episode::new(f.namespace.id, vec![f.entity.id]);
+        f.storage.save_episode(&episode).unwrap();
+        for index in 0..257 {
+            f.storage
+                .save_episodic(&EpisodicMemory::new(
+                    f.namespace.id,
+                    episode.id,
+                    f.entity.id,
+                    f.entity.id,
+                    format!("ownership row {index}"),
+                ))
+                .unwrap();
+        }
+        let probe = crate::storage::bulk_page_probe::start(
+            f.namespace.id,
+            crate::storage::BulkPageKind::SnapshotCapture,
+        );
+
+        forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            None,
+            f.namespace.id,
+            &f.dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap();
+
+        let observed = probe.observed();
+        assert_eq!(observed.max_requested, 256);
+        assert_eq!(observed.peak_live_pages, 1);
+        assert_eq!(observed.live_pages, 0);
+        assert_eq!(observed.created_pages, 2);
+    }
+
+    #[test]
+    fn snapshot_caller_rejects_an_oversized_page_request() {
+        let error = crate::storage::bounded_bulk_page_size(
+            Uuid::new_v4(),
+            crate::storage::BulkPageKind::SnapshotCapture,
+            257,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, StorageError::BudgetExceeded(_)));
+    }
+
+    #[test]
     fn restore_rejects_noncanonical_source_hash_with_valid_stream_checksum() {
         let f = fixture();
         seed_one_of_each(&f);
@@ -2357,6 +2472,146 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn restore_second_pass_uses_the_validated_open_file_after_path_retarget() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let outcome = forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            Some("subject"),
+            f.namespace.id,
+            &f.dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap();
+        let path = outcome.path.as_ref().unwrap();
+        let moved = path.with_extension("validated");
+        let mut file = std::fs::File::open(path).unwrap();
+
+        let restored = restore_opened_file_with(&f.storage, &mut file, || {
+            std::fs::rename(path, &moved).unwrap();
+            std::fs::write(path, b"retargeted after validation\n").unwrap();
+        })
+        .unwrap();
+
+        assert_eq!(restored.restored, outcome.snapshot.counts.total);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn id_second_pass_uses_the_validated_open_file_after_path_retarget() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let outcome = forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            Some("subject"),
+            f.namespace.id,
+            &f.dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap();
+        let path = outcome.path.as_ref().unwrap();
+        let moved = path.with_extension("validated");
+        let mut file = std::fs::File::open(path).unwrap();
+        let mut ids = Vec::new();
+
+        for_each_memory_id_in_opened_file_with(
+            &mut file,
+            |id| {
+                ids.push(id);
+                Ok(())
+            },
+            || {
+                std::fs::rename(path, &moved).unwrap();
+                std::fs::write(path, b"retargeted after validation\n").unwrap();
+            },
+        )
+        .unwrap();
+
+        assert_eq!(ids.len(), outcome.snapshot.counts.total);
+    }
+
+    #[test]
+    fn pinned_artifact_survives_a_second_forget_until_both_index_cleanups_finish() {
+        let f = fixture();
+        let mut other = Entity::new("other", EntityKind::User);
+        other.namespace_id = f.namespace.id;
+        f.storage.save_entity(&other).unwrap();
+        let first = SemanticMemory::new(f.namespace.id, f.entity.id, "likes", "rust", 0.9);
+        let second = SemanticMemory::new(f.namespace.id, other.id, "likes", "sqlite", 0.9);
+        f.storage.save_semantic(&first).unwrap();
+        f.storage.save_semantic(&second).unwrap();
+
+        let index = std::sync::Mutex::new(VectorIndex::new(2, 2));
+        index.lock().unwrap().add(first.id, &[1.0, 0.0]).unwrap();
+        index.lock().unwrap().add(second.id, &[0.0, 1.0]).unwrap();
+        let root = f.dir.path().join("snapshots");
+        let policy = RetentionPolicy {
+            max_age_days: None,
+            max_count: Some(1),
+        };
+        let (first_ready_tx, first_ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let storage = &f.storage;
+            let namespace_id = f.namespace.id;
+            let first_entity_id = f.entity.id;
+            let snapshot_root = &root;
+            let compatibility_index = &index;
+            let first_cleanup = scope.spawn(move || {
+                let mut outcome = forget_entity_bounded(
+                    storage,
+                    first_entity_id,
+                    None,
+                    namespace_id,
+                    snapshot_root,
+                    policy,
+                )
+                .unwrap();
+                first_ready_tx.send(outcome.path.clone().unwrap()).unwrap();
+                resume_rx.recv().unwrap();
+                outcome
+                    .artifact
+                    .as_mut()
+                    .expect("non-empty forget returns a pinned artifact")
+                    .for_each_memory_id(|id| {
+                        let _ = compatibility_index.lock().unwrap().remove(id);
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+
+            let first_path = first_ready_rx.recv().unwrap();
+            let mut second_outcome =
+                forget_entity_bounded(&f.storage, other.id, None, f.namespace.id, &root, policy)
+                    .unwrap();
+            #[cfg(unix)]
+            let first_was_pruned = !first_path.exists();
+            let second_cleanup = second_outcome
+                .artifact
+                .as_mut()
+                .expect("non-empty forget returns a pinned artifact")
+                .for_each_memory_id(|id| {
+                    let _ = index.lock().unwrap().remove(id);
+                    Ok(())
+                });
+            resume_tx.send(()).unwrap();
+            first_cleanup.join().unwrap();
+            second_cleanup.unwrap();
+            #[cfg(unix)]
+            assert!(
+                first_was_pruned,
+                "the second forget must prune the first artifact's directory entry"
+            );
+        });
+
+        assert!(index.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn streamed_snapshot_shipping_paths_avoid_legacy_bulk_readers() {
         let source = include_str!("snapshot.rs");
@@ -2374,10 +2629,23 @@ mod tests {
             .split_once("pub fn for_each_memory_id(")
             .expect("streamed restore implementation terminator")
             .0;
+        let ids = source
+            .split_once("/// Stream memory ids from a validated v2 artifact")
+            .expect("streamed id implementation")
+            .1
+            .split_once("fn validate_stream_file(")
+            .expect("streamed id implementation terminator")
+            .0;
 
         for shipping_path in [forget, restore] {
             assert!(!shipping_path.contains("get_all_memories_by_namespace"));
             assert!(!shipping_path.contains("including_superseded"));
         }
+        assert_eq!(restore.matches("File::open").count(), 1);
+        assert!(!restore.contains("validate_stream_file"));
+        assert!(restore.contains("restore_opened_file_with"));
+        assert_eq!(ids.matches("File::open").count(), 1);
+        assert!(!ids.contains("validate_stream_file"));
+        assert!(ids.contains("for_each_memory_id_in_opened_file_with"));
     }
 }

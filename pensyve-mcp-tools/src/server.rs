@@ -748,7 +748,7 @@ impl PensyveMcpServer {
             let retention = task_state.snapshot_retention;
             let namespace_id = task_state.namespace.id;
             let blocking_name = entity_name.clone();
-            let outcome = tokio::task::spawn_blocking(move || {
+            let mut outcome = tokio::task::spawn_blocking(move || {
                 pensyve_core::snapshot::forget_entity_bounded(
                     storage.as_ref(),
                     entity_id,
@@ -772,14 +772,17 @@ impl PensyveMcpServer {
             // entry, not an O(n) rebuild.
             if !snapshot.is_empty()
                 && let VectorRuntime::InMemory(vector_index) = &task_state.vector_runtime
-                && let Some(path) = outcome.path.as_deref()
             {
                 let mut vi = vector_index.write().await;
-                pensyve_core::snapshot::for_each_memory_id(path, |id| {
-                    let _ = vi.remove(id);
-                    Ok(())
-                })
-                .map_err(|error| error.to_string())?;
+                outcome
+                    .artifact
+                    .as_mut()
+                    .ok_or_else(|| "non-empty snapshot has no pinned artifact".to_string())?
+                    .for_each_memory_id(|id| {
+                        let _ = vi.remove(id);
+                        Ok(())
+                    })
+                    .map_err(|error| error.to_string())?;
             }
 
             let snapshot_path = outcome

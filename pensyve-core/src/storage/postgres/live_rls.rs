@@ -3605,11 +3605,259 @@ fn capturing_delete_is_confined_to_its_namespace() {
         path.parent().expect("snapshot parent"),
         crate::snapshot::namespace_dir(snapshot_root.path(), ns_a.id)
     );
-    let reloaded = crate::snapshot::read_file(&path).expect("reload snapshot");
     assert!(
-        !reloaded.memory_ids().contains(&theirs.id),
+        !captured.contains(&theirs.id),
         "namespace B's row leaked into the snapshot file on disk"
     );
+}
+
+#[test]
+fn capturing_delete_live_body_reads_the_streamed_v2_artifact() {
+    let source = include_str!("live_rls.rs");
+    let body = source
+        .split_once("fn capturing_delete_is_confined_to_its_namespace()")
+        .expect("capturing delete live body")
+        .1
+        .split_once("fn capturing_delete_live_body_reads_the_streamed_v2_artifact()")
+        .expect("capturing delete body terminator")
+        .0;
+
+    assert!(!body.contains("snapshot::read_file"));
+    assert!(body.contains("snapshot::for_each_memory_id"));
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one coordinated live fixture proves both conflicting writer classes and exact outcome"
+)]
+fn paged_forget_locks_final_source_and_generation_capture_against_concurrent_writers() {
+    let Some(admin_opts) = skip_notice(
+        "paged_forget_locks_final_source_and_generation_capture_against_concurrent_writers",
+    ) else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    fixture.relax_rls();
+    let backend = &fixture.backend;
+    let namespace = Namespace::new(format!("forget-lock-{}", Uuid::new_v4().simple()));
+    backend
+        .save_namespace(&namespace)
+        .expect("save lock-test namespace");
+    let entity_id = Uuid::new_v4();
+    let source = Memory::Semantic(SemanticMemory::new(
+        namespace.id,
+        entity_id,
+        "status",
+        "captured-before-concurrent-update",
+        0.9,
+    ));
+    register_embedding_space(&fixture, "forget-lock-space", "real", 2);
+    let original_record = embedding_record(&source, "forget-lock-space", vec![1.0, 0.0]);
+    backend
+        .save_memory_with_embedding(&source, Some(&original_record))
+        .expect("save source and original generation");
+    let memory_ref = MemoryRef::from_memory(&source);
+    let pause = super::capture_lock_probe::install(memory_ref);
+    let snapshot_root = tempfile::tempdir().expect("snapshot root");
+    let writer_options = admin_opts
+        .clone()
+        .username(&fixture.role)
+        .password(APP_ROLE_PASSWORD)
+        .database(&fixture.database);
+
+    let (update_done_tx, update_done_rx) = std::sync::mpsc::channel();
+    let (generation_done_tx, generation_done_rx) = std::sync::mpsc::channel();
+    let (outcome, update_rows, generation_result, update_early, generation_early) =
+        std::thread::scope(|scope| {
+            let forget = scope.spawn(|| {
+                crate::snapshot::forget_entity_bounded(
+                    backend,
+                    entity_id,
+                    Some("lock subject"),
+                    namespace.id,
+                    snapshot_root.path(),
+                    crate::snapshot::RetentionPolicy::UNBOUNDED,
+                )
+            });
+            let reached = pause.wait_until_reached(Duration::from_secs(10));
+            if !reached {
+                pause.release();
+                let _ = forget.join();
+                panic!("paged forget never reached the post-capture lock probe");
+            }
+
+            let update_options = writer_options.clone();
+            let update = scope.spawn(move || {
+                let runtime = Runtime::new().expect("update runtime");
+                let rows = runtime.block_on(async {
+                    let pool = PgPoolOptions::new()
+                        .max_connections(1)
+                        .connect_with(update_options)
+                        .await
+                        .expect("connect concurrent updater");
+                    query::<Postgres>(
+                        "UPDATE semantic_memories SET object = $1
+                         WHERE id = $2 AND namespace_id = $3",
+                    )
+                    .bind("concurrent-update")
+                    .bind(memory_ref.id)
+                    .bind(namespace.id)
+                    .execute(&pool)
+                    .await
+                    .expect("run concurrent source update")
+                    .rows_affected()
+                });
+                update_done_tx.send(()).expect("report update completion");
+                rows
+            });
+
+            let generation_options = writer_options.clone();
+            let concurrent_record = embedding_record(&source, "forget-lock-space", vec![0.0, 1.0]);
+            let generation = scope.spawn(move || {
+                let runtime = Runtime::new().expect("generation runtime");
+                let result = runtime.block_on(async {
+                    let pool = PgPoolOptions::new()
+                        .max_connections(1)
+                        .connect_with(generation_options)
+                        .await
+                        .expect("connect concurrent generation writer");
+                    let mut connection = pool.acquire().await.expect("acquire generation writer");
+                    let mut transaction = (&mut *connection)
+                        .begin()
+                        .await
+                        .expect("begin generation write");
+                    let result =
+                        super::insert_embedding_in_pg_tx(&mut transaction, &concurrent_record)
+                            .await
+                            .map_err(|error| error.to_string());
+                    if result.is_ok() {
+                        transaction.commit().await.expect("commit generation write");
+                    }
+                    result
+                });
+                generation_done_tx
+                    .send(())
+                    .expect("report generation completion");
+                result
+            });
+
+            let update_early = update_done_rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_ok();
+            let generation_early = generation_done_rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_ok();
+            pause.release();
+
+            (
+                forget
+                    .join()
+                    .expect("forget thread")
+                    .expect("forget result"),
+                update.join().expect("update thread"),
+                generation.join().expect("generation thread"),
+                update_early,
+                generation_early,
+            )
+        });
+
+    assert!(
+        !update_early,
+        "source update committed while capture was paused"
+    );
+    assert!(
+        !generation_early,
+        "generation insert committed while capture was paused"
+    );
+    assert_eq!(
+        update_rows, 0,
+        "the post-delete update must touch no source"
+    );
+    assert!(
+        generation_result
+            .expect_err("the post-delete generation must fail")
+            .contains("does not exist")
+    );
+    assert_eq!(outcome.snapshot.counts.total, 1);
+    assert_eq!(outcome.snapshot.embedding_records, 1);
+    let mut captured = Vec::new();
+    outcome
+        .artifact
+        .expect("pinned streamed artifact")
+        .for_each_memory_id(|id| {
+            captured.push(id);
+            Ok(())
+        })
+        .expect("stream captured ids");
+    assert_eq!(captured, [memory_ref.id]);
+    assert!(
+        backend
+            .get_semantic_in_namespace(memory_ref.id, namespace.id)
+            .expect("read deleted source")
+            .is_none()
+    );
+    assert_eq!(embedding_count(&fixture, namespace.id), 0);
+}
+
+#[test]
+fn postgres_snapshot_and_gdpr_pages_keep_one_real_page_live() {
+    let Some(admin_opts) = skip_notice("postgres_snapshot_and_gdpr_pages_keep_one_real_page_live")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+    let namespace = Namespace::new(format!("page-guard-{}", Uuid::new_v4().simple()));
+    backend
+        .save_namespace(&namespace)
+        .expect("save page-guard namespace");
+    let entity_id = Uuid::new_v4();
+    for index in 0..257 {
+        backend
+            .save_semantic(&SemanticMemory::new(
+                namespace.id,
+                entity_id,
+                "page",
+                format!("row {index}"),
+                0.9,
+            ))
+            .expect("save page-guard source");
+    }
+
+    let gdpr_probe = crate::storage::bulk_page_probe::start(
+        namespace.id,
+        crate::storage::BulkPageKind::GdprExport,
+    );
+    crate::gdpr::export_entity_data_to_writer(backend, entity_id, namespace.id, &mut Vec::new())
+        .expect("stream GDPR pages");
+    let gdpr = gdpr_probe.observed();
+    assert_eq!(gdpr.max_requested, 256);
+    assert_eq!(gdpr.peak_live_pages, 1);
+    assert_eq!(gdpr.live_pages, 0);
+    assert_eq!(gdpr.created_pages, 2);
+    drop(gdpr_probe);
+
+    let snapshot_probe = crate::storage::bulk_page_probe::start(
+        namespace.id,
+        crate::storage::BulkPageKind::SnapshotCapture,
+    );
+    let snapshot_root = tempfile::tempdir().expect("snapshot root");
+    let outcome = crate::snapshot::forget_entity_bounded(
+        backend,
+        entity_id,
+        Some("page subject"),
+        namespace.id,
+        snapshot_root.path(),
+        crate::snapshot::RetentionPolicy::UNBOUNDED,
+    )
+    .expect("stream snapshot pages");
+    let snapshot = snapshot_probe.observed();
+    assert_eq!(snapshot.max_requested, 256);
+    assert_eq!(snapshot.peak_live_pages, 1);
+    assert_eq!(snapshot.live_pages, 0);
+    assert_eq!(snapshot.created_pages, 2);
+    assert_eq!(outcome.snapshot.counts.total, 257);
 }
 
 /// Only known-safe call sites may take a connection that carries no namespace.

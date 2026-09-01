@@ -1313,10 +1313,185 @@ async fn reconcile_embedding_source_in_pg_tx(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum SourceLockMode {
+    Capture,
+    Generation,
+}
+
+const ENTITY_FORGET_PAGE_REFS_SQL: &str = r"SELECT memory_type, id FROM (
+       SELECT 0 AS type_order, 'episodic'::text AS memory_type, id
+       FROM episodic_memories
+       WHERE namespace_id = $1
+         AND (about_entity = $2 OR source_entity = $2)
+       UNION ALL
+       SELECT 1, 'semantic', id FROM semantic_memories
+       WHERE namespace_id = $1
+         AND (subject = $2 OR object_entity = $2)
+   ) AS memories
+   ORDER BY type_order, id
+   LIMIT $3";
+
+fn typed_source_lock_sql(memory_type: MemoryType, mode: SourceLockMode) -> &'static str {
+    match (memory_type, mode) {
+        (MemoryType::Episodic, SourceLockMode::Capture) => {
+            "SELECT id FROM episodic_memories WHERE id = $1 AND namespace_id = $2 FOR UPDATE"
+        }
+        (MemoryType::Semantic, SourceLockMode::Capture) => {
+            "SELECT id FROM semantic_memories WHERE id = $1 AND namespace_id = $2 FOR UPDATE"
+        }
+        (MemoryType::Procedural, SourceLockMode::Capture) => {
+            "SELECT id FROM procedural_memories WHERE id = $1 AND namespace_id = $2 FOR UPDATE"
+        }
+        (MemoryType::Observation, SourceLockMode::Capture) => {
+            "SELECT id FROM observation_memories WHERE id = $1 AND namespace_id = $2 FOR UPDATE"
+        }
+        (MemoryType::Episodic, SourceLockMode::Generation) => {
+            "SELECT id FROM episodic_memories WHERE id = $1 AND namespace_id = $2 FOR KEY SHARE"
+        }
+        (MemoryType::Semantic, SourceLockMode::Generation) => {
+            "SELECT id FROM semantic_memories WHERE id = $1 AND namespace_id = $2 FOR KEY SHARE"
+        }
+        (MemoryType::Procedural, SourceLockMode::Generation) => {
+            "SELECT id FROM procedural_memories WHERE id = $1 AND namespace_id = $2 FOR KEY SHARE"
+        }
+        (MemoryType::Observation, SourceLockMode::Generation) => {
+            "SELECT id FROM observation_memories WHERE id = $1 AND namespace_id = $2 FOR KEY SHARE"
+        }
+    }
+}
+
+async fn lock_typed_source(
+    conn: &mut PgConnection,
+    namespace_id: Uuid,
+    memory_ref: MemoryRef,
+    mode: SourceLockMode,
+) -> StorageResult<bool> {
+    let row: Option<(Uuid,)> =
+        query_as::<Postgres, _>(typed_source_lock_sql(memory_ref.memory_type, mode))
+            .bind(memory_ref.id)
+            .bind(namespace_id)
+            .fetch_optional(conn)
+            .await
+            .map_err(sqlx_to_io)?;
+    Ok(row.is_some())
+}
+
+async fn lock_typed_source_for_capture(
+    conn: &mut PgConnection,
+    namespace_id: Uuid,
+    memory_ref: MemoryRef,
+) -> StorageResult<bool> {
+    lock_typed_source(conn, namespace_id, memory_ref, SourceLockMode::Capture).await
+}
+
+#[cfg(test)]
+mod capture_lock_probe {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    use super::MemoryRef;
+
+    #[derive(Default)]
+    struct State {
+        reached: bool,
+        released: bool,
+    }
+
+    struct Control {
+        state: Mutex<State>,
+        changed: Condvar,
+    }
+
+    fn controls() -> &'static Mutex<BTreeMap<MemoryRef, Arc<Control>>> {
+        static CONTROLS: OnceLock<Mutex<BTreeMap<MemoryRef, Arc<Control>>>> = OnceLock::new();
+        CONTROLS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    pub(super) struct Pause {
+        memory_ref: MemoryRef,
+        control: Arc<Control>,
+    }
+
+    pub(super) fn install(memory_ref: MemoryRef) -> Pause {
+        let control = Arc::new(Control {
+            state: Mutex::new(State::default()),
+            changed: Condvar::new(),
+        });
+        let old = controls()
+            .lock()
+            .unwrap()
+            .insert(memory_ref, Arc::clone(&control));
+        assert!(old.is_none(), "capture pause already installed");
+        Pause {
+            memory_ref,
+            control,
+        }
+    }
+
+    impl Pause {
+        pub(super) fn wait_until_reached(&self, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            let mut state = self.control.state.lock().unwrap();
+            while !state.reached {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return false;
+                };
+                let (next, timed_out) =
+                    self.control.changed.wait_timeout(state, remaining).unwrap();
+                state = next;
+                if timed_out.timed_out() && !state.reached {
+                    return false;
+                }
+            }
+            true
+        }
+
+        pub(super) fn release(&self) {
+            let mut state = self.control.state.lock().unwrap();
+            state.released = true;
+            self.control.changed.notify_all();
+        }
+    }
+
+    impl Drop for Pause {
+        fn drop(&mut self) {
+            self.release();
+            controls().lock().unwrap().remove(&self.memory_ref);
+        }
+    }
+
+    pub(super) fn after_capture(memory_ref: MemoryRef) {
+        let Some(control) = controls().lock().unwrap().get(&memory_ref).cloned() else {
+            return;
+        };
+        let mut state = control.state.lock().unwrap();
+        state.reached = true;
+        control.changed.notify_all();
+        while !state.released {
+            state = control.changed.wait(state).unwrap();
+        }
+    }
+}
+
 async fn insert_embedding_in_pg_tx(
     transaction: &mut Transaction<'_, Postgres>,
     record: &EmbeddingRecord,
 ) -> StorageResult<()> {
+    if !lock_typed_source(
+        transaction,
+        record.namespace_id,
+        record.memory_ref,
+        SourceLockMode::Generation,
+    )
+    .await?
+    {
+        return Err(StorageError::Context(format!(
+            "embedding source {:?}/{} does not exist in namespace {}",
+            record.memory_ref.memory_type, record.memory_ref.id, record.namespace_id
+        )));
+    }
     let dimension: Option<(i32,)> =
         query_as::<Postgres, _>("SELECT dimension FROM embedding_spaces WHERE id = $1")
             .bind(&record.embedding_space_id.0)
@@ -3423,26 +3598,14 @@ impl StorageTrait for PostgresBackend {
             let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
             let mut summary = BulkMutationSummary::default();
             loop {
-                let refs: Vec<(String, Uuid)> = query_as::<Postgres, _>(
-                    r"SELECT memory_type, id FROM (
-                           SELECT 0 AS type_order, 'episodic'::text AS memory_type, id
-                           FROM episodic_memories
-                           WHERE namespace_id = $1
-                             AND (about_entity = $2 OR source_entity = $2)
-                           UNION ALL
-                           SELECT 1, 'semantic', id FROM semantic_memories
-                           WHERE namespace_id = $1
-                             AND (subject = $2 OR object_entity = $2)
-                       ) AS memories
-                       ORDER BY type_order, id
-                       LIMIT $3",
-                )
-                .bind(namespace_id)
-                .bind(entity_id)
-                .bind(i64::try_from(page_size).unwrap_or(i64::MAX))
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(sqlx_to_io)?;
+                let refs: Vec<(String, Uuid)> =
+                    query_as::<Postgres, _>(ENTITY_FORGET_PAGE_REFS_SQL)
+                        .bind(namespace_id)
+                        .bind(entity_id)
+                        .bind(i64::try_from(page_size).unwrap_or(i64::MAX))
+                        .fetch_all(&mut *tx)
+                        .await
+                        .map_err(sqlx_to_io)?;
                 if refs.is_empty() {
                     break;
                 }
@@ -3452,6 +3615,11 @@ impl StorageTrait for PostgresBackend {
                         memory_type: memory_type_from_str(&memory_type)?,
                         id,
                     };
+                    if !lock_typed_source_for_capture(&mut tx, namespace_id, memory_ref).await? {
+                        return Err(StorageError::Context(format!(
+                            "selected memory {memory_type}/{id} disappeared before capture lock"
+                        )));
+                    }
                     let memory = load_memory_without_embedding_pg(
                         &mut tx,
                         namespace_id,
@@ -3460,7 +3628,7 @@ impl StorageTrait for PostgresBackend {
                     .await?
                     .ok_or_else(|| {
                         StorageError::Context(format!(
-                            "captured memory {memory_type}/{id} disappeared inside transaction"
+                            "locked memory {memory_type}/{id} disappeared before final reread"
                         ))
                     })?;
                     let rows: Vec<(String, String, String)> = query_as::<Postgres, _>(
@@ -3485,6 +3653,8 @@ impl StorageTrait for PostgresBackend {
                             embedding: pgtext_to_embedding(Some(&embedding)),
                         })
                         .collect::<Vec<_>>();
+                    #[cfg(test)]
+                    capture_lock_probe::after_capture(memory_ref);
                     query::<Postgres>(
                         "DELETE FROM memory_embeddings
                          WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3",
@@ -3518,6 +3688,11 @@ impl StorageTrait for PostgresBackend {
                     }
                     page.push(CapturedMemory { memory, embeddings });
                 }
+                let page = super::BulkPageGuard::new(
+                    page,
+                    namespace_id,
+                    super::BulkPageKind::SnapshotCapture,
+                );
                 persist_page(&page)?;
                 summary.memories += page.len();
                 summary.embedding_records += page
@@ -4842,5 +5017,80 @@ mod tests {
             assert!(sql.contains("id = $3 AND namespace_id = $4"));
             assert!(sql.contains("superseded_by IS NULL"));
         }
+    }
+
+    #[test]
+    fn paged_forget_uses_conflicting_namespace_scoped_locks_for_every_source_type() {
+        for (memory_type, table) in [
+            (MemoryType::Episodic, "episodic_memories"),
+            (MemoryType::Semantic, "semantic_memories"),
+            (MemoryType::Procedural, "procedural_memories"),
+            (MemoryType::Observation, "observation_memories"),
+        ] {
+            let capture = typed_source_lock_sql(memory_type, SourceLockMode::Capture);
+            assert!(capture.contains(&format!("FROM {table}")));
+            assert!(capture.contains("WHERE id = $1 AND namespace_id = $2"));
+            assert!(capture.ends_with("FOR UPDATE"));
+
+            let generation = typed_source_lock_sql(memory_type, SourceLockMode::Generation);
+            assert!(generation.contains(&format!("FROM {table}")));
+            assert!(generation.contains("WHERE id = $1 AND namespace_id = $2"));
+            assert!(generation.ends_with("FOR KEY SHARE"));
+        }
+
+        assert!(ENTITY_FORGET_PAGE_REFS_SQL.contains("ORDER BY type_order, id"));
+        let source = include_str!("postgres.rs");
+        let body = source
+            .split_once("fn delete_memories_by_entity_paged(")
+            .expect("paged forget")
+            .1
+            .split_once("/// One-transaction GDPR erase")
+            .expect("paged forget terminator")
+            .0;
+        let lock = body
+            .find("lock_typed_source_for_capture")
+            .expect("source lock");
+        let reread = body[lock..]
+            .find("load_memory_without_embedding_pg")
+            .map(|offset| lock + offset)
+            .expect("source reread");
+        let generations = body[reread..]
+            .find("FROM memory_embeddings")
+            .map(|offset| reread + offset)
+            .expect("generation capture");
+        let delete = body[generations..]
+            .find("DELETE FROM memory_embeddings")
+            .map(|offset| generations + offset)
+            .expect("generation delete");
+        assert!(lock < reread && reread < generations && generations < delete);
+    }
+
+    #[test]
+    fn postgres_bulk_paths_keep_the_page_bound_and_real_page_guard_in_control_flow() {
+        let source = include_str!("postgres.rs");
+        let forget = source
+            .split_once("fn delete_memories_by_entity_paged(")
+            .expect("paged forget")
+            .1
+            .split_once("/// One-transaction GDPR erase")
+            .expect("paged forget terminator")
+            .0;
+        assert!(forget.contains("1..=MEMORY_PAGE_SIZE"));
+        let guard = forget.find("BulkPageGuard::new").expect("real page guard");
+        let callback = forget[guard..]
+            .find("persist_page(&page)")
+            .map(|offset| guard + offset)
+            .expect("guarded page callback");
+        assert!(guard < callback);
+
+        let gdpr = source
+            .split_once("fn page_gdpr_personal_data(")
+            .expect("GDPR page")
+            .1
+            .split_once("fn save_memory_with_embedding(")
+            .expect("GDPR page terminator")
+            .0;
+        assert!(gdpr.contains("1..=MEMORY_PAGE_SIZE"));
+        assert!(gdpr.contains("LIMIT $5"));
     }
 }

@@ -1342,7 +1342,7 @@ async fn forget_entity(
     let entity_id = entity.id;
     let owned_name = entity.name;
     let task = tokio::spawn(async move {
-        let outcome = forget_entity_blocking(&ps_task, entity_id, owned_name).await?;
+        let mut outcome = forget_entity_blocking(&ps_task, entity_id, owned_name).await?;
         let snapshot = &outcome.snapshot;
         let forgotten_count = snapshot.counts.total;
 
@@ -1353,15 +1353,15 @@ async fn forget_entity(
             && let VectorRuntime::InMemory(vector_index) = &ps_task.vector_runtime
         {
             let mut vi = vector_index.write().await;
-            let path = outcome
-                .path
-                .as_deref()
-                .ok_or_else(|| "non-empty snapshot has no artifact path".to_string())?;
-            pensyve_core::snapshot::for_each_memory_id(path, |id| {
-                let _ = vi.remove(id);
-                Ok(())
-            })
-            .map_err(|error| error.to_string())?;
+            outcome
+                .artifact
+                .as_mut()
+                .ok_or_else(|| "non-empty snapshot has no pinned artifact".to_string())?
+                .for_each_memory_id(|id| {
+                    let _ = vi.remove(id);
+                    Ok(())
+                })
+                .map_err(|error| error.to_string())?;
         }
 
         let snapshot_path = outcome
@@ -2652,19 +2652,22 @@ async fn a2a_forget(
     let entity_id = entity.id;
     let owned_name = entity.name;
     let task = tokio::spawn(async move {
-        let outcome = forget_entity_blocking(&ps, entity_id, owned_name).await?;
+        let mut outcome = forget_entity_blocking(&ps, entity_id, owned_name).await?;
         let snapshot = &outcome.snapshot;
 
         if !snapshot.is_empty()
             && let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime
-            && let Some(path) = outcome.path.as_deref()
         {
             let mut vi = vector_index.write().await;
-            pensyve_core::snapshot::for_each_memory_id(path, |id| {
-                let _ = vi.remove(id);
-                Ok(())
-            })
-            .map_err(|error| error.to_string())?;
+            outcome
+                .artifact
+                .as_mut()
+                .ok_or_else(|| "non-empty snapshot has no pinned artifact".to_string())?
+                .for_each_memory_id(|id| {
+                    let _ = vi.remove(id);
+                    Ok(())
+                })
+                .map_err(|error| error.to_string())?;
         }
 
         Ok::<_, String>(outcome)

@@ -205,7 +205,18 @@ pub fn export_entity_data_to_writer(
     let mut memory_records = 0_usize;
     let mut after = None;
     loop {
-        let page = storage.page_gdpr_personal_data(namespace_id, entity_id, after, 256)?;
+        let page_size = crate::storage::bounded_bulk_page_size(
+            namespace_id,
+            crate::storage::BulkPageKind::GdprExport,
+            crate::storage::bounded::MEMORY_PAGE_SIZE,
+        )?;
+        let page =
+            storage.page_gdpr_personal_data(namespace_id, entity_id, after.take(), page_size)?;
+        let page = crate::storage::BulkPageGuard::new(
+            page,
+            namespace_id,
+            crate::storage::BulkPageKind::GdprExport,
+        );
         for memory in &page.memories {
             write_export_frame(
                 writer,
@@ -217,7 +228,7 @@ pub fn export_entity_data_to_writer(
             )?;
             memory_records += 1;
         }
-        after = page.next_cursor;
+        after.clone_from(&page.next_cursor);
         if after.is_none() {
             break;
         }
@@ -447,6 +458,52 @@ mod tests {
         assert_eq!(manifest.total_records, 258);
         let lines = archive.split(|byte| *byte == b'\n').count() - 1;
         assert_eq!(lines, 260, "header + 257 records + entity + footer");
+    }
+
+    #[test]
+    fn gdpr_page_guard_owns_at_most_one_real_export_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteBackend::open(dir.path()).unwrap();
+        let ns = Namespace::new("guarded-export");
+        storage.save_namespace(&ns).unwrap();
+        let mut entity = Entity::new("subject", EntityKind::User);
+        entity.namespace_id = ns.id;
+        storage.save_entity(&entity).unwrap();
+        let episode = Episode::new(ns.id, vec![entity.id]);
+        storage.save_episode(&episode).unwrap();
+        for index in 0..257 {
+            storage
+                .save_episodic(&EpisodicMemory::new(
+                    ns.id,
+                    episode.id,
+                    entity.id,
+                    entity.id,
+                    format!("guarded export row {index}"),
+                ))
+                .unwrap();
+        }
+        let probe =
+            crate::storage::bulk_page_probe::start(ns.id, crate::storage::BulkPageKind::GdprExport);
+
+        export_entity_data_to_writer(&storage, entity.id, ns.id, &mut Vec::new()).unwrap();
+
+        let observed = probe.observed();
+        assert_eq!(observed.max_requested, 256);
+        assert_eq!(observed.peak_live_pages, 1);
+        assert_eq!(observed.live_pages, 0);
+        assert_eq!(observed.created_pages, 2);
+    }
+
+    #[test]
+    fn gdpr_caller_rejects_an_oversized_page_request() {
+        let error = crate::storage::bounded_bulk_page_size(
+            Uuid::new_v4(),
+            crate::storage::BulkPageKind::GdprExport,
+            257,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, StorageError::BudgetExceeded(_)));
     }
 
     #[test]
