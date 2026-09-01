@@ -4,6 +4,9 @@
 //! memories (episodic, semantic, procedural), embeddings, graph edges,
 //! and entity records.
 
+use std::io::Write;
+
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::storage::{ErasedRows, StorageError, StorageTrait};
@@ -47,6 +50,14 @@ pub struct ExportResult {
     pub total_records: usize,
 }
 
+/// Constant-size result of a streamed GDPR export archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportManifest {
+    pub memory_records: usize,
+    pub total_records: usize,
+    pub stream_sha256: String,
+}
+
 /// Execute a GDPR erasure for all data belonging to an entity, and hand back the
 /// rows it removed.
 ///
@@ -85,14 +96,22 @@ pub fn erase_entity_captured(
     Ok((result, erased))
 }
 
-/// [`erase_entity_captured`] for callers with no out-of-band state to clean up
-/// (the CLI, `erase_namespace`). The captured rows are dropped.
+/// Count-only bounded erasure for storage-backed callers with no out-of-band
+/// vector index to clean up (the CLI and `erase_namespace`).
 pub fn erase_entity(
     storage: &dyn StorageTrait,
     entity_id: Uuid,
     namespace_id: Uuid,
 ) -> Result<ErasureResult, StorageError> {
-    erase_entity_captured(storage, entity_id, namespace_id).map(|(result, _)| result)
+    let erased = storage.erase_entity_bounded(entity_id, namespace_id)?;
+    Ok(ErasureResult {
+        memories_deleted: erased.memories,
+        observations_deleted: erased.observations,
+        edges_deleted: erased.edges,
+        entities_deleted: erased.entities,
+        complete: true,
+        warnings: Vec::new(),
+    })
 }
 
 /// Execute a GDPR erasure for ALL entities in a namespace.
@@ -130,6 +149,10 @@ pub fn erase_namespace(
 
 /// Export all data for an entity (DSAR — Data Subject Access Request).
 ///
+/// This materializing collector remains for compatibility and test fixtures.
+/// Shipping exporters should call [`export_entity_data_to_writer`] so the
+/// corpus is never retained in memory.
+///
 /// Under GDPR Art. 15 the data subject has the right to receive all personal
 /// data, including data **derived** from their conversations. Observations
 /// extracted from episodes the entity participated in are derived personal
@@ -139,73 +162,16 @@ pub fn export_entity_data(
     entity_id: Uuid,
     namespace_id: Uuid,
 ) -> Result<ExportResult, StorageError> {
-    use std::collections::HashSet;
-
-    let all_memories = storage.get_all_memories_by_namespace(namespace_id)?;
-
-    // First pass: collect the entity's episodic + semantic memories AND the
-    // set of episode IDs that the entity participated in.
-    let mut entity_episode_ids: HashSet<Uuid> = HashSet::new();
-    let mut exports: Vec<String> = Vec::new();
-
-    for m in &all_memories {
-        match m {
-            Memory::Episodic(e) if e.about_entity == entity_id || e.source_entity == entity_id => {
-                entity_episode_ids.insert(e.episode_id);
-                exports.push(
-                    serde_json::json!({
-                        "type": "episodic",
-                        "id": e.id.to_string(),
-                        "episode_id": e.episode_id.to_string(),
-                        "content": e.content,
-                        "timestamp": e.timestamp.to_rfc3339(),
-                    })
-                    .to_string(),
-                );
-            }
-            Memory::Semantic(s) if s.subject == entity_id => {
-                exports.push(
-                    serde_json::json!({
-                        "type": "semantic",
-                        "id": s.id.to_string(),
-                        "subject": s.subject.to_string(),
-                        "predicate": s.predicate,
-                        "object": s.object,
-                    })
-                    .to_string(),
-                );
-            }
-            _ => {}
+    let mut exports = Vec::new();
+    let mut after = None;
+    loop {
+        let page = storage.page_gdpr_personal_data(namespace_id, entity_id, after, 256)?;
+        exports.extend(page.memories.iter().map(personal_memory_json));
+        after = page.next_cursor;
+        if after.is_none() {
+            break;
         }
     }
-
-    // Second pass: include observations whose source episode the entity
-    // participated in. Under GDPR these are derived personal data and must
-    // be part of the DSAR response.
-    for m in &all_memories {
-        if let Memory::Observation(o) = m
-            && entity_episode_ids.contains(&o.episode_id)
-        {
-            exports.push(
-                serde_json::json!({
-                    "type": "observation",
-                    "id": o.id.to_string(),
-                    "episode_id": o.episode_id.to_string(),
-                    "entity_type": o.entity_type,
-                    "instance": o.instance,
-                    "action": o.action,
-                    "quantity": o.quantity,
-                    "unit": o.unit,
-                    "content": o.content,
-                    "confidence": o.confidence,
-                    "event_time": o.event_time.map(|t| t.to_rfc3339()),
-                    "created_at": o.created_at.to_rfc3339(),
-                })
-                .to_string(),
-            );
-        }
-    }
-
     let total = exports.len();
 
     Ok(ExportResult {
@@ -213,6 +179,122 @@ pub fn export_entity_data(
         entities: vec![serde_json::json!({"id": entity_id.to_string()}).to_string()],
         total_records: total + 1,
     })
+}
+
+/// Stream a deterministic, checksummed GDPR export directly to `writer`.
+///
+/// The SHA-256 covers the exact UTF-8 bytes of the header, memory records, and entity record,
+/// including each trailing newline. The footer is excluded because it carries the digest.
+pub fn export_entity_data_to_writer(
+    storage: &dyn StorageTrait,
+    entity_id: Uuid,
+    namespace_id: Uuid,
+    writer: &mut dyn Write,
+) -> Result<ExportManifest, StorageError> {
+    let mut digest = Sha256::new();
+    write_export_frame(
+        writer,
+        &mut digest,
+        &serde_json::json!({
+            "kind": "header",
+            "format_version": 1,
+            "namespace_id": namespace_id.to_string(),
+            "entity_id": entity_id.to_string(),
+        }),
+    )?;
+    let mut memory_records = 0_usize;
+    let mut after = None;
+    loop {
+        let page = storage.page_gdpr_personal_data(namespace_id, entity_id, after, 256)?;
+        for memory in &page.memories {
+            write_export_frame(
+                writer,
+                &mut digest,
+                &serde_json::json!({
+                    "kind": "memory",
+                    "record": personal_memory_value(memory),
+                }),
+            )?;
+            memory_records += 1;
+        }
+        after = page.next_cursor;
+        if after.is_none() {
+            break;
+        }
+    }
+    write_export_frame(
+        writer,
+        &mut digest,
+        &serde_json::json!({
+            "kind": "entity",
+            "id": entity_id.to_string(),
+        }),
+    )?;
+    let stream_sha256 = hex::encode(digest.finalize());
+    let footer = serde_json::to_vec(&serde_json::json!({
+        "kind": "footer",
+        "memory_records": memory_records,
+        "total_records": memory_records + 1,
+        "stream_sha256": stream_sha256,
+    }))?;
+    writer.write_all(&footer)?;
+    writer.write_all(b"\n")?;
+    Ok(ExportManifest {
+        memory_records,
+        total_records: memory_records + 1,
+        stream_sha256,
+    })
+}
+
+fn write_export_frame(
+    writer: &mut dyn Write,
+    digest: &mut Sha256,
+    value: &serde_json::Value,
+) -> Result<(), StorageError> {
+    let bytes = serde_json::to_vec(value)?;
+    writer.write_all(&bytes)?;
+    writer.write_all(b"\n")?;
+    digest.update(&bytes);
+    digest.update(b"\n");
+    Ok(())
+}
+
+fn personal_memory_json(memory: &Memory) -> String {
+    personal_memory_value(memory).to_string()
+}
+
+fn personal_memory_value(memory: &Memory) -> serde_json::Value {
+    match memory {
+        Memory::Episodic(memory) => serde_json::json!({
+            "type": "episodic",
+            "id": memory.id.to_string(),
+            "episode_id": memory.episode_id.to_string(),
+            "content": memory.content,
+            "timestamp": memory.timestamp.to_rfc3339(),
+        }),
+        Memory::Semantic(memory) => serde_json::json!({
+            "type": "semantic",
+            "id": memory.id.to_string(),
+            "subject": memory.subject.to_string(),
+            "predicate": memory.predicate,
+            "object": memory.object,
+        }),
+        Memory::Observation(memory) => serde_json::json!({
+            "type": "observation",
+            "id": memory.id.to_string(),
+            "episode_id": memory.episode_id.to_string(),
+            "entity_type": memory.entity_type,
+            "instance": memory.instance,
+            "action": memory.action,
+            "quantity": memory.quantity,
+            "unit": memory.unit,
+            "content": memory.content,
+            "confidence": memory.confidence,
+            "event_time": memory.event_time.map(|time| time.to_rfc3339()),
+            "created_at": memory.created_at.to_rfc3339(),
+        }),
+        Memory::Procedural(_) => unreachable!("GDPR personal-data pages exclude procedures"),
+    }
 }
 
 #[cfg(test)]
@@ -332,5 +414,62 @@ mod tests {
 
         let result = erase_namespace(&storage, ns.id).unwrap();
         assert!(result.complete);
+    }
+
+    #[test]
+    fn gdpr_export_is_page_streamed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteBackend::open(dir.path()).unwrap();
+        let ns = Namespace::new("streamed-export");
+        storage.save_namespace(&ns).unwrap();
+        let mut entity = Entity::new("subject", EntityKind::User);
+        entity.namespace_id = ns.id;
+        storage.save_entity(&entity).unwrap();
+        let episode = Episode::new(ns.id, vec![entity.id]);
+        storage.save_episode(&episode).unwrap();
+        for index in 0..257 {
+            storage
+                .save_episodic(&EpisodicMemory::new(
+                    ns.id,
+                    episode.id,
+                    entity.id,
+                    entity.id,
+                    format!("export row {index}"),
+                ))
+                .unwrap();
+        }
+
+        let mut archive = Vec::new();
+        let manifest =
+            export_entity_data_to_writer(&storage, entity.id, ns.id, &mut archive).unwrap();
+
+        assert_eq!(manifest.memory_records, 257);
+        assert_eq!(manifest.total_records, 258);
+        let lines = archive.split(|byte| *byte == b'\n').count() - 1;
+        assert_eq!(lines, 260, "header + 257 records + entity + footer");
+    }
+
+    #[test]
+    fn gdpr_shipping_paths_avoid_legacy_bulk_readers() {
+        let source = include_str!("gdpr.rs");
+        let erase = source
+            .split_once("pub fn erase_entity(")
+            .expect("bounded erase implementation")
+            .1
+            .split_once("pub fn erase_namespace(")
+            .expect("bounded erase implementation terminator")
+            .0;
+        let export = source
+            .split_once("pub fn export_entity_data_to_writer(")
+            .expect("streamed export implementation")
+            .1
+            .split_once("fn write_export_frame(")
+            .expect("streamed export implementation terminator")
+            .0;
+
+        for shipping_path in [erase, export] {
+            assert!(!shipping_path.contains("get_all_memories_by_namespace"));
+            assert!(!shipping_path.contains("including_superseded"));
+        }
     }
 }

@@ -7,6 +7,7 @@
 //! written aborts the delete rather than losing rows silently.
 
 use std::future::Future;
+use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -230,13 +231,13 @@ async fn assert_indexed(state: &AppState, ids: &[Uuid]) {
 }
 
 /// Asserts the reference points at a real snapshot holding exactly `expected`
-/// and returns the parsed artifact.
+/// and returns the artifact path.
 fn assert_reference_matches_file(
     reference: &Value,
     snapshot_root: &std::path::Path,
     namespace_id: Uuid,
     expected: &[Uuid],
-) -> pensyve_core::snapshot::ForgetSnapshot {
+) -> PathBuf {
     // The reference is by id only: remote callers cannot use a server-local
     // filesystem path, so exposing one would only leak the snapshot layout.
     assert!(
@@ -254,16 +255,41 @@ fn assert_reference_matches_file(
         panic!("expected exactly one snapshot artifact, found {entries:?}");
     };
 
-    let snapshot = pensyve_core::snapshot::read_file(path).expect("snapshot round-trips");
-    let mut got = snapshot.memory_ids();
+    let mut got = Vec::new();
+    pensyve_core::snapshot::for_each_memory_id(path, |id| {
+        got.push(id);
+        Ok(())
+    })
+    .expect("snapshot round-trips");
     got.sort();
     let mut want = expected.to_vec();
     want.sort();
     assert_eq!(got, want, "snapshot must hold exactly the deleted rows");
 
-    assert_eq!(reference["snapshot_id"], snapshot.snapshot_id.to_string());
-    assert_eq!(reference["format_version"], snapshot.format_version);
-    assert_eq!(reference["captured_at"], snapshot.captured_at.to_rfc3339());
+    let mut lines =
+        std::io::BufReader::new(std::fs::File::open(path).expect("open snapshot")).lines();
+    let header: Value = serde_json::from_str(
+        &lines
+            .next()
+            .expect("snapshot header line")
+            .expect("read snapshot header"),
+    )
+    .expect("parse snapshot header");
+    assert_eq!(reference["snapshot_id"], header["snapshot_id"]);
+    assert_eq!(reference["format_version"], header["format_version"]);
+    let reference_captured_at = chrono::DateTime::parse_from_rfc3339(
+        reference["captured_at"]
+            .as_str()
+            .expect("reference captured_at string"),
+    )
+    .expect("reference captured_at timestamp");
+    let header_captured_at = chrono::DateTime::parse_from_rfc3339(
+        header["captured_at"]
+            .as_str()
+            .expect("header captured_at string"),
+    )
+    .expect("header captured_at timestamp");
+    assert_eq!(reference_captured_at, header_captured_at);
     assert_eq!(reference["memory_count"], expected.len());
     assert_eq!(reference["semantic_count"], expected.len());
     assert_eq!(reference["episodic_count"], 0);
@@ -273,7 +299,7 @@ fn assert_reference_matches_file(
         "the response must state whether the artifact is owner-only"
     );
 
-    snapshot
+    path.clone()
 }
 
 #[tokio::test]
@@ -293,7 +319,7 @@ async fn rest_forget_writes_a_snapshot_and_returns_its_reference() {
     let body: Value = response.json().await.expect("forget response JSON");
     assert_eq!(body["forgotten_count"], 2);
 
-    let snapshot = assert_reference_matches_file(
+    let snapshot_path = assert_reference_matches_file(
         &body["snapshot"],
         &snapshot_root,
         namespace_id,
@@ -306,7 +332,7 @@ async fn rest_forget_writes_a_snapshot_and_returns_its_reference() {
         .tenant_mgr
         .get_tenant_state(TEST_TENANT)
         .expect("tenant state");
-    pensyve_core::snapshot::restore(ps.storage.as_ref(), &snapshot).expect("restore");
+    pensyve_core::snapshot::restore_file(ps.storage.as_ref(), &snapshot_path).expect("restore");
     assert_eq!(stored_memory_count(&state), 2);
 
     let vector_index = vector_index(&ps).read().await;
@@ -371,7 +397,7 @@ async fn a2a_forget_writes_a_snapshot_and_returns_its_reference() {
     assert_eq!(body["status"], "completed");
     assert_eq!(body["output"]["forgotten_count"], 2);
 
-    let snapshot = assert_reference_matches_file(
+    let snapshot_path = assert_reference_matches_file(
         &body["output"]["snapshot"],
         &snapshot_root,
         namespace_id,
@@ -383,7 +409,7 @@ async fn a2a_forget_writes_a_snapshot_and_returns_its_reference() {
         .tenant_mgr
         .get_tenant_state(TEST_TENANT)
         .expect("tenant state");
-    pensyve_core::snapshot::restore(ps.storage.as_ref(), &snapshot).expect("restore");
+    pensyve_core::snapshot::restore_file(ps.storage.as_ref(), &snapshot_path).expect("restore");
     assert_eq!(stored_memory_count(&state), 2);
 
     let vector_index = vector_index(&ps).read().await;
@@ -551,10 +577,19 @@ async fn rest_forget_evicts_snapshots_beyond_the_per_namespace_quota() {
     let mut captured: Vec<String> = remaining
         .iter()
         .map(|path| {
-            pensyve_core::snapshot::read_file(path)
-                .expect("surviving snapshots stay readable")
-                .captured_at
-                .to_rfc3339()
+            let mut lines =
+                std::io::BufReader::new(std::fs::File::open(path).expect("open snapshot")).lines();
+            let header: Value = serde_json::from_str(
+                &lines
+                    .next()
+                    .expect("snapshot header line")
+                    .expect("read snapshot header"),
+            )
+            .expect("surviving snapshots stay readable");
+            header["captured_at"]
+                .as_str()
+                .expect("captured_at string")
+                .to_owned()
         })
         .collect();
     captured.sort();

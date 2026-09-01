@@ -1500,8 +1500,14 @@ fn capturing_delete_still_works_under_enforced_rls() {
     )
     .expect("forget in namespace A must still succeed under enforced RLS");
 
+    let mut captured = Vec::new();
+    crate::snapshot::for_each_memory_id(outcome.path.as_deref().expect("snapshot path"), |id| {
+        captured.push(id);
+        Ok(())
+    })
+    .expect("stream snapshot ids");
     assert_eq!(
-        outcome.snapshot.memory_ids(),
+        captured,
         vec![mine.id],
         "the capturing delete must still capture its own namespace's row under enforced RLS"
     );
@@ -3568,7 +3574,12 @@ fn capturing_delete_is_confined_to_its_namespace() {
     );
 
     // 2. And they never entered the artifact.
-    let captured = outcome.snapshot.memory_ids();
+    let mut captured = Vec::new();
+    crate::snapshot::for_each_memory_id(outcome.path.as_deref().expect("snapshot path"), |id| {
+        captured.push(id);
+        Ok(())
+    })
+    .expect("stream snapshot ids");
     assert!(
         !captured.contains(&theirs.id) && !captured.contains(&their_fact.id),
         "namespace B's rows leaked into namespace A's snapshot: {captured:?}"

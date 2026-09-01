@@ -158,6 +158,22 @@ pub struct CapturedMemory {
     pub embeddings: Vec<bounded::EmbeddingRecord>,
 }
 
+/// Constant-size result of a streamed bulk mutation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BulkMutationSummary {
+    pub memories: usize,
+    pub embedding_records: usize,
+}
+
+/// Constant-size result of a storage-backed GDPR entity erase.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ErasureSummary {
+    pub memories: usize,
+    pub observations: usize,
+    pub edges: usize,
+    pub entities: usize,
+}
+
 /// Maximum whitespace-delimited tokens an FTS query contributes to the search
 /// expression; both backends truncate identically so their candidate sets stay
 /// comparable (#225).
@@ -257,6 +273,38 @@ pub trait StorageTrait: Send + Sync {
         Err(StorageError::Unsupported("bounded memory paging".into()))
     }
 
+    /// Page the existing entity-oriented inspect relation in stable typed-key order:
+    /// episodic `about_entity`, semantic `subject`, and observation `instance`.
+    /// This preserves the public inspect contract without post-filtering a
+    /// namespace-wide page.
+    fn page_entity_memories(
+        &self,
+        _namespace_id: Uuid,
+        _entity_id: Uuid,
+        _entity_instance: &str,
+        _after: Option<bounded::PageCursor>,
+        _limit: usize,
+        _include_superseded: bool,
+    ) -> StorageResult<bounded::MemoryPage> {
+        Err(StorageError::Unsupported(
+            "bounded entity inspect paging".into(),
+        ))
+    }
+
+    /// Page the GDPR personal-data relation in stable typed-key order, including
+    /// observations derived from episodes in which the entity participated.
+    fn page_gdpr_personal_data(
+        &self,
+        _namespace_id: Uuid,
+        _entity_id: Uuid,
+        _after: Option<bounded::PageCursor>,
+        _limit: usize,
+    ) -> StorageResult<bounded::MemoryPage> {
+        Err(StorageError::Unsupported(
+            "bounded GDPR personal-data paging".into(),
+        ))
+    }
+
     /// Filesystem path of the underlying `SQLite` file, when the backend is
     /// disk-backed. Returns `None` for in-memory backends, the (future)
     /// Postgres backend, or any backend that has no single-file location.
@@ -296,6 +344,15 @@ pub trait StorageTrait: Send + Sync {
             Memory::Procedural(memory) => self.save_procedural(memory),
             Memory::Observation(memory) => self.save_observation(memory),
         }
+    }
+
+    /// Atomically restore one validated page of source memories and every captured
+    /// versioned embedding record. Implementations must reject pages over 256 before
+    /// writing anything and must not activate or register embedding spaces.
+    fn restore_memory_page(&self, _page: &[CapturedMemory]) -> StorageResult<()> {
+        Err(StorageError::Unsupported(
+            "transactional bounded restore page".into(),
+        ))
     }
 
     // Namespaces
@@ -632,10 +689,11 @@ pub trait StorageTrait: Send + Sync {
         limit: usize,
     ) -> StorageResult<Vec<Memory>>;
 
-    // Bulk
+    // Bulk compatibility/research helpers. Shipping callers must use bounded pages.
     fn get_all_memories_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Memory>>;
 
-    /// Fetch all memories, including superseded history, for audit/inspect paths.
+    /// Fetch all memories, including superseded history, for compatibility and
+    /// synthetic research fixtures. Shipping inspect/export paths must page instead.
     fn get_all_memories_by_namespace_including_superseded(
         &self,
         namespace_id: Uuid,
@@ -827,6 +885,22 @@ pub trait StorageTrait: Send + Sync {
         Ok(captured)
     }
 
+    /// Delete one entity's attached memories while handing the exact removed rows to
+    /// `persist_page` in stable pages. Page persistence and count-bearing `finalize`
+    /// execute inside the delete transaction; any callback error rolls the delete back.
+    fn delete_memories_by_entity_paged(
+        &self,
+        _entity_id: Uuid,
+        _namespace_id: Uuid,
+        _page_size: usize,
+        _persist_page: &mut dyn FnMut(&[CapturedMemory]) -> StorageResult<()>,
+        _finalize: &mut dyn FnMut(BulkMutationSummary) -> StorageResult<()>,
+    ) -> StorageResult<BulkMutationSummary> {
+        Err(StorageError::Unsupported(
+            "transactional paged entity capture".into(),
+        ))
+    }
+
     /// Erase everything belonging to `entity_id` within `namespace_id` in ONE
     /// transaction, and hand back the rows it removed.
     ///
@@ -865,6 +939,17 @@ pub trait StorageTrait: Send + Sync {
         entity_id: Uuid,
         namespace_id: Uuid,
     ) -> StorageResult<ErasedRows>;
+
+    /// Storage-backed GDPR erase that returns counts rather than captured corpus rows.
+    fn erase_entity_bounded(
+        &self,
+        _entity_id: Uuid,
+        _namespace_id: Uuid,
+    ) -> StorageResult<ErasureSummary> {
+        Err(StorageError::Unsupported(
+            "bounded GDPR entity erase".into(),
+        ))
+    }
 
     /// Delete a single memory (episodic, semantic, procedural or observation)
     /// only when it belongs to `namespace_id`.

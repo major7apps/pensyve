@@ -19,7 +19,9 @@ use crate::auth::AuthContext;
 
 use pensyve_core::retrieval::RecallEngine;
 use pensyve_core::retrieval::contradictions::detect_contradictions;
-use pensyve_core::storage::bounded::{MemoryRef, embedding_source_text};
+use pensyve_core::storage::bounded::{
+    MemoryPageRequest, MemoryRef, MemoryType, PageCursor, SearchScope, embedding_source_text,
+};
 use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{
     ContentType, Entity, EntityKind, Episode, EpisodicMemory, Memory, Outcome, SemanticMemory,
@@ -197,6 +199,7 @@ pub struct StatsResponse {
 pub struct InspectRequest {
     pub entity: String,
     pub limit: Option<usize>,
+    pub cursor: Option<String>,
     #[serde(default)]
     pub include_superseded: bool,
 }
@@ -209,6 +212,7 @@ pub struct InspectResponse {
     pub procedural: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observation: Vec<serde_json::Value>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1253,7 +1257,7 @@ async fn create_entity(
 /// a server-local filesystem path is useless to them and leaks the snapshot
 /// layout, so the reference is by id only; the path is recorded in the
 /// activity log for the operator who performs the restore.
-fn snapshot_reference(snapshot: &pensyve_core::snapshot::ForgetSnapshot) -> serde_json::Value {
+fn snapshot_reference(snapshot: &pensyve_core::snapshot::SnapshotManifest) -> serde_json::Value {
     let counts = snapshot.counts();
     json!({
         "snapshot_id": snapshot.snapshot_id.to_string(),
@@ -1340,7 +1344,7 @@ async fn forget_entity(
     let task = tokio::spawn(async move {
         let outcome = forget_entity_blocking(&ps_task, entity_id, owned_name).await?;
         let snapshot = &outcome.snapshot;
-        let forgotten_count = snapshot.memories.len();
+        let forgotten_count = snapshot.counts.total;
 
         // The snapshot holds exactly the rows the delete removed, so it is
         // also the authoritative list for vector-index cleanup — O(1) per
@@ -1349,9 +1353,15 @@ async fn forget_entity(
             && let VectorRuntime::InMemory(vector_index) = &ps_task.vector_runtime
         {
             let mut vi = vector_index.write().await;
-            for id in snapshot.memory_ids() {
+            let path = outcome
+                .path
+                .as_deref()
+                .ok_or_else(|| "non-empty snapshot has no artifact path".to_string())?;
+            pensyve_core::snapshot::for_each_memory_id(path, |id| {
                 let _ = vi.remove(id);
-            }
+                Ok(())
+            })
+            .map_err(|error| error.to_string())?;
         }
 
         let snapshot_path = outcome
@@ -1392,7 +1402,7 @@ async fn forget_entity(
 
     let snapshot = &outcome.snapshot;
     Ok(Json(ForgetResponse {
-        forgotten_count: snapshot.memories.len(),
+        forgotten_count: snapshot.counts.total,
         snapshot: outcome.path.is_some().then(|| snapshot_reference(snapshot)),
     }))
 }
@@ -1551,160 +1561,139 @@ async fn usage_summary(
     Ok(Json(summary))
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the inspect handler keeps default and opt-in audit projections together so their response shape cannot drift"
-)]
 async fn inspect(
     State(state): State<Arc<AppState>>,
     axum::Extension(auth_ctx): axum::Extension<AuthContext>,
     Json(body): Json<InspectRequest>,
 ) -> Result<impl IntoResponse, RestError> {
     let ps = get_pensyve_state(&state, &auth_ctx)?;
+    Ok(Json(inspect_bounded(&ps, body)?))
+}
+
+fn inspect_bounded(ps: &PensyveState, body: InspectRequest) -> Result<InspectResponse, RestError> {
     let limit = body.limit.unwrap_or(50);
-
-    // Empty entity → return all memories in the namespace (for dashboard browse mode).
-    if body.entity.is_empty() {
-        let mut episodic = Vec::new();
-        let mut semantic = Vec::new();
-        let mut procedural = Vec::new();
-        let mut observation = Vec::new();
-
-        let memories = if body.include_superseded {
-            ps.storage
-                .get_all_memories_by_namespace_including_superseded(ps.namespace.id)
-        } else {
-            ps.storage.get_all_memories_by_namespace(ps.namespace.id)
-        };
-        if let Ok(memories) = memories {
-            for mem in memories.into_iter().take(limit) {
-                match mem {
-                    pensyve_core::types::Memory::Episodic(m) => {
-                        let mut val = serde_json::to_value(&m).unwrap_or_default();
-                        strip_embedding(&mut val);
-                        episodic.push(val);
-                    }
-                    pensyve_core::types::Memory::Semantic(m) => {
-                        let mut val = serde_json::to_value(&m).unwrap_or_default();
-                        strip_embedding(&mut val);
-                        semantic.push(val);
-                    }
-                    pensyve_core::types::Memory::Procedural(m) => {
-                        let mut val = serde_json::to_value(&m).unwrap_or_default();
-                        strip_embedding(&mut val);
-                        procedural.push(val);
-                    }
-                    pensyve_core::types::Memory::Observation(m) => {
-                        let mut val = serde_json::to_value(&m).unwrap_or_default();
-                        strip_embedding(&mut val);
-                        observation.push(val);
-                    }
-                }
-            }
-        }
-
-        return Ok(Json(InspectResponse {
-            entity: String::new(),
-            episodic,
-            semantic,
-            procedural,
-            observation,
-        }));
+    if !(1..=200).contains(&limit) {
+        return Err(RestError(
+            StatusCode::BAD_REQUEST,
+            "inspect limit must be within 1..=200".into(),
+        ));
     }
-
-    let entity = resolve_entity_identifier(ps.storage.as_ref(), &body.entity, ps.namespace.id)?
-        .ok_or_else(|| {
-            RestError(
-                StatusCode::NOT_FOUND,
-                format!("Entity '{}' not found", body.entity),
-            )
-        })?;
-
-    if body.include_superseded {
-        let mut episodic = Vec::new();
-        let mut semantic = Vec::new();
-        if let Ok(memories) = ps
-            .storage
-            .get_all_memories_by_namespace_including_superseded(ps.namespace.id)
-        {
-            for memory in memories {
-                if episodic.len() + semantic.len() >= limit {
-                    break;
-                }
-                match memory {
-                    Memory::Episodic(memory) if memory.about_entity == entity.id => {
-                        let mut value = serde_json::to_value(&memory).unwrap_or_default();
-                        strip_embedding(&mut value);
-                        episodic.push(value);
-                    }
-                    Memory::Semantic(memory) if memory.subject == entity.id => {
-                        let mut value = serde_json::to_value(&memory).unwrap_or_default();
-                        strip_embedding(&mut value);
-                        semantic.push(value);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        return Ok(Json(InspectResponse {
-            entity: body.entity,
-            episodic,
-            semantic,
-            procedural: vec![],
-            observation: vec![],
-        }));
-    }
-
-    let mut episodic = Vec::new();
-    if let Ok(mems) =
-        ps.storage
-            .list_episodic_by_entity_in_namespace(entity.id, ps.namespace.id, limit)
-    {
-        for mem in mems {
-            let mut val = serde_json::to_value(&mem).unwrap_or_default();
-            strip_embedding(&mut val);
-            episodic.push(val);
-        }
-    }
-
-    let remaining = limit.saturating_sub(episodic.len());
-    let mut semantic = Vec::new();
-    if remaining > 0
-        && let Ok(mems) =
-            ps.storage
-                .list_semantic_by_entity_in_namespace(entity.id, ps.namespace.id, remaining)
-    {
-        for mem in mems {
-            let mut val = serde_json::to_value(&mem).unwrap_or_default();
-            strip_embedding(&mut val);
-            semantic.push(val);
-        }
-    }
-
-    let remaining = limit.saturating_sub(episodic.len() + semantic.len());
-    let mut observation = Vec::new();
-    if remaining > 0
-        && let Ok(mems) = ps.storage.list_observations_by_entity_instance(
-            ps.namespace.id,
-            &entity.name,
-            remaining,
+    let after = body
+        .cursor
+        .as_deref()
+        .map(decode_inspect_cursor)
+        .transpose()?;
+    let page = if body.entity.is_empty() {
+        let request = MemoryPageRequest::new(
+            SearchScope::namespace(ps.namespace.id),
+            after,
+            limit,
+            body.include_superseded,
         )
-    {
-        for mem in mems {
-            let mut val = serde_json::to_value(&mem).unwrap_or_default();
-            strip_embedding(&mut val);
-            observation.push(val);
-        }
-    }
+        .map_err(|error| inspect_storage_error(&error))?;
+        ps.storage
+            .page_memories(&request)
+            .map_err(|error| inspect_storage_error(&error))?
+    } else {
+        let entity = resolve_entity_identifier(ps.storage.as_ref(), &body.entity, ps.namespace.id)?
+            .ok_or_else(|| {
+                RestError(
+                    StatusCode::NOT_FOUND,
+                    format!("Entity '{}' not found", body.entity),
+                )
+            })?;
+        ps.storage
+            .page_entity_memories(
+                ps.namespace.id,
+                entity.id,
+                &entity.name,
+                after,
+                limit,
+                body.include_superseded,
+            )
+            .map_err(|error| inspect_storage_error(&error))?
+    };
 
-    Ok(Json(InspectResponse {
+    let mut response = InspectResponse {
         entity: body.entity,
-        episodic,
-        semantic,
-        // Procedural memories are namespace-scoped and have no entity linkage.
-        procedural: vec![],
-        observation,
-    }))
+        episodic: Vec::new(),
+        semantic: Vec::new(),
+        procedural: Vec::new(),
+        observation: Vec::new(),
+        next_cursor: page.next_cursor.as_ref().map(encode_inspect_cursor),
+    };
+    for memory in page.memories {
+        let (target, mut value) = match memory {
+            Memory::Episodic(memory) => (
+                &mut response.episodic,
+                serde_json::to_value(memory).unwrap_or_default(),
+            ),
+            Memory::Semantic(memory) => (
+                &mut response.semantic,
+                serde_json::to_value(memory).unwrap_or_default(),
+            ),
+            Memory::Procedural(memory) => (
+                &mut response.procedural,
+                serde_json::to_value(memory).unwrap_or_default(),
+            ),
+            Memory::Observation(memory) => (
+                &mut response.observation,
+                serde_json::to_value(memory).unwrap_or_default(),
+            ),
+        };
+        strip_embedding(&mut value);
+        target.push(value);
+    }
+    Ok(response)
+}
+
+fn inspect_storage_error(error: &pensyve_core::storage::StorageError) -> RestError {
+    RestError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("inspect storage error: {error}"),
+    )
+}
+
+fn encode_inspect_cursor(cursor: &PageCursor) -> String {
+    let memory_type = match cursor.memory_type {
+        MemoryType::Episodic => 0_u8,
+        MemoryType::Semantic => 1,
+        MemoryType::Procedural => 2,
+        MemoryType::Observation => 3,
+    };
+    let mut bytes = Vec::with_capacity(17);
+    bytes.push(memory_type);
+    bytes.extend_from_slice(cursor.id.as_bytes());
+    format!("p1.{}", hex::encode(bytes))
+}
+
+fn decode_inspect_cursor(cursor: &str) -> Result<PageCursor, RestError> {
+    let encoded = cursor
+        .strip_prefix("p1.")
+        .ok_or_else(|| RestError(StatusCode::BAD_REQUEST, "invalid inspect cursor".into()))?;
+    let bytes = hex::decode(encoded)
+        .map_err(|_| RestError(StatusCode::BAD_REQUEST, "invalid inspect cursor".into()))?;
+    if bytes.len() != 17 {
+        return Err(RestError(
+            StatusCode::BAD_REQUEST,
+            "invalid inspect cursor".into(),
+        ));
+    }
+    let memory_type = match bytes[0] {
+        0 => MemoryType::Episodic,
+        1 => MemoryType::Semantic,
+        2 => MemoryType::Procedural,
+        3 => MemoryType::Observation,
+        _ => {
+            return Err(RestError(
+                StatusCode::BAD_REQUEST,
+                "invalid inspect cursor".into(),
+            ));
+        }
+    };
+    let id = Uuid::from_slice(&bytes[1..])
+        .map_err(|_| RestError(StatusCode::BAD_REQUEST, "invalid inspect cursor".into()))?;
+    Ok(PageCursor { memory_type, id })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2398,7 +2387,8 @@ async fn feedback(
 // GDPR handler
 // ---------------------------------------------------------------------------
 
-/// Run the capturing GDPR erase on the blocking pool.
+/// Run GDPR erase on the blocking pool. In-memory compatibility states capture
+/// deleted rows for index cleanup; storage-backed states return bounded counts.
 ///
 /// The call is synchronous the whole way down — a rusqlite transaction behind a
 /// mutex on `SQLite`, a `block_on` of an sqlx transaction on Postgres — so it
@@ -2419,9 +2409,15 @@ async fn erase_entity_blocking(
 > {
     let storage = ps.storage.clone();
     let namespace_id = ps.namespace.id;
+    let needs_captured_rows = matches!(&ps.vector_runtime, VectorRuntime::InMemory(_));
 
     tokio::task::spawn_blocking(move || {
-        pensyve_core::gdpr::erase_entity_captured(storage.as_ref(), entity_id, namespace_id)
+        if needs_captured_rows {
+            pensyve_core::gdpr::erase_entity_captured(storage.as_ref(), entity_id, namespace_id)
+        } else {
+            pensyve_core::gdpr::erase_entity(storage.as_ref(), entity_id, namespace_id)
+                .map(|result| (result, pensyve_core::storage::ErasedRows::default()))
+        }
     })
     .await
     .map_err(|err| format!("GDPR erasure task failed: {err}"))
@@ -2659,13 +2655,16 @@ async fn a2a_forget(
         let outcome = forget_entity_blocking(&ps, entity_id, owned_name).await?;
         let snapshot = &outcome.snapshot;
 
-        if !snapshot.memories.is_empty()
+        if !snapshot.is_empty()
             && let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime
+            && let Some(path) = outcome.path.as_deref()
         {
             let mut vi = vector_index.write().await;
-            for id in snapshot.memory_ids() {
+            pensyve_core::snapshot::for_each_memory_id(path, |id| {
                 let _ = vi.remove(id);
-            }
+                Ok(())
+            })
+            .map_err(|error| error.to_string())?;
         }
 
         Ok::<_, String>(outcome)
@@ -2675,7 +2674,7 @@ async fn a2a_forget(
         .map_err(|err| format!("forget task failed: {err}"))??;
 
     let snapshot = &outcome.snapshot;
-    let mut output = json!({"forgotten_count": snapshot.memories.len()});
+    let mut output = json!({"forgotten_count": snapshot.counts.total});
     if outcome.path.is_some() {
         output["snapshot"] = snapshot_reference(snapshot);
     }
@@ -3062,6 +3061,79 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn inspect_requires_a_bounded_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, state, _space) = active_rest_state(&dir, "bounded-inspect");
+        for index in 0..101 {
+            storage
+                .save_procedural(&ProceduralMemory::new(
+                    state.namespace.id,
+                    format!("trigger {index}"),
+                    format!("action {index}"),
+                    pensyve_core::types::Outcome::Success,
+                    std::collections::HashMap::new(),
+                ))
+                .unwrap();
+        }
+
+        for invalid_limit in [0, 201] {
+            let Err(error) = inspect_bounded(
+                &state,
+                InspectRequest {
+                    entity: String::new(),
+                    limit: Some(invalid_limit),
+                    cursor: None,
+                    include_superseded: false,
+                },
+            ) else {
+                panic!("limit {invalid_limit} must be rejected");
+            };
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        }
+
+        let first = inspect_bounded(
+            &state,
+            InspectRequest {
+                entity: String::new(),
+                limit: Some(100),
+                cursor: None,
+                include_superseded: false,
+            },
+        )
+        .unwrap_or_else(|error| panic!("{}", error.1));
+        assert_eq!(first.procedural.len(), 100);
+        let next_cursor = first.next_cursor.expect("first page cursor");
+
+        let second = inspect_bounded(
+            &state,
+            InspectRequest {
+                entity: String::new(),
+                limit: Some(100),
+                cursor: Some(next_cursor),
+                include_superseded: false,
+            },
+        )
+        .unwrap_or_else(|error| panic!("{}", error.1));
+        assert_eq!(second.procedural.len(), 1);
+        assert!(second.next_cursor.is_none());
+    }
+
+    #[test]
+    fn inspect_shipping_path_avoids_legacy_bulk_readers() {
+        let source = include_str!("rest.rs");
+        let inspect = source
+            .split_once("fn inspect_bounded(")
+            .expect("inspect implementation")
+            .1
+            .split_once("fn inspect_storage_error(")
+            .expect("inspect implementation terminator")
+            .0;
+
+        assert!(!inspect.contains("get_all_memories_by_namespace"));
+        assert!(!inspect.contains("including_superseded"));
     }
 
     #[test]

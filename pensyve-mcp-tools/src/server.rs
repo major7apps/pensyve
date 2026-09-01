@@ -770,13 +770,16 @@ impl PensyveMcpServer {
             // The snapshot holds exactly the rows the delete removed, so it is
             // also the authoritative list for vector-index cleanup — O(1) per
             // entry, not an O(n) rebuild.
-            if !snapshot.memories.is_empty()
+            if !snapshot.is_empty()
                 && let VectorRuntime::InMemory(vector_index) = &task_state.vector_runtime
+                && let Some(path) = outcome.path.as_deref()
             {
                 let mut vi = vector_index.write().await;
-                for id in snapshot.memory_ids() {
+                pensyve_core::snapshot::for_each_memory_id(path, |id| {
                     let _ = vi.remove(id);
-                }
+                    Ok(())
+                })
+                .map_err(|error| error.to_string())?;
             }
 
             let snapshot_path = outcome
@@ -801,7 +804,7 @@ impl PensyveMcpServer {
             .map_err(|err| format!("forget task failed: {err}"))??;
 
         let snapshot = &outcome.snapshot;
-        let forgotten_count = snapshot.memories.len();
+        let forgotten_count = snapshot.counts.total;
         let snapshot_path = outcome
             .path
             .as_ref()
@@ -1146,6 +1149,7 @@ impl ServerHandler for PensyveMcpServer {
 mod tests {
     use super::*;
 
+    use std::io::BufRead;
     use std::path::PathBuf;
 
     /// A server backed by a temp database, holding one entity ("subject") with
@@ -1305,13 +1309,23 @@ mod tests {
             ),
             "snapshot must land under its own namespace, not a shared directory"
         );
-        let snapshot = pensyve_core::snapshot::read_file(&path).unwrap();
-        assert_eq!(snapshot.memories.len(), 2);
+        let mut memory_count = 0;
+        pensyve_core::snapshot::for_each_memory_id(&path, |_| {
+            memory_count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(memory_count, 2);
         assert_eq!(response["snapshot"]["memory_count"], 2);
-        assert_eq!(
-            response["snapshot"]["snapshot_id"],
-            snapshot.snapshot_id.to_string()
-        );
+        let header: serde_json::Value = serde_json::from_str(
+            &std::io::BufReader::new(std::fs::File::open(&path).unwrap())
+                .lines()
+                .next()
+                .expect("snapshot header line")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(response["snapshot"]["snapshot_id"], header["snapshot_id"]);
         assert_eq!(
             response["snapshot"]["owner_only"],
             pensyve_core::snapshot::OWNER_ONLY_SUPPORTED,
@@ -1320,7 +1334,7 @@ mod tests {
 
         // The snapshot is a real recovery path, not just a receipt.
         assert_eq!(stored_memory_count(&fixture.server), 0);
-        pensyve_core::snapshot::restore(fixture.server.state.storage.as_ref(), &snapshot).unwrap();
+        pensyve_core::snapshot::restore_file(fixture.server.state.storage.as_ref(), &path).unwrap();
         assert_eq!(stored_memory_count(&fixture.server), 2);
     }
 

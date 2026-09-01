@@ -23,9 +23,9 @@ use crate::types::{
 };
 
 use super::{
-    ActivityAggregate, ActivityEvent, CapturedMemory, ErasedRows, StorageError, StorageResult,
-    StorageTrait, canonical_embedding_source_sha256, cross_namespace_edge_id, memory_namespace_id,
-    validate_record_matches_memory,
+    ActivityAggregate, ActivityEvent, BulkMutationSummary, CapturedMemory, ErasedRows,
+    ErasureSummary, StorageError, StorageResult, StorageTrait, canonical_embedding_source_sha256,
+    cross_namespace_edge_id, memory_namespace_id, validate_record_matches_memory,
 };
 use crate::graph::EdgeType;
 use crate::storage::bounded::{
@@ -1456,6 +1456,47 @@ async fn load_memory_without_embedding_pg(
     }
 }
 
+async fn memory_page_from_pg_ids(
+    conn: &mut PgConnection,
+    namespace_id: Uuid,
+    rows: Vec<(String, Uuid)>,
+    limit: usize,
+) -> StorageResult<MemoryPage> {
+    let has_more = rows.len() > limit;
+    let refs = rows
+        .into_iter()
+        .take(limit)
+        .map(|(memory_type, id)| {
+            Ok(MemoryRef {
+                memory_type: memory_type_from_str(&memory_type)?,
+                id,
+            })
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    let next_cursor = has_more.then(|| {
+        let memory_ref = refs
+            .last()
+            .copied()
+            .expect("a page with more rows is non-empty");
+        PageCursor {
+            memory_type: memory_ref.memory_type,
+            id: memory_ref.id,
+        }
+    });
+    let mut memories = Vec::with_capacity(refs.len());
+    for memory_ref in refs {
+        if let Some(memory) =
+            load_memory_without_embedding_pg(conn, namespace_id, memory_ref).await?
+        {
+            memories.push(memory);
+        }
+    }
+    Ok(MemoryPage {
+        memories,
+        next_cursor,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // StorageTrait implementation
 // ---------------------------------------------------------------------------
@@ -2046,6 +2087,115 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    fn page_entity_memories(
+        &self,
+        namespace_id: Uuid,
+        entity_id: Uuid,
+        entity_instance: &str,
+        after: Option<PageCursor>,
+        limit: usize,
+        include_superseded: bool,
+    ) -> StorageResult<MemoryPage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "entity memory page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        let after_type = after
+            .as_ref()
+            .map_or(-1, |cursor| memory_type_order(cursor.memory_type));
+        let after_id = after.as_ref().map_or(Uuid::nil(), |cursor| cursor.id);
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let rows: Vec<(String, Uuid)> = query_as::<Postgres, _>(
+                r"SELECT memory_type, id FROM (
+                       SELECT 0 AS type_order, 'episodic'::text AS memory_type, id
+                       FROM episodic_memories
+                       WHERE namespace_id = $1
+                         AND about_entity = $2
+                         AND ($4 OR superseded_by IS NULL)
+                       UNION ALL
+                       SELECT 1, 'semantic', id FROM semantic_memories
+                       WHERE namespace_id = $1
+                         AND subject = $2
+                         AND ($4 OR superseded_by IS NULL)
+                       UNION ALL
+                       SELECT 3, 'observation', id FROM observation_memories
+                       WHERE namespace_id = $1 AND instance = $3
+                         AND ($4 OR superseded_by IS NULL)
+                   ) AS memories
+                   WHERE type_order > $5 OR (type_order = $5 AND id > $6)
+                   ORDER BY type_order, id
+                   LIMIT $7",
+            )
+            .bind(namespace_id)
+            .bind(entity_id)
+            .bind(entity_instance)
+            .bind(include_superseded)
+            .bind(after_type)
+            .bind(after_id)
+            .bind(i64::try_from(limit + 1).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            memory_page_from_pg_ids(&mut conn, namespace_id, rows, limit).await
+        })
+    }
+
+    fn page_gdpr_personal_data(
+        &self,
+        namespace_id: Uuid,
+        entity_id: Uuid,
+        after: Option<PageCursor>,
+        limit: usize,
+    ) -> StorageResult<MemoryPage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "GDPR memory page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        let after_type = after
+            .as_ref()
+            .map_or(-1, |cursor| memory_type_order(cursor.memory_type));
+        let after_id = after.as_ref().map_or(Uuid::nil(), |cursor| cursor.id);
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let rows: Vec<(String, Uuid)> = query_as::<Postgres, _>(
+                r"SELECT memory_type, id FROM (
+                       SELECT 0 AS type_order, 'episodic'::text AS memory_type, id
+                       FROM episodic_memories
+                       WHERE namespace_id = $1
+                         AND (about_entity = $2 OR source_entity = $2)
+                         AND superseded_by IS NULL
+                       UNION ALL
+                       SELECT 1, 'semantic', id FROM semantic_memories
+                       WHERE namespace_id = $1 AND subject = $2 AND superseded_by IS NULL
+                       UNION ALL
+                       SELECT 3, 'observation', o.id
+                       FROM observation_memories AS o
+                       WHERE o.namespace_id = $1 AND o.superseded_by IS NULL AND EXISTS (
+                           SELECT 1 FROM episodic_memories AS e
+                           WHERE e.namespace_id = $1 AND e.episode_id = o.episode_id
+                             AND (e.about_entity = $2 OR e.source_entity = $2)
+                             AND e.superseded_by IS NULL
+                       )
+                   ) AS memories
+                   WHERE type_order > $3 OR (type_order = $3 AND id > $4)
+                   ORDER BY type_order, id
+                   LIMIT $5",
+            )
+            .bind(namespace_id)
+            .bind(entity_id)
+            .bind(after_type)
+            .bind(after_id)
+            .bind(i64::try_from(limit + 1).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            memory_page_from_pg_ids(&mut conn, namespace_id, rows, limit).await
+        })
+    }
+
     fn save_memory_with_embedding(
         &self,
         memory: &Memory,
@@ -2067,6 +2217,50 @@ impl StorageTrait for PostgresBackend {
             reconcile_embedding_source_in_pg_tx(&mut transaction, memory).await?;
             if let Some(record) = embedding {
                 insert_embedding_in_pg_tx(&mut transaction, record).await?;
+            }
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            Ok(())
+        })
+    }
+
+    fn restore_memory_page(&self, page: &[CapturedMemory]) -> StorageResult<()> {
+        if page.len() > MEMORY_PAGE_SIZE {
+            return Err(StorageError::BudgetExceeded(format!(
+                "restore page contains {} rows; maximum is {MEMORY_PAGE_SIZE}",
+                page.len()
+            )));
+        }
+        for captured in page {
+            for record in &captured.embeddings {
+                validate_record_matches_memory(record, &captured.memory)?;
+            }
+        }
+        let Some(first) = page.first() else {
+            return Ok(());
+        };
+        let namespace_id = memory_namespace_id(&first.memory);
+        if page
+            .iter()
+            .any(|captured| memory_namespace_id(&captured.memory) != namespace_id)
+        {
+            return Err(StorageError::Context(
+                "restore page spans multiple namespaces".into(),
+            ));
+        }
+        self.block_on(async {
+            let mut conn = self.conn_with_namespace(UNSCOPED_NAMESPACE).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            query::<Postgres>("SELECT set_config('pensyve.namespace_id', $1, true)")
+                .bind(namespace_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
+            for captured in page {
+                save_memory_in_pg_tx(&mut transaction, &captured.memory).await?;
+                reconcile_embedding_source_in_pg_tx(&mut transaction, &captured.memory).await?;
+                for record in &captured.embeddings {
+                    insert_embedding_in_pg_tx(&mut transaction, record).await?;
+                }
             }
             transaction.commit().await.map_err(sqlx_to_io)?;
             Ok(())
@@ -3207,6 +3401,136 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "paged capture, generation cleanup, callbacks, and commit form one transaction"
+    )]
+    fn delete_memories_by_entity_paged(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+        page_size: usize,
+        persist_page: &mut dyn FnMut(&[CapturedMemory]) -> StorageResult<()>,
+        finalize: &mut dyn FnMut(BulkMutationSummary) -> StorageResult<()>,
+    ) -> StorageResult<BulkMutationSummary> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&page_size) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "capture page size must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            let mut summary = BulkMutationSummary::default();
+            loop {
+                let refs: Vec<(String, Uuid)> = query_as::<Postgres, _>(
+                    r"SELECT memory_type, id FROM (
+                           SELECT 0 AS type_order, 'episodic'::text AS memory_type, id
+                           FROM episodic_memories
+                           WHERE namespace_id = $1
+                             AND (about_entity = $2 OR source_entity = $2)
+                           UNION ALL
+                           SELECT 1, 'semantic', id FROM semantic_memories
+                           WHERE namespace_id = $1
+                             AND (subject = $2 OR object_entity = $2)
+                       ) AS memories
+                       ORDER BY type_order, id
+                       LIMIT $3",
+                )
+                .bind(namespace_id)
+                .bind(entity_id)
+                .bind(i64::try_from(page_size).unwrap_or(i64::MAX))
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+                if refs.is_empty() {
+                    break;
+                }
+                let mut page = Vec::with_capacity(refs.len());
+                for (memory_type, id) in refs {
+                    let memory_ref = MemoryRef {
+                        memory_type: memory_type_from_str(&memory_type)?,
+                        id,
+                    };
+                    let memory = load_memory_without_embedding_pg(
+                        &mut tx,
+                        namespace_id,
+                        memory_ref,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        StorageError::Context(format!(
+                            "captured memory {memory_type}/{id} disappeared inside transaction"
+                        ))
+                    })?;
+                    let rows: Vec<(String, String, String)> = query_as::<Postgres, _>(
+                        "SELECT embedding_space_id, source_sha256, embedding::text
+                         FROM memory_embeddings
+                         WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3
+                         ORDER BY embedding_space_id",
+                    )
+                    .bind(namespace_id)
+                    .bind(&memory_type)
+                    .bind(id)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(sqlx_to_io)?;
+                    let embeddings = rows
+                        .into_iter()
+                        .map(|(space, source_sha256, embedding)| EmbeddingRecord {
+                            namespace_id,
+                            memory_ref,
+                            embedding_space_id: EmbeddingSpaceId(space),
+                            source_sha256,
+                            embedding: pgtext_to_embedding(Some(&embedding)),
+                        })
+                        .collect::<Vec<_>>();
+                    query::<Postgres>(
+                        "DELETE FROM memory_embeddings
+                         WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3",
+                    )
+                    .bind(namespace_id)
+                    .bind(&memory_type)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(sqlx_to_io)?;
+                    let table = match memory_ref.memory_type {
+                        MemoryType::Episodic => "episodic_memories",
+                        MemoryType::Semantic => "semantic_memories",
+                        MemoryType::Procedural | MemoryType::Observation => {
+                            return Err(StorageError::Context(
+                                "entity forget selected a non-entity memory type".into(),
+                            ));
+                        }
+                    };
+                    let sql = format!("DELETE FROM {table} WHERE id = $1 AND namespace_id = $2");
+                    let deleted = query::<Postgres>(AssertSqlSafe(sql))
+                        .bind(id)
+                        .bind(namespace_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(sqlx_to_io)?;
+                    if deleted.rows_affected() != 1 {
+                        return Err(StorageError::Context(format!(
+                            "captured memory {id} was not deleted exactly once"
+                        )));
+                    }
+                    page.push(CapturedMemory { memory, embeddings });
+                }
+                persist_page(&page)?;
+                summary.memories += page.len();
+                summary.embedding_records += page
+                    .iter()
+                    .map(|captured| captured.embeddings.len())
+                    .sum::<usize>();
+            }
+            finalize(summary)?;
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(summary)
+        })
+    }
+
     /// One-transaction GDPR erase — the trait docs carry the leg order and why
     /// it is fixed. Each leg is a `DELETE ... RETURNING`, so the captured rows
     /// are the rows the statement removed rather than rows a preceding `SELECT`
@@ -3433,6 +3757,122 @@ impl StorageTrait for PostgresBackend {
 
             transaction.commit().await.map_err(sqlx_to_io)?;
             Ok(total)
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixed GDPR erase legs and generation cleanup form one visible transaction"
+    )]
+    fn erase_entity_bounded(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<ErasureSummary> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            query::<Postgres>(
+                "DELETE FROM memory_embeddings
+                 WHERE namespace_id = $2 AND memory_type = 'observation'
+                   AND memory_id IN (
+                     SELECT o.id FROM observation_memories AS o
+                     WHERE o.namespace_id = $2 AND o.episode_id IN (
+                       SELECT DISTINCT e.episode_id FROM episodic_memories AS e
+                       WHERE e.namespace_id = $2
+                         AND (e.about_entity = $1 OR e.source_entity = $1)
+                     )
+                   )",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let observations = query::<Postgres>(
+                "DELETE FROM observation_memories AS o
+                 WHERE o.namespace_id = $2 AND o.episode_id IN (
+                   SELECT DISTINCT e.episode_id FROM episodic_memories AS e
+                   WHERE e.namespace_id = $2
+                     AND (e.about_entity = $1 OR e.source_entity = $1)
+                 )",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?
+            .rows_affected();
+            for (memory_type, table, predicate) in [
+                (
+                    "episodic",
+                    "episodic_memories",
+                    "about_entity = $1 OR source_entity = $1",
+                ),
+                (
+                    "semantic",
+                    "semantic_memories",
+                    "subject = $1 OR object_entity = $1",
+                ),
+            ] {
+                let sql = format!(
+                    "DELETE FROM memory_embeddings WHERE namespace_id = $2
+                     AND memory_type = '{memory_type}' AND memory_id IN (
+                       SELECT id FROM {table} WHERE namespace_id = $2 AND ({predicate})
+                     )"
+                );
+                query::<Postgres>(AssertSqlSafe(sql))
+                    .bind(entity_id)
+                    .bind(namespace_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(sqlx_to_io)?;
+            }
+            let episodic = query::<Postgres>(
+                "DELETE FROM episodic_memories
+                 WHERE namespace_id = $2 AND (about_entity = $1 OR source_entity = $1)",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?
+            .rows_affected();
+            let semantic = query::<Postgres>(
+                "DELETE FROM semantic_memories
+                 WHERE namespace_id = $2 AND (subject = $1 OR object_entity = $1)",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?
+            .rows_affected();
+            let edges = query::<Postgres>(
+                "DELETE FROM edges
+                 WHERE namespace_id = $2 AND (source = $1 OR target = $1)",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?
+            .rows_affected();
+            let entities =
+                query::<Postgres>("DELETE FROM entities WHERE id = $1 AND namespace_id = $2")
+                    .bind(entity_id)
+                    .bind(namespace_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(sqlx_to_io)?
+                    .rows_affected();
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(ErasureSummary {
+                memories: usize::try_from(episodic + semantic).unwrap_or(usize::MAX),
+                observations: usize::try_from(observations).unwrap_or(usize::MAX),
+                edges: usize::try_from(edges).unwrap_or(usize::MAX),
+                entities: usize::try_from(entities).unwrap_or(usize::MAX),
+            })
         })
     }
 

@@ -16,9 +16,9 @@ use crate::types::{
 };
 
 use super::{
-    ActivityAggregate, ActivityEvent, CapturedMemory, ErasedRows, StorageError, StorageResult,
-    StorageTrait, canonical_embedding_source_sha256, cross_namespace_edge_id, memory_namespace_id,
-    validate_record_matches_memory,
+    ActivityAggregate, ActivityEvent, BulkMutationSummary, CapturedMemory, ErasedRows,
+    ErasureSummary, StorageError, StorageResult, StorageTrait, canonical_embedding_source_sha256,
+    cross_namespace_edge_id, memory_namespace_id, validate_record_matches_memory,
 };
 use crate::graph::EdgeType;
 use crate::storage::bounded::{
@@ -1322,6 +1322,88 @@ fn take_embedding_records_in_conn(
     Ok(records)
 }
 
+fn capture_and_delete_entity_page_in_conn(
+    conn: &Connection,
+    entity_id: Uuid,
+    namespace_id: Uuid,
+    limit: usize,
+) -> StorageResult<Vec<CapturedMemory>> {
+    let mut stmt = conn.prepare(
+        r"SELECT memory_type, id FROM (
+               SELECT 0 AS type_order, 'episodic' AS memory_type, id
+               FROM episodic_memories
+               WHERE namespace_id = ?1 AND (about_entity = ?2 OR source_entity = ?2)
+               UNION ALL
+               SELECT 1, 'semantic', id FROM semantic_memories
+               WHERE namespace_id = ?1 AND (subject = ?2 OR object_entity = ?2)
+           ) AS memories
+           ORDER BY type_order, id
+           LIMIT ?3",
+    )?;
+    let refs = stmt
+        .query_map(
+            params![
+                namespace_id.to_string(),
+                entity_id.to_string(),
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?
+        .map(|row| {
+            let (memory_type, id) = row?;
+            Ok(MemoryRef {
+                memory_type: memory_type_from_str(&memory_type)?,
+                id: Uuid::parse_str(&id).map_err(|error| {
+                    StorageError::Context(format!("corrupt memory UUID {id:?}: {error}"))
+                })?,
+            })
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    drop(stmt);
+
+    let mut captured = Vec::with_capacity(refs.len());
+    for memory_ref in refs {
+        let memory = load_memory_without_embedding_in_conn(conn, namespace_id, memory_ref)?
+            .ok_or_else(|| {
+                StorageError::Context(format!(
+                    "captured memory {:?}/{} disappeared inside delete transaction",
+                    memory_ref.memory_type, memory_ref.id
+                ))
+            })?;
+        let embeddings = take_embedding_records_in_conn(conn, &memory)?;
+        conn.execute(
+            "DELETE FROM memory_fts
+             WHERE memory_id = ?1 AND namespace_id = ?2 AND memory_type = ?3",
+            params![
+                memory.id().to_string(),
+                namespace_id.to_string(),
+                memory.type_name(),
+            ],
+        )?;
+        let table = match memory_ref.memory_type {
+            MemoryType::Episodic => "episodic_memories",
+            MemoryType::Semantic => "semantic_memories",
+            MemoryType::Procedural | MemoryType::Observation => {
+                return Err(StorageError::Context(
+                    "entity forget selected a non-entity memory type".into(),
+                ));
+            }
+        };
+        let deleted = conn.execute(
+            &format!("DELETE FROM {table} WHERE id = ?1 AND namespace_id = ?2"),
+            params![memory.id().to_string(), namespace_id.to_string()],
+        )?;
+        if deleted != 1 {
+            return Err(StorageError::Context(format!(
+                "captured memory {} was not deleted exactly once",
+                memory.id()
+            )));
+        }
+        captured.push(CapturedMemory { memory, embeddings });
+    }
+    Ok(captured)
+}
+
 // ---------------------------------------------------------------------------
 // Serialization helpers
 // ---------------------------------------------------------------------------
@@ -1536,6 +1618,48 @@ fn load_memory_without_embedding_in_conn(
             .transpose()
             .map(|memory| memory.map(Memory::Observation)),
     }
+}
+
+fn memory_page_from_typed_ids(
+    conn: &Connection,
+    namespace_id: Uuid,
+    rows: Vec<(String, String)>,
+    limit: usize,
+) -> StorageResult<MemoryPage> {
+    let has_more = rows.len() > limit;
+    let refs = rows
+        .into_iter()
+        .take(limit)
+        .map(|(memory_type, id)| {
+            Ok(MemoryRef {
+                memory_type: memory_type_from_str(&memory_type)?,
+                id: Uuid::parse_str(&id).map_err(|error| {
+                    StorageError::Context(format!("corrupt memory UUID {id:?}: {error}"))
+                })?,
+            })
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    let next_cursor = has_more.then(|| {
+        let memory_ref = refs
+            .last()
+            .copied()
+            .expect("a page with more rows is non-empty");
+        PageCursor {
+            memory_type: memory_ref.memory_type,
+            id: memory_ref.id,
+        }
+    });
+    let mut memories = Vec::with_capacity(refs.len());
+    for memory_ref in refs {
+        if let Some(memory) = load_memory_without_embedding_in_conn(conn, namespace_id, memory_ref)?
+        {
+            memories.push(memory);
+        }
+    }
+    Ok(MemoryPage {
+        memories,
+        next_cursor,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2282,6 +2406,123 @@ impl StorageTrait for SqliteBackend {
         })
     }
 
+    fn page_entity_memories(
+        &self,
+        namespace_id: Uuid,
+        entity_id: Uuid,
+        entity_instance: &str,
+        after: Option<PageCursor>,
+        limit: usize,
+        include_superseded: bool,
+    ) -> StorageResult<MemoryPage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "entity memory page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        let after_type = after
+            .as_ref()
+            .map_or(-1, |cursor| memory_type_order(cursor.memory_type));
+        let after_id = after
+            .as_ref()
+            .map_or_else(String::new, |cursor| cursor.id.to_string());
+        let conn = lock_conn!(self);
+        let mut stmt = conn.prepare(
+            r"SELECT memory_type, id FROM (
+                   SELECT 0 AS type_order, 'episodic' AS memory_type, id
+                   FROM episodic_memories
+                   WHERE namespace_id = ?1
+                     AND about_entity = ?2
+                     AND (?4 OR superseded_by IS NULL)
+                   UNION ALL
+                   SELECT 1, 'semantic', id FROM semantic_memories
+                   WHERE namespace_id = ?1
+                     AND subject = ?2
+                     AND (?4 OR superseded_by IS NULL)
+                   UNION ALL
+                   SELECT 3, 'observation', id FROM observation_memories
+                   WHERE namespace_id = ?1 AND instance = ?3
+                     AND (?4 OR superseded_by IS NULL)
+               ) AS memories
+               WHERE type_order > ?5 OR (type_order = ?5 AND id > ?6)
+               ORDER BY type_order, id
+               LIMIT ?7",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    namespace_id.to_string(),
+                    entity_id.to_string(),
+                    entity_instance,
+                    include_superseded,
+                    after_type,
+                    after_id,
+                    i64::try_from(limit + 1).unwrap_or(i64::MAX),
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        memory_page_from_typed_ids(&conn, namespace_id, rows, limit)
+    }
+
+    fn page_gdpr_personal_data(
+        &self,
+        namespace_id: Uuid,
+        entity_id: Uuid,
+        after: Option<PageCursor>,
+        limit: usize,
+    ) -> StorageResult<MemoryPage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "GDPR memory page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        let after_type = after
+            .as_ref()
+            .map_or(-1, |cursor| memory_type_order(cursor.memory_type));
+        let after_id = after
+            .as_ref()
+            .map_or_else(String::new, |cursor| cursor.id.to_string());
+        let conn = lock_conn!(self);
+        let mut stmt = conn.prepare(
+            r"SELECT memory_type, id FROM (
+                   SELECT 0 AS type_order, 'episodic' AS memory_type, id
+                   FROM episodic_memories
+                   WHERE namespace_id = ?1
+                     AND (about_entity = ?2 OR source_entity = ?2)
+                     AND superseded_by IS NULL
+                   UNION ALL
+                   SELECT 1, 'semantic', id FROM semantic_memories
+                   WHERE namespace_id = ?1 AND subject = ?2 AND superseded_by IS NULL
+                   UNION ALL
+                   SELECT 3, 'observation', o.id
+                   FROM observation_memories AS o
+                   WHERE o.namespace_id = ?1 AND o.superseded_by IS NULL AND EXISTS (
+                       SELECT 1 FROM episodic_memories AS e
+                       WHERE e.namespace_id = ?1 AND e.episode_id = o.episode_id
+                         AND (e.about_entity = ?2 OR e.source_entity = ?2)
+                         AND e.superseded_by IS NULL
+                   )
+               ) AS memories
+               WHERE type_order > ?3 OR (type_order = ?3 AND id > ?4)
+               ORDER BY type_order, id
+               LIMIT ?5",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    namespace_id.to_string(),
+                    entity_id.to_string(),
+                    after_type,
+                    after_id,
+                    i64::try_from(limit + 1).unwrap_or(i64::MAX),
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        memory_page_from_typed_ids(&conn, namespace_id, rows, limit)
+    }
+
     fn save_memory_with_embedding(
         &self,
         memory: &Memory,
@@ -2299,6 +2540,50 @@ impl StorageTrait for SqliteBackend {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    fn restore_memory_page(&self, page: &[CapturedMemory]) -> StorageResult<()> {
+        if page.len() > MEMORY_PAGE_SIZE {
+            return Err(StorageError::BudgetExceeded(format!(
+                "restore page contains {} rows; maximum is {MEMORY_PAGE_SIZE}",
+                page.len()
+            )));
+        }
+        if let Some(first) = page.first() {
+            let namespace_id = memory_namespace_id(&first.memory);
+            if page
+                .iter()
+                .any(|captured| memory_namespace_id(&captured.memory) != namespace_id)
+            {
+                return Err(StorageError::Context(
+                    "restore page spans multiple namespaces".into(),
+                ));
+            }
+        }
+        for captured in page {
+            for record in &captured.embeddings {
+                validate_record_matches_memory(record, &captured.memory)?;
+            }
+        }
+        let conn = lock_conn!(self);
+        let transaction = conn.unchecked_transaction()?;
+        let result = (|| {
+            for captured in page {
+                save_memory_in_conn(&transaction, &captured.memory)?;
+                reconcile_embedding_source_in_conn(&transaction, &captured.memory)?;
+                for record in &captured.embeddings {
+                    insert_embedding_in_conn(&transaction, record)?;
+                }
+            }
+            Ok::<_, StorageError>(())
+        })();
+        match result {
+            Ok(()) => transaction.commit().map_err(StorageError::from),
+            Err(error) => {
+                let _ = transaction.rollback();
+                Err(error)
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3700,6 +3985,55 @@ impl StorageTrait for SqliteBackend {
         }
     }
 
+    fn delete_memories_by_entity_paged(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+        page_size: usize,
+        persist_page: &mut dyn FnMut(&[CapturedMemory]) -> StorageResult<()>,
+        finalize: &mut dyn FnMut(BulkMutationSummary) -> StorageResult<()>,
+    ) -> StorageResult<BulkMutationSummary> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&page_size) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "capture page size must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        let conn = lock_conn!(self);
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let mut summary = BulkMutationSummary::default();
+            loop {
+                let page = capture_and_delete_entity_page_in_conn(
+                    &conn,
+                    entity_id,
+                    namespace_id,
+                    page_size,
+                )?;
+                if page.is_empty() {
+                    break;
+                }
+                persist_page(&page)?;
+                summary.memories += page.len();
+                summary.embedding_records += page
+                    .iter()
+                    .map(|captured| captured.embeddings.len())
+                    .sum::<usize>();
+            }
+            finalize(summary)?;
+            Ok::<_, StorageError>(summary)
+        })();
+        match result {
+            Ok(summary) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(summary)
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     /// One-transaction GDPR erase — the trait docs carry the leg order and why
     /// it is fixed. `RETURNING` supplies the captured rows, so what the caller
     /// gets back is what each `DELETE` removed rather than what a preceding
@@ -3847,6 +4181,110 @@ impl StorageTrait for SqliteBackend {
             Err(e) => {
                 let _ = conn.execute_batch("ROLLBACK");
                 Err(e)
+            }
+        }
+    }
+
+    fn erase_entity_bounded(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<ErasureSummary> {
+        let conn = lock_conn!(self);
+        let id = entity_id.to_string();
+        let namespace = namespace_id.to_string();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let observation_relation = "SELECT o.id FROM observation_memories AS o
+                 WHERE o.namespace_id = ?2 AND o.episode_id IN (
+                     SELECT DISTINCT e.episode_id FROM episodic_memories AS e
+                     WHERE e.namespace_id = ?2
+                       AND (e.about_entity = ?1 OR e.source_entity = ?1)
+                 )";
+            conn.execute(
+                &format!(
+                    "DELETE FROM memory_embeddings WHERE namespace_id = ?2
+                     AND memory_type = 'observation' AND memory_id IN ({observation_relation})"
+                ),
+                params![&id, &namespace],
+            )?;
+            conn.execute(
+                &format!(
+                    "DELETE FROM memory_fts WHERE namespace_id = ?2
+                     AND memory_type = 'observation' AND memory_id IN ({observation_relation})"
+                ),
+                params![&id, &namespace],
+            )?;
+            let observations = conn.execute(
+                &format!(
+                    "DELETE FROM observation_memories
+                     WHERE namespace_id = ?2 AND id IN ({observation_relation})"
+                ),
+                params![&id, &namespace],
+            )?;
+
+            for (memory_type, table, predicate) in [
+                (
+                    "episodic",
+                    "episodic_memories",
+                    "about_entity = ?1 OR source_entity = ?1",
+                ),
+                (
+                    "semantic",
+                    "semantic_memories",
+                    "subject = ?1 OR object_entity = ?1",
+                ),
+            ] {
+                let ids =
+                    format!("SELECT id FROM {table} WHERE namespace_id = ?2 AND ({predicate})");
+                conn.execute(
+                    &format!(
+                        "DELETE FROM memory_embeddings WHERE namespace_id = ?2
+                         AND memory_type = '{memory_type}' AND memory_id IN ({ids})"
+                    ),
+                    params![&id, &namespace],
+                )?;
+                conn.execute(
+                    &format!(
+                        "DELETE FROM memory_fts WHERE namespace_id = ?2
+                         AND memory_type = '{memory_type}' AND memory_id IN ({ids})"
+                    ),
+                    params![&id, &namespace],
+                )?;
+            }
+            let episodic = conn.execute(
+                "DELETE FROM episodic_memories
+                 WHERE namespace_id = ?2 AND (about_entity = ?1 OR source_entity = ?1)",
+                params![&id, &namespace],
+            )?;
+            let semantic = conn.execute(
+                "DELETE FROM semantic_memories
+                 WHERE namespace_id = ?2 AND (subject = ?1 OR object_entity = ?1)",
+                params![&id, &namespace],
+            )?;
+            let edges = conn.execute(
+                "DELETE FROM edges WHERE namespace_id = ?2 AND (source = ?1 OR target = ?1)",
+                params![&id, &namespace],
+            )?;
+            let entities = conn.execute(
+                "DELETE FROM entities WHERE id = ?1 AND namespace_id = ?2",
+                params![&id, &namespace],
+            )?;
+            Ok::<_, StorageError>(ErasureSummary {
+                memories: episodic + semantic,
+                observations,
+                edges,
+                entities,
+            })
+        })();
+        match result {
+            Ok(summary) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(summary)
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
             }
         }
     }
@@ -8346,5 +8784,349 @@ mod tests {
         );
         assert_eq!(fts_rows_for(&db, episodic.id), 0);
         assert_eq!(fts_rows_for(&db, semantic.id), 0);
+    }
+
+    #[test]
+    fn bulk_entity_capture_is_page_streamed_and_finalized_before_commit() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let mut entity = Entity::new("paged-forget", EntityKind::User);
+        entity.namespace_id = ns.id;
+        db.save_entity(&entity).unwrap();
+        let episode = Episode::new(ns.id, vec![entity.id]);
+        db.save_episode(&episode).unwrap();
+        for index in 0..257 {
+            db.save_episodic(&EpisodicMemory::new(
+                ns.id,
+                episode.id,
+                entity.id,
+                entity.id,
+                format!("captured row {index}"),
+            ))
+            .unwrap();
+        }
+
+        let mut page_sizes = Vec::new();
+        let finalized = std::cell::Cell::new(false);
+        let summary = db
+            .delete_memories_by_entity_paged(
+                entity.id,
+                ns.id,
+                64,
+                &mut |page| {
+                    assert!(!finalized.get(), "finalize must be the last callback");
+                    page_sizes.push(page.len());
+                    Ok(())
+                },
+                &mut |_| {
+                    finalized.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(summary.memories, 257);
+        assert_eq!(page_sizes, vec![64, 64, 64, 64, 1]);
+        assert!(finalized.get());
+        assert!(db.get_all_memories_by_namespace(ns.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn bulk_entity_capture_rolls_back_when_count_finalization_fails() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let mut entity = Entity::new("finalize-rollback", EntityKind::User);
+        entity.namespace_id = ns.id;
+        db.save_entity(&entity).unwrap();
+        let memory = EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            entity.id,
+            entity.id,
+            "must survive rejected finalization",
+        );
+        db.save_episodic(&memory).unwrap();
+
+        let error = db
+            .delete_memories_by_entity_paged(
+                entity.id,
+                ns.id,
+                256,
+                &mut |_| Ok(()),
+                &mut |summary| {
+                    assert_eq!(summary.memories, 1);
+                    Err(StorageError::Context("reject finalized counts".into()))
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("reject finalized counts"));
+        assert!(
+            db.get_episodic_in_namespace(memory.id, ns.id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn restore_memory_page_is_atomic_on_late_source_hash_failure() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        register_embedding_space(&db, "restore-page-space", 2);
+        let first = Memory::Episodic(EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "first restore source",
+        ));
+        let second = Memory::Semantic(SemanticMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            "likes",
+            "bounded restores",
+            0.9,
+        ));
+        let valid = EmbeddingRecord {
+            namespace_id: ns.id,
+            memory_ref: MemoryRef::from_memory(&first),
+            embedding_space_id: EmbeddingSpaceId("restore-page-space".into()),
+            source_sha256: canonical_embedding_source_sha256(&first),
+            embedding: vec![0.1, 0.2],
+        };
+        let mut invalid = EmbeddingRecord {
+            namespace_id: ns.id,
+            memory_ref: MemoryRef::from_memory(&second),
+            embedding_space_id: EmbeddingSpaceId("restore-page-space".into()),
+            source_sha256: canonical_embedding_source_sha256(&second),
+            embedding: vec![0.3, 0.4],
+        };
+        invalid.source_sha256 = "not-the-source-hash".into();
+
+        let error = db
+            .restore_memory_page(&[
+                CapturedMemory {
+                    memory: first.clone(),
+                    embeddings: vec![valid],
+                },
+                CapturedMemory {
+                    memory: second.clone(),
+                    embeddings: vec![invalid],
+                },
+            ])
+            .unwrap_err();
+
+        assert!(error.to_string().contains("source"));
+        assert!(
+            db.get_episodic_in_namespace(first.id(), ns.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_semantic_in_namespace(second.id(), ns.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn restore_memory_page_rolls_back_on_late_embedding_reconciliation_failure() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        register_embedding_space(&db, "restore-reconciliation-space", 2);
+        let first = Memory::Episodic(EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "first reconciled source",
+        ));
+        let second = Memory::Semantic(SemanticMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            "requires",
+            "atomic reconciliation",
+            0.9,
+        ));
+        let record = |memory: &Memory, embedding| EmbeddingRecord {
+            namespace_id: ns.id,
+            memory_ref: MemoryRef::from_memory(memory),
+            embedding_space_id: EmbeddingSpaceId("restore-reconciliation-space".into()),
+            source_sha256: canonical_embedding_source_sha256(memory),
+            embedding,
+        };
+
+        let error = db
+            .restore_memory_page(&[
+                CapturedMemory {
+                    memory: first.clone(),
+                    embeddings: vec![record(&first, vec![0.1, 0.2])],
+                },
+                CapturedMemory {
+                    memory: second.clone(),
+                    embeddings: vec![record(&second, vec![0.3, 0.4, 0.5])],
+                },
+            ])
+            .unwrap_err();
+
+        assert!(error.to_string().contains("dimension"));
+        assert!(
+            db.get_episodic_in_namespace(first.id(), ns.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_semantic_in_namespace(second.id(), ns.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn restore_memory_page_rejects_more_than_256_rows_before_writing() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let page: Vec<CapturedMemory> = (0..257)
+            .map(|index| CapturedMemory {
+                memory: Memory::Episodic(EpisodicMemory::new(
+                    ns.id,
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    format!("oversized restore row {index}"),
+                )),
+                embeddings: Vec::new(),
+            })
+            .collect();
+
+        let error = db.restore_memory_page(&page).unwrap_err();
+
+        assert!(matches!(error, StorageError::BudgetExceeded(_)));
+        assert!(db.get_all_memories_by_namespace(ns.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn entity_and_gdpr_pages_include_existing_observation_relationships() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let mut entity = Entity::new("Alice", EntityKind::User);
+        entity.namespace_id = ns.id;
+        db.save_entity(&entity).unwrap();
+        let episode = Episode::new(ns.id, vec![entity.id]);
+        db.save_episode(&episode).unwrap();
+        db.save_episodic(&EpisodicMemory::new(
+            ns.id,
+            episode.id,
+            entity.id,
+            entity.id,
+            "Alice participated",
+        ))
+        .unwrap();
+        let observation = ObservationMemory::new(
+            ns.id,
+            episode.id,
+            "person",
+            "Alice",
+            "participated",
+            "derived observation",
+        );
+        db.save_observation(&observation).unwrap();
+        let mut other = Entity::new("Bob", EntityKind::User);
+        other.namespace_id = ns.id;
+        db.save_entity(&other).unwrap();
+        let source_side = EpisodicMemory::new(
+            ns.id,
+            episode.id,
+            entity.id,
+            other.id,
+            "Alice spoke about Bob",
+        );
+        db.save_episodic(&source_side).unwrap();
+        let mut object_side = SemanticMemory::new(ns.id, other.id, "knows", "Alice", 0.9);
+        object_side.object_entity = Some(entity.id);
+        db.save_semantic(&object_side).unwrap();
+
+        let inspect = db
+            .page_entity_memories(ns.id, entity.id, "Alice", None, 1, false)
+            .unwrap();
+        assert_eq!(inspect.memories.len(), 1);
+        assert!(inspect.next_cursor.is_some());
+        let inspect_next = db
+            .page_entity_memories(ns.id, entity.id, "Alice", inspect.next_cursor, 1, false)
+            .unwrap();
+        assert!(
+            inspect_next
+                .memories
+                .iter()
+                .any(|memory| memory.id() == observation.id)
+        );
+        assert!(inspect_next.next_cursor.is_none());
+        assert!(
+            !inspect
+                .memories
+                .iter()
+                .any(|memory| { memory.id() == source_side.id || memory.id() == object_side.id })
+        );
+        assert!(
+            !inspect_next
+                .memories
+                .iter()
+                .any(|memory| { memory.id() == source_side.id || memory.id() == object_side.id })
+        );
+
+        let gdpr = db
+            .page_gdpr_personal_data(ns.id, entity.id, None, 256)
+            .unwrap();
+        assert!(
+            gdpr.memories
+                .iter()
+                .any(|memory| memory.id() == observation.id)
+        );
+        assert!(
+            gdpr.memories
+                .iter()
+                .any(|memory| memory.id() == source_side.id)
+        );
+        assert!(
+            !gdpr
+                .memories
+                .iter()
+                .any(|memory| memory.id() == object_side.id)
+        );
+    }
+
+    #[test]
+    fn bounded_gdpr_erase_returns_counts_without_captured_rows() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let mut entity = Entity::new("erase subject", EntityKind::User);
+        entity.namespace_id = ns.id;
+        db.save_entity(&entity).unwrap();
+        let episode = Episode::new(ns.id, vec![entity.id]);
+        db.save_episode(&episode).unwrap();
+        db.save_episodic(&EpisodicMemory::new(
+            ns.id,
+            episode.id,
+            entity.id,
+            entity.id,
+            "erase source",
+        ))
+        .unwrap();
+        db.save_observation(&ObservationMemory::new(
+            ns.id,
+            episode.id,
+            "person",
+            "erase subject",
+            "observed",
+            "derived data",
+        ))
+        .unwrap();
+
+        let summary = db.erase_entity_bounded(entity.id, ns.id).unwrap();
+
+        assert_eq!(summary.memories, 1);
+        assert_eq!(summary.observations, 1);
+        assert_eq!(summary.entities, 1);
+        assert!(db.get_all_memories_by_namespace(ns.id).unwrap().is_empty());
     }
 }

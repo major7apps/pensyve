@@ -215,7 +215,12 @@ fn snapshot_scope_equals_delete_scope() {
         snapshot::RetentionPolicy::UNBOUNDED,
     )
     .unwrap();
-    let snapshot_ids: HashSet<Uuid> = outcome.snapshot.memory_ids().into_iter().collect();
+    let mut snapshot_ids = HashSet::new();
+    snapshot::for_each_memory_id(outcome.path.as_deref().expect("snapshot path"), |id| {
+        snapshot_ids.insert(id);
+        Ok(())
+    })
+    .unwrap();
 
     let after = live_ids(storage, fixture.namespace.id);
     let actually_deleted: HashSet<Uuid> = before.difference(&after).copied().collect();
@@ -355,10 +360,9 @@ fn snapshot_round_trips_the_deleted_memories_back_into_storage() {
     // Recover from the persisted artifact alone, as a caller holding only the
     // path from the `pensyve_forget` response would.
     let path = outcome.path.expect("a non-empty snapshot must be written");
-    let reloaded = snapshot::read_file(&path).unwrap();
-    let restored = snapshot::restore(storage, &reloaded).unwrap();
+    let restored = snapshot::restore_file(storage, &path).unwrap();
 
-    assert_eq!(restored.restored, outcome.snapshot.memories.len());
+    assert_eq!(restored.restored, outcome.snapshot.counts.total);
     assert_eq!(
         live_ids(storage, fixture.namespace.id),
         before,
@@ -410,8 +414,9 @@ fn restore_is_idempotent() {
     )
     .unwrap();
 
-    snapshot::restore(storage, &outcome.snapshot).unwrap();
-    snapshot::restore(storage, &outcome.snapshot).unwrap();
+    let path = outcome.path.as_deref().expect("snapshot path");
+    snapshot::restore_file(storage, path).unwrap();
+    snapshot::restore_file(storage, path).unwrap();
 
     assert_eq!(live_ids(storage, fixture.namespace.id), before);
 }
@@ -475,13 +480,10 @@ fn snapshot_round_trips_versioned_embedding_generations() {
         snapshot::RetentionPolicy::UNBOUNDED,
     )
     .unwrap();
-    assert_eq!(outcome.snapshot.embedding_records, records);
+    assert_eq!(outcome.snapshot.embedding_records, records.len());
 
     let path = outcome.path.expect("generation-bearing snapshot file");
-    let reloaded = snapshot::read_file(&path).unwrap();
-    assert_eq!(reloaded.embedding_records, records);
-
-    snapshot::restore(&fixture.storage, &reloaded).unwrap();
+    snapshot::restore_file(&fixture.storage, &path).unwrap();
 
     let connection = Connection::open(fixture.db_path.join("memories.db")).unwrap();
     for record in &records {
