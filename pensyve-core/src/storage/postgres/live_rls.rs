@@ -4073,6 +4073,20 @@ fn bounded_lexical_stop_words_and_ranking_match_sqlite() {
     assert_eq!(postgres_meaningful, sqlite_meaningful);
     assert_eq!(postgres_with_stop, postgres_meaningful);
     assert_eq!(sqlite_with_stop, sqlite_meaningful);
+    for punctuated_query in ["the.alpha", "the—alpha"] {
+        assert_eq!(
+            postgres
+                .search_lexical_hits(punctuated_query, &scope, 100)
+                .expect("postgres punctuated query"),
+            postgres_meaningful
+        );
+        assert_eq!(
+            sqlite
+                .search_lexical_hits(punctuated_query, &scope, 100)
+                .expect("sqlite punctuated query"),
+            sqlite_meaningful
+        );
+    }
     assert!(
         postgres
             .search_lexical_hits("the and of", &scope, 100)

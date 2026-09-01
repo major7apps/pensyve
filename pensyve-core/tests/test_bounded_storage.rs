@@ -271,6 +271,32 @@ fn lexical_stop_words_are_ignored_without_changing_rank_order() {
 }
 
 #[test]
+fn lexical_internal_ascii_punctuation_separates_stop_words_from_terms() {
+    let (_dir, db, namespace) = sqlite_fixture();
+    save(&db, episodic(namespace.id, 1, "the alpha"));
+    save(&db, episodic(namespace.id, 2, "alpha alpha"));
+    let scope = SearchScope::namespace(namespace.id);
+
+    assert_eq!(
+        db.search_lexical_hits("the.alpha", &scope, 100).unwrap(),
+        db.search_lexical_hits("alpha", &scope, 100).unwrap()
+    );
+}
+
+#[test]
+fn lexical_unicode_punctuation_separates_stop_words_from_terms() {
+    let (_dir, db, namespace) = sqlite_fixture();
+    save(&db, episodic(namespace.id, 1, "the alpha"));
+    save(&db, episodic(namespace.id, 2, "alpha alpha"));
+    let scope = SearchScope::namespace(namespace.id);
+
+    assert_eq!(
+        db.search_lexical_hits("the—alpha", &scope, 100).unwrap(),
+        db.search_lexical_hits("alpha", &scope, 100).unwrap()
+    );
+}
+
+#[test]
 fn hydration_rejects_count_and_byte_overflow_before_returning_rows() {
     let (_dir, db, namespace) = sqlite_fixture();
     let memory_ref = save(&db, episodic(namespace.id, 1, &"large".repeat(64)));

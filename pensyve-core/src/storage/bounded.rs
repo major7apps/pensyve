@@ -202,17 +202,15 @@ const ENGLISH_LEXICAL_STOP_WORDS: &[&str] = &[
 /// Apply the shared bounded lexical query contract before either backend's
 /// native stemmer/parser sees tokens. This matches `PostgreSQL`'s English
 /// stop-word behavior on `SQLite` and makes stop-word-only queries uniformly
-/// empty rather than backend-dependent.
+/// empty rather than backend-dependent. Every non-alphanumeric Unicode scalar
+/// is a separator, so backend parsers never reinterpret internal punctuation.
 pub(crate) fn lexical_query_tokens(query: &str) -> Vec<String> {
     query
-        .split_whitespace()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
         .take(crate::storage::MAX_FTS_QUERY_TOKENS)
         .filter_map(|token| {
-            let normalized = token
-                .trim_matches(|character: char| {
-                    !character.is_alphanumeric() && character != '\'' && character != '-'
-                })
-                .to_lowercase();
+            let normalized = token.to_lowercase();
             (!normalized.is_empty() && !ENGLISH_LEXICAL_STOP_WORDS.contains(&normalized.as_str()))
                 .then_some(normalized)
         })
