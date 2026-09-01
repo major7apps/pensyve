@@ -158,6 +158,14 @@ const RLS_POLICIES: &[(&str, &str)] = &[
         "embedding_backfill_queue",
         "namespace_isolation_embedding_backfill_queue",
     ),
+    (
+        "consolidation_runs",
+        "namespace_isolation_consolidation_runs",
+    ),
+    (
+        "consolidation_sources",
+        "namespace_isolation_consolidation_sources",
+    ),
 ];
 
 /// How Postgres renders the expected `USING` clause back out of `pg_policies`.
@@ -178,9 +186,11 @@ const EXPECTED_EMBEDDING_POLICY_QUAL: &str =
 
 fn expected_policy_qual(table: &str) -> &'static str {
     match table {
-        "memory_embeddings" | "namespace_embedding_state" | "embedding_backfill_queue" => {
-            EXPECTED_EMBEDDING_POLICY_QUAL
-        }
+        "memory_embeddings"
+        | "namespace_embedding_state"
+        | "embedding_backfill_queue"
+        | "consolidation_runs"
+        | "consolidation_sources" => EXPECTED_EMBEDDING_POLICY_QUAL,
         _ => EXPECTED_POLICY_QUAL,
     }
 }
@@ -3468,7 +3478,11 @@ fn schema_declares_rls_for_every_expected_table() {
 
 fn expected_policy_predicate(table: &str) -> &'static str {
     match table {
-        "memory_embeddings" | "namespace_embedding_state" | "embedding_backfill_queue" => {
+        "memory_embeddings"
+        | "namespace_embedding_state"
+        | "embedding_backfill_queue"
+        | "consolidation_runs"
+        | "consolidation_sources" => {
             "namespace_id = current_setting('pensyve.namespace_id', true)::uuid"
         }
         _ => "namespace_id::text = current_setting('pensyve.namespace_id', true)",

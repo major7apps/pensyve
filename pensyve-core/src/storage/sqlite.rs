@@ -28,6 +28,11 @@ use crate::storage::bounded::{
     SearchScope, SearchUnavailable, VectorHit, VectorSearchOutcome, VectorSearchRequest,
     lexical_query_tokens, sort_vector_hits,
 };
+use crate::storage::consolidation_workspace::{
+    ClusterDecision, ClusterMember, ConsolidationWorkspace, NamespacePage, NamespacePageCursor,
+    RunId, WorkspaceAssignment, WorkspaceCandidatePage, WorkspaceCursor, WorkspaceEmbeddingSource,
+    WorkspaceSource, WorkspaceSourcePage,
+};
 
 // ---------------------------------------------------------------------------
 // Safe lock acquisition
@@ -556,6 +561,56 @@ impl SqliteBackend {
                     6_i64,
                     Utc::now().to_rfc3339(),
                     "bounded runtime: add versioned embedding spaces, records, state, and backfill queue",
+                ],
+            )?;
+            transaction.commit()?;
+        }
+
+        // ----- Migration v7: durable bounded consolidation workspace. -----
+        if max_applied < 7 {
+            let transaction = conn.unchecked_transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS consolidation_runs (
+                    run_id TEXT PRIMARY KEY,
+                    namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+                    embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(id),
+                    cursor_ordinal INTEGER NOT NULL DEFAULT 0,
+                    completed INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(namespace_id, embedding_space_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_consolidation_runs_namespace
+                    ON consolidation_runs(namespace_id, embedding_space_id);
+
+                CREATE TABLE IF NOT EXISTS consolidation_sources (
+                    run_id TEXT NOT NULL REFERENCES consolidation_runs(run_id) ON DELETE CASCADE,
+                    namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+                    memory_id TEXT NOT NULL,
+                    source_ordinal INTEGER NOT NULL,
+                    about_entity TEXT NOT NULL,
+                    episode_id TEXT NOT NULL,
+                    source_timestamp TEXT NOT NULL,
+                    source_sha256 TEXT NOT NULL,
+                    assignment_anchor TEXT,
+                    assignment_state TEXT NOT NULL DEFAULT 'unassigned'
+                        CHECK (assignment_state IN
+                            ('unassigned', 'tentative', 'finalized', 'discarded', 'promoted')),
+                    promotion_complete INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(run_id, memory_id),
+                    UNIQUE(run_id, source_ordinal)
+                );
+                CREATE INDEX IF NOT EXISTS idx_consolidation_sources_scan
+                    ON consolidation_sources(run_id, about_entity, source_ordinal,
+                                             assignment_state);",
+            )?;
+            transaction.execute(
+                "INSERT INTO schema_versions (version, applied_at, description)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    7_i64,
+                    Utc::now().to_rfc3339(),
+                    "bounded runtime: durable consolidation runs and source assignments",
                 ],
             )?;
             transaction.commit()?;
@@ -1667,6 +1722,50 @@ fn memory_page_from_typed_ids(
 // ---------------------------------------------------------------------------
 
 impl StorageTrait for SqliteBackend {
+    fn consolidation_workspace(&self) -> Option<&dyn ConsolidationWorkspace> {
+        Some(self)
+    }
+
+    fn page_namespaces(
+        &self,
+        after: Option<NamespacePageCursor>,
+        limit: usize,
+    ) -> StorageResult<NamespacePage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "namespace page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        let after = after.map_or_else(String::new, |cursor| cursor.id.to_string());
+        let conn = lock_conn!(self);
+        let mut stmt =
+            conn.prepare("SELECT id FROM namespaces WHERE id > ?1 ORDER BY id LIMIT ?2")?;
+        let ids = stmt
+            .query_map(
+                params![after, i64::try_from(limit).unwrap_or(i64::MAX)],
+                |row| row.get::<_, String>(0),
+            )?
+            .map(|row| {
+                let value = row?;
+                Uuid::parse_str(&value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_cursor = (ids.len() == limit)
+            .then(|| ids.last().copied())
+            .flatten()
+            .map(|id| NamespacePageCursor { id });
+        Ok(NamespacePage {
+            namespace_ids: ids,
+            next_cursor,
+        })
+    }
+
     fn get_namespace_embedding_state(
         &self,
         namespace_id: Uuid,
@@ -4643,6 +4742,626 @@ impl StorageTrait for SqliteBackend {
         }
         Ok(events)
     }
+}
+
+impl ConsolidationWorkspace for SqliteBackend {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transaction compares and refreshes the durable source snapshot atomically"
+    )]
+    fn begin_or_resume(
+        &self,
+        namespace_id: Uuid,
+        space: &EmbeddingSpaceId,
+    ) -> StorageResult<RunId> {
+        let mut conn = lock_conn!(self);
+        let tx = conn.transaction()?;
+        let namespace = namespace_id.to_string();
+        let now = Utc::now().to_rfc3339();
+        let existing = tx
+            .query_row(
+                "SELECT run_id FROM consolidation_runs
+                 WHERE namespace_id = ?1 AND embedding_space_id = ?2",
+                params![&namespace, &space.0],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let run = existing
+            .as_deref()
+            .map(Uuid::parse_str)
+            .transpose()
+            .map_err(|error| {
+                StorageError::Context(format!("corrupt consolidation run id: {error}"))
+            })?
+            .unwrap_or_else(Uuid::new_v4);
+        if existing.is_none() {
+            tx.execute(
+                "INSERT INTO consolidation_runs
+                    (run_id, namespace_id, embedding_space_id, cursor_ordinal,
+                     completed, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 0, 0, ?4, ?4)",
+                params![run.to_string(), &namespace, &space.0, &now],
+            )?;
+        }
+
+        let run_text = run.to_string();
+        let changed: i64 = tx.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM consolidation_sources AS workspace
+                 WHERE workspace.run_id = ?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM episodic_memories AS source
+                     JOIN memory_embeddings AS embedding
+                       ON embedding.namespace_id = source.namespace_id
+                      AND embedding.memory_type = 'episodic'
+                      AND embedding.memory_id = source.id
+                      AND embedding.embedding_space_id = ?3
+                     WHERE source.namespace_id = ?2
+                       AND source.superseded_by IS NULL AND source.invalid_at IS NULL
+                       AND source.id = workspace.memory_id
+                       AND source.about_entity = workspace.about_entity
+                       AND source.episode_id = workspace.episode_id
+                       AND source.timestamp = workspace.source_timestamp
+                       AND embedding.source_sha256 = workspace.source_sha256
+                   )
+                 UNION ALL
+                 SELECT 1 FROM episodic_memories AS source
+                 JOIN memory_embeddings AS embedding
+                   ON embedding.namespace_id = source.namespace_id
+                  AND embedding.memory_type = 'episodic'
+                  AND embedding.memory_id = source.id
+                  AND embedding.embedding_space_id = ?3
+                 WHERE source.namespace_id = ?2
+                   AND source.superseded_by IS NULL AND source.invalid_at IS NULL
+                   AND NOT EXISTS (
+                     SELECT 1 FROM consolidation_sources AS workspace
+                     WHERE workspace.run_id = ?1
+                       AND workspace.memory_id = source.id
+                       AND workspace.about_entity = source.about_entity
+                       AND workspace.episode_id = source.episode_id
+                       AND workspace.source_timestamp = source.timestamp
+                       AND workspace.source_sha256 = embedding.source_sha256
+                   )
+             )",
+            params![&run_text, &namespace, &space.0],
+            |row| row.get(0),
+        )?;
+        let source_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM consolidation_sources WHERE run_id = ?1",
+            params![&run_text],
+            |row| row.get(0),
+        )?;
+        if changed != 0 || source_count == 0 {
+            tx.execute(
+                "DELETE FROM consolidation_sources WHERE run_id = ?1",
+                params![&run_text],
+            )?;
+            tx.execute(
+                "INSERT INTO consolidation_sources
+                    (run_id, namespace_id, memory_id, source_ordinal, about_entity, episode_id,
+                     source_timestamp, source_sha256, assignment_anchor,
+                     assignment_state, promotion_complete)
+                 SELECT ?1, ?2, source.id,
+                        ROW_NUMBER() OVER (
+                            ORDER BY source.about_entity, source.timestamp, source.id),
+                        source.about_entity, source.episode_id, source.timestamp,
+                        embedding.source_sha256, NULL, 'unassigned', 0
+                 FROM episodic_memories AS source
+                 JOIN memory_embeddings AS embedding
+                   ON embedding.namespace_id = source.namespace_id
+                  AND embedding.memory_type = 'episodic'
+                  AND embedding.memory_id = source.id
+                  AND embedding.embedding_space_id = ?3
+                 WHERE source.namespace_id = ?2
+                   AND source.superseded_by IS NULL AND source.invalid_at IS NULL
+                 ORDER BY source.about_entity, source.timestamp, source.id",
+                params![&run_text, &namespace, &space.0],
+            )?;
+            tx.execute(
+                "UPDATE consolidation_runs
+                 SET cursor_ordinal = 0, completed = 0, updated_at = ?2
+                 WHERE run_id = ?1",
+                params![&run_text, &now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(RunId {
+            id: run,
+            namespace_id,
+        })
+    }
+
+    fn next_sources(
+        &self,
+        run: RunId,
+        after: Option<WorkspaceCursor>,
+        limit: usize,
+    ) -> StorageResult<WorkspaceSourcePage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "consolidation source page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        let conn = lock_conn!(self);
+        let run = run.id.to_string();
+        let cursor = match after {
+            Some(cursor) => cursor.source_ordinal,
+            None => conn.query_row(
+                "SELECT cursor_ordinal FROM consolidation_runs WHERE run_id = ?1",
+                params![&run],
+                |row| row.get(0),
+            )?,
+        };
+        let mut stmt = conn.prepare(
+            "SELECT workspace.memory_id, workspace.about_entity, workspace.episode_id,
+                    workspace.source_timestamp, source.content,
+                    workspace.source_sha256, workspace.source_ordinal
+             FROM consolidation_sources AS workspace
+             JOIN episodic_memories AS source ON source.id = workspace.memory_id
+             WHERE workspace.run_id = ?1 AND workspace.source_ordinal > ?2
+               AND workspace.assignment_state NOT IN ('discarded', 'promoted')
+               AND (workspace.assignment_anchor IS NULL
+                    OR workspace.assignment_anchor = workspace.memory_id)
+             ORDER BY workspace.source_ordinal LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![&run, cursor, i64::try_from(limit).unwrap_or(i64::MAX)],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let records = rows
+            .into_iter()
+            .map(workspace_source_from_sqlite)
+            .collect::<StorageResult<Vec<_>>>()?;
+        let next_cursor = (records.len() == limit)
+            .then(|| {
+                records.last().map(|source| WorkspaceCursor {
+                    source_ordinal: source.ordinal,
+                })
+            })
+            .flatten();
+        Ok(WorkspaceSourcePage {
+            records,
+            next_cursor,
+        })
+    }
+
+    fn load_source(
+        &self,
+        run: RunId,
+        source: MemoryRef,
+    ) -> StorageResult<WorkspaceEmbeddingSource> {
+        if source.memory_type != MemoryType::Episodic {
+            return Err(StorageError::Context(
+                "consolidation workspace accepts episodic sources only".into(),
+            ));
+        }
+        let conn = lock_conn!(self);
+        sqlite_workspace_embedding_source(&conn, run, source.id)
+    }
+
+    fn page_later_unassigned(
+        &self,
+        run: RunId,
+        anchor: MemoryRef,
+        after: Option<WorkspaceCursor>,
+        limit: usize,
+    ) -> StorageResult<WorkspaceCandidatePage> {
+        if !(1..=crate::storage::bounded::CONSOLIDATION_COMPARISON_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "consolidation candidate page limit must be within 1..={} ",
+                crate::storage::bounded::CONSOLIDATION_COMPARISON_PAGE_SIZE
+            )));
+        }
+        let conn = lock_conn!(self);
+        let run_text = run.id.to_string();
+        let anchor_text = anchor.id.to_string();
+        let (anchor_entity, anchor_ordinal): (String, i64) = conn.query_row(
+            "SELECT about_entity, source_ordinal FROM consolidation_sources
+             WHERE run_id = ?1 AND memory_id = ?2",
+            params![&run_text, &anchor_text],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let cursor = after.map_or(anchor_ordinal, |cursor| cursor.source_ordinal);
+        let mut stmt = conn.prepare(
+            "SELECT workspace.memory_id, workspace.about_entity, workspace.episode_id,
+                    workspace.source_timestamp, source.content,
+                    workspace.source_sha256, workspace.source_ordinal,
+                    runs.namespace_id, runs.embedding_space_id, embedding.embedding
+             FROM consolidation_sources AS workspace
+             JOIN consolidation_runs AS runs ON runs.run_id = workspace.run_id
+             JOIN episodic_memories AS source
+               ON source.id = workspace.memory_id AND source.namespace_id = runs.namespace_id
+             JOIN memory_embeddings AS embedding
+               ON embedding.namespace_id = runs.namespace_id
+              AND embedding.memory_type = 'episodic'
+              AND embedding.memory_id = workspace.memory_id
+              AND embedding.embedding_space_id = runs.embedding_space_id
+              AND embedding.source_sha256 = workspace.source_sha256
+             WHERE workspace.run_id = ?1 AND workspace.about_entity = ?2
+               AND workspace.source_ordinal > ?3
+               AND workspace.assignment_state = 'unassigned'
+             ORDER BY workspace.source_ordinal LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    &run_text,
+                    &anchor_entity,
+                    cursor,
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, Vec<u8>>(9)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let records = rows
+            .into_iter()
+            .map(workspace_embedding_source_from_sqlite)
+            .collect::<StorageResult<Vec<_>>>()?;
+        let next_cursor = (records.len() == limit)
+            .then(|| {
+                records.last().map(|source| WorkspaceCursor {
+                    source_ordinal: source.source.ordinal,
+                })
+            })
+            .flatten();
+        Ok(WorkspaceCandidatePage {
+            records,
+            next_cursor,
+        })
+    }
+
+    fn record_tentative_match(
+        &self,
+        run: RunId,
+        anchor: MemoryRef,
+        member: MemoryRef,
+    ) -> StorageResult<usize> {
+        let conn = lock_conn!(self);
+        let run = run.id.to_string();
+        let anchor = anchor.id.to_string();
+        let member = member.id.to_string();
+        let changed = conn.execute(
+            "UPDATE consolidation_sources
+             SET assignment_anchor = ?2, assignment_state = 'tentative'
+             WHERE run_id = ?1 AND memory_id = ?3
+               AND (assignment_state = 'unassigned'
+                    OR assignment_anchor = ?2)",
+            params![&run, &anchor, &member],
+        )?;
+        if changed == 0 {
+            return Ok(0);
+        }
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM consolidation_sources
+             WHERE run_id = ?1 AND assignment_anchor = ?2",
+            params![&run, &anchor],
+            |row| row.get(0),
+        )?;
+        usize::try_from(count)
+            .map_err(|_| StorageError::Context("negative workspace member count".into()))
+    }
+
+    fn finalize_or_discard_cluster(
+        &self,
+        run: RunId,
+        anchor: MemoryRef,
+    ) -> StorageResult<ClusterDecision> {
+        let conn = lock_conn!(self);
+        let run = run.id.to_string();
+        let anchor = anchor.id.to_string();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM consolidation_sources
+             WHERE run_id = ?1 AND assignment_anchor = ?2",
+            params![&run, &anchor],
+            |row| row.get(0),
+        )?;
+        let count = usize::try_from(count)
+            .map_err(|_| StorageError::Context("negative workspace member count".into()))?;
+        if count <= 1 {
+            conn.execute(
+                "UPDATE consolidation_sources
+                 SET assignment_anchor = NULL, assignment_state = 'discarded'
+                 WHERE run_id = ?1 AND memory_id = ?2",
+                params![&run, &anchor],
+            )?;
+            return Ok(ClusterDecision::SingletonDiscarded);
+        }
+        if count > crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS {
+            return Ok(ClusterDecision::MemberBudgetExceeded {
+                member_count: count,
+            });
+        }
+        conn.execute(
+            "UPDATE consolidation_sources SET assignment_state = 'finalized'
+             WHERE run_id = ?1 AND assignment_anchor = ?2",
+            params![&run, &anchor],
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT workspace.memory_id, workspace.episode_id,
+                    workspace.source_timestamp, source.content
+             FROM consolidation_sources AS workspace
+             JOIN episodic_memories AS source ON source.id = workspace.memory_id
+             WHERE workspace.run_id = ?1 AND workspace.assignment_anchor = ?2
+             ORDER BY workspace.source_ordinal",
+        )?;
+        let rows = stmt
+            .query_map(params![&run, &anchor], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let members = rows
+            .into_iter()
+            .map(|(id, episode_id, timestamp, content)| {
+                Ok(ClusterMember {
+                    memory_ref: MemoryRef {
+                        memory_type: MemoryType::Episodic,
+                        id: parse_uuid(&id)?,
+                    },
+                    episode_id: parse_uuid(&episode_id)?,
+                    timestamp: str_to_dt(&timestamp),
+                    content,
+                })
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
+        Ok(ClusterDecision::Finalized { members })
+    }
+
+    fn promotion_is_admitted(
+        &self,
+        run: RunId,
+        about_entity: Uuid,
+        content: &str,
+        episode_times: &[DateTime<Utc>],
+    ) -> StorageResult<bool> {
+        let conn = lock_conn!(self);
+        let namespace: String = conn.query_row(
+            "SELECT namespace_id FROM consolidation_runs WHERE run_id = ?1",
+            params![run.id.to_string()],
+            |row| row.get(0),
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT superseded_by, invalid_at FROM semantic_memories
+             WHERE namespace_id = ?1 AND subject = ?2 AND predicate = 'mentioned'
+               AND object = ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![namespace, about_entity.to_string(), content],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        if rows.is_empty() {
+            return Ok(true);
+        }
+        let mut latest_supersession = None;
+        for (superseded_by, invalid_at) in rows {
+            let (Some(_), Some(invalid_at)) = (superseded_by, invalid_at) else {
+                return Ok(false);
+            };
+            let invalid_at = str_to_dt(&invalid_at);
+            latest_supersession = Some(
+                latest_supersession.map_or(invalid_at, |at: DateTime<Utc>| at.max(invalid_at)),
+            );
+        }
+        Ok(latest_supersession
+            .is_none_or(|at| episode_times.iter().any(|timestamp| *timestamp > at)))
+    }
+
+    fn mark_promotion_complete(&self, run: RunId, anchor: MemoryRef) -> StorageResult<()> {
+        let conn = lock_conn!(self);
+        conn.execute(
+            "UPDATE consolidation_sources
+             SET assignment_state = 'promoted', promotion_complete = 1
+             WHERE run_id = ?1 AND assignment_anchor = ?2",
+            params![run.id.to_string(), anchor.id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn checkpoint(&self, run: RunId, cursor: WorkspaceCursor) -> StorageResult<()> {
+        let conn = lock_conn!(self);
+        conn.execute(
+            "UPDATE consolidation_runs
+             SET cursor_ordinal = ?2, updated_at = ?3 WHERE run_id = ?1",
+            params![
+                run.id.to_string(),
+                cursor.source_ordinal,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn complete(&self, run: RunId) -> StorageResult<()> {
+        let conn = lock_conn!(self);
+        conn.execute(
+            "UPDATE consolidation_runs SET completed = 1, updated_at = ?2 WHERE run_id = ?1",
+            params![run.id.to_string(), Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    fn assignments(&self, run: RunId, limit: usize) -> StorageResult<Vec<WorkspaceAssignment>> {
+        if limit > crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS {
+            return Err(StorageError::BudgetExceeded(format!(
+                "workspace assignment diagnostic limit exceeds {}",
+                crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS
+            )));
+        }
+        let conn = lock_conn!(self);
+        let mut stmt = conn.prepare(
+            "SELECT assignment_anchor, memory_id FROM consolidation_sources
+             WHERE run_id = ?1 AND assignment_state IN ('finalized', 'promoted')
+             ORDER BY assignment_anchor, source_ordinal LIMIT ?2",
+        )?;
+        stmt.query_map(
+            params![run.id.to_string(), i64::try_from(limit).unwrap_or(i64::MAX)],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?
+        .map(|row| {
+            let (anchor, member) = row?;
+            Ok(WorkspaceAssignment {
+                anchor: MemoryRef {
+                    memory_type: MemoryType::Episodic,
+                    id: parse_uuid(&anchor)?,
+                },
+                member: MemoryRef {
+                    memory_type: MemoryType::Episodic,
+                    id: parse_uuid(&member)?,
+                },
+            })
+        })
+        .collect()
+    }
+}
+
+type SqliteWorkspaceSourceRow = (String, String, String, String, String, String, i64);
+
+fn workspace_source_from_sqlite(row: SqliteWorkspaceSourceRow) -> StorageResult<WorkspaceSource> {
+    let (id, about_entity, episode_id, timestamp, content, source_sha256, ordinal) = row;
+    Ok(WorkspaceSource {
+        memory_ref: MemoryRef {
+            memory_type: MemoryType::Episodic,
+            id: parse_uuid(&id)?,
+        },
+        about_entity: parse_uuid(&about_entity)?,
+        episode_id: parse_uuid(&episode_id)?,
+        timestamp: str_to_dt(&timestamp),
+        content,
+        source_sha256,
+        ordinal,
+    })
+}
+
+type SqliteWorkspaceEmbeddingRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    Vec<u8>,
+);
+
+fn workspace_embedding_source_from_sqlite(
+    row: SqliteWorkspaceEmbeddingRow,
+) -> StorageResult<WorkspaceEmbeddingSource> {
+    let (
+        id,
+        about_entity,
+        episode_id,
+        timestamp,
+        content,
+        source_sha256,
+        ordinal,
+        namespace,
+        space,
+        embedding,
+    ) = row;
+    let source = workspace_source_from_sqlite((
+        id,
+        about_entity,
+        episode_id,
+        timestamp,
+        content,
+        source_sha256.clone(),
+        ordinal,
+    ))?;
+    let embedding = blob_to_embedding(&embedding);
+    if embedding.is_empty() || embedding.iter().any(|value| !value.is_finite()) {
+        return Err(StorageError::Context(format!(
+            "workspace embedding for {} is empty or non-finite",
+            source.memory_ref.id
+        )));
+    }
+    Ok(WorkspaceEmbeddingSource {
+        embedding: EmbeddingRecord {
+            namespace_id: parse_uuid(&namespace)?,
+            memory_ref: source.memory_ref,
+            embedding_space_id: EmbeddingSpaceId(space),
+            source_sha256,
+            embedding,
+        },
+        source,
+    })
+}
+
+fn sqlite_workspace_embedding_source(
+    conn: &Connection,
+    run: RunId,
+    memory_id: Uuid,
+) -> StorageResult<WorkspaceEmbeddingSource> {
+    let row = conn.query_row(
+        "SELECT workspace.memory_id, workspace.about_entity, workspace.episode_id,
+                workspace.source_timestamp, source.content, workspace.source_sha256,
+                workspace.source_ordinal, runs.namespace_id, runs.embedding_space_id,
+                embedding.embedding
+         FROM consolidation_sources AS workspace
+         JOIN consolidation_runs AS runs ON runs.run_id = workspace.run_id
+         JOIN episodic_memories AS source
+           ON source.id = workspace.memory_id AND source.namespace_id = runs.namespace_id
+         JOIN memory_embeddings AS embedding
+           ON embedding.namespace_id = runs.namespace_id
+          AND embedding.memory_type = 'episodic'
+          AND embedding.memory_id = workspace.memory_id
+          AND embedding.embedding_space_id = runs.embedding_space_id
+          AND embedding.source_sha256 = workspace.source_sha256
+         WHERE workspace.run_id = ?1 AND workspace.memory_id = ?2",
+        params![run.id.to_string(), memory_id.to_string()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+            ))
+        },
+    )?;
+    workspace_embedding_source_from_sqlite(row)
 }
 
 // ---------------------------------------------------------------------------

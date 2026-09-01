@@ -312,6 +312,8 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
     // without limit through a `remember`/`forget` loop.
     let snapshot_root = PensyveState::snapshot_root_for(&config.storage_path);
     let snapshot_retention = PensyveState::snapshot_retention_from_env();
+    let consolidation_storage = res.storage.clone();
+    let consolidation_embedder = res.embedder.clone();
     let tenant_mgr = if let Some(reranker) = res.strict_reranker {
         TenantStateManager::new_storage_backed_with_preinitialized_reranker(
             res.storage,
@@ -524,17 +526,13 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
 
     // Background consolidation — runs every PENSYVE_CONSOLIDATION_INTERVAL_SECS (default 6h).
     //
-    // #226: this sweep used to hold a `Semaphore::new(1)` here. It never
-    // served its purpose. This task is the only acquirer — it walks namespaces
-    // sequentially and awaits each run before starting the next — so the
-    // permit was uncontended by construction, while the `episode_end` spawns
-    // it was meant to exclude never acquired it at all. The guarantee now
-    // lives inside `ConsolidationEngine::run`, keyed on the namespace, which
-    // is the granularity the hazard actually has and which no call site can
-    // skip.
+    // Namespace discovery comes from bounded storage pages, so eviction from
+    // the tenant metadata cache cannot hide durable work. The engine owns one
+    // fair process-global permit shared by every trigger path.
     let consolidation_cancel = ct.clone();
     tokio::spawn({
-        let state = app_state;
+        let sweep_storage = consolidation_storage;
+        let sweep_embedder = consolidation_embedder;
         async move {
             let interval_secs: u64 = std::env::var("PENSYVE_CONSOLIDATION_INTERVAL_SECS")
                 .ok()
@@ -548,14 +546,23 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                 if consolidation_cancel.is_cancelled() {
                     return;
                 }
-                for ns_id in state.tenant_mgr.active_namespace_ids() {
-                    if consolidation_cancel.is_cancelled() {
-                        return;
-                    }
-                    if let Some(ps) = state.tenant_mgr.get_state_by_namespace_id(ns_id) {
+                let mut namespace_cursor = None;
+                loop {
+                    let page = match sweep_storage.page_namespaces(namespace_cursor, 256) {
+                        Ok(page) => page,
+                        Err(error) => {
+                            tracing::warn!(reason = %error, "Background namespace enumeration failed");
+                            break;
+                        }
+                    };
+                    let next_namespace_cursor = page.next_cursor;
+                    for ns_id in page.namespace_ids {
+                        if consolidation_cancel.is_cancelled() {
+                            return;
+                        }
                         let config = pensyve_core::config::ConsolidationConfig::default();
-                        let storage = ps.storage.clone();
-                        let embedder = ps.embedder.clone();
+                        let storage = sweep_storage.clone();
+                        let embedder = sweep_embedder.clone();
                         let run_storage = storage.clone();
                         let run_embedder = embedder.clone();
                         let run_cancel = consolidation_cancel.clone();
@@ -564,7 +571,7 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                         // today; pass Disabled (fail-closed) and the shared
                         // shutdown token so blocking work can exit promptly.
                         let run = tokio::task::spawn_blocking(move || {
-                            pensyve_core::consolidation::ConsolidationEngine::run(
+                            pensyve_core::consolidation::ConsolidationEngine::run_bounded(
                                 run_storage.as_ref(),
                                 &run_embedder,
                                 &config,
@@ -575,10 +582,13 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                         })
                         .await;
                         match run {
-                            Ok(Ok(cs)) => {
+                            Ok(Ok(
+                                pensyve_core::consolidation::ConsolidationOutcome::Complete {
+                                    stats: cs,
+                                },
+                            )) => {
                                 if cs.promoted > 0 || cs.archived > 0 {
                                     tracing::info!(
-                                        namespace_id = %ns_id,
                                         promoted = cs.promoted,
                                         decayed = cs.decayed,
                                         archived = cs.archived,
@@ -593,6 +603,33 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                                         "decayed": cs.decayed,
                                         "archived": cs.archived,
                                     }),
+                                );
+                            }
+                            Ok(Ok(
+                                pensyve_core::consolidation::ConsolidationOutcome::Incomplete {
+                                    stats: cs,
+                                    reason,
+                                    ..
+                                },
+                            )) => {
+                                let reason_code = match reason {
+                                    pensyve_core::consolidation::ConsolidationIncomplete::Cancelled => "cancelled",
+                                    pensyve_core::consolidation::ConsolidationIncomplete::DurationExceeded => "duration_exceeded",
+                                    pensyve_core::consolidation::ConsolidationIncomplete::ClusterMemberBudgetExceeded { .. } => "cluster_member_budget_exceeded",
+                                };
+                                let _ = storage.log_activity(
+                                    ns_id,
+                                    "consolidate",
+                                    &serde_json::json!({
+                                        "promoted": cs.promoted,
+                                        "decayed": cs.decayed,
+                                        "archived": cs.archived,
+                                        "incomplete": reason_code,
+                                    }),
+                                );
+                                tracing::info!(
+                                    reason = reason_code,
+                                    "Background consolidation checkpointed incomplete"
                                 );
                             }
                             Ok(Err(e)) => {
@@ -612,20 +649,22 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                                     );
                                 }
                                 tracing::warn!(
-                                    namespace_id = %ns_id,
                                     error = %e,
                                     "Background consolidation failed"
                                 );
                             }
                             Err(e) => {
                                 tracing::warn!(
-                                    namespace_id = %ns_id,
                                     error = %e,
                                     "Background consolidation task failed"
                                 );
                             }
                         }
                     }
+                    let Some(next) = next_namespace_cursor else {
+                        break;
+                    };
+                    namespace_cursor = Some(next);
                 }
             }
         }

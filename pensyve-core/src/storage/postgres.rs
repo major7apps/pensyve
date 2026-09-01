@@ -34,6 +34,11 @@ use crate::storage::bounded::{
     NamespaceEmbeddingPhase, NamespaceEmbeddingState, PageCursor, SearchScope, SearchUnavailable,
     VectorHit, VectorSearchOutcome, VectorSearchRequest, lexical_query_tokens,
 };
+use crate::storage::consolidation_workspace::{
+    ClusterDecision, ClusterMember, ConsolidationWorkspace, NamespacePage, NamespacePageCursor,
+    RunId, WorkspaceAssignment, WorkspaceCandidatePage, WorkspaceCursor, WorkspaceEmbeddingSource,
+    WorkspaceSource, WorkspaceSourcePage,
+};
 
 // ---------------------------------------------------------------------------
 // Row type aliases (for complex tuple types used with query_as)
@@ -1677,6 +1682,47 @@ async fn memory_page_from_pg_ids(
 // ---------------------------------------------------------------------------
 
 impl StorageTrait for PostgresBackend {
+    fn consolidation_workspace(&self) -> Option<&dyn ConsolidationWorkspace> {
+        Some(self)
+    }
+
+    fn page_namespaces(
+        &self,
+        after: Option<NamespacePageCursor>,
+        limit: usize,
+    ) -> StorageResult<NamespacePage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "namespace page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        let after = after.map_or(Uuid::nil(), |cursor| cursor.id);
+        self.block_on(async {
+            // `namespaces` is deliberately unpolicied: this bounded discovery
+            // query obtains the ids used to scope every subsequent operation.
+            let mut conn = self.conn_with_namespace(UNSCOPED_NAMESPACE).await?;
+            let ids: Vec<Uuid> = query_as::<Postgres, (Uuid,)>(
+                "SELECT id FROM namespaces WHERE id > $1 ORDER BY id LIMIT $2",
+            )
+            .bind(after)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?
+            .into_iter()
+            .map(|(id,)| id)
+            .collect();
+            let next_cursor = (ids.len() == limit)
+                .then(|| ids.last().copied())
+                .flatten()
+                .map(|id| NamespacePageCursor { id });
+            Ok(NamespacePage {
+                namespace_ids: ids,
+                next_cursor,
+            })
+        })
+    }
+
     fn get_namespace_embedding_state(
         &self,
         namespace_id: Uuid,
@@ -4468,6 +4514,653 @@ impl StorageTrait for PostgresBackend {
     }
 }
 
+impl ConsolidationWorkspace for PostgresBackend {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one RLS-scoped transaction compares and refreshes the source snapshot atomically"
+    )]
+    fn begin_or_resume(
+        &self,
+        namespace_id: Uuid,
+        space: &EmbeddingSpaceId,
+    ) -> StorageResult<RunId> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut tx = conn.begin().await.map_err(sqlx_to_io)?;
+            let existing: Option<(Uuid,)> = query_as::<Postgres, _>(
+                "SELECT run_id FROM consolidation_runs
+                 WHERE namespace_id = $1 AND embedding_space_id = $2 FOR UPDATE",
+            )
+            .bind(namespace_id)
+            .bind(&space.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let run_id = existing.map_or_else(Uuid::new_v4, |(id,)| id);
+            if existing.is_none() {
+                query::<Postgres>(
+                    "INSERT INTO consolidation_runs
+                        (run_id, namespace_id, embedding_space_id, cursor_ordinal,
+                         completed, created_at, updated_at)
+                     VALUES ($1, $2, $3, 0, FALSE, NOW(), NOW())",
+                )
+                .bind(run_id)
+                .bind(namespace_id)
+                .bind(&space.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+            }
+            let changed: (bool,) = query_as::<Postgres, _>(
+                "SELECT EXISTS (
+                    SELECT 1 FROM consolidation_sources AS workspace
+                    WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                      AND NOT EXISTS (
+                        SELECT 1 FROM episodic_memories AS source
+                        JOIN memory_embeddings AS embedding
+                          ON embedding.namespace_id = source.namespace_id
+                         AND embedding.memory_type = 'episodic'
+                         AND embedding.memory_id = source.id
+                         AND embedding.embedding_space_id = $3
+                        WHERE source.namespace_id = $2
+                          AND source.superseded_by IS NULL AND source.invalid_at IS NULL
+                          AND source.id = workspace.memory_id
+                          AND source.about_entity = workspace.about_entity
+                          AND source.episode_id = workspace.episode_id
+                          AND source.timestamp = workspace.source_timestamp
+                          AND embedding.source_sha256 = workspace.source_sha256)
+                    UNION ALL
+                    SELECT 1 FROM episodic_memories AS source
+                    JOIN memory_embeddings AS embedding
+                      ON embedding.namespace_id = source.namespace_id
+                     AND embedding.memory_type = 'episodic'
+                     AND embedding.memory_id = source.id
+                     AND embedding.embedding_space_id = $3
+                    WHERE source.namespace_id = $2
+                      AND source.superseded_by IS NULL AND source.invalid_at IS NULL
+                      AND NOT EXISTS (
+                        SELECT 1 FROM consolidation_sources AS workspace
+                        WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                          AND workspace.memory_id = source.id
+                          AND workspace.about_entity = source.about_entity
+                          AND workspace.episode_id = source.episode_id
+                          AND workspace.source_timestamp = source.timestamp
+                          AND workspace.source_sha256 = embedding.source_sha256))",
+            )
+            .bind(run_id)
+            .bind(namespace_id)
+            .bind(&space.0)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let source_count: (i64,) = query_as::<Postgres, _>(
+                "SELECT COUNT(*) FROM consolidation_sources
+                 WHERE run_id = $1 AND namespace_id = $2",
+            )
+            .bind(run_id)
+            .bind(namespace_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            if changed.0 || source_count.0 == 0 {
+                query::<Postgres>(
+                    "DELETE FROM consolidation_sources
+                     WHERE run_id = $1 AND namespace_id = $2",
+                )
+                .bind(run_id)
+                .bind(namespace_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+                query::<Postgres>(
+                    "INSERT INTO consolidation_sources
+                        (run_id, namespace_id, memory_id, source_ordinal, about_entity,
+                         episode_id, source_timestamp, source_sha256, assignment_anchor,
+                         assignment_state, promotion_complete)
+                     SELECT $1, $2, source.id,
+                            ROW_NUMBER() OVER (
+                                ORDER BY source.about_entity, source.timestamp, source.id),
+                            source.about_entity, source.episode_id, source.timestamp,
+                            embedding.source_sha256, NULL, 'unassigned', FALSE
+                     FROM episodic_memories AS source
+                     JOIN memory_embeddings AS embedding
+                       ON embedding.namespace_id = source.namespace_id
+                      AND embedding.memory_type = 'episodic'
+                      AND embedding.memory_id = source.id
+                      AND embedding.embedding_space_id = $3
+                     WHERE source.namespace_id = $2
+                       AND source.superseded_by IS NULL AND source.invalid_at IS NULL
+                     ORDER BY source.about_entity, source.timestamp, source.id",
+                )
+                .bind(run_id)
+                .bind(namespace_id)
+                .bind(&space.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+                query::<Postgres>(
+                    "UPDATE consolidation_runs
+                     SET cursor_ordinal = 0, completed = FALSE, updated_at = NOW()
+                     WHERE run_id = $1 AND namespace_id = $2",
+                )
+                .bind(run_id)
+                .bind(namespace_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+            }
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(RunId {
+                id: run_id,
+                namespace_id,
+            })
+        })
+    }
+
+    fn next_sources(
+        &self,
+        run: RunId,
+        after: Option<WorkspaceCursor>,
+        limit: usize,
+    ) -> StorageResult<WorkspaceSourcePage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "consolidation source page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            let cursor = if let Some(cursor) = after {
+                cursor.source_ordinal
+            } else {
+                query_as::<Postgres, (i64,)>(
+                    "SELECT cursor_ordinal FROM consolidation_runs
+                     WHERE run_id = $1 AND namespace_id = $2",
+                )
+                .bind(run.id)
+                .bind(run.namespace_id)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(sqlx_to_io)?
+                .0
+            };
+            let rows: Vec<PgWorkspaceSourceRow> = query_as::<Postgres, _>(
+                "SELECT workspace.memory_id, workspace.about_entity,
+                            workspace.episode_id, workspace.source_timestamp,
+                            source.content, workspace.source_sha256,
+                            workspace.source_ordinal
+                     FROM consolidation_sources AS workspace
+                     JOIN episodic_memories AS source
+                       ON source.id = workspace.memory_id
+                      AND source.namespace_id = workspace.namespace_id
+                     WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                       AND workspace.source_ordinal > $3
+                       AND workspace.assignment_state NOT IN ('discarded', 'promoted')
+                       AND (workspace.assignment_anchor IS NULL
+                            OR workspace.assignment_anchor = workspace.memory_id)
+                     ORDER BY workspace.source_ordinal LIMIT $4",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(cursor)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let records = rows
+                .into_iter()
+                .map(
+                    |(id, about_entity, episode_id, timestamp, content, hash, ordinal)| {
+                        WorkspaceSource {
+                            memory_ref: MemoryRef {
+                                memory_type: MemoryType::Episodic,
+                                id,
+                            },
+                            about_entity,
+                            episode_id,
+                            timestamp,
+                            content,
+                            source_sha256: hash,
+                            ordinal,
+                        }
+                    },
+                )
+                .collect::<Vec<_>>();
+            let next_cursor = (records.len() == limit)
+                .then(|| {
+                    records.last().map(|source| WorkspaceCursor {
+                        source_ordinal: source.ordinal,
+                    })
+                })
+                .flatten();
+            Ok(WorkspaceSourcePage {
+                records,
+                next_cursor,
+            })
+        })
+    }
+
+    fn load_source(
+        &self,
+        run: RunId,
+        source: MemoryRef,
+    ) -> StorageResult<WorkspaceEmbeddingSource> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            pg_workspace_embedding_source(&mut conn, run, source.id).await
+        })
+    }
+
+    fn page_later_unassigned(
+        &self,
+        run: RunId,
+        anchor: MemoryRef,
+        after: Option<WorkspaceCursor>,
+        limit: usize,
+    ) -> StorageResult<WorkspaceCandidatePage> {
+        if !(1..=crate::storage::bounded::CONSOLIDATION_COMPARISON_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "consolidation candidate page limit must be within 1..={} ",
+                crate::storage::bounded::CONSOLIDATION_COMPARISON_PAGE_SIZE
+            )));
+        }
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            let (entity, ordinal): (Uuid, i64) = query_as::<Postgres, _>(
+                "SELECT about_entity, source_ordinal FROM consolidation_sources
+                 WHERE run_id = $1 AND namespace_id = $2 AND memory_id = $3",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let cursor = after.map_or(ordinal, |cursor| cursor.source_ordinal);
+            let rows: Vec<PgWorkspaceEmbeddingRow> = query_as::<Postgres, _>(
+                "SELECT workspace.memory_id, workspace.about_entity,
+                        workspace.episode_id, workspace.source_timestamp,
+                        source.content, workspace.source_sha256,
+                        workspace.source_ordinal, runs.embedding_space_id,
+                        embedding.embedding::text, spaces.dimension
+                 FROM consolidation_sources AS workspace
+                 JOIN consolidation_runs AS runs
+                   ON runs.run_id = workspace.run_id
+                  AND runs.namespace_id = workspace.namespace_id
+                 JOIN episodic_memories AS source
+                   ON source.id = workspace.memory_id
+                  AND source.namespace_id = workspace.namespace_id
+                 JOIN memory_embeddings AS embedding
+                   ON embedding.namespace_id = workspace.namespace_id
+                  AND embedding.memory_type = 'episodic'
+                  AND embedding.memory_id = workspace.memory_id
+                  AND embedding.embedding_space_id = runs.embedding_space_id
+                  AND embedding.source_sha256 = workspace.source_sha256
+                 JOIN embedding_spaces AS spaces ON spaces.id = runs.embedding_space_id
+                 WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                   AND workspace.about_entity = $3 AND workspace.source_ordinal > $4
+                   AND workspace.assignment_state = 'unassigned'
+                 ORDER BY workspace.source_ordinal LIMIT $5",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(entity)
+            .bind(cursor)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let records = rows
+                .into_iter()
+                .map(|row| pg_workspace_embedding_from_row(run.namespace_id, row))
+                .collect::<StorageResult<Vec<_>>>()?;
+            let next_cursor = (records.len() == limit)
+                .then(|| {
+                    records.last().map(|source| WorkspaceCursor {
+                        source_ordinal: source.source.ordinal,
+                    })
+                })
+                .flatten();
+            Ok(WorkspaceCandidatePage {
+                records,
+                next_cursor,
+            })
+        })
+    }
+
+    fn record_tentative_match(
+        &self,
+        run: RunId,
+        anchor: MemoryRef,
+        member: MemoryRef,
+    ) -> StorageResult<usize> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            let changed = query::<Postgres>(
+                "UPDATE consolidation_sources
+                 SET assignment_anchor = $3, assignment_state = 'tentative'
+                 WHERE run_id = $1 AND namespace_id = $2 AND memory_id = $4
+                   AND (assignment_state = 'unassigned' OR assignment_anchor = $3)",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .bind(member.id)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?
+            .rows_affected();
+            if changed == 0 {
+                return Ok(0);
+            }
+            let count: (i64,) = query_as::<Postgres, _>(
+                "SELECT COUNT(*) FROM consolidation_sources
+                 WHERE run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            usize::try_from(count.0)
+                .map_err(|_| StorageError::Context("negative workspace member count".into()))
+        })
+    }
+
+    fn finalize_or_discard_cluster(
+        &self,
+        run: RunId,
+        anchor: MemoryRef,
+    ) -> StorageResult<ClusterDecision> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            let count: (i64,) = query_as::<Postgres, _>(
+                "SELECT COUNT(*) FROM consolidation_sources
+                 WHERE run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let count = usize::try_from(count.0)
+                .map_err(|_| StorageError::Context("negative workspace member count".into()))?;
+            if count <= 1 {
+                query::<Postgres>(
+                    "UPDATE consolidation_sources
+                     SET assignment_anchor = NULL, assignment_state = 'discarded'
+                     WHERE run_id = $1 AND namespace_id = $2 AND memory_id = $3",
+                )
+                .bind(run.id)
+                .bind(run.namespace_id)
+                .bind(anchor.id)
+                .execute(&mut *conn)
+                .await
+                .map_err(sqlx_to_io)?;
+                return Ok(ClusterDecision::SingletonDiscarded);
+            }
+            if count > crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS {
+                return Ok(ClusterDecision::MemberBudgetExceeded {
+                    member_count: count,
+                });
+            }
+            query::<Postgres>(
+                "UPDATE consolidation_sources SET assignment_state = 'finalized'
+                 WHERE run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let rows: Vec<(Uuid, Uuid, DateTime<Utc>, String)> = query_as::<Postgres, _>(
+                "SELECT workspace.memory_id, workspace.episode_id,
+                        workspace.source_timestamp, source.content
+                 FROM consolidation_sources AS workspace
+                 JOIN episodic_memories AS source
+                   ON source.id = workspace.memory_id
+                  AND source.namespace_id = workspace.namespace_id
+                 WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                   AND workspace.assignment_anchor = $3
+                 ORDER BY workspace.source_ordinal",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(ClusterDecision::Finalized {
+                members: rows
+                    .into_iter()
+                    .map(|(id, episode_id, timestamp, content)| ClusterMember {
+                        memory_ref: MemoryRef {
+                            memory_type: MemoryType::Episodic,
+                            id,
+                        },
+                        episode_id,
+                        timestamp,
+                        content,
+                    })
+                    .collect(),
+            })
+        })
+    }
+
+    fn promotion_is_admitted(
+        &self,
+        run: RunId,
+        about_entity: Uuid,
+        content: &str,
+        episode_times: &[DateTime<Utc>],
+    ) -> StorageResult<bool> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            let rows: Vec<(Option<Uuid>, Option<DateTime<Utc>>)> = query_as::<Postgres, _>(
+                "SELECT superseded_by, invalid_at FROM semantic_memories
+                 WHERE namespace_id = $1 AND subject = $2 AND predicate = 'mentioned'
+                   AND object = $3",
+            )
+            .bind(run.namespace_id)
+            .bind(about_entity)
+            .bind(content)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            if rows.is_empty() {
+                return Ok(true);
+            }
+            let mut latest = None;
+            for (superseded_by, invalid_at) in rows {
+                let (Some(_), Some(invalid_at)) = (superseded_by, invalid_at) else {
+                    return Ok(false);
+                };
+                latest = Some(latest.map_or(invalid_at, |at: DateTime<Utc>| at.max(invalid_at)));
+            }
+            Ok(latest.is_none_or(|at| episode_times.iter().any(|time| *time > at)))
+        })
+    }
+
+    fn mark_promotion_complete(&self, run: RunId, anchor: MemoryRef) -> StorageResult<()> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            query::<Postgres>(
+                "UPDATE consolidation_sources
+                 SET assignment_state = 'promoted', promotion_complete = TRUE
+                 WHERE run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(())
+        })
+    }
+
+    fn checkpoint(&self, run: RunId, cursor: WorkspaceCursor) -> StorageResult<()> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            query::<Postgres>(
+                "UPDATE consolidation_runs SET cursor_ordinal = $3, updated_at = NOW()
+                 WHERE run_id = $1 AND namespace_id = $2",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(cursor.source_ordinal)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(())
+        })
+    }
+
+    fn complete(&self, run: RunId) -> StorageResult<()> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            query::<Postgres>(
+                "UPDATE consolidation_runs SET completed = TRUE, updated_at = NOW()
+                 WHERE run_id = $1 AND namespace_id = $2",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(())
+        })
+    }
+
+    fn assignments(&self, run: RunId, limit: usize) -> StorageResult<Vec<WorkspaceAssignment>> {
+        if limit > crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS {
+            return Err(StorageError::BudgetExceeded(format!(
+                "workspace assignment diagnostic limit exceeds {}",
+                crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS
+            )));
+        }
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            let rows: Vec<(Uuid, Uuid)> = query_as::<Postgres, _>(
+                "SELECT assignment_anchor, memory_id FROM consolidation_sources
+                 WHERE run_id = $1 AND namespace_id = $2
+                   AND assignment_state IN ('finalized', 'promoted')
+                 ORDER BY assignment_anchor, source_ordinal LIMIT $3",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(rows
+                .into_iter()
+                .map(|(anchor, member)| WorkspaceAssignment {
+                    anchor: MemoryRef {
+                        memory_type: MemoryType::Episodic,
+                        id: anchor,
+                    },
+                    member: MemoryRef {
+                        memory_type: MemoryType::Episodic,
+                        id: member,
+                    },
+                })
+                .collect())
+        })
+    }
+}
+
+type PgWorkspaceSourceRow = (Uuid, Uuid, Uuid, DateTime<Utc>, String, String, i64);
+
+type PgWorkspaceEmbeddingRow = (
+    Uuid,
+    Uuid,
+    Uuid,
+    DateTime<Utc>,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    i32,
+);
+
+fn pg_workspace_embedding_from_row(
+    namespace_id: Uuid,
+    row: PgWorkspaceEmbeddingRow,
+) -> StorageResult<WorkspaceEmbeddingSource> {
+    let (id, about_entity, episode_id, timestamp, content, hash, ordinal, space, encoded, dim) =
+        row;
+    let embedding = pgtext_to_embedding(Some(&encoded));
+    if usize::try_from(dim).ok() != Some(embedding.len())
+        || embedding.is_empty()
+        || embedding.iter().any(|value| !value.is_finite())
+    {
+        return Err(StorageError::Context(format!(
+            "workspace embedding for {id} does not match its finite dimension"
+        )));
+    }
+    let memory_ref = MemoryRef {
+        memory_type: MemoryType::Episodic,
+        id,
+    };
+    Ok(WorkspaceEmbeddingSource {
+        source: WorkspaceSource {
+            memory_ref,
+            about_entity,
+            episode_id,
+            timestamp,
+            content,
+            source_sha256: hash.clone(),
+            ordinal,
+        },
+        embedding: EmbeddingRecord {
+            namespace_id,
+            memory_ref,
+            embedding_space_id: EmbeddingSpaceId(space),
+            source_sha256: hash,
+            embedding,
+        },
+    })
+}
+
+async fn pg_workspace_embedding_source(
+    conn: &mut PgConnection,
+    run: RunId,
+    memory_id: Uuid,
+) -> StorageResult<WorkspaceEmbeddingSource> {
+    let row: PgWorkspaceEmbeddingRow = query_as::<Postgres, _>(
+        "SELECT workspace.memory_id, workspace.about_entity,
+                workspace.episode_id, workspace.source_timestamp, source.content,
+                workspace.source_sha256, workspace.source_ordinal,
+                runs.embedding_space_id, embedding.embedding::text, spaces.dimension
+         FROM consolidation_sources AS workspace
+         JOIN consolidation_runs AS runs
+           ON runs.run_id = workspace.run_id AND runs.namespace_id = workspace.namespace_id
+         JOIN episodic_memories AS source
+           ON source.id = workspace.memory_id AND source.namespace_id = workspace.namespace_id
+         JOIN memory_embeddings AS embedding
+           ON embedding.namespace_id = workspace.namespace_id
+          AND embedding.memory_type = 'episodic'
+          AND embedding.memory_id = workspace.memory_id
+          AND embedding.embedding_space_id = runs.embedding_space_id
+          AND embedding.source_sha256 = workspace.source_sha256
+         JOIN embedding_spaces AS spaces ON spaces.id = runs.embedding_space_id
+         WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+           AND workspace.memory_id = $3",
+    )
+    .bind(run.id)
+    .bind(run.namespace_id)
+    .bind(memory_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(sqlx_to_io)?;
+    pg_workspace_embedding_from_row(run.namespace_id, row)
+}
+
 // ---------------------------------------------------------------------------
 // Row mapping helpers
 // ---------------------------------------------------------------------------
@@ -4832,6 +5525,42 @@ mod tests {
                 "missing schema statement: {statement}"
             );
         }
+    }
+
+    #[test]
+    fn consolidation_workspace_schema_is_rls_forced_and_namespace_scoped() {
+        for table in ["consolidation_runs", "consolidation_sources"] {
+            assert!(SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")));
+            assert!(SCHEMA.contains(&format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;")));
+            assert!(SCHEMA.contains(&format!(
+                "CREATE POLICY namespace_isolation_{table} ON {table}"
+            )));
+            assert!(SCHEMA.contains(&format!("ALTER TABLE {table} FORCE ROW LEVEL SECURITY;")));
+            assert!(SCHEMA.contains(&format!(
+                "GRANT SELECT, INSERT, UPDATE, DELETE ON {table} TO pensyve_app;"
+            )));
+        }
+        assert!(
+            SCHEMA
+                .matches("namespace_id = current_setting('pensyve.namespace_id', true)::uuid")
+                .count()
+                >= 8
+        );
+    }
+
+    #[test]
+    fn consolidation_workspace_queries_never_use_an_unbound_connection() {
+        let source = include_str!("postgres.rs");
+        let start = source
+            .find("impl ConsolidationWorkspace for PostgresBackend")
+            .expect("workspace implementation");
+        let end = source[start..]
+            .find("type PgWorkspaceEmbeddingRow")
+            .expect("workspace implementation end");
+        let workspace = &source[start..start + end];
+        assert!(!workspace.contains(&[".", "unbound()"].concat()));
+        assert!(workspace.matches("scoped_conn(run.namespace_id)").count() >= 9);
+        assert!(workspace.matches("namespace_id = $2").count() >= 12);
     }
 
     #[test]

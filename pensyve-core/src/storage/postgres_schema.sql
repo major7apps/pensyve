@@ -402,6 +402,39 @@ CREATE TABLE IF NOT EXISTS embedding_backfill_queue (
 CREATE INDEX IF NOT EXISTS idx_embedding_backfill_queue_namespace_status_sequence
     ON embedding_backfill_queue(namespace_id, status, sequence);
 
+CREATE TABLE IF NOT EXISTS consolidation_runs (
+    run_id              UUID PRIMARY KEY,
+    namespace_id        UUID NOT NULL REFERENCES namespaces(id),
+    embedding_space_id  TEXT NOT NULL REFERENCES embedding_spaces(id),
+    cursor_ordinal      BIGINT NOT NULL DEFAULT 0,
+    completed           BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at          TIMESTAMPTZ NOT NULL,
+    updated_at          TIMESTAMPTZ NOT NULL,
+    UNIQUE(namespace_id, embedding_space_id)
+);
+CREATE INDEX IF NOT EXISTS idx_consolidation_runs_namespace
+    ON consolidation_runs(namespace_id, embedding_space_id);
+
+CREATE TABLE IF NOT EXISTS consolidation_sources (
+    run_id              UUID NOT NULL REFERENCES consolidation_runs(run_id) ON DELETE CASCADE,
+    namespace_id        UUID NOT NULL REFERENCES namespaces(id),
+    memory_id           UUID NOT NULL,
+    source_ordinal      BIGINT NOT NULL,
+    about_entity        UUID NOT NULL,
+    episode_id          UUID NOT NULL,
+    source_timestamp    TIMESTAMPTZ NOT NULL,
+    source_sha256       TEXT NOT NULL,
+    assignment_anchor   UUID,
+    assignment_state    TEXT NOT NULL DEFAULT 'unassigned'
+        CHECK (assignment_state IN
+            ('unassigned', 'tentative', 'finalized', 'discarded', 'promoted')),
+    promotion_complete  BOOLEAN NOT NULL DEFAULT FALSE,
+    PRIMARY KEY(run_id, memory_id),
+    UNIQUE(run_id, source_ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_consolidation_sources_scan
+    ON consolidation_sources(run_id, about_entity, source_ordinal, assignment_state);
+
 -- A production deployment may use the dedicated serving role described in
 -- docs/SECURITY.md. Development and test databases need not create it, so the
 -- per-table grants are conditional while the schema remains self-applicable.
@@ -412,6 +445,8 @@ BEGIN
         GRANT SELECT, INSERT, UPDATE, DELETE ON memory_embeddings TO pensyve_app;
         GRANT SELECT, INSERT, UPDATE, DELETE ON namespace_embedding_state TO pensyve_app;
         GRANT SELECT, INSERT, UPDATE, DELETE ON embedding_backfill_queue TO pensyve_app;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON consolidation_runs TO pensyve_app;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON consolidation_sources TO pensyve_app;
     END IF;
 END $$;
 
@@ -447,6 +482,8 @@ ALTER TABLE edges                ENABLE ROW LEVEL SECURITY;
 ALTER TABLE memory_embeddings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE namespace_embedding_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE embedding_backfill_queue ENABLE ROW LEVEL SECURITY;
+ALTER TABLE consolidation_runs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE consolidation_sources ENABLE ROW LEVEL SECURITY;
 
 -- DROP + CREATE rather than "create if absent": this file is re-applied on
 -- every startup, so an existing database has to pick up a corrected policy.
@@ -510,6 +547,16 @@ CREATE POLICY namespace_isolation_embedding_backfill_queue ON embedding_backfill
   USING (namespace_id = current_setting('pensyve.namespace_id', true)::uuid)
   WITH CHECK (namespace_id = current_setting('pensyve.namespace_id', true)::uuid);
 
+DROP POLICY IF EXISTS namespace_isolation_consolidation_runs ON consolidation_runs;
+CREATE POLICY namespace_isolation_consolidation_runs ON consolidation_runs
+  USING (namespace_id = current_setting('pensyve.namespace_id', true)::uuid)
+  WITH CHECK (namespace_id = current_setting('pensyve.namespace_id', true)::uuid);
+
+DROP POLICY IF EXISTS namespace_isolation_consolidation_sources ON consolidation_sources;
+CREATE POLICY namespace_isolation_consolidation_sources ON consolidation_sources
+  USING (namespace_id = current_setting('pensyve.namespace_id', true)::uuid)
+  WITH CHECK (namespace_id = current_setting('pensyve.namespace_id', true)::uuid);
+
 -- ---------------------------------------------------------------------------
 -- Enforcement
 --
@@ -564,3 +611,5 @@ ALTER TABLE edges                FORCE ROW LEVEL SECURITY;
 ALTER TABLE memory_embeddings FORCE ROW LEVEL SECURITY;
 ALTER TABLE namespace_embedding_state FORCE ROW LEVEL SECURITY;
 ALTER TABLE embedding_backfill_queue FORCE ROW LEVEL SECURITY;
+ALTER TABLE consolidation_runs FORCE ROW LEVEL SECURITY;
+ALTER TABLE consolidation_sources FORCE ROW LEVEL SECURITY;

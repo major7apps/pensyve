@@ -15,8 +15,8 @@ use pensyve_core::config::{ConsolidationConfig, RetrievalConfig};
 use pensyve_core::consolidation::ConsolidationEngine;
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::network_policy::NetworkPolicy;
-use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
+use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{Episode, EpisodicMemory, Memory, Namespace};
 use pensyve_core::vector::VectorIndex;
 use pensyve_mcp_gateway::AppState;
@@ -76,10 +76,11 @@ fn app_state(dir: &TempDir) -> Arc<AppState> {
     storage
         .save_namespace(&namespace)
         .expect("save default namespace");
+    let embedder = Arc::new(OnnxEmbedder::new_mock(EMBEDDING_DIMS));
 
     let tenant_mgr = TenantStateManager::new_in_memory(
         storage,
-        Arc::new(OnnxEmbedder::new_mock(EMBEDDING_DIMS)),
+        embedder,
         retrieval_config(),
         namespace,
         VectorIndex::new(EMBEDDING_DIMS, 1024),
@@ -170,7 +171,15 @@ fn seed_clusters(storage: &dyn StorageTrait, embedder: &OnnxEmbedder, ns: Uuid) 
                 EpisodicMemory::new(ns, episode.id, source_id, entity_id, content.as_str());
             mem.embedding = embedder.embed(&mem.content).unwrap();
             mem.timestamp = Utc::now() - chrono::Duration::seconds(i);
-            storage.save_episodic(&mem).unwrap();
+            let wrapped = Memory::Episodic(mem.clone());
+            let record = embedding_record_for_memory(
+                &wrapped,
+                embedder.embedding_space().unwrap(),
+                mem.embedding.clone(),
+            );
+            storage
+                .save_memory_with_embedding(&wrapped, Some(&record))
+                .unwrap();
         }
     }
 }
@@ -189,6 +198,9 @@ async fn consolidate_reports_whether_the_request_coalesced() {
         .get_tenant_state(TEST_TENANT)
         .expect("tenant state");
     let ns_id = ps.namespace.id;
+    ps.storage
+        .initialize_local_runtime_space(ns_id, ps.embedder.embedding_space().unwrap())
+        .expect("initialize active embedding space");
     seed_clusters(ps.storage.as_ref(), ps.embedder.as_ref(), ns_id);
 
     // The run this request has to coalesce into. Started off the runtime, as

@@ -9,6 +9,7 @@ use crate::types::{
 };
 
 pub mod bounded;
+pub mod consolidation_workspace;
 pub mod sqlite;
 
 #[cfg(feature = "postgres")]
@@ -331,6 +332,23 @@ pub(crate) const MAX_FTS_QUERY_TOKENS: usize = 256;
 // ---------------------------------------------------------------------------
 
 pub trait StorageTrait: Send + Sync {
+    /// Durable bounded consolidation workspace when supported by the backend.
+    fn consolidation_workspace(
+        &self,
+    ) -> Option<&dyn consolidation_workspace::ConsolidationWorkspace> {
+        None
+    }
+
+    /// Enumerate persisted namespaces in stable bounded pages. Shipping
+    /// periodic consolidation must use this rather than a process cache.
+    fn page_namespaces(
+        &self,
+        _after: Option<consolidation_workspace::NamespacePageCursor>,
+        _limit: usize,
+    ) -> StorageResult<consolidation_workspace::NamespacePage> {
+        Err(StorageError::Unsupported("bounded namespace paging".into()))
+    }
+
     /// Read one namespace's embedding lifecycle row and joined immutable
     /// spaces. The namespace predicate is mandatory even when backend RLS is
     /// enabled. External backends without versioned generations remain

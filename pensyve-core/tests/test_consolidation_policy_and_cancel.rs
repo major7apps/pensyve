@@ -27,11 +27,13 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use pensyve_core::config::{ConsolidationConfig, PensyveConfig};
-use pensyve_core::consolidation::{ConsolidationEngine, ConsolidationError};
+use pensyve_core::consolidation::{
+    ConsolidationEngine, ConsolidationError, ConsolidationIncomplete, ConsolidationOutcome,
+};
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::network_policy::{NetworkPolicy, NetworkRequiredError};
-use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
+use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{Episode, EpisodicMemory, Memory, Namespace};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -79,6 +81,7 @@ fn i4_engine_runs_under_disabled_without_network_error() {
 
     let ns = Namespace::new("i4_disabled_smoke");
     storage.save_namespace(&ns).unwrap();
+    initialize_generation(&storage, &embedder, ns.id);
 
     // Empty namespace — both passes complete with zero work but exercise
     // the policy-parameter path.
@@ -118,6 +121,7 @@ fn i4_engine_runs_under_permissive_without_network_error() {
 
     let ns = Namespace::new("i4_permissive_smoke");
     storage.save_namespace(&ns).unwrap();
+    initialize_generation(&storage, &embedder, ns.id);
 
     let result = ConsolidationEngine::run(
         &storage,
@@ -152,11 +156,12 @@ fn i5_pre_cancelled_token_returns_cancelled_immediately() {
 
     let ns = Namespace::new("i5_pre_cancel");
     storage.save_namespace(&ns).unwrap();
+    initialize_generation(&storage, &embedder, ns.id);
 
     let cancel = CancellationToken::new();
     cancel.cancel(); // signal BEFORE run
 
-    let result = ConsolidationEngine::run(
+    let result = ConsolidationEngine::run_bounded(
         &storage,
         &embedder,
         &config,
@@ -165,15 +170,13 @@ fn i5_pre_cancelled_token_returns_cancelled_immediately() {
         &cancel,
     );
 
-    match result {
-        Err(ConsolidationError::Cancelled(msg)) => {
-            assert!(
-                msg.contains("before promotion pass"),
-                "expected entry-guard breadcrumb, got: {msg}"
-            );
-        }
-        other => panic!("expected ConsolidationError::Cancelled, got {other:?}"),
-    }
+    assert!(matches!(
+        result,
+        Ok(ConsolidationOutcome::Incomplete {
+            reason: ConsolidationIncomplete::Cancelled,
+            ..
+        })
+    ));
 }
 
 /// Long-running consolidation receives a cancel signal partway through
@@ -212,6 +215,7 @@ async fn i5_long_running_consolidation_cancels_within_budget() {
     // the cancel signal a window to interpose.
     let ns = Namespace::new("i5_long_running");
     storage.save_namespace(&ns).unwrap();
+    initialize_generation(&storage, &embedder, ns.id);
     let entity_id = Uuid::new_v4();
     let source_id = Uuid::new_v4();
     let episode = Episode::new(ns.id, vec![source_id, entity_id]);
@@ -226,7 +230,7 @@ async fn i5_long_running_consolidation_cancels_within_budget() {
             // Stagger timestamps so the cluster's "most recent" pick is
             // deterministic; the value itself doesn't matter for cancel.
             mem.timestamp = Utc::now() - chrono::Duration::seconds(i as i64);
-            storage.save_episodic(&mem).unwrap();
+            save_episodic(&storage, &embedder, &mem);
         }
         count_rows(&storage, ns.id)
     };
@@ -243,7 +247,7 @@ async fn i5_long_running_consolidation_cancels_within_budget() {
 
     let spawn_instant = Instant::now();
     let handle = tokio::task::spawn_blocking(move || {
-        ConsolidationEngine::run(
+        ConsolidationEngine::run_bounded(
             storage_for_engine.as_ref(),
             &embedder,
             &config,
@@ -276,18 +280,15 @@ async fn i5_long_running_consolidation_cancels_within_budget() {
     );
 
     match result {
-        Err(ConsolidationError::Cancelled(msg)) => {
-            // Breadcrumb must point to one of the cancel-check sites.
-            assert!(
-                msg.contains("cancelled"),
-                "expected Cancelled breadcrumb, got: {msg}"
-            );
-        }
-        Ok(stats) => panic!(
+        Ok(ConsolidationOutcome::Incomplete {
+            reason: ConsolidationIncomplete::Cancelled,
+            ..
+        }) => {}
+        Ok(other) => panic!(
             "engine completed before cancel could interpose — bump N_ROWS or \
-             reduce the head-start sleep. stats = {stats:?}"
+             reduce the head-start sleep. outcome = {other:?}"
         ),
-        Err(other) => panic!("expected ConsolidationError::Cancelled, got {other:?}"),
+        Err(other) => panic!("expected typed incomplete cancellation, got {other:?}"),
     }
 
     // I5 integrity guarantee: no partial-write corruption. The only writes
@@ -314,6 +315,24 @@ async fn i5_long_running_consolidation_cancels_within_budget() {
 
 fn make_config() -> ConsolidationConfig {
     PensyveConfig::default().consolidation
+}
+
+fn initialize_generation(storage: &SqliteBackend, embedder: &OnnxEmbedder, ns: Uuid) {
+    storage
+        .initialize_local_runtime_space(ns, embedder.embedding_space().unwrap())
+        .unwrap();
+}
+
+fn save_episodic(storage: &SqliteBackend, embedder: &OnnxEmbedder, memory: &EpisodicMemory) {
+    let wrapped = Memory::Episodic(memory.clone());
+    let record = embedding_record_for_memory(
+        &wrapped,
+        embedder.embedding_space().unwrap(),
+        memory.embedding.clone(),
+    );
+    storage
+        .save_memory_with_embedding(&wrapped, Some(&record))
+        .unwrap();
 }
 
 /// Count all memories visible in the namespace via the unscoped

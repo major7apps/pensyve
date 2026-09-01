@@ -24,8 +24,8 @@ use pensyve_core::config::{ConsolidationConfig, PensyveConfig};
 use pensyve_core::consolidation::ConsolidationEngine;
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::network_policy::NetworkPolicy;
-use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
+use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{Episode, EpisodicMemory, Memory, Namespace};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -72,7 +72,7 @@ fn seed_clusters(
                 EpisodicMemory::new(ns, episode.id, source_id, entity_id, content.as_str());
             mem.embedding = embedder.embed(&mem.content).unwrap();
             mem.timestamp = Utc::now() - chrono::Duration::seconds(i);
-            storage.save_episodic(&mem).unwrap();
+            save_episodic(storage, embedder, &mem);
         }
     }
 }
@@ -81,8 +81,23 @@ fn seed_clusters(
 fn seed_namespace(storage: &SqliteBackend, embedder: &OnnxEmbedder, name: &str) -> Uuid {
     let ns = Namespace::new(name);
     storage.save_namespace(&ns).unwrap();
+    storage
+        .initialize_local_runtime_space(ns.id, embedder.embedding_space().unwrap())
+        .unwrap();
     seed_clusters(storage, embedder, ns.id, 0..CLUSTERS);
     ns.id
+}
+
+fn save_episodic(storage: &SqliteBackend, embedder: &OnnxEmbedder, memory: &EpisodicMemory) {
+    let wrapped = Memory::Episodic(memory.clone());
+    let record = embedding_record_for_memory(
+        &wrapped,
+        embedder.embedding_space().unwrap(),
+        memory.embedding.clone(),
+    );
+    storage
+        .save_memory_with_embedding(&wrapped, Some(&record))
+        .unwrap();
 }
 
 fn run(storage: &SqliteBackend, embedder: &OnnxEmbedder, ns: Uuid) -> usize {
@@ -241,6 +256,9 @@ fn evidence_arriving_mid_run_is_not_dropped_by_coalescing() {
     let namespace = Namespace::new("coalesced_coverage");
     storage.save_namespace(&namespace).unwrap();
     let ns = namespace.id;
+    storage
+        .initialize_local_runtime_space(ns, embedder.embedding_space().unwrap())
+        .unwrap();
     seed_clusters(&storage, &embedder, ns, 0..SEEDED);
 
     // Build the late cluster up front, everything except its two `save_episodic`
@@ -281,7 +299,7 @@ fn evidence_arriving_mid_run_is_not_dropped_by_coalescing() {
     // Evidence the in-flight run cannot possibly have snapshotted, plus the
     // trigger that announces it. That trigger coalesces.
     for mem in &late_memories {
-        storage.save_episodic(mem).unwrap();
+        save_episodic(&storage, &embedder, mem);
     }
     let coalesced_promoted = run(&storage, &embedder, ns);
     let owner_promoted = owner.join().unwrap();
