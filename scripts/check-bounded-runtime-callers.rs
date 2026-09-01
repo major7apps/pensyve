@@ -222,6 +222,7 @@ fn scan_file(source: &str) -> Result<Vec<(usize, String)>, (usize, String)> {
     let mut violations = Vec::new();
     for token in tokens {
         if token.identifier == "VectorIndex"
+            || token.identifier == "MemoryGraph"
             || token.identifier == "get_all_memories_by_namespace"
             || token.identifier == "get_all_memories_by_namespace_including_superseded"
         {

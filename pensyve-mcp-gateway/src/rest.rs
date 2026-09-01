@@ -17,16 +17,18 @@ use uuid::Uuid;
 use crate::admission::MIB;
 use crate::auth::AuthContext;
 
+use pensyve_core::embedding_space::EmbeddingSpace;
 use pensyve_core::retrieval::RecallEngine;
 use pensyve_core::retrieval::contradictions::detect_contradictions;
 use pensyve_core::storage::bounded::{
-    MemoryPageRequest, MemoryRef, MemoryType, PageCursor, SearchScope, embedding_source_text,
+    MemoryFilter, MemoryPageRequest, MemoryRef, MemoryType, PageCursor, SearchScope,
+    embedding_source_text,
 };
 use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{
     ContentType, Entity, EntityKind, Episode, EpisodicMemory, Memory, Outcome, SemanticMemory,
 };
-use pensyve_mcp_tools::{PensyveState, VectorRuntime};
+use pensyve_mcp_tools::PensyveState;
 
 use crate::AppState;
 
@@ -305,6 +307,7 @@ pub struct FeedbackRequest {
 // Error helper
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 struct RestError(StatusCode, String);
 
 impl IntoResponse for RestError {
@@ -372,6 +375,31 @@ fn resolve_entity_identifier(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecallEntityScope {
+    Unscoped,
+    Entity(Uuid),
+    Missing,
+}
+
+fn resolve_recall_entity(
+    storage: &dyn StorageTrait,
+    requested: Option<&str>,
+    namespace_id: Uuid,
+) -> Result<RecallEntityScope, RestError> {
+    let Some(name) = requested else {
+        return Ok(RecallEntityScope::Unscoped);
+    };
+    match storage.get_entity_by_name(name, namespace_id) {
+        Ok(Some(entity)) => Ok(RecallEntityScope::Entity(entity.id)),
+        Ok(None) => Ok(RecallEntityScope::Missing),
+        Err(error) => Err(RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Error looking up entity: {error}"),
+        )),
+    }
+}
+
 fn memory_type_name(memory: &Memory) -> &'static str {
     memory.type_name()
 }
@@ -383,6 +411,33 @@ fn memory_confidence(memory: &Memory) -> f32 {
         Memory::Procedural(m) => m.reliability,
         Memory::Observation(m) => m.confidence,
     }
+}
+
+fn recall_filter(
+    types: Option<&[String]>,
+    min_confidence: Option<f64>,
+) -> Result<Option<MemoryFilter>, RestError> {
+    if types.is_none() && min_confidence.is_none() {
+        return Ok(None);
+    }
+    let allowed = types
+        .map(|types| {
+            types
+                .iter()
+                .map(|name| {
+                    MemoryType::from_name(name).ok_or_else(|| {
+                        RestError(
+                            StatusCode::BAD_REQUEST,
+                            format!("unknown memory type '{name}'"),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    MemoryFilter::new(allowed, min_confidence.map(|value| value as f32))
+        .map(Some)
+        .map_err(|error| RestError(StatusCode::BAD_REQUEST, error.to_string()))
 }
 
 fn memory_stability(memory: &Memory) -> f32 {
@@ -539,7 +594,7 @@ async fn memory_with_runtime_embedding(
     ps: &PensyveState,
     mut memory: Memory,
 ) -> Result<Memory, RestError> {
-    if !runtime_wants_embedding(&ps.vector_runtime) {
+    if !runtime_wants_embedding(ps)? {
         return Ok(memory);
     }
 
@@ -602,11 +657,7 @@ async fn remember_in_state(
         confidence,
     ));
     let memory = memory_with_runtime_embedding(ps, memory).await?;
-    save_memory(
-        ps.storage.as_ref(),
-        ps.vector_runtime.semantic_space(),
-        &memory,
-    )?;
+    save_memory(ps.storage.as_ref(), active_runtime_space(ps)?, &memory)?;
     Ok(memory)
 }
 
@@ -626,8 +677,17 @@ fn save_memory(
     })
 }
 
-fn runtime_wants_embedding(runtime: &VectorRuntime) -> bool {
-    runtime.semantic_space().is_some()
+fn active_runtime_space(ps: &PensyveState) -> Result<Option<&EmbeddingSpace>, RestError> {
+    ps.semantic_space().map_err(|error| {
+        RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Runtime space error: {error}"),
+        )
+    })
+}
+
+fn runtime_wants_embedding(ps: &PensyveState) -> Result<bool, RestError> {
+    active_runtime_space(ps).map(|space| space.is_some())
 }
 
 /// Extract the optional `event_time` from a memory as an ISO 8601 string.
@@ -643,27 +703,13 @@ fn memory_event_time(memory: &Memory) -> Option<String> {
 }
 
 /// Filter and convert recall results into API response format.
-fn filter_recall_results(
+fn recall_results(
     result: &pensyve_core::retrieval::RecallResult,
-    types: Option<&[String]>,
-    min_confidence: Option<f64>,
 ) -> (Vec<RecallMemory>, Vec<Memory>) {
     let mut response_memories = Vec::new();
     let mut returned_memories = Vec::new();
 
     for candidate in &result.memories {
-        if let Some(types) = types {
-            let memory_type = memory_type_name(&candidate.memory);
-            if !types.iter().any(|requested| requested == memory_type) {
-                continue;
-            }
-        }
-        if let Some(min_confidence) = min_confidence
-            && f64::from(memory_confidence(&candidate.memory)) < min_confidence
-        {
-            continue;
-        }
-
         response_memories.push(RecallMemory {
             id: candidate.memory_id.to_string(),
             content: memory_content(&candidate.memory),
@@ -720,7 +766,6 @@ fn get_pensyve_state(
 }
 
 async fn perform_supersession(
-    state: &AppState,
     ps: &PensyveState,
     memory_id: Uuid,
     requested_content: Option<String>,
@@ -745,9 +790,7 @@ async fn perform_supersession(
     let content = requested_content.unwrap_or_else(|| memory_content(&old));
     let new = replacement_memory_with_runtime_embedding(ps, &old, &content, confidence).await?;
     let new_id = new.id();
-    let record = ps
-        .vector_runtime
-        .semantic_space()
+    let record = active_runtime_space(ps)?
         .map(|space| embedding_record_for_memory(&new, space, new.embedding().to_vec()));
     let stamped = ps
         .storage
@@ -774,14 +817,8 @@ async fn perform_supersession(
     let _ = ps.storage.log_activity(
         ps.namespace.id,
         "supersede",
-        &json!({"memory_id": memory_id, "new_memory_id": new_id}),
+        &json!({"count": 1, "status": "superseded"}),
     );
-
-    if let Some(ref redis) = state.redis {
-        let mut conn = redis.clone();
-        let prefix = crate::cache::namespace_prefix(&ps.namespace.id.to_string());
-        crate::cache::invalidate_prefix(&mut conn, &prefix).await;
-    }
 
     Ok(SupersedeMemoryResponse {
         id: new_id.to_string(),
@@ -857,46 +894,30 @@ async fn recall(
             "min_confidence must be between 0.0 and 1.0".to_string(),
         ));
     }
-
-    // Check Redis cache for recall results.
-    let cache_key = {
-        use sha2::Digest;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(body.query.as_bytes());
-        hasher.update(limit.to_le_bytes());
-        if let Some(ref e) = body.entity {
-            hasher.update(e.as_bytes());
-        }
-        let hash = hex::encode(hasher.finalize());
-        crate::cache::recall_key(&ps.namespace.id.to_string(), &hash)
-    };
-
-    if let Some(ref redis) = state.redis {
-        let mut conn = redis.clone();
-        if let Some(cached) = crate::cache::get(&mut conn, &cache_key).await
-            && let Ok(response) = serde_json::from_str::<RecallResponse>(&cached)
-        {
-            return Ok(Json(response));
-        }
-    }
+    let filter = recall_filter(body.types.as_deref(), body.min_confidence)?;
 
     // Resolve optional entity filter to UUID.
-    let entity_id = if let Some(ref name) = body.entity {
-        match ps.storage.get_entity_by_name(name, ps.namespace.id) {
-            Ok(Some(e)) => Some(e.id),
-            Ok(None) => None,
-            Err(err) => {
-                return Err(RestError(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Error looking up entity: {err}"),
-                ));
-            }
+    let entity_id = match resolve_recall_entity(
+        ps.storage.as_ref(),
+        body.entity.as_deref(),
+        ps.namespace.id,
+    )? {
+        RecallEntityScope::Unscoped => None,
+        RecallEntityScope::Entity(id) => Some(id),
+        RecallEntityScope::Missing => {
+            let _ = ps.storage.log_activity(
+                ps.namespace.id,
+                "recall",
+                &json!({"results": 0, "entity_status": "not_found"}),
+            );
+            return Ok(Json(RecallResponse {
+                memories: Vec::new(),
+                contradictions: Vec::new(),
+            }));
         }
-    } else {
-        None
     };
 
-    let semantic_enabled = ps.vector_runtime.semantic_space().is_some();
+    let semantic_enabled = runtime_wants_embedding(&ps)?;
     let query_embedding = if semantic_enabled {
         let embedder = ps.embedder.clone();
         let query_text = body.query.clone();
@@ -924,22 +945,33 @@ async fn recall(
                 None
             });
 
+    let active_space = active_runtime_space(&ps)?;
     let mut engine = RecallEngine::new_storage_backed_with_vector_space(
         ps.storage.as_ref(),
         &ps.embedder,
-        ps.vector_runtime.semantic_space(),
+        active_space,
         &ps.retrieval_config,
     );
     if let Some(r) = reranker.as_deref() {
         engine = engine.with_reranker(r);
     }
-    let result = engine.recall_with_embedding(
-        &body.query,
-        query_embedding.as_deref(),
-        ps.namespace.id,
-        limit,
-        entity_id,
-    );
+    let result = match filter.as_ref() {
+        Some(filter) => engine.recall_with_embedding_filtered(
+            &body.query,
+            query_embedding.as_deref(),
+            ps.namespace.id,
+            limit,
+            entity_id,
+            filter,
+        ),
+        None => engine.recall_with_embedding(
+            &body.query,
+            query_embedding.as_deref(),
+            ps.namespace.id,
+            limit,
+            entity_id,
+        ),
+    };
     let result = result.map_err(|e| {
         RestError(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -947,8 +979,7 @@ async fn recall(
         )
     })?;
 
-    let (memories, returned_memories) =
-        filter_recall_results(&result, body.types.as_deref(), body.min_confidence);
+    let (memories, returned_memories) = recall_results(&result);
     let contradictions = detect_contradictions(&returned_memories)
         .into_iter()
         .map(serde_json::to_value)
@@ -963,21 +994,17 @@ async fn recall(
     let _ = ps.storage.log_activity(
         ps.namespace.id,
         "recall",
-        &json!({"query": body.query, "results": memories.len()}),
+        &json!({
+            "results": memories.len(),
+            "type_filter_count": body.types.as_ref().map_or(0, Vec::len),
+            "has_min_confidence": body.min_confidence.is_some(),
+        }),
     );
 
     let response = RecallResponse {
         memories,
         contradictions,
     };
-
-    // Cache the result (60s TTL).
-    if let Some(ref redis) = state.redis {
-        let mut conn = redis.clone();
-        if let Ok(serialized) = serde_json::to_string(&response) {
-            crate::cache::set(&mut conn, &cache_key, &serialized, 60).await;
-        }
-    }
 
     Ok(Json(response))
 }
@@ -1003,7 +1030,7 @@ async fn recall_grouped(
     let order = parse_recall_grouped_order(body.order.as_deref())?;
     let max_groups = body.max_groups;
 
-    let semantic_enabled = ps.vector_runtime.semantic_space().is_some();
+    let semantic_enabled = runtime_wants_embedding(&ps)?;
     let query_embedding = if semantic_enabled {
         let embedder = ps.embedder.clone();
         let query_text = body.query.clone();
@@ -1027,10 +1054,11 @@ async fn recall_grouped(
                 None
             });
 
+    let active_space = active_runtime_space(&ps)?;
     let mut engine = RecallEngine::new_storage_backed_with_vector_space(
         ps.storage.as_ref(),
         &ps.embedder,
-        ps.vector_runtime.semantic_space(),
+        active_space,
         &ps.retrieval_config,
     );
     if let Some(r) = reranker.as_deref() {
@@ -1069,7 +1097,6 @@ async fn recall_grouped(
         ps.namespace.id,
         "recall_grouped",
         &json!({
-            "query": body.query,
             "groups": result.len(),
             "limit": limit,
         }),
@@ -1118,15 +1145,8 @@ async fn remember(
     let _ = ps.storage.log_activity(
         ps.namespace.id,
         "remember",
-        &json!({"entity": body.entity, "preview": body.fact.chars().take(50).collect::<String>()}),
+        &json!({"memory_type": "semantic", "status": "stored"}),
     );
-
-    // Invalidate recall cache for this namespace.
-    if let Some(ref redis) = state.redis {
-        let mut conn = redis.clone();
-        let prefix = crate::cache::namespace_prefix(&ps.namespace.id.to_string());
-        crate::cache::invalidate_prefix(&mut conn, &prefix).await;
-    }
 
     let content = format!("{} {}", mem.predicate, mem.object);
 
@@ -1170,8 +1190,7 @@ async fn create_entity(
 /// rather than inlined: they carry their embeddings, so a full payload runs to
 /// megabytes. Unlike the co-located MCP tool, REST and A2A callers are remote —
 /// a server-local filesystem path is useless to them and leaks the snapshot
-/// layout, so the reference is by id only; the path is recorded in the
-/// activity log for the operator who performs the restore.
+/// layout, so the reference is by id only.
 fn snapshot_reference(snapshot: &pensyve_core::snapshot::SnapshotManifest) -> serde_json::Value {
     let counts = snapshot.counts();
     json!({
@@ -1244,16 +1263,12 @@ async fn forget_entity(
             )
         })?;
 
-    // The delete and everything downstream of it — the activity record and
-    // recall-cache invalidation — run on a spawned task
+    // The delete and its downstream activity record run on a spawned task
     // the handler only observes. axum drops handler futures when the client
     // disconnects, and a drop between the committed delete and its bookkeeping
-    // would leave forgotten memories visible in the recall cache; a spawned
-    // task is detached from the request, so
+    // could lose its audit record; a spawned task is detached from the request, so
     // once the delete starts, its bookkeeping runs to completion regardless.
     let ps_task = ps.clone();
-    let redis = state.redis.clone();
-    let logged_name = entity_name.clone();
     let entity_id = entity.id;
     let owned_name = entity.name;
     let task = tokio::spawn(async move {
@@ -1261,26 +1276,14 @@ async fn forget_entity(
         let snapshot = &outcome.snapshot;
         let forgotten_count = snapshot.counts.total;
 
-        let snapshot_path = outcome
-            .path
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned());
-
         let _ = ps_task.storage.log_activity(
             ps_task.namespace.id,
             "forget",
             &json!({
-                "entity": logged_name,
                 "forgotten_count": forgotten_count,
-                "snapshot_path": snapshot_path,
+                "status": "deleted",
             }),
         );
-
-        // Invalidate recall cache for this namespace.
-        if let Some(mut conn) = redis {
-            let prefix = crate::cache::namespace_prefix(&ps_task.namespace.id.to_string());
-            crate::cache::invalidate_prefix(&mut conn, &prefix).await;
-        }
 
         Ok::<_, String>(outcome)
     });
@@ -1338,7 +1341,7 @@ async fn delete_memory(
     let _ = ps.storage.log_activity(
         ps.namespace.id,
         "forget",
-        &json!({"memory_id": id, "count": 1}),
+        &json!({"count": 1, "status": "deleted"}),
     );
 
     Ok(Json(DeleteMemoryResponse { deleted: true, id }))
@@ -1371,7 +1374,7 @@ async fn supersede_memory(
     let memory_id = Uuid::parse_str(&id)
         .map_err(|_| RestError(StatusCode::BAD_REQUEST, "Invalid memory ID".to_string()))?;
     let response =
-        perform_supersession(&state, &ps, memory_id, Some(body.content), body.confidence).await?;
+        perform_supersession(&ps, memory_id, Some(body.content), body.confidence).await?;
     Ok((StatusCode::CREATED, Json(response)))
 }
 
@@ -1386,8 +1389,7 @@ async fn update_memory(
 
     let memory_id = Uuid::parse_str(&id)
         .map_err(|_| RestError(StatusCode::BAD_REQUEST, "Invalid memory ID".to_string()))?;
-    let response =
-        perform_supersession(&state, &ps, memory_id, body.content, body.confidence).await?;
+    let response = perform_supersession(&ps, memory_id, body.content, body.confidence).await?;
     Ok(Json(response))
 }
 
@@ -1660,29 +1662,16 @@ async fn observe(
     let Memory::Episodic(mem) = &memory else {
         unreachable!("observe always constructs an episodic memory")
     };
-    save_memory(
-        ps.storage.as_ref(),
-        ps.vector_runtime.semantic_space(),
-        &memory,
-    )?;
+    save_memory(ps.storage.as_ref(), active_runtime_space(&ps)?, &memory)?;
     let _ = ps.storage.log_activity(
         ps.namespace.id,
         "observe",
         &json!({
-            "episode_id": episode_id.to_string(),
-            "source_entity": body.source_entity,
-            "about_entity": body.about_entity,
             "content_type": mem.content_type.as_str(),
             "content_len": body.content.len(),
+            "status": "stored",
         }),
     );
-
-    // Invalidate recall cache for this namespace.
-    if let Some(ref redis) = state.redis {
-        let mut conn = redis.clone();
-        let prefix = crate::cache::namespace_prefix(&ps.namespace.id.to_string());
-        crate::cache::invalidate_prefix(&mut conn, &prefix).await;
-    }
 
     Ok((
         StatusCode::CREATED,
@@ -1854,7 +1843,7 @@ async fn episode_start(
     let _ = ps.storage.log_activity(
         ps.namespace.id,
         "episode_start",
-        &json!({"participants": body.participants}),
+        &json!({"participant_count": body.participants.len(), "status": "started"}),
     );
 
     Ok((
@@ -1922,11 +1911,7 @@ async fn episode_message(
     let Memory::Episodic(mem) = &memory else {
         unreachable!("episode_message always constructs an episodic memory")
     };
-    save_memory(
-        ps.storage.as_ref(),
-        ps.vector_runtime.semantic_space(),
-        &memory,
-    )?;
+    save_memory(ps.storage.as_ref(), active_runtime_space(&ps)?, &memory)?;
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -2099,12 +2084,12 @@ async fn episode_end(
         let storage = ps.storage.clone();
         let embedder = ps.embedder.clone();
         let ns_id = ps.namespace.id;
+        let active_space = active_runtime_space(&ps)?.cloned();
         tokio::spawn(async move {
             // G1/P3b: commit_extraction_for_episode gained a `cancel` arg;
             // background spawn has no external cancel signal, so pass a
             // fresh never-cancelled token (same pattern as the
             // ConsolidationEngine call sites above).
-            let active_space = ps.vector_runtime.semantic_space().cloned();
             let persisted = pensyve_core::observation::commit_extraction_for_episode_in_space(
                 storage.as_ref(),
                 extractor.as_ref(),
@@ -2125,7 +2110,6 @@ async fn episode_end(
                     ns_id,
                     "observation_extract",
                     &serde_json::json!({
-                        "episode_id": episode_id.to_string(),
                         "observations": persisted,
                         "trigger": "episode_end",
                     }),
@@ -2391,7 +2375,10 @@ async fn a2a_recall(
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(5) as usize;
 
-    let semantic_enabled = ps.vector_runtime.semantic_space().is_some();
+    let active_space = ps
+        .semantic_space()
+        .map_err(|error| format!("Runtime space error: {error}"))?;
+    let semantic_enabled = active_space.is_some();
     let query_embedding = if semantic_enabled {
         let embedder = ps.embedder.clone();
         let query_text = query.clone();
@@ -2418,7 +2405,7 @@ async fn a2a_recall(
     let mut engine = RecallEngine::new_storage_backed_with_vector_space(
         ps.storage.as_ref(),
         &ps.embedder,
-        ps.vector_runtime.semantic_space(),
+        active_space,
         &ps.retrieval_config,
     );
     if let Some(r) = reranker.as_deref() {
@@ -2624,7 +2611,7 @@ mod tests {
     use pensyve_core::retrieval::SemanticStatus;
     use pensyve_core::storage::bounded::{MemoryRef, MemoryType};
     use pensyve_core::storage::sqlite::SqliteBackend;
-    use pensyve_core::types::ProceduralMemory;
+    use pensyve_core::types::{Namespace, ProceduralMemory};
     use pensyve_mcp_tools::{PensyveState, VectorRuntime};
     use serde_json::json;
 
@@ -2662,6 +2649,76 @@ mod tests {
             snapshot_retention: pensyve_core::snapshot::RetentionPolicy::UNBOUNDED,
         };
         (storage, state, space)
+    }
+
+    #[test]
+    fn requested_missing_entity_is_distinct_from_unscoped_recall() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteBackend::open(dir.path()).unwrap();
+        let namespace = Namespace::new("missing-recall-entity");
+        storage.save_namespace(&namespace).unwrap();
+        let mut unrelated = Entity::new("unrelated", EntityKind::User);
+        unrelated.namespace_id = namespace.id;
+        storage.save_entity(&unrelated).unwrap();
+
+        assert_eq!(
+            resolve_recall_entity(&storage, None, namespace.id).unwrap(),
+            RecallEntityScope::Unscoped
+        );
+        assert_eq!(
+            resolve_recall_entity(&storage, Some("missing"), namespace.id).unwrap(),
+            RecallEntityScope::Missing
+        );
+        let source = include_str!("rest.rs");
+        let recall = source
+            .split_once("async fn recall(")
+            .unwrap()
+            .1
+            .split_once("async fn recall_grouped(")
+            .unwrap()
+            .0;
+        assert!(recall.contains("RecallEntityScope::Missing =>"));
+        assert!(recall.contains("return Ok(Json(RecallResponse"));
+    }
+
+    #[test]
+    fn recall_entity_lookup_error_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteBackend::open(dir.path()).unwrap();
+        let namespace = Namespace::new("failed-recall-entity");
+        storage.save_namespace(&namespace).unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("memories.db")).unwrap();
+        conn.execute("ALTER TABLE entities RENAME TO unavailable_entities", [])
+            .unwrap();
+
+        let error = resolve_recall_entity(&storage, Some("entity"), namespace.id)
+            .expect_err("lookup failure must not become unscoped recall");
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn rest_recall_filter_rejects_unknown_types_and_shipping_path_uses_pre_limit_filter() {
+        let error = recall_filter(Some(&["unknown".to_string()]), None).unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+
+        let filter = recall_filter(
+            Some(&["observation".to_string(), "observation".to_string()]),
+            Some(0.6),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(filter.allows_type(MemoryType::Observation));
+        assert!(!filter.allows_type(MemoryType::Semantic));
+        let source = include_str!("rest.rs");
+        let recall = source
+            .split_once("async fn recall(")
+            .unwrap()
+            .1
+            .split_once("async fn recall_grouped(")
+            .unwrap()
+            .0;
+        assert!(recall.contains("recall_with_embedding_filtered"));
+        assert!(!recall.contains("filter_recall_results"));
     }
 
     #[tokio::test]
@@ -2970,6 +3027,102 @@ mod tests {
 
         assert!(!inspect.contains("get_all_memories_by_namespace"));
         assert!(!inspect.contains("including_superseded"));
+    }
+
+    #[test]
+    fn recall_shipping_path_has_no_query_result_cache() {
+        let source = include_str!("rest.rs");
+        let recall = source
+            .split_once("async fn recall(")
+            .expect("recall implementation")
+            .1
+            .split_once("async fn recall_grouped(")
+            .expect("recall implementation terminator")
+            .0;
+
+        assert!(!recall.contains("crate::cache"));
+    }
+
+    #[test]
+    fn activity_details_do_not_include_recall_or_memory_content() {
+        fn activity_detail(handler: &str) -> &str {
+            handler
+                .split_once(".log_activity(")
+                .unwrap()
+                .1
+                .split_once(");")
+                .unwrap()
+                .0
+        }
+
+        let source = include_str!("rest.rs");
+        let recall = source
+            .split_once("async fn recall(")
+            .unwrap()
+            .1
+            .split_once("async fn recall_grouped(")
+            .unwrap()
+            .0;
+        let grouped = source
+            .split_once("async fn recall_grouped(")
+            .unwrap()
+            .1
+            .split_once("async fn remember(")
+            .unwrap()
+            .0;
+        let remember = source
+            .split_once("async fn remember(")
+            .unwrap()
+            .1
+            .split_once("async fn create_entity(")
+            .unwrap()
+            .0;
+
+        assert!(!recall.contains("\"query\":"));
+        assert!(!grouped.contains("\"query\":"));
+        assert!(!remember.contains("\"preview\":"));
+
+        let observe_handler = source
+            .split_once("async fn observe(")
+            .unwrap()
+            .1
+            .split_once("async fn activity(")
+            .unwrap()
+            .0;
+        let episode_start_handler = source
+            .split_once("async fn episode_start(")
+            .unwrap()
+            .1
+            .split_once("async fn episode_message(")
+            .unwrap()
+            .0;
+        let forget_handler = source
+            .split_once("async fn forget_entity(")
+            .unwrap()
+            .1
+            .split_once("async fn delete_memory(")
+            .unwrap()
+            .0;
+        let forget_memory_handler = source
+            .split_once("async fn delete_memory(")
+            .unwrap()
+            .1
+            .split_once("async fn purge_all_memories(")
+            .unwrap()
+            .0;
+        let observe = activity_detail(observe_handler);
+        let episode_start = activity_detail(episode_start_handler);
+        let forget = activity_detail(forget_handler);
+        let forget_memory = activity_detail(forget_memory_handler);
+
+        for forbidden in ["\"episode_id\":", "\"source_entity\":", "\"about_entity\":"] {
+            assert!(!observe.contains(forbidden));
+        }
+        assert!(!episode_start.contains("\"participants\":"));
+        for forbidden in ["\"entity\":", "\"snapshot_path\":"] {
+            assert!(!forget.contains(forbidden));
+        }
+        assert!(!forget_memory.contains("\"memory_id\":"));
     }
 
     #[test]

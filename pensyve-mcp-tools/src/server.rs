@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use pensyve_core::retrieval::RecallEngine;
 use pensyve_core::storage::bounded::{
-    MemoryPageRequest, MemoryType, SearchScope, embedding_source_text,
+    MemoryFilter, MemoryPageRequest, MemoryType, SearchScope, embedding_source_text,
 };
 use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{
@@ -20,19 +20,35 @@ use crate::params::{
     AccountParams, EpisodeEndParams, EpisodeStartParams, ForgetMemoryParams, ForgetParams,
     InspectParams, ObserveParams, RecallParams, RememberParams, StatusParams,
 };
-use crate::state::{MIB, PensyveState, RecallAdmission, VectorRuntime};
+#[cfg(test)]
+use crate::state::VectorRuntime;
+use crate::state::{MIB, PensyveState, RecallAdmission};
 
 fn memory_type_name(memory: &Memory) -> &'static str {
     memory.type_name()
 }
 
-fn memory_confidence(memory: &Memory) -> f32 {
-    match memory {
-        Memory::Episodic(_) => 1.0,
-        Memory::Semantic(m) => m.confidence,
-        Memory::Procedural(m) => m.reliability,
-        Memory::Observation(m) => m.confidence,
+fn recall_filter(
+    types: Option<&[String]>,
+    min_confidence: Option<f64>,
+) -> Result<Option<MemoryFilter>, String> {
+    if types.is_none() && min_confidence.is_none() {
+        return Ok(None);
     }
+    let allowed = types
+        .map(|types| {
+            types
+                .iter()
+                .map(|name| {
+                    MemoryType::from_name(name)
+                        .ok_or_else(|| format!("unknown memory type '{name}'"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    MemoryFilter::new(allowed, min_confidence.map(|value| value as f32))
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 fn strip_embedding(val: &mut serde_json::Value) {
@@ -65,8 +81,8 @@ fn consolidation_activity(
 
 fn persist_runtime_memory(state: &PensyveState, memory: &Memory) -> Result<(), String> {
     let record = state
-        .vector_runtime
         .semantic_space()
+        .map_err(|error| format!("Runtime space error: {error}"))?
         .map(|space| embedding_record_for_memory(memory, space, memory.embedding().to_vec()));
     state
         .storage
@@ -74,8 +90,8 @@ fn persist_runtime_memory(state: &PensyveState, memory: &Memory) -> Result<(), S
         .map_err(|error| format!("Error saving memory: {error}"))
 }
 
-fn runtime_wants_embedding(runtime: &VectorRuntime) -> bool {
-    runtime.semantic_space().is_some()
+fn runtime_wants_embedding(state: &PensyveState) -> Result<bool, String> {
+    state.semantic_space().map(|space| space.is_some())
 }
 
 fn set_memory_embedding(memory: &mut Memory, embedding: Vec<f32>) {
@@ -104,6 +120,28 @@ fn get_or_create_entity(
             Ok(e)
         }
         Err(err) => Err(format!("Error looking up entity '{name}': {err}")),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecallEntityScope {
+    Unscoped,
+    Entity(Uuid),
+    Missing,
+}
+
+fn resolve_recall_entity(
+    storage: &dyn StorageTrait,
+    requested: Option<&str>,
+    namespace_id: Uuid,
+) -> Result<RecallEntityScope, String> {
+    let Some(name) = requested else {
+        return Ok(RecallEntityScope::Unscoped);
+    };
+    match storage.get_entity_by_name(name, namespace_id) {
+        Ok(Some(entity)) => Ok(RecallEntityScope::Entity(entity.id)),
+        Ok(None) => Ok(RecallEntityScope::Missing),
+        Err(error) => Err(format!("Error looking up entity '{name}': {error}")),
     }
 }
 
@@ -186,6 +224,7 @@ impl PensyveMcpServer {
         {
             return Err("min_confidence must be between 0.0 and 1.0".to_string());
         }
+        let filter = recall_filter(params.types.as_deref(), params.min_confidence)?;
 
         let limit = params.limit.unwrap_or(5).clamp(1, 100) as usize;
         let state = &self.state;
@@ -201,19 +240,25 @@ impl PensyveMcpServer {
         })?;
 
         // Resolve the optional entity parameter to an entity UUID for entity-affinity ranking.
-        let target_entity = if let Some(ref entity_name) = params.entity {
-            state
-                .storage
-                .get_entity_by_name(entity_name, state.namespace.id)
-                .ok()
-                .flatten()
-                .map(|e| e.id)
-        } else {
-            None
+        let target_entity = match resolve_recall_entity(
+            state.storage.as_ref(),
+            params.entity.as_deref(),
+            state.namespace.id,
+        )? {
+            RecallEntityScope::Unscoped => None,
+            RecallEntityScope::Entity(id) => Some(id),
+            RecallEntityScope::Missing => {
+                let _ = state.storage.log_activity(
+                    state.namespace.id,
+                    "recall",
+                    &serde_json::json!({"results": 0, "entity_status": "not_found"}),
+                );
+                return Ok("[]".to_string());
+            }
         };
 
         // Run embedding off the async worker because ONNX inference is blocking.
-        let semantic_enabled = state.vector_runtime.semantic_space().is_some();
+        let semantic_enabled = runtime_wants_embedding(state)?;
         let query_embedding = if semantic_enabled {
             let embedder = state.embedder.clone();
             let query_text = params.query.clone();
@@ -241,39 +286,40 @@ impl PensyveMcpServer {
             None
         });
 
+        let active_space = state.semantic_space()?;
         let mut engine = RecallEngine::new_storage_backed_with_vector_space(
             state.storage.as_ref(),
             &state.embedder,
-            state.vector_runtime.semantic_space(),
+            active_space,
             &state.retrieval_config,
         );
         if let Some(r) = reranker.as_deref() {
             engine = engine.with_reranker(r);
         }
-        let result = engine.recall_with_embedding(
-            &params.query,
-            query_embedding.as_deref(),
-            state.namespace.id,
-            limit,
-            target_entity,
-        );
+        let result = match filter.as_ref() {
+            Some(filter) => engine.recall_with_embedding_filtered(
+                &params.query,
+                query_embedding.as_deref(),
+                state.namespace.id,
+                limit,
+                target_entity,
+                filter,
+            ),
+            None => engine.recall_with_embedding(
+                &params.query,
+                query_embedding.as_deref(),
+                state.namespace.id,
+                limit,
+                target_entity,
+            ),
+        };
         let result = result.map_err(|e| format!("Error recalling memories: {e}"))?;
 
         let memories: Vec<serde_json::Value> = result
             .memories
             .iter()
-            .filter_map(|c| {
+            .map(|c| {
                 let type_name = memory_type_name(&c.memory);
-                if let Some(types) = &params.types
-                    && !types.iter().any(|t| t == type_name)
-                {
-                    return None;
-                }
-                if let Some(min_conf) = params.min_confidence
-                    && f64::from(memory_confidence(&c.memory)) < min_conf
-                {
-                    return None;
-                }
                 let mut outer = serde_json::to_value(&c.memory).unwrap_or_default();
                 let inner = if let serde_json::Value::Object(ref mut map) = outer {
                     map.values_mut()
@@ -283,21 +329,25 @@ impl PensyveMcpServer {
                 } else {
                     outer.clone()
                 };
-                Some(if let serde_json::Value::Object(mut map) = inner {
+                if let serde_json::Value::Object(mut map) = inner {
                     map.remove("embedding");
                     map.insert("_type".to_string(), serde_json::json!(type_name));
                     map.insert("_score".to_string(), serde_json::json!(c.final_score));
                     serde_json::Value::Object(map)
                 } else {
                     serde_json::json!({ "_type": type_name, "_score": c.final_score })
-                })
+                }
             })
             .collect();
 
         let _ = state.storage.log_activity(
             state.namespace.id,
             "recall",
-            &serde_json::json!({"query": params.query, "results": memories.len()}),
+            &serde_json::json!({
+                "results": memories.len(),
+                "type_filter_count": params.types.as_ref().map_or(0, Vec::len),
+                "has_min_confidence": params.min_confidence.is_some(),
+            }),
         );
 
         serde_json::to_string(&memories).map_err(|e| format!("Serialization error: {e}"))
@@ -342,7 +392,7 @@ impl PensyveMcpServer {
             confidence,
         ));
 
-        if runtime_wants_embedding(&state.vector_runtime) {
+        if runtime_wants_embedding(state)? {
             // Run ONNX inference on the blocking thread pool to avoid stalling the async runtime.
             let embedder = state.embedder.clone();
             let source = embedding_source_text(&memory);
@@ -366,7 +416,7 @@ impl PensyveMcpServer {
         let _ = state.storage.log_activity(
             state.namespace.id,
             "remember",
-            &serde_json::json!({"entity": params.entity, "preview": &params.fact[..params.fact.len().min(50)]}),
+            &serde_json::json!({"memory_type": "semantic", "status": "stored"}),
         );
 
         let Memory::Semantic(stored) = &memory else {
@@ -404,7 +454,7 @@ impl PensyveMcpServer {
         let _ = state.storage.log_activity(
             state.namespace.id,
             "episode_start",
-            &serde_json::json!({"participants": params.participants}),
+            &serde_json::json!({"participant_count": params.participants.len(), "status": "started"}),
         );
 
         serde_json::to_string(&serde_json::json!({
@@ -625,7 +675,7 @@ impl PensyveMcpServer {
         };
         let mut memory = Memory::Episodic(episodic);
 
-        if runtime_wants_embedding(&state.vector_runtime) {
+        if runtime_wants_embedding(state)? {
             // Embed content on the blocking thread pool.
             let embedder = state.embedder.clone();
             let source = embedding_source_text(&memory);
@@ -653,11 +703,9 @@ impl PensyveMcpServer {
             state.namespace.id,
             "observe",
             &serde_json::json!({
-                "episode_id": episode_id.to_string(),
-                "source_entity": params.source_entity,
-                "about_entity": params.about_entity,
                 "content_type": stored.content_type.as_str(),
                 "content_len": params.content.len(),
+                "status": "stored",
             }),
         );
 
@@ -744,15 +792,13 @@ impl PensyveMcpServer {
                 format!("Aborted: pre-delete snapshot failed, nothing was deleted: {err}")
             })?;
 
-            let snapshot_path = outcome
-                .path
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned());
-
             let _ = task_state.storage.log_activity(
                 task_state.namespace.id,
                 "forget",
-                &serde_json::json!({"entity": entity_name, "snapshot_path": snapshot_path}),
+                &serde_json::json!({
+                    "forgotten_count": outcome.snapshot.counts.total,
+                    "status": "deleted",
+                }),
             );
 
             Ok::<_, String>(outcome)
@@ -802,8 +848,7 @@ impl PensyveMcpServer {
             // #266: the path is a detail of the server's filesystem. A local
             // stdio caller owns that filesystem and needs the pointer to
             // recover on its own; a hosted tenant does not, and handing it one
-            // leaks the server's layout. The activity log above records the
-            // path either way, so the operator's recovery pointer is intact.
+            // leaks the server's layout.
             if !state.is_remote {
                 reference["path"] = serde_json::Value::String(path);
             }
@@ -839,7 +884,7 @@ impl PensyveMcpServer {
         let _ = state.storage.log_activity(
             state.namespace.id,
             "forget_memory",
-            &serde_json::json!({"memory_id": params.memory_id, "deleted": deleted}),
+            &serde_json::json!({"deleted": deleted, "count": usize::from(deleted)}),
         );
 
         serde_json::to_string(&serde_json::json!({
@@ -1027,19 +1072,12 @@ impl PensyveMcpServer {
             // Stats for a specific entity
             if let Ok(Some(entity)) = state.storage.get_entity_by_name(entity_name, ns.id) {
                 entity_count = 1;
-                if let Ok(mems) =
-                    state
-                        .storage
-                        .list_semantic_by_entity_in_namespace(entity.id, ns.id, usize::MAX)
+                if let Ok((episodic, semantic)) = state
+                    .storage
+                    .count_memories_by_entity_in_namespace(entity.id, ns.id)
                 {
-                    semantic_count = mems.len();
-                }
-                if let Ok(mems) =
-                    state
-                        .storage
-                        .list_episodic_by_entity_in_namespace(entity.id, ns.id, usize::MAX)
-                {
-                    episodic_count = mems.len();
+                    episodic_count = episodic;
+                    semantic_count = semantic;
                 }
             }
         } else {
@@ -1149,7 +1187,7 @@ mod tests {
     /// The second is the shape the pre-#246 snapshot path dropped.
     struct ForgetFixture {
         server: PensyveMcpServer,
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
     }
 
     fn forget_fixture(snapshot_root: PathBuf, is_remote: bool) -> ForgetFixture {
@@ -1212,7 +1250,7 @@ mod tests {
 
         ForgetFixture {
             server: PensyveMcpServer::new(state),
-            _dir: dir,
+            dir,
         }
     }
 
@@ -1233,6 +1271,164 @@ mod tests {
                 return count;
             };
             after = Some(next);
+        }
+    }
+
+    #[tokio::test]
+    async fn entity_status_counts_without_loading_memory_rows() {
+        let snapshot_root = tempfile::tempdir().unwrap();
+        let fixture = forget_fixture(snapshot_root.path().join("snapshots"), false);
+        let namespace_id = fixture.server.state.namespace.id;
+        let subject = fixture
+            .server
+            .state
+            .storage
+            .get_entity_by_name("subject", namespace_id)
+            .unwrap()
+            .unwrap();
+        let episode = Episode::new(namespace_id, vec![subject.id]);
+        fixture.server.state.storage.save_episode(&episode).unwrap();
+
+        let mut semantic_id = Uuid::nil();
+        let mut episodic_id = Uuid::nil();
+        for number in 0..300 {
+            let semantic = SemanticMemory::new(
+                namespace_id,
+                subject.id,
+                "status-count",
+                format!("semantic-{number}"),
+                1.0,
+            );
+            semantic_id = semantic.id;
+            fixture
+                .server
+                .state
+                .storage
+                .save_semantic(&semantic)
+                .unwrap();
+
+            let episodic = EpisodicMemory::new(
+                namespace_id,
+                episode.id,
+                subject.id,
+                subject.id,
+                format!("episodic-{number}"),
+            );
+            episodic_id = episodic.id;
+            fixture
+                .server
+                .state
+                .storage
+                .save_episodic(&episodic)
+                .unwrap();
+        }
+
+        let db_path = fixture.server.state.storage.db_path().unwrap();
+        let connection = rusqlite::Connection::open(db_path).unwrap();
+        connection
+            .execute(
+                "UPDATE semantic_memories SET id = 'not-a-uuid' WHERE id = ?1",
+                [semantic_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE episodic_memories SET id = 'also-not-a-uuid' WHERE id = ?1",
+                [episodic_id.to_string()],
+            )
+            .unwrap();
+
+        let response = fixture
+            .server
+            .status(Parameters(StatusParams {
+                entity: Some("subject".to_string()),
+            }))
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(response["stats"]["semantic"], 300);
+        assert_eq!(response["stats"]["episodic"], 301);
+        assert_eq!(response["stats"]["total_memories"], 601);
+    }
+
+    #[tokio::test]
+    async fn remember_handles_multibyte_preview_boundary_without_logging_content() {
+        let snapshot_root = tempfile::tempdir().unwrap();
+        let fixture = forget_fixture(snapshot_root.path().join("snapshots"), false);
+        let unique_fact = format!("é {}", "界".repeat(30));
+
+        let response = fixture
+            .server
+            .remember(Parameters(RememberParams {
+                entity: "subject".to_string(),
+                fact: unique_fact.clone(),
+                confidence: Some(0.9),
+            }))
+            .await;
+
+        assert!(
+            response.is_ok(),
+            "remember failed after persistence: {response:?}"
+        );
+        let activity = fixture
+            .server
+            .state
+            .storage
+            .get_recent_activity(fixture.server.state.namespace.id, 1)
+            .unwrap();
+        assert_eq!(activity.len(), 1);
+        let detail = serde_json::to_string(&activity[0].detail_json).unwrap();
+        assert!(!detail.contains(&unique_fact));
+        assert!(!detail.contains('界'));
+        assert!(!detail.contains("preview"));
+    }
+
+    #[tokio::test]
+    async fn activity_details_omit_participant_and_entity_names() {
+        let snapshot_root = tempfile::tempdir().unwrap();
+        let fixture = forget_fixture(snapshot_root.path().join("snapshots"), false);
+        let participant = "participant-sentinel".to_string();
+        let source = "source-sentinel".to_string();
+        let about = "about-sentinel".to_string();
+
+        let started = fixture
+            .server
+            .episode_start(Parameters(EpisodeStartParams {
+                participants: vec![participant.clone()],
+            }))
+            .await
+            .unwrap();
+        let episode_id = serde_json::from_str::<serde_json::Value>(&started).unwrap()["episode_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        fixture
+            .server
+            .observe(Parameters(ObserveParams {
+                episode_id,
+                content: "observation-sentinel".to_string(),
+                source_entity: source.clone(),
+                about_entity: about.clone(),
+                content_type: None,
+            }))
+            .await
+            .unwrap();
+
+        let activity = fixture
+            .server
+            .state
+            .storage
+            .get_recent_activity(fixture.server.state.namespace.id, 2)
+            .unwrap();
+        let detail = serde_json::to_string(&activity).unwrap();
+        for sentinel in [
+            participant,
+            source,
+            about,
+            "observation-sentinel".to_string(),
+        ] {
+            assert!(!detail.contains(&sentinel), "activity leaked {sentinel}");
         }
     }
 
@@ -1264,6 +1460,118 @@ mod tests {
             "Retryable internal error: recall overloaded; retry after 1 second"
         );
         assert_eq!(admission.overload_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn requested_missing_entity_returns_empty_without_unscoped_recall() {
+        let snapshots = tempfile::tempdir().unwrap();
+        let fixture = forget_fixture(snapshots.path().to_path_buf(), false);
+
+        let response = fixture
+            .server
+            .recall(Parameters(RecallParams {
+                query: "episodic turn".into(),
+                entity: Some("does-not-exist".into()),
+                types: None,
+                limit: Some(10),
+                min_confidence: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response).unwrap(),
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn entity_lookup_storage_error_fails_closed() {
+        let snapshots = tempfile::tempdir().unwrap();
+        let fixture = forget_fixture(snapshots.path().to_path_buf(), false);
+        let conn = rusqlite::Connection::open(fixture.dir.path().join("memories.db")).unwrap();
+        conn.execute("ALTER TABLE entities RENAME TO unavailable_entities", [])
+            .unwrap();
+
+        let error = fixture
+            .server
+            .recall(Parameters(RecallParams {
+                query: "episodic turn".into(),
+                entity: Some("subject".into()),
+                types: None,
+                limit: Some(10),
+                min_confidence: None,
+            }))
+            .await
+            .expect_err("entity lookup errors must not become unscoped recall");
+
+        assert!(error.contains("Error looking up entity"));
+    }
+
+    #[tokio::test]
+    async fn recall_type_filter_is_pre_limit_and_unknown_types_are_rejected() {
+        let snapshots = tempfile::tempdir().unwrap();
+        let fixture = forget_fixture(snapshots.path().to_path_buf(), false);
+        let namespace_id = fixture.server.state.namespace.id;
+        for index in 0..=100 {
+            fixture
+                .server
+                .state
+                .storage
+                .save_semantic(&SemanticMemory::new(
+                    namespace_id,
+                    Uuid::new_v4(),
+                    "shared",
+                    format!("nonmatch {index}"),
+                    0.99,
+                ))
+                .unwrap();
+        }
+        let episode = Episode::new(namespace_id, vec![]);
+        fixture.server.state.storage.save_episode(&episode).unwrap();
+        let mut observation = pensyve_core::types::ObservationMemory::new(
+            namespace_id,
+            episode.id,
+            "kind",
+            "instance",
+            "shared",
+            "shared qualifying observation",
+        );
+        observation.confidence = 0.6;
+        fixture
+            .server
+            .state
+            .storage
+            .save_observation(&observation)
+            .unwrap();
+
+        let response = fixture
+            .server
+            .recall(Parameters(RecallParams {
+                query: "shared".into(),
+                entity: None,
+                types: Some(vec!["observation".into(), "observation".into()]),
+                limit: Some(1),
+                min_confidence: Some(0.6),
+            }))
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response.as_array().unwrap().len(), 1);
+        assert_eq!(response[0]["_type"], "observation");
+
+        let error = fixture
+            .server
+            .recall(Parameters(RecallParams {
+                query: "shared".into(),
+                entity: None,
+                types: Some(vec!["unknown".into()]),
+                limit: Some(1),
+                min_confidence: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(error.contains("unknown memory type"));
     }
 
     #[tokio::test]

@@ -608,6 +608,17 @@ impl OnnxEmbedder {
         policy: &NetworkPolicy,
     ) -> EmbeddingResult<Arc<Self>> {
         let pool_size = resolved_embedding_pool_size();
+        Self::new_cached_with_policy_and_pool_size(model_name, policy, pool_size)
+    }
+
+    /// Policy-aware cached constructor with an explicit session-pool size.
+    /// Shipping runtimes use this to pin one session independently of
+    /// process-global harness tuning.
+    pub fn new_cached_with_policy_and_pool_size(
+        model_name: &str,
+        policy: &NetworkPolicy,
+        pool_size: usize,
+    ) -> EmbeddingResult<Arc<Self>> {
         let cache_dir = resolved_fastembed_cache_dir()?;
         if !matches!(policy, NetworkPolicy::Permissive) {
             let (_, _, hf_model_code, model_file) = resolve_model(model_name)?;

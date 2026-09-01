@@ -127,10 +127,7 @@ pub struct RecallReservation {
 }
 
 pub enum VectorRuntime {
-    StorageBacked {
-        space: Arc<EmbeddingSpace>,
-        semantic_active: bool,
-    },
+    StorageBacked { space: Arc<EmbeddingSpace> },
 }
 
 impl VectorRuntime {
@@ -139,7 +136,7 @@ impl VectorRuntime {
         namespace_state: Option<&NamespaceEmbeddingState>,
     ) -> Result<Self, String> {
         let runtime_id = runtime_space.id();
-        let semantic_active = match namespace_state {
+        match namespace_state {
             Some(state) if state.phase == NamespaceEmbeddingPhase::Active => {
                 let active_id = state.active_read_space_id.as_ref().ok_or_else(|| {
                     "active namespace embedding state has no active read space id".to_string()
@@ -159,13 +156,11 @@ impl VectorRuntime {
                         active_id.0, runtime_id.0
                     ));
                 }
-                true
             }
-            Some(_) | None => false,
-        };
+            Some(_) | None => {}
+        }
         Ok(Self::StorageBacked {
             space: Arc::new(runtime_space),
-            semantic_active,
         })
     }
 
@@ -184,17 +179,29 @@ impl VectorRuntime {
         Self::storage_backed(runtime_space, state.as_ref())
     }
 
-    #[must_use]
-    pub fn semantic_space(&self) -> Option<&EmbeddingSpace> {
-        match self {
-            Self::StorageBacked {
-                space,
-                semantic_active: true,
-            } => Some(space),
-            Self::StorageBacked {
-                semantic_active: false,
-                ..
-            } => None,
+    pub fn semantic_space_for_state(
+        &self,
+        namespace_state: Option<&NamespaceEmbeddingState>,
+    ) -> Result<Option<&EmbeddingSpace>, String> {
+        let space = self.space();
+        match namespace_state {
+            Some(state) if state.phase == NamespaceEmbeddingPhase::Active => {
+                let active_id = state.active_read_space_id.as_ref().ok_or_else(|| {
+                    "active namespace embedding state has no active read space id".to_string()
+                })?;
+                let active_space = state.active_read_space.as_ref().ok_or_else(|| {
+                    "active namespace embedding state has no joined active space".to_string()
+                })?;
+                if active_space.id() != *active_id || *active_id != space.id() {
+                    return Err(format!(
+                        "active embedding space {} does not match runtime space {}",
+                        active_id.0,
+                        space.id().0
+                    ));
+                }
+                Ok(Some(space))
+            }
+            Some(_) | None => Ok(None),
         }
     }
 
@@ -318,6 +325,17 @@ pub struct PensyveState {
 }
 
 impl PensyveState {
+    /// Resolve the namespace lifecycle for this operation against the one
+    /// embedding space loaded by the process. This makes activation and
+    /// rollback visible without loading or swapping models.
+    pub fn semantic_space(&self) -> Result<Option<&EmbeddingSpace>, String> {
+        let state = self
+            .storage
+            .get_namespace_embedding_state(self.namespace.id)
+            .map_err(|error| format!("failed to resolve namespace embedding state: {error}"))?;
+        self.vector_runtime.semantic_space_for_state(state.as_ref())
+    }
+
     /// Build a reranker cell that is populated before state becomes visible.
     /// Strict gateways use this after fail-closed model initialization so the
     /// first recall cannot enter the lazy resolver or fall back to `None`.
@@ -368,8 +386,8 @@ impl PensyveState {
     }
 
     /// Resolve the reranker lazily (first call wins) and return a clone of
-    /// the cached result on every subsequent call. `None` means either
-    /// `PENSYVE_RERANKER=0` was set or the model failed to load; either way
+    /// the cached result on every subsequent call. `None` means reranking was
+    /// not explicitly enabled or the model failed to load; either way
     /// callers should proceed with an unreranked `RecallEngine`.
     ///
     /// # Blocking
@@ -400,8 +418,8 @@ impl PensyveState {
 }
 
 fn resolve_reranker() -> Option<Arc<Reranker>> {
-    if std::env::var("PENSYVE_RERANKER").as_deref() == Ok("0") {
-        tracing::info!("Reranker disabled via PENSYVE_RERANKER=0");
+    if !reranker_opted_in(&std::env::var("PENSYVE_RERANKER")) {
+        tracing::info!("Reranker disabled; set PENSYVE_RERANKER=1 to enable it");
         return None;
     }
     match Reranker::new_cached(RERANKER_MODEL) {
@@ -409,11 +427,15 @@ fn resolve_reranker() -> Option<Arc<Reranker>> {
         Err(e) => {
             tracing::warn!(
                 "Reranker unavailable ({e}); recall proceeding unreranked. \
-                 Set PENSYVE_RERANKER=0 to silence this warning."
+                 Reranking remains disabled until PENSYVE_RERANKER=1."
             );
             None
         }
     }
+}
+
+fn reranker_opted_in(value: &Result<String, std::env::VarError>) -> bool {
+    value.as_deref() == Ok("1")
 }
 
 #[cfg(test)]
@@ -425,6 +447,59 @@ mod tests {
     use super::*;
     use pensyve_core::embedding_space::{EmbeddingSpace, EmbeddingSpaceId};
     use pensyve_core::storage::bounded::{NamespaceEmbeddingPhase, NamespaceEmbeddingState};
+    use pensyve_core::storage::sqlite::SqliteBackend;
+
+    #[test]
+    fn reranker_is_default_off_and_requires_explicit_opt_in() {
+        assert!(!reranker_opted_in(&Err(std::env::VarError::NotPresent)));
+        assert!(!reranker_opted_in(&Ok("0".to_string())));
+        assert!(!reranker_opted_in(&Ok("invalid".to_string())));
+        assert!(reranker_opted_in(&Ok("1".to_string())));
+    }
+
+    #[test]
+    fn state_observes_activation_and_rollback_after_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(SqliteBackend::open(dir.path()).unwrap());
+        let namespace = Namespace::new("lifecycle-refresh");
+        storage.save_namespace(&namespace).unwrap();
+        let embedder = Arc::new(OnnxEmbedder::new_mock(8));
+        let runtime_space = embedder.embedding_space().unwrap().clone();
+        let state = PensyveState {
+            storage: storage.clone(),
+            embedder,
+            vector_runtime: VectorRuntime::storage_backed(runtime_space.clone(), None).unwrap(),
+            namespace,
+            retrieval_config: pensyve_core::config::PensyveConfig::default().retrieval,
+            is_remote: false,
+            reranker_cell: Arc::new(OnceLock::new()),
+            snapshot_root: dir.path().join("snapshots"),
+            snapshot_retention: RetentionPolicy::UNBOUNDED,
+        };
+
+        assert!(state.semantic_space().unwrap().is_none());
+        storage
+            .begin_embedding_migration(state.namespace.id, &runtime_space)
+            .unwrap();
+        storage
+            .verify_embedding_migration(state.namespace.id, &runtime_space.id())
+            .unwrap();
+        storage
+            .activate_embedding_migration(
+                state.namespace.id,
+                &runtime_space.id(),
+                &runtime_space.id(),
+            )
+            .unwrap();
+        assert_eq!(
+            state.semantic_space().unwrap().map(EmbeddingSpace::id),
+            Some(runtime_space.id())
+        );
+        storage
+            .rollback_embedding_migration_to_lexical(state.namespace.id)
+            .unwrap();
+        assert!(state.semantic_space().unwrap().is_none());
+    }
 
     /// Sets `PENSYVE_RERANKER=0` exactly once for this test binary. Uses
     /// `Once` (rather than a bare `set_var` per test) so the mutation is
@@ -461,14 +536,20 @@ mod tests {
 
             let runtime = VectorRuntime::storage_backed(runtime_space.clone(), Some(&state))
                 .expect("inactive phase remains lexical-only");
-            assert!(runtime.semantic_space().is_none(), "phase {phase:?}");
+            assert!(
+                runtime
+                    .semantic_space_for_state(Some(&state))
+                    .unwrap()
+                    .is_none(),
+                "phase {phase:?}"
+            );
             assert_eq!(
                 runtime.space().id(),
                 EmbeddingSpaceId(state.target_space_id.unwrap().0)
             );
         }
         let no_row = VectorRuntime::storage_backed(runtime_space, None).unwrap();
-        assert!(no_row.semantic_space().is_none());
+        assert!(no_row.semantic_space_for_state(None).unwrap().is_none());
     }
 
     #[test]
@@ -505,7 +586,10 @@ mod tests {
 
         let runtime = VectorRuntime::storage_backed(runtime_space, Some(&state)).unwrap();
         assert_eq!(
-            runtime.semantic_space().map(EmbeddingSpace::id),
+            runtime
+                .semantic_space_for_state(Some(&state))
+                .unwrap()
+                .map(EmbeddingSpace::id),
             state.active_read_space_id
         );
     }

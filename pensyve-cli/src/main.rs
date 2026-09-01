@@ -17,13 +17,15 @@ use pensyve_core::{
     types::{Entity, EntityKind, Memory, Namespace, SemanticMemory},
 };
 
+const SHIPPING_EMBEDDING_POOL_SIZE: usize = 1;
+
 /// Lazily resolve the cross-encoder reranker for `recall`. Only called from
 /// `cmd_recall`, so other subcommands never pay the model-load cost.
 /// `PENSYVE_RERANKER=0` disables it outright; a model-load failure is
 /// logged once (to stderr) and recall proceeds unreranked rather than
 /// failing the command.
 fn resolve_reranker() -> Option<std::sync::Arc<Reranker>> {
-    if std::env::var("PENSYVE_RERANKER").as_deref() == Ok("0") {
+    if std::env::var("PENSYVE_RERANKER").as_deref() != Ok("1") {
         return None;
     }
     match Reranker::new_cached("BGERerankerBase") {
@@ -203,10 +205,13 @@ enum EmbeddingSpaceCommand {
 /// Return the storage path for a given namespace.
 /// Defaults to ~/.pensyve/<namespace>.
 fn storage_path(namespace: &str) -> PathBuf {
+    storage_root().join(namespace)
+}
+
+fn storage_root() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".pensyve")
-        .join(namespace)
 }
 
 /// Open (or create) the `SqliteBackend` for `path`.
@@ -346,14 +351,24 @@ fn cmd_recall(
     let ns = ensure_namespace(&storage, namespace_name)?;
 
     // Try real ONNX embedder with fallback to mock.
-    let embedder = OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5")
-        .or_else(|_| OnnxEmbedder::new("all-MiniLM-L6-v2"))
-        .unwrap_or_else(|_| {
-            eprintln!(
-                "Warning: ONNX embedder unavailable, using mock (semantic search will be degraded)"
-            );
-            OnnxEmbedder::new_mock(768)
-        });
+    let embedder = OnnxEmbedder::new_with_policy_and_pool_size(
+        "Alibaba-NLP/gte-base-en-v1.5",
+        &NetworkPolicy::Permissive,
+        SHIPPING_EMBEDDING_POOL_SIZE,
+    )
+    .or_else(|_| {
+        OnnxEmbedder::new_with_policy_and_pool_size(
+            "all-MiniLM-L6-v2",
+            &NetworkPolicy::Permissive,
+            SHIPPING_EMBEDDING_POOL_SIZE,
+        )
+    })
+    .unwrap_or_else(|_| {
+        eprintln!(
+            "Warning: ONNX embedder unavailable, using mock (semantic search will be degraded)"
+        );
+        OnnxEmbedder::new_mock(768)
+    });
     let active_space = resolve_local_semantic_space(&storage, &embedder, ns.id)?;
 
     let config = RetrievalConfig {
@@ -708,14 +723,24 @@ fn cmd_remember(
     let entity = ensure_entity(&storage, entity_name, ns.id)?;
 
     // Embed using real ONNX embedder with fallback to mock.
-    let embedder = OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5")
-        .or_else(|_| OnnxEmbedder::new("all-MiniLM-L6-v2"))
-        .unwrap_or_else(|_| {
-            eprintln!(
-                "Warning: ONNX embedder unavailable, using mock (semantic search will be degraded)"
-            );
-            OnnxEmbedder::new_mock(768)
-        });
+    let embedder = OnnxEmbedder::new_with_policy_and_pool_size(
+        "Alibaba-NLP/gte-base-en-v1.5",
+        &NetworkPolicy::Permissive,
+        SHIPPING_EMBEDDING_POOL_SIZE,
+    )
+    .or_else(|_| {
+        OnnxEmbedder::new_with_policy_and_pool_size(
+            "all-MiniLM-L6-v2",
+            &NetworkPolicy::Permissive,
+            SHIPPING_EMBEDDING_POOL_SIZE,
+        )
+    })
+    .unwrap_or_else(|_| {
+        eprintln!(
+            "Warning: ONNX embedder unavailable, using mock (semantic search will be degraded)"
+        );
+        OnnxEmbedder::new_mock(768)
+    });
     remember_local_memory(
         &storage,
         &embedder,
@@ -799,11 +824,27 @@ fn cmd_forget(
 fn open_embedding_space_storage(
     namespace_id: uuid::Uuid,
 ) -> Result<SqliteBackend, Box<dyn std::error::Error>> {
-    let storage = open_storage(&storage_path(&namespace_id.to_string()))?;
-    if storage.get_namespace(namespace_id)?.is_none() {
-        return Err(StorageError::NotFound(format!("namespace {namespace_id}")).into());
+    let root = storage_root();
+    let mut namespace_paths = if root.is_dir() {
+        std::fs::read_dir(root)?
+            .map(|entry| entry.map(|value| value.path()))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+    namespace_paths.sort();
+
+    for path in namespace_paths {
+        if !path.join("memories.db").is_file() {
+            continue;
+        }
+        let storage = open_storage(&path)?;
+        if storage.get_namespace(namespace_id)?.is_some() {
+            return Ok(storage);
+        }
     }
-    Ok(storage)
+
+    Err(StorageError::NotFound(format!("namespace {namespace_id}")).into())
 }
 
 fn approved_manifest_embedder(
@@ -815,7 +856,11 @@ fn approved_manifest_embedder(
         )
         .into());
     }
-    let embedder = OnnxEmbedder::new_with_policy(&manifest.model_name, &NetworkPolicy::Disabled)?;
+    let embedder = OnnxEmbedder::new_with_policy_and_pool_size(
+        &manifest.model_name,
+        &NetworkPolicy::Disabled,
+        SHIPPING_EMBEDDING_POOL_SIZE,
+    )?;
     let runtime_id = embedder.embedding_space()?.id();
     let manifest_id = manifest.id();
     if runtime_id != manifest_id {
@@ -1022,6 +1067,12 @@ mod tests {
     use super::*;
     use pensyve_core::retrieval::SemanticStatus;
     use pensyve_core::storage::bounded::MemoryRef;
+
+    #[test]
+    fn shipping_model_defaults_are_opt_in_and_single_session() {
+        assert_eq!(SHIPPING_EMBEDDING_POOL_SIZE, 1);
+        assert!(include_str!("main.rs").contains("as_deref() != Ok(\"1\")"));
+    }
 
     #[test]
     fn embedding_space_commands_parse_without_a_model_selector() {

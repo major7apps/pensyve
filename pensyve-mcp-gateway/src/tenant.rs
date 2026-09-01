@@ -387,6 +387,34 @@ mod tests {
     }
 
     #[test]
+    fn default_state_observes_activation_and_rollback_after_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(&dir);
+        let state = mgr.default_state.clone();
+        let runtime_space = mgr.embedder.embedding_space().unwrap().clone();
+
+        assert!(state.semantic_space().unwrap().is_none());
+        mgr.storage
+            .begin_embedding_migration(state.namespace.id, &runtime_space)
+            .unwrap();
+        mgr.storage
+            .verify_embedding_migration(state.namespace.id, &runtime_space.id())
+            .unwrap();
+        mgr.storage
+            .activate_embedding_migration(
+                state.namespace.id,
+                &runtime_space.id(),
+                &runtime_space.id(),
+            )
+            .unwrap();
+        assert!(state.semantic_space().unwrap().is_some());
+        mgr.storage
+            .rollback_embedding_migration_to_lexical(state.namespace.id)
+            .unwrap();
+        assert!(state.semantic_space().unwrap().is_none());
+    }
+
+    #[test]
     fn test_concurrent_same_tenant_returns_same_state() {
         let dir = tempfile::tempdir().unwrap();
         let mgr = test_manager(&dir);

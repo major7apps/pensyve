@@ -14,7 +14,7 @@ use crate::reranker::Reranker;
 use crate::rrf;
 use crate::storage::bounded::{
     EntityScope, IdentityScope, MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS,
-    MAX_VECTOR_HITS, MemoryRef, SearchScope, SearchUnavailable, VectorSearchOutcome,
+    MAX_VECTOR_HITS, MemoryFilter, MemoryRef, SearchScope, SearchUnavailable, VectorSearchOutcome,
     VectorSearchRequest,
 };
 use crate::storage::{StorageTrait, memory_matches_scope as pensyve_core_scope_match};
@@ -585,6 +585,24 @@ impl<'a> RecallEngine<'a> {
         self.recall_with_entity(query, namespace_id, limit, None)
     }
 
+    pub fn recall_filtered(
+        &self,
+        query: &str,
+        namespace_id: Uuid,
+        limit: usize,
+        target_entity: Option<Uuid>,
+        filter: &MemoryFilter,
+    ) -> Result<RecallResult, RecallError> {
+        self.recall_inner(
+            query,
+            None,
+            namespace_id,
+            limit,
+            target_entity,
+            Some(filter),
+        )
+    }
+
     /// Like `recall`, but accepts a pre-computed query embedding so callers
     /// can embed outside a lock scope. Falls back to internal embedding if
     /// `query_embedding` is `None`.
@@ -596,7 +614,35 @@ impl<'a> RecallEngine<'a> {
         limit: usize,
         target_entity: Option<Uuid>,
     ) -> Result<RecallResult, RecallError> {
-        self.recall_inner(query, query_embedding, namespace_id, limit, target_entity)
+        self.recall_inner(
+            query,
+            query_embedding,
+            namespace_id,
+            limit,
+            target_entity,
+            None,
+        )
+    }
+
+    /// Storage-backed recall with exact type/confidence predicates applied
+    /// before first-stage quotas and limits.
+    pub fn recall_with_embedding_filtered(
+        &self,
+        query: &str,
+        query_embedding: Option<&[f32]>,
+        namespace_id: Uuid,
+        limit: usize,
+        target_entity: Option<Uuid>,
+        filter: &MemoryFilter,
+    ) -> Result<RecallResult, RecallError> {
+        self.recall_inner(
+            query,
+            query_embedding,
+            namespace_id,
+            limit,
+            target_entity,
+            Some(filter),
+        )
     }
 
     /// Run the recall pipeline and cluster the results by source session.
@@ -618,16 +664,30 @@ impl<'a> RecallEngine<'a> {
         namespace_id: Uuid,
         config: &crate::recall_grouped::RecallGroupedConfig,
     ) -> Result<Vec<crate::recall_grouped::SessionGroup>, RecallError> {
-        let result = self.recall(query, namespace_id, config.limit)?;
-        // Apply optional memory-type filter on the flat candidate pool *before*
-        // grouping. Mirrors the SDK-level `types` filter on the flat recall
-        // path; doing it pre-grouping means a group whose only matching member
-        // was filtered out collapses cleanly instead of becoming an empty
-        // bucket.
-        let memories = crate::recall_grouped::filter_candidates_by_types(
-            result.memories,
-            config.types.as_deref(),
-        );
+        let filter = config
+            .types
+            .as_ref()
+            .map(|types| {
+                let allowed = types
+                    .iter()
+                    .map(|name| {
+                        crate::storage::bounded::MemoryType::from_name(name).ok_or_else(|| {
+                            crate::storage::StorageError::Context(format!(
+                                "unknown memory type '{name}'"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                MemoryFilter::new(Some(allowed), None)
+            })
+            .transpose()?;
+        let result = match filter.as_ref() {
+            Some(filter) => {
+                self.recall_filtered(query, namespace_id, config.limit, None, filter)?
+            }
+            None => self.recall(query, namespace_id, config.limit)?,
+        };
+        let memories = result.memories;
         let groups =
             crate::recall_grouped::group_by_session(memories, config.order, config.max_groups);
         // Observations attach post-grouping — they don't participate in RRF
@@ -686,7 +746,7 @@ impl<'a> RecallEngine<'a> {
         limit: usize,
         target_entity: Option<Uuid>,
     ) -> Result<RecallResult, RecallError> {
-        self.recall_inner(query, None, namespace_id, limit, target_entity)
+        self.recall_inner(query, None, namespace_id, limit, target_entity, None)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -697,6 +757,7 @@ impl<'a> RecallEngine<'a> {
         namespace_id: Uuid,
         limit: usize,
         target_entity: Option<Uuid>,
+        filter: Option<&MemoryFilter>,
     ) -> Result<RecallResult, RecallError> {
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(self.config.recall_timeout_secs);
@@ -777,6 +838,7 @@ impl<'a> RecallEngine<'a> {
                 target_entity,
                 runtime_space,
                 start + timeout,
+                filter,
             )?,
         };
 
@@ -1559,6 +1621,7 @@ impl<'a> RecallEngine<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
     fn gather_storage_candidates(
         &self,
         query: &str,
@@ -1568,6 +1631,7 @@ impl<'a> RecallEngine<'a> {
         target_entity: Option<Uuid>,
         runtime_space: Option<&EmbeddingSpace>,
         deadline: std::time::Instant,
+        filter: Option<&MemoryFilter>,
     ) -> Result<GatheredCandidates, RecallError> {
         let identity = if let Some(agent_id) = self.agent_only {
             IdentityScope::AgentAcrossUsers(agent_id)
@@ -1584,11 +1648,19 @@ impl<'a> RecallEngine<'a> {
             identity,
             entity: target_entity.map_or(EntityScope::Any, EntityScope::PreferWithBroad),
         };
-        let mut lexical_hits = self.storage.search_lexical_hits(
-            query,
-            &scope,
-            max_candidates.min(MAX_LEXICAL_HITS),
-        )?;
+        let mut lexical_hits = match filter {
+            Some(filter) => self.storage.search_lexical_hits_filtered(
+                query,
+                &scope,
+                filter,
+                max_candidates.min(MAX_LEXICAL_HITS),
+            )?,
+            None => self.storage.search_lexical_hits(
+                query,
+                &scope,
+                max_candidates.min(MAX_LEXICAL_HITS),
+            )?,
+        };
         lexical_hits.sort_by(|left, right| {
             left.rank
                 .cmp(&right.rank)
@@ -1604,6 +1676,7 @@ impl<'a> RecallEngine<'a> {
                 max_candidates,
                 runtime_space,
                 deadline,
+                filter,
             )?
         } else {
             (
@@ -1662,6 +1735,12 @@ impl<'a> RecallEngine<'a> {
             }
         }
         candidates.retain(|_, memory| storage_scope_matches(memory, &scope));
+        if let Some(filter) = filter {
+            // Confidence is mutable. Re-check hydrated rows so a concurrent
+            // update between candidate selection and hydration can only drop
+            // a result, never leak one outside the requested predicate.
+            candidates.retain(|_, memory| filter.matches(memory));
+        }
         vector_map.retain(|memory_ref, _| candidates.contains_key(memory_ref));
         bm25_map.retain(|memory_ref, _| candidates.contains_key(memory_ref));
 
@@ -1682,6 +1761,7 @@ impl<'a> RecallEngine<'a> {
         max_candidates: usize,
         runtime_space: &EmbeddingSpace,
         deadline: std::time::Instant,
+        filter: Option<&MemoryFilter>,
     ) -> Result<(Vec<crate::storage::bounded::VectorHit>, SemanticStatus), RecallError> {
         let runtime_id = runtime_space.id();
         if self.embedder.embedding_space()?.id() != runtime_id {
@@ -1704,7 +1784,11 @@ impl<'a> RecallEngine<'a> {
             max_candidates.clamp(1, MAX_VECTOR_HITS),
             deadline,
         )?;
-        match self.storage.search_vector(&request)? {
+        let outcome = match filter {
+            Some(filter) => self.storage.search_vector_filtered(&request, filter)?,
+            None => self.storage.search_vector(&request)?,
+        };
+        match outcome {
             VectorSearchOutcome::Complete(mut hits) => {
                 crate::storage::bounded::sort_vector_hits(&mut hits);
                 hits.truncate(MAX_VECTOR_HITS);

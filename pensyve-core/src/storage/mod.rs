@@ -489,6 +489,19 @@ pub trait StorageTrait: Send + Sync {
         ))
     }
 
+    /// Bounded vector retrieval with storage-side type/confidence predicates.
+    /// Compatibility backends opt in explicitly; filtering never falls back
+    /// to post-limit selection.
+    fn search_vector_filtered(
+        &self,
+        _request: &bounded::VectorSearchRequest<'_>,
+        _filter: &bounded::MemoryFilter,
+    ) -> StorageResult<bounded::VectorSearchOutcome> {
+        Ok(bounded::VectorSearchOutcome::Unavailable(
+            bounded::SearchUnavailable::UnsupportedBackend,
+        ))
+    }
+
     /// Bounded lexical candidate retrieval. Unlike legacy FTS hydration, this
     /// default is an explicit unsupported error rather than an unbounded path.
     fn search_lexical_hits(
@@ -498,6 +511,19 @@ pub trait StorageTrait: Send + Sync {
         _limit: usize,
     ) -> StorageResult<Vec<bounded::LexicalHit>> {
         Err(StorageError::Unsupported("bounded lexical search".into()))
+    }
+
+    /// Bounded lexical retrieval with storage-side type/confidence predicates.
+    fn search_lexical_hits_filtered(
+        &self,
+        _query: &str,
+        _scope: &bounded::SearchScope,
+        _filter: &bounded::MemoryFilter,
+        _limit: usize,
+    ) -> StorageResult<Vec<bounded::LexicalHit>> {
+        Err(StorageError::Unsupported(
+            "bounded filtered lexical search".into(),
+        ))
     }
 
     /// Hydrate at most one bounded batch of typed memory references.
@@ -863,6 +889,21 @@ pub trait StorageTrait: Send + Sync {
         _limit: usize,
     ) -> StorageResult<Vec<ObservationMemory>> {
         Ok(Vec::new())
+    }
+
+    /// Fetch observation rows for grouped-recall enrichment without inline
+    /// embeddings, bounded before hydration by row count and serialized-size
+    /// budget.
+    fn list_observation_enrichments_by_episode_ids(
+        &self,
+        _namespace_id: Uuid,
+        _episode_ids: &[Uuid],
+        _limit: usize,
+        _max_bytes: usize,
+    ) -> StorageResult<Vec<ObservationMemory>> {
+        Err(StorageError::Unsupported(
+            "bounded observation enrichment".into(),
+        ))
     }
 
     /// Delete every observation tied to the given episode *within
@@ -1299,6 +1340,18 @@ pub trait StorageTrait: Send + Sync {
         &self,
         namespace_id: Uuid,
     ) -> StorageResult<(usize, usize, usize)>; // (episodic, semantic, procedural)
+
+    /// Count live episodic memories about `entity_id` and live semantic
+    /// memories whose subject is `entity_id`, scoped to one namespace.
+    fn count_memories_by_entity_in_namespace(
+        &self,
+        _entity_id: Uuid,
+        _namespace_id: Uuid,
+    ) -> StorageResult<(usize, usize)> {
+        Err(StorageError::Unsupported(
+            "entity-scoped memory counts".into(),
+        ))
+    }
 
     /// Count active observations in a namespace without loading memory content.
     fn count_observations_by_namespace(&self, _namespace_id: Uuid) -> StorageResult<usize> {

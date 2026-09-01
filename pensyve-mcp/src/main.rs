@@ -29,14 +29,9 @@ fn resolve_namespace() -> String {
 /// Pool size for the stdio server's embedder. This server has exactly one
 /// client and serves tool calls serially, so one ONNX session is enough;
 /// the CPU-derived default in pensyve-core (up to 4 sessions ≈ 4× the
-/// resident memory) is meant for multi-threaded harnesses.
-/// `PENSYVE_EMBEDDING_POOL_SIZE` still overrides.
+/// resident memory) is reserved for non-shipping harnesses.
 fn resolve_stdio_pool_size() -> usize {
-    std::env::var("PENSYVE_EMBEDDING_POOL_SIZE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(1)
+    1
 }
 
 /// Build the embedder for the stdio server.
@@ -301,6 +296,11 @@ mod tests {
     use super::*;
     use pensyve_core::types::{Memory, SemanticMemory};
     use uuid::Uuid;
+
+    #[test]
+    fn shipping_stdio_pool_is_one_session() {
+        assert_eq!(resolve_stdio_pool_size(), 1);
+    }
 
     #[test]
     fn stored_dims_win_over_cache_state() {

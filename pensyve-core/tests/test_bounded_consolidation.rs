@@ -497,6 +497,47 @@ fn mutation_after_tentative_assignment_invalidates_before_atomic_promotion() {
 }
 
 #[test]
+fn promotion_from_active_run_committed_after_transition_is_queued() {
+    let (_tmp, storage, embedder, namespace, episode) = setup("bounded-transition-promotion");
+    let entity = Uuid::new_v4();
+    let now = Utc::now();
+    save_episode_memory(&storage, &embedder, &episode, entity, "same", now);
+    save_episode_memory(
+        &storage,
+        &embedder,
+        &episode,
+        entity,
+        "same",
+        now + Duration::seconds(1),
+    );
+    let (run_id, anchor, promotion) = finalize_pair(&storage, &embedder, namespace.id);
+    let (semantic, semantic_record) =
+        promotion_payload(&embedder, namespace.id, entity, &promotion);
+    let target = pensyve_core::embedding_space::EmbeddingSpace::mock(8, "next-generation");
+    storage
+        .begin_embedding_migration(namespace.id, &target)
+        .unwrap();
+
+    assert_eq!(
+        storage
+            .consolidation_workspace()
+            .unwrap()
+            .commit_promotion(run_id, anchor, &semantic, &semantic_record)
+            .unwrap(),
+        PromotionCommit::Committed
+    );
+
+    let pending = storage
+        .page_embedding_backfill(namespace.id, &target.id(), 200)
+        .unwrap();
+    assert!(
+        pending
+            .iter()
+            .any(|item| item.memory_ref == MemoryRef::from_memory(&semantic))
+    );
+}
+
+#[test]
 fn deletion_after_tentative_assignment_invalidates_before_atomic_promotion() {
     let (_tmp, storage, embedder, namespace, episode) = setup("bounded-race-delete");
     let entity = Uuid::new_v4();

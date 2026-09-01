@@ -251,6 +251,17 @@ impl MemoryType {
             Memory::Observation(_) => Self::Observation,
         }
     }
+
+    #[must_use]
+    pub fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "episodic" => Some(Self::Episodic),
+            "semantic" => Some(Self::Semantic),
+            "procedural" => Some(Self::Procedural),
+            "observation" => Some(Self::Observation),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -390,6 +401,88 @@ pub enum EntityScope {
     /// Reserve four fifths of each first-stage cap for entity matches and one
     /// fifth for non-matching broad context.
     PreferWithBroad(Uuid),
+}
+
+/// Optional first-stage recall predicates applied by storage before ranking
+/// quotas and limits. An absent type list means all four memory kinds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryFilter {
+    allowed_types: Option<Vec<MemoryType>>,
+    min_confidence: Option<f32>,
+}
+
+impl MemoryFilter {
+    #[must_use]
+    pub(crate) fn legacy_first_stage() -> Self {
+        Self {
+            allowed_types: Some(vec![
+                MemoryType::Episodic,
+                MemoryType::Semantic,
+                MemoryType::Procedural,
+            ]),
+            min_confidence: None,
+        }
+    }
+
+    pub fn new(
+        allowed_types: Option<Vec<MemoryType>>,
+        min_confidence: Option<f32>,
+    ) -> StorageResult<Self> {
+        if min_confidence.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+            return Err(StorageError::Context(
+                "minimum confidence must be finite and within 0.0..=1.0".into(),
+            ));
+        }
+        let allowed_types = allowed_types.map(|types| {
+            types
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        });
+        Ok(Self {
+            allowed_types,
+            min_confidence,
+        })
+    }
+
+    #[must_use]
+    pub fn allows_type(&self, memory_type: MemoryType) -> bool {
+        self.allowed_types
+            .as_ref()
+            .is_none_or(|types| types.contains(&memory_type))
+    }
+
+    #[must_use]
+    pub fn min_confidence(&self) -> Option<f32> {
+        self.min_confidence
+    }
+
+    #[must_use]
+    pub(crate) fn sql_parts(&self) -> (bool, bool, bool, bool, Option<f32>) {
+        (
+            self.allows_type(MemoryType::Episodic),
+            self.allows_type(MemoryType::Semantic),
+            self.allows_type(MemoryType::Procedural),
+            self.allows_type(MemoryType::Observation),
+            self.min_confidence,
+        )
+    }
+
+    #[must_use]
+    pub fn matches(&self, memory: &crate::types::Memory) -> bool {
+        if !self.allows_type(MemoryType::of(memory)) {
+            return false;
+        }
+        let confidence = match memory {
+            crate::types::Memory::Episodic(_) => 1.0,
+            crate::types::Memory::Semantic(memory) => memory.confidence,
+            crate::types::Memory::Procedural(memory) => memory.reliability,
+            crate::types::Memory::Observation(memory) => memory.confidence,
+        };
+        self.min_confidence
+            .is_none_or(|minimum| confidence >= minimum)
+    }
 }
 
 /// Namespace plus explicit identity and entity constraints.

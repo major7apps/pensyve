@@ -37,9 +37,9 @@ use super::{
 use crate::graph::EdgeType;
 use crate::storage::bounded::{
     EmbeddingRecord, LexicalHit, MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS,
-    MAX_VECTOR_HITS, MEMORY_PAGE_SIZE, MemoryPage, MemoryPageRequest, MemoryRef, MemoryType,
-    NamespaceEmbeddingPhase, NamespaceEmbeddingState, PageCursor, SearchScope, SearchUnavailable,
-    VectorHit, VectorSearchOutcome, VectorSearchRequest, lexical_query_tokens,
+    MAX_VECTOR_HITS, MEMORY_PAGE_SIZE, MemoryFilter, MemoryPage, MemoryPageRequest, MemoryRef,
+    MemoryType, NamespaceEmbeddingPhase, NamespaceEmbeddingState, PageCursor, SearchScope,
+    SearchUnavailable, VectorHit, VectorSearchOutcome, VectorSearchRequest, lexical_query_tokens,
 };
 use crate::storage::consolidation_workspace::{
     ClusterDecision, ClusterProvenance, ConsolidationWorkspace, DecayPage, DecayRecord,
@@ -919,7 +919,7 @@ type PgVectorSearchRow = (
     Option<String>,
 );
 
-/// One exact, global top-k over the three first-stage memory kinds.
+/// One exact, global top-k over the allowed first-stage memory kinds.
 ///
 /// `memory_type` is the [`MemoryType`] discriminant rather than its stored text
 /// so SQL tie order stays identical to `SQLite`'s typed order. The windowed
@@ -950,6 +950,7 @@ const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH lifecycle AS (
            OR ($4 = 2 AND memory.agent_id = $5))
       AND ($7::smallint = 0 OR $7 = 2 OR ($7 = 1
            AND (memory.about_entity = $8 OR memory.source_entity = $8)))
+      AND $12 AND ($16::real IS NULL OR 1.0 >= $16)
       AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
     UNION ALL
     SELECT 1::smallint, embeddings.memory_id, embeddings.embedding,
@@ -971,6 +972,7 @@ const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH lifecycle AS (
            OR ($4 = 2 AND memory.agent_id = $5))
       AND ($7::smallint = 0 OR $7 = 2 OR ($7 = 1
            AND (memory.subject = $8 OR memory.object_entity = $8)))
+      AND $13 AND ($16::real IS NULL OR memory.confidence >= $16)
       AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
     UNION ALL
     SELECT 2::smallint, embeddings.memory_id, embeddings.embedding, false
@@ -989,6 +991,26 @@ const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH lifecycle AS (
                       AND memory.user_id IS NOT DISTINCT FROM $6)
            OR ($4 = 2 AND memory.agent_id = $5))
       AND ($7::smallint = 0 OR $7 = 2)
+      AND $14 AND ($16::real IS NULL OR memory.reliability >= $16)
+      AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
+    UNION ALL
+    SELECT 3::smallint, embeddings.memory_id, embeddings.embedding, false
+    FROM memory_embeddings AS embeddings
+    JOIN observation_memories AS memory
+      ON memory.id = embeddings.memory_id
+     AND memory.namespace_id = embeddings.namespace_id
+    CROSS JOIN lifecycle
+    WHERE embeddings.namespace_id = $2
+      AND embeddings.embedding_space_id = $3
+      AND embeddings.memory_type = 'observation'
+      AND lifecycle.state = 'active'
+      AND lifecycle.active_read_space_id = $3
+      AND ($4::smallint = 0
+           OR ($4 = 1 AND memory.agent_id IS NOT DISTINCT FROM $5
+                      AND memory.user_id IS NOT DISTINCT FROM $6)
+           OR ($4 = 2 AND memory.agent_id = $5))
+      AND ($7::smallint = 0 OR $7 = 2)
+      AND $15 AND ($16::real IS NULL OR memory.confidence >= $16)
       AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
 ), scored AS (
     SELECT memory_type, memory_id, entity_preferred,
@@ -1383,18 +1405,94 @@ async fn reconcile_embedding_source_in_pg_tx(
     transaction: &mut Transaction<'_, Postgres>,
     memory: &Memory,
 ) -> StorageResult<()> {
+    let namespace_id = memory_namespace_id(memory);
+    let memory_type = memory_type_str(MemoryType::of(memory));
+    let memory_id = memory.id();
+    let source_sha256 = canonical_embedding_source_sha256(memory);
     query::<Postgres>(
         "DELETE FROM memory_embeddings
          WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3
            AND source_sha256 <> $4",
     )
-    .bind(memory_namespace_id(memory))
-    .bind(memory_type_str(MemoryType::of(memory)))
-    .bind(memory.id())
-    .bind(canonical_embedding_source_sha256(memory))
+    .bind(namespace_id)
+    .bind(memory_type)
+    .bind(memory_id)
+    .bind(&source_sha256)
     .execute(&mut **transaction)
     .await
     .map_err(sqlx_to_io)?;
+
+    let lifecycle = query_as::<Postgres, (String, Option<String>)>(
+        "SELECT state, target_space_id FROM namespace_embedding_state
+         WHERE namespace_id = $1 FOR UPDATE",
+    )
+    .bind(namespace_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?;
+    let Some((phase, target_space_id)) = lifecycle else {
+        return Ok(());
+    };
+    if phase != "backfilling" && phase != "ready" {
+        return Ok(());
+    }
+    if target_space_id.is_none() {
+        return Err(StorageError::Context(format!(
+            "{phase} embedding lifecycle has no target space"
+        )));
+    }
+
+    query::<Postgres>(
+        "DELETE FROM embedding_backfill_queue
+         WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3
+           AND status = 'pending'",
+    )
+    .bind(namespace_id)
+    .bind(memory_type)
+    .bind(memory_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?;
+    let next_sequence = query_as::<Postgres, (i64,)>(
+        "SELECT MAX(maximum) + 1 FROM (
+             SELECT COALESCE(MAX(sequence), 0) AS maximum
+               FROM embedding_backfill_queue WHERE namespace_id = $1
+             UNION ALL
+             SELECT barrier_sequence FROM namespace_embedding_state
+              WHERE namespace_id = $1
+         ) AS bounds",
+    )
+    .bind(namespace_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?
+    .0;
+    query::<Postgres>(
+        "INSERT INTO embedding_backfill_queue
+         (namespace_id, memory_type, memory_id, source_sha256, sequence,
+          status, last_error)
+         VALUES ($1, $2, $3, $4, $5, 'pending', NULL)",
+    )
+    .bind(namespace_id)
+    .bind(memory_type)
+    .bind(memory_id)
+    .bind(source_sha256)
+    .bind(next_sequence)
+    .execute(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?;
+    if phase == "ready" {
+        query::<Postgres>(
+            "UPDATE namespace_embedding_state
+             SET state = 'backfilling', updated_at = $1
+             WHERE namespace_id = $2 AND state = 'ready'",
+        )
+        .bind(Utc::now())
+        .bind(namespace_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(sqlx_to_io)?;
+    }
     Ok(())
 }
 
@@ -2850,6 +2948,18 @@ impl StorageTrait for PostgresBackend {
         &self,
         request: &VectorSearchRequest<'_>,
     ) -> StorageResult<VectorSearchOutcome> {
+        self.search_vector_filtered(request, &MemoryFilter::legacy_first_stage())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transaction keeps deadline, validation, exact query, and fail-closed decoding inseparable"
+    )]
+    fn search_vector_filtered(
+        &self,
+        request: &VectorSearchRequest<'_>,
+        filter: &MemoryFilter,
+    ) -> StorageResult<VectorSearchOutcome> {
         if !(1..=MAX_VECTOR_HITS).contains(&request.k) {
             return Err(StorageError::Context(format!(
                 "vector search k must be within 1..={MAX_VECTOR_HITS}, got {}",
@@ -2992,6 +3102,7 @@ impl StorageTrait for PostgresBackend {
             let (identity_mode, agent, user) = request.scope.identity_sql_parts();
             let (entity_mode, entity) = request.scope.entity_sql_parts();
             let (preferred_quota, broad_quota) = request.scope.entity_quotas(request.k);
+            let (episodic, semantic, procedural, observation, min_confidence) = filter.sql_parts();
             let rows: Vec<PgVectorSearchRow> =
                 match query_as::<Postgres, _>(POSTGRES_VECTOR_SEARCH_SQL)
                     .bind(query_embedding)
@@ -3005,6 +3116,11 @@ impl StorageTrait for PostgresBackend {
                     .bind(i64::try_from(preferred_quota).unwrap_or(i64::MAX))
                     .bind(i64::try_from(broad_quota).unwrap_or(i64::MAX))
                     .bind(i64::try_from(request.k).unwrap_or(i64::MAX))
+                    .bind(episodic)
+                    .bind(semantic)
+                    .bind(procedural)
+                    .bind(observation)
+                    .bind(min_confidence)
                     .fetch_all(&mut *transaction)
                     .await
                 {
@@ -3047,6 +3163,7 @@ impl StorageTrait for PostgresBackend {
                     0 => MemoryType::Episodic,
                     1 => MemoryType::Semantic,
                     2 => MemoryType::Procedural,
+                    3 => MemoryType::Observation,
                     _ => {
                         return Ok(VectorSearchOutcome::Unavailable(
                             SearchUnavailable::InvalidStoredVector,
@@ -3090,12 +3207,28 @@ impl StorageTrait for PostgresBackend {
         scope: &SearchScope,
         limit: usize,
     ) -> StorageResult<Vec<LexicalHit>> {
+        self.search_lexical_hits_filtered(
+            query_str,
+            scope,
+            &MemoryFilter::legacy_first_stage(),
+            limit,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn search_lexical_hits_filtered(
+        &self,
+        query_str: &str,
+        scope: &SearchScope,
+        filter: &MemoryFilter,
+        limit: usize,
+    ) -> StorageResult<Vec<LexicalHit>> {
         let tokens = lexical_query_tokens(query_str);
         let limit = limit.min(MAX_LEXICAL_HITS);
         if tokens.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let tsquery = or_tsquery_fragment(10, tokens.len());
+        let tsquery = or_tsquery_fragment(15, tokens.len());
         let sql = format!(
             "WITH candidates AS ( \
                  SELECT 'episodic' AS memory_type, id, ts_rank(fts_content, {tsquery}) AS score, \
@@ -3110,6 +3243,7 @@ impl StorageTrait for PostgresBackend {
                         OR ($3 = 2 AND agent_id = $4)) \
                    AND ($6::smallint = 0 OR $6 = 2 OR ($6 = 1 \
                         AND (about_entity = $7 OR source_entity = $7))) \
+                   AND $10 AND ($14::real IS NULL OR 1.0 >= $14) \
                    AND superseded_by IS NULL AND invalid_at IS NULL \
                    AND fts_content @@ {tsquery} \
                  UNION ALL \
@@ -3124,6 +3258,7 @@ impl StorageTrait for PostgresBackend {
                         OR ($3 = 2 AND agent_id = $4)) \
                    AND ($6::smallint = 0 OR $6 = 2 OR ($6 = 1 \
                         AND (subject = $7 OR object_entity = $7))) \
+                   AND $11 AND ($14::real IS NULL OR confidence >= $14) \
                    AND superseded_by IS NULL AND invalid_at IS NULL \
                    AND fts_content @@ {tsquery} \
                  UNION ALL \
@@ -3135,13 +3270,27 @@ impl StorageTrait for PostgresBackend {
                                    AND user_id IS NOT DISTINCT FROM $5) \
                         OR ($3 = 2 AND agent_id = $4)) \
                    AND ($6::smallint = 0 OR $6 = 2) \
+                   AND $12 AND ($14::real IS NULL OR reliability >= $14) \
+                   AND superseded_by IS NULL AND invalid_at IS NULL \
+                   AND fts_content @@ {tsquery} \
+                 UNION ALL \
+                 SELECT 'observation', id, ts_rank(fts_content, {tsquery}), false \
+                 FROM observation_memories \
+                 WHERE namespace_id = $1 \
+                   AND ($3::smallint = 0 \
+                        OR ($3 = 1 AND agent_id IS NOT DISTINCT FROM $4 \
+                                   AND user_id IS NOT DISTINCT FROM $5) \
+                        OR ($3 = 2 AND agent_id = $4)) \
+                   AND ($6::smallint = 0 OR $6 = 2) \
+                   AND $13 AND ($14::real IS NULL OR confidence >= $14) \
                    AND superseded_by IS NULL AND invalid_at IS NULL \
                    AND fts_content @@ {tsquery} \
              ), ranked AS ( \
                  SELECT memory_type, id, score, entity_preferred, \
                         row_number() OVER (PARTITION BY entity_preferred \
                             ORDER BY score DESC, CASE memory_type \
-                                WHEN 'episodic' THEN 0 WHEN 'semantic' THEN 1 ELSE 2 END, id) \
+                                WHEN 'episodic' THEN 0 WHEN 'semantic' THEN 1 \
+                                WHEN 'procedural' THEN 2 ELSE 3 END, id) \
                             AS entity_rank \
                  FROM candidates \
              ) \
@@ -3151,7 +3300,7 @@ impl StorageTrait for PostgresBackend {
                 OR (NOT entity_preferred AND entity_rank <= $9) \
              ORDER BY score DESC, CASE memory_type \
                  WHEN 'episodic' THEN 0 WHEN 'semantic' THEN 1 \
-                 ELSE 2 END, id \
+                 WHEN 'procedural' THEN 2 ELSE 3 END, id \
              LIMIT $2"
         );
         self.block_on(async {
@@ -3159,6 +3308,7 @@ impl StorageTrait for PostgresBackend {
             let (identity_mode, agent, user) = scope.identity_sql_parts();
             let (entity_mode, entity) = scope.entity_sql_parts();
             let (preferred_quota, broad_quota) = scope.entity_quotas(limit);
+            let (episodic, semantic, procedural, observation, min_confidence) = filter.sql_parts();
             let mut query = query_as::<Postgres, (String, Uuid, f32)>(AssertSqlSafe(sql))
                 .bind(scope.namespace_id)
                 .bind(i64::try_from(limit).unwrap_or(i64::MAX))
@@ -3168,7 +3318,12 @@ impl StorageTrait for PostgresBackend {
                 .bind(entity_mode)
                 .bind(entity)
                 .bind(i64::try_from(preferred_quota).unwrap_or(i64::MAX))
-                .bind(i64::try_from(broad_quota).unwrap_or(i64::MAX));
+                .bind(i64::try_from(broad_quota).unwrap_or(i64::MAX))
+                .bind(episodic)
+                .bind(semantic)
+                .bind(procedural)
+                .bind(observation)
+                .bind(min_confidence);
             for token in &tokens {
                 query = query.bind(token);
             }
@@ -4190,6 +4345,58 @@ impl StorageTrait for PostgresBackend {
             .bind(&ids)
             .bind(namespace_id)
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(rows.into_iter().map(row_to_observation).collect())
+        })
+    }
+
+    fn list_observation_enrichments_by_episode_ids(
+        &self,
+        namespace_id: Uuid,
+        episode_ids: &[Uuid],
+        limit: usize,
+        max_bytes: usize,
+    ) -> StorageResult<Vec<ObservationMemory>> {
+        let limit = limit.min(MAX_FUSED_HITS);
+        let max_bytes = max_bytes.min(MAX_HYDRATED_BYTES);
+        if episode_ids.is_empty() || limit == 0 || max_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        let ids = episode_ids.to_vec();
+        self.block_on(async move {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let rows: Vec<ObservationRow> = query_as::<Postgres, ObservationRow>(
+                r"WITH projected AS (
+                     SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
+                            unit, content, NULL::text AS embedding, confidence, event_time,
+                            created_at, stability, retrievability, superseded_by, invalid_at,
+                            agent_id, user_id,
+                            1024 + 6 * (
+                                octet_length(entity_type) + octet_length(instance) +
+                                octet_length(action) + octet_length(COALESCE(unit, '')) +
+                                octet_length(content)
+                            ) AS budget_bytes
+                       FROM observation_memories
+                      WHERE episode_id = ANY($1) AND namespace_id = $2
+                        AND superseded_by IS NULL
+                      ORDER BY created_at ASC, id ASC
+                      LIMIT $3
+                 ), budgeted AS (
+                     SELECT *, SUM(budget_bytes) OVER (ORDER BY created_at ASC, id ASC) AS used_bytes
+                       FROM projected
+                 )
+                 SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
+                        unit, content, embedding, confidence, event_time, created_at, stability,
+                        retrievability, superseded_by, invalid_at, agent_id, user_id
+                   FROM budgeted WHERE used_bytes <= $4
+                  ORDER BY created_at ASC, id ASC",
+            )
+            .bind(&ids)
+            .bind(namespace_id)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .bind(i64::try_from(max_bytes).unwrap_or(i64::MAX))
             .fetch_all(&mut *conn)
             .await
             .map_err(sqlx_to_io)?;
@@ -5535,6 +5742,37 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    fn count_memories_by_entity_in_namespace(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<(usize, usize)> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+
+            let (episodic,): (i64,) = query_as::<Postgres, _>(
+                "SELECT COUNT(*) FROM episodic_memories \
+                 WHERE about_entity = $1 AND namespace_id = $2 AND superseded_by IS NULL",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let (semantic,): (i64,) = query_as::<Postgres, _>(
+                "SELECT COUNT(*) FROM semantic_memories \
+                 WHERE subject = $1 AND namespace_id = $2 AND superseded_by IS NULL",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+
+            Ok((episodic as usize, semantic as usize))
+        })
+    }
+
     fn count_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
@@ -5722,6 +5960,21 @@ impl ConsolidationWorkspace for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut tx = conn.begin().await.map_err(sqlx_to_io)?;
+            let lifecycle = query_as::<Postgres, (String, Option<String>)>(
+                "SELECT state, active_read_space_id FROM namespace_embedding_state
+                 WHERE namespace_id = $1 FOR UPDATE",
+            )
+            .bind(namespace_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            if lifecycle.as_ref().is_none_or(|(phase, active)| {
+                phase != "active" || active.as_deref() != Some(space.0.as_str())
+            }) {
+                return Err(StorageError::Context(
+                    "consolidation requires an active matching embedding space".into(),
+                ));
+            }
             let existing: Option<(Uuid,)> = query_as::<Postgres, _>(
                 "SELECT run_id FROM consolidation_runs
                  WHERE namespace_id = $1 AND embedding_space_id = $2 FOR UPDATE",

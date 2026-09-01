@@ -11,7 +11,6 @@ use pensyve_core::config::{PensyveConfig, RetrievalConfig};
 use pensyve_core::consolidation::ConsolidationEngine;
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::embedding_space::EmbeddingSpace;
-use pensyve_core::graph::MemoryGraph;
 use pensyve_core::recall_grouped::{OrderBy, RecallGroupedConfig};
 use pensyve_core::retrieval::RecallEngine;
 use pensyve_core::retrieval::cards::composite::{
@@ -40,6 +39,7 @@ static TRACING_INIT: Once = Once::new();
 static EMBEDDING_MODEL_NAME: OnceLock<String> = OnceLock::new();
 static EMBEDDING_DIMS: OnceLock<usize> = OnceLock::new();
 static LOCAL_OPERATION_LOCK: Mutex<()> = Mutex::new(());
+const SHIPPING_EMBEDDING_POOL_SIZE: usize = 1;
 
 #[cfg(test)]
 #[derive(Clone)]
@@ -382,7 +382,6 @@ struct PensyveInner {
     storage: Arc<SqliteBackend>,
     embedder: Arc<OnnxEmbedder>,
     runtime_space: EmbeddingSpace,
-    semantic_active: bool,
     retrieval_config: RetrievalConfig,
     consolidation_config: pensyve_core::config::ConsolidationConfig,
     /// G1 multi-tenant scope. `None` on both = legacy unscoped recall on
@@ -420,10 +419,8 @@ struct PensyveInner {
     /// the non-deferred path. Consumed by `Pensyve.flush_extractions()`.
     pending_extractions: Mutex<Vec<(Uuid, Uuid)>>,
     /// Cross-encoder reranker applied post-fusion in `recall` and
-    /// `recall_grouped`. Default is `BGERerankerBase` — on-by-default
-    /// because the Pensyve algorithm specifies it. Callers can opt out
-    /// with `Pensyve(reranker=None)` for embedded/offline contexts where
-    /// the ~150MB model download is unacceptable.
+    /// `recall_grouped`. Disabled by default; callers opt in with an
+    /// explicit reranker name.
     reranker: Option<Arc<pensyve_core::reranker::Reranker>>,
     /// G4 P5: stateful intent router with the resolved per-`question_type`
     /// k-budget cached at construction. Built from the `k_budget` kwarg /
@@ -442,8 +439,34 @@ struct PensyveInner {
 }
 
 impl PensyveInner {
-    fn semantic_space(&self) -> Option<&EmbeddingSpace> {
-        self.semantic_active.then_some(&self.runtime_space)
+    fn semantic_space(&self) -> StorageResult<Option<&EmbeddingSpace>> {
+        let state = self
+            .storage
+            .get_namespace_embedding_state(self.namespace.id)?;
+        let Some(state) = state else {
+            return Ok(None);
+        };
+        if state.phase != NamespaceEmbeddingPhase::Active {
+            return Ok(None);
+        }
+        let active_id = state.active_read_space_id.ok_or_else(|| {
+            StorageError::Context(
+                "active namespace embedding state has no active read space id".into(),
+            )
+        })?;
+        let joined_space = state.active_read_space.ok_or_else(|| {
+            StorageError::Context(
+                "active namespace embedding state has no joined active space".into(),
+            )
+        })?;
+        if joined_space.id() != active_id || active_id != self.runtime_space.id() {
+            return Err(StorageError::Context(format!(
+                "active embedding space {} does not match runtime space {}",
+                active_id.0,
+                self.runtime_space.id().0
+            )));
+        }
+        Ok(Some(&self.runtime_space))
     }
 }
 
@@ -463,17 +486,15 @@ fn recall_local(
     #[cfg(test)]
     run_recall_test_probe();
 
-    let graph = entity_id
-        .map(|_| MemoryGraph::build_from_storage(inner.storage.as_ref(), inner.namespace.id));
+    let active_space = inner
+        .semantic_space()
+        .map_err(|error| format!("Runtime space error: {error}"))?;
     let mut engine = RecallEngine::new_storage_backed_with_vector_space(
         inner.storage.as_ref(),
         inner.embedder.as_ref(),
-        inner.semantic_space(),
+        active_space,
         &inner.retrieval_config,
     );
-    if let Some(graph) = graph.as_ref() {
-        engine = engine.with_graph(graph);
-    }
     if let Some(reranker) = inner.reranker.as_deref() {
         engine = engine.with_reranker(reranker);
     }
@@ -707,7 +728,7 @@ impl PyPensyve {
     ///         Default 2. Precedence: kwarg > `PENSYVE_MS_CARD_DAYS` env >
     ///         default. Pre-reg lock at `pensyve-docs@8930c4a`.
     #[new]
-    #[pyo3(signature = (path=None, namespace=None, extractor=None, extractor_api_key=None, reranker=Some("BGERerankerBase".to_string()), extractor_base_url=None, extractor_model=None, extractor_max_concurrency=None, agent_id=None, user_id=None, k_budget=None, ms_card_days=None))]
+    #[pyo3(signature = (path=None, namespace=None, extractor=None, extractor_api_key=None, reranker=None, extractor_base_url=None, extractor_model=None, extractor_max_concurrency=None, agent_id=None, user_id=None, k_budget=None, ms_card_days=None))]
     #[allow(
         clippy::needless_pass_by_value,
         clippy::too_many_arguments,
@@ -828,9 +849,10 @@ impl PyPensyve {
         // `embedder_policy` so `NetworkPolicy::Disabled` set on the
         // Pensyve handle propagates to the embedder (pre-reg I4 + §3.0
         // item 10).
-        let (embedder, model_name) = match OnnxEmbedder::new_cached_with_policy(
+        let (embedder, model_name) = match OnnxEmbedder::new_cached_with_policy_and_pool_size(
             "Alibaba-NLP/gte-base-en-v1.5",
             &embedder_policy,
+            SHIPPING_EMBEDDING_POOL_SIZE,
         ) {
             Ok(e) => {
                 tracing::info!(embedding_model = "gte-base-en-v1.5", dimensions = 768);
@@ -838,7 +860,11 @@ impl PyPensyve {
             }
             Err(e1) => {
                 tracing::warn!(error = %e1, "Primary embedding model failed, trying fallback");
-                match OnnxEmbedder::new_cached_with_policy("all-MiniLM-L6-v2", &embedder_policy) {
+                match OnnxEmbedder::new_cached_with_policy_and_pool_size(
+                    "all-MiniLM-L6-v2",
+                    &embedder_policy,
+                    SHIPPING_EMBEDDING_POOL_SIZE,
+                ) {
                     Ok(e) => {
                         tracing::warn!(
                             embedding_model = "all-MiniLM-L6-v2",
@@ -874,7 +900,7 @@ impl PyPensyve {
         let _ = EMBEDDING_MODEL_NAME.set(model_name.to_string());
         let _ = EMBEDDING_DIMS.set(dimensions);
 
-        let active_space = resolve_local_semantic_space(&storage, &embedder, ns.id)
+        resolve_local_semantic_space(&storage, &embedder, ns.id)
             .map_err(|error| PyRuntimeError::new_err(format!("Runtime space error: {error}")))?;
         let runtime_space = embedder
             .embedding_space()
@@ -898,10 +924,8 @@ impl PyPensyve {
         // behaviour is byte-for-byte unchanged.
         let defer_extraction = matches!(extractor.as_deref(), Some("batched-local-llm"));
 
-        // Cross-encoder reranker is on-by-default per the Pensyve
-        // algorithm spec. `reranker=None` opts out for embedded/offline
-        // callers. On first construction fastembed downloads the model
-        // (~150MB for BGE; cached at ~/.fastembed_cache thereafter).
+        // Cross-encoder reranking is an explicit opt-in. Construction may
+        // download the selected model, so the default path remains disabled.
         let reranker_impl =
             match reranker.as_deref() {
                 None => None,
@@ -916,7 +940,6 @@ impl PyPensyve {
                 storage,
                 embedder,
                 runtime_space,
-                semantic_active: active_space.is_some(),
                 retrieval_config: config.retrieval,
                 consolidation_config: config.consolidation,
                 extractor: extractor_impl,
@@ -1122,10 +1145,13 @@ impl PyPensyve {
                 let _permit = LOCAL_OPERATION_LOCK
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let active_space = inner
+                    .semantic_space()
+                    .map_err(|error| format!("Runtime space error: {error}"))?;
                 let mut engine = RecallEngine::new_storage_backed_with_vector_space(
                     inner.storage.as_ref(),
                     inner.embedder.as_ref(),
-                    inner.semantic_space(),
+                    active_space,
                     &inner.retrieval_config,
                 );
                 if let Some(reranker) = inner.reranker.as_deref() {
@@ -1221,10 +1247,13 @@ impl PyPensyve {
                 let _permit = LOCAL_OPERATION_LOCK
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let active_space = inner
+                    .semantic_space()
+                    .map_err(|error| format!("Runtime space error: {error}"))?;
                 let mut engine = RecallEngine::new_storage_backed_with_vector_space(
                     inner.storage.as_ref(),
                     inner.embedder.as_ref(),
-                    inner.semantic_space(),
+                    active_space,
                     &inner.retrieval_config,
                 );
                 if let Some(reranker) = inner.reranker.as_deref() {
@@ -1775,10 +1804,13 @@ impl PyPensyve {
                 let _permit = LOCAL_OPERATION_LOCK
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let active_space = inner
+                    .semantic_space()
+                    .map_err(|error| format!("Runtime space error: {error}"))?;
                 let mut engine = RecallEngine::new_storage_backed_with_vector_space(
                     inner.storage.as_ref(),
                     inner.embedder.as_ref(),
-                    inner.semantic_space(),
+                    active_space,
                     &inner.retrieval_config,
                 );
                 if let Some(reranker) = inner.reranker.as_deref() {
@@ -1832,10 +1864,13 @@ impl PyPensyve {
                 let _permit = LOCAL_OPERATION_LOCK
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let active_space = inner
+                    .semantic_space()
+                    .map_err(|error| format!("Runtime space error: {error}"))?;
                 remember_python_memory(
                     inner.storage.as_ref(),
                     inner.embedder.as_ref(),
-                    inner.semantic_space(),
+                    active_space,
                     inner.namespace.id,
                     entity_id,
                     &fact,
@@ -1955,7 +1990,7 @@ impl PyPensyve {
     /// strand episodes in the queue forever.
     ///
     /// Returns the number of observations persisted across the batch.
-    fn flush_extractions(&self, py: Python<'_>) -> usize {
+    fn flush_extractions(&self, py: Python<'_>) -> PyResult<usize> {
         // Drain the queue first — the lock is dropped before we call the
         // extractor so concurrent __exit__ calls (different threads) can
         // keep enqueueing without contention.
@@ -1963,7 +1998,7 @@ impl PyPensyve {
             std::mem::take(&mut *self.inner.pending_extractions.lock().unwrap());
 
         if pending.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
         // Without an extractor configured the deferred path is unreachable
@@ -1973,7 +2008,7 @@ impl PyPensyve {
             self.inner.extractor.clone(),
             self.inner.extractor_runtime.clone(),
         ) else {
-            return 0;
+            return Ok(0);
         };
 
         // Batch by namespace_id. Cross-namespace flushes are rare (one
@@ -1987,7 +2022,11 @@ impl PyPensyve {
 
         let storage = self.inner.storage.clone();
         let embedder = self.inner.embedder.clone();
-        let active_space = self.inner.semantic_space().cloned();
+        let active_space = self
+            .inner
+            .semantic_space()
+            .map_err(|error| PyRuntimeError::new_err(format!("Runtime space error: {error}")))?
+            .cloned();
         let total = py.detach(|| {
             let _permit = LOCAL_OPERATION_LOCK
                 .lock()
@@ -2017,7 +2056,7 @@ impl PyPensyve {
         if total > 0 {
             tracing::info!(observations = total, "flush_extractions");
         }
-        total
+        Ok(total)
     }
 
     ///     entity: The entity whose memories to forget.
@@ -2215,6 +2254,10 @@ impl PyEpisode {
                 episode.close(outcome);
                 let source_entity = participants.first().copied().unwrap_or(Uuid::nil());
                 let about_entity = participants.get(1).copied().unwrap_or(source_entity);
+                let active_space = inner
+                    .semantic_space()
+                    .map_err(|error| format!("Runtime space error: {error}"))?
+                    .cloned();
 
                 for (_role, content, when) in &messages {
                     let mut memory = types::Memory::Episodic(EpisodicMemory::new(
@@ -2230,8 +2273,8 @@ impl PyEpisode {
                         episodic.user_id = inner.user_id;
                     }
                     let source = embedding_source_text(&memory);
-                    let embedding = inner
-                        .semantic_space()
+                    let embedding = active_space
+                        .as_ref()
                         .map(|_| inner.embedder.embed(&source))
                         .transpose()
                         .map_err(|error| format!("Embedding failed: {error}"))?
@@ -2241,7 +2284,7 @@ impl PyEpisode {
                     }
                     persist_python_memory(
                         inner.storage.as_ref(),
-                        inner.semantic_space(),
+                        active_space.as_ref(),
                         &memory,
                         embedding,
                     )
@@ -2272,7 +2315,10 @@ impl PyEpisode {
                 };
                 let storage = inner.storage.clone();
                 let embedder = inner.embedder.clone();
-                let active_space = inner.semantic_space().cloned();
+                let active_space = inner
+                    .semantic_space()
+                    .map_err(|error| format!("Runtime space error: {error}"))?
+                    .cloned();
                 Ok::<usize, String>(runtime.block_on(async move {
                     pensyve_core::observation::commit_extraction_for_episode_in_space(
                         storage.as_ref(),
@@ -2442,14 +2488,19 @@ mod tests {
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn python_test_handle(path: &std::path::Path, namespace_name: &str) -> PyPensyve {
+    fn python_test_handle_with_lifecycle(
+        path: &std::path::Path,
+        namespace_name: &str,
+        initialize_active: bool,
+    ) -> PyPensyve {
         let storage = Arc::new(SqliteBackend::open(path).unwrap());
         let namespace = Namespace::new(namespace_name);
         storage.save_namespace(&namespace).unwrap();
         let embedder = Arc::new(OnnxEmbedder::new_mock(2));
-        let runtime_space = resolve_local_semantic_space(&storage, &embedder, namespace.id)
-            .unwrap()
-            .unwrap();
+        let runtime_space = embedder.embedding_space().unwrap().clone();
+        if initialize_active {
+            resolve_local_semantic_space(&storage, &embedder, namespace.id).unwrap();
+        }
         let config = PensyveConfig::default();
         PyPensyve {
             inner: Arc::new(PensyveInner {
@@ -2457,7 +2508,6 @@ mod tests {
                 storage,
                 embedder,
                 runtime_space,
-                semantic_active: true,
                 retrieval_config: config.retrieval,
                 consolidation_config: config.consolidation,
                 agent_id: None,
@@ -2472,6 +2522,55 @@ mod tests {
                 ms_card_days: G4_DEFAULT_MS_CARD_DAYS,
             }),
         }
+    }
+
+    fn python_test_handle(path: &std::path::Path, namespace_name: &str) -> PyPensyve {
+        python_test_handle_with_lifecycle(path, namespace_name, true)
+    }
+
+    #[test]
+    fn shipping_model_defaults_are_opt_in_and_single_session() {
+        assert_eq!(SHIPPING_EMBEDDING_POOL_SIZE, 1);
+        let source = include_str!("lib.rs");
+        assert!(source.contains("reranker=None"));
+        assert!(source.contains("new_cached_with_policy_and_pool_size"));
+    }
+
+    #[test]
+    fn python_handle_observes_rollback_and_activation_after_construction() {
+        let dir = std::env::temp_dir().join(format!("pensyve-python-test-{}", Uuid::new_v4()));
+        let handle = python_test_handle_with_lifecycle(&dir, "python-lifecycle-refresh", false);
+        let runtime_space = handle.inner.runtime_space.clone();
+
+        assert!(handle.inner.semantic_space().unwrap().is_none());
+        handle
+            .inner
+            .storage
+            .begin_embedding_migration(handle.inner.namespace.id, &runtime_space)
+            .unwrap();
+        handle
+            .inner
+            .storage
+            .verify_embedding_migration(handle.inner.namespace.id, &runtime_space.id())
+            .unwrap();
+        handle
+            .inner
+            .storage
+            .activate_embedding_migration(
+                handle.inner.namespace.id,
+                &runtime_space.id(),
+                &runtime_space.id(),
+            )
+            .unwrap();
+        assert!(handle.inner.semantic_space().unwrap().is_some());
+        handle
+            .inner
+            .storage
+            .rollback_embedding_migration_to_lexical(handle.inner.namespace.id)
+            .unwrap();
+        assert!(handle.inner.semantic_space().unwrap().is_none());
+        drop(handle);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

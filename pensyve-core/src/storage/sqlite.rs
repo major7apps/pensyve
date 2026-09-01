@@ -30,10 +30,10 @@ use super::{
 use crate::graph::EdgeType;
 use crate::storage::bounded::{
     EmbeddingRecord, LexicalHit, MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS,
-    MAX_VECTOR_HITS, MEMORY_PAGE_SIZE, MemoryPage, MemoryPageRequest, MemoryRef, MemoryType,
-    NamespaceEmbeddingPhase, NamespaceEmbeddingState, PageCursor, SQLITE_MAX_SCANNED_VECTORS,
-    SearchScope, SearchUnavailable, VectorHit, VectorSearchOutcome, VectorSearchRequest,
-    lexical_query_tokens, sort_vector_hits,
+    MAX_VECTOR_HITS, MEMORY_PAGE_SIZE, MemoryFilter, MemoryPage, MemoryPageRequest, MemoryRef,
+    MemoryType, NamespaceEmbeddingPhase, NamespaceEmbeddingState, PageCursor,
+    SQLITE_MAX_SCANNED_VECTORS, SearchScope, SearchUnavailable, VectorHit, VectorSearchOutcome,
+    VectorSearchRequest, lexical_query_tokens, sort_vector_hits,
 };
 use crate::storage::consolidation_workspace::{
     ClusterDecision, ClusterProvenance, ConsolidationWorkspace, DecayPage, DecayRecord,
@@ -1091,6 +1091,7 @@ const SQLITE_VECTOR_SEARCH_SQL: &str = r"SELECT 'episodic' AS memory_type,
                OR (?3 = 2 AND memory.agent_id = ?4))
           AND (?6 = 0 OR ?6 = 2
                OR (?6 = 1 AND (memory.about_entity = ?7 OR memory.source_entity = ?7)))
+          AND ?8 AND (?12 IS NULL OR 1.0 >= ?12)
           AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
         UNION ALL
         SELECT 'semantic', embeddings.memory_id, embeddings.embedding,
@@ -1109,6 +1110,7 @@ const SQLITE_VECTOR_SEARCH_SQL: &str = r"SELECT 'episodic' AS memory_type,
                OR (?3 = 2 AND memory.agent_id = ?4))
           AND (?6 = 0 OR ?6 = 2
                OR (?6 = 1 AND (memory.subject = ?7 OR memory.object_entity = ?7)))
+          AND ?9 AND (?12 IS NULL OR memory.confidence >= ?12)
           AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
         UNION ALL
         SELECT 'procedural', embeddings.memory_id, embeddings.embedding, 0
@@ -1123,6 +1125,22 @@ const SQLITE_VECTOR_SEARCH_SQL: &str = r"SELECT 'episodic' AS memory_type,
                OR (?3 = 1 AND memory.agent_id IS ?4 AND memory.user_id IS ?5)
                OR (?3 = 2 AND memory.agent_id = ?4))
           AND (?6 = 0 OR ?6 = 2)
+          AND ?10 AND (?12 IS NULL OR memory.reliability >= ?12)
+          AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
+        UNION ALL
+        SELECT 'observation', embeddings.memory_id, embeddings.embedding, 0
+        FROM memory_embeddings AS embeddings
+        JOIN observation_memories AS memory
+          ON memory.id = embeddings.memory_id
+         AND memory.namespace_id = embeddings.namespace_id
+        WHERE embeddings.namespace_id = ?1
+          AND embeddings.embedding_space_id = ?2
+          AND embeddings.memory_type = 'observation'
+          AND (?3 = 0
+               OR (?3 = 1 AND memory.agent_id IS ?4 AND memory.user_id IS ?5)
+               OR (?3 = 2 AND memory.agent_id = ?4))
+          AND (?6 = 0 OR ?6 = 2)
+          AND ?11 AND (?12 IS NULL OR memory.confidence >= ?12)
           AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL";
 
 fn vector_unavailable(reason: SearchUnavailable) -> VectorSearchOutcome {
@@ -1339,17 +1357,80 @@ fn save_memory_in_conn(conn: &Connection, memory: &Memory) -> StorageResult<()> 
 }
 
 fn reconcile_embedding_source_in_conn(conn: &Connection, memory: &Memory) -> StorageResult<()> {
+    let namespace_id = memory_namespace_id(memory);
+    let memory_type = memory_type_str(MemoryType::of(memory));
+    let memory_id = memory.id();
+    let source_sha256 = canonical_embedding_source_sha256(memory);
     conn.execute(
         "DELETE FROM memory_embeddings
          WHERE namespace_id = ?1 AND memory_type = ?2 AND memory_id = ?3
            AND source_sha256 <> ?4",
         params![
-            memory_namespace_id(memory).to_string(),
-            memory_type_str(MemoryType::of(memory)),
-            memory.id().to_string(),
-            canonical_embedding_source_sha256(memory),
+            namespace_id.to_string(),
+            memory_type,
+            memory_id.to_string(),
+            &source_sha256,
         ],
     )?;
+
+    let lifecycle: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT state, target_space_id FROM namespace_embedding_state
+             WHERE namespace_id = ?1",
+            [namespace_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((phase, target_space_id)) = lifecycle else {
+        return Ok(());
+    };
+    if phase != "backfilling" && phase != "ready" {
+        return Ok(());
+    }
+    if target_space_id.is_none() {
+        return Err(StorageError::Context(format!(
+            "{phase} embedding lifecycle has no target space"
+        )));
+    }
+
+    conn.execute(
+        "DELETE FROM embedding_backfill_queue
+         WHERE namespace_id = ?1 AND memory_type = ?2 AND memory_id = ?3
+           AND status = 'pending'",
+        params![namespace_id.to_string(), memory_type, memory_id.to_string()],
+    )?;
+    let next_sequence: i64 = conn.query_row(
+        "SELECT MAX(maximum) + 1 FROM (
+             SELECT COALESCE(MAX(sequence), 0) AS maximum
+               FROM embedding_backfill_queue WHERE namespace_id = ?1
+             UNION ALL
+             SELECT barrier_sequence FROM namespace_embedding_state
+              WHERE namespace_id = ?1
+         )",
+        [namespace_id.to_string()],
+        |row| row.get(0),
+    )?;
+    conn.execute(
+        "INSERT INTO embedding_backfill_queue
+         (namespace_id, memory_type, memory_id, source_sha256, sequence,
+          status, last_error)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', NULL)",
+        params![
+            namespace_id.to_string(),
+            memory_type,
+            memory_id.to_string(),
+            source_sha256,
+            next_sequence,
+        ],
+    )?;
+    if phase == "ready" {
+        conn.execute(
+            "UPDATE namespace_embedding_state
+             SET state = 'backfilling', updated_at = ?1
+             WHERE namespace_id = ?2 AND state = 'ready'",
+            params![Utc::now().to_rfc3339(), namespace_id.to_string()],
+        )?;
+    }
     Ok(())
 }
 
@@ -3003,6 +3084,18 @@ impl StorageTrait for SqliteBackend {
         &self,
         request: &VectorSearchRequest<'_>,
     ) -> StorageResult<VectorSearchOutcome> {
+        self.search_vector_filtered(request, &MemoryFilter::legacy_first_stage())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one streaming pass keeps validation, deadline checks, typed decoding, and entity quotas fail-closed"
+    )]
+    fn search_vector_filtered(
+        &self,
+        request: &VectorSearchRequest<'_>,
+        filter: &MemoryFilter,
+    ) -> StorageResult<VectorSearchOutcome> {
         if !(1..=MAX_VECTOR_HITS).contains(&request.k) {
             return Err(StorageError::Context(format!(
                 "vector search k must be within 1..={MAX_VECTOR_HITS}, got {}",
@@ -3020,6 +3113,7 @@ impl StorageTrait for SqliteBackend {
         let user = user.map(|value| value.to_string());
         let (entity_mode, entity) = request.scope.entity_sql_parts();
         let entity = entity.map(|value| value.to_string());
+        let (episodic, semantic, procedural, observation, min_confidence) = filter.sql_parts();
         let conn = lock_conn!(self);
         if self.vector_deadline_expired(request.deadline, VectorDeadlineBoundary::AfterConnection) {
             return Ok(vector_unavailable(SearchUnavailable::DeadlineExceeded));
@@ -3080,7 +3174,12 @@ impl StorageTrait for SqliteBackend {
             agent,
             user,
             entity_mode,
-            entity
+            entity,
+            episodic,
+            semantic,
+            procedural,
+            observation,
+            min_confidence,
         ])?;
         let mut scanned = 0_usize;
         let (preferred_quota, broad_quota) = request.scope.entity_quotas(request.k);
@@ -3109,6 +3208,7 @@ impl StorageTrait for SqliteBackend {
                 "episodic" => MemoryType::Episodic,
                 "semantic" => MemoryType::Semantic,
                 "procedural" => MemoryType::Procedural,
+                "observation" => MemoryType::Observation,
                 _ => return Ok(vector_unavailable(SearchUnavailable::InvalidStoredVector)),
             };
             let Ok(id) = Uuid::parse_str(&row.get::<_, String>(1)?) else {
@@ -3157,6 +3257,20 @@ impl StorageTrait for SqliteBackend {
         scope: &SearchScope,
         limit: usize,
     ) -> StorageResult<Vec<LexicalHit>> {
+        self.search_lexical_hits_filtered(query, scope, &MemoryFilter::legacy_first_stage(), limit)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one SQL statement keeps identity, entity quota, filters, and global limit atomic"
+    )]
+    fn search_lexical_hits_filtered(
+        &self,
+        query: &str,
+        scope: &SearchScope,
+        filter: &MemoryFilter,
+        limit: usize,
+    ) -> StorageResult<Vec<LexicalHit>> {
         let escaped_query = lexical_query_tokens(query)
             .into_iter()
             .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
@@ -3174,6 +3288,7 @@ impl StorageTrait for SqliteBackend {
         let (entity_mode, entity) = scope.entity_sql_parts();
         let entity = entity.map(|value| value.to_string());
         let (preferred_quota, broad_quota) = scope.entity_quotas(limit);
+        let (episodic, semantic, procedural, observation, min_confidence) = filter.sql_parts();
         let conn = lock_conn!(self);
         let mut stmt = conn.prepare(
             r"WITH candidates AS (
@@ -3202,6 +3317,7 @@ impl StorageTrait for SqliteBackend {
                                 OR (?3 = 2 AND e.agent_id = ?4))
                            AND (?6 = 0 OR ?6 = 2 OR (?6 = 1
                                 AND (e.about_entity = ?7 OR e.source_entity = ?7)))
+                           AND ?11 AND (?15 IS NULL OR 1.0 >= ?15)
                            AND e.superseded_by IS NULL AND e.invalid_at IS NULL
                      ))
                      OR (f.memory_type = 'semantic' AND EXISTS (
@@ -3212,6 +3328,7 @@ impl StorageTrait for SqliteBackend {
                                 OR (?3 = 2 AND s.agent_id = ?4))
                            AND (?6 = 0 OR ?6 = 2 OR (?6 = 1
                                 AND (s.subject = ?7 OR s.object_entity = ?7)))
+                           AND ?12 AND (?15 IS NULL OR s.confidence >= ?15)
                            AND s.superseded_by IS NULL AND s.invalid_at IS NULL
                      ))
                      OR (f.memory_type = 'procedural' AND EXISTS (
@@ -3221,7 +3338,18 @@ impl StorageTrait for SqliteBackend {
                                 OR (?3 = 1 AND p.agent_id IS ?4 AND p.user_id IS ?5)
                                 OR (?3 = 2 AND p.agent_id = ?4))
                            AND (?6 = 0 OR ?6 = 2)
+                           AND ?13 AND (?15 IS NULL OR p.reliability >= ?15)
                            AND p.superseded_by IS NULL AND p.invalid_at IS NULL
+                     ))
+                     OR (f.memory_type = 'observation' AND EXISTS (
+                         SELECT 1 FROM observation_memories o
+                         WHERE o.id = f.memory_id AND o.namespace_id = ?2
+                           AND (?3 = 0
+                                OR (?3 = 1 AND o.agent_id IS ?4 AND o.user_id IS ?5)
+                                OR (?3 = 2 AND o.agent_id = ?4))
+                           AND (?6 = 0 OR ?6 = 2)
+                           AND ?14 AND (?15 IS NULL OR o.confidence >= ?15)
+                           AND o.superseded_by IS NULL AND o.invalid_at IS NULL
                      ))
                  )
              ), ranked AS (
@@ -3230,7 +3358,8 @@ impl StorageTrait for SqliteBackend {
                           PARTITION BY entity_preferred
                           ORDER BY score,
                                    CASE memory_type
-                                       WHEN 'episodic' THEN 0 WHEN 'semantic' THEN 1 ELSE 2
+                                       WHEN 'episodic' THEN 0 WHEN 'semantic' THEN 1
+                                       WHEN 'procedural' THEN 2 ELSE 3
                                    END,
                                    memory_id
                       ) AS entity_rank
@@ -3243,7 +3372,7 @@ impl StorageTrait for SqliteBackend {
                ORDER BY score,
                         CASE memory_type
                             WHEN 'episodic' THEN 0 WHEN 'semantic' THEN 1
-                            ELSE 2
+                            WHEN 'procedural' THEN 2 ELSE 3
                         END,
                         memory_id
                LIMIT ?10",
@@ -3260,7 +3389,12 @@ impl StorageTrait for SqliteBackend {
                     entity,
                     i64::try_from(preferred_quota).unwrap_or(i64::MAX),
                     i64::try_from(broad_quota).unwrap_or(i64::MAX),
-                    i64::try_from(limit).unwrap_or(i64::MAX)
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                    episodic,
+                    semantic,
+                    procedural,
+                    observation,
+                    min_confidence,
                 ],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )?
@@ -4301,6 +4435,67 @@ impl StorageTrait for SqliteBackend {
         let param_refs: Vec<&dyn rusqlite::ToSql> =
             params_vec.iter().map(std::convert::AsRef::as_ref).collect();
 
+        let rows = stmt.query_map(param_refs.as_slice(), row_to_observation)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row??);
+        }
+        Ok(out)
+    }
+
+    fn list_observation_enrichments_by_episode_ids(
+        &self,
+        namespace_id: Uuid,
+        episode_ids: &[Uuid],
+        limit: usize,
+        max_bytes: usize,
+    ) -> StorageResult<Vec<ObservationMemory>> {
+        let limit = limit.min(MAX_FUSED_HITS);
+        let max_bytes = max_bytes.min(MAX_HYDRATED_BYTES);
+        if episode_ids.is_empty() || limit == 0 || max_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = lock_conn!(self);
+        let placeholders = vec!["?"; episode_ids.len()].join(",");
+        let sql = format!(
+            "WITH projected AS ( \
+                 SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity, \
+                        unit, content, NULL AS embedding, confidence, event_time, created_at, \
+                        stability, retrievability, agent_id, user_id, superseded_by, invalid_at, \
+                        1024 + 6 * ( \
+                            length(CAST(entity_type AS BLOB)) + \
+                            length(CAST(instance AS BLOB)) + \
+                            length(CAST(action AS BLOB)) + \
+                            length(CAST(COALESCE(unit, '') AS BLOB)) + \
+                            length(CAST(content AS BLOB)) \
+                        ) AS budget_bytes \
+                   FROM observation_memories \
+                  WHERE episode_id IN ({placeholders}) AND namespace_id = ? \
+                    AND superseded_by IS NULL \
+                  ORDER BY created_at ASC, id ASC \
+                  LIMIT ? \
+             ), budgeted AS ( \
+                 SELECT *, SUM(budget_bytes) OVER (ORDER BY created_at ASC, id ASC) AS used_bytes \
+                   FROM projected \
+             ) \
+             SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity, \
+                    unit, content, embedding, confidence, event_time, created_at, stability, \
+                    retrievability, agent_id, user_id, superseded_by, invalid_at \
+               FROM budgeted WHERE used_bytes <= ? \
+              ORDER BY created_at ASC, id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = episode_ids
+            .iter()
+            .map(|id| Box::new(id.to_string()) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        params_vec.push(Box::new(namespace_id.to_string()));
+        params_vec.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
+        params_vec.push(Box::new(i64::try_from(max_bytes).unwrap_or(i64::MAX)));
+        let param_refs = params_vec
+            .iter()
+            .map(std::convert::AsRef::as_ref)
+            .collect::<Vec<&dyn rusqlite::ToSql>>();
         let rows = stmt.query_map(param_refs.as_slice(), row_to_observation)?;
         let mut out = Vec::new();
         for row in rows {
@@ -5671,6 +5866,31 @@ impl StorageTrait for SqliteBackend {
         Ok((episodic as usize, semantic as usize, procedural as usize))
     }
 
+    fn count_memories_by_entity_in_namespace(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<(usize, usize)> {
+        let conn = lock_conn!(self);
+        let entity = entity_id.to_string();
+        let namespace = namespace_id.to_string();
+
+        let episodic: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM episodic_memories \
+             WHERE about_entity = ?1 AND namespace_id = ?2 AND superseded_by IS NULL",
+            params![entity, namespace],
+            |row| row.get(0),
+        )?;
+        let semantic: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM semantic_memories \
+             WHERE subject = ?1 AND namespace_id = ?2 AND superseded_by IS NULL",
+            params![entity, namespace],
+            |row| row.get(0),
+        )?;
+
+        Ok((episodic as usize, semantic as usize))
+    }
+
     fn count_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
         let conn = lock_conn!(self);
         let count: i64 = conn.query_row(
@@ -5837,6 +6057,21 @@ impl ConsolidationWorkspace for SqliteBackend {
         let tx = conn.transaction()?;
         let namespace = namespace_id.to_string();
         let now = Utc::now().to_rfc3339();
+        let lifecycle: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT state, active_read_space_id FROM namespace_embedding_state
+                 WHERE namespace_id = ?1",
+                [&namespace],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if lifecycle.as_ref().is_none_or(|(phase, active)| {
+            phase != "active" || active.as_deref() != Some(space.0.as_str())
+        }) {
+            return Err(StorageError::Context(
+                "consolidation requires an active matching embedding space".into(),
+            ));
+        }
         let existing = tx
             .query_row(
                 "SELECT run_id FROM consolidation_runs
@@ -8093,6 +8328,122 @@ mod tests {
             .unwrap()
     }
 
+    fn commit_backfill_item(
+        db: &SqliteBackend,
+        namespace_id: Uuid,
+        space: &EmbeddingSpace,
+        item: BackfillItem,
+    ) {
+        let memory = item.memory.as_ref().expect("live queued source");
+        let record = embedding_record_for_memory(memory, space, vec![0.25; space.dimensions]);
+        db.commit_embedding_backfill_page(
+            namespace_id,
+            &space.id(),
+            &[BackfillCommit {
+                item,
+                record: Some(record),
+            }],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn source_created_after_initial_backfill_drain_is_queued_immediately() {
+        let (db, namespace, initial) = fixture_memory();
+        db.save_memory_with_embedding(&initial, None).unwrap();
+        let space = EmbeddingSpace::mock(2, "late-source-backfill");
+        db.begin_embedding_migration(namespace.id, &space).unwrap();
+        let initial_item = db
+            .page_embedding_backfill(namespace.id, &space.id(), 10)
+            .unwrap()
+            .pop()
+            .unwrap();
+        commit_backfill_item(&db, namespace.id, &space, initial_item);
+        assert!(
+            db.page_embedding_backfill(namespace.id, &space.id(), 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        let late = Memory::Semantic(SemanticMemory::new(
+            namespace.id,
+            Uuid::new_v4(),
+            "late",
+            "source",
+            0.9,
+        ));
+        db.save_memory_with_embedding(&late, None).unwrap();
+
+        let page = db
+            .page_embedding_backfill(namespace.id, &space.id(), 10)
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].memory_ref, MemoryRef::from_memory(&late));
+    }
+
+    #[test]
+    fn source_update_replaces_pending_item_with_current_hash() {
+        let (db, namespace, mut memory) = fixture_memory();
+        db.save_memory_with_embedding(&memory, None).unwrap();
+        let space = EmbeddingSpace::mock(2, "updated-source-backfill");
+        db.begin_embedding_migration(namespace.id, &space).unwrap();
+        let old_hash = db
+            .page_embedding_backfill(namespace.id, &space.id(), 10)
+            .unwrap()[0]
+            .source_sha256
+            .clone();
+        let Memory::Episodic(episodic) = &mut memory else {
+            unreachable!();
+        };
+        episodic.content = "updated canonical source".into();
+        let current_hash = canonical_embedding_source_sha256(&memory);
+
+        db.save_memory_with_embedding(&memory, None).unwrap();
+
+        let page = db
+            .page_embedding_backfill(namespace.id, &space.id(), 10)
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].source_sha256, current_hash);
+        assert_ne!(page[0].source_sha256, old_hash);
+    }
+
+    #[test]
+    fn source_write_in_ready_queues_and_demotes_before_activation() {
+        let (_dir, db) = setup();
+        let namespace = make_namespace(&db);
+        let space = EmbeddingSpace::mock(2, "ready-write-demotion");
+        db.begin_embedding_migration(namespace.id, &space).unwrap();
+        let (_, ready) = db
+            .verify_embedding_migration(namespace.id, &space.id())
+            .unwrap();
+        assert_eq!(ready.phase, NamespaceEmbeddingPhase::Ready);
+
+        let memory = Memory::Semantic(SemanticMemory::new(
+            namespace.id,
+            Uuid::new_v4(),
+            "ready",
+            "late write",
+            0.9,
+        ));
+        db.save_memory_with_embedding(&memory, None).unwrap();
+
+        let state = db
+            .get_namespace_embedding_state(namespace.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.phase, NamespaceEmbeddingPhase::Backfilling);
+        let page = db
+            .page_embedding_backfill(namespace.id, &space.id(), 10)
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].memory_ref, MemoryRef::from_memory(&memory));
+        assert!(
+            db.activate_embedding_migration(namespace.id, &space.id(), &space.id())
+                .is_err()
+        );
+    }
+
     fn memory_superseded_by_for_test(memory: &Memory) -> Option<Uuid> {
         match memory {
             Memory::Episodic(memory) => memory.superseded_by,
@@ -8361,6 +8712,176 @@ mod tests {
         assert_eq!(db.live_decoded_row_vectors(), 1);
         drop(second);
         assert_eq!(db.live_decoded_row_vectors(), 0);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn filtered_first_stage_is_pre_limit_exact_across_types_confidence_and_entity_quota() {
+        let (_dir, db) = setup();
+        let namespace = make_namespace(&db);
+        let space = EmbeddingSpace::mock(2, "filtered-first-stage");
+        db.initialize_local_runtime_space(namespace.id, &space)
+            .unwrap();
+        let entity = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let episode = Episode::new(namespace.id, vec![entity]);
+        db.save_episode(&episode).unwrap();
+
+        let memories = vec![
+            Memory::Episodic(EpisodicMemory::new(
+                namespace.id,
+                episode.id,
+                other,
+                entity,
+                "shared qualifier",
+            )),
+            Memory::Semantic(SemanticMemory::new(
+                namespace.id,
+                entity,
+                "shared",
+                "below",
+                0.5,
+            )),
+            Memory::Procedural(ProceduralMemory::new(
+                namespace.id,
+                "shared",
+                "equal qualifier",
+                Outcome::Success,
+                HashMap::new(),
+            )),
+            Memory::Observation(ObservationMemory::new(
+                namespace.id,
+                episode.id,
+                "kind",
+                "instance",
+                "shared",
+                "shared above qualifier",
+            )),
+        ];
+        let mut memories = memories;
+        if let Memory::Procedural(memory) = &mut memories[2] {
+            memory.reliability = 0.6;
+        }
+        if let Memory::Observation(memory) = &mut memories[3] {
+            memory.confidence = 0.7;
+        }
+        for memory in &memories {
+            let record = embedding_record_for_memory(memory, &space, vec![1.0, 0.0]);
+            db.save_memory_with_embedding(memory, Some(&record))
+                .unwrap();
+        }
+
+        let threshold = MemoryFilter::new(None, Some(0.6)).unwrap();
+        let scope = SearchScope::namespace(namespace.id);
+        let lexical = db
+            .search_lexical_hits_filtered("shared", &scope, &threshold, 10)
+            .unwrap();
+        assert_eq!(
+            lexical
+                .iter()
+                .map(|hit| hit.memory_ref.memory_type)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                MemoryType::Episodic,
+                MemoryType::Procedural,
+                MemoryType::Observation,
+            ])
+        );
+        let request = VectorSearchRequest::new(
+            scope.clone(),
+            space.id(),
+            &[1.0, 0.0],
+            10,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        let VectorSearchOutcome::Complete(vector) =
+            db.search_vector_filtered(&request, &threshold).unwrap()
+        else {
+            panic!("filtered vector search must complete");
+        };
+        assert_eq!(
+            vector
+                .iter()
+                .map(|hit| hit.memory_ref.memory_type)
+                .collect::<Vec<_>>(),
+            vec![
+                MemoryType::Episodic,
+                MemoryType::Procedural,
+                MemoryType::Observation,
+            ]
+        );
+
+        let preferred_memory = Memory::Semantic(SemanticMemory::new(
+            namespace.id,
+            entity,
+            "shared",
+            "preferred qualifier",
+            0.8,
+        ));
+        let preferred_record =
+            embedding_record_for_memory(&preferred_memory, &space, vec![1.0, 0.0]);
+        db.save_memory_with_embedding(&preferred_memory, Some(&preferred_record))
+            .unwrap();
+        let mut superseded = ObservationMemory::new(
+            namespace.id,
+            episode.id,
+            "kind",
+            "superseded",
+            "shared",
+            "shared superseded qualifier",
+        );
+        superseded.confidence = 0.9;
+        superseded.superseded_by = Some(Uuid::new_v4());
+        let superseded = Memory::Observation(superseded);
+        let superseded_record = embedding_record_for_memory(&superseded, &space, vec![1.0, 0.0]);
+        db.save_memory_with_embedding(&superseded, Some(&superseded_record))
+            .unwrap();
+
+        for index in 0..=100 {
+            let nonmatch = Memory::Semantic(SemanticMemory::new(
+                namespace.id,
+                other,
+                "shared",
+                format!("higher-ranked nonmatch {index}"),
+                0.99,
+            ));
+            let record = embedding_record_for_memory(&nonmatch, &space, vec![1.0, 0.0]);
+            db.save_memory_with_embedding(&nonmatch, Some(&record))
+                .unwrap();
+        }
+        let observation_only =
+            MemoryFilter::new(Some(vec![MemoryType::Observation]), Some(0.6)).unwrap();
+        let lexical = db
+            .search_lexical_hits_filtered("shared", &scope, &observation_only, 1)
+            .unwrap();
+        assert_eq!(lexical.len(), 1);
+        assert_eq!(lexical[0].memory_ref, MemoryRef::from_memory(&memories[3]));
+        let request = VectorSearchRequest::new(
+            scope.clone(),
+            space.id(),
+            &[1.0, 0.0],
+            1,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(matches!(
+            db.search_vector_filtered(&request, &observation_only).unwrap(),
+            VectorSearchOutcome::Complete(hits)
+                if hits.len() == 1 && hits[0].memory_ref == MemoryRef::from_memory(&memories[3])
+        ));
+
+        let preferred = SearchScope::namespace(namespace.id).prefer_entity_with_broad(entity);
+        let semantic_only = MemoryFilter::new(Some(vec![MemoryType::Semantic]), Some(0.6)).unwrap();
+        let preferred_hits = db
+            .search_lexical_hits_filtered("shared", &preferred, &semantic_only, 5)
+            .unwrap();
+        assert!(
+            preferred_hits
+                .iter()
+                .any(|hit| hit.memory_ref.id == preferred_memory.id())
+        );
+        assert!(preferred_hits.len() <= 5);
     }
 
     fn assert_forced_search_deadline(boundary: VectorDeadlineBoundary) {

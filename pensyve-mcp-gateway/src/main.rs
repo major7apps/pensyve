@@ -11,9 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use pensyve_core::config::RetrievalConfig;
-use pensyve_core::embedding::{
-    OnnxEmbedder, resolved_embedding_pool_size, resolved_fastembed_cache_dir,
-};
+use pensyve_core::embedding::{OnnxEmbedder, resolved_fastembed_cache_dir};
 use pensyve_core::network_policy::NetworkPolicy;
 use pensyve_core::reranker::Reranker;
 use pensyve_core::storage::StorageTrait;
@@ -50,6 +48,7 @@ const MINILM_MODEL: &str = "all-MiniLM-L6-v2";
 const MINILM_REPOSITORY: &str = "Qdrant/all-MiniLM-L6-v2-onnx";
 const RERANKER_MODEL: &str = "BGERerankerBase";
 const RERANKER_REPOSITORY: &str = "BAAI/bge-reranker-base";
+const SHIPPING_EMBEDDING_POOL_SIZE: usize = 1;
 
 fn validate_model_runtime_configuration(
     strict_local_models: bool,
@@ -65,10 +64,10 @@ fn validate_model_runtime_configuration(
              the presence of PENSYVE_ALLOW_MOCK_EMBEDDER"
         );
     }
-    if reranker_value == Some("0") {
+    if reranker_value != Some("1") {
         anyhow::bail!(
-            "Invalid model runtime configuration: PENSYVE_REQUIRE_LOCAL_MODELS=1 conflicts with \
-             PENSYVE_RERANKER=0"
+            "Invalid model runtime configuration: PENSYVE_REQUIRE_LOCAL_MODELS=1 requires \
+             PENSYVE_RERANKER=1"
         );
     }
     Ok(())
@@ -100,7 +99,7 @@ fn reranker_runtime_metadata(
             revision: initialized_revision.unwrap_or("unresolved").to_string(),
         };
     }
-    if reranker_value == Some("0") {
+    if reranker_value != Some("1") {
         return RerankerRuntimeMetadata {
             state: "disabled",
             model: "none",
@@ -128,7 +127,7 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
         allow_mock_embedder_value.as_deref(),
         reranker_value.as_deref(),
     )?;
-    let embedding_pool_size = resolved_embedding_pool_size();
+    let embedding_pool_size = SHIPPING_EMBEDDING_POOL_SIZE;
     let cache_root = resolved_fastembed_cache_dir()
         .map_err(|error| anyhow::anyhow!("Failed to resolve model cache root: {error}"))?;
 
@@ -188,37 +187,46 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
             Some(reranker),
         )
     } else {
-        let (embedder, embedding_model, embedding_repository) = match OnnxEmbedder::new(
-            EMBEDDING_MODEL,
-        ) {
-            Ok(embedder) => {
-                tracing::info!("Using ONNX embedder (Alibaba-NLP/gte-base-en-v1.5, 768 dims)");
-                (embedder, EMBEDDING_MODEL, Some(EMBEDDING_MODEL))
-            }
-            Err(gte_err) => {
-                tracing::warn!("GTE model unavailable ({gte_err}), trying MiniLM fallback");
-                match OnnxEmbedder::new(MINILM_MODEL) {
-                    Ok(embedder) => {
-                        tracing::info!("Using fallback ONNX embedder (all-MiniLM-L6-v2, 384 dims)");
-                        (embedder, MINILM_MODEL, Some(MINILM_REPOSITORY))
-                    }
-                    Err(mini_err) => {
-                        if allow_mock_embedder {
-                            // PENSYVE_ALLOW_MOCK_EMBEDDER is the explicit opt-in
-                            // for environments that intentionally ship without the
-                            // ONNX models (e.g. prod containers built without the
-                            // model artifacts). Surface as info, not warn.
-                            tracing::info!("Using mock embedder (768 dims) — {mini_err}");
-                            (OnnxEmbedder::new_mock(768), "mock", None)
-                        } else {
-                            return Err(anyhow::anyhow!(
-                                "No ONNX model available. Set PENSYVE_ALLOW_MOCK_EMBEDDER=1 to use mock. Error: {mini_err}"
-                            ));
+        let (embedder, embedding_model, embedding_repository) =
+            match OnnxEmbedder::new_with_policy_and_pool_size(
+                EMBEDDING_MODEL,
+                &NetworkPolicy::Permissive,
+                SHIPPING_EMBEDDING_POOL_SIZE,
+            ) {
+                Ok(embedder) => {
+                    tracing::info!("Using ONNX embedder (Alibaba-NLP/gte-base-en-v1.5, 768 dims)");
+                    (embedder, EMBEDDING_MODEL, Some(EMBEDDING_MODEL))
+                }
+                Err(gte_err) => {
+                    tracing::warn!("GTE model unavailable ({gte_err}), trying MiniLM fallback");
+                    match OnnxEmbedder::new_with_policy_and_pool_size(
+                        MINILM_MODEL,
+                        &NetworkPolicy::Permissive,
+                        SHIPPING_EMBEDDING_POOL_SIZE,
+                    ) {
+                        Ok(embedder) => {
+                            tracing::info!(
+                                "Using fallback ONNX embedder (all-MiniLM-L6-v2, 384 dims)"
+                            );
+                            (embedder, MINILM_MODEL, Some(MINILM_REPOSITORY))
+                        }
+                        Err(mini_err) => {
+                            if allow_mock_embedder {
+                                // PENSYVE_ALLOW_MOCK_EMBEDDER is the explicit opt-in
+                                // for environments that intentionally ship without the
+                                // ONNX models (e.g. prod containers built without the
+                                // model artifacts). Surface as info, not warn.
+                                tracing::info!("Using mock embedder (768 dims) — {mini_err}");
+                                (OnnxEmbedder::new_mock(768), "mock", None)
+                            } else {
+                                return Err(anyhow::anyhow!(
+                                    "No ONNX model available. Set PENSYVE_ALLOW_MOCK_EMBEDDER=1 to use mock. Error: {mini_err}"
+                                ));
+                            }
                         }
                     }
                 }
-            }
-        };
+            };
         (embedder, embedding_model, embedding_repository, None)
     };
 
@@ -765,12 +773,26 @@ mod tests {
     }
 
     #[test]
-    fn permissive_enabled_reranker_metadata_reports_deferred_load() {
-        let metadata = reranker_runtime_metadata(false, None, Some("cached-but-not-loaded"));
+    fn permissive_default_reranker_metadata_reports_no_model() {
+        let metadata = reranker_runtime_metadata(false, None, Some("cached-but-unused"));
+
+        assert_eq!(metadata.state, "disabled");
+        assert_eq!(metadata.model, "none");
+        assert_eq!(metadata.revision, "not-applicable");
+    }
+
+    #[test]
+    fn permissive_explicit_reranker_metadata_reports_deferred_load() {
+        let metadata = reranker_runtime_metadata(false, Some("1"), Some("cached-but-not-loaded"));
 
         assert_eq!(metadata.state, "deferred");
         assert_eq!(metadata.model, RERANKER_MODEL);
         assert_eq!(metadata.revision, "resolved-on-first-use");
+    }
+
+    #[test]
+    fn shipping_embedding_pool_is_one_session() {
+        assert_eq!(SHIPPING_EMBEDDING_POOL_SIZE, 1);
     }
 
     #[test]
@@ -796,7 +818,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("PENSYVE_REQUIRE_LOCAL_MODELS=1 conflicts with PENSYVE_RERANKER=0"),
+                .contains("PENSYVE_REQUIRE_LOCAL_MODELS=1 requires PENSYVE_RERANKER=1"),
             "startup error must identify the conflicting settings: {error}"
         );
     }

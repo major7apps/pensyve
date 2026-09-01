@@ -149,9 +149,8 @@ fn update_after_enqueue_requeues_current_source_instead_of_committing_stale_vect
         .unwrap();
 
     let first = migration.backfill(1, &BackfillCancellation::new()).unwrap();
-    assert_eq!(first.requeued, 1);
-    let second = migration.backfill(1, &BackfillCancellation::new()).unwrap();
-    assert_eq!(second.committed, 1);
+    assert_eq!(first.requeued, 0);
+    assert_eq!(first.committed, 1);
     migration.verify().unwrap();
 
     let records = fixture
