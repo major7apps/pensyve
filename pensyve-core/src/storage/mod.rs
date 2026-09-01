@@ -51,10 +51,32 @@ pub(crate) fn memory_namespace_id(memory: &Memory) -> Uuid {
     }
 }
 
-pub(crate) fn canonical_embedding_source_sha256(memory: &Memory) -> String {
+/// SHA-256 of the canonical UTF-8 source document used for embedding.
+///
+/// Shipping runtimes and backfill must share this exact path so provenance is
+/// independent of serialization and mutable memory metadata.
+#[must_use]
+pub fn canonical_embedding_source_sha256(memory: &Memory) -> String {
     hex::encode(Sha256::digest(
         bounded::embedding_source_text(memory).as_bytes(),
     ))
+}
+
+/// Construct one versioned embedding record from the exact runtime space and
+/// the shared canonical source document.
+#[must_use]
+pub fn embedding_record_for_memory(
+    memory: &Memory,
+    space: &crate::embedding_space::EmbeddingSpace,
+    embedding: Vec<f32>,
+) -> bounded::EmbeddingRecord {
+    bounded::EmbeddingRecord {
+        namespace_id: memory_namespace_id(memory),
+        memory_ref: bounded::MemoryRef::from_memory(memory),
+        embedding_space_id: space.id(),
+        source_sha256: canonical_embedding_source_sha256(memory),
+        embedding,
+    }
 }
 
 pub(crate) fn validate_record_matches_memory(
@@ -161,6 +183,23 @@ pub trait StorageTrait: Send + Sync {
         _namespace_id: Uuid,
     ) -> StorageResult<Option<bounded::NamespaceEmbeddingState>> {
         Ok(None)
+    }
+
+    /// Register one immutable local runtime space and initialize its namespace
+    /// lifecycle without inventing coverage.
+    ///
+    /// Built-in local storage may activate the space only for a namespace with
+    /// no live source memories, or return an already-active exact match.
+    /// Existing non-empty or in-progress namespaces remain semantic-unavailable
+    /// until the explicit migration protocol proves coverage.
+    fn initialize_local_runtime_space(
+        &self,
+        _namespace_id: Uuid,
+        _space: &crate::embedding_space::EmbeddingSpace,
+    ) -> StorageResult<bounded::NamespaceEmbeddingState> {
+        Err(StorageError::Unsupported(
+            "local embedding-space initialization".into(),
+        ))
     }
 
     /// Bounded vector retrieval. Backends must opt in explicitly; the

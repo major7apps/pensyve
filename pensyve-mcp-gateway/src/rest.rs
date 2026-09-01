@@ -19,7 +19,7 @@ use crate::auth::AuthContext;
 
 use pensyve_core::retrieval::RecallEngine;
 use pensyve_core::retrieval::contradictions::detect_contradictions;
-use pensyve_core::storage::StorageTrait;
+use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{
     ContentType, Entity, EntityKind, Episode, EpisodicMemory, Memory, Outcome, SemanticMemory,
 };
@@ -504,23 +504,40 @@ fn replacement_memory(
     }
 }
 
-fn save_memory(storage: &dyn StorageTrait, memory: &Memory) -> Result<(), RestError> {
-    let result = match memory {
-        Memory::Episodic(memory) => storage.save_episodic(memory),
-        Memory::Semantic(memory) => storage.save_semantic(memory),
-        Memory::Procedural(memory) => storage.save_procedural(memory),
-        Memory::Observation(memory) => {
-            // Supersession is content replacement, not a new ingest, so the G3
-            // typed-slot and chain hooks intentionally do not fire here.
-            storage.save_observation(memory)
-        }
-    };
+fn save_memory(
+    storage: &dyn StorageTrait,
+    active_space: Option<&pensyve_core::embedding_space::EmbeddingSpace>,
+    memory: &Memory,
+) -> Result<(), RestError> {
+    let record = active_space
+        .map(|space| embedding_record_for_memory(memory, space, memory.embedding().to_vec()));
+    let result = storage.save_memory_with_embedding(memory, record.as_ref());
     result.map_err(|err| {
         RestError(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Error saving superseding memory: {err}"),
+            format!("Error saving memory: {err}"),
         )
     })
+}
+
+fn add_compatibility_index(memory: &Memory, vector_index: &mut VectorIndex) {
+    let result = match memory {
+        Memory::Semantic(memory) => {
+            vector_index.add_with_entity(memory.id, &memory.embedding, memory.subject)
+        }
+        Memory::Episodic(memory) => {
+            vector_index.add_with_entity(memory.id, &memory.embedding, memory.about_entity)
+        }
+        Memory::Procedural(memory) => vector_index.add(memory.id, &memory.embedding),
+        Memory::Observation(_) => Ok(()),
+    };
+    if let Err(error) = result {
+        tracing::warn!("Failed to update compatibility vector index: {error}");
+    }
+}
+
+fn runtime_wants_embedding(runtime: &VectorRuntime) -> bool {
+    runtime.semantic_space().is_some() || matches!(runtime, VectorRuntime::InMemory(_))
 }
 
 /// Extract the optional `event_time` from a memory as an ISO 8601 string.
@@ -636,28 +653,36 @@ async fn perform_supersession(
     }
 
     let content = requested_content.unwrap_or_else(|| memory_content(&old));
-    let embedder = ps.embedder.clone();
-    let text = content.clone();
-    let embedding = tokio::task::spawn_blocking(move || embedder.embed(&text))
-        .await
-        .map_err(|err| {
-            RestError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Embedding task failed: {err}"),
-            )
-        })?
-        .map_err(|err| {
-            RestError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Embedding failed: {err}"),
-            )
-        })?;
+    let embedding = if runtime_wants_embedding(&ps.vector_runtime) {
+        let embedder = ps.embedder.clone();
+        let text = content.clone();
+        tokio::task::spawn_blocking(move || embedder.embed(&text))
+            .await
+            .map_err(|err| {
+                RestError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Embedding task failed: {err}"),
+                )
+            })?
+            .map_err(|err| {
+                RestError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Embedding failed: {err}"),
+                )
+            })?
+    } else {
+        Vec::new()
+    };
 
     let new = replacement_memory(&old, &content, confidence, embedding);
     let new_id = new.id();
 
     // The replacement must exist before the old row can point to it.
-    save_memory(ps.storage.as_ref(), &new)?;
+    save_memory(
+        ps.storage.as_ref(),
+        ps.vector_runtime.semantic_space(),
+        &new,
+    )?;
     let stamped = ps
         .storage
         .supersede_memory_in_namespace(memory_id, ps.namespace.id, new_id, Utc::now())
@@ -684,19 +709,7 @@ async fn perform_supersession(
 
     if let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime {
         let mut vector_index = vector_index.write().await;
-        let add_result = match &new {
-            Memory::Semantic(memory) => {
-                vector_index.add_with_entity(new_id, &memory.embedding, memory.subject)
-            }
-            Memory::Episodic(memory) => {
-                vector_index.add_with_entity(new_id, &memory.embedding, memory.about_entity)
-            }
-            Memory::Procedural(memory) => vector_index.add(new_id, &memory.embedding),
-            Memory::Observation(_) => Ok(()),
-        };
-        if let Err(err) = add_result {
-            tracing::warn!("Failed to add superseding memory to vector index: {err}");
-        }
+        add_compatibility_index(&new, &mut vector_index);
         let _ = vector_index.remove(memory_id);
     }
 
@@ -1114,31 +1127,43 @@ async fn remember(
 
     let mut mem = SemanticMemory::new(ps.namespace.id, entity.id, predicate, object, confidence);
 
-    // Run ONNX inference on the blocking thread pool to avoid stalling the async runtime.
-    let embedder = ps.embedder.clone();
-    let fact = body.fact.clone();
-    let embed_result = tokio::task::spawn_blocking(move || embedder.embed(&fact)).await;
+    if runtime_wants_embedding(&ps.vector_runtime) {
+        // Run ONNX inference on the blocking thread pool to avoid stalling the async runtime.
+        let embedder = ps.embedder.clone();
+        let fact = body.fact.clone();
+        let embed_result = tokio::task::spawn_blocking(move || embedder.embed(&fact)).await;
 
-    match embed_result {
-        Ok(Ok(embedding)) => {
-            if let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime {
-                let mut vector_index = vector_index.write().await;
-                if let Err(err) = vector_index.add_with_entity(mem.id, &embedding, entity.id) {
-                    tracing::warn!("Failed to add to vector index: {err}");
-                }
+        match embed_result {
+            Ok(Ok(embedding)) => {
+                mem.embedding = embedding;
             }
-            mem.embedding = embedding;
+            Ok(Err(err)) if ps.vector_runtime.semantic_space().is_some() => {
+                return Err(RestError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Embedding failed: {err}"),
+                ));
+            }
+            Err(err) if ps.vector_runtime.semantic_space().is_some() => {
+                return Err(RestError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Embedding task failed: {err}"),
+                ));
+            }
+            Ok(Err(err)) => tracing::warn!("Compatibility embedding failed: {err}"),
+            Err(err) => tracing::warn!("Compatibility embedding task panicked: {err}"),
         }
-        Ok(Err(err)) => tracing::warn!("Embedding failed: {err}"),
-        Err(err) => tracing::warn!("Embedding task panicked: {err}"),
     }
 
-    ps.storage.save_semantic(&mem).map_err(|err| {
-        RestError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Error saving semantic memory: {err}"),
-        )
-    })?;
+    let memory = Memory::Semantic(mem.clone());
+    save_memory(
+        ps.storage.as_ref(),
+        ps.vector_runtime.semantic_space(),
+        &memory,
+    )?;
+    if let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime {
+        let mut index = vector_index.write().await;
+        add_compatibility_index(&memory, &mut index);
+    }
 
     let _ = ps.storage.log_activity(
         ps.namespace.id,
@@ -1736,32 +1761,43 @@ async fn observe(
         .as_deref()
         .map_or(ContentType::Text, ContentType::from_str);
 
-    // Embed content on the blocking thread pool.
-    let embedder = ps.embedder.clone();
-    let content = body.content.clone();
-    let embed_result = tokio::task::spawn_blocking(move || embedder.embed(&content)).await;
+    if runtime_wants_embedding(&ps.vector_runtime) {
+        // Embed content on the blocking thread pool.
+        let embedder = ps.embedder.clone();
+        let content = body.content.clone();
+        let embed_result = tokio::task::spawn_blocking(move || embedder.embed(&content)).await;
 
-    match embed_result {
-        Ok(Ok(embedding)) => {
-            if let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime {
-                let mut vector_index = vector_index.write().await;
-                if let Err(err) = vector_index.add_with_entity(mem.id, &embedding, about_entity.id)
-                {
-                    tracing::warn!("Failed to add to vector index: {err}");
-                }
+        match embed_result {
+            Ok(Ok(embedding)) => {
+                mem.embedding = embedding;
             }
-            mem.embedding = embedding;
+            Ok(Err(err)) if ps.vector_runtime.semantic_space().is_some() => {
+                return Err(RestError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Embedding failed: {err}"),
+                ));
+            }
+            Err(err) if ps.vector_runtime.semantic_space().is_some() => {
+                return Err(RestError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Embedding task failed: {err}"),
+                ));
+            }
+            Ok(Err(err)) => tracing::warn!("Compatibility embedding failed: {err}"),
+            Err(err) => tracing::warn!("Compatibility embedding task panicked: {err}"),
         }
-        Ok(Err(err)) => tracing::warn!("Embedding failed: {err}"),
-        Err(err) => tracing::warn!("Embedding task panicked: {err}"),
     }
 
-    ps.storage.save_episodic(&mem).map_err(|err| {
-        RestError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Error saving episodic memory: {err}"),
-        )
-    })?;
+    let memory = Memory::Episodic(mem.clone());
+    save_memory(
+        ps.storage.as_ref(),
+        ps.vector_runtime.semantic_space(),
+        &memory,
+    )?;
+    if let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime {
+        let mut index = vector_index.write().await;
+        add_compatibility_index(&memory, &mut index);
+    }
 
     let _ = ps.storage.log_activity(
         ps.namespace.id,
@@ -2017,31 +2053,43 @@ async fn episode_message(
     );
     mem.content_type = ContentType::Text;
 
-    // Embed content on the blocking thread pool.
-    let embedder = ps.embedder.clone();
-    let content = body.content.clone();
-    let embed_result = tokio::task::spawn_blocking(move || embedder.embed(&content)).await;
+    if runtime_wants_embedding(&ps.vector_runtime) {
+        // Embed content on the blocking thread pool.
+        let embedder = ps.embedder.clone();
+        let content = body.content.clone();
+        let embed_result = tokio::task::spawn_blocking(move || embedder.embed(&content)).await;
 
-    match embed_result {
-        Ok(Ok(embedding)) => {
-            if let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime {
-                let mut vector_index = vector_index.write().await;
-                if let Err(err) = vector_index.add_with_entity(mem.id, &embedding, entity.id) {
-                    tracing::warn!("Failed to add to vector index: {err}");
-                }
+        match embed_result {
+            Ok(Ok(embedding)) => {
+                mem.embedding = embedding;
             }
-            mem.embedding = embedding;
+            Ok(Err(err)) if ps.vector_runtime.semantic_space().is_some() => {
+                return Err(RestError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Embedding failed: {err}"),
+                ));
+            }
+            Err(err) if ps.vector_runtime.semantic_space().is_some() => {
+                return Err(RestError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Embedding task failed: {err}"),
+                ));
+            }
+            Ok(Err(err)) => tracing::warn!("Compatibility embedding failed: {err}"),
+            Err(err) => tracing::warn!("Compatibility embedding task panicked: {err}"),
         }
-        Ok(Err(err)) => tracing::warn!("Embedding failed: {err}"),
-        Err(err) => tracing::warn!("Embedding task panicked: {err}"),
     }
 
-    ps.storage.save_episodic(&mem).map_err(|err| {
-        RestError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Error saving episodic memory: {err}"),
-        )
-    })?;
+    let memory = Memory::Episodic(mem.clone());
+    save_memory(
+        ps.storage.as_ref(),
+        ps.vector_runtime.semantic_space(),
+        &memory,
+    )?;
+    if let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime {
+        let mut index = vector_index.write().await;
+        add_compatibility_index(&memory, &mut index);
+    }
 
     Ok((
         StatusCode::CREATED,
@@ -2194,12 +2242,14 @@ async fn episode_end(
             // background spawn has no external cancel signal, so pass a
             // fresh never-cancelled token (same pattern as the
             // ConsolidationEngine call sites above).
-            let persisted = pensyve_core::observation::commit_extraction_for_episode(
+            let active_space = ps.vector_runtime.semantic_space().cloned();
+            let persisted = pensyve_core::observation::commit_extraction_for_episode_in_space(
                 storage.as_ref(),
                 extractor.as_ref(),
                 ns_id,
                 episode_id,
                 tokio_util::sync::CancellationToken::new(),
+                active_space.as_ref(),
                 |text| embedder.embed(text),
             )
             .await;
@@ -2606,14 +2656,20 @@ fn a2a_remember(
         .and_then(serde_json::Value::as_f64)
         .unwrap_or(0.8) as f32;
 
-    let mem = SemanticMemory::new(ps.namespace.id, entity.id, predicate, object, confidence);
-
-    ps.storage.save_semantic(&mem).map_err(|err| {
-        RestError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Error saving memory: {err}"),
-        )
-    })?;
+    let mut mem = SemanticMemory::new(ps.namespace.id, entity.id, predicate, object, confidence);
+    if ps.vector_runtime.semantic_space().is_some() {
+        mem.embedding = ps.embedder.embed(&fact).map_err(|error| {
+            RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Embedding failed: {error}"),
+            )
+        })?;
+    }
+    save_memory(
+        ps.storage.as_ref(),
+        ps.vector_runtime.semantic_space(),
+        &Memory::Semantic(mem.clone()),
+    )?;
 
     Ok(json!({"memory_id": mem.id.to_string()}))
 }
@@ -2779,7 +2835,102 @@ async fn a2a_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pensyve_core::config::RetrievalConfig;
+    use pensyve_core::embedding::OnnxEmbedder;
+    use pensyve_core::embedding_space::EmbeddingSpace;
+    use pensyve_core::retrieval::SemanticStatus;
+    use pensyve_core::storage::bounded::{MemoryRef, MemoryType};
+    use pensyve_core::storage::sqlite::SqliteBackend;
     use serde_json::json;
+
+    #[test]
+    fn immediate_recall_uses_persisted_embedding() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteBackend::open(dir.path()).unwrap();
+        let namespace = pensyve_core::types::Namespace::new("rest-persisted-recall");
+        storage.save_namespace(&namespace).unwrap();
+        let mut entity = Entity::new("alice", EntityKind::Agent);
+        entity.namespace_id = namespace.id;
+        storage.save_entity(&entity).unwrap();
+        let embedder = OnnxEmbedder::new_mock(2);
+        let space = embedder.embedding_space().unwrap().clone();
+        storage
+            .initialize_local_runtime_space(namespace.id, &space)
+            .unwrap();
+        let mut semantic = SemanticMemory::new(namespace.id, entity.id, "likes", "Rust", 0.9);
+        semantic.embedding = embedder.embed("likes Rust").unwrap();
+        let memory = Memory::Semantic(semantic.clone());
+
+        assert!(save_memory(&storage, Some(&space), &memory).is_ok());
+
+        let records = storage
+            .load_embedding_records(
+                namespace.id,
+                &space.id(),
+                &[MemoryRef {
+                    memory_type: MemoryType::Semantic,
+                    id: semantic.id,
+                }],
+            )
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        let config = RetrievalConfig {
+            default_limit: 5,
+            max_candidates: 100,
+            weights: [0.30, 0.15, 0.20, 0.10, 0.10, 0.05, 0.05, 0.05],
+            recall_timeout_secs: 5,
+            rrf_k: 60,
+            rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.0],
+            beam_width: 10,
+            max_depth: 4,
+        };
+        let recalled = RecallEngine::new_storage_backed(&storage, &embedder, &space, &config)
+            .recall_with_embedding(
+                "likes Rust",
+                Some(&semantic.embedding),
+                namespace.id,
+                5,
+                None,
+            )
+            .unwrap();
+        assert_eq!(recalled.semantic_status, SemanticStatus::Complete);
+        assert!(
+            recalled
+                .memories
+                .iter()
+                .any(|candidate| candidate.memory_id == semantic.id)
+        );
+    }
+
+    #[test]
+    fn embedding_failure_leaves_neither_rest_source_nor_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteBackend::open(dir.path()).unwrap();
+        let namespace = pensyve_core::types::Namespace::new("rest-atomic-write");
+        storage.save_namespace(&namespace).unwrap();
+        let space = EmbeddingSpace::mock(2, "rest-atomic-write");
+        storage
+            .initialize_local_runtime_space(namespace.id, &space)
+            .unwrap();
+        let mut semantic = SemanticMemory::new(namespace.id, Uuid::new_v4(), "likes", "Rust", 0.9);
+        semantic.embedding = vec![1.0];
+        let memory = Memory::Semantic(semantic);
+        let memory_ref = MemoryRef::from_memory(&memory);
+
+        assert!(save_memory(&storage, Some(&space), &memory).is_err());
+        assert!(
+            storage
+                .get_all_memories_by_namespace(namespace.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            storage
+                .load_embedding_records(namespace.id, &space.id(), &[memory_ref])
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn recall_grouped_request_deserializes_with_defaults() {

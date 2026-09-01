@@ -10,6 +10,7 @@ use uuid::Uuid;
 use pensyve_core::config::{PensyveConfig, RetrievalConfig};
 use pensyve_core::consolidation::ConsolidationEngine;
 use pensyve_core::embedding::OnnxEmbedder;
+use pensyve_core::embedding_space::EmbeddingSpace;
 use pensyve_core::graph::MemoryGraph;
 use pensyve_core::recall_grouped::{OrderBy, RecallGroupedConfig};
 use pensyve_core::retrieval::RecallEngine;
@@ -22,10 +23,12 @@ use pensyve_core::retrieval::cards::{
     SupersessionCard,
 };
 use pensyve_core::retrieval::intent_router::{IntentRouter, KBudget};
-use pensyve_core::storage::StorageTrait;
+use pensyve_core::storage::bounded::NamespaceEmbeddingPhase;
 use pensyve_core::storage::sqlite::SqliteBackend;
+use pensyve_core::storage::{
+    StorageError, StorageResult, StorageTrait, embedding_record_for_memory,
+};
 use pensyve_core::types::{self, EntityKind, EpisodicMemory, Namespace, Outcome, SemanticMemory};
-use pensyve_core::vector::VectorIndex;
 
 // ---------------------------------------------------------------------------
 // Module entry point
@@ -345,7 +348,9 @@ struct PensyveInner {
     namespace: Namespace,
     storage: Arc<SqliteBackend>,
     embedder: Arc<OnnxEmbedder>,
-    vector_index: Arc<Mutex<VectorIndex>>,
+    runtime_space: EmbeddingSpace,
+    semantic_active: bool,
+    recall_lock: Mutex<()>,
     retrieval_config: RetrievalConfig,
     consolidation_config: pensyve_core::config::ConsolidationConfig,
     /// G1 multi-tenant scope. `None` on both = legacy unscoped recall on
@@ -402,6 +407,38 @@ struct PensyveInner {
     /// construction site so the recall pipeline (composite-card path)
     /// observes the resolved value.
     ms_card_days: usize,
+}
+
+impl PensyveInner {
+    fn semantic_space(&self) -> Option<&EmbeddingSpace> {
+        self.semantic_active.then_some(&self.runtime_space)
+    }
+}
+
+fn resolve_local_semantic_space(
+    storage: &SqliteBackend,
+    embedder: &OnnxEmbedder,
+    namespace_id: Uuid,
+) -> StorageResult<Option<EmbeddingSpace>> {
+    let space = embedder
+        .embedding_space()
+        .map_err(|error| StorageError::Context(format!("runtime embedding space: {error}")))?
+        .clone();
+    let state = storage.initialize_local_runtime_space(namespace_id, &space)?;
+    if state.phase == NamespaceEmbeddingPhase::Active {
+        return Ok(Some(space));
+    }
+    Ok(None)
+}
+
+fn persist_python_memory(
+    storage: &SqliteBackend,
+    active_space: Option<&EmbeddingSpace>,
+    memory: &types::Memory,
+    embedding: Vec<f32>,
+) -> StorageResult<()> {
+    let record = active_space.map(|space| embedding_record_for_memory(memory, space, embedding));
+    storage.save_memory_with_embedding(memory, record.as_ref())
 }
 
 // ---------------------------------------------------------------------------
@@ -722,20 +759,12 @@ impl PyPensyve {
         let _ = EMBEDDING_MODEL_NAME.set(model_name.to_string());
         let _ = EMBEDDING_DIMS.set(dimensions);
 
-        // Create vector index.
-        let vector_index = Arc::new(Mutex::new(VectorIndex::new(dimensions, 1024)));
-
-        // Bootstrap vector index from existing memories in storage.
-        if let Ok(memories) = storage.get_all_memories_by_namespace(ns.id) {
-            let mut vi = vector_index.lock().unwrap();
-            for mem in &memories {
-                let emb = mem.embedding();
-                if !emb.is_empty() {
-                    // Ignore dimension mismatches from old data gracefully.
-                    let _ = vi.add(mem.id(), emb);
-                }
-            }
-        }
+        let active_space = resolve_local_semantic_space(&storage, &embedder, ns.id)
+            .map_err(|error| PyRuntimeError::new_err(format!("Runtime space error: {error}")))?;
+        let runtime_space = embedder
+            .embedding_space()
+            .map_err(|error| PyRuntimeError::new_err(format!("Runtime space error: {error}")))?
+            .clone();
 
         let (extractor_impl, extractor_runtime) = build_extractor(
             extractor.as_deref(),
@@ -771,7 +800,9 @@ impl PyPensyve {
                 namespace: ns,
                 storage,
                 embedder,
-                vector_index,
+                runtime_space,
+                semantic_active: active_space.is_some(),
+                recall_lock: Mutex::new(()),
                 retrieval_config: config.retrieval,
                 consolidation_config: config.consolidation,
                 extractor: extractor_impl,
@@ -900,9 +931,9 @@ impl PyPensyve {
             return Err(PyRuntimeError::new_err("query must not be empty"));
         }
 
-        // NOTE: Lock held across recall (including embedding). RecallEngine borrows &VectorIndex.
-        // Future: make RecallEngine lock internally per-operation to allow concurrent recalls.
-        let vi = self.inner.vector_index.lock().unwrap();
+        // Serialize local SQLite recall so each request performs one bounded
+        // storage-backed semantic pass against a stable runtime space.
+        let _recall = self.inner.recall_lock.lock().unwrap();
         // Per PR #72 review (codex P2): graph traversal in `RecallEngine`
         // only kicks in when both a graph AND a target_entity are supplied
         // (see `retrieval.rs:512` `match (self.graph, target_entity)`).
@@ -912,10 +943,10 @@ impl PyPensyve {
         let graph = entity_id.map(|_| {
             MemoryGraph::build_from_storage(self.inner.storage.as_ref(), self.inner.namespace.id)
         });
-        let mut engine = RecallEngine::new(
+        let mut engine = RecallEngine::new_storage_backed_with_vector_space(
             self.inner.storage.as_ref(),
             self.inner.embedder.as_ref(),
-            &vi,
+            self.inner.semantic_space(),
             &self.inner.retrieval_config,
         );
         if let Some(g) = graph.as_ref() {
@@ -1010,11 +1041,11 @@ impl PyPensyve {
             ));
         };
 
-        let vi = self.inner.vector_index.lock().unwrap();
-        let mut engine = RecallEngine::new(
+        let _recall = self.inner.recall_lock.lock().unwrap();
+        let mut engine = RecallEngine::new_storage_backed_with_vector_space(
             self.inner.storage.as_ref(),
             self.inner.embedder.as_ref(),
-            &vi,
+            self.inner.semantic_space(),
             &self.inner.retrieval_config,
         );
         if let Some(reranker) = self.inner.reranker.as_deref() {
@@ -1101,18 +1132,17 @@ impl PyPensyve {
             types,
         };
 
-        // Lock held across recall, same as `recall()` — RecallEngine borrows
-        // &VectorIndex for the duration of the call.
-        let vi = self.inner.vector_index.lock().unwrap();
+        // Serialize the same bounded storage-backed path used by `recall()`.
+        let _recall = self.inner.recall_lock.lock().unwrap();
         // No graph here: `recall_grouped` accepts no target_entity, and graph
         // traversal in `RecallEngine` only fires when both a graph and a
         // target_entity are present (codex P2 on PR #72). Building it here
         // would burn an O(entities + edges) storage scan with no ranking
         // payoff. Reranker still wires in below.
-        let mut engine = RecallEngine::new(
+        let mut engine = RecallEngine::new_storage_backed_with_vector_space(
             self.inner.storage.as_ref(),
             self.inner.embedder.as_ref(),
-            &vi,
+            self.inner.semantic_space(),
             &self.inner.retrieval_config,
         );
         if let Some(reranker) = self.inner.reranker.as_deref() {
@@ -1665,11 +1695,11 @@ impl PyPensyve {
         // var while another caller had it transiently set.
         let clamped = lambda_.clamp(0.0, 1.0);
 
-        let vi = self.inner.vector_index.lock().unwrap();
-        let mut engine = RecallEngine::new(
+        let _recall = self.inner.recall_lock.lock().unwrap();
+        let mut engine = RecallEngine::new_storage_backed_with_vector_space(
             self.inner.storage.as_ref(),
             self.inner.embedder.as_ref(),
-            &vi,
+            self.inner.semantic_space(),
             &self.inner.retrieval_config,
         );
         if let Some(reranker) = self.inner.reranker.as_deref() {
@@ -1723,28 +1753,25 @@ impl PyPensyve {
         mem.agent_id = self.inner.agent_id;
         mem.user_id = self.inner.user_id;
 
-        // Embed the fact.
         let embedding = self
             .inner
-            .embedder
-            .embed(fact)
-            .map_err(|e| PyRuntimeError::new_err(format!("Embedding failed: {e}")))?;
-        mem.embedding = embedding;
+            .semantic_space()
+            .map(|_| self.inner.embedder.embed(fact))
+            .transpose()
+            .map_err(|e| PyRuntimeError::new_err(format!("Embedding failed: {e}")))?
+            .unwrap_or_default();
+        mem.embedding.clone_from(&embedding);
+        let memory = types::Memory::Semantic(mem);
 
-        // Add to vector index.
-        {
-            let mut vi = self.inner.vector_index.lock().unwrap();
-            vi.add(mem.id, &mem.embedding)
-                .map_err(|e| PyRuntimeError::new_err(format!("Vector index error: {e}")))?;
-        }
+        persist_python_memory(
+            self.inner.storage.as_ref(),
+            self.inner.semantic_space(),
+            &memory,
+            embedding,
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("Storage error: {e}")))?;
 
-        // Save to storage.
-        self.inner
-            .storage
-            .save_semantic(&mem)
-            .map_err(|e| PyRuntimeError::new_err(format!("Storage error: {e}")))?;
-
-        Ok(py_memory_from(&types::Memory::Semantic(mem), 0.0))
+        Ok(py_memory_from(&memory, 0.0))
     }
 
     /// Run the consolidation engine (episodic→semantic promotion + FSRS decay).
@@ -1866,6 +1893,7 @@ impl PyPensyve {
 
         let storage = self.inner.storage.clone();
         let embedder = self.inner.embedder.clone();
+        let active_space = self.inner.semantic_space().cloned();
         let total = py.detach(|| {
             runtime.block_on(async move {
                 let mut grand_total = 0usize;
@@ -1874,12 +1902,13 @@ impl PyPensyve {
                     // synchronous and exposes no cancel primitive to Python
                     // today, so a fresh never-cancelled token is correct;
                     // future async-Python work can wire a real token here.
-                    let n = pensyve_core::observation::commit_extractions_for_episodes(
+                    let n = pensyve_core::observation::commit_extractions_for_episodes_in_space(
                         storage.as_ref(),
                         extractor.as_ref(),
                         ns_id,
                         &ep_ids,
                         tokio_util::sync::CancellationToken::new(),
+                        active_space.as_ref(),
                         |text| embedder.embed(text),
                     )
                     .await;
@@ -1925,16 +1954,6 @@ impl PyPensyve {
             })
             .map_err(|e| PyRuntimeError::new_err(format!("Forget failed: {e}")))?;
         let count = deleted.len();
-
-        // Only after the delete commits — a failed delete must leave the index
-        // agreeing with storage. Rows that were never indexed (no embedding)
-        // return `NotFound`, which is not an error here.
-        {
-            let mut vi = self.inner.vector_index.lock().unwrap();
-            for memory in &deleted {
-                let _ = vi.remove(memory.id());
-            }
-        }
 
         let dict = PyDict::new(py);
         dict.set_item("forgotten_count", count)?;
@@ -2113,26 +2132,23 @@ impl PyEpisode {
             mem.agent_id = self.inner.agent_id;
             mem.user_id = self.inner.user_id;
 
-            // Embed the content.
             let embedding = self
                 .inner
-                .embedder
-                .embed(content)
-                .map_err(|e| PyRuntimeError::new_err(format!("Embedding failed: {e}")))?;
-            mem.embedding = embedding;
+                .semantic_space()
+                .map(|_| self.inner.embedder.embed(content))
+                .transpose()
+                .map_err(|e| PyRuntimeError::new_err(format!("Embedding failed: {e}")))?
+                .unwrap_or_default();
+            mem.embedding.clone_from(&embedding);
+            let memory = types::Memory::Episodic(mem);
 
-            // Add to vector index.
-            {
-                let mut vi = self.inner.vector_index.lock().unwrap();
-                vi.add(mem.id, &mem.embedding)
-                    .map_err(|e| PyRuntimeError::new_err(format!("Vector index error: {e}")))?;
-            }
-
-            // Save to storage.
-            self.inner
-                .storage
-                .save_episodic(&mem)
-                .map_err(|e| PyRuntimeError::new_err(format!("Storage error: {e}")))?;
+            persist_python_memory(
+                self.inner.storage.as_ref(),
+                self.inner.semantic_space(),
+                &memory,
+                embedding,
+            )
+            .map_err(|e| PyRuntimeError::new_err(format!("Storage error: {e}")))?;
         }
 
         // All messages succeeded — now save the episode.
@@ -2188,6 +2204,7 @@ impl PyEpisode {
         ) {
             let storage = self.inner.storage.clone();
             let embedder = self.inner.embedder.clone();
+            let active_space = self.inner.semantic_space().cloned();
             let ns_id = self.namespace_id;
             let ep_id = self.episode_id;
             let persisted = py.detach(|| {
@@ -2195,12 +2212,13 @@ impl PyEpisode {
                     // G1/P3b: helper gained `cancel`. The PyO3 binding is
                     // synchronous and exposes no cancel primitive to Python
                     // today, so a fresh never-cancelled token is correct.
-                    pensyve_core::observation::commit_extraction_for_episode(
+                    pensyve_core::observation::commit_extraction_for_episode_in_space(
                         storage.as_ref(),
                         extractor.as_ref(),
                         ns_id,
                         ep_id,
                         tokio_util::sync::CancellationToken::new(),
+                        active_space.as_ref(),
                         |text| embedder.embed(text),
                     )
                     .await
@@ -2350,5 +2368,111 @@ impl PySessionGroup {
 
     fn __len__(&self) -> usize {
         self.memories.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pensyve_core::retrieval::SemanticStatus;
+    use pensyve_core::storage::bounded::MemoryRef;
+    use pensyve_core::types::{Entity, Memory};
+
+    #[test]
+    fn immediate_recall_uses_persisted_embedding() {
+        let dir = std::env::temp_dir().join(format!("pensyve-python-test-{}", Uuid::new_v4()));
+        let storage = SqliteBackend::open(&dir).unwrap();
+        let namespace = Namespace::new("python-persisted-recall");
+        storage.save_namespace(&namespace).unwrap();
+        let mut entity = Entity::new("alice", EntityKind::Agent);
+        entity.namespace_id = namespace.id;
+        storage.save_entity(&entity).unwrap();
+        let embedder = OnnxEmbedder::new_mock(2);
+        let active_space = resolve_local_semantic_space(&storage, &embedder, namespace.id)
+            .unwrap()
+            .unwrap();
+        let mut semantic = SemanticMemory::new(namespace.id, entity.id, "likes", "Rust", 0.9);
+        let embedding = embedder.embed("likes Rust").unwrap();
+        semantic.embedding.clone_from(&embedding);
+        let memory = Memory::Semantic(semantic.clone());
+
+        persist_python_memory(&storage, Some(&active_space), &memory, embedding).unwrap();
+
+        assert_eq!(
+            storage
+                .load_embedding_records(
+                    namespace.id,
+                    &active_space.id(),
+                    &[MemoryRef::from_memory(&memory)],
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        let config = RetrievalConfig {
+            default_limit: 5,
+            max_candidates: 100,
+            weights: [0.30, 0.15, 0.20, 0.10, 0.10, 0.05, 0.05, 0.05],
+            recall_timeout_secs: 5,
+            rrf_k: 60,
+            rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.0],
+            beam_width: 10,
+            max_depth: 4,
+        };
+        let recalled =
+            RecallEngine::new_storage_backed(&storage, &embedder, &active_space, &config)
+                .recall_with_embedding(
+                    "likes Rust",
+                    Some(&semantic.embedding),
+                    namespace.id,
+                    5,
+                    None,
+                )
+                .unwrap();
+        assert_eq!(recalled.semantic_status, SemanticStatus::Complete);
+        assert!(
+            recalled
+                .memories
+                .iter()
+                .any(|candidate| candidate.memory_id == semantic.id)
+        );
+        drop(storage);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn embedding_failure_leaves_neither_python_source_nor_record() {
+        let dir = std::env::temp_dir().join(format!("pensyve-python-test-{}", Uuid::new_v4()));
+        let storage = SqliteBackend::open(&dir).unwrap();
+        let namespace = Namespace::new("python-atomic-write");
+        storage.save_namespace(&namespace).unwrap();
+        let embedder = OnnxEmbedder::new_mock(2);
+        let active_space = resolve_local_semantic_space(&storage, &embedder, namespace.id)
+            .unwrap()
+            .unwrap();
+        let memory = Memory::Semantic(SemanticMemory::new(
+            namespace.id,
+            Uuid::new_v4(),
+            "likes",
+            "Rust",
+            0.9,
+        ));
+        let memory_ref = MemoryRef::from_memory(&memory);
+
+        assert!(persist_python_memory(&storage, Some(&active_space), &memory, vec![1.0]).is_err());
+        assert!(
+            storage
+                .get_all_memories_by_namespace(namespace.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            storage
+                .load_embedding_records(namespace.id, &active_space.id(), &[memory_ref])
+                .unwrap()
+                .is_empty()
+        );
+        drop(storage);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -8,7 +8,7 @@ use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use uuid::Uuid;
 
 use pensyve_core::retrieval::RecallEngine;
-use pensyve_core::storage::StorageTrait;
+use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{
     ContentType, Entity, EntityKind, Episode, EpisodicMemory, Memory, Outcome, SemanticMemory,
 };
@@ -36,6 +36,41 @@ fn strip_embedding(val: &mut serde_json::Value) {
     if let serde_json::Value::Object(map) = val {
         map.remove("embedding");
     }
+}
+
+fn persist_runtime_memory(state: &PensyveState, memory: &Memory) -> Result<(), String> {
+    let record = state
+        .vector_runtime
+        .semantic_space()
+        .map(|space| embedding_record_for_memory(memory, space, memory.embedding().to_vec()));
+    state
+        .storage
+        .save_memory_with_embedding(memory, record.as_ref())
+        .map_err(|error| format!("Error saving memory: {error}"))
+}
+
+async fn add_compatibility_index(state: &PensyveState, memory: &Memory) {
+    let VectorRuntime::InMemory(vector_index) = &state.vector_runtime else {
+        return;
+    };
+    let mut vector_index = vector_index.write().await;
+    let result = match memory {
+        Memory::Semantic(memory) => {
+            vector_index.add_with_entity(memory.id, &memory.embedding, memory.subject)
+        }
+        Memory::Episodic(memory) => {
+            vector_index.add_with_entity(memory.id, &memory.embedding, memory.about_entity)
+        }
+        Memory::Procedural(memory) => vector_index.add(memory.id, &memory.embedding),
+        Memory::Observation(_) => Ok(()),
+    };
+    if let Err(error) = result {
+        tracing::warn!("Failed to update compatibility vector index: {error}");
+    }
+}
+
+fn runtime_wants_embedding(runtime: &VectorRuntime) -> bool {
+    runtime.semantic_space().is_some() || matches!(runtime, VectorRuntime::InMemory(_))
 }
 
 /// Look up an entity by name, creating it if it doesn't exist.
@@ -315,29 +350,30 @@ impl PensyveMcpServer {
         let mut mem =
             SemanticMemory::new(state.namespace.id, entity.id, predicate, object, confidence);
 
-        // Run ONNX inference on the blocking thread pool to avoid stalling the async runtime.
-        let embedder = state.embedder.clone();
-        let fact = params.fact.clone();
-        let embed_result = tokio::task::spawn_blocking(move || embedder.embed(&fact)).await;
+        if runtime_wants_embedding(&state.vector_runtime) {
+            // Run ONNX inference on the blocking thread pool to avoid stalling the async runtime.
+            let embedder = state.embedder.clone();
+            let fact = params.fact.clone();
+            let embed_result = tokio::task::spawn_blocking(move || embedder.embed(&fact)).await;
 
-        match embed_result {
-            Ok(Ok(embedding)) => {
-                if let VectorRuntime::InMemory(vector_index) = &state.vector_runtime {
-                    let mut vector_index = vector_index.write().await;
-                    if let Err(err) = vector_index.add_with_entity(mem.id, &embedding, entity.id) {
-                        tracing::warn!("Failed to add to vector index: {err}");
-                    }
+            match embed_result {
+                Ok(Ok(embedding)) => {
+                    mem.embedding = embedding;
                 }
-                mem.embedding = embedding;
+                Ok(Err(err)) if state.vector_runtime.semantic_space().is_some() => {
+                    return Err(format!("Embedding failed: {err}"));
+                }
+                Err(err) if state.vector_runtime.semantic_space().is_some() => {
+                    return Err(format!("Embedding task failed: {err}"));
+                }
+                Ok(Err(err)) => tracing::warn!("Compatibility embedding failed: {err}"),
+                Err(err) => tracing::warn!("Compatibility embedding task panicked: {err}"),
             }
-            Ok(Err(err)) => tracing::warn!("Embedding failed: {err}"),
-            Err(err) => tracing::warn!("Embedding task panicked: {err}"),
         }
 
-        state
-            .storage
-            .save_semantic(&mem)
-            .map_err(|err| format!("Error saving semantic memory: {err}"))?;
+        let memory = Memory::Semantic(mem.clone());
+        persist_runtime_memory(state, &memory)?;
+        add_compatibility_index(state, &memory).await;
 
         let _ = state.storage.log_activity(
             state.namespace.id,
@@ -589,31 +625,30 @@ impl PensyveMcpServer {
             _ => ContentType::Text,
         };
 
-        // Embed content on the blocking thread pool.
-        let embedder = state.embedder.clone();
-        let content = params.content.clone();
-        let embed_result = tokio::task::spawn_blocking(move || embedder.embed(&content)).await;
+        if runtime_wants_embedding(&state.vector_runtime) {
+            // Embed content on the blocking thread pool.
+            let embedder = state.embedder.clone();
+            let content = params.content.clone();
+            let embed_result = tokio::task::spawn_blocking(move || embedder.embed(&content)).await;
 
-        match embed_result {
-            Ok(Ok(embedding)) => {
-                if let VectorRuntime::InMemory(vector_index) = &state.vector_runtime {
-                    let mut vector_index = vector_index.write().await;
-                    if let Err(err) =
-                        vector_index.add_with_entity(mem.id, &embedding, about_entity.id)
-                    {
-                        tracing::warn!("Failed to add to vector index: {err}");
-                    }
+            match embed_result {
+                Ok(Ok(embedding)) => {
+                    mem.embedding = embedding;
                 }
-                mem.embedding = embedding;
+                Ok(Err(err)) if state.vector_runtime.semantic_space().is_some() => {
+                    return Err(format!("Embedding failed: {err}"));
+                }
+                Err(err) if state.vector_runtime.semantic_space().is_some() => {
+                    return Err(format!("Embedding task failed: {err}"));
+                }
+                Ok(Err(err)) => tracing::warn!("Compatibility embedding failed: {err}"),
+                Err(err) => tracing::warn!("Compatibility embedding task panicked: {err}"),
             }
-            Ok(Err(err)) => tracing::warn!("Embedding failed: {err}"),
-            Err(err) => tracing::warn!("Embedding task panicked: {err}"),
         }
 
-        state
-            .storage
-            .save_episodic(&mem)
-            .map_err(|err| format!("Error saving episodic memory: {err}"))?;
+        let memory = Memory::Episodic(mem.clone());
+        persist_runtime_memory(state, &memory)?;
+        add_compatibility_index(state, &memory).await;
 
         let _ = state.storage.log_activity(
             state.namespace.id,
@@ -1543,6 +1578,7 @@ mod tests {
     use pensyve_core::embedding::OnnxEmbedder;
     use pensyve_core::reranker::Reranker;
     use pensyve_core::snapshot::RetentionPolicy;
+    use pensyve_core::storage::bounded::MemoryRef;
     use pensyve_core::storage::sqlite::SqliteBackend;
     use pensyve_core::types::{Episode, Namespace};
     use pensyve_core::vector::VectorIndex;
@@ -1560,6 +1596,109 @@ mod tests {
             beam_width: 10,
             max_depth: 4,
         }
+    }
+
+    #[tokio::test]
+    async fn immediate_recall_uses_persisted_embedding() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(SqliteBackend::open(dir.path()).unwrap());
+        let namespace = Namespace::new("mcp-persisted-recall");
+        storage.save_namespace(&namespace).unwrap();
+        let embedder = Arc::new(OnnxEmbedder::new_mock(2));
+        let space = embedder.embedding_space().unwrap().clone();
+        let lifecycle = storage
+            .initialize_local_runtime_space(namespace.id, &space)
+            .unwrap();
+        let runtime = VectorRuntime::storage_backed(space.clone(), Some(&lifecycle)).unwrap();
+        let state = Arc::new(PensyveState {
+            storage: storage.clone() as Arc<dyn StorageTrait>,
+            embedder,
+            vector_runtime: runtime,
+            namespace: namespace.clone(),
+            retrieval_config: test_retrieval_config(),
+            is_remote: false,
+            reranker_cell: Arc::new(OnceLock::from(None)),
+            snapshot_root: dir.path().join("snapshots"),
+            snapshot_retention: RetentionPolicy::UNBOUNDED,
+        });
+        let server = PensyveMcpServer::new(state);
+
+        server
+            .remember(Parameters(RememberParams {
+                entity: "alice".into(),
+                fact: "likes Rust".into(),
+                confidence: Some(0.9),
+            }))
+            .await
+            .unwrap();
+
+        let memory = storage
+            .get_all_memories_by_namespace(namespace.id)
+            .unwrap()
+            .into_iter()
+            .find(|memory| matches!(memory, Memory::Semantic(_)))
+            .unwrap();
+        let records = storage
+            .load_embedding_records(
+                namespace.id,
+                &space.id(),
+                &[MemoryRef::from_memory(&memory)],
+            )
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        let recalled = server
+            .recall(Parameters(RecallParams {
+                query: "likes Rust".into(),
+                entity: None,
+                types: None,
+                limit: Some(5),
+                min_confidence: None,
+            }))
+            .await
+            .unwrap();
+        assert!(recalled.contains("Rust"));
+    }
+
+    #[test]
+    fn embedding_failure_leaves_neither_mcp_source_nor_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(SqliteBackend::open(dir.path()).unwrap());
+        let namespace = Namespace::new("mcp-atomic-write");
+        storage.save_namespace(&namespace).unwrap();
+        let embedder = Arc::new(OnnxEmbedder::new_mock(2));
+        let space = embedder.embedding_space().unwrap().clone();
+        let lifecycle = storage
+            .initialize_local_runtime_space(namespace.id, &space)
+            .unwrap();
+        let state = PensyveState {
+            storage: storage.clone() as Arc<dyn StorageTrait>,
+            embedder,
+            vector_runtime: VectorRuntime::storage_backed(space.clone(), Some(&lifecycle)).unwrap(),
+            namespace: namespace.clone(),
+            retrieval_config: test_retrieval_config(),
+            is_remote: false,
+            reranker_cell: Arc::new(OnceLock::from(None)),
+            snapshot_root: dir.path().join("snapshots"),
+            snapshot_retention: RetentionPolicy::UNBOUNDED,
+        };
+        let mut semantic = SemanticMemory::new(namespace.id, Uuid::new_v4(), "likes", "Rust", 0.9);
+        semantic.embedding = vec![1.0];
+        let memory = Memory::Semantic(semantic);
+        let memory_ref = MemoryRef::from_memory(&memory);
+
+        assert!(persist_runtime_memory(&state, &memory).is_err());
+        assert!(
+            storage
+                .get_all_memories_by_namespace(namespace.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            storage
+                .load_embedding_records(namespace.id, &space.id(), &[memory_ref])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Two tenant states over one shared backend, as the gateway builds them.

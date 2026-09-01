@@ -241,6 +241,13 @@ async fn main() -> Result<()> {
     // Initialize the configured runtime without hydrating the namespace corpus.
     // The persisted namespace embedding state is the read-side activation gate.
     let embedder = build_embedder(None)?;
+    let runtime_space = embedder
+        .embedding_space()
+        .map_err(|error| anyhow::anyhow!("Failed to resolve runtime embedding space: {error}"))?
+        .clone();
+    storage
+        .initialize_local_runtime_space(namespace.id, &runtime_space)
+        .map_err(|error| anyhow::anyhow!("Failed to initialize local runtime space: {error}"))?;
     let storage = Arc::new(storage) as Arc<dyn StorageTrait>;
     let vector_runtime =
         VectorRuntime::resolve_storage_backed(storage.as_ref(), &embedder, namespace.id)

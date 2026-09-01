@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
-use crate::embedding_space::{EmbeddingSpace, EmbeddingSpaceId};
+use crate::embedding_space::{EmbeddingClass, EmbeddingSpace, EmbeddingSpaceId};
 use crate::types::{
     ContentType, Edge, Entity, EntityKind, Episode, EpisodicMemory, Memory, Namespace,
     ObservationMemory, Outcome, ProceduralMemory, SemanticMemory,
@@ -1615,6 +1615,154 @@ impl StorageTrait for SqliteBackend {
         };
         state.validate_joined_space_identities()?;
         Ok(Some(state))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Registration, lifecycle checks, and activation must share one SQLite transaction."
+    )]
+    fn initialize_local_runtime_space(
+        &self,
+        namespace_id: Uuid,
+        space: &EmbeddingSpace,
+    ) -> StorageResult<NamespaceEmbeddingState> {
+        let mut conn = lock_conn!(self);
+        let transaction = conn.transaction()?;
+        let namespace = namespace_id.to_string();
+        let namespace_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM namespaces WHERE id = ?1)",
+            [&namespace],
+            |row| row.get(0),
+        )?;
+        if !namespace_exists {
+            return Err(StorageError::NotFound(format!("namespace {namespace_id}")));
+        }
+
+        let space_id = space.id();
+        let canonical_json = space.canonical_json();
+        let class = match space.class {
+            EmbeddingClass::Real => "real",
+            EmbeddingClass::Mock => "mock",
+            EmbeddingClass::LegacyUnknown => "legacy_unknown",
+        };
+        transaction.execute(
+            "INSERT OR IGNORE INTO embedding_spaces
+             (id, canonical_identity_json, class, dimension, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                &space_id.0,
+                &canonical_json,
+                class,
+                i64::try_from(space.dimensions).map_err(|error| {
+                    StorageError::Context(format!(
+                        "embedding dimension {} is not representable: {error}",
+                        space.dimensions
+                    ))
+                })?,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        let registered: (String, String, i64) = transaction.query_row(
+            "SELECT canonical_identity_json, class, dimension
+             FROM embedding_spaces WHERE id = ?1",
+            [&space_id.0],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if registered.0 != canonical_json
+            || registered.1 != class
+            || usize::try_from(registered.2).ok() != Some(space.dimensions)
+        {
+            return Err(StorageError::Context(format!(
+                "embedding space {} conflicts with registered canonical provenance",
+                space_id.0
+            )));
+        }
+
+        let existing = transaction
+            .query_row(
+                "SELECT active_read_space_id, target_space_id, state
+                 FROM namespace_embedding_state WHERE namespace_id = ?1",
+                [&namespace],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((active, target, phase)) = &existing
+            && phase == "active"
+            && (active.as_deref() != Some(space_id.0.as_str()) || target.is_some())
+        {
+            return Err(StorageError::Context(format!(
+                "active embedding lifecycle is inconsistent with local runtime {}",
+                space_id.0
+            )));
+        }
+
+        let has_live_sources: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM episodic_memories
+                  WHERE namespace_id = ?1 AND superseded_by IS NULL AND invalid_at IS NULL
+                 UNION ALL
+                 SELECT 1 FROM semantic_memories
+                  WHERE namespace_id = ?1 AND superseded_by IS NULL AND invalid_at IS NULL
+                 UNION ALL
+                 SELECT 1 FROM procedural_memories
+                  WHERE namespace_id = ?1 AND superseded_by IS NULL AND invalid_at IS NULL
+                 UNION ALL
+                 SELECT 1 FROM observation_memories
+                  WHERE namespace_id = ?1 AND superseded_by IS NULL AND invalid_at IS NULL
+             )",
+            [&namespace],
+            |row| row.get(0),
+        )?;
+        let updated_at = Utc::now().to_rfc3339();
+        match existing {
+            None if has_live_sources => {
+                transaction.execute(
+                    "INSERT INTO namespace_embedding_state
+                     (namespace_id, active_read_space_id, target_space_id, state,
+                      barrier_sequence, updated_at)
+                     VALUES (?1, NULL, NULL, 'lexical_only', 0, ?2)",
+                    params![&namespace, &updated_at],
+                )?;
+            }
+            None => {
+                transaction.execute(
+                    "INSERT INTO namespace_embedding_state
+                     (namespace_id, active_read_space_id, target_space_id, state,
+                      barrier_sequence, updated_at)
+                     VALUES (?1, ?2, NULL, 'active', 0, ?3)",
+                    params![&namespace, &space_id.0, &updated_at],
+                )?;
+            }
+            Some((active, target, phase))
+                if phase == "lexical_only" && active.is_none() && target.is_none() =>
+            {
+                if !has_live_sources {
+                    transaction.execute(
+                        "UPDATE namespace_embedding_state
+                         SET active_read_space_id = ?1, state = 'active', updated_at = ?2
+                         WHERE namespace_id = ?3",
+                        params![&space_id.0, &updated_at, &namespace],
+                    )?;
+                }
+            }
+            Some((_, _, phase)) if phase == "active" => {}
+            Some((_, _, phase)) if phase == "backfilling" || phase == "ready" => {}
+            Some(_) => {
+                return Err(StorageError::Context(
+                    "lexical-only embedding state contains unexpected space pointers".into(),
+                ));
+            }
+        }
+        transaction.commit()?;
+        drop(conn);
+        self.get_namespace_embedding_state(namespace_id)?
+            .ok_or_else(|| StorageError::Context("embedding state commit disappeared".into()))
     }
 
     // -----------------------------------------------------------------------
@@ -4614,6 +4762,7 @@ mod tests {
     use super::*;
     use crate::embedding_space::EmbeddingSpaceId;
     use crate::storage::bounded::{EmbeddingRecord, MemoryRef, embedding_source_text};
+    use crate::storage::embedding_record_for_memory;
     use crate::types::*;
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
@@ -4697,6 +4846,117 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn canonical_embedding_record_uses_runtime_space_and_source_text() {
+        let (_db, namespace, memory) = fixture_memory();
+        let space = EmbeddingSpace::mock(2, "record-fixture");
+
+        let record = embedding_record_for_memory(&memory, &space, vec![0.25, -0.5]);
+
+        assert_eq!(record.namespace_id, namespace.id);
+        assert_eq!(record.memory_ref, MemoryRef::from_memory(&memory));
+        assert_eq!(record.embedding_space_id, space.id());
+        assert_eq!(
+            record.source_sha256,
+            "89de4cf51557989de0bf09baa87476f1265b2d66ddecc12a4da50d3bd02fd3e7"
+        );
+        assert_eq!(record.embedding, vec![0.25, -0.5]);
+    }
+
+    #[test]
+    fn local_runtime_space_activates_only_for_empty_namespace() {
+        let (_dir, db) = setup();
+        let namespace = make_namespace(&db);
+        let space = EmbeddingSpace::mock(2, "empty-local-runtime");
+
+        let state = db
+            .initialize_local_runtime_space(namespace.id, &space)
+            .unwrap();
+
+        assert_eq!(state.phase, NamespaceEmbeddingPhase::Active);
+        assert_eq!(state.active_read_space_id, Some(space.id()));
+        assert_eq!(state.active_read_space, Some(space));
+        assert_eq!(state.target_space_id, None);
+    }
+
+    #[test]
+    fn local_runtime_space_initialization_is_idempotent() {
+        let (_dir, db) = setup();
+        let namespace = make_namespace(&db);
+        let space = EmbeddingSpace::mock(2, "idempotent-local-runtime");
+
+        let first = db
+            .initialize_local_runtime_space(namespace.id, &space)
+            .unwrap();
+        let second = db
+            .initialize_local_runtime_space(namespace.id, &space)
+            .unwrap();
+
+        assert_eq!(second, first);
+        let registered: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM embedding_spaces WHERE id = ?1",
+                [space.id().0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(registered, 1);
+    }
+
+    #[test]
+    fn local_runtime_space_keeps_nonempty_legacy_namespace_lexical_only() {
+        let (db, namespace, memory) = fixture_memory();
+        db.save_memory_with_embedding(&memory, None).unwrap();
+        let space = EmbeddingSpace::mock(2, "legacy-local-runtime");
+
+        let state = db
+            .initialize_local_runtime_space(namespace.id, &space)
+            .unwrap();
+
+        assert_eq!(state.phase, NamespaceEmbeddingPhase::LexicalOnly);
+        assert_eq!(state.active_read_space_id, None);
+        assert_eq!(state.active_read_space, None);
+        assert_eq!(state.target_space_id, None);
+        assert!(db.get_namespace(namespace.id).unwrap().is_some());
+        assert_eq!(
+            db.get_all_memories_by_namespace(namespace.id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn local_runtime_space_failure_rolls_back_registration_and_state() {
+        let (_dir, db) = setup();
+        let missing_namespace = Uuid::new_v4();
+        let space = EmbeddingSpace::mock(2, "missing-namespace-runtime");
+
+        assert!(
+            db.initialize_local_runtime_space(missing_namespace, &space)
+                .is_err()
+        );
+
+        let conn = db.conn.lock().unwrap();
+        let spaces: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embedding_spaces", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let states: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM namespace_embedding_state",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(spaces, 0);
+        assert_eq!(states, 0);
     }
 
     fn fts_contents(db: &SqliteBackend, memory: &Memory) -> Vec<String> {

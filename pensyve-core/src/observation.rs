@@ -3052,12 +3052,40 @@ where
     F: FnMut(&str) -> Result<Vec<f32>, E>,
     E: std::fmt::Display,
 {
-    commit_extraction_for_episode_dmem_aware(
+    commit_extraction_for_episode_in_space(
         storage,
         extractor,
         namespace_id,
         episode_id,
         cancel,
+        None,
+        embed,
+    )
+    .await
+}
+
+/// Persist extracted observations under one exact active embedding space.
+/// `None` preserves source-only compatibility for lexical-only callers.
+pub async fn commit_extraction_for_episode_in_space<F, E>(
+    storage: &(dyn crate::storage::StorageTrait + Send + Sync),
+    extractor: &dyn ObservationExtractor,
+    namespace_id: Uuid,
+    episode_id: Uuid,
+    cancel: CancellationToken,
+    active_space: Option<&crate::embedding_space::EmbeddingSpace>,
+    embed: F,
+) -> usize
+where
+    F: FnMut(&str) -> Result<Vec<f32>, E>,
+    E: std::fmt::Display,
+{
+    commit_extraction_for_episode_dmem_aware_in_space(
+        storage,
+        extractor,
+        namespace_id,
+        episode_id,
+        cancel,
+        active_space,
         embed,
         crate::consolidation::dmem::dmem_enabled(),
     )
@@ -3101,6 +3129,37 @@ where
     F: FnMut(&str) -> Result<Vec<f32>, E>,
     E: std::fmt::Display,
 {
+    commit_extraction_for_episode_dmem_aware_in_space(
+        storage,
+        extractor,
+        namespace_id,
+        episode_id,
+        cancel,
+        None,
+        embed,
+        dmem_enabled,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The exact active space and D-MEM gate are independent optional ingest controls."
+)]
+async fn commit_extraction_for_episode_dmem_aware_in_space<F, E>(
+    storage: &(dyn crate::storage::StorageTrait + Send + Sync),
+    extractor: &dyn ObservationExtractor,
+    namespace_id: Uuid,
+    episode_id: Uuid,
+    cancel: CancellationToken,
+    active_space: Option<&crate::embedding_space::EmbeddingSpace>,
+    embed: F,
+    dmem_enabled: bool,
+) -> usize
+where
+    F: FnMut(&str) -> Result<Vec<f32>, E>,
+    E: std::fmt::Display,
+{
     if dmem_enabled {
         let mut gate = crate::consolidation::dmem::DMemGate::from_env(
             crate::consolidation::dmem::DEFAULT_RING_BUFFER_CAPACITY,
@@ -3113,12 +3172,13 @@ where
                 existing_embeddings: &existing,
                 query_context_emb: &context,
             };
-            commit_extraction_for_episode_with_dmem(
+            commit_extraction_for_episode_with_dmem_in_space(
                 storage,
                 extractor,
                 namespace_id,
                 episode_id,
                 cancel,
+                active_space,
                 embed,
                 Some(&mut ctx),
             )
@@ -3167,12 +3227,13 @@ where
 
         persisted
     } else {
-        commit_extraction_for_episode_with_dmem(
+        commit_extraction_for_episode_with_dmem_in_space(
             storage,
             extractor,
             namespace_id,
             episode_id,
             cancel,
+            active_space,
             embed,
             None,
         )
@@ -3206,6 +3267,38 @@ pub async fn commit_extraction_for_episode_with_dmem<F, E>(
     namespace_id: Uuid,
     episode_id: Uuid,
     cancel: CancellationToken,
+    embed: F,
+    dmem: Option<&mut DMemIngestContext<'_, '_, '_>>,
+) -> usize
+where
+    F: FnMut(&str) -> Result<Vec<f32>, E>,
+    E: std::fmt::Display,
+{
+    commit_extraction_for_episode_with_dmem_in_space(
+        storage,
+        extractor,
+        namespace_id,
+        episode_id,
+        cancel,
+        None,
+        embed,
+        dmem,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "The exact active space is independent of the existing D-MEM ingest context."
+)]
+async fn commit_extraction_for_episode_with_dmem_in_space<F, E>(
+    storage: &(dyn crate::storage::StorageTrait + Send + Sync),
+    extractor: &dyn ObservationExtractor,
+    namespace_id: Uuid,
+    episode_id: Uuid,
+    cancel: CancellationToken,
+    active_space: Option<&crate::embedding_space::EmbeddingSpace>,
     mut embed: F,
     mut dmem: Option<&mut DMemIngestContext<'_, '_, '_>>,
 ) -> usize
@@ -3290,7 +3383,15 @@ where
                 continue;
             }
         }
-        if let Err(e) = storage.save_observation(&obs) {
+        let save_result = if let Some(space) = active_space {
+            let memory = crate::types::Memory::Observation(obs.clone());
+            let record =
+                crate::storage::embedding_record_for_memory(&memory, space, obs.embedding.clone());
+            storage.save_memory_with_embedding(&memory, Some(&record))
+        } else {
+            storage.save_observation(&obs)
+        };
+        if let Err(e) = save_result {
             tracing::warn!(
                 target: "pensyve::observation",
                 error = %e,
@@ -3407,12 +3508,40 @@ where
     F: FnMut(&str) -> Result<Vec<f32>, E>,
     E: std::fmt::Display,
 {
-    commit_extractions_for_episodes_dmem_aware(
+    commit_extractions_for_episodes_in_space(
         storage,
         extractor,
         namespace_id,
         episode_ids,
         cancel,
+        None,
+        embed,
+    )
+    .await
+}
+
+/// Bulk extraction under one exact active space. `None` preserves the
+/// source-only compatibility path.
+pub async fn commit_extractions_for_episodes_in_space<F, E>(
+    storage: &(dyn crate::storage::StorageTrait + Send + Sync),
+    extractor: &dyn ObservationExtractor,
+    namespace_id: Uuid,
+    episode_ids: &[Uuid],
+    cancel: CancellationToken,
+    active_space: Option<&crate::embedding_space::EmbeddingSpace>,
+    embed: F,
+) -> usize
+where
+    F: FnMut(&str) -> Result<Vec<f32>, E>,
+    E: std::fmt::Display,
+{
+    commit_extractions_for_episodes_dmem_aware_in_space(
+        storage,
+        extractor,
+        namespace_id,
+        episode_ids,
+        cancel,
+        active_space,
         embed,
         crate::consolidation::dmem::dmem_enabled(),
     )
@@ -3437,6 +3566,37 @@ where
     F: FnMut(&str) -> Result<Vec<f32>, E>,
     E: std::fmt::Display,
 {
+    commit_extractions_for_episodes_dmem_aware_in_space(
+        storage,
+        extractor,
+        namespace_id,
+        episode_ids,
+        cancel,
+        None,
+        embed,
+        dmem_enabled,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The exact active space and D-MEM gate are independent optional bulk controls."
+)]
+async fn commit_extractions_for_episodes_dmem_aware_in_space<F, E>(
+    storage: &(dyn crate::storage::StorageTrait + Send + Sync),
+    extractor: &dyn ObservationExtractor,
+    namespace_id: Uuid,
+    episode_ids: &[Uuid],
+    cancel: CancellationToken,
+    active_space: Option<&crate::embedding_space::EmbeddingSpace>,
+    embed: F,
+    dmem_enabled: bool,
+) -> usize
+where
+    F: FnMut(&str) -> Result<Vec<f32>, E>,
+    E: std::fmt::Display,
+{
     if dmem_enabled {
         let mut gate = crate::consolidation::dmem::DMemGate::from_env(
             crate::consolidation::dmem::DEFAULT_RING_BUFFER_CAPACITY,
@@ -3449,12 +3609,13 @@ where
                 existing_embeddings: &existing,
                 query_context_emb: &context,
             };
-            commit_extractions_for_episodes_with_dmem(
+            commit_extractions_for_episodes_with_dmem_in_space(
                 storage,
                 extractor,
                 namespace_id,
                 episode_ids,
                 cancel,
+                active_space,
                 embed,
                 Some(&mut ctx),
             )
@@ -3487,12 +3648,13 @@ where
 
         persisted
     } else {
-        commit_extractions_for_episodes_with_dmem(
+        commit_extractions_for_episodes_with_dmem_in_space(
             storage,
             extractor,
             namespace_id,
             episode_ids,
             cancel,
+            active_space,
             embed,
             None,
         )
@@ -3685,6 +3847,41 @@ pub async fn commit_extractions_for_episodes_with_dmem<F, E>(
     namespace_id: Uuid,
     episode_ids: &[Uuid],
     cancel: CancellationToken,
+    embed: F,
+    dmem: Option<&mut DMemIngestContext<'_, '_, '_>>,
+) -> usize
+where
+    F: FnMut(&str) -> Result<Vec<f32>, E>,
+    E: std::fmt::Display,
+{
+    commit_extractions_for_episodes_with_dmem_in_space(
+        storage,
+        extractor,
+        namespace_id,
+        episode_ids,
+        cancel,
+        None,
+        embed,
+        dmem,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The exact active space is independent of the existing bulk D-MEM context."
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "This is the existing bounded bulk ingest body with transactional persistence."
+)]
+async fn commit_extractions_for_episodes_with_dmem_in_space<F, E>(
+    storage: &(dyn crate::storage::StorageTrait + Send + Sync),
+    extractor: &dyn ObservationExtractor,
+    namespace_id: Uuid,
+    episode_ids: &[Uuid],
+    cancel: CancellationToken,
+    active_space: Option<&crate::embedding_space::EmbeddingSpace>,
     mut embed: F,
     mut dmem: Option<&mut DMemIngestContext<'_, '_, '_>>,
 ) -> usize
@@ -3772,7 +3969,18 @@ where
                     continue;
                 }
             }
-            if let Err(e) = storage.save_observation(&obs) {
+            let save_result = if let Some(space) = active_space {
+                let memory = crate::types::Memory::Observation(obs.clone());
+                let record = crate::storage::embedding_record_for_memory(
+                    &memory,
+                    space,
+                    obs.embedding.clone(),
+                );
+                storage.save_memory_with_embedding(&memory, Some(&record))
+            } else {
+                storage.save_observation(&obs)
+            };
+            if let Err(e) = save_result {
                 tracing::warn!(
                     target: "pensyve::observation",
                     error = %e,
@@ -4057,7 +4265,9 @@ mod tests {
     // commit_extraction_for_episode — integration with storage
     // -----------------------------------------------------------------------
 
+    use crate::embedding_space::EmbeddingSpace;
     use crate::storage::StorageTrait;
+    use crate::storage::bounded::{MemoryRef, MemoryType};
     use crate::storage::sqlite::SqliteBackend;
     use crate::types::{EpisodicMemory, Namespace, ObservationMemory};
     use tempfile::TempDir;
@@ -4085,6 +4295,72 @@ mod tests {
             db.save_episodic(&mem).unwrap();
         }
         (dir, db, ns, episode_id)
+    }
+
+    fn setup_active_storage(
+        dimensions: usize,
+    ) -> (TempDir, SqliteBackend, Namespace, Uuid, EmbeddingSpace) {
+        let dir = TempDir::new().unwrap();
+        let db = SqliteBackend::open(dir.path()).unwrap();
+        let ns = Namespace::new("test-active-obs-ingest");
+        db.save_namespace(&ns).unwrap();
+        let space = EmbeddingSpace::mock(dimensions, "observation-active-space");
+        db.initialize_local_runtime_space(ns.id, &space).unwrap();
+
+        let episode_id = Uuid::new_v4();
+        let mut mem = EpisodicMemory::new(
+            ns.id,
+            episode_id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "user: I played AC Odyssey",
+        );
+        mem.event_time = Some(Utc::now());
+        db.save_episodic(&mem).unwrap();
+        (dir, db, ns, episode_id, space)
+    }
+
+    #[tokio::test]
+    async fn active_extraction_failure_leaves_neither_source_nor_embedding() {
+        let (_dir, db, ns, ep, space) = setup_active_storage(2);
+        let observation = ObservationMemory::new(
+            ns.id,
+            ep,
+            "game_played",
+            "AC Odyssey",
+            "played",
+            "played AC Odyssey",
+        );
+        let reference = MemoryRef {
+            memory_type: MemoryType::Observation,
+            id: observation.id,
+        };
+        let extractor = MockExtractor {
+            fixed: vec![observation],
+        };
+
+        let persisted = commit_extraction_for_episode_in_space(
+            &db,
+            &extractor,
+            ns.id,
+            ep,
+            CancellationToken::new(),
+            Some(&space),
+            fake_embed,
+        )
+        .await;
+
+        assert_eq!(persisted, 0);
+        assert!(
+            db.list_observations_by_episode_ids(ns.id, &[ep], 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.load_embedding_records(ns.id, &space.id(), &[reference])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -4479,6 +4755,49 @@ mod tests {
             .unwrap();
         assert_eq!(stored_b.len(), 1);
         assert_eq!(stored_b[0].instance, "sourdough");
+    }
+
+    #[tokio::test]
+    async fn active_bulk_extraction_failure_leaves_neither_source_nor_embedding() {
+        let (_dir, db, ns, ep, space) = setup_active_storage(2);
+        let observation = ObservationMemory::new(
+            ns.id,
+            ep,
+            "game_played",
+            "AC Odyssey",
+            "played",
+            "played AC Odyssey",
+        );
+        let reference = MemoryRef {
+            memory_type: MemoryType::Observation,
+            id: observation.id,
+        };
+        let mut by_episode = std::collections::HashMap::new();
+        by_episode.insert(ep, vec![observation]);
+        let extractor = PerEpisodeMockExtractor { by_episode };
+
+        let persisted = commit_extractions_for_episodes_in_space(
+            &db,
+            &extractor,
+            ns.id,
+            &[ep],
+            CancellationToken::new(),
+            Some(&space),
+            fake_embed,
+        )
+        .await;
+
+        assert_eq!(persisted, 0);
+        assert!(
+            db.list_observations_by_episode_ids(ns.id, &[ep], 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.load_embedding_records(ns.id, &space.id(), &[reference])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test(start_paused = true)]
