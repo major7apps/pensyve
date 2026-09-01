@@ -228,7 +228,7 @@ fn hash_file(path: &Path) -> String {
     let mut file = File::open(path)
         .unwrap_or_else(|_| panic!("open certified ONNX artifact: {}", path.display()));
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
         let read = file
             .read(&mut buffer)
