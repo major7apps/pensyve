@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -18,7 +18,11 @@ use super::{
     validate_record_matches_memory,
 };
 use crate::graph::EdgeType;
-use crate::storage::bounded::{EmbeddingRecord, MemoryType};
+use crate::storage::bounded::{
+    EmbeddingRecord, LexicalHit, MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS,
+    MEMORY_PAGE_SIZE, MemoryPage, MemoryPageRequest, MemoryRef, MemoryType, PageCursor,
+    SearchScope,
+};
 
 // ---------------------------------------------------------------------------
 // Safe lock acquisition
@@ -1211,6 +1215,108 @@ fn delete_memory_by_id_with_namespace(
     Ok(deleted)
 }
 
+fn memory_type_from_str(value: &str) -> StorageResult<MemoryType> {
+    match value {
+        "episodic" => Ok(MemoryType::Episodic),
+        "semantic" => Ok(MemoryType::Semantic),
+        "procedural" => Ok(MemoryType::Procedural),
+        "observation" => Ok(MemoryType::Observation),
+        other => Err(StorageError::Context(format!(
+            "unknown stored memory type {other:?}"
+        ))),
+    }
+}
+
+fn memory_type_order(memory_type: MemoryType) -> i64 {
+    match memory_type {
+        MemoryType::Episodic => 0,
+        MemoryType::Semantic => 1,
+        MemoryType::Procedural => 2,
+        MemoryType::Observation => 3,
+    }
+}
+
+fn load_memory_without_embedding_in_conn(
+    conn: &Connection,
+    namespace_id: Uuid,
+    memory_ref: MemoryRef,
+) -> StorageResult<Option<Memory>> {
+    let id = memory_ref.id.to_string();
+    let namespace = namespace_id.to_string();
+    match memory_ref.memory_type {
+        MemoryType::Episodic => conn
+            .query_row(
+                r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
+                          content_type, summary, NULL AS embedding, context_intent, timestamp,
+                          stability, retrievability, access_count, last_accessed, event_time,
+                          agent_id, user_id, superseded_by, invalid_at
+                   FROM episodic_memories WHERE id = ?1 AND namespace_id = ?2",
+                params![id, namespace],
+                row_to_episodic,
+            )
+            .optional()?
+            .transpose()
+            .map(|memory| memory.map(Memory::Episodic)),
+        MemoryType::Semantic => conn
+            .query_row(
+                r"SELECT id, namespace_id, subject, predicate, object, content_type,
+                          object_entity, confidence, valid_at, invalid_at, source_episodes,
+                          NULL AS embedding, stability, retrievability, agent_id, user_id,
+                          superseded_by
+                   FROM semantic_memories WHERE id = ?1 AND namespace_id = ?2",
+                params![id, namespace],
+                row_to_semantic,
+            )
+            .optional()?
+            .transpose()
+            .map(|memory| memory.map(Memory::Semantic)),
+        MemoryType::Procedural => conn
+            .query_row(
+                r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
+                          trial_count, success_count, source_episodes, NULL AS embedding,
+                          created_at, last_used, agent_id, user_id, superseded_by, invalid_at
+                   FROM procedural_memories WHERE id = ?1 AND namespace_id = ?2",
+                params![id, namespace],
+                row_to_procedural,
+            )
+            .optional()?
+            .transpose()
+            .map(|memory| memory.map(Memory::Procedural)),
+        MemoryType::Observation => conn
+            .query_row(
+                r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
+                          unit, content, NULL AS embedding, confidence, event_time, created_at,
+                          stability, retrievability, agent_id, user_id, superseded_by, invalid_at
+                   FROM observation_memories WHERE id = ?1 AND namespace_id = ?2",
+                params![id, namespace],
+                row_to_observation,
+            )
+            .optional()?
+            .transpose()
+            .map(|memory| memory.map(Memory::Observation)),
+    }
+}
+
+fn ensure_hydrated_payload_fits(
+    memories: &[Memory],
+    requested_max_bytes: usize,
+) -> StorageResult<()> {
+    let max_bytes = requested_max_bytes.min(MAX_HYDRATED_BYTES);
+    let mut total = 0_usize;
+    for memory in memories {
+        let bytes = serde_json::to_vec(memory)?.len();
+        total = total.checked_add(bytes).ok_or_else(|| {
+            StorageError::BudgetExceeded("hydrated payload byte count overflowed usize".into())
+        })?;
+        if total > max_bytes {
+            return Err(StorageError::BudgetExceeded(format!(
+                "hydrated payload exceeds {max_bytes} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // StorageTrait implementation
 // ---------------------------------------------------------------------------
@@ -1222,6 +1328,310 @@ impl StorageTrait for SqliteBackend {
 
     fn db_path(&self) -> Option<&Path> {
         Some(&self.db_path)
+    }
+
+    fn search_lexical_hits(
+        &self,
+        query: &str,
+        scope: &SearchScope,
+        limit: usize,
+    ) -> StorageResult<Vec<LexicalHit>> {
+        let escaped_query = query
+            .split_whitespace()
+            .take(super::MAX_FTS_QUERY_TOKENS)
+            .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let limit = limit.min(MAX_LEXICAL_HITS);
+        if escaped_query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let namespace = scope.namespace_id.to_string();
+        let agent = scope.agent_id.map(|value| value.to_string());
+        let user = scope.user_id.map(|value| value.to_string());
+        let conn = lock_conn!(self);
+        let mut stmt = conn.prepare(
+            r"SELECT f.memory_id, f.memory_type
+               FROM memory_fts AS f
+               WHERE memory_fts MATCH ?1 AND f.namespace_id = ?2
+                 AND (
+                     (f.memory_type = 'episodic' AND EXISTS (
+                         SELECT 1 FROM episodic_memories e
+                         WHERE e.id = f.memory_id AND e.namespace_id = ?2
+                           AND (?3 IS NULL OR e.agent_id = ?3)
+                           AND (?4 IS NULL OR e.user_id = ?4)
+                           AND e.superseded_by IS NULL AND e.invalid_at IS NULL
+                     ))
+                     OR (f.memory_type = 'semantic' AND EXISTS (
+                         SELECT 1 FROM semantic_memories s
+                         WHERE s.id = f.memory_id AND s.namespace_id = ?2
+                           AND (?3 IS NULL OR s.agent_id = ?3)
+                           AND (?4 IS NULL OR s.user_id = ?4)
+                           AND s.superseded_by IS NULL AND s.invalid_at IS NULL
+                     ))
+                     OR (f.memory_type = 'procedural' AND EXISTS (
+                         SELECT 1 FROM procedural_memories p
+                         WHERE p.id = f.memory_id AND p.namespace_id = ?2
+                           AND (?3 IS NULL OR p.agent_id = ?3)
+                           AND (?4 IS NULL OR p.user_id = ?4)
+                           AND p.superseded_by IS NULL AND p.invalid_at IS NULL
+                     ))
+                     OR (f.memory_type = 'observation' AND EXISTS (
+                         SELECT 1 FROM observation_memories o
+                         WHERE o.id = f.memory_id AND o.namespace_id = ?2
+                           AND (?3 IS NULL OR o.agent_id = ?3)
+                           AND (?4 IS NULL OR o.user_id = ?4)
+                           AND o.superseded_by IS NULL AND o.invalid_at IS NULL
+                     ))
+                 )
+               ORDER BY bm25(memory_fts),
+                        CASE f.memory_type
+                            WHEN 'episodic' THEN 0 WHEN 'semantic' THEN 1
+                            WHEN 'procedural' THEN 2 ELSE 3
+                        END,
+                        f.memory_id
+               LIMIT ?5",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    escaped_query,
+                    namespace,
+                    agent,
+                    user,
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .enumerate()
+            .map(|(index, (id, memory_type))| {
+                Ok(LexicalHit {
+                    memory_ref: MemoryRef {
+                        memory_type: memory_type_from_str(&memory_type)?,
+                        id: Uuid::parse_str(&id).map_err(|error| {
+                            StorageError::Context(format!("corrupt memory UUID {id:?}: {error}"))
+                        })?,
+                    },
+                    rank: index + 1,
+                })
+            })
+            .collect()
+    }
+
+    fn hydrate_memories(
+        &self,
+        namespace_id: Uuid,
+        memory_refs: &[MemoryRef],
+        max_bytes: usize,
+    ) -> StorageResult<Vec<Memory>> {
+        if memory_refs.len() > MAX_FUSED_HITS {
+            return Err(StorageError::BudgetExceeded(format!(
+                "memory hydration accepts at most {MAX_FUSED_HITS} references"
+            )));
+        }
+        let conn = lock_conn!(self);
+        let mut memories = Vec::with_capacity(memory_refs.len());
+        for memory_ref in memory_refs {
+            if let Some(memory) =
+                load_memory_without_embedding_in_conn(&conn, namespace_id, *memory_ref)?
+            {
+                memories.push(memory);
+            }
+        }
+        ensure_hydrated_payload_fits(&memories, max_bytes)?;
+        Ok(memories)
+    }
+
+    fn load_embedding_records(
+        &self,
+        namespace_id: Uuid,
+        embedding_space_id: &EmbeddingSpaceId,
+        memory_refs: &[MemoryRef],
+    ) -> StorageResult<Vec<EmbeddingRecord>> {
+        let unique_refs = memory_refs.iter().copied().collect::<BTreeSet<_>>();
+        if unique_refs.len() > MAX_FUSED_HITS {
+            return Err(StorageError::BudgetExceeded(format!(
+                "embedding load accepts at most {MAX_FUSED_HITS} unique references"
+            )));
+        }
+        if unique_refs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let clauses =
+            vec!["(e.memory_type = ? AND e.memory_id = ?)"; unique_refs.len()].join(" OR ");
+        let sql = format!(
+            "SELECT e.memory_type, e.memory_id, e.source_sha256, e.embedding, s.dimension \
+             FROM memory_embeddings e \
+             JOIN embedding_spaces s ON s.id = e.embedding_space_id \
+             WHERE e.namespace_id = ? AND e.embedding_space_id = ? AND ({clauses}) \
+             ORDER BY CASE e.memory_type \
+                 WHEN 'episodic' THEN 0 WHEN 'semantic' THEN 1 \
+                 WHEN 'procedural' THEN 2 ELSE 3 END, e.memory_id"
+        );
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(namespace_id.to_string()),
+            Box::new(embedding_space_id.0.clone()),
+        ];
+        for memory_ref in &unique_refs {
+            values.push(Box::new(memory_type_str(memory_ref.memory_type).to_owned()));
+            values.push(Box::new(memory_ref.id.to_string()));
+        }
+        let parameters = values
+            .iter()
+            .map(std::convert::AsRef::as_ref)
+            .collect::<Vec<&dyn rusqlite::ToSql>>();
+        let conn = lock_conn!(self);
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(parameters.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut records = Vec::with_capacity(rows.len());
+        for (memory_type, id, source_sha256, bytes, dimension) in rows {
+            if bytes.len() % std::mem::size_of::<f32>() != 0 {
+                return Err(StorageError::Context(format!(
+                    "embedding for {id} has a truncated binary representation"
+                )));
+            }
+            let memory_ref = MemoryRef {
+                memory_type: memory_type_from_str(&memory_type)?,
+                id: Uuid::parse_str(&id).map_err(|error| {
+                    StorageError::Context(format!("corrupt embedding UUID {id:?}: {error}"))
+                })?,
+            };
+            if !unique_refs.contains(&memory_ref) {
+                return Err(StorageError::Context(format!(
+                    "embedding load returned an unrequested key {memory_ref:?}"
+                )));
+            }
+            let embedding = blob_to_embedding(&bytes);
+            if usize::try_from(dimension).ok() != Some(embedding.len())
+                || embedding.is_empty()
+                || embedding.iter().any(|value| !value.is_finite())
+            {
+                return Err(StorageError::Context(format!(
+                    "embedding for {id} does not match its registered finite dimension"
+                )));
+            }
+            records.push(EmbeddingRecord {
+                namespace_id,
+                memory_ref,
+                embedding_space_id: embedding_space_id.clone(),
+                source_sha256,
+                embedding,
+            });
+        }
+        Ok(records)
+    }
+
+    fn page_memories(&self, request: &MemoryPageRequest) -> StorageResult<MemoryPage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&request.limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "memory page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        let after_type = request
+            .after
+            .as_ref()
+            .map_or(-1, |cursor| memory_type_order(cursor.memory_type));
+        let after_id = request
+            .after
+            .as_ref()
+            .map_or_else(String::new, |cursor| cursor.id.to_string());
+        let namespace = request.scope.namespace_id.to_string();
+        let agent = request.scope.agent_id.map(|value| value.to_string());
+        let user = request.scope.user_id.map(|value| value.to_string());
+        let conn = lock_conn!(self);
+        let mut stmt = conn.prepare(
+            r"SELECT memory_type, id FROM (
+                   SELECT 0 AS type_order, 'episodic' AS memory_type, id
+                   FROM episodic_memories
+                   WHERE namespace_id = ?1 AND (?2 IS NULL OR agent_id = ?2)
+                     AND (?3 IS NULL OR user_id = ?3)
+                     AND (?4 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                   UNION ALL
+                   SELECT 1, 'semantic', id FROM semantic_memories
+                   WHERE namespace_id = ?1 AND (?2 IS NULL OR agent_id = ?2)
+                     AND (?3 IS NULL OR user_id = ?3)
+                     AND (?4 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                   UNION ALL
+                   SELECT 2, 'procedural', id FROM procedural_memories
+                   WHERE namespace_id = ?1 AND (?2 IS NULL OR agent_id = ?2)
+                     AND (?3 IS NULL OR user_id = ?3)
+                     AND (?4 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                   UNION ALL
+                   SELECT 3, 'observation', id FROM observation_memories
+                   WHERE namespace_id = ?1 AND (?2 IS NULL OR agent_id = ?2)
+                     AND (?3 IS NULL OR user_id = ?3)
+                     AND (?4 OR (superseded_by IS NULL AND invalid_at IS NULL))
+               ) AS memories
+               WHERE type_order > ?5 OR (type_order = ?5 AND id > ?6)
+               ORDER BY type_order, id
+               LIMIT ?7",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![
+                    namespace,
+                    agent,
+                    user,
+                    request.include_superseded,
+                    after_type,
+                    after_id,
+                    i64::try_from(request.limit + 1).unwrap_or(i64::MAX),
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = rows.len() > request.limit;
+        let refs = rows
+            .into_iter()
+            .take(request.limit)
+            .map(|(memory_type, id)| {
+                Ok(MemoryRef {
+                    memory_type: memory_type_from_str(&memory_type)?,
+                    id: Uuid::parse_str(&id).map_err(|error| {
+                        StorageError::Context(format!("corrupt memory UUID {id:?}: {error}"))
+                    })?,
+                })
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
+        let next_cursor = has_more.then(|| {
+            let memory_ref = refs
+                .last()
+                .copied()
+                .expect("a page with more rows is non-empty");
+            PageCursor {
+                memory_type: memory_ref.memory_type,
+                id: memory_ref.id,
+            }
+        });
+        let mut memories = Vec::with_capacity(refs.len());
+        for memory_ref in refs {
+            if let Some(memory) = load_memory_without_embedding_in_conn(
+                &conn,
+                request.scope.namespace_id,
+                memory_ref,
+            )? {
+                memories.push(memory);
+            }
+        }
+        Ok(MemoryPage {
+            memories,
+            next_cursor,
+        })
     }
 
     fn save_memory_with_embedding(

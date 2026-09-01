@@ -84,6 +84,8 @@ CREATE TABLE IF NOT EXISTS episodic_memories (
     access_count    INTEGER NOT NULL DEFAULT 0,
     last_accessed   TIMESTAMPTZ,
     event_time      TIMESTAMPTZ,
+    agent_id        UUID,
+    user_id         UUID,
     fts_content     tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
 );
 
@@ -94,11 +96,15 @@ CREATE TABLE IF NOT EXISTS episodic_memories (
 ALTER TABLE episodic_memories ADD COLUMN IF NOT EXISTS event_time TIMESTAMPTZ;
 ALTER TABLE episodic_memories ADD COLUMN IF NOT EXISTS superseded_by UUID;
 ALTER TABLE episodic_memories ADD COLUMN IF NOT EXISTS invalid_at TIMESTAMPTZ;
+ALTER TABLE episodic_memories ADD COLUMN IF NOT EXISTS agent_id UUID;
+ALTER TABLE episodic_memories ADD COLUMN IF NOT EXISTS user_id UUID;
 
 CREATE INDEX IF NOT EXISTS idx_episodic_about_entity ON episodic_memories(about_entity);
 CREATE INDEX IF NOT EXISTS idx_episodic_namespace ON episodic_memories(namespace_id);
 CREATE INDEX IF NOT EXISTS idx_episodic_episode
     ON episodic_memories(namespace_id, episode_id);
+CREATE INDEX IF NOT EXISTS idx_episodic_namespace_agent_user
+    ON episodic_memories(namespace_id, agent_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_episodic_fts ON episodic_memories USING GIN(fts_content);
 
 -- ---------------------------------------------------------------------------
@@ -119,13 +125,19 @@ CREATE TABLE IF NOT EXISTS semantic_memories (
     embedding       vector,
     stability       REAL NOT NULL DEFAULT 1.0,
     retrievability  REAL NOT NULL DEFAULT 1.0,
+    agent_id        UUID,
+    user_id         UUID,
     fts_content     tsvector GENERATED ALWAYS AS (to_tsvector('english', predicate || ' ' || object)) STORED
 );
 
 ALTER TABLE semantic_memories ADD COLUMN IF NOT EXISTS superseded_by UUID;
+ALTER TABLE semantic_memories ADD COLUMN IF NOT EXISTS agent_id UUID;
+ALTER TABLE semantic_memories ADD COLUMN IF NOT EXISTS user_id UUID;
 
 CREATE INDEX IF NOT EXISTS idx_semantic_subject ON semantic_memories(subject);
 CREATE INDEX IF NOT EXISTS idx_semantic_namespace ON semantic_memories(namespace_id);
+CREATE INDEX IF NOT EXISTS idx_semantic_namespace_agent_user
+    ON semantic_memories(namespace_id, agent_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_semantic_fts ON semantic_memories USING GIN(fts_content);
 
 -- ---------------------------------------------------------------------------
@@ -146,13 +158,19 @@ CREATE TABLE IF NOT EXISTS procedural_memories (
     embedding       vector,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_used       TIMESTAMPTZ,
+    agent_id        UUID,
+    user_id         UUID,
     fts_content     tsvector GENERATED ALWAYS AS (to_tsvector('english', trigger_text || ' ' || action)) STORED
 );
 
 ALTER TABLE procedural_memories ADD COLUMN IF NOT EXISTS superseded_by UUID;
 ALTER TABLE procedural_memories ADD COLUMN IF NOT EXISTS invalid_at TIMESTAMPTZ;
+ALTER TABLE procedural_memories ADD COLUMN IF NOT EXISTS agent_id UUID;
+ALTER TABLE procedural_memories ADD COLUMN IF NOT EXISTS user_id UUID;
 
 CREATE INDEX IF NOT EXISTS idx_procedural_namespace ON procedural_memories(namespace_id);
+CREATE INDEX IF NOT EXISTS idx_procedural_namespace_agent_user
+    ON procedural_memories(namespace_id, agent_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_procedural_fts ON procedural_memories USING GIN(fts_content);
 
 -- ---------------------------------------------------------------------------
@@ -177,14 +195,20 @@ CREATE TABLE IF NOT EXISTS observation_memories (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     stability       REAL NOT NULL DEFAULT 1.0,
     retrievability  REAL NOT NULL DEFAULT 1.0,
+    agent_id        UUID,
+    user_id         UUID,
     fts_content     tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
 );
 
 ALTER TABLE observation_memories ADD COLUMN IF NOT EXISTS superseded_by UUID;
 ALTER TABLE observation_memories ADD COLUMN IF NOT EXISTS invalid_at TIMESTAMPTZ;
+ALTER TABLE observation_memories ADD COLUMN IF NOT EXISTS agent_id UUID;
+ALTER TABLE observation_memories ADD COLUMN IF NOT EXISTS user_id UUID;
 
 CREATE INDEX IF NOT EXISTS idx_observation_episode ON observation_memories(episode_id);
 CREATE INDEX IF NOT EXISTS idx_observation_namespace ON observation_memories(namespace_id);
+CREATE INDEX IF NOT EXISTS idx_observation_namespace_agent_user
+    ON observation_memories(namespace_id, agent_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_observation_entity_type
     ON observation_memories(namespace_id, entity_type);
 

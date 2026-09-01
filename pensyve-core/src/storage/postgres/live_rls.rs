@@ -112,7 +112,10 @@ use uuid::Uuid;
 
 use super::PostgresBackend;
 use crate::embedding_space::EmbeddingSpaceId;
-use crate::storage::bounded::{EmbeddingRecord, MemoryRef, embedding_source_text};
+use crate::storage::bounded::{
+    EmbeddingRecord, MAX_HYDRATED_BYTES, MemoryPageRequest, MemoryRef, MemoryType, SearchScope,
+    embedding_source_text,
+};
 use crate::storage::{StorageError, StorageTrait};
 use crate::types::{
     Edge, Entity, EntityKind, EpisodicMemory, Memory, Namespace, ObservationMemory, Outcome,
@@ -3844,5 +3847,179 @@ fn fts_candidates_match_sqlite_for_multi_token_queries() {
     assert!(
         pg_stopwords.is_empty(),
         "a stop-word-only query normalises to the empty tsquery on Postgres"
+    );
+}
+
+fn bounded_memory_keys(memories: &[Memory]) -> Vec<(MemoryType, Uuid)> {
+    memories
+        .iter()
+        .map(MemoryRef::from_memory)
+        .map(|memory_ref| (memory_ref.memory_type, memory_ref.id))
+        .collect()
+}
+
+fn register_sqlite_embedding_space(path: &std::path::Path, id: &str, dimension: usize) {
+    let connection = rusqlite::Connection::open(path.join("memories.db"))
+        .expect("open sqlite generation fixture");
+    connection
+        .execute(
+            "INSERT INTO embedding_spaces
+             (id, canonical_identity_json, class, dimension, created_at)
+             VALUES (?1, '{}', 'real', ?2, '2026-08-31T00:00:00Z')",
+            rusqlite::params![id, i64::try_from(dimension).unwrap()],
+        )
+        .expect("register sqlite embedding space");
+}
+
+#[test]
+fn bounded_reads_match_sqlite_and_isolate_forced_rls() {
+    let Some(admin_opts) = skip_notice("bounded_reads_match_sqlite_and_isolate_forced_rls") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let postgres = &fixture.backend;
+    let sqlite_dir = tempfile::tempdir().expect("sqlite tempdir");
+    let sqlite = crate::storage::sqlite::SqliteBackend::open(sqlite_dir.path())
+        .expect("open sqlite parity backend");
+    let backends: [&dyn StorageTrait; 2] = [postgres, &sqlite];
+
+    let namespace = Namespace::new(format!("bounded-own-{}", Uuid::new_v4().simple()));
+    let foreign = Namespace::new(format!("bounded-foreign-{}", Uuid::new_v4().simple()));
+    let agent = Uuid::new_v4();
+    let user = Uuid::new_v4();
+    let shared_id = Uuid::from_u128(71);
+    for backend in backends {
+        backend
+            .save_namespace(&namespace)
+            .expect("save own namespace");
+        backend
+            .save_namespace(&foreign)
+            .expect("save foreign namespace");
+
+        let mut own = EpisodicMemory::new(
+            namespace.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "boundedtoken own",
+        );
+        own.id = shared_id;
+        own.agent_id = Some(agent);
+        own.user_id = Some(user);
+        own.embedding = vec![99.0, 98.0];
+        backend.save_episodic(&own).expect("save scoped own row");
+
+        let mut wrong_scope = SemanticMemory::new(
+            namespace.id,
+            Uuid::new_v4(),
+            "boundedtoken",
+            "wrong scope",
+            1.0,
+        );
+        wrong_scope.id = Uuid::from_u128(72);
+        wrong_scope.agent_id = Some(agent);
+        wrong_scope.user_id = Some(Uuid::new_v4());
+        backend
+            .save_semantic(&wrong_scope)
+            .expect("save wrong-scope row");
+
+        let mut foreign_same_id = ProceduralMemory::new(
+            foreign.id,
+            "boundedtoken",
+            "foreign row",
+            Outcome::Success,
+            HashMap::new(),
+        );
+        foreign_same_id.id = shared_id;
+        foreign_same_id.agent_id = Some(agent);
+        foreign_same_id.user_id = Some(user);
+        backend
+            .save_procedural(&foreign_same_id)
+            .expect("save foreign same-id row");
+    }
+
+    let scope = SearchScope {
+        namespace_id: namespace.id,
+        agent_id: Some(agent),
+        user_id: Some(user),
+    };
+    let sqlite_hits = sqlite
+        .search_lexical_hits("boundedtoken", &scope, 100)
+        .expect("sqlite lexical hits");
+    let postgres_hits = postgres
+        .search_lexical_hits("boundedtoken", &scope, 100)
+        .expect("postgres lexical hits");
+    assert_eq!(postgres_hits, sqlite_hits);
+    assert_eq!(
+        postgres_hits
+            .iter()
+            .map(|hit| hit.memory_ref)
+            .collect::<Vec<_>>(),
+        vec![MemoryRef {
+            memory_type: MemoryType::Episodic,
+            id: shared_id,
+        }]
+    );
+
+    let refs = [
+        MemoryRef {
+            memory_type: MemoryType::Episodic,
+            id: shared_id,
+        },
+        MemoryRef {
+            memory_type: MemoryType::Procedural,
+            id: shared_id,
+        },
+    ];
+    let sqlite_hydrated = sqlite
+        .hydrate_memories(namespace.id, &refs, MAX_HYDRATED_BYTES)
+        .expect("sqlite hydrate");
+    let postgres_hydrated = postgres
+        .hydrate_memories(namespace.id, &refs, MAX_HYDRATED_BYTES)
+        .expect("postgres hydrate");
+    assert_eq!(
+        bounded_memory_keys(&postgres_hydrated),
+        bounded_memory_keys(&sqlite_hydrated)
+    );
+    assert!(postgres_hydrated.iter().all(|memory| match memory {
+        Memory::Episodic(memory) => memory.embedding.is_empty(),
+        Memory::Semantic(memory) => memory.embedding.is_empty(),
+        Memory::Procedural(memory) => memory.embedding.is_empty(),
+        Memory::Observation(memory) => memory.embedding.is_empty(),
+    }));
+
+    let request = MemoryPageRequest::new(scope, None, 1, false).expect("page request");
+    let sqlite_page = sqlite.page_memories(&request).expect("sqlite page");
+    let postgres_page = postgres.page_memories(&request).expect("postgres page");
+    assert_eq!(
+        bounded_memory_keys(&postgres_page.memories),
+        bounded_memory_keys(&sqlite_page.memories)
+    );
+    assert_eq!(postgres_page.next_cursor, sqlite_page.next_cursor);
+
+    register_embedding_space(&fixture, "bounded-space", "real", 2);
+    register_sqlite_embedding_space(sqlite_dir.path(), "bounded-space", 2);
+    let source = Memory::Episodic(EpisodicMemory {
+        embedding: Vec::new(),
+        ..match &postgres_hydrated[0] {
+            Memory::Episodic(memory) => memory.clone(),
+            _ => panic!("expected episodic source"),
+        }
+    });
+    let record = embedding_record(&source, "bounded-space", vec![1.0, 2.0]);
+    postgres
+        .save_memory_with_embedding(&source, Some(&record))
+        .expect("save postgres generation");
+    sqlite
+        .save_memory_with_embedding(&source, Some(&record))
+        .expect("save sqlite generation");
+    let space = EmbeddingSpaceId("bounded-space".into());
+    assert_eq!(
+        postgres
+            .load_embedding_records(namespace.id, &space, &refs[..1])
+            .expect("load postgres generation"),
+        sqlite
+            .load_embedding_records(namespace.id, &space, &refs[..1])
+            .expect("load sqlite generation")
     );
 }

@@ -34,6 +34,8 @@ pub enum StorageError {
     Context(String),
     #[error("Unsupported storage capability: {0}")]
     Unsupported(String),
+    #[error("Storage budget exceeded: {0}")]
+    BudgetExceeded(String),
     #[error("Mutex lock poisoned: {0}")]
     LockPoisoned(String),
 }
@@ -170,6 +172,39 @@ pub trait StorageTrait: Send + Sync {
         _limit: usize,
     ) -> StorageResult<Vec<bounded::LexicalHit>> {
         Err(StorageError::Unsupported("bounded lexical search".into()))
+    }
+
+    /// Hydrate at most one bounded batch of typed memory references.
+    /// Backends must never fall back to namespace-wide bulk loading.
+    fn hydrate_memories(
+        &self,
+        _namespace_id: Uuid,
+        _memory_refs: &[bounded::MemoryRef],
+        _max_bytes: usize,
+    ) -> StorageResult<Vec<Memory>> {
+        Err(StorageError::Unsupported("bounded memory hydration".into()))
+    }
+
+    /// Load one immutable embedding generation for a bounded reference batch.
+    /// Backends must never consult compatibility inline embedding columns.
+    fn load_embedding_records(
+        &self,
+        _namespace_id: Uuid,
+        _embedding_space_id: &crate::embedding_space::EmbeddingSpaceId,
+        _memory_refs: &[bounded::MemoryRef],
+    ) -> StorageResult<Vec<bounded::EmbeddingRecord>> {
+        Err(StorageError::Unsupported(
+            "bounded embedding-generation load".into(),
+        ))
+    }
+
+    /// Page source memories in deterministic typed-key order.
+    /// Backends must never implement this through a namespace-wide bulk load.
+    fn page_memories(
+        &self,
+        _request: &bounded::MemoryPageRequest,
+    ) -> StorageResult<bounded::MemoryPage> {
+        Err(StorageError::Unsupported("bounded memory paging".into()))
     }
 
     /// Filesystem path of the underlying `SQLite` file, when the backend is

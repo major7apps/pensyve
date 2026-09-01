@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use std::future::Future;
 
@@ -12,7 +12,7 @@ use sqlx_core::raw_sql::raw_sql;
 use sqlx_core::row::Row;
 use sqlx_core::sql_str::AssertSqlSafe;
 use sqlx_core::transaction::Transaction;
-use sqlx_postgres::{PgPool, PgPoolOptions, PgRow, Postgres};
+use sqlx_postgres::{PgConnection, PgPool, PgPoolOptions, PgRow, Postgres};
 use tokio::runtime::{Handle, Runtime};
 use uuid::Uuid;
 
@@ -28,7 +28,11 @@ use super::{
     validate_record_matches_memory,
 };
 use crate::graph::EdgeType;
-use crate::storage::bounded::{EmbeddingRecord, MemoryType};
+use crate::storage::bounded::{
+    EmbeddingRecord, LexicalHit, MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS,
+    MEMORY_PAGE_SIZE, MemoryPage, MemoryPageRequest, MemoryRef, MemoryType, PageCursor,
+    SearchScope,
+};
 
 // ---------------------------------------------------------------------------
 // Row type aliases (for complex tuple types used with query_as)
@@ -52,6 +56,8 @@ struct EpisodicRow {
     event_time: Option<DateTime<Utc>>,
     superseded_by: Option<Uuid>,
     invalid_at: Option<DateTime<Utc>>,
+    agent_id: Option<Uuid>,
+    user_id: Option<Uuid>,
 }
 
 impl<'r> FromRow<'r, PgRow> for EpisodicRow {
@@ -74,44 +80,97 @@ impl<'r> FromRow<'r, PgRow> for EpisodicRow {
             event_time: row.try_get("event_time")?,
             superseded_by: row.try_get("superseded_by")?,
             invalid_at: row.try_get("invalid_at")?,
+            agent_id: row.try_get("agent_id").unwrap_or(None),
+            user_id: row.try_get("user_id").unwrap_or(None),
         })
     }
 }
 
-type SemanticRow = (
-    Uuid,
-    Uuid,
-    Uuid,
-    String,
-    String,
-    Option<Uuid>,
-    f32,
-    DateTime<Utc>,
-    Option<DateTime<Utc>>,
-    serde_json::Value,
-    Option<String>,
-    f32,
-    f32,
-    Option<Uuid>,
-);
+struct SemanticRow {
+    id: Uuid,
+    namespace_id: Uuid,
+    subject: Uuid,
+    predicate: String,
+    object: String,
+    object_entity: Option<Uuid>,
+    confidence: f32,
+    valid_at: DateTime<Utc>,
+    invalid_at: Option<DateTime<Utc>>,
+    source_episodes: serde_json::Value,
+    embedding_text: Option<String>,
+    stability: f32,
+    retrievability: f32,
+    superseded_by: Option<Uuid>,
+    agent_id: Option<Uuid>,
+    user_id: Option<Uuid>,
+}
 
-type ProceduralRow = (
-    Uuid,
-    Uuid,
-    String,
-    String,
-    String,
-    serde_json::Value,
-    f32,
-    i32,
-    i32,
-    serde_json::Value,
-    Option<String>,
-    DateTime<Utc>,
-    Option<DateTime<Utc>>,
-    Option<Uuid>,
-    Option<DateTime<Utc>>,
-);
+impl<'r> FromRow<'r, PgRow> for SemanticRow {
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx_core::error::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            namespace_id: row.try_get("namespace_id")?,
+            subject: row.try_get("subject")?,
+            predicate: row.try_get("predicate")?,
+            object: row.try_get("object")?,
+            object_entity: row.try_get("object_entity")?,
+            confidence: row.try_get("confidence")?,
+            valid_at: row.try_get("valid_at")?,
+            invalid_at: row.try_get("invalid_at")?,
+            source_episodes: row.try_get("source_episodes")?,
+            embedding_text: row.try_get("embedding")?,
+            stability: row.try_get("stability")?,
+            retrievability: row.try_get("retrievability")?,
+            superseded_by: row.try_get("superseded_by")?,
+            agent_id: row.try_get("agent_id").unwrap_or(None),
+            user_id: row.try_get("user_id").unwrap_or(None),
+        })
+    }
+}
+
+struct ProceduralRow {
+    id: Uuid,
+    namespace_id: Uuid,
+    trigger: String,
+    action: String,
+    outcome: String,
+    context: serde_json::Value,
+    reliability: f32,
+    trial_count: i32,
+    success_count: i32,
+    source_episodes: serde_json::Value,
+    embedding_text: Option<String>,
+    created_at: DateTime<Utc>,
+    last_used: Option<DateTime<Utc>>,
+    superseded_by: Option<Uuid>,
+    invalid_at: Option<DateTime<Utc>>,
+    agent_id: Option<Uuid>,
+    user_id: Option<Uuid>,
+}
+
+impl<'r> FromRow<'r, PgRow> for ProceduralRow {
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx_core::error::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            namespace_id: row.try_get("namespace_id")?,
+            trigger: row.try_get("trigger_text")?,
+            action: row.try_get("action")?,
+            outcome: row.try_get("outcome")?,
+            context: row.try_get("context")?,
+            reliability: row.try_get("reliability")?,
+            trial_count: row.try_get("trial_count")?,
+            success_count: row.try_get("success_count")?,
+            source_episodes: row.try_get("source_episodes")?,
+            embedding_text: row.try_get("embedding")?,
+            created_at: row.try_get("created_at")?,
+            last_used: row.try_get("last_used")?,
+            superseded_by: row.try_get("superseded_by")?,
+            invalid_at: row.try_get("invalid_at")?,
+            agent_id: row.try_get("agent_id").unwrap_or(None),
+            user_id: row.try_get("user_id").unwrap_or(None),
+        })
+    }
+}
 
 struct ObservationRow {
     id: Uuid,
@@ -131,6 +190,8 @@ struct ObservationRow {
     retrievability: f32,
     superseded_by: Option<Uuid>,
     invalid_at: Option<DateTime<Utc>>,
+    agent_id: Option<Uuid>,
+    user_id: Option<Uuid>,
 }
 
 impl<'r> FromRow<'r, PgRow> for ObservationRow {
@@ -153,6 +214,8 @@ impl<'r> FromRow<'r, PgRow> for ObservationRow {
             retrievability: row.try_get("retrievability")?,
             superseded_by: row.try_get("superseded_by")?,
             invalid_at: row.try_get("invalid_at")?,
+            agent_id: row.try_get("agent_id").unwrap_or(None),
+            user_id: row.try_get("user_id").unwrap_or(None),
         })
     }
 }
@@ -926,14 +989,15 @@ async fn save_memory_in_pg_tx(
                 r"INSERT INTO episodic_memories
                (id, namespace_id, episode_id, source_entity, about_entity, content, summary,
                 embedding, context_intent, timestamp, stability, retrievability,
-                access_count, last_accessed, event_time, superseded_by, invalid_at)
+                access_count, last_accessed, event_time, superseded_by, invalid_at, agent_id,
+                user_id)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13,
-                       $14, $15, $16, $17)
+                       $14, $15, $16, $17, $18, $19)
                ON CONFLICT (id) DO UPDATE SET
                    content = $6, summary = $7, embedding = $8::vector, context_intent = $9,
                    stability = $11, retrievability = $12, access_count = $13,
                    last_accessed = $14, event_time = $15, superseded_by = $16,
-                   invalid_at = $17
+                   invalid_at = $17, agent_id = $18, user_id = $19
                WHERE episodic_memories.namespace_id = EXCLUDED.namespace_id",
             )
             .bind(memory.id)
@@ -953,6 +1017,8 @@ async fn save_memory_in_pg_tx(
             .bind(memory.event_time)
             .bind(memory.superseded_by)
             .bind(memory.invalid_at)
+            .bind(memory.agent_id)
+            .bind(memory.user_id)
             .execute(&mut **transaction)
             .await
         }
@@ -962,13 +1028,14 @@ async fn save_memory_in_pg_tx(
                 r"INSERT INTO semantic_memories
                    (id, namespace_id, subject, predicate, object, object_entity, confidence,
                     valid_at, invalid_at, source_episodes, embedding, stability, retrievability,
-                    superseded_by)
+                    superseded_by, agent_id, user_id)
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::vector, $12, $13,
-                           $14)
+                           $14, $15, $16)
                    ON CONFLICT (id) DO UPDATE SET
                        predicate = $4, object = $5, object_entity = $6, confidence = $7,
                        invalid_at = $9, source_episodes = $10, embedding = $11::vector,
-                       stability = $12, retrievability = $13, superseded_by = $14
+                       stability = $12, retrievability = $13, superseded_by = $14,
+                       agent_id = $15, user_id = $16
                    WHERE semantic_memories.namespace_id = EXCLUDED.namespace_id",
             )
             .bind(memory.id)
@@ -985,6 +1052,8 @@ async fn save_memory_in_pg_tx(
             .bind(memory.stability)
             .bind(memory.retrievability)
             .bind(memory.superseded_by)
+            .bind(memory.agent_id)
+            .bind(memory.user_id)
             .execute(&mut **transaction)
             .await
         }
@@ -995,14 +1064,14 @@ async fn save_memory_in_pg_tx(
                 r"INSERT INTO procedural_memories
                    (id, namespace_id, trigger_text, action, outcome, context, reliability,
                     trial_count, success_count, source_episodes, embedding, created_at, last_used,
-                    superseded_by, invalid_at)
+                    superseded_by, invalid_at, agent_id, user_id)
                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::vector, $12, $13,
-                           $14, $15)
+                           $14, $15, $16, $17)
                    ON CONFLICT (id) DO UPDATE SET
                        trigger_text = $3, action = $4, outcome = $5, context = $6,
                        reliability = $7, trial_count = $8, success_count = $9,
                        source_episodes = $10, embedding = $11::vector, last_used = $13,
-                       superseded_by = $14, invalid_at = $15
+                       superseded_by = $14, invalid_at = $15, agent_id = $16, user_id = $17
                    WHERE procedural_memories.namespace_id = EXCLUDED.namespace_id",
             )
             .bind(memory.id)
@@ -1020,6 +1089,8 @@ async fn save_memory_in_pg_tx(
             .bind(memory.last_used)
             .bind(memory.superseded_by)
             .bind(memory.invalid_at)
+            .bind(memory.agent_id)
+            .bind(memory.user_id)
             .execute(&mut **transaction)
             .await
         }
@@ -1028,14 +1099,14 @@ async fn save_memory_in_pg_tx(
                 r"INSERT INTO observation_memories
                (id, namespace_id, episode_id, entity_type, instance, action, quantity, unit,
                 content, embedding, confidence, event_time, created_at, stability, retrievability,
-                superseded_by, invalid_at)
+                superseded_by, invalid_at, agent_id, user_id)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::vector, $11, $12, $13, $14,
-                       $15, $16, $17)
+                       $15, $16, $17, $18, $19)
                ON CONFLICT (id) DO UPDATE SET
                    entity_type = $4, instance = $5, action = $6, quantity = $7, unit = $8,
                    content = $9, embedding = $10::vector, confidence = $11,
                    event_time = $12, stability = $14, retrievability = $15,
-                   superseded_by = $16, invalid_at = $17
+                   superseded_by = $16, invalid_at = $17, agent_id = $18, user_id = $19
                WHERE observation_memories.namespace_id = EXCLUDED.namespace_id",
             )
             .bind(memory.id)
@@ -1055,6 +1126,8 @@ async fn save_memory_in_pg_tx(
             .bind(memory.retrievability)
             .bind(memory.superseded_by)
             .bind(memory.invalid_at)
+            .bind(memory.agent_id)
+            .bind(memory.user_id)
             .execute(&mut **transaction)
             .await
         }
@@ -1145,11 +1218,391 @@ async fn insert_embedding_in_pg_tx(
     Ok(())
 }
 
+fn memory_type_from_str(value: &str) -> StorageResult<MemoryType> {
+    match value {
+        "episodic" => Ok(MemoryType::Episodic),
+        "semantic" => Ok(MemoryType::Semantic),
+        "procedural" => Ok(MemoryType::Procedural),
+        "observation" => Ok(MemoryType::Observation),
+        other => Err(StorageError::Context(format!(
+            "unknown stored memory type {other:?}"
+        ))),
+    }
+}
+
+fn memory_type_order(memory_type: MemoryType) -> i32 {
+    match memory_type {
+        MemoryType::Episodic => 0,
+        MemoryType::Semantic => 1,
+        MemoryType::Procedural => 2,
+        MemoryType::Observation => 3,
+    }
+}
+
+async fn load_memory_without_embedding_pg(
+    conn: &mut PgConnection,
+    namespace_id: Uuid,
+    memory_ref: MemoryRef,
+) -> StorageResult<Option<Memory>> {
+    match memory_ref.memory_type {
+        MemoryType::Episodic => {
+            let row = query_as::<Postgres, EpisodicRow>(
+                r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
+                          summary, NULL::text AS embedding, context_intent, timestamp, stability,
+                          retrievability, access_count, last_accessed, event_time, superseded_by,
+                          invalid_at, agent_id, user_id
+                   FROM episodic_memories WHERE id = $1 AND namespace_id = $2",
+            )
+            .bind(memory_ref.id)
+            .bind(namespace_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(row.map(row_to_episodic).map(Memory::Episodic))
+        }
+        MemoryType::Semantic => {
+            let row = query_as::<Postgres, SemanticRow>(
+                r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
+                          valid_at, invalid_at, source_episodes, NULL::text AS embedding, stability,
+                          retrievability, superseded_by, agent_id, user_id
+                   FROM semantic_memories WHERE id = $1 AND namespace_id = $2",
+            )
+            .bind(memory_ref.id)
+            .bind(namespace_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(row.map(row_to_semantic).map(Memory::Semantic))
+        }
+        MemoryType::Procedural => {
+            let row = query_as::<Postgres, ProceduralRow>(
+                r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
+                          trial_count, success_count, source_episodes, NULL::text AS embedding,
+                          created_at, last_used, superseded_by, invalid_at, agent_id, user_id
+                   FROM procedural_memories WHERE id = $1 AND namespace_id = $2",
+            )
+            .bind(memory_ref.id)
+            .bind(namespace_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(row.map(row_to_procedural).map(Memory::Procedural))
+        }
+        MemoryType::Observation => {
+            let row = query_as::<Postgres, ObservationRow>(
+                r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
+                          unit, content, NULL::text AS embedding, confidence, event_time, created_at,
+                          stability, retrievability, superseded_by, invalid_at, agent_id, user_id
+                   FROM observation_memories WHERE id = $1 AND namespace_id = $2",
+            )
+            .bind(memory_ref.id)
+            .bind(namespace_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(row.map(row_to_observation).map(Memory::Observation))
+        }
+    }
+}
+
+fn ensure_hydrated_payload_fits(
+    memories: &[Memory],
+    requested_max_bytes: usize,
+) -> StorageResult<()> {
+    let max_bytes = requested_max_bytes.min(MAX_HYDRATED_BYTES);
+    let mut total = 0_usize;
+    for memory in memories {
+        let bytes = serde_json::to_vec(memory)?.len();
+        total = total.checked_add(bytes).ok_or_else(|| {
+            StorageError::BudgetExceeded("hydrated payload byte count overflowed usize".into())
+        })?;
+        if total > max_bytes {
+            return Err(StorageError::BudgetExceeded(format!(
+                "hydrated payload exceeds {max_bytes} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // StorageTrait implementation
 // ---------------------------------------------------------------------------
 
 impl StorageTrait for PostgresBackend {
+    fn search_lexical_hits(
+        &self,
+        query_str: &str,
+        scope: &SearchScope,
+        limit: usize,
+    ) -> StorageResult<Vec<LexicalHit>> {
+        let tokens = query_str
+            .split_whitespace()
+            .take(super::MAX_FTS_QUERY_TOKENS)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let limit = limit.min(MAX_LEXICAL_HITS);
+        if tokens.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let tsquery = or_tsquery_fragment(5, tokens.len());
+        let sql = format!(
+            "SELECT memory_type, id, score FROM ( \
+                 SELECT 'episodic' AS memory_type, id, ts_rank(fts_content, {tsquery}) AS score \
+                 FROM episodic_memories \
+                 WHERE namespace_id = $1 AND ($3::uuid IS NULL OR agent_id = $3) \
+                   AND ($4::uuid IS NULL OR user_id = $4) \
+                   AND superseded_by IS NULL AND invalid_at IS NULL \
+                   AND fts_content @@ {tsquery} \
+                 UNION ALL \
+                 SELECT 'semantic', id, ts_rank(fts_content, {tsquery}) \
+                 FROM semantic_memories \
+                 WHERE namespace_id = $1 AND ($3::uuid IS NULL OR agent_id = $3) \
+                   AND ($4::uuid IS NULL OR user_id = $4) \
+                   AND superseded_by IS NULL AND invalid_at IS NULL \
+                   AND fts_content @@ {tsquery} \
+                 UNION ALL \
+                 SELECT 'procedural', id, ts_rank(fts_content, {tsquery}) \
+                 FROM procedural_memories \
+                 WHERE namespace_id = $1 AND ($3::uuid IS NULL OR agent_id = $3) \
+                   AND ($4::uuid IS NULL OR user_id = $4) \
+                   AND superseded_by IS NULL AND invalid_at IS NULL \
+                   AND fts_content @@ {tsquery} \
+                 UNION ALL \
+                 SELECT 'observation', id, ts_rank(fts_content, {tsquery}) \
+                 FROM observation_memories \
+                 WHERE namespace_id = $1 AND ($3::uuid IS NULL OR agent_id = $3) \
+                   AND ($4::uuid IS NULL OR user_id = $4) \
+                   AND superseded_by IS NULL AND invalid_at IS NULL \
+                   AND fts_content @@ {tsquery} \
+             ) AS ranked \
+             ORDER BY score DESC, CASE memory_type \
+                 WHEN 'episodic' THEN 0 WHEN 'semantic' THEN 1 \
+                 WHEN 'procedural' THEN 2 ELSE 3 END, id \
+             LIMIT $2"
+        );
+        self.block_on(async {
+            let mut conn = self.scoped_conn(scope.namespace_id).await?;
+            let mut query = query_as::<Postgres, (String, Uuid, f32)>(AssertSqlSafe(sql))
+                .bind(scope.namespace_id)
+                .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+                .bind(scope.agent_id)
+                .bind(scope.user_id);
+            for token in &tokens {
+                query = query.bind(token);
+            }
+            let rows = query.fetch_all(&mut *conn).await.map_err(sqlx_to_io)?;
+            rows.into_iter()
+                .enumerate()
+                .map(|(index, (memory_type, id, _score))| {
+                    Ok(LexicalHit {
+                        memory_ref: MemoryRef {
+                            memory_type: memory_type_from_str(&memory_type)?,
+                            id,
+                        },
+                        rank: index + 1,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn hydrate_memories(
+        &self,
+        namespace_id: Uuid,
+        memory_refs: &[MemoryRef],
+        max_bytes: usize,
+    ) -> StorageResult<Vec<Memory>> {
+        if memory_refs.len() > MAX_FUSED_HITS {
+            return Err(StorageError::BudgetExceeded(format!(
+                "memory hydration accepts at most {MAX_FUSED_HITS} references"
+            )));
+        }
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut memories = Vec::with_capacity(memory_refs.len());
+            for memory_ref in memory_refs {
+                if let Some(memory) =
+                    load_memory_without_embedding_pg(&mut conn, namespace_id, *memory_ref).await?
+                {
+                    memories.push(memory);
+                }
+            }
+            ensure_hydrated_payload_fits(&memories, max_bytes)?;
+            Ok(memories)
+        })
+    }
+
+    fn load_embedding_records(
+        &self,
+        namespace_id: Uuid,
+        embedding_space_id: &EmbeddingSpaceId,
+        memory_refs: &[MemoryRef],
+    ) -> StorageResult<Vec<EmbeddingRecord>> {
+        let unique_refs = memory_refs.iter().copied().collect::<BTreeSet<_>>();
+        if unique_refs.len() > MAX_FUSED_HITS {
+            return Err(StorageError::BudgetExceeded(format!(
+                "embedding load accepts at most {MAX_FUSED_HITS} unique references"
+            )));
+        }
+        if unique_refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let memory_types = unique_refs
+            .iter()
+            .map(|memory_ref| memory_type_str(memory_ref.memory_type).to_owned())
+            .collect::<Vec<_>>();
+        let memory_ids = unique_refs
+            .iter()
+            .map(|memory_ref| memory_ref.id)
+            .collect::<Vec<_>>();
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let rows: Vec<(String, Uuid, String, String, i32)> = query_as::<Postgres, _>(
+                r"SELECT e.memory_type, e.memory_id, e.source_sha256,
+                          e.embedding::text, s.dimension
+                   FROM unnest($3::text[], $4::uuid[]) AS requested(memory_type, memory_id)
+                   JOIN memory_embeddings e
+                     ON e.memory_type = requested.memory_type
+                    AND e.memory_id = requested.memory_id
+                   JOIN embedding_spaces s ON s.id = e.embedding_space_id
+                   WHERE e.namespace_id = $1 AND e.embedding_space_id = $2
+                   ORDER BY CASE e.memory_type
+                       WHEN 'episodic' THEN 0 WHEN 'semantic' THEN 1
+                       WHEN 'procedural' THEN 2 ELSE 3 END, e.memory_id",
+            )
+            .bind(namespace_id)
+            .bind(&embedding_space_id.0)
+            .bind(&memory_types)
+            .bind(&memory_ids)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let mut records = Vec::with_capacity(rows.len());
+            for (memory_type, id, source_sha256, encoded, dimension) in rows {
+                let memory_ref = MemoryRef {
+                    memory_type: memory_type_from_str(&memory_type)?,
+                    id,
+                };
+                if !unique_refs.contains(&memory_ref) {
+                    return Err(StorageError::Context(format!(
+                        "embedding load returned an unrequested key {memory_ref:?}"
+                    )));
+                }
+                let embedding = pgtext_to_embedding(Some(&encoded));
+                if usize::try_from(dimension).ok() != Some(embedding.len())
+                    || embedding.is_empty()
+                    || embedding.iter().any(|value| !value.is_finite())
+                {
+                    return Err(StorageError::Context(format!(
+                        "embedding for {id} does not match its registered finite dimension"
+                    )));
+                }
+                records.push(EmbeddingRecord {
+                    namespace_id,
+                    memory_ref,
+                    embedding_space_id: embedding_space_id.clone(),
+                    source_sha256,
+                    embedding,
+                });
+            }
+            Ok(records)
+        })
+    }
+
+    fn page_memories(&self, request: &MemoryPageRequest) -> StorageResult<MemoryPage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&request.limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "memory page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        let after_type = request
+            .after
+            .as_ref()
+            .map_or(-1, |cursor| memory_type_order(cursor.memory_type));
+        let after_id = request
+            .after
+            .as_ref()
+            .map_or(Uuid::nil(), |cursor| cursor.id);
+        self.block_on(async {
+            let mut conn = self.scoped_conn(request.scope.namespace_id).await?;
+            let rows: Vec<(String, Uuid)> = query_as::<Postgres, _>(
+                r"SELECT memory_type, id FROM (
+                       SELECT 0 AS type_order, 'episodic'::text AS memory_type, id
+                       FROM episodic_memories
+                       WHERE namespace_id = $1 AND ($2::uuid IS NULL OR agent_id = $2)
+                         AND ($3::uuid IS NULL OR user_id = $3)
+                         AND ($4 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                       UNION ALL
+                       SELECT 1, 'semantic', id FROM semantic_memories
+                       WHERE namespace_id = $1 AND ($2::uuid IS NULL OR agent_id = $2)
+                         AND ($3::uuid IS NULL OR user_id = $3)
+                         AND ($4 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                       UNION ALL
+                       SELECT 2, 'procedural', id FROM procedural_memories
+                       WHERE namespace_id = $1 AND ($2::uuid IS NULL OR agent_id = $2)
+                         AND ($3::uuid IS NULL OR user_id = $3)
+                         AND ($4 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                       UNION ALL
+                       SELECT 3, 'observation', id FROM observation_memories
+                       WHERE namespace_id = $1 AND ($2::uuid IS NULL OR agent_id = $2)
+                         AND ($3::uuid IS NULL OR user_id = $3)
+                         AND ($4 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                   ) AS memories
+                   WHERE type_order > $5 OR (type_order = $5 AND id > $6)
+                   ORDER BY type_order, id
+                   LIMIT $7",
+            )
+            .bind(request.scope.namespace_id)
+            .bind(request.scope.agent_id)
+            .bind(request.scope.user_id)
+            .bind(request.include_superseded)
+            .bind(after_type)
+            .bind(after_id)
+            .bind(i64::try_from(request.limit + 1).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let has_more = rows.len() > request.limit;
+            let refs = rows
+                .into_iter()
+                .take(request.limit)
+                .map(|(memory_type, id)| {
+                    Ok(MemoryRef {
+                        memory_type: memory_type_from_str(&memory_type)?,
+                        id,
+                    })
+                })
+                .collect::<StorageResult<Vec<_>>>()?;
+            let next_cursor = has_more.then(|| {
+                let memory_ref = refs
+                    .last()
+                    .copied()
+                    .expect("a page with more rows is non-empty");
+                PageCursor {
+                    memory_type: memory_ref.memory_type,
+                    id: memory_ref.id,
+                }
+            });
+            let mut memories = Vec::with_capacity(refs.len());
+            for memory_ref in refs {
+                if let Some(memory) = load_memory_without_embedding_pg(
+                    &mut conn,
+                    request.scope.namespace_id,
+                    memory_ref,
+                )
+                .await?
+                {
+                    memories.push(memory);
+                }
+            }
+            Ok(MemoryPage {
+                memories,
+                next_cursor,
+            })
+        })
+    }
+
     fn save_memory_with_embedding(
         &self,
         memory: &Memory,
@@ -2916,6 +3369,8 @@ fn row_to_episodic(row: EpisodicRow) -> EpisodicMemory {
         event_time,
         superseded_by,
         invalid_at,
+        agent_id,
+        user_id,
     } = row;
     EpisodicMemory {
         id,
@@ -2938,17 +3393,13 @@ fn row_to_episodic(row: EpisodicRow) -> EpisodicMemory {
         event_time,
         superseded_by,
         invalid_at,
-        // G1: postgres backend does not yet carry the multi-tenant scope
-        // columns. The struct fields exist for trait/serde compatibility
-        // but are always None on this backend until the postgres schema
-        // adds matching columns in a follow-up.
-        agent_id: None,
-        user_id: None,
+        agent_id,
+        user_id,
     }
 }
 
 fn row_to_semantic(row: SemanticRow) -> SemanticMemory {
-    let (
+    let SemanticRow {
         id,
         namespace_id,
         subject,
@@ -2958,12 +3409,14 @@ fn row_to_semantic(row: SemanticRow) -> SemanticMemory {
         confidence,
         valid_at,
         invalid_at,
-        source_episodes_json,
+        source_episodes: source_episodes_json,
         embedding_text,
         stability,
         retrievability,
         superseded_by,
-    ) = row;
+        agent_id,
+        user_id,
+    } = row;
     let source_episodes: Vec<Uuid> =
         serde_json::from_value(source_episodes_json).unwrap_or_default();
     SemanticMemory {
@@ -2982,30 +3435,31 @@ fn row_to_semantic(row: SemanticRow) -> SemanticMemory {
         embedding: pgtext_to_embedding(embedding_text.as_deref()),
         stability,
         retrievability,
-        // G1: postgres backend does not yet carry the multi-tenant scope columns.
-        agent_id: None,
-        user_id: None,
+        agent_id,
+        user_id,
     }
 }
 
 fn row_to_procedural(row: ProceduralRow) -> ProceduralMemory {
-    let (
+    let ProceduralRow {
         id,
         namespace_id,
         trigger,
         action,
-        outcome_str,
-        context_json,
+        outcome: outcome_str,
+        context: context_json,
         reliability,
         trial_count,
         success_count,
-        source_episodes_json,
+        source_episodes: source_episodes_json,
         embedding_text,
         created_at,
         last_used,
         superseded_by,
         invalid_at,
-    ) = row;
+        agent_id,
+        user_id,
+    } = row;
     let context: HashMap<String, serde_json::Value> =
         serde_json::from_value(context_json).unwrap_or_default();
     let source_episodes: Vec<Uuid> =
@@ -3026,9 +3480,8 @@ fn row_to_procedural(row: ProceduralRow) -> ProceduralMemory {
         last_used,
         superseded_by,
         invalid_at,
-        // G1: postgres backend does not yet carry the multi-tenant scope columns.
-        agent_id: None,
-        user_id: None,
+        agent_id,
+        user_id,
     }
 }
 
@@ -3067,6 +3520,8 @@ fn row_to_observation(row: ObservationRow) -> ObservationMemory {
         retrievability,
         superseded_by,
         invalid_at,
+        agent_id,
+        user_id,
     } = row;
     ObservationMemory {
         id,
@@ -3086,9 +3541,8 @@ fn row_to_observation(row: ObservationRow) -> ObservationMemory {
         retrievability,
         superseded_by,
         invalid_at,
-        // G1: postgres backend does not yet carry the multi-tenant scope columns.
-        agent_id: None,
-        user_id: None,
+        agent_id,
+        user_id,
     }
 }
 
@@ -3124,6 +3578,8 @@ mod tests {
         let now = Utc::now();
         let successor = Uuid::new_v4();
         let namespace_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
 
         let episodic = row_to_episodic(EpisodicRow {
             id: Uuid::new_v4(),
@@ -3143,46 +3599,52 @@ mod tests {
             event_time: None,
             superseded_by: Some(successor),
             invalid_at: Some(now),
+            agent_id: Some(agent_id),
+            user_id: Some(user_id),
         });
         assert_eq!(episodic.superseded_by, Some(successor));
         assert_eq!(episodic.invalid_at, Some(now));
 
-        let semantic = row_to_semantic((
-            Uuid::new_v4(),
+        let semantic = row_to_semantic(SemanticRow {
+            id: Uuid::new_v4(),
             namespace_id,
-            Uuid::new_v4(),
-            "predicate".to_string(),
-            "object".to_string(),
-            None,
-            0.9,
-            now,
-            Some(now),
-            serde_json::json!([]),
-            None,
-            1.0,
-            1.0,
-            Some(successor),
-        ));
+            subject: Uuid::new_v4(),
+            predicate: "predicate".to_string(),
+            object: "object".to_string(),
+            object_entity: None,
+            confidence: 0.9,
+            valid_at: now,
+            invalid_at: Some(now),
+            source_episodes: serde_json::json!([]),
+            embedding_text: None,
+            stability: 1.0,
+            retrievability: 1.0,
+            superseded_by: Some(successor),
+            agent_id: Some(agent_id),
+            user_id: Some(user_id),
+        });
         assert_eq!(semantic.superseded_by, Some(successor));
         assert_eq!(semantic.invalid_at, Some(now));
 
-        let procedural = row_to_procedural((
-            Uuid::new_v4(),
+        let procedural = row_to_procedural(ProceduralRow {
+            id: Uuid::new_v4(),
             namespace_id,
-            "trigger".to_string(),
-            "action".to_string(),
-            "Success".to_string(),
-            serde_json::json!({}),
-            0.9,
-            1,
-            1,
-            serde_json::json!([]),
-            None,
-            now,
-            None,
-            Some(successor),
-            Some(now),
-        ));
+            trigger: "trigger".to_string(),
+            action: "action".to_string(),
+            outcome: "Success".to_string(),
+            context: serde_json::json!({}),
+            reliability: 0.9,
+            trial_count: 1,
+            success_count: 1,
+            source_episodes: serde_json::json!([]),
+            embedding_text: None,
+            created_at: now,
+            last_used: None,
+            superseded_by: Some(successor),
+            invalid_at: Some(now),
+            agent_id: Some(agent_id),
+            user_id: Some(user_id),
+        });
         assert_eq!(procedural.superseded_by, Some(successor));
         assert_eq!(procedural.invalid_at, Some(now));
 
@@ -3204,9 +3666,20 @@ mod tests {
             retrievability: 1.0,
             superseded_by: Some(successor),
             invalid_at: Some(now),
+            agent_id: Some(agent_id),
+            user_id: Some(user_id),
         });
         assert_eq!(observation.superseded_by, Some(successor));
         assert_eq!(observation.invalid_at, Some(now));
+        for (actual_agent, actual_user) in [
+            (episodic.agent_id, episodic.user_id),
+            (semantic.agent_id, semantic.user_id),
+            (procedural.agent_id, procedural.user_id),
+            (observation.agent_id, observation.user_id),
+        ] {
+            assert_eq!(actual_agent, Some(agent_id));
+            assert_eq!(actual_user, Some(user_id));
+        }
     }
 
     use rusqlite::{Connection, params};
