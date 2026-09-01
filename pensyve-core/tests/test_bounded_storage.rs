@@ -633,6 +633,75 @@ fn sqlite_streaming_pushes_scope_generation_live_and_observation_predicates_into
 }
 
 #[test]
+fn sqlite_streaming_keeps_cross_type_uuid_collisions_typed_and_excludes_observations() {
+    let (dir, db, namespace) = sqlite_fixture();
+    register_embedding_space(dir.path(), "collision-space", 2);
+    let id = 42;
+    let episodic = episodic(namespace.id, id, "collision episodic");
+    let semantic = semantic(namespace.id, id, "collision semantic");
+    let procedural = procedural(namespace.id, id, "collision procedural");
+    let observation = observation(namespace.id, id, "collision observation");
+    save_vector(&db, &episodic, "collision-space", vec![1.0, 0.0]);
+    save_vector(&db, &semantic, "collision-space", vec![0.0, 1.0]);
+    save_vector(&db, &procedural, "collision-space", vec![-1.0, 0.0]);
+    save_vector(&db, &observation, "collision-space", vec![1.0, 0.0]);
+    let query = [1.0, 0.0];
+    let request = VectorSearchRequest::new(
+        SearchScope::namespace(namespace.id),
+        "collision-space",
+        &query,
+        100,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+
+    let hits = complete_hits(db.search_vector(&request).unwrap());
+    assert_eq!(
+        hits.iter().map(|hit| hit.memory_ref).collect::<Vec<_>>(),
+        vec![
+            MemoryRef {
+                memory_type: MemoryType::Episodic,
+                id: Uuid::from_u128(id),
+            },
+            MemoryRef {
+                memory_type: MemoryType::Semantic,
+                id: Uuid::from_u128(id),
+            },
+            MemoryRef {
+                memory_type: MemoryType::Procedural,
+                id: Uuid::from_u128(id),
+            },
+        ]
+    );
+    assert_eq!(
+        hits.iter().map(|hit| hit.score).collect::<Vec<_>>(),
+        vec![1.0, 0.0, -1.0]
+    );
+}
+
+#[test]
+fn sqlite_streaming_zero_norm_query_returns_no_hits() {
+    let (dir, db, namespace) = sqlite_fixture();
+    register_embedding_space(dir.path(), "zero-query-space", 2);
+    let memory = episodic(namespace.id, 1, "zero query");
+    save_vector(&db, &memory, "zero-query-space", vec![1.0, 0.0]);
+    let query = [0.0, 0.0];
+    let request = VectorSearchRequest::new(
+        SearchScope::namespace(namespace.id),
+        "zero-query-space",
+        &query,
+        10,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.search_vector(&request).unwrap(),
+        VectorSearchOutcome::Complete(Vec::new())
+    );
+}
+
+#[test]
 fn sqlite_streaming_discards_partial_hits_when_deadline_expires() {
     let (dir, db, namespace) = sqlite_fixture();
     register_embedding_space(dir.path(), "deadline-space", 2);

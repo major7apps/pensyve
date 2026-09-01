@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -58,6 +58,8 @@ pub struct SqliteBackend {
     decoded_vectors_live: AtomicUsize,
     #[cfg(test)]
     decoded_vectors_peak: AtomicUsize,
+    #[cfg(test)]
+    forced_deadline_boundary: AtomicU8,
 }
 
 impl SqliteBackend {
@@ -80,6 +82,8 @@ impl SqliteBackend {
             decoded_vectors_live: AtomicUsize::new(0),
             #[cfg(test)]
             decoded_vectors_peak: AtomicUsize::new(0),
+            #[cfg(test)]
+            forced_deadline_boundary: AtomicU8::new(0),
         };
         backend.run_schema()?;
         Ok(backend)
@@ -97,6 +101,11 @@ impl SqliteBackend {
     }
 
     #[cfg(test)]
+    fn live_decoded_row_vectors(&self) -> usize {
+        self.decoded_vectors_live.load(AtomicOrdering::SeqCst)
+    }
+
+    #[cfg(test)]
     fn begin_vector_decode(&self) -> VectorDecodeGuard<'_> {
         let live = self
             .decoded_vectors_live
@@ -107,6 +116,78 @@ impl SqliteBackend {
         VectorDecodeGuard {
             live: &self.decoded_vectors_live,
         }
+    }
+
+    #[cfg(test)]
+    fn force_vector_deadline_at(&self, boundary: VectorDeadlineBoundary) {
+        self.forced_deadline_boundary
+            .store(boundary as u8, AtomicOrdering::SeqCst);
+    }
+
+    fn vector_deadline_expired(
+        &self,
+        deadline: std::time::Instant,
+        boundary: VectorDeadlineBoundary,
+    ) -> bool {
+        #[cfg(not(test))]
+        let _ = self;
+        if std::time::Instant::now() >= deadline {
+            return true;
+        }
+        #[cfg(test)]
+        if self
+            .forced_deadline_boundary
+            .compare_exchange(
+                boundary as u8,
+                0,
+                AtomicOrdering::SeqCst,
+                AtomicOrdering::SeqCst,
+            )
+            .is_ok()
+        {
+            return true;
+        }
+        #[cfg(not(test))]
+        let _ = boundary;
+        false
+    }
+
+    fn complete_vector_search(
+        &self,
+        deadline: std::time::Instant,
+        hits: Vec<VectorHit>,
+    ) -> VectorSearchOutcome {
+        if self.vector_deadline_expired(deadline, VectorDeadlineBoundary::BeforeComplete) {
+            vector_unavailable(SearchUnavailable::DeadlineExceeded)
+        } else {
+            VectorSearchOutcome::Complete(hits)
+        }
+    }
+
+    fn decode_stored_vector<'a>(
+        &'a self,
+        bytes: &[u8],
+        expected_dimension: usize,
+    ) -> Result<DecodedRowVector<'a>, SearchUnavailable> {
+        #[cfg(not(test))]
+        let _ = self;
+        if !bytes.len().is_multiple_of(std::mem::size_of::<f32>()) {
+            return Err(SearchUnavailable::InvalidStoredVector);
+        }
+        let values = blob_to_embedding(bytes);
+        if values.len() != expected_dimension
+            || values.is_empty()
+            || values.iter().any(|value| !value.is_finite())
+        {
+            return Err(SearchUnavailable::InvalidStoredVector);
+        }
+        Ok(DecodedRowVector {
+            values,
+            #[cfg(test)]
+            _guard: self.begin_vector_decode(),
+            #[cfg(not(test))]
+            _marker: std::marker::PhantomData,
+        })
     }
 
     fn run_schema(&self) -> StorageResult<()> {
@@ -636,6 +717,14 @@ impl Drop for VectorDecodeGuard<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum VectorDeadlineBoundary {
+    Initial = 1,
+    AfterConnection = 2,
+    DuringScan = 3,
+    BeforeComplete = 4,
+}
+
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
@@ -810,6 +899,22 @@ fn blob_to_embedding(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+struct DecodedRowVector<'a> {
+    values: Vec<f32>,
+    #[cfg(test)]
+    _guard: VectorDecodeGuard<'a>,
+    #[cfg(not(test))]
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl std::ops::Deref for DecodedRowVector<'_> {
+    type Target = [f32];
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
 struct RankedVectorHit(VectorHit);
 
 impl PartialEq for RankedVectorHit {
@@ -850,6 +955,7 @@ const SQLITE_VECTOR_SEARCH_SQL: &str = r"SELECT 'episodic' AS memory_type,
          AND memory.namespace_id = embeddings.namespace_id
         WHERE embeddings.namespace_id = ?1
           AND embeddings.embedding_space_id = ?2
+          AND embeddings.memory_type = 'episodic'
           AND (?3 IS NULL OR memory.agent_id = ?3)
           AND (?4 IS NULL OR memory.user_id = ?4)
           AND (?5 IS NULL OR memory.about_entity = ?5 OR memory.source_entity = ?5)
@@ -862,6 +968,7 @@ const SQLITE_VECTOR_SEARCH_SQL: &str = r"SELECT 'episodic' AS memory_type,
          AND memory.namespace_id = embeddings.namespace_id
         WHERE embeddings.namespace_id = ?1
           AND embeddings.embedding_space_id = ?2
+          AND embeddings.memory_type = 'semantic'
           AND (?3 IS NULL OR memory.agent_id = ?3)
           AND (?4 IS NULL OR memory.user_id = ?4)
           AND (?5 IS NULL OR memory.subject = ?5 OR memory.object_entity = ?5)
@@ -874,6 +981,7 @@ const SQLITE_VECTOR_SEARCH_SQL: &str = r"SELECT 'episodic' AS memory_type,
          AND memory.namespace_id = embeddings.namespace_id
         WHERE embeddings.namespace_id = ?1
           AND embeddings.embedding_space_id = ?2
+          AND embeddings.memory_type = 'procedural'
           AND (?3 IS NULL OR memory.agent_id = ?3)
           AND (?4 IS NULL OR memory.user_id = ?4)
           AND ?5 IS NULL
@@ -1441,7 +1549,7 @@ impl StorageTrait for SqliteBackend {
                 request.k
             )));
         }
-        if std::time::Instant::now() >= request.deadline {
+        if self.vector_deadline_expired(request.deadline, VectorDeadlineBoundary::Initial) {
             return Ok(vector_unavailable(SearchUnavailable::DeadlineExceeded));
         }
 
@@ -1451,6 +1559,9 @@ impl StorageTrait for SqliteBackend {
         let user = request.scope.user_id.map(|value| value.to_string());
         let entity = request.scope.entity_id.map(|value| value.to_string());
         let conn = lock_conn!(self);
+        if self.vector_deadline_expired(request.deadline, VectorDeadlineBoundary::AfterConnection) {
+            return Ok(vector_unavailable(SearchUnavailable::DeadlineExceeded));
+        }
         let expected_dimension = conn
             .query_row(
                 "SELECT dimension FROM embedding_spaces WHERE id = ?1",
@@ -1476,6 +1587,9 @@ impl StorageTrait for SqliteBackend {
                 "query embedding must contain {expected_dimension} finite components"
             )));
         }
+        if request.query_embedding.iter().all(|value| *value == 0.0) {
+            return Ok(self.complete_vector_search(request.deadline, Vec::new()));
+        }
 
         let mut statement = conn.prepare(SQLITE_VECTOR_SEARCH_SQL)?;
         let mut rows = statement.query(params![namespace, space, agent, user, entity])?;
@@ -1485,25 +1599,17 @@ impl StorageTrait for SqliteBackend {
             if scanned >= SQLITE_MAX_SCANNED_VECTORS {
                 return Ok(vector_unavailable(SearchUnavailable::ScanBudgetExceeded));
             }
-            if std::time::Instant::now() >= request.deadline {
+            if self.vector_deadline_expired(request.deadline, VectorDeadlineBoundary::DuringScan) {
                 return Ok(vector_unavailable(SearchUnavailable::DeadlineExceeded));
             }
 
             let rusqlite::types::ValueRef::Blob(bytes) = row.get_ref(2)? else {
                 return Ok(vector_unavailable(SearchUnavailable::InvalidStoredVector));
             };
-            if bytes.len() % std::mem::size_of::<f32>() != 0 {
-                return Ok(vector_unavailable(SearchUnavailable::InvalidStoredVector));
-            }
-            #[cfg(test)]
-            let _decode_guard = self.begin_vector_decode();
-            let vector = blob_to_embedding(bytes);
-            if vector.len() != expected_dimension
-                || vector.is_empty()
-                || vector.iter().any(|value| !value.is_finite())
-            {
-                return Ok(vector_unavailable(SearchUnavailable::InvalidStoredVector));
-            }
+            let vector = match self.decode_stored_vector(bytes, expected_dimension) {
+                Ok(vector) => vector,
+                Err(reason) => return Ok(vector_unavailable(reason)),
+            };
             let score = crate::embedding::cosine_similarity(request.query_embedding, &vector);
             if !score.is_finite() {
                 return Ok(vector_unavailable(SearchUnavailable::InvalidStoredVector));
@@ -1535,7 +1641,7 @@ impl StorageTrait for SqliteBackend {
 
         let mut hits = heap.into_iter().map(|ranked| ranked.0).collect::<Vec<_>>();
         sort_vector_hits(&mut hits);
-        Ok(VectorSearchOutcome::Complete(hits))
+        Ok(self.complete_vector_search(request.deadline, hits))
     }
 
     fn search_lexical_hits(
@@ -4490,6 +4596,64 @@ mod tests {
             VectorSearchOutcome::Complete(hits) if hits.len() == 10
         ));
         assert_eq!(db.peak_live_decoded_row_vectors(), 1);
+    }
+
+    #[test]
+    fn decoded_vector_instrumentation_follows_owned_vector_lifetime() {
+        let (db, _, _) = fixture_memory();
+        let bytes = embedding_to_blob(&[1.0, 2.0, 3.0, 4.0]);
+        db.reset_vector_decode_instrumentation();
+
+        let first = db.decode_stored_vector(&bytes, 4).unwrap();
+        assert_eq!(db.live_decoded_row_vectors(), 1);
+        let second = db.decode_stored_vector(&bytes, 4).unwrap();
+        assert_eq!(db.live_decoded_row_vectors(), 2);
+        assert_eq!(db.peak_live_decoded_row_vectors(), 2);
+        drop(first);
+        assert_eq!(db.live_decoded_row_vectors(), 1);
+        drop(second);
+        assert_eq!(db.live_decoded_row_vectors(), 0);
+    }
+
+    fn assert_forced_search_deadline(boundary: VectorDeadlineBoundary) {
+        let (db, ns, memory) = fixture_memory();
+        register_embedding_space(&db, "test-space", 4);
+        if matches!(boundary, VectorDeadlineBoundary::BeforeComplete) {
+            db.save_memory_with_embedding(
+                &memory,
+                Some(&embedding_record(
+                    &memory,
+                    "test-space",
+                    vec![1.0, 0.0, 0.0, 0.0],
+                )),
+            )
+            .unwrap();
+        }
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let request = VectorSearchRequest::new(
+            SearchScope::namespace(ns.id),
+            "test-space",
+            &query,
+            10,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        db.force_vector_deadline_at(boundary);
+
+        assert_eq!(
+            db.search_vector(&request).unwrap(),
+            VectorSearchOutcome::Unavailable(SearchUnavailable::DeadlineExceeded)
+        );
+    }
+
+    #[test]
+    fn search_fails_closed_when_deadline_expires_after_connection_acquisition() {
+        assert_forced_search_deadline(VectorDeadlineBoundary::AfterConnection);
+    }
+
+    #[test]
+    fn search_fails_closed_when_deadline_expires_before_success() {
+        assert_forced_search_deadline(VectorDeadlineBoundary::BeforeComplete);
     }
 
     #[test]
