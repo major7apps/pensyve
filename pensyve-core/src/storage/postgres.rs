@@ -951,7 +951,7 @@ const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH lifecycle AS (
            OR ($4 = 2 AND memory.agent_id = $5))
       AND ($7::smallint = 0 OR $7 = 2 OR ($7 = 1
            AND (memory.about_entity = $8 OR memory.source_entity = $8)))
-      AND $12 AND ($16::real IS NULL OR 1.0 >= $16)
+      AND $12 AND ($15::real IS NULL OR 1.0 >= $15)
       AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
     UNION ALL
     SELECT 1::smallint, embeddings.memory_id, embeddings.embedding,
@@ -973,7 +973,7 @@ const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH lifecycle AS (
            OR ($4 = 2 AND memory.agent_id = $5))
       AND ($7::smallint = 0 OR $7 = 2 OR ($7 = 1
            AND (memory.subject = $8 OR memory.object_entity = $8)))
-      AND $13 AND ($16::real IS NULL OR memory.confidence >= $16)
+      AND $13 AND ($15::real IS NULL OR memory.confidence >= $15)
       AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
     UNION ALL
     SELECT 2::smallint, embeddings.memory_id, embeddings.embedding, false
@@ -992,26 +992,7 @@ const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH lifecycle AS (
                       AND memory.user_id IS NOT DISTINCT FROM $6)
            OR ($4 = 2 AND memory.agent_id = $5))
       AND ($7::smallint = 0 OR $7 = 2)
-      AND $14 AND ($16::real IS NULL OR memory.reliability >= $16)
-      AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
-    UNION ALL
-    SELECT 3::smallint, embeddings.memory_id, embeddings.embedding, false
-    FROM memory_embeddings AS embeddings
-    JOIN observation_memories AS memory
-      ON memory.id = embeddings.memory_id
-     AND memory.namespace_id = embeddings.namespace_id
-    CROSS JOIN lifecycle
-    WHERE embeddings.namespace_id = $2
-      AND embeddings.embedding_space_id = $3
-      AND embeddings.memory_type = 'observation'
-      AND lifecycle.state = 'active'
-      AND lifecycle.active_read_space_id = $3
-      AND ($4::smallint = 0
-           OR ($4 = 1 AND memory.agent_id IS NOT DISTINCT FROM $5
-                      AND memory.user_id IS NOT DISTINCT FROM $6)
-           OR ($4 = 2 AND memory.agent_id = $5))
-      AND ($7::smallint = 0 OR $7 = 2)
-      AND $15 AND ($16::real IS NULL OR memory.confidence >= $16)
+      AND $14 AND ($15::real IS NULL OR memory.reliability >= $15)
       AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
 ), scored AS (
     SELECT memory_type, memory_id, entity_preferred,
@@ -3152,7 +3133,7 @@ impl StorageTrait for PostgresBackend {
             let (identity_mode, agent, user) = request.scope.identity_sql_parts();
             let (entity_mode, entity) = request.scope.entity_sql_parts();
             let (preferred_quota, broad_quota) = request.scope.entity_quotas(request.k);
-            let (episodic, semantic, procedural, observation, min_confidence) = filter.sql_parts();
+            let (episodic, semantic, procedural, _, min_confidence) = filter.sql_parts();
             let rows: Vec<PgVectorSearchRow> =
                 match query_as::<Postgres, _>(POSTGRES_VECTOR_SEARCH_SQL)
                     .bind(query_embedding)
@@ -3169,7 +3150,6 @@ impl StorageTrait for PostgresBackend {
                     .bind(episodic)
                     .bind(semantic)
                     .bind(procedural)
-                    .bind(observation)
                     .bind(min_confidence)
                     .fetch_all(&mut *transaction)
                     .await
@@ -3213,7 +3193,6 @@ impl StorageTrait for PostgresBackend {
                     0 => MemoryType::Episodic,
                     1 => MemoryType::Semantic,
                     2 => MemoryType::Procedural,
-                    3 => MemoryType::Observation,
                     _ => {
                         return Ok(VectorSearchOutcome::Unavailable(
                             SearchUnavailable::InvalidStoredVector,
@@ -3278,7 +3257,7 @@ impl StorageTrait for PostgresBackend {
         if tokens.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let tsquery = or_tsquery_fragment(15, tokens.len());
+        let tsquery = or_tsquery_fragment(14, tokens.len());
         let sql = format!(
             "WITH candidates AS ( \
                  SELECT 'episodic' AS memory_type, id, ts_rank(fts_content, {tsquery}) AS score, \
@@ -3293,7 +3272,7 @@ impl StorageTrait for PostgresBackend {
                         OR ($3 = 2 AND agent_id = $4)) \
                    AND ($6::smallint = 0 OR $6 = 2 OR ($6 = 1 \
                         AND (about_entity = $7 OR source_entity = $7))) \
-                   AND $10 AND ($14::real IS NULL OR 1.0 >= $14) \
+                   AND $10 AND ($13::real IS NULL OR 1.0 >= $13) \
                    AND superseded_by IS NULL AND invalid_at IS NULL \
                    AND fts_content @@ {tsquery} \
                  UNION ALL \
@@ -3308,7 +3287,7 @@ impl StorageTrait for PostgresBackend {
                         OR ($3 = 2 AND agent_id = $4)) \
                    AND ($6::smallint = 0 OR $6 = 2 OR ($6 = 1 \
                         AND (subject = $7 OR object_entity = $7))) \
-                   AND $11 AND ($14::real IS NULL OR confidence >= $14) \
+                   AND $11 AND ($13::real IS NULL OR confidence >= $13) \
                    AND superseded_by IS NULL AND invalid_at IS NULL \
                    AND fts_content @@ {tsquery} \
                  UNION ALL \
@@ -3320,19 +3299,7 @@ impl StorageTrait for PostgresBackend {
                                    AND user_id IS NOT DISTINCT FROM $5) \
                         OR ($3 = 2 AND agent_id = $4)) \
                    AND ($6::smallint = 0 OR $6 = 2) \
-                   AND $12 AND ($14::real IS NULL OR reliability >= $14) \
-                   AND superseded_by IS NULL AND invalid_at IS NULL \
-                   AND fts_content @@ {tsquery} \
-                 UNION ALL \
-                 SELECT 'observation', id, ts_rank(fts_content, {tsquery}), false \
-                 FROM observation_memories \
-                 WHERE namespace_id = $1 \
-                   AND ($3::smallint = 0 \
-                        OR ($3 = 1 AND agent_id IS NOT DISTINCT FROM $4 \
-                                   AND user_id IS NOT DISTINCT FROM $5) \
-                        OR ($3 = 2 AND agent_id = $4)) \
-                   AND ($6::smallint = 0 OR $6 = 2) \
-                   AND $13 AND ($14::real IS NULL OR confidence >= $14) \
+                   AND $12 AND ($13::real IS NULL OR reliability >= $13) \
                    AND superseded_by IS NULL AND invalid_at IS NULL \
                    AND fts_content @@ {tsquery} \
              ), ranked AS ( \
@@ -3358,7 +3325,7 @@ impl StorageTrait for PostgresBackend {
             let (identity_mode, agent, user) = scope.identity_sql_parts();
             let (entity_mode, entity) = scope.entity_sql_parts();
             let (preferred_quota, broad_quota) = scope.entity_quotas(limit);
-            let (episodic, semantic, procedural, observation, min_confidence) = filter.sql_parts();
+            let (episodic, semantic, procedural, _, min_confidence) = filter.sql_parts();
             let mut query = query_as::<Postgres, (String, Uuid, f32)>(AssertSqlSafe(sql))
                 .bind(scope.namespace_id)
                 .bind(i64::try_from(limit).unwrap_or(i64::MAX))
@@ -3372,7 +3339,6 @@ impl StorageTrait for PostgresBackend {
                 .bind(episodic)
                 .bind(semantic)
                 .bind(procedural)
-                .bind(observation)
                 .bind(min_confidence);
             for token in &tokens {
                 query = query.bind(token);
@@ -7623,14 +7589,15 @@ mod tests {
     #[test]
     fn bounded_lexical_sql_applies_explicit_modes_and_quotas_before_limit() {
         let source = include_str!("postgres.rs");
-        let start = source
-            .find("let tsquery = or_tsquery_fragment(10")
-            .expect("bounded lexical SQL start");
-        let end = source[start..]
-            .find("self.block_on(async")
-            .expect("bounded lexical SQL end");
-        let sql = &source[start..start + end];
+        let sql = source
+            .split_once("fn search_lexical_hits_filtered(")
+            .expect("bounded lexical method")
+            .1
+            .split_once("fn hydrate_memories(")
+            .expect("bounded lexical method terminator")
+            .0;
 
+        assert!(sql.contains("let tsquery = or_tsquery_fragment(14"));
         assert!(sql.contains("IS NOT DISTINCT FROM $4"));
         assert!(sql.contains("IS NOT DISTINCT FROM $5"));
         assert!(sql.contains("$3 = 2 AND agent_id = $4"));
@@ -7648,13 +7615,13 @@ mod tests {
         );
 
         let source = include_str!("postgres.rs");
-        let start = source
-            .find("let tsquery = or_tsquery_fragment(10")
-            .expect("bounded lexical SQL start");
-        let end = source[start..]
-            .find("self.block_on(async")
-            .expect("bounded lexical SQL end");
-        let sql = &source[start..start + end];
+        let sql = source
+            .split_once("fn search_lexical_hits_filtered(")
+            .expect("bounded lexical method")
+            .1
+            .split_once("fn hydrate_memories(")
+            .expect("bounded lexical method terminator")
+            .0;
         assert_eq!(sql.matches("AND COALESCE((").count(), 2);
     }
 

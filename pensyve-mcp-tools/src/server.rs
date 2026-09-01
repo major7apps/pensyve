@@ -1509,7 +1509,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recall_type_filter_is_pre_limit_and_unknown_types_are_rejected() {
+    async fn recall_type_filter_excludes_observations_and_rejects_unknown_types() {
         let snapshots = tempfile::tempdir().unwrap();
         let fixture = forget_fixture(snapshots.path().to_path_buf(), false);
         let namespace_id = fixture.server.state.namespace.id;
@@ -1557,8 +1557,31 @@ mod tests {
             .await
             .unwrap();
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
-        assert_eq!(response.as_array().unwrap().len(), 1);
-        assert_eq!(response[0]["_type"], "observation");
+        assert_eq!(response, serde_json::json!([]));
+
+        let semantic_only = fixture
+            .server
+            .recall(Parameters(RecallParams {
+                query: "shared".into(),
+                entity: None,
+                types: Some(vec!["semantic".into()]),
+                limit: Some(1),
+                min_confidence: Some(0.6),
+            }))
+            .await
+            .unwrap();
+        let semantic_and_observation = fixture
+            .server
+            .recall(Parameters(RecallParams {
+                query: "shared".into(),
+                entity: None,
+                types: Some(vec!["semantic".into(), "observation".into()]),
+                limit: Some(1),
+                min_confidence: Some(0.6),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(semantic_and_observation, semantic_only);
 
         let error = fixture
             .server

@@ -2611,7 +2611,9 @@ mod tests {
     use pensyve_core::retrieval::SemanticStatus;
     use pensyve_core::storage::bounded::{MemoryRef, MemoryType};
     use pensyve_core::storage::sqlite::SqliteBackend;
-    use pensyve_core::types::{Namespace, ProceduralMemory};
+    use pensyve_core::types::{
+        Episode, Namespace, ObservationMemory, ProceduralMemory, SemanticMemory,
+    };
     use pensyve_mcp_tools::{PensyveState, VectorRuntime};
     use serde_json::json;
 
@@ -2719,6 +2721,98 @@ mod tests {
             .0;
         assert!(recall.contains("recall_with_embedding_filtered"));
         assert!(!recall.contains("filter_recall_results"));
+    }
+
+    #[test]
+    fn rest_recall_filter_excludes_observations_from_first_stage_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, state, space) = active_rest_state(&dir, "rest-observation-filter");
+        let namespace_id = state.namespace.id;
+        let semantic = Memory::Semantic(SemanticMemory::new(
+            namespace_id,
+            Uuid::new_v4(),
+            "shared",
+            "qualifying semantic",
+            0.8,
+        ));
+        storage
+            .save_memory_with_embedding(
+                &semantic,
+                Some(&embedding_record_for_memory(
+                    &semantic,
+                    &space,
+                    vec![1.0, 0.0],
+                )),
+            )
+            .unwrap();
+        let episode = Episode::new(namespace_id, Vec::new());
+        storage.save_episode(&episode).unwrap();
+        let mut observation = ObservationMemory::new(
+            namespace_id,
+            episode.id,
+            "kind",
+            "instance",
+            "shared",
+            "qualifying observation",
+        );
+        observation.confidence = 0.8;
+        let observation = Memory::Observation(observation);
+        storage
+            .save_memory_with_embedding(
+                &observation,
+                Some(&embedding_record_for_memory(
+                    &observation,
+                    &space,
+                    vec![1.0, 0.0],
+                )),
+            )
+            .unwrap();
+
+        let engine = RecallEngine::new_storage_backed_with_vector_space(
+            storage.as_ref(),
+            state.embedder.as_ref(),
+            None,
+            &state.retrieval_config,
+        );
+        let observation_only = recall_filter(Some(&["observation".to_string()]), Some(0.6))
+            .unwrap()
+            .unwrap();
+        let observation_result = engine
+            .recall_with_embedding_filtered(
+                "shared",
+                None,
+                namespace_id,
+                5,
+                None,
+                &observation_only,
+            )
+            .unwrap();
+        assert!(observation_result.memories.is_empty());
+
+        let semantic_only = recall_filter(Some(&["semantic".to_string()]), Some(0.6))
+            .unwrap()
+            .unwrap();
+        let mixed = recall_filter(
+            Some(&["semantic".to_string(), "observation".to_string()]),
+            Some(0.6),
+        )
+        .unwrap()
+        .unwrap();
+        let semantic_ids = engine
+            .recall_with_embedding_filtered("shared", None, namespace_id, 5, None, &semantic_only)
+            .unwrap()
+            .memories
+            .into_iter()
+            .map(|candidate| candidate.memory_id)
+            .collect::<Vec<_>>();
+        let mixed_ids = engine
+            .recall_with_embedding_filtered("shared", None, namespace_id, 5, None, &mixed)
+            .unwrap()
+            .memories
+            .into_iter()
+            .map(|candidate| candidate.memory_id)
+            .collect::<Vec<_>>();
+        assert_eq!(mixed_ids, semantic_ids);
     }
 
     #[tokio::test]

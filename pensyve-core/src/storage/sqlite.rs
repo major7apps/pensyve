@@ -1092,7 +1092,7 @@ const SQLITE_VECTOR_SEARCH_SQL: &str = r"SELECT 'episodic' AS memory_type,
                OR (?3 = 2 AND memory.agent_id = ?4))
           AND (?6 = 0 OR ?6 = 2
                OR (?6 = 1 AND (memory.about_entity = ?7 OR memory.source_entity = ?7)))
-          AND ?8 AND (?12 IS NULL OR 1.0 >= ?12)
+          AND ?8 AND (?11 IS NULL OR 1.0 >= ?11)
           AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
         UNION ALL
         SELECT 'semantic', embeddings.memory_id, embeddings.embedding,
@@ -1111,7 +1111,7 @@ const SQLITE_VECTOR_SEARCH_SQL: &str = r"SELECT 'episodic' AS memory_type,
                OR (?3 = 2 AND memory.agent_id = ?4))
           AND (?6 = 0 OR ?6 = 2
                OR (?6 = 1 AND (memory.subject = ?7 OR memory.object_entity = ?7)))
-          AND ?9 AND (?12 IS NULL OR memory.confidence >= ?12)
+          AND ?9 AND (?11 IS NULL OR memory.confidence >= ?11)
           AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
         UNION ALL
         SELECT 'procedural', embeddings.memory_id, embeddings.embedding, 0
@@ -1126,22 +1126,7 @@ const SQLITE_VECTOR_SEARCH_SQL: &str = r"SELECT 'episodic' AS memory_type,
                OR (?3 = 1 AND memory.agent_id IS ?4 AND memory.user_id IS ?5)
                OR (?3 = 2 AND memory.agent_id = ?4))
           AND (?6 = 0 OR ?6 = 2)
-          AND ?10 AND (?12 IS NULL OR memory.reliability >= ?12)
-          AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
-        UNION ALL
-        SELECT 'observation', embeddings.memory_id, embeddings.embedding, 0
-        FROM memory_embeddings AS embeddings
-        JOIN observation_memories AS memory
-          ON memory.id = embeddings.memory_id
-         AND memory.namespace_id = embeddings.namespace_id
-        WHERE embeddings.namespace_id = ?1
-          AND embeddings.embedding_space_id = ?2
-          AND embeddings.memory_type = 'observation'
-          AND (?3 = 0
-               OR (?3 = 1 AND memory.agent_id IS ?4 AND memory.user_id IS ?5)
-               OR (?3 = 2 AND memory.agent_id = ?4))
-          AND (?6 = 0 OR ?6 = 2)
-          AND ?11 AND (?12 IS NULL OR memory.confidence >= ?12)
+          AND ?10 AND (?11 IS NULL OR memory.reliability >= ?11)
           AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL";
 
 fn vector_unavailable(reason: SearchUnavailable) -> VectorSearchOutcome {
@@ -3181,7 +3166,7 @@ impl StorageTrait for SqliteBackend {
         let user = user.map(|value| value.to_string());
         let (entity_mode, entity) = request.scope.entity_sql_parts();
         let entity = entity.map(|value| value.to_string());
-        let (episodic, semantic, procedural, observation, min_confidence) = filter.sql_parts();
+        let (episodic, semantic, procedural, _, min_confidence) = filter.sql_parts();
         let conn = lock_conn!(self);
         if self.vector_deadline_expired(request.deadline, VectorDeadlineBoundary::AfterConnection) {
             return Ok(vector_unavailable(SearchUnavailable::DeadlineExceeded));
@@ -3246,7 +3231,6 @@ impl StorageTrait for SqliteBackend {
             episodic,
             semantic,
             procedural,
-            observation,
             min_confidence,
         ])?;
         let mut scanned = 0_usize;
@@ -3276,7 +3260,6 @@ impl StorageTrait for SqliteBackend {
                 "episodic" => MemoryType::Episodic,
                 "semantic" => MemoryType::Semantic,
                 "procedural" => MemoryType::Procedural,
-                "observation" => MemoryType::Observation,
                 _ => return Ok(vector_unavailable(SearchUnavailable::InvalidStoredVector)),
             };
             let Ok(id) = Uuid::parse_str(&row.get::<_, String>(1)?) else {
@@ -3356,7 +3339,7 @@ impl StorageTrait for SqliteBackend {
         let (entity_mode, entity) = scope.entity_sql_parts();
         let entity = entity.map(|value| value.to_string());
         let (preferred_quota, broad_quota) = scope.entity_quotas(limit);
-        let (episodic, semantic, procedural, observation, min_confidence) = filter.sql_parts();
+        let (episodic, semantic, procedural, _, min_confidence) = filter.sql_parts();
         let conn = lock_conn!(self);
         let mut stmt = conn.prepare(
             r"WITH candidates AS (
@@ -3385,7 +3368,7 @@ impl StorageTrait for SqliteBackend {
                                 OR (?3 = 2 AND e.agent_id = ?4))
                            AND (?6 = 0 OR ?6 = 2 OR (?6 = 1
                                 AND (e.about_entity = ?7 OR e.source_entity = ?7)))
-                           AND ?11 AND (?15 IS NULL OR 1.0 >= ?15)
+                           AND ?11 AND (?14 IS NULL OR 1.0 >= ?14)
                            AND e.superseded_by IS NULL AND e.invalid_at IS NULL
                      ))
                      OR (f.memory_type = 'semantic' AND EXISTS (
@@ -3396,7 +3379,7 @@ impl StorageTrait for SqliteBackend {
                                 OR (?3 = 2 AND s.agent_id = ?4))
                            AND (?6 = 0 OR ?6 = 2 OR (?6 = 1
                                 AND (s.subject = ?7 OR s.object_entity = ?7)))
-                           AND ?12 AND (?15 IS NULL OR s.confidence >= ?15)
+                           AND ?12 AND (?14 IS NULL OR s.confidence >= ?14)
                            AND s.superseded_by IS NULL AND s.invalid_at IS NULL
                      ))
                      OR (f.memory_type = 'procedural' AND EXISTS (
@@ -3406,18 +3389,8 @@ impl StorageTrait for SqliteBackend {
                                 OR (?3 = 1 AND p.agent_id IS ?4 AND p.user_id IS ?5)
                                 OR (?3 = 2 AND p.agent_id = ?4))
                            AND (?6 = 0 OR ?6 = 2)
-                           AND ?13 AND (?15 IS NULL OR p.reliability >= ?15)
+                           AND ?13 AND (?14 IS NULL OR p.reliability >= ?14)
                            AND p.superseded_by IS NULL AND p.invalid_at IS NULL
-                     ))
-                     OR (f.memory_type = 'observation' AND EXISTS (
-                         SELECT 1 FROM observation_memories o
-                         WHERE o.id = f.memory_id AND o.namespace_id = ?2
-                           AND (?3 = 0
-                                OR (?3 = 1 AND o.agent_id IS ?4 AND o.user_id IS ?5)
-                                OR (?3 = 2 AND o.agent_id = ?4))
-                           AND (?6 = 0 OR ?6 = 2)
-                           AND ?14 AND (?15 IS NULL OR o.confidence >= ?15)
-                           AND o.superseded_by IS NULL AND o.invalid_at IS NULL
                      ))
                  )
              ), ranked AS (
@@ -3461,7 +3434,6 @@ impl StorageTrait for SqliteBackend {
                     episodic,
                     semantic,
                     procedural,
-                    observation,
                     min_confidence,
                 ],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
@@ -8849,11 +8821,7 @@ mod tests {
                 .iter()
                 .map(|hit| hit.memory_ref.memory_type)
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                MemoryType::Episodic,
-                MemoryType::Procedural,
-                MemoryType::Observation,
-            ])
+            BTreeSet::from([MemoryType::Episodic, MemoryType::Procedural,])
         );
         let request = VectorSearchRequest::new(
             scope.clone(),
@@ -8873,11 +8841,7 @@ mod tests {
                 .iter()
                 .map(|hit| hit.memory_ref.memory_type)
                 .collect::<Vec<_>>(),
-            vec![
-                MemoryType::Episodic,
-                MemoryType::Procedural,
-                MemoryType::Observation,
-            ]
+            vec![MemoryType::Episodic, MemoryType::Procedural,]
         );
 
         let preferred_memory = Memory::Semantic(SemanticMemory::new(
@@ -8923,8 +8887,7 @@ mod tests {
         let lexical = db
             .search_lexical_hits_filtered("shared", &scope, &observation_only, 1)
             .unwrap();
-        assert_eq!(lexical.len(), 1);
-        assert_eq!(lexical[0].memory_ref, MemoryRef::from_memory(&memories[3]));
+        assert!(lexical.is_empty());
         let request = VectorSearchRequest::new(
             scope.clone(),
             space.id(),
@@ -8935,12 +8898,39 @@ mod tests {
         .unwrap();
         assert!(matches!(
             db.search_vector_filtered(&request, &observation_only).unwrap(),
-            VectorSearchOutcome::Complete(hits)
-                if hits.len() == 1 && hits[0].memory_ref == MemoryRef::from_memory(&memories[3])
+            VectorSearchOutcome::Complete(hits) if hits.is_empty()
         ));
 
-        let preferred = SearchScope::namespace(namespace.id).prefer_entity_with_broad(entity);
         let semantic_only = MemoryFilter::new(Some(vec![MemoryType::Semantic]), Some(0.6)).unwrap();
+        let semantic_and_observation = MemoryFilter::new(
+            Some(vec![MemoryType::Semantic, MemoryType::Observation]),
+            Some(0.6),
+        )
+        .unwrap();
+        let semantic_lexical = db
+            .search_lexical_hits_filtered("shared", &scope, &semantic_only, 5)
+            .unwrap();
+        let mixed_lexical = db
+            .search_lexical_hits_filtered("shared", &scope, &semantic_and_observation, 5)
+            .unwrap();
+        assert_eq!(mixed_lexical, semantic_lexical);
+        let semantic_request = VectorSearchRequest::new(
+            scope.clone(),
+            space.id(),
+            &[1.0, 0.0],
+            5,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        let semantic_vector = db
+            .search_vector_filtered(&semantic_request, &semantic_only)
+            .unwrap();
+        let mixed_vector = db
+            .search_vector_filtered(&semantic_request, &semantic_and_observation)
+            .unwrap();
+        assert_eq!(mixed_vector, semantic_vector);
+
+        let preferred = SearchScope::namespace(namespace.id).prefer_entity_with_broad(entity);
         let preferred_hits = db
             .search_lexical_hits_filtered("shared", &preferred, &semantic_only, 5)
             .unwrap();
