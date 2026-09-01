@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::Utc;
 use tracing::info;
@@ -8,15 +8,34 @@ use crate::activation;
 use crate::config::RetrievalConfig;
 use crate::decay;
 use crate::embedding::OnnxEmbedder;
+use crate::embedding_space::EmbeddingSpace;
 use crate::graph::MemoryGraph;
 use crate::reranker::Reranker;
 use crate::rrf;
+use crate::storage::bounded::{
+    MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS, MAX_VECTOR_HITS, MemoryRef, SearchScope,
+    SearchUnavailable, VectorSearchOutcome, VectorSearchRequest,
+};
 use crate::storage::{StorageTrait, memory_matches_scope as pensyve_core_scope_match};
 use crate::types::Memory;
 use crate::vector::VectorIndex;
 
 /// Type alias for the candidate map + vector-score map returned by `gather_candidates`.
 type CandidateMaps = (HashMap<Uuid, Memory>, HashMap<Uuid, f32>);
+
+type BoundedScoreMap = BTreeMap<MemoryRef, f32>;
+
+struct GatheredCandidates {
+    candidates: BTreeMap<MemoryRef, Memory>,
+    vector_map: BoundedScoreMap,
+    bm25_map: BoundedScoreMap,
+    semantic_status: SemanticStatus,
+}
+
+enum VectorSource<'a> {
+    InMemory(&'a VectorIndex),
+    StorageBacked { runtime_space: &'a EmbeddingSpace },
+}
 
 // ---------------------------------------------------------------------------
 // Query Intent
@@ -293,6 +312,23 @@ pub struct ScoredCandidate {
 #[derive(Debug)]
 pub struct RecallResult {
     pub memories: Vec<ScoredCandidate>,
+    pub semantic_status: SemanticStatus,
+    pub diversity_status: DiversityStatus,
+}
+
+/// Whether the semantic candidate leg completed for this recall.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SemanticStatus {
+    Complete,
+    Unavailable(SearchUnavailable),
+}
+
+/// Whether an explicitly requested optional diversity stage completed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DiversityStatus {
+    NotRequested,
+    Complete,
+    Unavailable(SearchUnavailable),
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +338,7 @@ pub struct RecallResult {
 pub struct RecallEngine<'a> {
     storage: &'a dyn StorageTrait,
     embedder: &'a OnnxEmbedder,
-    vector_index: &'a VectorIndex,
+    vector_source: VectorSource<'a>,
     config: &'a RetrievalConfig,
     /// Optional graph for BFS-based graph scoring.
     graph: Option<&'a MemoryGraph>,
@@ -356,7 +392,31 @@ impl<'a> RecallEngine<'a> {
         Self {
             storage,
             embedder,
-            vector_index,
+            vector_source: VectorSource::InMemory(vector_index),
+            config,
+            graph: None,
+            reranker: None,
+            agent_id: None,
+            user_id: None,
+            agent_only: None,
+            mmr_lambda: None,
+            ppr_index: None,
+            vendi_reranker: None,
+        }
+    }
+
+    /// Construct a recall engine that obtains one bounded candidate pass from
+    /// storage instead of consulting a resident corpus index.
+    pub fn new_storage_backed(
+        storage: &'a dyn StorageTrait,
+        embedder: &'a OnnxEmbedder,
+        runtime_space: &'a EmbeddingSpace,
+        config: &'a RetrievalConfig,
+    ) -> Self {
+        Self {
+            storage,
+            embedder,
+            vector_source: VectorSource::StorageBacked { runtime_space },
             config,
             graph: None,
             reranker: None,
@@ -624,29 +684,58 @@ impl<'a> RecallEngine<'a> {
         // the reranker's `final_score` for relevance per coderabbit
         // round-5 review on diversity.rs:95), so the recall path
         // doesn't have to retain it past the gather step.
-        let (candidates, vector_map) = if let Some(emb) = pre_embedding {
-            if target_entity.is_some() {
-                self.gather_candidates_dual_path(
-                    emb,
-                    query,
-                    namespace_id,
-                    max_candidates,
-                    target_entity,
-                )?
-            } else {
-                self.gather_candidates_with_embedding(emb, query, namespace_id, max_candidates)?
+        let GatheredCandidates {
+            candidates,
+            vector_map,
+            bm25_map,
+            semantic_status,
+        } = match self.vector_source {
+            VectorSource::InMemory(_) => {
+                let (legacy_candidates, legacy_vector_map) = if let Some(emb) = pre_embedding {
+                    if target_entity.is_some() {
+                        self.gather_candidates_dual_path(
+                            emb,
+                            query,
+                            namespace_id,
+                            max_candidates,
+                            target_entity,
+                        )?
+                    } else {
+                        self.gather_candidates_with_embedding(
+                            emb,
+                            query,
+                            namespace_id,
+                            max_candidates,
+                        )?
+                    }
+                } else if target_entity.is_some() {
+                    let query_embedding = self.embedder.embed(query)?;
+                    self.gather_candidates_dual_path(
+                        &query_embedding,
+                        query,
+                        namespace_id,
+                        max_candidates,
+                        target_entity,
+                    )?
+                } else {
+                    self.gather_candidates(query, namespace_id, max_candidates)?
+                };
+                let legacy_bm25_map = if legacy_candidates.is_empty() {
+                    HashMap::new()
+                } else {
+                    self.build_bm25_map(query, namespace_id, max_candidates)?
+                };
+                gathered_from_legacy(legacy_candidates, &legacy_vector_map, &legacy_bm25_map)
             }
-        } else if target_entity.is_some() {
-            let query_embedding = self.embedder.embed(query)?;
-            self.gather_candidates_dual_path(
-                &query_embedding,
+            VectorSource::StorageBacked { runtime_space } => self.gather_storage_candidates(
                 query,
+                pre_embedding,
                 namespace_id,
                 max_candidates,
                 target_entity,
-            )?
-        } else {
-            self.gather_candidates(query, namespace_id, max_candidates)?
+                runtime_space,
+                start + timeout,
+            )?,
         };
 
         // Phase 2A SelRoute: question-type classification + per-route
@@ -702,15 +791,16 @@ impl<'a> RecallEngine<'a> {
             };
 
         if candidates.is_empty() {
-            return Ok(RecallResult { memories: vec![] });
+            return Ok(RecallResult {
+                memories: vec![],
+                semantic_status,
+                diversity_status: DiversityStatus::NotRequested,
+            });
         }
 
-        if start.elapsed() > timeout {
+        if matches!(self.vector_source, VectorSource::InMemory(_)) && start.elapsed() > timeout {
             return Err(RecallError::Timeout(self.config.recall_timeout_secs));
         }
-
-        // Step 5: Normalize BM25 scores (positional rank).
-        let bm25_map = self.build_bm25_map(query, namespace_id, max_candidates)?;
 
         // Classify query intent for intent-based scoring.
         let intent = classify_intent(query);
@@ -720,8 +810,10 @@ impl<'a> RecallEngine<'a> {
         let now = Utc::now();
 
         // 1. Vector similarity ranking (already have scores from gather_candidates)
-        let mut ranking_vec: Vec<(Uuid, f32)> =
-            vector_map.iter().map(|(&id, &score)| (id, score)).collect();
+        let mut ranking_vec: Vec<(MemoryRef, f32)> = vector_map
+            .iter()
+            .map(|(&memory_ref, &score)| (memory_ref, score))
+            .collect();
         ranking_vec.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -729,8 +821,10 @@ impl<'a> RecallEngine<'a> {
         });
 
         // 2. BM25 ranking (from FTS results — already gathered)
-        let mut ranking_bm25: Vec<(Uuid, f32)> =
-            bm25_map.iter().map(|(&id, &score)| (id, score)).collect();
+        let mut ranking_bm25: Vec<(MemoryRef, f32)> = bm25_map
+            .iter()
+            .map(|(&memory_ref, &score)| (memory_ref, score))
+            .collect();
         ranking_bm25.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -738,7 +832,7 @@ impl<'a> RecallEngine<'a> {
         });
 
         // 3. Activation ranking (ACT-R base-level activation)
-        let mut ranking_activation: Vec<(Uuid, f32)> = candidates
+        let mut ranking_activation: Vec<(MemoryRef, f32)> = candidates
             .iter()
             .map(|(&id, mem)| {
                 let b = match mem {
@@ -763,7 +857,7 @@ impl<'a> RecallEngine<'a> {
         });
 
         // 4. Spreading activation / graph ranking
-        let ranking_spread: Vec<(Uuid, f32)> = match (self.graph, target_entity) {
+        let ranking_spread: Vec<(MemoryRef, f32)> = match (self.graph, target_entity) {
             (Some(g), Some(entity_id)) => {
                 let intent_str = match &intent {
                     QueryIntent::Question => "question",
@@ -779,12 +873,21 @@ impl<'a> RecallEngine<'a> {
                     self.config.beam_width,
                     self.config.max_depth,
                 )
+                .into_iter()
+                .flat_map(|(id, score)| {
+                    candidates
+                        .keys()
+                        .filter(move |memory_ref| memory_ref.id == id)
+                        .copied()
+                        .map(move |memory_ref| (memory_ref, score))
+                })
+                .collect()
             }
             _ => Vec::new(),
         };
 
         // 5. Intent-type alignment ranking
-        let mut ranking_intent: Vec<(Uuid, f32)> = candidates
+        let mut ranking_intent: Vec<(MemoryRef, f32)> = candidates
             .iter()
             .map(|(&id, mem)| {
                 let score = intent_score_for_type(&intent, mem.type_name());
@@ -798,7 +901,7 @@ impl<'a> RecallEngine<'a> {
         });
 
         // 6. Confidence/reliability ranking
-        let mut ranking_confidence: Vec<(Uuid, f32)> = candidates
+        let mut ranking_confidence: Vec<(MemoryRef, f32)> = candidates
             .iter()
             .map(|(&id, mem)| {
                 let conf = match mem {
@@ -817,7 +920,7 @@ impl<'a> RecallEngine<'a> {
         });
 
         // 7. Entity-affinity ranking
-        let mut ranking_entity: Vec<(Uuid, f32)> = if let Some(entity_id) = target_entity {
+        let mut ranking_entity: Vec<(MemoryRef, f32)> = if let Some(entity_id) = target_entity {
             candidates
                 .iter()
                 .map(|(&id, mem)| {
@@ -894,7 +997,7 @@ impl<'a> RecallEngine<'a> {
         // adding signal worth de-duplicating against.
         let mut ppr_score_by_id: std::collections::HashMap<Uuid, f32> =
             std::collections::HashMap::new();
-        let mut ranking_ppr: Vec<(Uuid, f32)> = Vec::new();
+        let mut ranking_ppr: Vec<(MemoryRef, f32)> = Vec::new();
         // PPR honors the Phase 2C runtime contract: the engine fires
         // PPR only when ALL three preconditions hold:
         //   (a) a `PprIndex` is attached via `with_ppr`
@@ -928,15 +1031,25 @@ impl<'a> RecallEngine<'a> {
             // ranking, scored by the vector score. PPR's restart
             // vector normalizes the seed mass, so the raw scores
             // here only need to be proportional.
-            let dense_seeds: Vec<(Uuid, f32)> = ranking_vec.clone();
+            let dense_seeds: Vec<(Uuid, f32)> = ranking_vec
+                .iter()
+                .map(|(memory_ref, score)| (memory_ref.id, *score))
+                .collect();
             // PPR brief defaults: alpha = 0.15 (restart probability),
             // max_iter = 20 (production graph default; small unit-
             // test graphs use larger caps — see ppr.rs module doc),
             // top_k = 50 (we re-merge through RRF so this is the
             // upper-bound on the PPR signal's contribution).
-            ranking_ppr = ppr_index.query(&query_entity_uuids, &dense_seeds, 0.15, 20, 50);
-            for (id, score) in &ranking_ppr {
-                ppr_score_by_id.insert(*id, *score);
+            let ppr_by_id = ppr_index.query(&query_entity_uuids, &dense_seeds, 0.15, 20, 50);
+            for (id, score) in ppr_by_id {
+                ppr_score_by_id.insert(id, score);
+                ranking_ppr.extend(
+                    candidates
+                        .keys()
+                        .filter(|memory_ref| memory_ref.id == id)
+                        .copied()
+                        .map(|memory_ref| (memory_ref, score)),
+                );
             }
         }
 
@@ -985,9 +1098,9 @@ impl<'a> RecallEngine<'a> {
         // Use adaptive k based on candidate pool size to preserve rank discrimination
         // at small corpus sizes (k=60 was designed for web-scale IR).
         let effective_k = rrf::adaptive_k(candidates.len(), self.config.rrf_k);
-        let rrf_results = rrf::reciprocal_rank_fusion(&rankings, &rrf_weights, effective_k)?;
+        let rrf_results = reciprocal_rank_fusion_refs(&rankings, &rrf_weights, effective_k)?;
 
-        if start.elapsed() > timeout {
+        if matches!(self.vector_source, VectorSource::InMemory(_)) && start.elapsed() > timeout {
             return Err(RecallError::Timeout(self.config.recall_timeout_secs));
         }
 
@@ -1005,10 +1118,14 @@ impl<'a> RecallEngine<'a> {
         // downstream consumers (CLI JSON output, reinforcement, etc.).
         let mut scored: Vec<ScoredCandidate> = rrf_results
             .iter()
-            .filter_map(|&(id, rrf_score)| {
-                candidates.get(&id).map(|mem| {
-                    let vector_score = vector_map.get(&id).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-                    let bm25_score = bm25_map.get(&id).copied().unwrap_or(0.0);
+            .filter_map(|&(memory_ref, rrf_score)| {
+                candidates.get(&memory_ref).map(|mem| {
+                    let vector_score = vector_map
+                        .get(&memory_ref)
+                        .copied()
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 1.0);
+                    let bm25_score = bm25_map.get(&memory_ref).copied().unwrap_or(0.0);
                     let recency_score = match mem {
                         Memory::Episodic(e) => decay::retrievability(
                             e.stability,
@@ -1055,9 +1172,9 @@ impl<'a> RecallEngine<'a> {
                         0.0
                     };
 
-                    let ppr_score = ppr_score_by_id.get(&id).copied();
+                    let ppr_score = ppr_score_by_id.get(&memory_ref.id).copied();
                     ScoredCandidate {
-                        memory_id: id,
+                        memory_id: memory_ref.id,
                         memory: mem.clone(),
                         vector_score,
                         bm25_score,
@@ -1079,6 +1196,30 @@ impl<'a> RecallEngine<'a> {
         if let Some(reranker) = self.reranker {
             scored = apply_reranking(scored, reranker, query)?;
         }
+
+        let vendi_requested = self.vendi_reranker.is_some()
+            && crate::retrieval::vendi::vendi_enabled()
+            && !scored.is_empty();
+        let diversity_requested = vendi_requested || mmr_lambda.is_some();
+        let mut diversity_status = if diversity_requested {
+            DiversityStatus::Complete
+        } else {
+            DiversityStatus::NotRequested
+        };
+        let storage_diversity_embeddings = match self.vector_source {
+            VectorSource::StorageBacked { runtime_space }
+                if diversity_requested && !scored.is_empty() =>
+            {
+                match self.load_storage_diversity_embeddings(namespace_id, runtime_space, &scored) {
+                    Ok(embeddings) => Some(embeddings),
+                    Err(reason) => {
+                        diversity_status = DiversityStatus::Unavailable(reason);
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
 
         // Phase 2E: Optional Vendi-Score diversity rerank.
         //
@@ -1102,12 +1243,34 @@ impl<'a> RecallEngine<'a> {
         // holds the route's preferred `alpha`. Falls back to the
         // reranker's own `alpha` otherwise (set at `with_vendi` time).
         if let Some(vendi) = self.vendi_reranker
-            && crate::retrieval::vendi::vendi_enabled()
-            && !scored.is_empty()
+            && vendi_requested
         {
-            scored = vendi_merge_candidates(scored, vendi, selroute_vendi_alpha, limit, |id| {
-                self.vector_index.get(id).map(<[f32]>::to_vec)
-            });
+            scored = match self.vector_source {
+                VectorSource::InMemory(vector_index) => vendi_merge_candidates(
+                    scored,
+                    vendi,
+                    selroute_vendi_alpha,
+                    limit,
+                    |candidate| vector_index.get(candidate.memory_id).map(<[f32]>::to_vec),
+                ),
+                VectorSource::StorageBacked { .. } => {
+                    if let Some(embeddings) = storage_diversity_embeddings.as_ref() {
+                        vendi_merge_candidates(
+                            scored,
+                            vendi,
+                            selroute_vendi_alpha,
+                            limit,
+                            |candidate| {
+                                embeddings
+                                    .get(&MemoryRef::from_memory(&candidate.memory))
+                                    .cloned()
+                            },
+                        )
+                    } else {
+                        scored
+                    }
+                }
+            };
         }
 
         // G3-P5: optional MMR diversity rerank, BEFORE card prepend AND
@@ -1124,7 +1287,18 @@ impl<'a> RecallEngine<'a> {
         // parity for ARM-1-G3-BASELINE through ARM-4-TYPED-SLOTS.
         // ARM-5-G3-FULL sets λ=0.5.
         if let Some(lambda) = mmr_lambda {
-            scored = crate::retrieval::diversity::rerank_mmr(scored, lambda, limit);
+            scored = match self.vector_source {
+                VectorSource::InMemory(_) => {
+                    crate::retrieval::diversity::rerank_mmr(scored, lambda, limit)
+                }
+                VectorSource::StorageBacked { .. } => {
+                    if let Some(embeddings) = storage_diversity_embeddings.as_ref() {
+                        rerank_mmr_with_embeddings(scored, lambda, limit, embeddings)
+                    } else {
+                        scored
+                    }
+                }
+            };
         }
 
         scored.truncate(limit);
@@ -1142,7 +1316,11 @@ impl<'a> RecallEngine<'a> {
             "recall completed"
         );
 
-        Ok(RecallResult { memories: scored })
+        Ok(RecallResult {
+            memories: scored,
+            semantic_status,
+            diversity_status,
+        })
     }
 
     /// Embed the query, run vector + FTS search, and merge into a unified candidate map.
@@ -1165,7 +1343,10 @@ impl<'a> RecallEngine<'a> {
         namespace_id: Uuid,
         max_candidates: usize,
     ) -> Result<CandidateMaps, RecallError> {
-        let vector_hits = self.vector_index.search(query_embedding, max_candidates)?;
+        let VectorSource::InMemory(vector_index) = self.vector_source else {
+            unreachable!("storage-backed recall uses gather_storage_candidates")
+        };
+        let vector_hits = vector_index.search(query_embedding, max_candidates)?;
         let vector_map: HashMap<Uuid, f32> = vector_hits.iter().copied().collect();
 
         // G1: when scope is configured, prefer the scope-aware FTS variant
@@ -1233,16 +1414,18 @@ impl<'a> RecallEngine<'a> {
         max_candidates: usize,
         target_entity: Option<Uuid>,
     ) -> Result<CandidateMaps, RecallError> {
+        let VectorSource::InMemory(vector_index) = self.vector_source else {
+            unreachable!("storage-backed recall uses gather_storage_candidates")
+        };
         let mut candidates: HashMap<Uuid, Memory> = HashMap::new();
         let mut vector_map: HashMap<Uuid, f32> = HashMap::new();
 
         // Path A: entity-scoped search
         if let Some(entity_id) = target_entity {
             // Filtered vector search — only memories belonging to the target entity.
-            let entity_map_ref = &self.vector_index;
             let entity_hits =
-                entity_map_ref.filtered_search(query_embedding, max_candidates, |id| {
-                    entity_map_ref.entity_for(id) == Some(entity_id)
+                vector_index.filtered_search(query_embedding, max_candidates, |id| {
+                    vector_index.entity_for(id) == Some(entity_id)
                 })?;
             for &(id, score) in &entity_hits {
                 vector_map.insert(id, score);
@@ -1276,7 +1459,7 @@ impl<'a> RecallEngine<'a> {
 
         // Path B: broad search (capped at max/4 to avoid drowning entity-scoped results).
         let broad_limit = max_candidates / 4;
-        let broad_vector_hits = self.vector_index.search(query_embedding, broad_limit)?;
+        let broad_vector_hits = vector_index.search(query_embedding, broad_limit)?;
         for &(id, score) in &broad_vector_hits {
             vector_map.entry(id).or_insert(score);
         }
@@ -1323,6 +1506,230 @@ impl<'a> RecallEngine<'a> {
         }
 
         Ok((candidates, vector_map))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gather_storage_candidates(
+        &self,
+        query: &str,
+        pre_embedding: Option<&[f32]>,
+        namespace_id: Uuid,
+        max_candidates: usize,
+        target_entity: Option<Uuid>,
+        runtime_space: &EmbeddingSpace,
+        deadline: std::time::Instant,
+    ) -> Result<GatheredCandidates, RecallError> {
+        let scope = SearchScope {
+            namespace_id,
+            agent_id: self.agent_only.or(self.agent_id),
+            user_id: if self.agent_only.is_some() {
+                None
+            } else {
+                self.user_id
+            },
+            entity_id: target_entity,
+        };
+        let mut lexical_hits = self.storage.search_lexical_hits(
+            query,
+            &scope,
+            max_candidates.min(MAX_LEXICAL_HITS),
+        )?;
+        lexical_hits.sort_by(|left, right| {
+            left.rank
+                .cmp(&right.rank)
+                .then_with(|| left.memory_ref.cmp(&right.memory_ref))
+        });
+        lexical_hits.truncate(MAX_LEXICAL_HITS);
+
+        let (vector_hits, semantic_status) = self.search_storage_vectors(
+            query,
+            pre_embedding,
+            &scope,
+            max_candidates,
+            runtime_space,
+            deadline,
+        )?;
+
+        let mut vector_map = BTreeMap::new();
+        for hit in vector_hits {
+            vector_map
+                .entry(hit.memory_ref)
+                .and_modify(|score: &mut f32| *score = score.max(hit.score))
+                .or_insert(hit.score);
+        }
+        let lexical_count = lexical_hits.len();
+        let mut bm25_map = BTreeMap::new();
+        for hit in lexical_hits {
+            let lexical_score = if lexical_count <= 1 {
+                1.0
+            } else {
+                let zero_based_rank = hit.rank.saturating_sub(1).min(lexical_count - 1);
+                (lexical_count - zero_based_rank) as f32 / lexical_count as f32
+            };
+            bm25_map.entry(hit.memory_ref).or_insert(lexical_score);
+        }
+
+        let candidate_refs = vector_map
+            .keys()
+            .chain(bm25_map.keys())
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .take(MAX_FUSED_HITS)
+            .collect::<Vec<_>>();
+        let requested = candidate_refs.iter().copied().collect::<BTreeSet<_>>();
+        let hydrated =
+            self.storage
+                .hydrate_memories(namespace_id, &candidate_refs, MAX_HYDRATED_BYTES)?;
+        let mut candidates = BTreeMap::new();
+        for memory in hydrated {
+            let memory_ref = MemoryRef::from_memory(&memory);
+            if crate::storage::memory_namespace_id(&memory) != namespace_id
+                || !requested.contains(&memory_ref)
+            {
+                return Err(crate::storage::StorageError::Context(
+                    "bounded hydration returned a memory outside the requested scope".into(),
+                )
+                .into());
+            }
+            if candidates.insert(memory_ref, memory).is_some() {
+                return Err(crate::storage::StorageError::Context(
+                    "bounded hydration returned a duplicate memory reference".into(),
+                )
+                .into());
+            }
+        }
+        if self.agent_id.is_some() || self.user_id.is_some() || self.agent_only.is_some() {
+            candidates.retain(|_, memory| {
+                pensyve_core_scope_match(memory, self.agent_id, self.user_id, self.agent_only)
+            });
+        }
+        if let Some(entity_id) = target_entity {
+            candidates.retain(|_, memory| memory_matches_entity(memory, entity_id));
+        }
+        vector_map.retain(|memory_ref, _| candidates.contains_key(memory_ref));
+        bm25_map.retain(|memory_ref, _| candidates.contains_key(memory_ref));
+
+        Ok(GatheredCandidates {
+            candidates,
+            vector_map,
+            bm25_map,
+            semantic_status,
+        })
+    }
+
+    fn search_storage_vectors(
+        &self,
+        query: &str,
+        pre_embedding: Option<&[f32]>,
+        scope: &SearchScope,
+        max_candidates: usize,
+        runtime_space: &EmbeddingSpace,
+        deadline: std::time::Instant,
+    ) -> Result<(Vec<crate::storage::bounded::VectorHit>, SemanticStatus), RecallError> {
+        let runtime_id = runtime_space.id();
+        if self.embedder.embedding_space()?.id() != runtime_id {
+            return Ok((
+                Vec::new(),
+                SemanticStatus::Unavailable(SearchUnavailable::RuntimeSpaceMismatch),
+            ));
+        }
+        let owned_embedding;
+        let query_embedding = if let Some(embedding) = pre_embedding {
+            embedding
+        } else {
+            owned_embedding = self.embedder.embed(query)?;
+            &owned_embedding
+        };
+        let request = VectorSearchRequest::new(
+            scope.clone(),
+            runtime_id,
+            query_embedding,
+            max_candidates.clamp(1, MAX_VECTOR_HITS),
+            deadline,
+        )?;
+        match self.storage.search_vector(&request)? {
+            VectorSearchOutcome::Complete(mut hits) => {
+                crate::storage::bounded::sort_vector_hits(&mut hits);
+                hits.truncate(MAX_VECTOR_HITS);
+                Ok((hits, SemanticStatus::Complete))
+            }
+            VectorSearchOutcome::Unavailable(reason) => {
+                Ok((Vec::new(), SemanticStatus::Unavailable(reason)))
+            }
+        }
+    }
+
+    fn load_storage_diversity_embeddings(
+        &self,
+        namespace_id: Uuid,
+        runtime_space: &EmbeddingSpace,
+        scored: &[ScoredCandidate],
+    ) -> Result<BTreeMap<MemoryRef, Vec<f32>>, SearchUnavailable> {
+        let memory_refs = scored
+            .iter()
+            .map(|candidate| MemoryRef::from_memory(&candidate.memory))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .take(MAX_FUSED_HITS)
+            .collect::<Vec<_>>();
+        let expected = memory_refs.iter().copied().collect::<BTreeSet<_>>();
+        let runtime_id = runtime_space.id();
+        let records =
+            match self
+                .storage
+                .load_embedding_records(namespace_id, &runtime_id, &memory_refs)
+            {
+                Ok(records) => records,
+                Err(crate::storage::StorageError::Unsupported(_)) => {
+                    info!(
+                        event = "recall_diversity_unavailable",
+                        reason = "unsupported_backend",
+                        "optional diversity stage skipped"
+                    );
+                    return Err(SearchUnavailable::UnsupportedBackend);
+                }
+                Err(_) => {
+                    info!(
+                        event = "recall_diversity_unavailable",
+                        reason = "embedding_generation_load_failed",
+                        "optional diversity stage skipped"
+                    );
+                    return Err(SearchUnavailable::InvalidStoredVector);
+                }
+            };
+        let mut embeddings = BTreeMap::new();
+        for record in records {
+            if record.namespace_id != namespace_id
+                || record.embedding_space_id != runtime_id
+                || !expected.contains(&record.memory_ref)
+                || record.embedding.len() != runtime_space.dimensions
+                || record.embedding.is_empty()
+                || record
+                    .embedding
+                    .iter()
+                    .any(|component| !component.is_finite())
+                || embeddings
+                    .insert(record.memory_ref, record.embedding)
+                    .is_some()
+            {
+                info!(
+                    event = "recall_diversity_unavailable",
+                    reason = "invalid_embedding_generation",
+                    "optional diversity stage skipped"
+                );
+                return Err(SearchUnavailable::InvalidStoredVector);
+            }
+        }
+        if embeddings.keys().copied().collect::<BTreeSet<_>>() != expected {
+            info!(
+                event = "recall_diversity_unavailable",
+                reason = "incomplete_embedding_generation",
+                "optional diversity stage skipped"
+            );
+            return Err(SearchUnavailable::InvalidStoredVector);
+        }
+        Ok(embeddings)
     }
 
     /// Build a BM25 positional score map by re-running FTS and assigning rank-based scores.
@@ -1385,6 +1792,77 @@ impl<'a> RecallEngine<'a> {
     }
 }
 
+fn gathered_from_legacy(
+    candidates: HashMap<Uuid, Memory>,
+    vector_by_id: &HashMap<Uuid, f32>,
+    bm25_by_id: &HashMap<Uuid, f32>,
+) -> GatheredCandidates {
+    let mut typed_candidates = BTreeMap::new();
+    let mut vector_map = BTreeMap::new();
+    let mut bm25_map = BTreeMap::new();
+    for (id, memory) in candidates {
+        let memory_ref = MemoryRef::from_memory(&memory);
+        if let Some(score) = vector_by_id.get(&id) {
+            vector_map.insert(memory_ref, *score);
+        }
+        if let Some(score) = bm25_by_id.get(&id) {
+            bm25_map.insert(memory_ref, *score);
+        }
+        typed_candidates.insert(memory_ref, memory);
+    }
+    GatheredCandidates {
+        candidates: typed_candidates,
+        vector_map,
+        bm25_map,
+        semantic_status: SemanticStatus::Complete,
+    }
+}
+
+fn memory_matches_entity(memory: &Memory, entity_id: Uuid) -> bool {
+    match memory {
+        Memory::Episodic(memory) => {
+            memory.about_entity == entity_id || memory.source_entity == entity_id
+        }
+        Memory::Semantic(memory) => {
+            memory.subject == entity_id || memory.object_entity == Some(entity_id)
+        }
+        Memory::Procedural(_) | Memory::Observation(_) => false,
+    }
+}
+
+fn reciprocal_rank_fusion_refs(
+    rankings: &[Vec<(MemoryRef, f32)>],
+    weights: &[f32],
+    k: u32,
+) -> Result<Vec<(MemoryRef, f32)>, crate::rrf::RrfError> {
+    if rankings.len() != weights.len() {
+        return Err(crate::rrf::RrfError::Config(format!(
+            "rankings ({}) and weights ({}) must be same length",
+            rankings.len(),
+            weights.len()
+        )));
+    }
+    let mut scores = BTreeMap::<MemoryRef, f64>::new();
+    let k = f64::from(k);
+    for (ranking, weight) in rankings.iter().zip(weights) {
+        for (zero_based_rank, (memory_ref, _)) in ranking.iter().enumerate() {
+            *scores.entry(*memory_ref).or_insert(0.0) +=
+                f64::from(*weight) / (k + (zero_based_rank + 1) as f64);
+        }
+    }
+    let mut fused = scores
+        .into_iter()
+        .map(|(memory_ref, score)| (memory_ref, score as f32))
+        .collect::<Vec<_>>();
+    fused.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    Ok(fused)
+}
+
 /// Score a single candidate using all fusion signals (legacy linear weighted sum).
 ///
 /// Retained for ablation studies comparing linear fusion vs RRF.
@@ -1398,7 +1876,7 @@ impl<'a> RecallEngine<'a> {
 /// - Graph ranking is empty (no entity relationships built yet)
 /// - Activation ranking is flat (all memories have zero access count)
 /// - Confidence ranking is uniform (all memories are episodic with 1.0)
-fn has_discriminative_signal(ranking: &[(Uuid, f32)]) -> bool {
+fn has_discriminative_signal<T>(ranking: &[(T, f32)]) -> bool {
     if ranking.len() < 2 {
         return !ranking.is_empty();
     }
@@ -1536,12 +2014,12 @@ fn vendi_merge_candidates<F>(
     mut embedding_lookup: F,
 ) -> Vec<ScoredCandidate>
 where
-    F: FnMut(Uuid) -> Option<Vec<f32>>,
+    F: FnMut(&ScoredCandidate) -> Option<Vec<f32>>,
 {
     let pool_size = scored.len().min(reranker.max_k);
     let mut vendi_input: Vec<(Uuid, f32, Vec<f32>)> = Vec::with_capacity(pool_size);
     for cand in scored.iter().take(pool_size) {
-        if let Some(emb) = embedding_lookup(cand.memory_id) {
+        if let Some(emb) = embedding_lookup(cand) {
             vendi_input.push((cand.memory_id, cand.final_score, emb));
         }
     }
@@ -1578,6 +2056,75 @@ where
     }
     reordered_scored.extend(tail);
     reordered_scored
+}
+
+fn rerank_mmr_with_embeddings(
+    items: Vec<ScoredCandidate>,
+    lambda: f32,
+    k: usize,
+    embeddings: &BTreeMap<MemoryRef, Vec<f32>>,
+) -> Vec<ScoredCandidate> {
+    if k == 0 || items.is_empty() {
+        return Vec::new();
+    }
+    let target = k.min(items.len());
+    let lambda = lambda.clamp(0.0, 1.0);
+    let raw_relevance = items
+        .iter()
+        .map(|candidate| candidate.final_score)
+        .collect::<Vec<_>>();
+    let (minimum, maximum) = raw_relevance
+        .iter()
+        .copied()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(low, high), value| {
+            (low.min(value), high.max(value))
+        });
+    let range = maximum - minimum;
+    let relevance = if range > f32::EPSILON {
+        raw_relevance
+            .iter()
+            .map(|value| (*value - minimum) / range)
+            .collect::<Vec<_>>()
+    } else {
+        vec![0.5; items.len()]
+    };
+    let refs = items
+        .iter()
+        .map(|candidate| MemoryRef::from_memory(&candidate.memory))
+        .collect::<Vec<_>>();
+    let mut pool = (0..items.len()).collect::<Vec<_>>();
+    let mut selected = Vec::with_capacity(target);
+    while selected.len() < target && !pool.is_empty() {
+        let mut best_pool_position = 0;
+        let mut best_score = f32::NEG_INFINITY;
+        for (pool_position, candidate_index) in pool.iter().copied().enumerate() {
+            let redundancy = if selected.is_empty() {
+                0.0
+            } else {
+                selected
+                    .iter()
+                    .copied()
+                    .map(|selected_index| {
+                        crate::embedding::cosine_similarity(
+                            &embeddings[&refs[candidate_index]],
+                            &embeddings[&refs[selected_index]],
+                        )
+                    })
+                    .fold(f32::NEG_INFINITY, f32::max)
+            };
+            let score = lambda * relevance[candidate_index] - (1.0 - lambda) * redundancy;
+            if score > best_score {
+                best_score = score;
+                best_pool_position = pool_position;
+            }
+        }
+        selected.push(pool.swap_remove(best_pool_position));
+    }
+    let mut slots = items.into_iter().map(Some).collect::<Vec<_>>();
+    selected
+        .into_iter()
+        .map(|index| slots[index].take().expect("MMR indices are unique"))
+        .collect()
 }
 
 /// Apply cross-encoder reranking to the top-N candidates.
@@ -1629,9 +2176,21 @@ mod tests {
     use super::*;
     use crate::config::RetrievalConfig;
     use crate::embedding::OnnxEmbedder;
+    use crate::embedding_space::{EmbeddingSpace, MOCK_ALGORITHM_VERSION};
+    use crate::storage::bounded::{
+        EmbeddingRecord, LexicalHit, MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS,
+        MAX_VECTOR_HITS, MemoryRef, SearchScope, SearchUnavailable, VectorHit, VectorSearchOutcome,
+        VectorSearchRequest,
+    };
     use crate::storage::sqlite::SqliteBackend;
-    use crate::types::{Entity, EntityKind, Episode, EpisodicMemory, Namespace};
+    use crate::storage::{ActivityAggregate, ActivityEvent, ErasedRows, StorageResult};
+    use crate::types::{
+        Edge, Entity, EntityKind, Episode, EpisodicMemory, Namespace, ProceduralMemory,
+        SemanticMemory,
+    };
     use crate::vector::VectorIndex;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Default weights: [vector, bm25, graph, intent, recency, access, confidence, type_boost]
     const TEST_WEIGHTS: [f32; 8] = [0.25, 0.10, 0.15, 0.05, 0.20, 0.10, 0.10, 0.05];
@@ -2196,8 +2755,8 @@ mod tests {
         indexed.insert(ids[4], e4);
 
         let reranker = crate::retrieval::vendi::VendiReranker::new(0.5, 50);
-        let merged = vendi_merge_candidates(candidates, &reranker, None, 5, |id| {
-            indexed.get(&id).cloned()
+        let merged = vendi_merge_candidates(candidates, &reranker, None, 5, |candidate| {
+            indexed.get(&candidate.memory_id).cloned()
         });
 
         // No duplicates.
@@ -2248,8 +2807,8 @@ mod tests {
         indexed.insert(ids[3], orth);
 
         let reranker = crate::retrieval::vendi::VendiReranker::new(0.0, 50);
-        let merged = vendi_merge_candidates(candidates, &reranker, None, 2, |id| {
-            indexed.get(&id).cloned()
+        let merged = vendi_merge_candidates(candidates, &reranker, None, 2, |candidate| {
+            indexed.get(&candidate.memory_id).cloned()
         });
 
         // All four still present (no loss).
@@ -2285,8 +2844,8 @@ mod tests {
         indexed.insert(original_ids[0], e);
 
         let reranker = crate::retrieval::vendi::VendiReranker::new(0.5, 50);
-        let merged = vendi_merge_candidates(candidates, &reranker, None, 3, |id| {
-            indexed.get(&id).cloned()
+        let merged = vendi_merge_candidates(candidates, &reranker, None, 3, |candidate| {
+            indexed.get(&candidate.memory_id).cloned()
         });
 
         let merged_ids: Vec<Uuid> = merged.iter().map(|c| c.memory_id).collect();
@@ -2318,8 +2877,8 @@ mod tests {
         }
 
         let reranker = crate::retrieval::vendi::VendiReranker::new(1.0, 50);
-        let merged = vendi_merge_candidates(candidates, &reranker, None, 4, |id| {
-            indexed.get(&id).cloned()
+        let merged = vendi_merge_candidates(candidates, &reranker, None, 4, |candidate| {
+            indexed.get(&candidate.memory_id).cloned()
         });
 
         let merged_ids: Vec<Uuid> = merged.iter().map(|c| c.memory_id).collect();
@@ -2733,5 +3292,884 @@ mod tests {
                 "ppr_score must be None when PPR produced no discriminative signal for this query"
             );
         }
+    }
+
+    #[derive(Default)]
+    struct CountingStorage {
+        vector_outcome: Mutex<Option<VectorSearchOutcome>>,
+        lexical_hits: Mutex<Vec<LexicalHit>>,
+        hydrated: Mutex<Vec<Memory>>,
+        embedding_records: Mutex<Vec<EmbeddingRecord>>,
+        fail_hydration: Mutex<bool>,
+        fail_embedding_load: Mutex<bool>,
+        vector_calls: AtomicUsize,
+        lexical_calls: AtomicUsize,
+        hydration_calls: AtomicUsize,
+        embedding_calls: AtomicUsize,
+        legacy_calls: AtomicUsize,
+        vector_ks: Mutex<Vec<usize>>,
+        lexical_limits: Mutex<Vec<usize>>,
+        hydration_batches: Mutex<Vec<(Vec<MemoryRef>, usize)>>,
+        embedding_batches: Mutex<Vec<Vec<MemoryRef>>>,
+        scopes: Mutex<Vec<SearchScope>>,
+    }
+
+    impl CountingStorage {
+        fn with_results(
+            vector_outcome: VectorSearchOutcome,
+            lexical_hits: Vec<LexicalHit>,
+            hydrated: Vec<Memory>,
+        ) -> Self {
+            Self {
+                vector_outcome: Mutex::new(Some(vector_outcome)),
+                lexical_hits: Mutex::new(lexical_hits),
+                hydrated: Mutex::new(hydrated),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl StorageTrait for CountingStorage {
+        fn search_vector(
+            &self,
+            request: &VectorSearchRequest<'_>,
+        ) -> StorageResult<VectorSearchOutcome> {
+            self.vector_calls.fetch_add(1, Ordering::SeqCst);
+            self.vector_ks.lock().unwrap().push(request.k);
+            self.scopes.lock().unwrap().push(request.scope.clone());
+            Ok(self
+                .vector_outcome
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(VectorSearchOutcome::Complete(Vec::new())))
+        }
+
+        fn search_lexical_hits(
+            &self,
+            _query: &str,
+            scope: &SearchScope,
+            limit: usize,
+        ) -> StorageResult<Vec<LexicalHit>> {
+            self.lexical_calls.fetch_add(1, Ordering::SeqCst);
+            self.lexical_limits.lock().unwrap().push(limit);
+            self.scopes.lock().unwrap().push(scope.clone());
+            Ok(self.lexical_hits.lock().unwrap().clone())
+        }
+
+        fn hydrate_memories(
+            &self,
+            _namespace_id: Uuid,
+            memory_refs: &[MemoryRef],
+            max_bytes: usize,
+        ) -> StorageResult<Vec<Memory>> {
+            self.hydration_calls.fetch_add(1, Ordering::SeqCst);
+            self.hydration_batches
+                .lock()
+                .unwrap()
+                .push((memory_refs.to_vec(), max_bytes));
+            if *self.fail_hydration.lock().unwrap() {
+                return Err(crate::storage::StorageError::BudgetExceeded(
+                    "counting hydration failure".into(),
+                ));
+            }
+            let requested = memory_refs.iter().copied().collect::<BTreeSet<_>>();
+            Ok(self
+                .hydrated
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|memory| requested.contains(&MemoryRef::from_memory(memory)))
+                .cloned()
+                .collect())
+        }
+
+        fn load_embedding_records(
+            &self,
+            _namespace_id: Uuid,
+            _embedding_space_id: &crate::embedding_space::EmbeddingSpaceId,
+            memory_refs: &[MemoryRef],
+        ) -> StorageResult<Vec<EmbeddingRecord>> {
+            self.embedding_calls.fetch_add(1, Ordering::SeqCst);
+            self.embedding_batches
+                .lock()
+                .unwrap()
+                .push(memory_refs.to_vec());
+            if *self.fail_embedding_load.lock().unwrap() {
+                return Err(crate::storage::StorageError::Context(
+                    "counting embedding failure".into(),
+                ));
+            }
+            Ok(self.embedding_records.lock().unwrap().clone())
+        }
+
+        fn save_namespace(&self, _ns: &Namespace) -> StorageResult<()> {
+            Ok(())
+        }
+        fn get_namespace(&self, _id: Uuid) -> StorageResult<Option<Namespace>> {
+            Ok(None)
+        }
+        fn get_namespace_by_name(&self, _name: &str) -> StorageResult<Option<Namespace>> {
+            Ok(None)
+        }
+        fn save_entity(&self, _entity: &Entity) -> StorageResult<()> {
+            Ok(())
+        }
+        fn get_entity_in_namespace(
+            &self,
+            _id: Uuid,
+            _namespace_id: Uuid,
+        ) -> StorageResult<Option<Entity>> {
+            Ok(None)
+        }
+        fn get_entity_by_name(
+            &self,
+            _name: &str,
+            _namespace_id: Uuid,
+        ) -> StorageResult<Option<Entity>> {
+            Ok(None)
+        }
+        fn save_episode(&self, _episode: &Episode) -> StorageResult<()> {
+            Ok(())
+        }
+        fn get_episode_in_namespace(
+            &self,
+            _id: Uuid,
+            _namespace_id: Uuid,
+        ) -> StorageResult<Option<Episode>> {
+            Ok(None)
+        }
+        fn update_episode(&self, _episode: &Episode) -> StorageResult<()> {
+            Ok(())
+        }
+        fn save_episodic(&self, _mem: &EpisodicMemory) -> StorageResult<()> {
+            Ok(())
+        }
+        fn get_episodic_in_namespace(
+            &self,
+            _id: Uuid,
+            _namespace_id: Uuid,
+        ) -> StorageResult<Option<EpisodicMemory>> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+        fn list_episodic_by_entity_in_namespace(
+            &self,
+            _about_entity: Uuid,
+            _namespace_id: Uuid,
+            _limit: usize,
+        ) -> StorageResult<Vec<EpisodicMemory>> {
+            Ok(Vec::new())
+        }
+        fn update_episodic_access_in_namespace(
+            &self,
+            _id: Uuid,
+            _namespace_id: Uuid,
+            _stability: f32,
+            _retrievability: f32,
+        ) -> StorageResult<()> {
+            Ok(())
+        }
+        fn save_semantic(&self, _mem: &SemanticMemory) -> StorageResult<()> {
+            Ok(())
+        }
+        fn get_semantic_in_namespace(
+            &self,
+            _id: Uuid,
+            _namespace_id: Uuid,
+        ) -> StorageResult<Option<SemanticMemory>> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+        fn list_semantic_by_entity_in_namespace(
+            &self,
+            _subject: Uuid,
+            _namespace_id: Uuid,
+            _limit: usize,
+        ) -> StorageResult<Vec<SemanticMemory>> {
+            Ok(Vec::new())
+        }
+        fn save_procedural(&self, _mem: &ProceduralMemory) -> StorageResult<()> {
+            Ok(())
+        }
+        fn get_procedural_in_namespace(
+            &self,
+            _id: Uuid,
+            _namespace_id: Uuid,
+        ) -> StorageResult<Option<ProceduralMemory>> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+        fn update_procedural_reliability_in_namespace(
+            &self,
+            _id: Uuid,
+            _namespace_id: Uuid,
+            _reliability: f32,
+            _trial_count: u32,
+            _success_count: u32,
+        ) -> StorageResult<()> {
+            Ok(())
+        }
+        fn search_fts(
+            &self,
+            _query: &str,
+            _namespace_id: Uuid,
+            _limit: usize,
+        ) -> StorageResult<Vec<Memory>> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+        fn search_fts_scoped(
+            &self,
+            _query: &str,
+            _namespace_id: Uuid,
+            _entity_id: Uuid,
+            _limit: usize,
+        ) -> StorageResult<Vec<Memory>> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+        fn get_all_memories_by_namespace(&self, _namespace_id: Uuid) -> StorageResult<Vec<Memory>> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+        fn supersede_memory_in_namespace(
+            &self,
+            _id: Uuid,
+            _namespace_id: Uuid,
+            _superseded_by: Uuid,
+            _invalid_at: chrono::DateTime<Utc>,
+        ) -> StorageResult<bool> {
+            Ok(false)
+        }
+        fn delete_memories_by_entity(
+            &self,
+            _entity_id: Uuid,
+            _namespace_id: Uuid,
+        ) -> StorageResult<usize> {
+            Ok(0)
+        }
+        fn delete_memories_by_entity_capturing(
+            &self,
+            _entity_id: Uuid,
+            _namespace_id: Uuid,
+            persist: &mut dyn FnMut(&[Memory]) -> StorageResult<()>,
+        ) -> StorageResult<Vec<Memory>> {
+            persist(&[])?;
+            Ok(Vec::new())
+        }
+        fn erase_entity_capturing(
+            &self,
+            _entity_id: Uuid,
+            _namespace_id: Uuid,
+        ) -> StorageResult<ErasedRows> {
+            Ok(ErasedRows::default())
+        }
+        fn delete_memory_by_id_in_namespace(
+            &self,
+            _id: Uuid,
+            _namespace_id: Uuid,
+        ) -> StorageResult<bool> {
+            Ok(false)
+        }
+        fn list_entities_by_namespace(&self, _namespace_id: Uuid) -> StorageResult<Vec<Entity>> {
+            Ok(Vec::new())
+        }
+        fn save_edge(&self, _edge: &Edge, _namespace_id: Uuid) -> StorageResult<()> {
+            Ok(())
+        }
+        fn get_edges_for_entity_in_namespace(
+            &self,
+            _entity_id: Uuid,
+            _namespace_id: Uuid,
+        ) -> StorageResult<Vec<Edge>> {
+            Ok(Vec::new())
+        }
+        fn count_memories_by_namespace(
+            &self,
+            _namespace_id: Uuid,
+        ) -> StorageResult<(usize, usize, usize)> {
+            Ok((0, 0, 0))
+        }
+        fn count_entities_by_namespace(&self, _namespace_id: Uuid) -> StorageResult<usize> {
+            Ok(0)
+        }
+        fn log_activity(
+            &self,
+            _namespace_id: Uuid,
+            _event_type: &str,
+            _detail: &serde_json::Value,
+        ) -> StorageResult<()> {
+            Ok(())
+        }
+        fn get_activity_aggregates(
+            &self,
+            _namespace_id: Uuid,
+            _days: u32,
+        ) -> StorageResult<Vec<ActivityAggregate>> {
+            Ok(Vec::new())
+        }
+        fn get_recent_activity(
+            &self,
+            _namespace_id: Uuid,
+            _limit: usize,
+        ) -> StorageResult<Vec<ActivityEvent>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn bounded_memory(namespace_id: Uuid, id: Uuid, content: &str) -> Memory {
+        let mut memory = EpisodicMemory::new(
+            namespace_id,
+            Uuid::from_bytes([91; 16]),
+            Uuid::from_bytes([92; 16]),
+            Uuid::from_bytes([93; 16]),
+            content,
+        );
+        memory.id = id;
+        memory.embedding = vec![9.0, 9.0];
+        Memory::Episodic(memory)
+    }
+
+    fn bounded_semantic_memory(namespace_id: Uuid, id: Uuid, object: &str) -> Memory {
+        let mut memory = SemanticMemory::new(
+            namespace_id,
+            Uuid::from_bytes([94; 16]),
+            "describes",
+            object,
+            0.8,
+        );
+        memory.id = id;
+        memory.embedding = vec![8.0, 8.0];
+        Memory::Semantic(memory)
+    }
+
+    fn mock_space(dimensions: usize) -> EmbeddingSpace {
+        EmbeddingSpace::mock(dimensions, MOCK_ALGORITHM_VERSION)
+    }
+
+    #[test]
+    fn storage_backed_recall_uses_one_bounded_candidate_pass() {
+        let namespace_id = Uuid::from_bytes([80; 16]);
+        let id = Uuid::from_bytes([81; 16]);
+        let memory = bounded_memory(namespace_id, id, "bounded query");
+        let memory_ref = MemoryRef::from_memory(&memory);
+        let storage = CountingStorage::with_results(
+            VectorSearchOutcome::Complete(vec![VectorHit {
+                memory_ref,
+                score: 0.9,
+            }]),
+            vec![LexicalHit {
+                memory_ref,
+                rank: 1,
+            }],
+            vec![memory],
+        );
+        let embedder = OnnxEmbedder::new_mock(2);
+        let runtime_space = mock_space(2);
+        let mut config = test_config();
+        config.max_candidates = 500;
+
+        let result = RecallEngine::new_storage_backed(&storage, &embedder, &runtime_space, &config)
+            .recall("bounded query", namespace_id, 10)
+            .unwrap();
+
+        assert_eq!(storage.vector_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.lexical_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.hydration_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.embedding_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(storage.legacy_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(*storage.vector_ks.lock().unwrap(), vec![MAX_VECTOR_HITS]);
+        assert_eq!(
+            *storage.lexical_limits.lock().unwrap(),
+            vec![MAX_LEXICAL_HITS]
+        );
+        let hydration = storage.hydration_batches.lock().unwrap();
+        assert_eq!(
+            hydration.as_slice(),
+            &[(vec![memory_ref], MAX_HYDRATED_BYTES)]
+        );
+        assert_eq!(result.semantic_status, SemanticStatus::Complete);
+        assert_eq!(result.memories.len(), 1);
+        assert_eq!(result.memories[0].memory_id, id);
+    }
+
+    #[test]
+    fn storage_backed_diversity_loads_only_the_bounded_active_generation() {
+        let namespace_id = Uuid::from_bytes([82; 16]);
+        let first = bounded_memory(
+            namespace_id,
+            Uuid::from_bytes([83; 16]),
+            "bounded diversity query alpha",
+        );
+        let second = bounded_memory(
+            namespace_id,
+            Uuid::from_bytes([84; 16]),
+            "bounded diversity query beta",
+        );
+        let first_ref = MemoryRef::from_memory(&first);
+        let second_ref = MemoryRef::from_memory(&second);
+        let runtime_space = mock_space(2);
+        let runtime_id = runtime_space.id();
+        let storage = CountingStorage::with_results(
+            VectorSearchOutcome::Complete(vec![
+                VectorHit {
+                    memory_ref: first_ref,
+                    score: 0.9,
+                },
+                VectorHit {
+                    memory_ref: second_ref,
+                    score: 0.8,
+                },
+            ]),
+            Vec::new(),
+            vec![first, second],
+        );
+        *storage.embedding_records.lock().unwrap() = vec![
+            EmbeddingRecord {
+                namespace_id,
+                memory_ref: first_ref,
+                embedding_space_id: runtime_id.clone(),
+                source_sha256: "a".into(),
+                embedding: vec![1.0, 0.0],
+            },
+            EmbeddingRecord {
+                namespace_id,
+                memory_ref: second_ref,
+                embedding_space_id: runtime_id,
+                source_sha256: "b".into(),
+                embedding: vec![0.0, 1.0],
+            },
+        ];
+        let embedder = OnnxEmbedder::new_mock(2);
+        let config = test_config();
+
+        let result = RecallEngine::new_storage_backed(&storage, &embedder, &runtime_space, &config)
+            .with_mmr_lambda(0.5)
+            .recall("bounded diversity query", namespace_id, 2)
+            .unwrap();
+
+        assert_eq!(result.diversity_status, DiversityStatus::Complete);
+        assert_eq!(storage.embedding_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            storage.embedding_batches.lock().unwrap().as_slice(),
+            &[vec![first_ref, second_ref]]
+        );
+        assert_eq!(storage.legacy_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(result.memories.len(), 2);
+    }
+
+    #[test]
+    fn storage_backed_diversity_failure_is_explicit_and_keeps_fused_results() {
+        let namespace_id = Uuid::from_bytes([85; 16]);
+        let first = bounded_memory(
+            namespace_id,
+            Uuid::from_bytes([86; 16]),
+            "bounded failure query alpha",
+        );
+        let second = bounded_memory(
+            namespace_id,
+            Uuid::from_bytes([87; 16]),
+            "bounded failure query beta",
+        );
+        let first_ref = MemoryRef::from_memory(&first);
+        let second_ref = MemoryRef::from_memory(&second);
+        let storage = CountingStorage::with_results(
+            VectorSearchOutcome::Complete(vec![
+                VectorHit {
+                    memory_ref: first_ref,
+                    score: 0.9,
+                },
+                VectorHit {
+                    memory_ref: second_ref,
+                    score: 0.8,
+                },
+            ]),
+            Vec::new(),
+            vec![first, second],
+        );
+        *storage.fail_embedding_load.lock().unwrap() = true;
+        let embedder = OnnxEmbedder::new_mock(2);
+        let runtime_space = mock_space(2);
+        let config = test_config();
+
+        let result = RecallEngine::new_storage_backed(&storage, &embedder, &runtime_space, &config)
+            .with_mmr_lambda(0.5)
+            .recall("bounded failure query", namespace_id, 2)
+            .unwrap();
+
+        assert_eq!(
+            result.diversity_status,
+            DiversityStatus::Unavailable(SearchUnavailable::InvalidStoredVector)
+        );
+        assert_eq!(storage.embedding_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.memories.len(), 2);
+        assert_eq!(storage.legacy_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn storage_backed_vector_unavailability_degrades_to_lexical_once() {
+        for reason in [
+            SearchUnavailable::RuntimeSpaceMismatch,
+            SearchUnavailable::NoActiveEmbeddingSpace,
+            SearchUnavailable::DeadlineExceeded,
+            SearchUnavailable::ScanBudgetExceeded,
+            SearchUnavailable::InvalidStoredVector,
+            SearchUnavailable::UnsupportedBackend,
+        ] {
+            let namespace_id = Uuid::from_bytes([88; 16]);
+            let id = Uuid::from_bytes([89; 16]);
+            let memory = bounded_memory(namespace_id, id, "lexical degradation query");
+            let memory_ref = MemoryRef::from_memory(&memory);
+            let storage = CountingStorage::with_results(
+                VectorSearchOutcome::Unavailable(reason.clone()),
+                vec![LexicalHit {
+                    memory_ref,
+                    rank: 1,
+                }],
+                vec![memory],
+            );
+            let embedder = OnnxEmbedder::new_mock(2);
+            let runtime_space = mock_space(2);
+            let config = test_config();
+
+            let result =
+                RecallEngine::new_storage_backed(&storage, &embedder, &runtime_space, &config)
+                    .recall("lexical degradation query", namespace_id, 10)
+                    .unwrap();
+
+            assert_eq!(result.semantic_status, SemanticStatus::Unavailable(reason));
+            assert_eq!(result.memories.len(), 1);
+            assert_eq!(result.memories[0].memory_id, id);
+            assert_eq!(storage.vector_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(storage.lexical_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(storage.hydration_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(storage.legacy_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn storage_backed_vector_deadline_does_not_become_a_whole_recall_timeout() {
+        let namespace_id = Uuid::from_bytes([106; 16]);
+        let id = Uuid::from_bytes([107; 16]);
+        let memory = bounded_memory(namespace_id, id, "deadline lexical query");
+        let memory_ref = MemoryRef::from_memory(&memory);
+        let storage = CountingStorage::with_results(
+            VectorSearchOutcome::Unavailable(SearchUnavailable::DeadlineExceeded),
+            vec![LexicalHit {
+                memory_ref,
+                rank: 1,
+            }],
+            vec![memory],
+        );
+        let embedder = OnnxEmbedder::new_mock(2);
+        let runtime_space = mock_space(2);
+        let mut config = test_config();
+        config.recall_timeout_secs = 0;
+
+        let result = RecallEngine::new_storage_backed(&storage, &embedder, &runtime_space, &config)
+            .recall("deadline lexical query", namespace_id, 10)
+            .unwrap();
+
+        assert_eq!(
+            result.semantic_status,
+            SemanticStatus::Unavailable(SearchUnavailable::DeadlineExceeded)
+        );
+        assert_eq!(result.memories.len(), 1);
+        assert_eq!(result.memories[0].memory_id, id);
+    }
+
+    #[test]
+    fn storage_backed_runtime_identity_mismatch_never_queries_vectors_or_falls_back() {
+        let namespace_id = Uuid::from_bytes([95; 16]);
+        let id = Uuid::from_bytes([96; 16]);
+        let memory = bounded_memory(namespace_id, id, "runtime mismatch query");
+        let memory_ref = MemoryRef::from_memory(&memory);
+        let storage = CountingStorage::with_results(
+            VectorSearchOutcome::Complete(vec![VectorHit {
+                memory_ref,
+                score: 1.0,
+            }]),
+            vec![LexicalHit {
+                memory_ref,
+                rank: 1,
+            }],
+            vec![memory],
+        );
+        let embedder = OnnxEmbedder::new_mock(2);
+        let mismatched_runtime = EmbeddingSpace::mock(2, "different-runtime-provenance");
+        let config = test_config();
+
+        let result =
+            RecallEngine::new_storage_backed(&storage, &embedder, &mismatched_runtime, &config)
+                .recall("runtime mismatch query", namespace_id, 10)
+                .unwrap();
+
+        assert_eq!(
+            result.semantic_status,
+            SemanticStatus::Unavailable(SearchUnavailable::RuntimeSpaceMismatch)
+        );
+        assert_eq!(result.memories.len(), 1);
+        assert_eq!(storage.vector_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(storage.lexical_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.hydration_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.legacy_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn storage_backed_hydration_budget_error_is_not_retried_or_partially_returned() {
+        let namespace_id = Uuid::from_bytes([97; 16]);
+        let memory = bounded_memory(
+            namespace_id,
+            Uuid::from_bytes([98; 16]),
+            "hydration budget query",
+        );
+        let memory_ref = MemoryRef::from_memory(&memory);
+        let storage = CountingStorage::with_results(
+            VectorSearchOutcome::Complete(vec![VectorHit {
+                memory_ref,
+                score: 0.9,
+            }]),
+            Vec::new(),
+            vec![memory],
+        );
+        *storage.fail_hydration.lock().unwrap() = true;
+        let embedder = OnnxEmbedder::new_mock(2);
+        let runtime_space = mock_space(2);
+        let config = test_config();
+
+        let error = RecallEngine::new_storage_backed(&storage, &embedder, &runtime_space, &config)
+            .recall("hydration budget query", namespace_id, 10)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RecallError::Storage(crate::storage::StorageError::BudgetExceeded(_))
+        ));
+        assert_eq!(storage.hydration_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.legacy_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn storage_backed_fusion_deduplicates_typed_refs_and_preserves_cross_type_uuid_collisions() {
+        let namespace_id = Uuid::from_bytes([99; 16]);
+        let shared_id = Uuid::from_bytes([100; 16]);
+        let episodic = bounded_memory(namespace_id, shared_id, "typed collision query episodic");
+        let semantic =
+            bounded_semantic_memory(namespace_id, shared_id, "typed collision query semantic");
+        let episodic_ref = MemoryRef::from_memory(&episodic);
+        let semantic_ref = MemoryRef::from_memory(&semantic);
+        let storage = CountingStorage::with_results(
+            VectorSearchOutcome::Complete(vec![
+                VectorHit {
+                    memory_ref: semantic_ref,
+                    score: 0.9,
+                },
+                VectorHit {
+                    memory_ref: episodic_ref,
+                    score: 0.9,
+                },
+                VectorHit {
+                    memory_ref: episodic_ref,
+                    score: 0.8,
+                },
+            ]),
+            vec![
+                LexicalHit {
+                    memory_ref: episodic_ref,
+                    rank: 1,
+                },
+                LexicalHit {
+                    memory_ref: semantic_ref,
+                    rank: 1,
+                },
+            ],
+            vec![semantic, episodic],
+        );
+        let embedder = OnnxEmbedder::new_mock(2);
+        let runtime_space = mock_space(2);
+        let config = test_config();
+
+        let result = RecallEngine::new_storage_backed(&storage, &embedder, &runtime_space, &config)
+            .recall("typed collision query", namespace_id, 10)
+            .unwrap();
+
+        assert_eq!(result.memories.len(), 2);
+        assert!(result.memories.iter().any(|candidate| {
+            matches!(candidate.memory, Memory::Episodic(_)) && candidate.memory_id == shared_id
+        }));
+        assert!(result.memories.iter().any(|candidate| {
+            matches!(candidate.memory, Memory::Semantic(_)) && candidate.memory_id == shared_id
+        }));
+        let batches = storage.hydration_batches.lock().unwrap();
+        assert_eq!(batches[0].0, vec![episodic_ref, semantic_ref]);
+    }
+
+    #[test]
+    fn storage_backed_fusion_globally_caps_two_hundred_refs_with_stable_ties() {
+        let namespace_id = Uuid::from_bytes([101; 16]);
+        let vector_memories = (1_u128..=120)
+            .map(|value| {
+                bounded_memory(
+                    namespace_id,
+                    Uuid::from_u128(value),
+                    "global cap tie query vector",
+                )
+            })
+            .collect::<Vec<_>>();
+        let lexical_memories = (121_u128..=240)
+            .map(|value| {
+                bounded_memory(
+                    namespace_id,
+                    Uuid::from_u128(value),
+                    "global cap tie query lexical",
+                )
+            })
+            .collect::<Vec<_>>();
+        let vector_hits = vector_memories
+            .iter()
+            .rev()
+            .map(|memory| VectorHit {
+                memory_ref: MemoryRef::from_memory(memory),
+                score: 0.5,
+            })
+            .collect::<Vec<_>>();
+        let lexical_hits = lexical_memories
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(index, memory)| LexicalHit {
+                memory_ref: MemoryRef::from_memory(memory),
+                rank: index + 1,
+            })
+            .collect::<Vec<_>>();
+        let hydrated = vector_memories
+            .into_iter()
+            .chain(lexical_memories)
+            .collect::<Vec<_>>();
+        let storage = CountingStorage::with_results(
+            VectorSearchOutcome::Complete(vector_hits),
+            lexical_hits,
+            hydrated,
+        );
+        let embedder = OnnxEmbedder::new_mock(2);
+        let runtime_space = mock_space(2);
+        let mut config = test_config();
+        config.max_candidates = 500;
+        let engine = RecallEngine::new_storage_backed(&storage, &embedder, &runtime_space, &config);
+
+        let first = engine
+            .recall("global cap tie query", namespace_id, MAX_FUSED_HITS)
+            .unwrap();
+        let second = engine
+            .recall("global cap tie query", namespace_id, MAX_FUSED_HITS)
+            .unwrap();
+
+        let batches = storage.hydration_batches.lock().unwrap();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].0.len(), MAX_FUSED_HITS);
+        assert_eq!(batches[0].0, batches[1].0);
+        assert!(batches[0].0.windows(2).all(|pair| pair[0] < pair[1]));
+        let first_refs = first
+            .memories
+            .iter()
+            .map(|candidate| MemoryRef::from_memory(&candidate.memory))
+            .collect::<Vec<_>>();
+        let second_refs = second
+            .memories
+            .iter()
+            .map(|candidate| MemoryRef::from_memory(&candidate.memory))
+            .collect::<Vec<_>>();
+        assert_eq!(first_refs, second_refs);
+        assert_eq!(storage.vector_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(storage.lexical_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(storage.hydration_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(storage.legacy_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn storage_backed_scope_carries_namespace_agent_user_and_entity_to_both_legs() {
+        let namespace_id = Uuid::from_bytes([102; 16]);
+        let agent_id = Uuid::from_bytes([103; 16]);
+        let user_id = Uuid::from_bytes([104; 16]);
+        let entity_id = Uuid::from_bytes([105; 16]);
+        let storage = CountingStorage::with_results(
+            VectorSearchOutcome::Complete(Vec::new()),
+            Vec::new(),
+            Vec::new(),
+        );
+        let embedder = OnnxEmbedder::new_mock(2);
+        let runtime_space = mock_space(2);
+        let config = test_config();
+
+        RecallEngine::new_storage_backed(&storage, &embedder, &runtime_space, &config)
+            .with_scope(Some(agent_id), Some(user_id))
+            .recall_with_entity("scoped query", namespace_id, 10, Some(entity_id))
+            .unwrap();
+
+        assert_eq!(
+            storage.scopes.lock().unwrap().as_slice(),
+            &[
+                SearchScope {
+                    namespace_id,
+                    agent_id: Some(agent_id),
+                    user_id: Some(user_id),
+                    entity_id: Some(entity_id),
+                },
+                SearchScope {
+                    namespace_id,
+                    agent_id: Some(agent_id),
+                    user_id: Some(user_id),
+                    entity_id: Some(entity_id),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn storage_backed_hydration_defensively_preserves_scope_and_entity_isolation() {
+        let namespace_id = Uuid::from_bytes([108; 16]);
+        let requested_agent = Uuid::from_bytes([109; 16]);
+        let requested_user = Uuid::from_bytes([110; 16]);
+        let requested_entity = Uuid::from_bytes([111; 16]);
+        let Memory::Episodic(mut foreign) = bounded_memory(
+            namespace_id,
+            Uuid::from_bytes([112; 16]),
+            "defensive scope query",
+        ) else {
+            unreachable!()
+        };
+        foreign.agent_id = Some(Uuid::from_bytes([113; 16]));
+        foreign.user_id = Some(Uuid::from_bytes([114; 16]));
+        foreign.about_entity = Uuid::from_bytes([115; 16]);
+        foreign.source_entity = Uuid::from_bytes([116; 16]);
+        let foreign = Memory::Episodic(foreign);
+        let foreign_ref = MemoryRef::from_memory(&foreign);
+        let storage = CountingStorage::with_results(
+            VectorSearchOutcome::Complete(vec![VectorHit {
+                memory_ref: foreign_ref,
+                score: 1.0,
+            }]),
+            vec![LexicalHit {
+                memory_ref: foreign_ref,
+                rank: 1,
+            }],
+            vec![foreign],
+        );
+        let embedder = OnnxEmbedder::new_mock(2);
+        let runtime_space = mock_space(2);
+        let config = test_config();
+
+        let result = RecallEngine::new_storage_backed(&storage, &embedder, &runtime_space, &config)
+            .with_scope(Some(requested_agent), Some(requested_user))
+            .recall_with_entity(
+                "defensive scope query",
+                namespace_id,
+                10,
+                Some(requested_entity),
+            )
+            .unwrap();
+
+        assert!(result.memories.is_empty());
     }
 }
