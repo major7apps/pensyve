@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::embedding_space::{EmbeddingClass, EmbeddingPolicy, EmbeddingSpace};
@@ -71,6 +72,7 @@ fn production_policy_rejects_mock_and_legacy_unknown() {
 
 #[test]
 fn mock_embedder_reports_a_mock_space_and_real_cache_hashes_exact_artifacts() {
+    let _guard = cache_env_lock().lock().unwrap();
     let mock = OnnxEmbedder::new_mock(768);
     assert_eq!(mock.embedding_space().unwrap().class, EmbeddingClass::Mock);
 
@@ -81,9 +83,130 @@ fn mock_embedder_reports_a_mock_space_and_real_cache_hashes_exact_artifacts() {
     );
 }
 
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "Rust 2024 makes process-environment mutation unsafe; this serialized integration fixture must direct the public constructor to its isolated cache"
+)]
+fn eager_embedder_keeps_the_space_of_the_snapshot_it_loaded() {
+    let _guard = cache_env_lock().lock().unwrap();
+    let source_root = fixture_cache_root();
+    let cache = tempfile::TempDir::new().expect("create isolated cache");
+    let loaded_onnx = seed_minilm_cache(&source_root, cache.path());
+    let original_cache_dir = std::env::var_os("FASTEMBED_CACHE_DIR");
+    unsafe { std::env::set_var("FASTEMBED_CACHE_DIR", cache.path()) };
+
+    let embedder = OnnxEmbedder::new_with_policy("all-MiniLM-L6-v2", &NetworkPolicy::Disabled)
+        .expect("load the certified snapshot");
+    let original_hash = hash_file(&loaded_onnx);
+    point_minilm_ref_at_drifted_snapshot(cache.path());
+
+    assert_eq!(
+        embedder.embedding_space().unwrap().artifact_sha256,
+        original_hash
+    );
+
+    match original_cache_dir {
+        Some(value) => unsafe { std::env::set_var("FASTEMBED_CACHE_DIR", value) },
+        None => unsafe { std::env::remove_var("FASTEMBED_CACHE_DIR") },
+    }
+}
+
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "Rust 2024 makes process-environment mutation unsafe; this serialized integration fixture must direct the public constructor to its isolated cache"
+)]
+fn lazy_embedder_keeps_the_space_of_the_snapshot_it_loaded() {
+    let _guard = cache_env_lock().lock().unwrap();
+    let source_root = fixture_cache_root();
+    let cache = tempfile::TempDir::new().expect("create isolated cache");
+    let loaded_onnx = seed_minilm_cache(&source_root, cache.path());
+    let original_cache_dir = std::env::var_os("FASTEMBED_CACHE_DIR");
+    unsafe { std::env::set_var("FASTEMBED_CACHE_DIR", cache.path()) };
+
+    let embedder =
+        OnnxEmbedder::new_lazy_with_options("all-MiniLM-L6-v2", &NetworkPolicy::Disabled, 1)
+            .expect("construct a lazy embedder");
+    embedder.embed("load the certified snapshot").unwrap();
+    let original_hash = hash_file(&loaded_onnx);
+    point_minilm_ref_at_drifted_snapshot(cache.path());
+
+    assert_eq!(
+        embedder.embedding_space().unwrap().artifact_sha256,
+        original_hash
+    );
+
+    match original_cache_dir {
+        Some(value) => unsafe { std::env::set_var("FASTEMBED_CACHE_DIR", value) },
+        None => unsafe { std::env::remove_var("FASTEMBED_CACHE_DIR") },
+    }
+}
+
 fn fixture_embedder_from_certified_cache() -> OnnxEmbedder {
     OnnxEmbedder::new_with_policy("all-MiniLM-L6-v2", &NetworkPolicy::Disabled)
         .expect("certified MiniLM cache fixture is required")
+}
+
+fn cache_env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn fixture_cache_root() -> PathBuf {
+    std::env::var("HF_HOME")
+        .or_else(|_| std::env::var("FASTEMBED_CACHE_DIR"))
+        .map(PathBuf::from)
+        .expect("certified MiniLM cache root must be set")
+}
+
+fn seed_minilm_cache(source_root: &Path, destination_root: &Path) -> PathBuf {
+    const REPOSITORY: &str = "models--Qdrant--all-MiniLM-L6-v2-onnx";
+    const FILES: &[&str] = &[
+        "config.json",
+        "model.onnx",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ];
+
+    let source_repository = source_root.join(REPOSITORY);
+    let revision = std::fs::read_to_string(source_repository.join("refs/main"))
+        .expect("read source cache revision");
+    let destination_repository = destination_root.join(REPOSITORY);
+    std::fs::create_dir_all(destination_repository.join("refs")).expect("create destination refs");
+    std::fs::write(destination_repository.join("refs/main"), &revision)
+        .expect("write destination cache revision");
+
+    let source_snapshot = source_repository.join("snapshots").join(&revision);
+    let destination_snapshot = destination_repository.join("snapshots").join(&revision);
+    for file in FILES {
+        let source = std::fs::canonicalize(source_snapshot.join(file))
+            .unwrap_or_else(|_| panic!("resolve source cache file {file}"));
+        let destination = destination_snapshot.join(file);
+        std::fs::create_dir_all(destination.parent().expect("cache file has a parent"))
+            .expect("create destination snapshot parent");
+        std::os::unix::fs::symlink(source, destination).expect("link certified cache file");
+    }
+    destination_snapshot.join("model.onnx")
+}
+
+fn point_minilm_ref_at_drifted_snapshot(cache_root: &Path) {
+    let repository = cache_root.join("models--Qdrant--all-MiniLM-L6-v2-onnx");
+    let snapshot = repository.join("snapshots/drifted-snapshot");
+    std::fs::create_dir_all(&snapshot).expect("create drifted snapshot");
+    for file in [
+        "config.json",
+        "model.onnx",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ] {
+        std::fs::write(snapshot.join(file), format!("drifted-{file}"))
+            .expect("write drifted artifact");
+    }
+    std::fs::write(repository.join("refs/main"), "drifted-snapshot")
+        .expect("advance cache ref after load");
 }
 
 fn fixture_onnx_sha256() -> String {
@@ -93,13 +216,17 @@ fn fixture_onnx_sha256() -> String {
     let repository = PathBuf::from(cache_dir).join("models--Qdrant--all-MiniLM-L6-v2-onnx");
     let revision = std::fs::read_to_string(repository.join("refs/main"))
         .expect("read certified MiniLM cache revision");
-    let mut file = File::open(
-        repository
+    hash_file(
+        &repository
             .join("snapshots")
             .join(revision)
             .join("model.onnx"),
     )
-    .expect("open certified MiniLM ONNX artifact");
+}
+
+fn hash_file(path: &Path) -> String {
+    let mut file = File::open(path)
+        .unwrap_or_else(|_| panic!("open certified ONNX artifact: {}", path.display()));
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {

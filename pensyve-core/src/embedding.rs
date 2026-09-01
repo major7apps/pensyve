@@ -203,6 +203,7 @@ enum EmbedderInner {
     Mock,
     Real {
         pool: Vec<Mutex<TextEmbedding>>,
+        files: LocalEmbeddingFiles,
         next: AtomicUsize,
     },
     /// Deferred variant: the ONNX session pool (and any load-time HF
@@ -216,9 +217,14 @@ enum EmbedderInner {
         model_file: &'static str,
         policy: NetworkPolicy,
         pool_size: usize,
-        pool: Mutex<Option<Arc<Vec<Mutex<TextEmbedding>>>>>,
+        pool: Mutex<Option<Arc<LazyEmbedderPool>>>,
         next: AtomicUsize,
     },
+}
+
+struct LazyEmbedderPool {
+    pool: Vec<Mutex<TextEmbedding>>,
+    files: LocalEmbeddingFiles,
 }
 
 // ---------------------------------------------------------------------------
@@ -362,18 +368,23 @@ fn build_pool_with_policy_at_cache(
     policy: &NetworkPolicy,
     pool_size: usize,
     cache_dir: &Path,
-) -> EmbeddingResult<Vec<Mutex<TextEmbedding>>> {
+) -> EmbeddingResult<(Vec<Mutex<TextEmbedding>>, LocalEmbeddingFiles)> {
     match preflight_model_cache(cache_dir, hf_model_code, model_file) {
-        Ok(files) if !matches!(policy, NetworkPolicy::Permissive) => {
-            build_local_pool(model, &files, pool_size)
-        }
-        Ok(_) => build_hugging_face_pool(model, pool_size, cache_dir),
+        Ok(files) => Ok((build_local_pool(model, &files, pool_size)?, files)),
         Err(detail) => {
             let hf_url = format!("https://huggingface.co/{hf_model_code}");
             policy.check(&hf_url).map_err(|policy_error| {
                 EmbeddingError::Network(format!("{CACHE_ERROR_PREFIX}{detail}; {policy_error}"))
             })?;
-            build_hugging_face_pool(model, pool_size, cache_dir)
+            // Fastembed owns the download path. Discard its sessions, then
+            // construct the returned pool from the one certified snapshot we
+            // retain as provenance; otherwise a later `refs/main` update
+            // could label vectors with a different artifact set.
+            drop(build_hugging_face_pool(model, 1, cache_dir)?);
+            let files = preflight_model_cache(cache_dir, hf_model_code, model_file)
+                .map_err(cache_model_load_error)?;
+            let pool = build_local_pool(model, &files, pool_size)?;
+            Ok((pool, files))
         }
     }
 }
@@ -384,7 +395,7 @@ fn build_pool_with_policy(
     model_file: &str,
     policy: &NetworkPolicy,
     pool_size: usize,
-) -> EmbeddingResult<Vec<Mutex<TextEmbedding>>> {
+) -> EmbeddingResult<(Vec<Mutex<TextEmbedding>>, LocalEmbeddingFiles)> {
     let cache_dir = resolved_fastembed_cache_dir()?;
     build_pool_with_policy_at_cache(
         model,
@@ -459,7 +470,7 @@ impl OnnxEmbedder {
         cache_dir: &Path,
     ) -> EmbeddingResult<Self> {
         let (model_enum, dims, hf_model_code, model_file) = resolve_model(model_name)?;
-        let pool = build_pool_with_policy_at_cache(
+        let (pool, files) = build_pool_with_policy_at_cache(
             &model_enum,
             hf_model_code,
             model_file,
@@ -473,6 +484,7 @@ impl OnnxEmbedder {
             descriptor: Some(embedding_space_descriptor(model_name, dims, &model_enum)),
             inner: EmbedderInner::Real {
                 pool,
+                files,
                 next: AtomicUsize::new(0),
             },
             space: OnceLock::new(),
@@ -539,7 +551,7 @@ impl OnnxEmbedder {
     /// serialize instead of double-loading. Errors are returned without
     /// being cached so a transient failure (e.g. download denied/offline)
     /// is retried on the next call.
-    fn ensure_lazy_pool(&self) -> EmbeddingResult<Arc<Vec<Mutex<TextEmbedding>>>> {
+    fn ensure_lazy_pool(&self) -> EmbeddingResult<Arc<LazyEmbedderPool>> {
         let EmbedderInner::Lazy {
             model,
             hf_model_code,
@@ -563,13 +575,9 @@ impl OnnxEmbedder {
         }
 
         tracing::info!("Lazily loading ONNX embedder (pool_size={pool_size})");
-        let built = Arc::new(build_pool_with_policy(
-            model,
-            hf_model_code,
-            model_file,
-            policy,
-            *pool_size,
-        )?);
+        let (pool, files) =
+            build_pool_with_policy(model, hf_model_code, model_file, policy, *pool_size)?;
+        let built = Arc::new(LazyEmbedderPool { pool, files });
         *guard = Some(Arc::clone(&built));
         Ok(built)
     }
@@ -646,10 +654,10 @@ impl OnnxEmbedder {
     pub fn embed(&self, text: &str) -> EmbeddingResult<Vec<f32>> {
         match &self.inner {
             EmbedderInner::Mock => Ok(mock_embed(text, self.dimensions)),
-            EmbedderInner::Real { pool, next } => embed_one_in_pool(pool, next, text),
+            EmbedderInner::Real { pool, next, .. } => embed_one_in_pool(pool, next, text),
             EmbedderInner::Lazy { next, .. } => {
                 let pool = self.ensure_lazy_pool()?;
-                embed_one_in_pool(&pool, next, text)
+                embed_one_in_pool(&pool.pool, next, text)
             }
         }
     }
@@ -661,10 +669,10 @@ impl OnnxEmbedder {
                 .iter()
                 .map(|t| Ok(mock_embed(t, self.dimensions)))
                 .collect(),
-            EmbedderInner::Real { pool, next } => embed_batch_in_pool(pool, next, texts),
+            EmbedderInner::Real { pool, next, .. } => embed_batch_in_pool(pool, next, texts),
             EmbedderInner::Lazy { next, .. } => {
                 let pool = self.ensure_lazy_pool()?;
-                embed_batch_in_pool(&pool, next, texts)
+                embed_batch_in_pool(&pool.pool, next, texts)
             }
         }
     }
@@ -693,34 +701,10 @@ impl OnnxEmbedder {
                 self.dimensions,
                 MOCK_ALGORITHM_VERSION,
             )),
-            EmbedderInner::Real { .. } => self.resolve_exact_local_files().and_then(|files| {
-                EmbeddingSpace::from_hashed_files(
-                    self.descriptor
-                        .as_ref()
-                        .expect("real embedder has a descriptor"),
-                    &files,
-                )
-                .map_err(|error| {
-                    cache_model_load_error(format!(
-                        "failed to hash certified local embedding artifacts: {error}"
-                    ))
-                })
-            }),
+            EmbedderInner::Real { files, .. } => self.embedding_space_from_files(files),
             EmbedderInner::Lazy { .. } => {
-                self.ensure_lazy_pool()?;
-                self.resolve_exact_local_files().and_then(|files| {
-                    EmbeddingSpace::from_hashed_files(
-                        self.descriptor
-                            .as_ref()
-                            .expect("lazy embedder has a descriptor"),
-                        &files,
-                    )
-                    .map_err(|error| {
-                        cache_model_load_error(format!(
-                            "failed to hash certified local embedding artifacts: {error}"
-                        ))
-                    })
-                })
+                let loaded = self.ensure_lazy_pool()?;
+                self.embedding_space_from_files(&loaded.files)
             }
         }?;
         self.space.set(resolved).map_err(|_| {
@@ -731,21 +715,25 @@ impl OnnxEmbedder {
         })
     }
 
-    fn resolve_exact_local_files(&self) -> EmbeddingResult<LocalArtifactFiles> {
+    fn embedding_space_from_files(
+        &self,
+        files: &LocalEmbeddingFiles,
+    ) -> EmbeddingResult<EmbeddingSpace> {
         let descriptor = self.descriptor.as_ref().ok_or_else(|| {
             EmbeddingError::Inference("mock embedder has no local artifacts".into())
         })?;
-        let (_, _, hf_model_code, model_file) = resolve_model(&descriptor.model_name)?;
-        let cache_dir = resolved_fastembed_cache_dir()?;
-        let files = preflight_model_cache(&cache_dir, hf_model_code, model_file)
-            .map_err(cache_model_load_error)?;
-        Ok(LocalArtifactFiles {
-            revision: files.revision,
-            config: files.config,
-            onnx: files.onnx,
-            special_tokens_map: files.special_tokens_map,
-            tokenizer: files.tokenizer,
-            tokenizer_config: files.tokenizer_config,
+        let files = LocalArtifactFiles {
+            revision: files.revision.clone(),
+            config: files.config.clone(),
+            onnx: files.onnx.clone(),
+            special_tokens_map: files.special_tokens_map.clone(),
+            tokenizer: files.tokenizer.clone(),
+            tokenizer_config: files.tokenizer_config.clone(),
+        };
+        EmbeddingSpace::from_hashed_files(descriptor, &files).map_err(|error| {
+            cache_model_load_error(format!(
+                "failed to hash certified local embedding artifacts: {error}"
+            ))
         })
     }
 }
