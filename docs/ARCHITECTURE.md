@@ -35,8 +35,8 @@
 │  │  └──────────┘  └──────────┘  └──────────────────┘│          │
 │  │                                                    │          │
 │  │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐│          │
-│  │  │ Vector   │  │ Graph    │  │ Reranker         ││          │
-│  │  │ Index    │  │ (petgraph│  │ (cross-encoder)  ││          │
+│  │  │ Bounded  │  │ Graph    │  │ Reranker         ││          │
+│  │  │ Search   │  │ (petgraph│  │ (cross-encoder)  ││          │
 │  │  └──────────┘  └──────────┘  └──────────────────┘│          │
 │  └────────────────────────────────────────────────────┘          │
 └─────────────────────────────────────────────────────────────────┘
@@ -68,7 +68,7 @@
 | `storage/sqlite.rs` | SQLite with WAL mode, FTS5 for BM25, multimodal content types, ACL table |
 | `storage/postgres.rs` | Postgres backend (feature-gated) with pgvector, tsvector FTS, JSONB |
 | `embedding.rs` | ONNX embeddings via `fastembed`; stored as raw f32 BLOBs |
-| `vector.rs` | In-memory vector index for cosine similarity search |
+| `vector.rs` | Cosine-similarity primitives; shipping runtimes use storage-backed search rather than a resident corpus index |
 | `graph.rs` | Entity relationship graph via `petgraph`; BFS traversal for proximity scoring |
 | `retrieval.rs` | `RecallEngine` — 8-signal fusion with weighted sum, cross-encoder reranking, `QueryIntent` classifier |
 | `decay.rs` | FSRS forgetting curve: `R(t, S) = (1 + t/(9*S))^(-1)` |
@@ -117,11 +117,11 @@ Namespace (isolation boundary)
 1. INGEST
    Message → Tier 1 extraction (patterns, always) → Episodic memory created
            → Tier 2 extraction (LLM, if configured) → Richer facts extracted
-           → Embed via ONNX → Add to vector index → Save to SQLite
+           → Embed via ONNX → Atomically save source + immutable embedding generation
 
 2. RETRIEVE
    Query → Embed query
-         → Vector search (cosine similarity)
+         → Storage-backed exact vector search (cosine similarity)
          → BM25 search (FTS5 lexical matching)
          → Graph traversal (petgraph BFS from entity)
          → Fusion scoring (8-signal weighted sum)
@@ -148,6 +148,46 @@ slot 6: confidence              (0.5)  — reliability
 slot 7: entity_affinity         (1.2)  — entity-scoped boost
 slot 8: ppr                     (1.0)  — Personalized PageRank (Phase 2C, opt-in)
 ```
+
+## Bounded Retrieval and Embedding Generations
+
+All shipping Rust entry points use `StorageTrait` retrieval. They do not hydrate a
+namespace corpus or retain a per-tenant `VectorIndex`. SQLite streams exact cosine
+scoring with at most one decoded row vector live outside the top-k heap; Postgres
+performs the equivalent exact ranking in SQL. Filters for namespace, agent/user,
+entity, supersession state, and embedding generation are applied before limits.
+
+An embedding is identified by immutable canonical provenance (model, revision,
+dimensions, normalization, distance metric, and content policy), not by a mutable
+model label. Source and generation writes share a transaction. A namespace exposes
+only its active generation to semantic retrieval, so mock, legacy-unknown, old-real,
+and target-real vectors cannot mix. Missing or mismatched active provenance degrades
+explicitly to lexical-only retrieval; it never ranks a partial vector population.
+
+Local SQLite and hosted Postgres implement the same storage contract and ordering.
+The enforced bounds are:
+
+| Work | Hard bound |
+|---|---:|
+| Vector candidates returned | 100 |
+| Lexical candidates returned | 100 |
+| Fused references | 200 |
+| Hydrated payload | 200 references and 4 MiB |
+| SQLite vectors scanned by one exact query | 50,000 |
+| General memory page | 256 rows |
+| Consolidation comparison page | 64 rows |
+| Promotion cluster | 4,096 members |
+| Hosted recall admission | 8 concurrent reservations and 64 MiB |
+| Hosted tenant metadata cache | 1,024 entries, 30-minute idle expiry |
+
+Embedding replacement is a one-session-per-namespace migration: one target
+generation is backfilled in 256-row pages, verified for complete coverage, then
+activated separately. Rollback returns the namespace to lexical-only operation.
+Activation is not an automatic model-selection or deployment decision.
+
+Consolidation pages sources and decay work, compares only bounded 64-row windows,
+and rejects promotion clusters above 4,096 members. This replaces the former
+corpus-wide working-set assumption.
 
 ## Storage Schema
 

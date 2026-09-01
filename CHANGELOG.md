@@ -5,6 +5,31 @@ All notable changes to Pensyve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Shipping Rust runtimes now use storage-backed exact retrieval exclusively.**
+  The CLI, MCP server, and hosted gateway no longer hydrate whole namespaces or
+  construct per-tenant resident vector corpora. SQLite streams exact cosine search;
+  Postgres ranks in storage. Both apply namespace, identity, entity, supersession,
+  and immutable active-generation filters before their bounded result limits.
+- **Embedding generations now have canonical immutable provenance and a one-session
+  namespace migration lifecycle.** Source/generation mutations are transactional;
+  incomplete, absent, rolled-back, or runtime-mismatched generations degrade to
+  lexical-only retrieval instead of mixing vector spaces or returning partial
+  vector rankings.
+- **Runtime bounds are explicit:** 100 vector hits, 100 lexical hits, 200 fused and
+  hydrated references, 4 MiB hydrated payload, a 50,000-row SQLite exact scan,
+  256-row pages, 64-row consolidation comparisons, 4,096-member promotion clusters,
+  hosted recall admission of 8 / 64 MiB, and 1,024 cached tenant metadata entries
+  with 30-minute idle expiry.
+- **Deployment guidance corrected.** Earlier full-GTE-plus-BGE and 4 GiB sizing is
+  superseded. This candidate does not select or download a production model and
+  does not authorize a production backfill, cutover, infrastructure change, or
+  release; certified real-model evidence and a separately approved rollout remain
+  required.
+
 ## [3.2.0] - 2026-08-21
 
 ### Changed
@@ -430,7 +455,8 @@ Initial public release of Pensyve — the universal memory runtime for AI agents
 - ONNX embeddings via fastembed (all-MiniLM-L6-v2, 384 dimensions)
 - Brute-force vector index with cosine similarity
 - 8-signal fusion retrieval: vector, BM25, graph, intent, recency, access frequency, confidence, type boost
-- Cross-encoder reranking via BGE reranker
+- Cross-encoder reranking via BGE reranker (historical initial-release behavior;
+  the full-GTE-plus-BGE sizing guidance is superseded by the Unreleased entry above)
 - Graph-based retrieval via petgraph BFS traversal
 - FSRS memory decay with retrieval-induced reinforcement
 - Bayesian procedural tracking (beta-binomial posterior updates)
