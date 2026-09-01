@@ -751,6 +751,54 @@ fn active_dimension_rejects_a_64_vector_page_before_fetch() {
 }
 
 #[test]
+fn oversized_singleton_content_decays_through_a_compact_fixed_size_page() {
+    let (_tmp, storage, embedder, namespace, episode) = setup("bounded-compact-decay");
+    let singleton = save_episode_memory(
+        &storage,
+        &embedder,
+        &episode,
+        Uuid::new_v4(),
+        "small before persisted corruption",
+        Utc::now() - Duration::days(365),
+    );
+    let conn = rusqlite::Connection::open(storage.db_path().unwrap()).unwrap();
+    conn.execute(
+        "UPDATE episodic_memories SET content = printf('%.*c', ?1, 'x') WHERE id = ?2",
+        rusqlite::params![
+            i64::try_from(CONSOLIDATION_WORKING_STATE_BYTES + 1).unwrap(),
+            singleton.id.to_string()
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let outcome = run(&storage, &embedder, namespace.id, &CancellationToken::new());
+    let ConsolidationOutcome::Complete { stats } = outcome else {
+        panic!("a singleton must reach compact decay without loading its content");
+    };
+    assert_eq!(stats.promoted, 0);
+    assert_eq!(stats.decayed, 1);
+    assert!(stats.metrics.max_decay_page_rows <= 256);
+    assert!(stats.metrics.max_decay_commit_rows <= 256);
+    assert!(stats.metrics.max_decay_page_bytes < CONSOLIDATION_WORKING_STATE_BYTES);
+    assert!(stats.metrics.peak_working_state_bytes < CONSOLIDATION_WORKING_STATE_BYTES);
+}
+
+#[test]
+fn shipping_decay_does_not_call_full_memory_paging() {
+    let core = fs::read_to_string("src/consolidation/mod.rs").unwrap();
+    let start = core
+        .find("fn decay_bounded(")
+        .expect("bounded decay function");
+    let end = core[start..]
+        .find("\n    }\n}\n\n// ---------------------------------------------------------------------------")
+        .expect("bounded decay function end");
+    let decay = &core[start..start + end];
+    assert!(!decay.contains("page_memories"));
+    assert!(!decay.contains("MemoryPageRequest"));
+}
+
+#[test]
 fn exactly_cluster_member_budget_can_finalize() {
     let (_tmp, storage, embedder, namespace, episode) = setup("bounded-exact-budget");
     let entity = Uuid::new_v4();

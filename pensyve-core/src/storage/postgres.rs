@@ -1,6 +1,8 @@
 use std::collections::{BTreeSet, HashMap};
 
 use std::future::Future;
+#[cfg(test)]
+use std::sync::{Arc, Barrier, Mutex};
 
 use chrono::{DateTime, Utc};
 use sqlx_core::acquire::Acquire;
@@ -35,10 +37,10 @@ use crate::storage::bounded::{
     VectorHit, VectorSearchOutcome, VectorSearchRequest, lexical_query_tokens,
 };
 use crate::storage::consolidation_workspace::{
-    ClusterDecision, ClusterProvenance, ConsolidationWorkspace, LatestClusterMember, NamespacePage,
-    NamespacePageCursor, PromotionAggregate, PromotionCommit, RunId, WorkspaceAssignment,
-    WorkspaceCandidatePage, WorkspaceCursor, WorkspaceEmbeddingSource, WorkspaceSource,
-    WorkspaceSourcePage, ensure_application_budget,
+    ClusterDecision, ClusterProvenance, ConsolidationWorkspace, DecayPage, DecayRecord,
+    DecayUpdate, LatestClusterMember, NamespacePage, NamespacePageCursor, PromotionAggregate,
+    PromotionCommit, RunId, WorkspaceAssignment, WorkspaceCandidatePage, WorkspaceCursor,
+    WorkspaceEmbeddingSource, WorkspaceSource, WorkspaceSourcePage, ensure_application_budget,
 };
 
 // ---------------------------------------------------------------------------
@@ -358,6 +360,15 @@ pub struct PostgresBackend {
     /// `self.pool.begin()` check out an unbound connection.
     pool: ScopedPool,
     rt: Runtime,
+    #[cfg(test)]
+    workspace_race_barrier: Mutex<Option<(WorkspaceRacePoint, Arc<Barrier>)>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WorkspaceRacePoint {
+    Vector,
+    FinalContent,
 }
 
 impl PostgresBackend {
@@ -400,6 +411,8 @@ impl PostgresBackend {
         let backend = Self {
             pool: ScopedPool::new(pool),
             rt,
+            #[cfg(test)]
+            workspace_race_barrier: Mutex::new(None),
         };
         backend.start()?;
         Ok(backend)
@@ -411,6 +424,8 @@ impl PostgresBackend {
         let backend = Self {
             pool: ScopedPool::new(pool),
             rt,
+            #[cfg(test)]
+            workspace_race_barrier: Mutex::new(None),
         };
         backend.start()?;
         Ok(backend)
@@ -423,6 +438,32 @@ impl PostgresBackend {
         self.run_schema()?;
         self.warn_on_rls_exempt_role();
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_workspace_race_barrier(
+        &self,
+        point: WorkspaceRacePoint,
+        barrier: Arc<Barrier>,
+    ) {
+        *self.workspace_race_barrier.lock().unwrap() = Some((point, barrier));
+    }
+
+    #[cfg(test)]
+    fn pause_workspace_race(&self, point: WorkspaceRacePoint) {
+        let barrier = {
+            let mut hook = self.workspace_race_barrier.lock().unwrap();
+            match hook.as_ref() {
+                Some((configured, _)) if *configured == point => {
+                    hook.take().map(|(_, barrier)| barrier)
+                }
+                _ => None,
+            }
+        };
+        if let Some(barrier) = barrier {
+            barrier.wait();
+            barrier.wait();
+        }
     }
 
     // `with_default_namespace` is gone. It existed so the `StorageTrait`
@@ -4746,7 +4787,20 @@ impl ConsolidationWorkspace for PostgresBackend {
     ) -> StorageResult<WorkspaceEmbeddingSource> {
         self.block_on(async {
             let mut conn = self.scoped_conn(run.namespace_id).await?;
-            pg_workspace_embedding_source(&mut conn, run, source.id, max_application_bytes).await
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            let source = pg_workspace_embedding_source(
+                &mut tx,
+                run,
+                source.id,
+                max_application_bytes,
+                || {
+                    #[cfg(test)]
+                    self.pause_workspace_race(WorkspaceRacePoint::Vector);
+                },
+            )
+            .await?;
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(source)
         })
     }
 
@@ -4770,57 +4824,72 @@ impl ConsolidationWorkspace for PostgresBackend {
         }
         self.block_on(async {
             let mut conn = self.scoped_conn(run.namespace_id).await?;
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
             let (entity, ordinal): (Uuid, i64) = query_as::<Postgres, _>(
                 "SELECT about_entity, source_ordinal FROM consolidation_sources
-                 WHERE run_id = $1 AND namespace_id = $2 AND memory_id = $3",
+                 WHERE run_id = $1 AND namespace_id = $2 AND memory_id = $3
+                 FOR SHARE",
             )
             .bind(run.id)
             .bind(run.namespace_id)
             .bind(anchor.id)
-            .fetch_one(&mut *conn)
+            .fetch_one(&mut *tx)
             .await
             .map_err(sqlx_to_io)?;
             let cursor = after.map_or(ordinal, |cursor| cursor.source_ordinal);
-            let preflight: (i64, i64, i32) = query_as::<Postgres, _>(
-                "SELECT COUNT(*),
-                        COALESCE(SUM(octet_length(embedding.embedding::text)), 0)::BIGINT,
-                        COALESCE(MAX(spaces.dimension), 0)
-                 FROM (
-                     SELECT workspace.memory_id
-                     FROM consolidation_sources AS workspace
-                     WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
-                       AND workspace.about_entity = $3 AND workspace.source_ordinal > $4
-                       AND workspace.assignment_state = 'unassigned'
-                     ORDER BY workspace.source_ordinal LIMIT $5
-                 ) AS page
+            let preflight: Vec<PgWorkspaceEmbeddingPreflightRow> = query_as::<Postgres, _>(
+                "SELECT workspace.memory_id, workspace.source_ordinal,
+                        octet_length(embedding.embedding::text)::BIGINT,
+                        vector_dims(embedding.embedding), spaces.dimension
+                 FROM consolidation_sources AS workspace
                  JOIN consolidation_runs AS runs
-                   ON runs.run_id = $1 AND runs.namespace_id = $2
+                   ON runs.run_id = workspace.run_id
+                  AND runs.namespace_id = workspace.namespace_id
                  JOIN memory_embeddings AS embedding
-                   ON embedding.namespace_id = $2
+                   ON embedding.namespace_id = workspace.namespace_id
                   AND embedding.memory_type = 'episodic'
-                  AND embedding.memory_id = page.memory_id
+                  AND embedding.memory_id = workspace.memory_id
                   AND embedding.embedding_space_id = runs.embedding_space_id
                  JOIN consolidation_sources AS source_snapshot
                    ON source_snapshot.run_id = runs.run_id
                   AND source_snapshot.namespace_id = runs.namespace_id
-                  AND source_snapshot.memory_id = page.memory_id
+                  AND source_snapshot.memory_id = workspace.memory_id
                   AND embedding.source_sha256 = source_snapshot.source_sha256
-                 JOIN embedding_spaces AS spaces ON spaces.id = runs.embedding_space_id",
+                 JOIN embedding_spaces AS spaces ON spaces.id = runs.embedding_space_id
+                 WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                   AND workspace.about_entity = $3 AND workspace.source_ordinal > $4
+                   AND workspace.assignment_state = 'unassigned'
+                 ORDER BY workspace.source_ordinal LIMIT $5
+                 FOR SHARE OF workspace, runs, embedding, source_snapshot, spaces",
             )
             .bind(run.id)
             .bind(run.namespace_id)
             .bind(entity)
             .bind(cursor)
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-            .fetch_one(&mut *conn)
+            .fetch_all(&mut *tx)
             .await
             .map_err(sqlx_to_io)?;
-            let row_count = usize::try_from(preflight.0)
-                .map_err(|_| StorageError::Context("negative candidate page count".into()))?;
-            let encoded_bytes = usize::try_from(preflight.1)
-                .map_err(|_| StorageError::Context("negative candidate payload bytes".into()))?;
-            let dimension = usize::try_from(preflight.2)
-                .map_err(|_| StorageError::Context("negative candidate dimension".into()))?;
+            let row_count = preflight.len();
+            let mut encoded_bytes = 0_usize;
+            let mut decoded_bytes = 0_usize;
+            for (_, _, encoded, actual_dimension, registered_dimension) in &preflight {
+                if actual_dimension <= &0 || actual_dimension != registered_dimension {
+                    return Err(StorageError::Context(
+                        "workspace candidate embedding does not match its registered dimension"
+                            .into(),
+                    ));
+                }
+                encoded_bytes =
+                    encoded_bytes.saturating_add(usize::try_from(*encoded).map_err(|_| {
+                        StorageError::Context("negative candidate payload bytes".into())
+                    })?);
+                decoded_bytes = decoded_bytes.saturating_add(
+                    usize::try_from(*actual_dimension)
+                        .map_err(|_| StorageError::Context("negative candidate dimension".into()))?
+                        .saturating_mul(std::mem::size_of::<f32>()),
+                );
+            }
             ensure_application_budget(
                 std::mem::size_of::<WorkspaceCandidatePage>()
                     .saturating_add(
@@ -4830,17 +4899,13 @@ impl ConsolidationWorkspace for PostgresBackend {
                         row_count.saturating_mul(std::mem::size_of::<PgWorkspaceEmbeddingRow>()),
                     )
                     .saturating_add(encoded_bytes)
-                    .saturating_add(
-                        row_count
-                            .saturating_mul(dimension)
-                            .saturating_mul(std::mem::size_of::<f32>()),
-                    ),
+                    .saturating_add(decoded_bytes),
                 max_application_bytes,
                 "consolidation candidate page",
             )?;
             let rows: Vec<PgWorkspaceEmbeddingRow> = query_as::<Postgres, _>(
                 "SELECT workspace.memory_id, workspace.source_ordinal,
-                        embedding.embedding::text, spaces.dimension
+                        embedding.embedding::text, vector_dims(embedding.embedding)
                  FROM consolidation_sources AS workspace
                  JOIN consolidation_runs AS runs
                    ON runs.run_id = workspace.run_id
@@ -4862,7 +4927,7 @@ impl ConsolidationWorkspace for PostgresBackend {
             .bind(entity)
             .bind(cursor)
             .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-            .fetch_all(&mut *conn)
+            .fetch_all(&mut *tx)
             .await
             .map_err(sqlx_to_io)?;
             let records = rows
@@ -4876,10 +4941,12 @@ impl ConsolidationWorkspace for PostgresBackend {
                     })
                 })
                 .flatten();
-            Ok(WorkspaceCandidatePage {
+            let page = WorkspaceCandidatePage {
                 records,
                 next_cursor,
-            })
+            };
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(page)
         })
     }
 
@@ -4935,18 +5002,21 @@ impl ConsolidationWorkspace for PostgresBackend {
     ) -> StorageResult<ClusterDecision> {
         self.block_on(async {
             let mut conn = self.scoped_conn(run.namespace_id).await?;
-            let count: (i64,) = query_as::<Postgres, _>(
-                "SELECT COUNT(*) FROM consolidation_sources
-                 WHERE run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            let assigned: Vec<(Uuid,)> = query_as::<Postgres, _>(
+                "SELECT workspace.memory_id FROM consolidation_sources AS workspace
+                 WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                   AND workspace.assignment_anchor = $3
+                 ORDER BY workspace.source_ordinal
+                 FOR SHARE OF workspace",
             )
             .bind(run.id)
             .bind(run.namespace_id)
             .bind(anchor.id)
-            .fetch_one(&mut *conn)
+            .fetch_all(&mut *tx)
             .await
             .map_err(sqlx_to_io)?;
-            let count = usize::try_from(count.0)
-                .map_err(|_| StorageError::Context("negative workspace member count".into()))?;
+            let count = assigned.len();
             if count <= 1 {
                 query::<Postgres>(
                     "UPDATE consolidation_sources
@@ -4956,9 +5026,10 @@ impl ConsolidationWorkspace for PostgresBackend {
                 .bind(run.id)
                 .bind(run.namespace_id)
                 .bind(anchor.id)
-                .execute(&mut *conn)
+                .execute(&mut *tx)
                 .await
                 .map_err(sqlx_to_io)?;
+                tx.commit().await.map_err(sqlx_to_io)?;
                 return Ok(ClusterDecision::SingletonDiscarded);
             }
             if count > crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS {
@@ -4975,12 +5046,13 @@ impl ConsolidationWorkspace for PostgresBackend {
                  WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
                    AND workspace.assignment_anchor = $3
                  ORDER BY workspace.source_timestamp DESC, workspace.memory_id DESC
-                 LIMIT 1",
+                 LIMIT 1
+                 FOR SHARE OF workspace, source",
             )
             .bind(run.id)
             .bind(run.namespace_id)
             .bind(anchor.id)
-            .fetch_one(&mut *conn)
+            .fetch_one(&mut *tx)
             .await
             .map_err(sqlx_to_io)?;
             let latest_content_bytes = usize::try_from(latest_content_bytes.0)
@@ -4996,6 +5068,8 @@ impl ConsolidationWorkspace for PostgresBackend {
                 max_application_bytes,
                 "consolidation finalized cluster",
             )?;
+            #[cfg(test)]
+            self.pause_workspace_race(WorkspaceRacePoint::FinalContent);
             query::<Postgres>(
                 "UPDATE consolidation_sources SET assignment_state = 'finalized'
                  WHERE run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
@@ -5003,7 +5077,7 @@ impl ConsolidationWorkspace for PostgresBackend {
             .bind(run.id)
             .bind(run.namespace_id)
             .bind(anchor.id)
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await
             .map_err(sqlx_to_io)?;
             let latest: (Uuid, DateTime<Utc>, String) = query_as::<Postgres, _>(
@@ -5020,7 +5094,7 @@ impl ConsolidationWorkspace for PostgresBackend {
             .bind(run.id)
             .bind(run.namespace_id)
             .bind(anchor.id)
-            .fetch_one(&mut *conn)
+            .fetch_one(&mut *tx)
             .await
             .map_err(sqlx_to_io)?;
             let rows: Vec<(Uuid, DateTime<Utc>)> = query_as::<Postgres, _>(
@@ -5033,10 +5107,10 @@ impl ConsolidationWorkspace for PostgresBackend {
             .bind(run.id)
             .bind(run.namespace_id)
             .bind(anchor.id)
-            .fetch_all(&mut *conn)
+            .fetch_all(&mut *tx)
             .await
             .map_err(sqlx_to_io)?;
-            Ok(ClusterDecision::Finalized {
+            let decision = ClusterDecision::Finalized {
                 promotion: PromotionAggregate {
                     member_count: count,
                     latest: LatestClusterMember {
@@ -5052,7 +5126,9 @@ impl ConsolidationWorkspace for PostgresBackend {
                         })
                         .collect(),
                 },
-            })
+            };
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(decision)
         })
     }
 
@@ -5294,6 +5370,187 @@ impl ConsolidationWorkspace for PostgresBackend {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the compact preflight and matching fixed-size projection stay adjacent for allocation-order proof"
+    )]
+    fn page_decay(
+        &self,
+        namespace_id: Uuid,
+        after: Option<PageCursor>,
+        limit: usize,
+        max_application_bytes: usize,
+    ) -> StorageResult<DecayPage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "consolidation decay page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        let after_type = after
+            .as_ref()
+            .map_or(-1, |cursor| memory_type_order(cursor.memory_type));
+        let after_id = after.as_ref().map_or(Uuid::nil(), |cursor| cursor.id);
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let row_count: (i64,) = query_as::<Postgres, _>(
+                "SELECT COUNT(*) FROM (
+                     SELECT type_order, id FROM (
+                         SELECT 0 AS type_order, id FROM episodic_memories
+                         WHERE namespace_id = $1
+                           AND superseded_by IS NULL AND invalid_at IS NULL
+                         UNION ALL
+                         SELECT 1, id FROM semantic_memories
+                         WHERE namespace_id = $1
+                           AND superseded_by IS NULL AND invalid_at IS NULL
+                         UNION ALL
+                         SELECT 2, id FROM procedural_memories
+                         WHERE namespace_id = $1
+                           AND superseded_by IS NULL AND invalid_at IS NULL
+                         UNION ALL
+                         SELECT 3, id FROM observation_memories
+                         WHERE namespace_id = $1
+                           AND superseded_by IS NULL AND invalid_at IS NULL
+                     ) AS compact_decay
+                     WHERE type_order > $2 OR (type_order = $2 AND id > $3)
+                     ORDER BY type_order, id LIMIT $4
+                 ) AS compact_decay_page",
+            )
+            .bind(namespace_id)
+            .bind(after_type)
+            .bind(after_id)
+            .bind(i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX))
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let row_count = usize::try_from(row_count.0)
+                .map_err(|_| StorageError::Context("negative compact decay row count".into()))?;
+            ensure_application_budget(
+                std::mem::size_of::<DecayPage>()
+                    .saturating_add(row_count.saturating_mul(std::mem::size_of::<DecayRecord>()))
+                    .saturating_add(row_count.saturating_mul(std::mem::size_of::<PgDecayRow>())),
+                max_application_bytes,
+                "consolidation compact decay page",
+            )?;
+            let rows: Vec<PgDecayRow> = query_as::<Postgres, _>(
+                "SELECT type_order, id, reference_time, decay_value, trial_count, success_count
+                 FROM (
+                     SELECT 0 AS type_order, id,
+                            COALESCE(last_accessed, timestamp) AS reference_time,
+                            stability AS decay_value, NULL::integer AS trial_count,
+                            NULL::integer AS success_count
+                     FROM episodic_memories
+                     WHERE namespace_id = $1
+                       AND superseded_by IS NULL AND invalid_at IS NULL
+                     UNION ALL
+                     SELECT 1, id, valid_at, stability, NULL::integer, NULL::integer
+                     FROM semantic_memories
+                     WHERE namespace_id = $1
+                       AND superseded_by IS NULL AND invalid_at IS NULL
+                     UNION ALL
+                     SELECT 2, id, COALESCE(last_used, created_at), reliability,
+                            trial_count, success_count
+                     FROM procedural_memories
+                     WHERE namespace_id = $1
+                       AND superseded_by IS NULL AND invalid_at IS NULL
+                     UNION ALL
+                     SELECT 3, id, NULL::timestamptz, NULL::real,
+                            NULL::integer, NULL::integer
+                     FROM observation_memories
+                     WHERE namespace_id = $1
+                       AND superseded_by IS NULL AND invalid_at IS NULL
+                 ) AS compact_decay
+                 WHERE type_order > $2 OR (type_order = $2 AND id > $3)
+                 ORDER BY type_order, id LIMIT $4",
+            )
+            .bind(namespace_id)
+            .bind(after_type)
+            .bind(after_id)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let has_more = row_count > limit;
+            let next_cursor = has_more
+                .then(|| rows.last().map(pg_decay_cursor))
+                .flatten()
+                .transpose()?;
+            let scanned_rows = rows.len();
+            let records = rows
+                .into_iter()
+                .filter_map(pg_decay_record)
+                .collect::<StorageResult<Vec<_>>>()?;
+            Ok(DecayPage {
+                records,
+                scanned_rows,
+                next_cursor,
+            })
+        })
+    }
+
+    fn commit_decay(&self, namespace_id: Uuid, updates: &[DecayUpdate]) -> StorageResult<()> {
+        if updates.len() > MEMORY_PAGE_SIZE {
+            return Err(StorageError::BudgetExceeded(format!(
+                "consolidation decay commit exceeds {MEMORY_PAGE_SIZE} updates"
+            )));
+        }
+        if updates.is_empty() {
+            return Ok(());
+        }
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            let now = Utc::now();
+            for update in updates {
+                match update {
+                    DecayUpdate::Episodic {
+                        id,
+                        stability,
+                        retrievability,
+                    } => {
+                        query::<Postgres>(
+                            "UPDATE episodic_memories
+                             SET stability = $1, retrievability = $2,
+                                 access_count = access_count + 1, last_accessed = $3
+                             WHERE id = $4 AND namespace_id = $5",
+                        )
+                        .bind(stability)
+                        .bind(retrievability)
+                        .bind(now)
+                        .bind(id)
+                        .bind(namespace_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(sqlx_to_io)?;
+                    }
+                    DecayUpdate::Procedural {
+                        id,
+                        reliability,
+                        trial_count,
+                        success_count,
+                    } => {
+                        query::<Postgres>(
+                            "UPDATE procedural_memories
+                             SET reliability = $1, trial_count = $2, success_count = $3,
+                                 last_used = $4
+                             WHERE id = $5 AND namespace_id = $6",
+                        )
+                        .bind(reliability)
+                        .bind(i32::try_from(*trial_count).unwrap_or(i32::MAX))
+                        .bind(i32::try_from(*success_count).unwrap_or(i32::MAX))
+                        .bind(now)
+                        .bind(id)
+                        .bind(namespace_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(sqlx_to_io)?;
+                    }
+                }
+            }
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(())
+        })
+    }
+
     fn assignments(&self, run: RunId, limit: usize) -> StorageResult<Vec<WorkspaceAssignment>> {
         if limit > crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS {
             return Err(StorageError::BudgetExceeded(format!(
@@ -5332,7 +5589,78 @@ impl ConsolidationWorkspace for PostgresBackend {
     }
 }
 
+type PgDecayRow = (
+    i32,
+    Uuid,
+    Option<DateTime<Utc>>,
+    Option<f32>,
+    Option<i32>,
+    Option<i32>,
+);
+
+fn pg_decay_cursor(row: &PgDecayRow) -> StorageResult<PageCursor> {
+    let memory_type = match row.0 {
+        0 => MemoryType::Episodic,
+        1 => MemoryType::Semantic,
+        2 => MemoryType::Procedural,
+        3 => MemoryType::Observation,
+        other => {
+            return Err(StorageError::Context(format!(
+                "invalid compact decay memory type order {other}"
+            )));
+        }
+    };
+    Ok(PageCursor {
+        memory_type,
+        id: row.1,
+    })
+}
+
+fn pg_decay_record(row: PgDecayRow) -> Option<StorageResult<DecayRecord>> {
+    let (type_order, id, reference_time, decay_value, trial_count, success_count) = row;
+    if type_order == 3 {
+        return None;
+    }
+    Some((|| {
+        let reference_time = reference_time
+            .ok_or_else(|| StorageError::Context("compact decay row has no timestamp".into()))?;
+        let decay_value = decay_value
+            .ok_or_else(|| StorageError::Context("compact decay row has no decay value".into()))?;
+        match type_order {
+            0 => Ok(DecayRecord::Episodic {
+                id,
+                reference_time,
+                stability: decay_value,
+            }),
+            1 => Ok(DecayRecord::Semantic {
+                valid_at: reference_time,
+                stability: decay_value,
+            }),
+            2 => Ok(DecayRecord::Procedural {
+                id,
+                reference_time,
+                reliability: decay_value,
+                trial_count: u32::try_from(trial_count.ok_or_else(|| {
+                    StorageError::Context("compact procedural decay row has no trial count".into())
+                })?)
+                .map_err(|_| StorageError::Context("invalid procedural trial count".into()))?,
+                success_count: u32::try_from(success_count.ok_or_else(|| {
+                    StorageError::Context(
+                        "compact procedural decay row has no success count".into(),
+                    )
+                })?)
+                .map_err(|_| StorageError::Context("invalid procedural success count".into()))?,
+            }),
+            other => Err(StorageError::Context(format!(
+                "invalid compact decay memory type order {other}"
+            ))),
+        }
+    })())
+}
+
 type PgWorkspaceSourceRow = (Uuid, Uuid, i64);
+
+type PgWorkspaceEmbeddingPreflightRow = (Uuid, i64, i64, i32, i32);
 
 type PgWorkspaceEmbeddingRow = (Uuid, i64, String, i32);
 
@@ -5361,14 +5689,19 @@ fn pg_workspace_embedding_from_row(
     })
 }
 
-async fn pg_workspace_embedding_source(
-    conn: &mut PgConnection,
+async fn pg_workspace_embedding_source<F>(
+    tx: &mut Transaction<'_, Postgres>,
     run: RunId,
     memory_id: Uuid,
     max_application_bytes: usize,
-) -> StorageResult<WorkspaceEmbeddingSource> {
-    let preflight: (i64, i32) = query_as::<Postgres, _>(
-        "SELECT octet_length(embedding.embedding::text)::BIGINT, spaces.dimension
+    before_payload: F,
+) -> StorageResult<WorkspaceEmbeddingSource>
+where
+    F: FnOnce(),
+{
+    let preflight: (i64, i32, i32) = query_as::<Postgres, _>(
+        "SELECT octet_length(embedding.embedding::text)::BIGINT,
+                vector_dims(embedding.embedding), spaces.dimension
          FROM consolidation_sources AS workspace
          JOIN consolidation_runs AS runs
            ON runs.run_id = workspace.run_id AND runs.namespace_id = workspace.namespace_id
@@ -5380,16 +5713,22 @@ async fn pg_workspace_embedding_source(
           AND embedding.source_sha256 = workspace.source_sha256
          JOIN embedding_spaces AS spaces ON spaces.id = runs.embedding_space_id
          WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
-           AND workspace.memory_id = $3",
+           AND workspace.memory_id = $3
+         FOR SHARE OF workspace, runs, embedding, spaces",
     )
     .bind(run.id)
     .bind(run.namespace_id)
     .bind(memory_id)
-    .fetch_one(&mut *conn)
+    .fetch_one(&mut **tx)
     .await
     .map_err(sqlx_to_io)?;
     let encoded_bytes = usize::try_from(preflight.0)
         .map_err(|_| StorageError::Context("negative anchor payload bytes".into()))?;
+    if preflight.1 <= 0 || preflight.1 != preflight.2 {
+        return Err(StorageError::Context(
+            "workspace anchor embedding does not match its registered dimension".into(),
+        ));
+    }
     let dimension = usize::try_from(preflight.1)
         .map_err(|_| StorageError::Context("negative anchor dimension".into()))?;
     ensure_application_budget(
@@ -5400,9 +5739,10 @@ async fn pg_workspace_embedding_source(
         max_application_bytes,
         "consolidation anchor",
     )?;
+    before_payload();
     let row: PgWorkspaceEmbeddingRow = query_as::<Postgres, _>(
         "SELECT workspace.memory_id, workspace.source_ordinal,
-                embedding.embedding::text, spaces.dimension
+                embedding.embedding::text, vector_dims(embedding.embedding)
          FROM consolidation_sources AS workspace
          JOIN consolidation_runs AS runs
            ON runs.run_id = workspace.run_id AND runs.namespace_id = workspace.namespace_id
@@ -5419,7 +5759,7 @@ async fn pg_workspace_embedding_source(
     .bind(run.id)
     .bind(run.namespace_id)
     .bind(memory_id)
-    .fetch_one(&mut *conn)
+    .fetch_one(&mut **tx)
     .await
     .map_err(sqlx_to_io)?;
     pg_workspace_embedding_from_row(run.namespace_id, row)
@@ -5931,7 +6271,8 @@ mod tests {
                 binds: 3,
                 required: &[
                     "run_id = $1 AND namespace_id = $2 AND memory_id = $3",
-                    "fetch_one(&mut *conn)",
+                    "FOR SHARE",
+                    "fetch_one(&mut *tx)",
                 ],
             },
             Contract {
@@ -5942,8 +6283,10 @@ mod tests {
                     "workspace.about_entity = $3",
                     "workspace.source_ordinal > $4",
                     "LIMIT $5",
-                    "SUM(octet_length(embedding.embedding::text))",
-                    "fetch_one(&mut *conn)",
+                    "octet_length(embedding.embedding::text)::BIGINT",
+                    "vector_dims(embedding.embedding)",
+                    "FOR SHARE OF workspace, runs, embedding, source_snapshot, spaces",
+                    "fetch_all(&mut *tx)",
                 ],
             },
             Contract {
@@ -5954,7 +6297,8 @@ mod tests {
                     "workspace.about_entity = $3",
                     "workspace.source_ordinal > $4",
                     "LIMIT $5",
-                    "fetch_all(&mut *conn)",
+                    "vector_dims(embedding.embedding)",
+                    "fetch_all(&mut *tx)",
                 ],
             },
             Contract {
@@ -5975,11 +6319,13 @@ mod tests {
                 ],
             },
             Contract {
-                label: "count finalized",
+                label: "lock finalized members",
                 binds: 3,
                 required: &[
-                    "run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
-                    "fetch_one(&mut *conn)",
+                    "workspace.run_id = $1 AND workspace.namespace_id = $2",
+                    "workspace.assignment_anchor = $3",
+                    "FOR SHARE OF workspace",
+                    "fetch_all(&mut *tx)",
                 ],
             },
             Contract {
@@ -5987,7 +6333,7 @@ mod tests {
                 binds: 3,
                 required: &[
                     "run_id = $1 AND namespace_id = $2 AND memory_id = $3",
-                    "execute(&mut *conn)",
+                    "execute(&mut *tx)",
                 ],
             },
             Contract {
@@ -5998,7 +6344,8 @@ mod tests {
                     "workspace.assignment_anchor = $3",
                     "octet_length(source.content)::BIGINT",
                     "LIMIT 1",
-                    "fetch_one(&mut *conn)",
+                    "FOR SHARE OF workspace, source",
+                    "fetch_one(&mut *tx)",
                 ],
             },
             Contract {
@@ -6006,7 +6353,7 @@ mod tests {
                 binds: 3,
                 required: &[
                     "run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
-                    "execute(&mut *conn)",
+                    "execute(&mut *tx)",
                 ],
             },
             Contract {
@@ -6016,7 +6363,7 @@ mod tests {
                     "workspace.run_id = $1 AND workspace.namespace_id = $2",
                     "workspace.assignment_anchor = $3",
                     "LIMIT 1",
-                    "fetch_one(&mut *conn)",
+                    "fetch_one(&mut *tx)",
                 ],
             },
             Contract {
@@ -6025,7 +6372,7 @@ mod tests {
                 required: &[
                     "workspace.run_id = $1 AND workspace.namespace_id = $2",
                     "workspace.assignment_anchor = $3",
-                    "fetch_all(&mut *conn)",
+                    "fetch_all(&mut *tx)",
                 ],
             },
             Contract {
@@ -6111,6 +6458,36 @@ mod tests {
                 required: &["run_id = $1 AND namespace_id = $2", "execute(&mut *conn)"],
             },
             Contract {
+                label: "preflight compact decay page",
+                binds: 4,
+                required: &[
+                    "namespace_id = $1",
+                    "type_order > $2 OR (type_order = $2 AND id > $3)",
+                    "LIMIT $4",
+                    "fetch_one(&mut *conn)",
+                ],
+            },
+            Contract {
+                label: "load compact decay page",
+                binds: 4,
+                required: &[
+                    "namespace_id = $1",
+                    "type_order > $2 OR (type_order = $2 AND id > $3)",
+                    "LIMIT $4",
+                    "fetch_all(&mut *conn)",
+                ],
+            },
+            Contract {
+                label: "commit episodic decay",
+                binds: 5,
+                required: &["WHERE id = $4 AND namespace_id = $5", "execute(&mut *tx)"],
+            },
+            Contract {
+                label: "commit procedural decay",
+                binds: 6,
+                required: &["WHERE id = $5 AND namespace_id = $6", "execute(&mut *tx)"],
+            },
+            Contract {
                 label: "diagnostic assignments",
                 binds: 3,
                 required: &[
@@ -6160,8 +6537,9 @@ mod tests {
             "let source_count: (i64,)",
             "let rows: Vec<PgWorkspaceSourceRow>",
             "let (entity, ordinal): (Uuid, i64)",
-            "let preflight: (i64, i64, i32)",
+            "let preflight: Vec<PgWorkspaceEmbeddingPreflightRow>",
             "let rows: Vec<PgWorkspaceEmbeddingRow>",
+            "let assigned: Vec<(Uuid,)>",
             "let latest: (Uuid, DateTime<Utc>, String)",
             "let rows: Vec<(Uuid, DateTime<Utc>)>",
             "let space: (String,)",
@@ -6198,18 +6576,71 @@ mod tests {
         for required in [
             "workspace.run_id = $1 AND workspace.namespace_id = $2",
             "workspace.memory_id = $3",
-            "fetch_one(&mut *conn)",
+            "fetch_one(&mut **tx)",
         ] {
             assert!(preflight_query.contains(required));
             assert!(payload_query.contains(required));
         }
         assert!(helper.contains("let row: PgWorkspaceEmbeddingRow"));
+        assert!(helper.contains("let preflight: (i64, i32, i32)"));
+        assert!(helper.contains("vector_dims(embedding.embedding)"));
+        assert!(helper.contains("FOR SHARE OF workspace, runs, embedding, spaces"));
         assert!(helper.contains("pg_workspace_embedding_from_row(run.namespace_id, row)"));
     }
 
     #[test]
     fn consolidation_workspace_statements_pin_scope_binds_locks_and_decoding() {
         assert_consolidation_workspace_sql_contracts(include_str!("postgres.rs"));
+    }
+
+    #[test]
+    fn consolidation_payload_preflights_use_actual_dimensions_and_shared_transactions() {
+        let source = include_str!("postgres.rs");
+        let start = source
+            .find("impl ConsolidationWorkspace for PostgresBackend")
+            .expect("workspace implementation");
+        let end = source[start..]
+            .find("type PgWorkspaceSourceRow")
+            .expect("workspace implementation end");
+        let workspace = &source[start..start + end];
+        let candidate_start = workspace
+            .find("fn page_later_unassigned")
+            .expect("candidate paging");
+        let candidate_end = workspace[candidate_start..]
+            .find("fn record_tentative_match")
+            .expect("candidate paging end");
+        let candidate = &workspace[candidate_start..candidate_start + candidate_end];
+        for required in [
+            "vector_dims(embedding.embedding)",
+            "let mut tx = (&mut *conn).begin()",
+            "FOR SHARE",
+            "fetch_all(&mut *tx)",
+        ] {
+            assert!(
+                candidate.contains(required),
+                "candidate path lost {required}"
+            );
+        }
+        let final_start = workspace
+            .find("fn finalize_or_discard_cluster")
+            .expect("finalization");
+        let final_end = workspace[final_start..]
+            .find("fn commit_promotion")
+            .expect("finalization end");
+        let finalization = &workspace[final_start..final_start + final_end];
+        assert!(finalization.contains("let mut tx = (&mut *conn).begin()"));
+        assert!(finalization.contains("FOR SHARE OF workspace, source"));
+
+        let helper_start = source
+            .find("async fn pg_workspace_embedding_source")
+            .expect("anchor loader");
+        let helper_end = source[helper_start..]
+            .find("// ---------------------------------------------------------------------------")
+            .expect("anchor loader end");
+        let helper = &source[helper_start..helper_start + helper_end];
+        assert!(helper.contains("vector_dims(embedding.embedding)"));
+        assert!(helper.contains("FOR SHARE"));
+        assert!(helper.contains("&mut Transaction<'_, Postgres>"));
     }
 
     #[test]

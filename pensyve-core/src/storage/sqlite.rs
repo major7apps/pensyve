@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
+#[cfg(test)]
+use std::sync::{Arc, Barrier};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -29,10 +31,10 @@ use crate::storage::bounded::{
     lexical_query_tokens, sort_vector_hits,
 };
 use crate::storage::consolidation_workspace::{
-    ClusterDecision, ClusterProvenance, ConsolidationWorkspace, LatestClusterMember, NamespacePage,
-    NamespacePageCursor, PromotionAggregate, PromotionCommit, RunId, WorkspaceAssignment,
-    WorkspaceCandidatePage, WorkspaceCursor, WorkspaceEmbeddingSource, WorkspaceSource,
-    WorkspaceSourcePage, ensure_application_budget,
+    ClusterDecision, ClusterProvenance, ConsolidationWorkspace, DecayPage, DecayRecord,
+    DecayUpdate, LatestClusterMember, NamespacePage, NamespacePageCursor, PromotionAggregate,
+    PromotionCommit, RunId, WorkspaceAssignment, WorkspaceCandidatePage, WorkspaceCursor,
+    WorkspaceEmbeddingSource, WorkspaceSource, WorkspaceSourcePage, ensure_application_budget,
 };
 
 // ---------------------------------------------------------------------------
@@ -68,7 +70,18 @@ pub struct SqliteBackend {
     #[cfg(test)]
     workspace_payload_fetches: AtomicUsize,
     #[cfg(test)]
+    decay_payload_fetches: AtomicUsize,
+    #[cfg(test)]
     forced_deadline_boundary: AtomicU8,
+    #[cfg(test)]
+    workspace_race_barrier: Mutex<Option<(WorkspaceRacePoint, Arc<Barrier>)>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceRacePoint {
+    Vector,
+    FinalContent,
 }
 
 impl SqliteBackend {
@@ -94,7 +107,11 @@ impl SqliteBackend {
             #[cfg(test)]
             workspace_payload_fetches: AtomicUsize::new(0),
             #[cfg(test)]
+            decay_payload_fetches: AtomicUsize::new(0),
+            #[cfg(test)]
             forced_deadline_boundary: AtomicU8::new(0),
+            #[cfg(test)]
+            workspace_race_barrier: Mutex::new(None),
         };
         backend.run_schema()?;
         Ok(backend)
@@ -138,6 +155,38 @@ impl SqliteBackend {
     #[cfg(test)]
     fn workspace_payload_fetches(&self) -> usize {
         self.workspace_payload_fetches.load(AtomicOrdering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn reset_decay_payload_fetches(&self) {
+        self.decay_payload_fetches.store(0, AtomicOrdering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn decay_payload_fetches(&self) -> usize {
+        self.decay_payload_fetches.load(AtomicOrdering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn set_workspace_race_barrier(&self, point: WorkspaceRacePoint, barrier: Arc<Barrier>) {
+        *self.workspace_race_barrier.lock().unwrap() = Some((point, barrier));
+    }
+
+    #[cfg(test)]
+    fn pause_workspace_race(&self, point: WorkspaceRacePoint) {
+        let barrier = {
+            let mut hook = self.workspace_race_barrier.lock().unwrap();
+            match hook.as_ref() {
+                Some((configured, _)) if *configured == point => {
+                    hook.take().map(|(_, barrier)| barrier)
+                }
+                _ => None,
+            }
+        };
+        if let Some(barrier) = barrier {
+            barrier.wait();
+            barrier.wait();
+        }
     }
 
     #[cfg(test)]
@@ -4967,8 +5016,15 @@ impl ConsolidationWorkspace for SqliteBackend {
                 "consolidation workspace accepts episodic sources only".into(),
             ));
         }
-        let conn = lock_conn!(self);
-        sqlite_workspace_embedding_source(&conn, run, source.id, max_application_bytes)
+        let mut conn = lock_conn!(self);
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+        let source =
+            sqlite_workspace_embedding_source(&tx, run, source.id, max_application_bytes, || {
+                #[cfg(test)]
+                self.pause_workspace_race(WorkspaceRacePoint::Vector);
+            })?;
+        tx.commit()?;
+        Ok(source)
     }
 
     #[allow(
@@ -4989,18 +5045,27 @@ impl ConsolidationWorkspace for SqliteBackend {
                 crate::storage::bounded::CONSOLIDATION_COMPARISON_PAGE_SIZE
             )));
         }
-        let conn = lock_conn!(self);
+        let mut conn = lock_conn!(self);
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
         let run_text = run.id.to_string();
         let anchor_text = anchor.id.to_string();
-        let (anchor_entity, anchor_ordinal): (String, i64) = conn.query_row(
+        let (anchor_entity, anchor_ordinal): (String, i64) = tx.query_row(
             "SELECT about_entity, source_ordinal FROM consolidation_sources
              WHERE run_id = ?1 AND memory_id = ?2",
             params![&run_text, &anchor_text],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let cursor = after.map_or(anchor_ordinal, |cursor| cursor.source_ordinal);
-        let (row_count, encoded_bytes, dimension): (i64, i64, i64) = conn.query_row(
+        let (row_count, encoded_bytes, minimum_bytes, maximum_bytes, dimension): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = tx.query_row(
             "SELECT COUNT(*), COALESCE(SUM(length(embedding.embedding)), 0),
+                    COALESCE(MIN(length(embedding.embedding)), 0),
+                    COALESCE(MAX(length(embedding.embedding)), 0),
                     COALESCE(MAX(spaces.dimension), 0)
              FROM (
                  SELECT workspace.memory_id
@@ -5027,7 +5092,15 @@ impl ConsolidationWorkspace for SqliteBackend {
                 cursor,
                 i64::try_from(limit).unwrap_or(i64::MAX)
             ],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )?;
         let row_count = usize::try_from(row_count)
             .map_err(|_| StorageError::Context("negative candidate page count".into()))?;
@@ -5035,6 +5108,23 @@ impl ConsolidationWorkspace for SqliteBackend {
             .map_err(|_| StorageError::Context("negative candidate payload bytes".into()))?;
         let dimension = usize::try_from(dimension)
             .map_err(|_| StorageError::Context("negative candidate dimension".into()))?;
+        let minimum_bytes = usize::try_from(minimum_bytes)
+            .map_err(|_| StorageError::Context("negative candidate vector bytes".into()))?;
+        let maximum_bytes = usize::try_from(maximum_bytes)
+            .map_err(|_| StorageError::Context("negative candidate vector bytes".into()))?;
+        let expected_bytes = dimension
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| StorageError::Context("candidate dimension overflow".into()))?;
+        if row_count > 0
+            && (!minimum_bytes.is_multiple_of(std::mem::size_of::<f32>())
+                || !maximum_bytes.is_multiple_of(std::mem::size_of::<f32>())
+                || minimum_bytes != expected_bytes
+                || maximum_bytes != expected_bytes)
+        {
+            return Err(StorageError::Context(
+                "workspace candidate embedding does not match its registered dimension".into(),
+            ));
+        }
         ensure_application_budget(
             std::mem::size_of::<WorkspaceCandidatePage>()
                 .saturating_add(
@@ -5045,19 +5135,18 @@ impl ConsolidationWorkspace for SqliteBackend {
                 )
                 .saturating_add(row_count.saturating_mul(36))
                 .saturating_add(encoded_bytes)
-                .saturating_add(
-                    row_count
-                        .saturating_mul(dimension)
-                        .saturating_mul(std::mem::size_of::<f32>()),
-                ),
+                .saturating_add(encoded_bytes),
             max_application_bytes,
             "consolidation candidate page",
         )?;
         #[cfg(test)]
         self.workspace_payload_fetches
             .fetch_add(1, AtomicOrdering::SeqCst);
-        let mut stmt = conn.prepare(
-            "SELECT workspace.memory_id, workspace.source_ordinal, embedding.embedding
+        #[cfg(test)]
+        self.pause_workspace_race(WorkspaceRacePoint::Vector);
+        let mut stmt = tx.prepare(
+            "SELECT workspace.memory_id, workspace.source_ordinal, embedding.embedding,
+                    spaces.dimension
              FROM consolidation_sources AS workspace
              JOIN consolidation_runs AS runs ON runs.run_id = workspace.run_id
              JOIN memory_embeddings AS embedding
@@ -5066,6 +5155,7 @@ impl ConsolidationWorkspace for SqliteBackend {
               AND embedding.memory_id = workspace.memory_id
               AND embedding.embedding_space_id = runs.embedding_space_id
               AND embedding.source_sha256 = workspace.source_sha256
+             JOIN embedding_spaces AS spaces ON spaces.id = runs.embedding_space_id
              WHERE workspace.run_id = ?1 AND workspace.about_entity = ?2
                AND workspace.source_ordinal > ?3
                AND workspace.assignment_state = 'unassigned'
@@ -5084,6 +5174,7 @@ impl ConsolidationWorkspace for SqliteBackend {
                         row.get::<_, String>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
                     ))
                 },
             )?
@@ -5092,6 +5183,7 @@ impl ConsolidationWorkspace for SqliteBackend {
             .into_iter()
             .map(workspace_embedding_source_from_sqlite)
             .collect::<StorageResult<Vec<_>>>()?;
+        drop(stmt);
         let next_cursor = (records.len() == limit)
             .then(|| {
                 records.last().map(|source| WorkspaceCursor {
@@ -5099,10 +5191,12 @@ impl ConsolidationWorkspace for SqliteBackend {
                 })
             })
             .flatten();
-        Ok(WorkspaceCandidatePage {
+        let page = WorkspaceCandidatePage {
             records,
             next_cursor,
-        })
+        };
+        tx.commit()?;
+        Ok(page)
     }
 
     fn record_tentative_match(
@@ -5142,10 +5236,11 @@ impl ConsolidationWorkspace for SqliteBackend {
         anchor: MemoryRef,
         max_application_bytes: usize,
     ) -> StorageResult<ClusterDecision> {
-        let conn = lock_conn!(self);
+        let mut conn = lock_conn!(self);
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
         let run = run.id.to_string();
         let anchor = anchor.id.to_string();
-        let count: i64 = conn.query_row(
+        let count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM consolidation_sources
              WHERE run_id = ?1 AND assignment_anchor = ?2",
             params![&run, &anchor],
@@ -5154,12 +5249,13 @@ impl ConsolidationWorkspace for SqliteBackend {
         let count = usize::try_from(count)
             .map_err(|_| StorageError::Context("negative workspace member count".into()))?;
         if count <= 1 {
-            conn.execute(
+            tx.execute(
                 "UPDATE consolidation_sources
                  SET assignment_anchor = NULL, assignment_state = 'discarded'
                  WHERE run_id = ?1 AND memory_id = ?2",
                 params![&run, &anchor],
             )?;
+            tx.commit()?;
             return Ok(ClusterDecision::SingletonDiscarded);
         }
         if count > crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS {
@@ -5167,7 +5263,7 @@ impl ConsolidationWorkspace for SqliteBackend {
                 member_count: count,
             });
         }
-        let latest_content_bytes: i64 = conn.query_row(
+        let latest_content_bytes: i64 = tx.query_row(
             "SELECT length(CAST(source.content AS BLOB))
              FROM consolidation_sources AS workspace
              JOIN episodic_memories AS source ON source.id = workspace.memory_id
@@ -5189,12 +5285,14 @@ impl ConsolidationWorkspace for SqliteBackend {
             max_application_bytes,
             "consolidation finalized cluster",
         )?;
-        conn.execute(
+        #[cfg(test)]
+        self.pause_workspace_race(WorkspaceRacePoint::FinalContent);
+        tx.execute(
             "UPDATE consolidation_sources SET assignment_state = 'finalized'
              WHERE run_id = ?1 AND assignment_anchor = ?2",
             params![&run, &anchor],
         )?;
-        let latest: (String, String, String) = conn.query_row(
+        let latest: (String, String, String) = tx.query_row(
             "SELECT workspace.episode_id, workspace.source_timestamp, source.content
              FROM consolidation_sources AS workspace
              JOIN episodic_memories AS source ON source.id = workspace.memory_id
@@ -5204,7 +5302,7 @@ impl ConsolidationWorkspace for SqliteBackend {
             params![&run, &anchor],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        let mut stmt = conn.prepare(
+        let mut stmt = tx.prepare(
             "SELECT workspace.episode_id, workspace.source_timestamp
              FROM consolidation_sources AS workspace
              WHERE workspace.run_id = ?1 AND workspace.assignment_anchor = ?2
@@ -5223,7 +5321,8 @@ impl ConsolidationWorkspace for SqliteBackend {
                 })
             })
             .collect::<StorageResult<Vec<_>>>()?;
-        Ok(ClusterDecision::Finalized {
+        drop(stmt);
+        let decision = ClusterDecision::Finalized {
             promotion: PromotionAggregate {
                 member_count: count,
                 latest: LatestClusterMember {
@@ -5233,7 +5332,9 @@ impl ConsolidationWorkspace for SqliteBackend {
                 },
                 provenance,
             },
-        })
+        };
+        tx.commit()?;
+        Ok(decision)
     }
 
     #[allow(
@@ -5448,6 +5549,207 @@ impl ConsolidationWorkspace for SqliteBackend {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the compact preflight and matching fixed-size projection stay adjacent for allocation-order proof"
+    )]
+    fn page_decay(
+        &self,
+        namespace_id: Uuid,
+        after: Option<PageCursor>,
+        limit: usize,
+        max_application_bytes: usize,
+    ) -> StorageResult<DecayPage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "consolidation decay page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        let after_type = after
+            .as_ref()
+            .map_or(-1, |cursor| memory_type_order(cursor.memory_type));
+        let after_id = after
+            .as_ref()
+            .map_or_else(String::new, |cursor| cursor.id.to_string());
+        let namespace = namespace_id.to_string();
+        let conn = lock_conn!(self);
+        let (row_count, timestamp_bytes): (i64, i64) = conn.query_row(
+            r"SELECT COUNT(*), COALESCE(SUM(length(CAST(reference_time AS BLOB))), 0)
+              FROM (
+                  SELECT type_order, id, reference_time
+                  FROM (
+                      SELECT 0 AS type_order, id,
+                             COALESCE(last_accessed, timestamp) AS reference_time
+                      FROM episodic_memories
+                      WHERE namespace_id = ?1
+                        AND superseded_by IS NULL AND invalid_at IS NULL
+                      UNION ALL
+                      SELECT 1, id, valid_at FROM semantic_memories
+                      WHERE namespace_id = ?1
+                        AND superseded_by IS NULL AND invalid_at IS NULL
+                      UNION ALL
+                      SELECT 2, id, COALESCE(last_used, created_at) FROM procedural_memories
+                      WHERE namespace_id = ?1
+                        AND superseded_by IS NULL AND invalid_at IS NULL
+                      UNION ALL
+                      SELECT 3, id, NULL FROM observation_memories
+                      WHERE namespace_id = ?1
+                        AND superseded_by IS NULL AND invalid_at IS NULL
+                  ) AS compact_decay
+                  WHERE type_order > ?2 OR (type_order = ?2 AND id > ?3)
+                  ORDER BY type_order, id LIMIT ?4
+              ) AS compact_decay_page",
+            params![
+                &namespace,
+                after_type,
+                &after_id,
+                i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX)
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let row_count = usize::try_from(row_count)
+            .map_err(|_| StorageError::Context("negative compact decay row count".into()))?;
+        let timestamp_bytes = usize::try_from(timestamp_bytes)
+            .map_err(|_| StorageError::Context("negative compact decay timestamp bytes".into()))?;
+        ensure_application_budget(
+            std::mem::size_of::<DecayPage>()
+                .saturating_add(row_count.saturating_mul(std::mem::size_of::<DecayRecord>()))
+                .saturating_add(row_count.saturating_mul(std::mem::size_of::<SqliteDecayRow>()))
+                .saturating_add(row_count.saturating_mul(36))
+                .saturating_add(timestamp_bytes),
+            max_application_bytes,
+            "consolidation compact decay page",
+        )?;
+        #[cfg(test)]
+        self.decay_payload_fetches
+            .fetch_add(1, AtomicOrdering::SeqCst);
+        /* compact-decay-projection */
+        let mut stmt = conn.prepare(
+            r"SELECT type_order, id, reference_time, decay_value, trial_count, success_count
+              FROM (
+                  SELECT 0 AS type_order, id,
+                         COALESCE(last_accessed, timestamp) AS reference_time,
+                         stability AS decay_value, NULL AS trial_count, NULL AS success_count
+                  FROM episodic_memories
+                  WHERE namespace_id = ?1
+                    AND superseded_by IS NULL AND invalid_at IS NULL
+                  UNION ALL
+                  SELECT 1, id, valid_at, stability, NULL, NULL FROM semantic_memories
+                  WHERE namespace_id = ?1
+                    AND superseded_by IS NULL AND invalid_at IS NULL
+                  UNION ALL
+                  SELECT 2, id, COALESCE(last_used, created_at), reliability,
+                         trial_count, success_count
+                  FROM procedural_memories
+                  WHERE namespace_id = ?1
+                    AND superseded_by IS NULL AND invalid_at IS NULL
+                  UNION ALL
+                  SELECT 3, id, NULL, NULL, NULL, NULL FROM observation_memories
+                  WHERE namespace_id = ?1
+                    AND superseded_by IS NULL AND invalid_at IS NULL
+              ) AS compact_decay
+              WHERE type_order > ?2 OR (type_order = ?2 AND id > ?3)
+              ORDER BY type_order, id LIMIT ?4",
+        )?;
+        /* compact-decay-projection-end */
+        let rows = stmt
+            .query_map(
+                params![
+                    &namespace,
+                    after_type,
+                    &after_id,
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<f64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = row_count > limit;
+        let next_cursor = has_more
+            .then(|| rows.last().map(sqlite_decay_cursor))
+            .flatten()
+            .transpose()?;
+        let scanned_rows = rows.len();
+        let records = rows
+            .into_iter()
+            .filter_map(sqlite_decay_record)
+            .collect::<StorageResult<Vec<_>>>()?;
+        Ok(DecayPage {
+            records,
+            scanned_rows,
+            next_cursor,
+        })
+    }
+
+    fn commit_decay(&self, namespace_id: Uuid, updates: &[DecayUpdate]) -> StorageResult<()> {
+        if updates.len() > MEMORY_PAGE_SIZE {
+            return Err(StorageError::BudgetExceeded(format!(
+                "consolidation decay commit exceeds {MEMORY_PAGE_SIZE} updates"
+            )));
+        }
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut conn = lock_conn!(self);
+        let tx = conn.transaction()?;
+        let namespace = namespace_id.to_string();
+        let now = Utc::now().to_rfc3339();
+        for update in updates {
+            match update {
+                DecayUpdate::Episodic {
+                    id,
+                    stability,
+                    retrievability,
+                } => {
+                    tx.execute(
+                        "UPDATE episodic_memories
+                         SET stability = ?1, retrievability = ?2,
+                             access_count = access_count + 1, last_accessed = ?3
+                         WHERE id = ?4 AND namespace_id = ?5",
+                        params![
+                            f64::from(*stability),
+                            f64::from(*retrievability),
+                            &now,
+                            id.to_string(),
+                            &namespace
+                        ],
+                    )?;
+                }
+                DecayUpdate::Procedural {
+                    id,
+                    reliability,
+                    trial_count,
+                    success_count,
+                } => {
+                    tx.execute(
+                        "UPDATE procedural_memories
+                         SET reliability = ?1, trial_count = ?2, success_count = ?3,
+                             last_used = ?4
+                         WHERE id = ?5 AND namespace_id = ?6",
+                        params![
+                            f64::from(*reliability),
+                            trial_count,
+                            success_count,
+                            &now,
+                            id.to_string(),
+                            &namespace
+                        ],
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn assignments(&self, run: RunId, limit: usize) -> StorageResult<Vec<WorkspaceAssignment>> {
         if limit > crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS {
             return Err(StorageError::BudgetExceeded(format!(
@@ -5484,6 +5786,78 @@ impl ConsolidationWorkspace for SqliteBackend {
 
 type SqliteWorkspaceSourceRow = (String, String, i64);
 
+type SqliteDecayRow = (
+    i64,
+    String,
+    Option<String>,
+    Option<f64>,
+    Option<i64>,
+    Option<i64>,
+);
+
+fn sqlite_decay_cursor(row: &SqliteDecayRow) -> StorageResult<PageCursor> {
+    let memory_type = match row.0 {
+        0 => MemoryType::Episodic,
+        1 => MemoryType::Semantic,
+        2 => MemoryType::Procedural,
+        3 => MemoryType::Observation,
+        other => {
+            return Err(StorageError::Context(format!(
+                "invalid compact decay memory type order {other}"
+            )));
+        }
+    };
+    Ok(PageCursor {
+        memory_type,
+        id: parse_uuid(&row.1)?,
+    })
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn sqlite_decay_record(row: SqliteDecayRow) -> Option<StorageResult<DecayRecord>> {
+    let (type_order, id, reference_time, decay_value, trial_count, success_count) = row;
+    if type_order == 3 {
+        return None;
+    }
+    Some((|| {
+        let id = parse_uuid(&id)?;
+        let reference_time = reference_time
+            .ok_or_else(|| StorageError::Context("compact decay row has no timestamp".into()))?;
+        let decay_value = decay_value
+            .ok_or_else(|| StorageError::Context("compact decay row has no decay value".into()))?
+            as f32;
+        match type_order {
+            0 => Ok(DecayRecord::Episodic {
+                id,
+                reference_time: str_to_dt(&reference_time),
+                stability: decay_value,
+            }),
+            1 => Ok(DecayRecord::Semantic {
+                valid_at: str_to_dt(&reference_time),
+                stability: decay_value,
+            }),
+            2 => Ok(DecayRecord::Procedural {
+                id,
+                reference_time: str_to_dt(&reference_time),
+                reliability: decay_value,
+                trial_count: u32::try_from(trial_count.ok_or_else(|| {
+                    StorageError::Context("compact procedural decay row has no trial count".into())
+                })?)
+                .map_err(|_| StorageError::Context("invalid procedural trial count".into()))?,
+                success_count: u32::try_from(success_count.ok_or_else(|| {
+                    StorageError::Context(
+                        "compact procedural decay row has no success count".into(),
+                    )
+                })?)
+                .map_err(|_| StorageError::Context("invalid procedural success count".into()))?,
+            }),
+            other => Err(StorageError::Context(format!(
+                "invalid compact decay memory type order {other}"
+            ))),
+        }
+    })())
+}
+
 fn workspace_source_from_sqlite(row: SqliteWorkspaceSourceRow) -> StorageResult<WorkspaceSource> {
     let (id, about_entity, ordinal) = row;
     Ok(WorkspaceSource {
@@ -5496,16 +5870,26 @@ fn workspace_source_from_sqlite(row: SqliteWorkspaceSourceRow) -> StorageResult<
     })
 }
 
-type SqliteWorkspaceEmbeddingRow = (String, i64, Vec<u8>);
+type SqliteWorkspaceEmbeddingRow = (String, i64, Vec<u8>, i64);
 
 fn workspace_embedding_source_from_sqlite(
     row: SqliteWorkspaceEmbeddingRow,
 ) -> StorageResult<WorkspaceEmbeddingSource> {
-    let (id, ordinal, embedding) = row;
+    let (id, ordinal, embedding, dimension) = row;
     let memory_ref = MemoryRef {
         memory_type: MemoryType::Episodic,
         id: parse_uuid(&id)?,
     };
+    let dimension = usize::try_from(dimension)
+        .map_err(|_| StorageError::Context("negative workspace embedding dimension".into()))?;
+    if !embedding.len().is_multiple_of(std::mem::size_of::<f32>())
+        || embedding.len() != dimension.saturating_mul(std::mem::size_of::<f32>())
+    {
+        return Err(StorageError::Context(format!(
+            "workspace embedding for {} does not match its registered dimension",
+            memory_ref.id
+        )));
+    }
     let embedding = blob_to_embedding(&embedding);
     if embedding.is_empty() || embedding.iter().any(|value| !value.is_finite()) {
         return Err(StorageError::Context(format!(
@@ -5520,12 +5904,16 @@ fn workspace_embedding_source_from_sqlite(
     })
 }
 
-fn sqlite_workspace_embedding_source(
+fn sqlite_workspace_embedding_source<F>(
     conn: &Connection,
     run: RunId,
     memory_id: Uuid,
     max_application_bytes: usize,
-) -> StorageResult<WorkspaceEmbeddingSource> {
+    before_payload: F,
+) -> StorageResult<WorkspaceEmbeddingSource>
+where
+    F: FnOnce(),
+{
     let (encoded_bytes, dimension): (i64, i64) = conn.query_row(
         "SELECT length(embedding.embedding), spaces.dimension
          FROM consolidation_sources AS workspace
@@ -5545,17 +5933,28 @@ fn sqlite_workspace_embedding_source(
         .map_err(|_| StorageError::Context("negative anchor payload bytes".into()))?;
     let dimension = usize::try_from(dimension)
         .map_err(|_| StorageError::Context("negative anchor dimension".into()))?;
+    let expected_bytes = dimension
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| StorageError::Context("anchor dimension overflow".into()))?;
+    if !encoded_bytes.is_multiple_of(std::mem::size_of::<f32>()) || encoded_bytes != expected_bytes
+    {
+        return Err(StorageError::Context(
+            "workspace anchor embedding does not match its registered dimension".into(),
+        ));
+    }
     ensure_application_budget(
         std::mem::size_of::<WorkspaceEmbeddingSource>()
             .saturating_add(std::mem::size_of::<SqliteWorkspaceEmbeddingRow>())
             .saturating_add(36)
             .saturating_add(encoded_bytes)
-            .saturating_add(dimension.saturating_mul(std::mem::size_of::<f32>())),
+            .saturating_add(encoded_bytes),
         max_application_bytes,
         "consolidation anchor",
     )?;
+    before_payload();
     let row = conn.query_row(
-        "SELECT workspace.memory_id, workspace.source_ordinal, embedding.embedding
+        "SELECT workspace.memory_id, workspace.source_ordinal, embedding.embedding,
+                spaces.dimension
          FROM consolidation_sources AS workspace
          JOIN consolidation_runs AS runs ON runs.run_id = workspace.run_id
          JOIN memory_embeddings AS embedding
@@ -5564,9 +5963,10 @@ fn sqlite_workspace_embedding_source(
           AND embedding.memory_id = workspace.memory_id
           AND embedding.embedding_space_id = runs.embedding_space_id
           AND embedding.source_sha256 = workspace.source_sha256
+         JOIN embedding_spaces AS spaces ON spaces.id = runs.embedding_space_id
          WHERE workspace.run_id = ?1 AND workspace.memory_id = ?2",
         params![run.id.to_string(), memory_id.to_string()],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
     workspace_embedding_source_from_sqlite(row)
 }
@@ -6196,6 +6596,7 @@ mod tests {
     use crate::embedding::OnnxEmbedder;
     use crate::embedding_space::EmbeddingSpaceId;
     use crate::storage::bounded::{EmbeddingRecord, MemoryRef, embedding_source_text};
+    use crate::storage::consolidation_workspace::CONSOLIDATION_WORKING_STATE_BYTES;
     use crate::storage::embedding_record_for_memory;
     use crate::types::*;
     use sha2::{Digest, Sha256};
@@ -6323,6 +6724,249 @@ mod tests {
             0,
             "candidate payload SELECT must not run after a failed preflight"
         );
+    }
+
+    #[test]
+    fn compact_decay_budget_preflight_runs_before_payload_select() {
+        let (_dir, db) = setup();
+        let namespace = make_namespace(&db);
+        let memory = Memory::Episodic(EpisodicMemory::new(
+            namespace.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "payload must never be projected",
+        ));
+        db.save_episodic(match &memory {
+            Memory::Episodic(memory) => memory,
+            _ => unreachable!(),
+        })
+        .unwrap();
+        let workspace: &dyn ConsolidationWorkspace = &db;
+        db.reset_decay_payload_fetches();
+
+        let error = workspace
+            .page_decay(namespace.id, None, MEMORY_PAGE_SIZE, 1)
+            .unwrap_err();
+
+        assert!(matches!(error, StorageError::BudgetExceeded(_)));
+        assert_eq!(db.decay_payload_fetches(), 0);
+    }
+
+    #[test]
+    fn malformed_large_vector_is_rejected_before_workspace_payload_fetch() {
+        let (_dir, db) = setup();
+        let namespace = make_namespace(&db);
+        let embedder = OnnxEmbedder::new_mock(8);
+        db.initialize_local_runtime_space(namespace.id, embedder.embedding_space().unwrap())
+            .unwrap();
+        let episode = Episode::new(namespace.id, vec![Uuid::new_v4()]);
+        db.save_episode(&episode).unwrap();
+        let entity = Uuid::new_v4();
+        let mut memories = Vec::new();
+        for offset in 0..2 {
+            let mut memory = EpisodicMemory::new(
+                namespace.id,
+                episode.id,
+                Uuid::new_v4(),
+                entity,
+                "malformed vector preflight",
+            );
+            memory.timestamp += chrono::Duration::seconds(offset);
+            let memory = Memory::Episodic(memory);
+            let record = embedding_record(
+                &memory,
+                &embedder.embedding_space().unwrap().id().0,
+                vec![1.0; 8],
+            );
+            db.save_memory_with_embedding(&memory, Some(&record))
+                .unwrap();
+            memories.push(memory);
+        }
+        let workspace: &dyn ConsolidationWorkspace = &db;
+        let run = workspace
+            .begin_or_resume(namespace.id, &embedder.embedding_space().unwrap().id())
+            .unwrap();
+        let sources = workspace.next_sources(run, None, 256, usize::MAX).unwrap();
+        let anchor = sources.records[0].memory_ref;
+        let malformed = sources.records[1].memory_ref;
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE memory_embeddings SET embedding = zeroblob(?1) WHERE memory_id = ?2",
+                params![8 * 1024 * 1024_i64, malformed.id.to_string()],
+            )
+            .unwrap();
+        db.reset_workspace_payload_fetches();
+
+        let error = workspace
+            .page_later_unassigned(run, anchor, None, 64, 12 * 1024 * 1024)
+            .unwrap_err();
+
+        assert!(matches!(error, StorageError::Context(_)));
+        assert_eq!(db.workspace_payload_fetches(), 0);
+    }
+
+    #[test]
+    fn vector_preflight_and_fetch_share_one_sqlite_snapshot() {
+        let (dir, db) = setup();
+        let db = std::sync::Arc::new(db);
+        let namespace = make_namespace(&db);
+        let embedder = OnnxEmbedder::new_mock(8);
+        db.initialize_local_runtime_space(namespace.id, embedder.embedding_space().unwrap())
+            .unwrap();
+        let episode = Episode::new(namespace.id, vec![Uuid::new_v4()]);
+        db.save_episode(&episode).unwrap();
+        let memory = Memory::Episodic(EpisodicMemory::new(
+            namespace.id,
+            episode.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "stable vector snapshot",
+        ));
+        let record = embedding_record(
+            &memory,
+            &embedder.embedding_space().unwrap().id().0,
+            vec![1.0; 8],
+        );
+        db.save_memory_with_embedding(&memory, Some(&record))
+            .unwrap();
+        let workspace: &dyn ConsolidationWorkspace = db.as_ref();
+        let run = workspace
+            .begin_or_resume(namespace.id, &embedder.embedding_space().unwrap().id())
+            .unwrap();
+        let source = MemoryRef::from_memory(&memory);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        db.set_workspace_race_barrier(WorkspaceRacePoint::Vector, barrier.clone());
+        let runner = db.clone();
+        let handle = std::thread::spawn(move || {
+            let workspace: &dyn ConsolidationWorkspace = runner.as_ref();
+            workspace.load_source(run, source, CONSOLIDATION_WORKING_STATE_BYTES)
+        });
+
+        barrier.wait();
+        let writer = Connection::open(dir.path().join("memories.db")).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE memory_embeddings SET embedding = zeroblob(?1) WHERE memory_id = ?2",
+                params![8 * 1024 * 1024_i64, source.id.to_string()],
+            )
+            .unwrap();
+        barrier.wait();
+
+        let loaded = handle
+            .join()
+            .expect("workspace reader thread")
+            .expect("stable SQLite snapshot");
+        assert_eq!(loaded.embedding.len(), 8);
+    }
+
+    #[test]
+    fn final_content_preflight_and_fetch_never_materialize_a_racing_replacement() {
+        let (dir, db) = setup();
+        let db = std::sync::Arc::new(db);
+        let namespace = make_namespace(&db);
+        let embedder = OnnxEmbedder::new_mock(8);
+        db.initialize_local_runtime_space(namespace.id, embedder.embedding_space().unwrap())
+            .unwrap();
+        let episode = Episode::new(namespace.id, vec![Uuid::new_v4()]);
+        db.save_episode(&episode).unwrap();
+        let entity = Uuid::new_v4();
+        let mut memories = Vec::new();
+        for offset in 0..2 {
+            let mut memory = EpisodicMemory::new(
+                namespace.id,
+                episode.id,
+                Uuid::new_v4(),
+                entity,
+                "stable final content",
+            );
+            memory.timestamp += chrono::Duration::seconds(offset);
+            let memory = Memory::Episodic(memory);
+            let record = embedding_record(
+                &memory,
+                &embedder.embedding_space().unwrap().id().0,
+                vec![1.0; 8],
+            );
+            db.save_memory_with_embedding(&memory, Some(&record))
+                .unwrap();
+            memories.push(memory);
+        }
+        let workspace: &dyn ConsolidationWorkspace = db.as_ref();
+        let run = workspace
+            .begin_or_resume(namespace.id, &embedder.embedding_space().unwrap().id())
+            .unwrap();
+        let sources = workspace.next_sources(run, None, 256, usize::MAX).unwrap();
+        let anchor = sources.records[0].memory_ref;
+        let member = sources.records[1].memory_ref;
+        workspace
+            .record_tentative_match(run, anchor, anchor)
+            .unwrap();
+        workspace
+            .record_tentative_match(run, anchor, member)
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        db.set_workspace_race_barrier(WorkspaceRacePoint::FinalContent, barrier.clone());
+        let runner = db.clone();
+        let handle = std::thread::spawn(move || {
+            let workspace: &dyn ConsolidationWorkspace = runner.as_ref();
+            workspace.finalize_or_discard_cluster(run, anchor, CONSOLIDATION_WORKING_STATE_BYTES)
+        });
+
+        barrier.wait();
+        let writer = Connection::open(dir.path().join("memories.db")).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE episodic_memories SET content = printf('%.*c', ?1, 'x') WHERE id = ?2",
+                params![
+                    i64::try_from(CONSOLIDATION_WORKING_STATE_BYTES + 1).unwrap(),
+                    member.id.to_string()
+                ],
+            )
+            .unwrap();
+        barrier.wait();
+
+        match handle.join().expect("workspace reader thread") {
+            Ok(ClusterDecision::Finalized { promotion }) => {
+                assert_eq!(promotion.latest.content, "stable final content");
+            }
+            Err(_) => {}
+            Ok(other) => panic!("pair must finalize or reject the racing write: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compact_decay_projection_excludes_variable_payload_columns() {
+        let source = include_str!("sqlite.rs");
+        let start = source
+            .find("/* compact-decay-projection */")
+            .expect("compact decay projection marker");
+        let end = source[start..]
+            .find("/* compact-decay-projection-end */")
+            .expect("compact decay projection end");
+        let projection = &source[start..start + end];
+        for forbidden in [
+            "source.content",
+            ".summary",
+            "metadata_json",
+            "embedding.embedding",
+            "predicate AS",
+            "object AS",
+            "trigger_text AS",
+            "action AS",
+        ] {
+            assert!(
+                !projection.contains(forbidden),
+                "compact decay projection selected {forbidden}"
+            );
+        }
     }
 
     fn embedding_count(db: &SqliteBackend, namespace_id: Uuid) -> i64 {

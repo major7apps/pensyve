@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::embedding_space::EmbeddingSpaceId;
 use crate::storage::StorageError;
 use crate::storage::StorageResult;
-use crate::storage::bounded::{EmbeddingRecord, MemoryRef};
+use crate::storage::bounded::{EmbeddingRecord, MemoryRef, PageCursor};
 use crate::types::Memory;
 
 pub const CONSOLIDATION_WORKING_STATE_BYTES: usize = 32 * 1024 * 1024;
@@ -213,6 +213,19 @@ pub trait ConsolidationWorkspace: Send + Sync {
 
     fn complete(&self, run: RunId) -> StorageResult<()>;
 
+    /// Page only the fixed-size fields consumed by decay. The cursor traverses
+    /// observations even though they produce no [`DecayRecord`].
+    fn page_decay(
+        &self,
+        namespace_id: Uuid,
+        after: Option<PageCursor>,
+        limit: usize,
+        max_application_bytes: usize,
+    ) -> StorageResult<DecayPage>;
+
+    /// Commit at most one compact decay page in a backend transaction.
+    fn commit_decay(&self, namespace_id: Uuid, updates: &[DecayUpdate]) -> StorageResult<()>;
+
     /// Bounded diagnostic surface used by correctness tests and operators.
     fn assignments(&self, run: RunId, limit: usize) -> StorageResult<Vec<WorkspaceAssignment>>;
 }
@@ -226,4 +239,61 @@ pub struct NamespacePageCursor {
 pub struct NamespacePage {
     pub namespace_ids: Vec<Uuid>,
     pub next_cursor: Option<NamespacePageCursor>,
+}
+
+/// Fixed-size fields needed by decay. Observation rows advance the page cursor
+/// but deliberately produce no record.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DecayRecord {
+    Episodic {
+        id: Uuid,
+        reference_time: DateTime<Utc>,
+        stability: f32,
+    },
+    Semantic {
+        valid_at: DateTime<Utc>,
+        stability: f32,
+    },
+    Procedural {
+        id: Uuid,
+        reference_time: DateTime<Utc>,
+        reliability: f32,
+        trial_count: u32,
+        success_count: u32,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DecayPage {
+    pub records: Vec<DecayRecord>,
+    /// Includes observations, which carry no decay record but are part of the
+    /// stable typed traversal.
+    pub scanned_rows: usize,
+    pub next_cursor: Option<PageCursor>,
+}
+
+impl DecayPage {
+    #[must_use]
+    pub fn application_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self
+                .records
+                .capacity()
+                .saturating_mul(std::mem::size_of::<DecayRecord>())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DecayUpdate {
+    Episodic {
+        id: Uuid,
+        stability: f32,
+        retrievability: f32,
+    },
+    Procedural {
+        id: Uuid,
+        reliability: f32,
+        trial_count: u32,
+        success_count: u32,
+    },
 }

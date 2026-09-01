@@ -112,7 +112,7 @@ use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions, Postgres};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
-use super::{POSTGRES_VECTOR_SEARCH_SQL, PostgresBackend};
+use super::{POSTGRES_VECTOR_SEARCH_SQL, PostgresBackend, WorkspaceRacePoint};
 use crate::embedding_space::{EmbeddingSpace, EmbeddingSpaceId};
 use crate::storage::bounded::{
     EmbeddingRecord, EntityScope as BoundedEntityScope, IdentityScope, MAX_HYDRATED_BYTES,
@@ -1013,6 +1013,210 @@ fn consolidation_workspace_lifecycle_is_transactional_resumable_and_rls_scoped()
             .len(),
         6
     );
+}
+
+#[test]
+fn consolidation_rejects_a_live_postgres_vector_dimension_mismatch() {
+    let Some(admin_opts) =
+        skip_notice("consolidation_rejects_a_live_postgres_vector_dimension_mismatch")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let namespace = Namespace::new("workspace-vector-dimension");
+    fixture.backend.save_namespace(&namespace).unwrap();
+    register_embedding_space(&fixture, "workspace-dimension-space", "mock", 2);
+    let space = EmbeddingSpaceId("workspace-dimension-space".to_string());
+    let source = save_workspace_episode(
+        &fixture,
+        namespace.id,
+        Uuid::new_v4(),
+        "dimension mismatch",
+        Utc::now(),
+        &space.0,
+    );
+    let workspace: &dyn ConsolidationWorkspace = &fixture.backend;
+    let run = workspace.begin_or_resume(namespace.id, &space).unwrap();
+    let source_ref = MemoryRef::from_memory(&source);
+    fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace.id).await.unwrap();
+        query::<Postgres>(
+            "UPDATE memory_embeddings SET embedding = '[1.0,0.0,0.0]'::vector
+             WHERE namespace_id = $1 AND memory_type = 'episodic'
+               AND memory_id = $2 AND embedding_space_id = $3",
+        )
+        .bind(namespace.id)
+        .bind(source_ref.id)
+        .bind(&space.0)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    });
+
+    let error = workspace
+        .load_source(run, source_ref, CONSOLIDATION_WORKING_STATE_BYTES)
+        .expect_err("actual pgvector dimension must match the immutable registry dimension");
+    assert!(
+        matches!(error, StorageError::Context(message) if message.contains("registered dimension"))
+    );
+}
+
+#[test]
+fn consolidation_vector_preflight_blocks_a_two_connection_postgres_race() {
+    let Some(admin_opts) =
+        skip_notice("consolidation_vector_preflight_blocks_a_two_connection_postgres_race")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let writer = fixture.backend_as(&admin_opts, &fixture.role);
+    let namespace = Namespace::new("workspace-vector-race");
+    fixture.backend.save_namespace(&namespace).unwrap();
+    register_embedding_space(&fixture, "workspace-race-space", "mock", 2);
+    let space = EmbeddingSpaceId("workspace-race-space".to_string());
+    let source = save_workspace_episode(
+        &fixture,
+        namespace.id,
+        Uuid::new_v4(),
+        "stable vector",
+        Utc::now(),
+        &space.0,
+    );
+    let workspace: &dyn ConsolidationWorkspace = &fixture.backend;
+    let run = workspace.begin_or_resume(namespace.id, &space).unwrap();
+    let source_ref = MemoryRef::from_memory(&source);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    fixture
+        .backend
+        .set_workspace_race_barrier(WorkspaceRacePoint::Vector, barrier.clone());
+
+    let loaded = std::thread::scope(|scope| {
+        let reader = scope
+            .spawn(|| workspace.load_source(run, source_ref, CONSOLIDATION_WORKING_STATE_BYTES));
+        barrier.wait();
+        let update_error = writer
+            .block_on(async {
+                let mut conn = writer.scoped_conn(namespace.id).await.unwrap();
+                let mut tx = (&mut *conn).begin().await.unwrap();
+                query::<Postgres>("SET LOCAL lock_timeout = '250ms'")
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                let result = query::<Postgres>(
+                    "UPDATE memory_embeddings SET embedding = '[0.0,1.0]'::vector
+                     WHERE namespace_id = $1 AND memory_type = 'episodic'
+                       AND memory_id = $2 AND embedding_space_id = $3",
+                )
+                .bind(namespace.id)
+                .bind(source_ref.id)
+                .bind(&space.0)
+                .execute(&mut *tx)
+                .await;
+                let _ = tx.rollback().await;
+                result
+            })
+            .expect_err("the reader's FOR SHARE lock must reject the racing vector update");
+        assert_eq!(
+            update_error
+                .as_database_error()
+                .and_then(sqlx_core::error::DatabaseError::code)
+                .as_deref(),
+            Some("55P03")
+        );
+        barrier.wait();
+        reader.join().expect("workspace reader thread")
+    })
+    .expect("stable PostgreSQL vector snapshot");
+    assert_eq!(loaded.embedding, vec![1.0, 0.0]);
+}
+
+#[test]
+fn consolidation_content_preflight_blocks_a_two_connection_postgres_race() {
+    let Some(admin_opts) =
+        skip_notice("consolidation_content_preflight_blocks_a_two_connection_postgres_race")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let writer = fixture.backend_as(&admin_opts, &fixture.role);
+    let namespace = Namespace::new("workspace-content-race");
+    fixture.backend.save_namespace(&namespace).unwrap();
+    register_embedding_space(&fixture, "workspace-content-race-space", "mock", 2);
+    let space = EmbeddingSpaceId("workspace-content-race-space".to_string());
+    let about = Uuid::new_v4();
+    let base = Utc::now();
+    let first = save_workspace_episode(
+        &fixture,
+        namespace.id,
+        about,
+        "stable final content",
+        base,
+        &space.0,
+    );
+    let latest = save_workspace_episode(
+        &fixture,
+        namespace.id,
+        about,
+        "stable final content",
+        base + chrono::Duration::seconds(1),
+        &space.0,
+    );
+    let workspace: &dyn ConsolidationWorkspace = &fixture.backend;
+    let run = workspace.begin_or_resume(namespace.id, &space).unwrap();
+    let anchor = MemoryRef::from_memory(&first);
+    let latest_ref = MemoryRef::from_memory(&latest);
+    workspace
+        .record_tentative_match(run, anchor, anchor)
+        .unwrap();
+    workspace
+        .record_tentative_match(run, anchor, latest_ref)
+        .unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    fixture
+        .backend
+        .set_workspace_race_barrier(WorkspaceRacePoint::FinalContent, barrier.clone());
+
+    let decision = std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            workspace.finalize_or_discard_cluster(run, anchor, CONSOLIDATION_WORKING_STATE_BYTES)
+        });
+        barrier.wait();
+        let update_error = writer
+            .block_on(async {
+                let mut conn = writer.scoped_conn(namespace.id).await.unwrap();
+                let mut tx = (&mut *conn).begin().await.unwrap();
+                query::<Postgres>("SET LOCAL lock_timeout = '250ms'")
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                let result = query::<Postgres>(
+                    "UPDATE episodic_memories SET content = repeat('x', $1)
+                     WHERE namespace_id = $2 AND id = $3",
+                )
+                .bind(i32::try_from(CONSOLIDATION_WORKING_STATE_BYTES + 1).unwrap())
+                .bind(namespace.id)
+                .bind(latest_ref.id)
+                .execute(&mut *tx)
+                .await;
+                let _ = tx.rollback().await;
+                result
+            })
+            .expect_err("the reader's FOR SHARE lock must reject the racing content update");
+        assert_eq!(
+            update_error
+                .as_database_error()
+                .and_then(sqlx_core::error::DatabaseError::code)
+                .as_deref(),
+            Some("55P03")
+        );
+        barrier.wait();
+        reader.join().expect("workspace reader thread")
+    })
+    .expect("stable PostgreSQL content snapshot");
+    let ClusterDecision::Finalized { promotion } = decision else {
+        panic!("pair must finalize after the racing write is rejected");
+    };
+    assert_eq!(promotion.latest.content, "stable final content");
 }
 
 #[test]

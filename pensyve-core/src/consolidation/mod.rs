@@ -70,12 +70,12 @@ use crate::decay;
 use crate::embedding::{OnnxEmbedder, cosine_similarity};
 use crate::network_policy::{NetworkPolicy, NetworkRequiredError};
 use crate::storage::bounded::{
-    CONSOLIDATION_COMPARISON_PAGE_SIZE, EmbeddingRecord, MEMORY_PAGE_SIZE, MemoryPageRequest,
-    MemoryRef, SearchScope, embedding_source_text,
+    CONSOLIDATION_COMPARISON_PAGE_SIZE, EmbeddingRecord, MEMORY_PAGE_SIZE, MemoryRef,
+    embedding_source_text,
 };
 use crate::storage::consolidation_workspace::{
-    CONSOLIDATION_WORKING_STATE_BYTES, ClusterDecision, ConsolidationWorkspace, PromotionCommit,
-    RunId, WorkspaceCursor,
+    CONSOLIDATION_WORKING_STATE_BYTES, ClusterDecision, ConsolidationWorkspace, DecayRecord,
+    DecayUpdate, PromotionCommit, RunId, WorkspaceCursor,
 };
 use crate::storage::{StorageError, StorageResult, StorageTrait};
 use crate::types::{Memory, SemanticMemory, SlotKind};
@@ -256,6 +256,9 @@ pub struct ConsolidationMetrics {
     pub max_finalized_metadata_bytes: usize,
     pub peak_working_state_bytes: usize,
     pub max_decay_page_request: usize,
+    pub max_decay_page_rows: usize,
+    pub max_decay_page_bytes: usize,
+    pub max_decay_commit_rows: usize,
     pub decay_pages: usize,
 }
 
@@ -318,6 +321,18 @@ impl ConsolidationStats {
             .metrics
             .max_decay_page_request
             .max(other.metrics.max_decay_page_request);
+        self.metrics.max_decay_page_rows = self
+            .metrics
+            .max_decay_page_rows
+            .max(other.metrics.max_decay_page_rows);
+        self.metrics.max_decay_page_bytes = self
+            .metrics
+            .max_decay_page_bytes
+            .max(other.metrics.max_decay_page_bytes);
+        self.metrics.max_decay_commit_rows = self
+            .metrics
+            .max_decay_commit_rows
+            .max(other.metrics.max_decay_commit_rows);
         self.metrics.decay_pages += other.metrics.decay_pages;
     }
 }
@@ -742,7 +757,7 @@ impl ConsolidationEngine {
         }
 
         if let Some(incomplete) = Self::decay_bounded(
-            storage,
+            workspace,
             config,
             namespace_id,
             start,
@@ -1087,9 +1102,13 @@ impl ConsolidationEngine {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "compact decay paging, budget accounting, and typed updates remain one bounded control-flow proof"
+    )]
     fn decay_bounded(
-        storage: &dyn StorageTrait,
+        workspace: &dyn ConsolidationWorkspace,
         config: &ConsolidationConfig,
         namespace_id: Uuid,
         start: Instant,
@@ -1109,100 +1128,150 @@ impl ConsolidationEngine {
             }
             stats.metrics.max_decay_page_request =
                 stats.metrics.max_decay_page_request.max(MEMORY_PAGE_SIZE);
-            let request = MemoryPageRequest::new(
-                SearchScope::namespace(namespace_id),
+            let Some(page) = Self::workspace_payload(workspace.page_decay(
+                namespace_id,
                 after,
                 MEMORY_PAGE_SIZE,
-                false,
-            )?;
-            let page = storage.page_memories(&request)?;
-            if page.memories.is_empty() {
+                CONSOLIDATION_WORKING_STATE_BYTES,
+            ))?
+            else {
+                return Ok(Some(ConsolidationIncomplete::WorkingStateBudgetExceeded));
+            };
+            if page.scanned_rows == 0 {
                 return Ok(None);
             }
+            let page_bytes = page.application_bytes();
+            stats.metrics.max_decay_page_rows =
+                stats.metrics.max_decay_page_rows.max(page.scanned_rows);
+            stats.metrics.max_decay_page_bytes = stats.metrics.max_decay_page_bytes.max(page_bytes);
             stats.metrics.decay_pages += 1;
             let next = page.next_cursor;
-            for mem in page.memories {
+            let update_bytes = page
+                .records
+                .len()
+                .saturating_mul(std::mem::size_of::<DecayUpdate>());
+            if let Some(reason) =
+                Self::observe_working_state(stats, page_bytes.saturating_add(update_bytes))
+            {
+                return Ok(Some(reason));
+            }
+            let mut updates = Vec::with_capacity(page.records.len());
+            let mut page_decayed = 0;
+            let mut page_archived = 0;
+            for record in page.records {
                 if cancel.is_cancelled() {
+                    Self::commit_decay_page(
+                        workspace,
+                        namespace_id,
+                        &updates,
+                        page_decayed,
+                        page_archived,
+                        stats,
+                    )?;
                     return Ok(Some(ConsolidationIncomplete::Cancelled));
                 }
                 if start.elapsed() > max_duration {
+                    Self::commit_decay_page(
+                        workspace,
+                        namespace_id,
+                        &updates,
+                        page_decayed,
+                        page_archived,
+                        stats,
+                    )?;
                     return Ok(Some(ConsolidationIncomplete::DurationExceeded));
                 }
-                match mem {
-                    Memory::Episodic(em) => {
-                        let reference_time = em.last_accessed.unwrap_or(em.timestamp);
+                match record {
+                    DecayRecord::Episodic {
+                        id,
+                        reference_time,
+                        stability,
+                    } => {
                         let elapsed = decay::elapsed_days(reference_time, now);
-                        let retrievability = decay::retrievability(em.stability, elapsed);
+                        let retrievability = decay::retrievability(stability, elapsed);
 
                         if retrievability < threshold {
-                            // Mark as archived by setting retrievability to near-zero and
-                            // generating a summary stub if none exists. We store the updated
-                            // stability/retrievability back via
-                            // `update_episodic_access_in_namespace`.
-                            storage.update_episodic_access_in_namespace(
-                                em.id,
-                                namespace_id,
-                                em.stability * 0.5,
+                            updates.push(DecayUpdate::Episodic {
+                                id,
+                                stability: stability * 0.5,
                                 retrievability,
-                            )?;
-                            stats.archived += 1;
+                            });
+                            page_archived += 1;
                         } else {
-                            // Just record updated retrievability.
-                            storage.update_episodic_access_in_namespace(
-                                em.id,
-                                namespace_id,
-                                em.stability,
+                            updates.push(DecayUpdate::Episodic {
+                                id,
+                                stability,
                                 retrievability,
-                            )?;
+                            });
                         }
-                        stats.decayed += 1;
+                        page_decayed += 1;
                     }
 
-                    Memory::Semantic(sm) => {
-                        let elapsed = decay::elapsed_days(sm.valid_at, now);
-                        let retrievability = decay::retrievability(sm.stability, elapsed);
+                    DecayRecord::Semantic {
+                        valid_at,
+                        stability,
+                    } => {
+                        let elapsed = decay::elapsed_days(valid_at, now);
+                        let retrievability = decay::retrievability(stability, elapsed);
 
                         if retrievability < threshold {
-                            // Semantic memories: flag for review by invalidating (not deleting).
-                            // We don't archive semantic memories — just note the retrievability.
-                            // For now we track archived count but do not invalidate the
-                            // fact, as that would permanently mark it invalid. Instead we
-                            // simply note it in stats.
-                            stats.archived += 1;
+                            page_archived += 1;
                         }
-                        stats.decayed += 1;
+                        page_decayed += 1;
                     }
 
-                    Memory::Procedural(pm) => {
-                        let reference_time = pm.last_used.unwrap_or(pm.created_at);
+                    DecayRecord::Procedural {
+                        id,
+                        reference_time,
+                        reliability,
+                        trial_count,
+                        success_count,
+                    } => {
                         let elapsed = decay::elapsed_days(reference_time, now);
-                        // Use reliability as a proxy for "stability" in FSRS retrievability.
-                        let retrievability = decay::retrievability(pm.reliability, elapsed);
+                        let retrievability = decay::retrievability(reliability, elapsed);
 
-                        if retrievability < threshold && pm.reliability < 0.1 {
-                            // Archive: reduce reliability and increment archived count.
-                            let new_reliability = pm.reliability * 0.5;
-                            storage.update_procedural_reliability_in_namespace(
-                                pm.id,
-                                namespace_id,
-                                new_reliability,
-                                pm.trial_count,
-                                pm.success_count,
-                            )?;
-                            stats.archived += 1;
+                        if retrievability < threshold && reliability < 0.1 {
+                            updates.push(DecayUpdate::Procedural {
+                                id,
+                                reliability: reliability * 0.5,
+                                trial_count,
+                                success_count,
+                            });
+                            page_archived += 1;
                         }
-                        stats.decayed += 1;
+                        page_decayed += 1;
                     }
-
-                    // Observations decay with their source episode, not independently.
-                    Memory::Observation(_) => {}
                 }
             }
+            Self::commit_decay_page(
+                workspace,
+                namespace_id,
+                &updates,
+                page_decayed,
+                page_archived,
+                stats,
+            )?;
             let Some(next) = next else {
                 return Ok(None);
             };
             after = Some(next);
         }
+    }
+
+    fn commit_decay_page(
+        workspace: &dyn ConsolidationWorkspace,
+        namespace_id: Uuid,
+        updates: &[DecayUpdate],
+        decayed: usize,
+        archived: usize,
+        stats: &mut ConsolidationStats,
+    ) -> Result<(), ConsolidationError> {
+        stats.metrics.max_decay_commit_rows =
+            stats.metrics.max_decay_commit_rows.max(updates.len());
+        workspace.commit_decay(namespace_id, updates)?;
+        stats.decayed += decayed;
+        stats.archived += archived;
+        Ok(())
     }
 }
 
