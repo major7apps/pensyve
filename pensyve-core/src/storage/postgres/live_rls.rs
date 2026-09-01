@@ -101,6 +101,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 use sqlx_core::query::query;
 use sqlx_core::query_as::query_as;
 use sqlx_core::raw_sql::raw_sql;
@@ -110,7 +111,9 @@ use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 use super::PostgresBackend;
-use crate::storage::StorageTrait;
+use crate::embedding_space::EmbeddingSpaceId;
+use crate::storage::bounded::{EmbeddingRecord, MemoryRef, embedding_source_text};
+use crate::storage::{StorageError, StorageTrait};
 use crate::types::{
     Edge, Entity, EntityKind, EpisodicMemory, Memory, Namespace, ObservationMemory, Outcome,
     ProceduralMemory, SemanticMemory,
@@ -504,6 +507,302 @@ fn memory_ids(memories: &[Memory]) -> Vec<Uuid> {
             Memory::Observation(x) => x.id,
         })
         .collect()
+}
+
+fn register_embedding_space(fixture: &Fixture, id: &str, class: &str, dimension: i32) {
+    fixture.rt.block_on(async {
+        query::<Postgres>(
+            "INSERT INTO embedding_spaces
+             (id, canonical_identity_json, class, dimension, created_at)
+             VALUES ($1, '{}', $2, $3, NOW())",
+        )
+        .bind(id)
+        .bind(class)
+        .bind(dimension)
+        .execute(fixture.backend.pool())
+        .await
+        .expect("register embedding space");
+    });
+}
+
+fn canonical_source_sha256(memory: &Memory) -> String {
+    hex::encode(Sha256::digest(embedding_source_text(memory).as_bytes()))
+}
+
+fn embedding_record(memory: &Memory, space: &str, embedding: Vec<f32>) -> EmbeddingRecord {
+    let namespace_id = match memory {
+        Memory::Episodic(memory) => memory.namespace_id,
+        Memory::Semantic(memory) => memory.namespace_id,
+        Memory::Procedural(memory) => memory.namespace_id,
+        Memory::Observation(memory) => memory.namespace_id,
+    };
+    EmbeddingRecord {
+        namespace_id,
+        memory_ref: MemoryRef::from_memory(memory),
+        embedding_space_id: EmbeddingSpaceId(space.to_string()),
+        source_sha256: canonical_source_sha256(memory),
+        embedding,
+    }
+}
+
+fn embedding_count(fixture: &Fixture, namespace_id: Uuid) -> i64 {
+    fixture.rt.block_on(async {
+        let mut conn = fixture
+            .backend
+            .scoped_conn(namespace_id)
+            .await
+            .expect("scope embedding count");
+        query_as::<Postgres, (i64,)>(
+            "SELECT COUNT(*) FROM memory_embeddings WHERE namespace_id = $1",
+        )
+        .bind(namespace_id)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("count embeddings")
+        .0
+    })
+}
+
+fn embedding_write_fixture(fixture: &Fixture) -> (Namespace, Memory) {
+    let namespace = Namespace::new("embedding-write");
+    fixture
+        .backend
+        .save_namespace(&namespace)
+        .expect("save embedding namespace");
+    let memory = Memory::Episodic(EpisodicMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "transactional postgres source",
+    ));
+    (namespace, memory)
+}
+
+#[test]
+fn embedding_write_commits_mock_and_real_generations_for_the_same_source() {
+    let Some(admin_opts) =
+        skip_notice("embedding_write_commits_mock_and_real_generations_for_the_same_source")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let (namespace, memory) = embedding_write_fixture(&fixture);
+    register_embedding_space(&fixture, "mock-space", "mock", 4);
+    register_embedding_space(&fixture, "real-space", "real", 4);
+
+    for space in ["mock-space", "real-space"] {
+        let record = embedding_record(&memory, space, vec![1.0; 4]);
+        fixture
+            .backend
+            .save_memory_with_embedding(&memory, Some(&record))
+            .expect("save source and embedding generation");
+    }
+
+    assert_eq!(embedding_count(&fixture, namespace.id), 2);
+    assert!(
+        fixture
+            .backend
+            .get_episodic_in_namespace(memory.id(), namespace.id)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn embedding_write_missing_space_and_stale_hash_roll_back_source() {
+    let Some(admin_opts) =
+        skip_notice("embedding_write_missing_space_and_stale_hash_roll_back_source")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let (namespace, missing_memory) = embedding_write_fixture(&fixture);
+    let missing = embedding_record(&missing_memory, "missing-space", vec![1.0; 4]);
+    assert!(
+        fixture
+            .backend
+            .save_memory_with_embedding(&missing_memory, Some(&missing))
+            .is_err()
+    );
+    assert!(
+        fixture
+            .backend
+            .get_episodic_in_namespace(missing_memory.id(), namespace.id)
+            .unwrap()
+            .is_none()
+    );
+
+    register_embedding_space(&fixture, "test-space", "mock", 4);
+    let stale_memory = Memory::Episodic(EpisodicMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "stale source",
+    ));
+    let mut stale = embedding_record(&stale_memory, "test-space", vec![1.0; 4]);
+    stale.source_sha256 = "00".repeat(32);
+    assert!(matches!(
+        fixture
+            .backend
+            .save_memory_with_embedding(&stale_memory, Some(&stale)),
+        Err(StorageError::Context(_))
+    ));
+    assert!(
+        fixture
+            .backend
+            .get_episodic_in_namespace(stale_memory.id(), namespace.id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(embedding_count(&fixture, namespace.id), 0);
+}
+
+fn assert_embedding_write_rejects_cross_namespace_replacement(fixture: &Fixture, relax_rls: bool) {
+    if relax_rls {
+        fixture.relax_rls();
+    }
+    let (owner, memory) = embedding_write_fixture(fixture);
+    register_embedding_space(fixture, "test-space", "mock", 4);
+    let owner_record = embedding_record(&memory, "test-space", vec![1.0; 4]);
+    fixture
+        .backend
+        .save_memory_with_embedding(&memory, Some(&owner_record))
+        .unwrap();
+
+    let foreign = Namespace::new("embedding-foreign");
+    fixture.backend.save_namespace(&foreign).unwrap();
+    let mut replacement = memory.clone();
+    let Memory::Episodic(replacement) = &mut replacement else {
+        unreachable!()
+    };
+    replacement.namespace_id = foreign.id;
+    replacement.content = "cross-namespace replacement".to_string();
+    let foreign_record = embedding_record(
+        &Memory::Episodic(replacement.clone()),
+        "test-space",
+        vec![2.0; 4],
+    );
+
+    assert!(
+        fixture
+            .backend
+            .save_memory_with_embedding(
+                &Memory::Episodic(replacement.clone()),
+                Some(&foreign_record)
+            )
+            .is_err()
+    );
+    assert!(
+        fixture
+            .backend
+            .get_episodic_in_namespace(memory.id(), owner.id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        fixture
+            .backend
+            .get_episodic_in_namespace(memory.id(), foreign.id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(embedding_count(fixture, owner.id), 1);
+    assert_eq!(embedding_count(fixture, foreign.id), 0);
+}
+
+#[test]
+fn embedding_write_cross_namespace_replacement_is_blocked_by_explicit_predicates() {
+    let Some(admin_opts) = skip_notice(
+        "embedding_write_cross_namespace_replacement_is_blocked_by_explicit_predicates",
+    ) else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    assert_embedding_write_rejects_cross_namespace_replacement(&fixture, true);
+}
+
+#[test]
+fn embedding_write_cross_namespace_replacement_is_blocked_under_forced_rls() {
+    let Some(admin_opts) =
+        skip_notice("embedding_write_cross_namespace_replacement_is_blocked_under_forced_rls")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    assert_embedding_write_rejects_cross_namespace_replacement(&fixture, false);
+}
+
+#[test]
+fn embedding_write_rows_are_removed_by_supersede_delete_and_erase() {
+    let Some(admin_opts) =
+        skip_notice("embedding_write_rows_are_removed_by_supersede_delete_and_erase")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let (namespace, superseded) = embedding_write_fixture(&fixture);
+    register_embedding_space(&fixture, "test-space", "mock", 4);
+    let Memory::Episodic(superseded_source) = &superseded else {
+        unreachable!()
+    };
+    let deleted = Memory::Procedural(ProceduralMemory::new(
+        namespace.id,
+        "delete",
+        "generation",
+        Outcome::Success,
+        HashMap::new(),
+    ));
+    let observation = Memory::Observation(ObservationMemory::new(
+        namespace.id,
+        superseded_source.episode_id,
+        "erase",
+        "observation",
+        "remove",
+        "erase generation",
+    ));
+    let mut entity = Entity::new("erase target", EntityKind::User);
+    entity.id = superseded_source.about_entity;
+    entity.namespace_id = namespace.id;
+    fixture.backend.save_entity(&entity).unwrap();
+
+    for memory in [&superseded, &deleted, &observation] {
+        let record = embedding_record(memory, "test-space", vec![1.0; 4]);
+        fixture
+            .backend
+            .save_memory_with_embedding(memory, Some(&record))
+            .unwrap();
+    }
+    assert_eq!(embedding_count(&fixture, namespace.id), 3);
+
+    assert!(
+        fixture
+            .backend
+            .supersede_memory_in_namespace(
+                superseded.id(),
+                namespace.id,
+                Uuid::new_v4(),
+                Utc::now(),
+            )
+            .unwrap()
+    );
+    assert_eq!(embedding_count(&fixture, namespace.id), 2);
+    assert!(
+        fixture
+            .backend
+            .delete_memory_by_id_in_namespace(deleted.id(), namespace.id)
+            .unwrap()
+    );
+    assert_eq!(embedding_count(&fixture, namespace.id), 1);
+
+    let erased = fixture
+        .backend
+        .erase_entity_capturing(entity.id, namespace.id)
+        .unwrap();
+    assert_eq!(erased.memories.len(), 1);
+    assert_eq!(erased.observations.len(), 1);
+    assert_eq!(embedding_count(&fixture, namespace.id), 0);
 }
 
 /// Seed one episodic memory in `ns_a` and register both namespaces.

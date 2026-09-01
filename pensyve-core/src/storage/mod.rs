@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::types::{
@@ -38,6 +39,55 @@ pub enum StorageError {
 }
 
 pub type StorageResult<T> = Result<T, StorageError>;
+
+pub(crate) fn memory_namespace_id(memory: &Memory) -> Uuid {
+    match memory {
+        Memory::Episodic(memory) => memory.namespace_id,
+        Memory::Semantic(memory) => memory.namespace_id,
+        Memory::Procedural(memory) => memory.namespace_id,
+        Memory::Observation(memory) => memory.namespace_id,
+    }
+}
+
+pub(crate) fn canonical_embedding_source_sha256(memory: &Memory) -> String {
+    hex::encode(Sha256::digest(
+        bounded::embedding_source_text(memory).as_bytes(),
+    ))
+}
+
+pub(crate) fn validate_record_matches_memory(
+    record: &bounded::EmbeddingRecord,
+    memory: &Memory,
+) -> StorageResult<()> {
+    let namespace_id = memory_namespace_id(memory);
+    if record.namespace_id != namespace_id {
+        return Err(StorageError::Context(format!(
+            "embedding namespace {} does not match source namespace {namespace_id}",
+            record.namespace_id
+        )));
+    }
+    let expected_ref = bounded::MemoryRef::from_memory(memory);
+    if record.memory_ref != expected_ref {
+        return Err(StorageError::Context(format!(
+            "embedding memory reference {:?} does not match source {:?}",
+            record.memory_ref, expected_ref
+        )));
+    }
+    let expected_hash = canonical_embedding_source_sha256(memory);
+    if record.source_sha256 != expected_hash {
+        return Err(StorageError::Context(format!(
+            "embedding source hash does not match canonical source for {}",
+            memory.id()
+        )));
+    }
+    if record.embedding.is_empty() || record.embedding.iter().any(|value| !value.is_finite()) {
+        return Err(StorageError::Context(format!(
+            "embedding for {} must contain finite components",
+            memory.id()
+        )));
+    }
+    Ok(())
+}
 
 /// Rejection returned by `save_edge` when the supplied edge id already exists
 /// in a different namespace.
@@ -127,6 +177,32 @@ pub trait StorageTrait: Send + Sync {
     /// with.
     fn db_path(&self) -> Option<&std::path::Path> {
         None
+    }
+
+    /// Atomically persist one source memory and, when supplied, its immutable
+    /// embedding-generation record. Built-in backends also reconcile stale
+    /// generations whose source hash no longer matches this source.
+    ///
+    /// The default preserves source-only compatibility for external backends.
+    /// It rejects an embedding before writing anything because a backend that
+    /// cannot provide one transaction must fail closed rather than expose a
+    /// partially persisted logical mutation.
+    fn save_memory_with_embedding(
+        &self,
+        memory: &Memory,
+        embedding: Option<&bounded::EmbeddingRecord>,
+    ) -> StorageResult<()> {
+        if embedding.is_some() {
+            return Err(StorageError::Unsupported(
+                "transactional source and embedding save".into(),
+            ));
+        }
+        match memory {
+            Memory::Episodic(memory) => self.save_episodic(memory),
+            Memory::Semantic(memory) => self.save_semantic(memory),
+            Memory::Procedural(memory) => self.save_procedural(memory),
+            Memory::Observation(memory) => self.save_observation(memory),
+        }
     }
 
     // Namespaces

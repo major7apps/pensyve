@@ -13,9 +13,11 @@ use crate::types::{
 
 use super::{
     ActivityAggregate, ActivityEvent, ErasedRows, StorageError, StorageResult, StorageTrait,
-    cross_namespace_edge_id,
+    canonical_embedding_source_sha256, cross_namespace_edge_id, memory_namespace_id,
+    validate_record_matches_memory,
 };
 use crate::graph::EdgeType;
+use crate::storage::bounded::{EmbeddingRecord, MemoryType};
 
 // ---------------------------------------------------------------------------
 // Safe lock acquisition
@@ -755,6 +757,283 @@ fn blob_to_embedding(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+fn memory_type_str(memory_type: MemoryType) -> &'static str {
+    match memory_type {
+        MemoryType::Episodic => "episodic",
+        MemoryType::Semantic => "semantic",
+        MemoryType::Procedural => "procedural",
+        MemoryType::Observation => "observation",
+    }
+}
+
+fn source_table(memory_type: MemoryType) -> &'static str {
+    match memory_type {
+        MemoryType::Episodic => "episodic_memories",
+        MemoryType::Semantic => "semantic_memories",
+        MemoryType::Procedural => "procedural_memories",
+        MemoryType::Observation => "observation_memories",
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive source write keeps all four Memory variants inside the caller's transaction"
+)]
+fn save_memory_in_conn(conn: &Connection, memory: &Memory) -> StorageResult<()> {
+    let namespace_id = memory_namespace_id(memory);
+    let namespace = namespace_id.to_string();
+    let namespace_exists = conn
+        .query_row(
+            "SELECT 1 FROM namespaces WHERE id = ?1",
+            [&namespace],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !namespace_exists {
+        return Err(StorageError::Context(format!(
+            "source namespace {namespace_id} is not registered"
+        )));
+    }
+
+    let memory_type = MemoryType::of(memory);
+    let id = memory.id().to_string();
+    let owner: Option<String> = conn
+        .query_row(
+            &format!(
+                "SELECT namespace_id FROM {} WHERE id = ?1",
+                source_table(memory_type)
+            ),
+            [&id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if owner.as_deref().is_some_and(|owner| owner != namespace) {
+        return Err(StorageError::Context(format!(
+            "memory {} already exists outside source namespace {namespace_id}",
+            memory.id()
+        )));
+    }
+
+    let fts_content = match memory {
+        Memory::Episodic(memory) => {
+            let embedding =
+                (!memory.embedding.is_empty()).then(|| embedding_to_blob(&memory.embedding));
+            conn.execute(
+                r"INSERT OR REPLACE INTO episodic_memories
+                   (id, namespace_id, episode_id, source_entity, about_entity, content,
+                    content_type, summary, embedding, context_intent, timestamp, stability,
+                    retrievability, access_count, last_accessed, event_time, agent_id, user_id,
+                    superseded_by, invalid_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                           ?15, ?16, ?17, ?18, ?19, ?20)",
+                params![
+                    &id,
+                    &namespace,
+                    memory.episode_id.to_string(),
+                    memory.source_entity.to_string(),
+                    memory.about_entity.to_string(),
+                    &memory.content,
+                    memory.content_type.as_str(),
+                    &memory.summary,
+                    embedding,
+                    &memory.context_intent,
+                    memory.timestamp.to_rfc3339(),
+                    f64::from(memory.stability),
+                    f64::from(memory.retrievability),
+                    memory.access_count,
+                    opt_dt_to_str(memory.last_accessed),
+                    opt_dt_to_str(memory.event_time),
+                    memory.agent_id.map(|value| value.to_string()),
+                    memory.user_id.map(|value| value.to_string()),
+                    memory.superseded_by.map(|value| value.to_string()),
+                    opt_dt_to_str(memory.invalid_at),
+                ],
+            )?;
+            memory.content.clone()
+        }
+        Memory::Semantic(memory) => {
+            let embedding =
+                (!memory.embedding.is_empty()).then(|| embedding_to_blob(&memory.embedding));
+            conn.execute(
+                r"INSERT OR REPLACE INTO semantic_memories
+                   (id, namespace_id, subject, predicate, object, content_type, object_entity,
+                    confidence, valid_at, invalid_at, source_episodes, embedding, stability,
+                    retrievability, agent_id, user_id, superseded_by)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                           ?15, ?16, ?17)",
+                params![
+                    &id,
+                    &namespace,
+                    memory.subject.to_string(),
+                    &memory.predicate,
+                    &memory.object,
+                    memory.content_type.as_str(),
+                    memory.object_entity.map(|value| value.to_string()),
+                    f64::from(memory.confidence),
+                    memory.valid_at.to_rfc3339(),
+                    opt_dt_to_str(memory.invalid_at),
+                    uuids_to_json(&memory.source_episodes),
+                    embedding,
+                    f64::from(memory.stability),
+                    f64::from(memory.retrievability),
+                    memory.agent_id.map(|value| value.to_string()),
+                    memory.user_id.map(|value| value.to_string()),
+                    memory.superseded_by.map(|value| value.to_string()),
+                ],
+            )?;
+            format!("{} {}", memory.predicate, memory.object)
+        }
+        Memory::Procedural(memory) => {
+            let embedding =
+                (!memory.embedding.is_empty()).then(|| embedding_to_blob(&memory.embedding));
+            conn.execute(
+                r"INSERT OR REPLACE INTO procedural_memories
+                   (id, namespace_id, trigger_text, action, outcome, context, reliability,
+                    trial_count, success_count, source_episodes, embedding, created_at, last_used,
+                    agent_id, user_id, superseded_by, invalid_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                           ?15, ?16, ?17)",
+                params![
+                    &id,
+                    &namespace,
+                    &memory.trigger,
+                    &memory.action,
+                    outcome_to_str(&memory.outcome),
+                    serde_json::to_string(&memory.context)?,
+                    f64::from(memory.reliability),
+                    memory.trial_count,
+                    memory.success_count,
+                    uuids_to_json(&memory.source_episodes),
+                    embedding,
+                    memory.created_at.to_rfc3339(),
+                    opt_dt_to_str(memory.last_used),
+                    memory.agent_id.map(|value| value.to_string()),
+                    memory.user_id.map(|value| value.to_string()),
+                    memory.superseded_by.map(|value| value.to_string()),
+                    opt_dt_to_str(memory.invalid_at),
+                ],
+            )?;
+            format!("{} {}", memory.trigger, memory.action)
+        }
+        Memory::Observation(memory) => {
+            let embedding =
+                (!memory.embedding.is_empty()).then(|| embedding_to_blob(&memory.embedding));
+            conn.execute(
+                r"INSERT OR REPLACE INTO observation_memories
+                   (id, namespace_id, episode_id, entity_type, instance, action, quantity, unit,
+                    content, embedding, confidence, event_time, created_at, stability,
+                    retrievability, agent_id, user_id, superseded_by, invalid_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                           ?15, ?16, ?17, ?18, ?19)",
+                params![
+                    &id,
+                    &namespace,
+                    memory.episode_id.to_string(),
+                    &memory.entity_type,
+                    &memory.instance,
+                    &memory.action,
+                    memory.quantity,
+                    &memory.unit,
+                    &memory.content,
+                    embedding,
+                    f64::from(memory.confidence),
+                    opt_dt_to_str(memory.event_time),
+                    memory.created_at.to_rfc3339(),
+                    f64::from(memory.stability),
+                    f64::from(memory.retrievability),
+                    memory.agent_id.map(|value| value.to_string()),
+                    memory.user_id.map(|value| value.to_string()),
+                    memory.superseded_by.map(|value| value.to_string()),
+                    opt_dt_to_str(memory.invalid_at),
+                ],
+            )?;
+            memory.content.clone()
+        }
+    };
+
+    conn.execute(
+        "INSERT OR REPLACE INTO memory_fts (memory_id, memory_type, namespace_id, content)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![&id, memory_type_str(memory_type), &namespace, fts_content],
+    )?;
+    Ok(())
+}
+
+fn reconcile_embedding_source_in_conn(conn: &Connection, memory: &Memory) -> StorageResult<()> {
+    conn.execute(
+        "DELETE FROM memory_embeddings
+         WHERE namespace_id = ?1 AND memory_type = ?2 AND memory_id = ?3
+           AND source_sha256 <> ?4",
+        params![
+            memory_namespace_id(memory).to_string(),
+            memory_type_str(MemoryType::of(memory)),
+            memory.id().to_string(),
+            canonical_embedding_source_sha256(memory),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_embedding_in_conn(conn: &Connection, record: &EmbeddingRecord) -> StorageResult<()> {
+    let dimension: Option<i64> = conn
+        .query_row(
+            "SELECT dimension FROM embedding_spaces WHERE id = ?1",
+            [&record.embedding_space_id.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let dimension = dimension.ok_or_else(|| {
+        StorageError::Context(format!(
+            "embedding space {} is not registered",
+            record.embedding_space_id.0
+        ))
+    })?;
+    if usize::try_from(dimension).ok() != Some(record.embedding.len()) {
+        return Err(StorageError::Context(format!(
+            "embedding dimension {} does not match registered space dimension {dimension}",
+            record.embedding.len()
+        )));
+    }
+
+    let memory_type = memory_type_str(record.memory_ref.memory_type);
+    let memory_id = record.memory_ref.id.to_string();
+    let existing_namespace: Option<String> = conn
+        .query_row(
+            "SELECT namespace_id FROM memory_embeddings
+             WHERE memory_type = ?1 AND memory_id = ?2 AND embedding_space_id = ?3",
+            params![memory_type, &memory_id, &record.embedding_space_id.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if existing_namespace
+        .as_deref()
+        .is_some_and(|owner| owner != record.namespace_id.to_string())
+    {
+        return Err(StorageError::Context(format!(
+            "embedding key for {} already exists outside namespace {}",
+            record.memory_ref.id, record.namespace_id
+        )));
+    }
+
+    conn.execute(
+        "INSERT OR REPLACE INTO memory_embeddings
+         (namespace_id, memory_type, memory_id, embedding_space_id, source_sha256,
+          embedding, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            record.namespace_id.to_string(),
+            memory_type,
+            memory_id,
+            &record.embedding_space_id.0,
+            &record.source_sha256,
+            embedding_to_blob(&record.embedding),
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Serialization helpers
 // ---------------------------------------------------------------------------
@@ -880,6 +1159,10 @@ fn delete_memory_by_id_with_namespace(
             params![&id_str, &namespace_id],
         )?;
     }
+    transaction.execute(
+        "DELETE FROM memory_embeddings WHERE memory_id = ?1 AND namespace_id = ?2",
+        params![&id_str, &namespace_id],
+    )?;
 
     transaction.commit()?;
     Ok(deleted)
@@ -896,6 +1179,25 @@ impl StorageTrait for SqliteBackend {
 
     fn db_path(&self) -> Option<&Path> {
         Some(&self.db_path)
+    }
+
+    fn save_memory_with_embedding(
+        &self,
+        memory: &Memory,
+        embedding: Option<&EmbeddingRecord>,
+    ) -> StorageResult<()> {
+        if let Some(record) = embedding {
+            validate_record_matches_memory(record, memory)?;
+        }
+        let conn = lock_conn!(self);
+        let transaction = conn.unchecked_transaction()?;
+        save_memory_in_conn(&transaction, memory)?;
+        reconcile_embedding_source_in_conn(&transaction, memory)?;
+        if let Some(record) = embedding {
+            insert_embedding_in_conn(&transaction, record)?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1170,56 +1472,7 @@ impl StorageTrait for SqliteBackend {
     // -----------------------------------------------------------------------
 
     fn save_episodic(&self, mem: &EpisodicMemory) -> StorageResult<()> {
-        let conn = lock_conn!(self);
-        let embedding_blob = if mem.embedding.is_empty() {
-            None
-        } else {
-            Some(embedding_to_blob(&mem.embedding))
-        };
-        let last_accessed = opt_dt_to_str(mem.last_accessed);
-        conn.execute(
-            r"INSERT OR REPLACE INTO episodic_memories
-               (id, namespace_id, episode_id, source_entity, about_entity, content, content_type,
-                summary, embedding, context_intent, timestamp, stability, retrievability,
-                access_count, last_accessed, event_time, agent_id, user_id, superseded_by,
-                invalid_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
-            params![
-                mem.id.to_string(),
-                mem.namespace_id.to_string(),
-                mem.episode_id.to_string(),
-                mem.source_entity.to_string(),
-                mem.about_entity.to_string(),
-                mem.content,
-                mem.content_type.as_str(),
-                mem.summary,
-                embedding_blob,
-                mem.context_intent,
-                mem.timestamp.to_rfc3339(),
-                f64::from(mem.stability),
-                f64::from(mem.retrievability),
-                mem.access_count,
-                last_accessed,
-                opt_dt_to_str(mem.event_time),
-                mem.agent_id.map(|u| u.to_string()),
-                mem.user_id.map(|u| u.to_string()),
-                mem.superseded_by.map(|u| u.to_string()),
-                opt_dt_to_str(mem.invalid_at),
-            ],
-        )?;
-
-        // Insert into FTS.
-        conn.execute(
-            "INSERT OR REPLACE INTO memory_fts (memory_id, memory_type, namespace_id, content) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                mem.id.to_string(),
-                "episodic",
-                mem.namespace_id.to_string(),
-                mem.content,
-            ],
-        )?;
-
-        Ok(())
+        self.save_memory_with_embedding(&Memory::Episodic(mem.clone()), None)
     }
 
     fn get_episodic_in_namespace(
@@ -1303,71 +1556,7 @@ impl StorageTrait for SqliteBackend {
     // -----------------------------------------------------------------------
 
     fn save_semantic(&self, mem: &SemanticMemory) -> StorageResult<()> {
-        let conn = lock_conn!(self);
-        let embedding_blob = if mem.embedding.is_empty() {
-            None
-        } else {
-            Some(embedding_to_blob(&mem.embedding))
-        };
-        let invalid_at = opt_dt_to_str(mem.invalid_at);
-        let object_entity = mem.object_entity.map(|u| u.to_string());
-        let source_episodes = uuids_to_json(&mem.source_episodes);
-
-        // Single transaction for the memory row + FTS entry.
-        conn.execute_batch("BEGIN")?;
-
-        let result = (|| -> StorageResult<()> {
-            conn.execute(
-                r"INSERT OR REPLACE INTO semantic_memories
-                   (id, namespace_id, subject, predicate, object, content_type, object_entity,
-                    confidence, valid_at, invalid_at, source_episodes, embedding, stability,
-                    retrievability, agent_id, user_id, superseded_by)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-                params![
-                    mem.id.to_string(),
-                    mem.namespace_id.to_string(),
-                    mem.subject.to_string(),
-                    mem.predicate,
-                    mem.object,
-                    mem.content_type.as_str(),
-                    object_entity,
-                    f64::from(mem.confidence),
-                    mem.valid_at.to_rfc3339(),
-                    invalid_at,
-                    source_episodes,
-                    embedding_blob,
-                    f64::from(mem.stability),
-                    f64::from(mem.retrievability),
-                    mem.agent_id.map(|u| u.to_string()),
-                    mem.user_id.map(|u| u.to_string()),
-                    mem.superseded_by.map(|u| u.to_string()),
-                ],
-            )?;
-
-            let fts_content = format!("{} {}", mem.predicate, mem.object);
-            conn.execute(
-                "INSERT OR REPLACE INTO memory_fts (memory_id, memory_type, namespace_id, content) VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    mem.id.to_string(),
-                    "semantic",
-                    mem.namespace_id.to_string(),
-                    fts_content,
-                ],
-            )?;
-
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+        self.save_memory_with_embedding(&Memory::Semantic(mem.clone()), None)
     }
 
     fn get_semantic_in_namespace(
@@ -1452,57 +1641,7 @@ impl StorageTrait for SqliteBackend {
     // -----------------------------------------------------------------------
 
     fn save_procedural(&self, mem: &ProceduralMemory) -> StorageResult<()> {
-        let conn = lock_conn!(self);
-        let embedding_blob = if mem.embedding.is_empty() {
-            None
-        } else {
-            Some(embedding_to_blob(&mem.embedding))
-        };
-        let last_used = opt_dt_to_str(mem.last_used);
-        let outcome = outcome_to_str(&mem.outcome);
-        let context = serde_json::to_string(&mem.context)?;
-        let source_episodes = uuids_to_json(&mem.source_episodes);
-
-        conn.execute(
-            r"INSERT OR REPLACE INTO procedural_memories
-               (id, namespace_id, trigger_text, action, outcome, context, reliability,
-                trial_count, success_count, source_episodes, embedding, created_at, last_used,
-                agent_id, user_id, superseded_by, invalid_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-            params![
-                mem.id.to_string(),
-                mem.namespace_id.to_string(),
-                mem.trigger,
-                mem.action,
-                outcome,
-                context,
-                f64::from(mem.reliability),
-                mem.trial_count,
-                mem.success_count,
-                source_episodes,
-                embedding_blob,
-                mem.created_at.to_rfc3339(),
-                last_used,
-                mem.agent_id.map(|u| u.to_string()),
-                mem.user_id.map(|u| u.to_string()),
-                mem.superseded_by.map(|u| u.to_string()),
-                opt_dt_to_str(mem.invalid_at),
-            ],
-        )?;
-
-        // FTS content: "trigger action"
-        let fts_content = format!("{} {}", mem.trigger, mem.action);
-        conn.execute(
-            "INSERT OR REPLACE INTO memory_fts (memory_id, memory_type, namespace_id, content) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                mem.id.to_string(),
-                "procedural",
-                mem.namespace_id.to_string(),
-                fts_content,
-            ],
-        )?;
-
-        Ok(())
+        self.save_memory_with_embedding(&Memory::Procedural(mem.clone()), None)
     }
 
     fn get_procedural_in_namespace(
@@ -1557,67 +1696,7 @@ impl StorageTrait for SqliteBackend {
     // -----------------------------------------------------------------------
 
     fn save_observation(&self, mem: &ObservationMemory) -> StorageResult<()> {
-        let conn = lock_conn!(self);
-        let embedding_blob = if mem.embedding.is_empty() {
-            None
-        } else {
-            Some(embedding_to_blob(&mem.embedding))
-        };
-        let event_time = opt_dt_to_str(mem.event_time);
-
-        // One fsync for row + FTS rather than two.
-        conn.execute_batch("BEGIN")?;
-        let result = (|| -> StorageResult<()> {
-            conn.execute(
-                r"INSERT OR REPLACE INTO observation_memories
-                   (id, namespace_id, episode_id, entity_type, instance, action, quantity, unit,
-                    content, embedding, confidence, event_time, created_at, stability, retrievability,
-                    agent_id, user_id, superseded_by, invalid_at)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
-                params![
-                    mem.id.to_string(),
-                    mem.namespace_id.to_string(),
-                    mem.episode_id.to_string(),
-                    mem.entity_type,
-                    mem.instance,
-                    mem.action,
-                    mem.quantity,
-                    mem.unit,
-                    mem.content,
-                    embedding_blob,
-                    f64::from(mem.confidence),
-                    event_time,
-                    mem.created_at.to_rfc3339(),
-                    f64::from(mem.stability),
-                    f64::from(mem.retrievability),
-                    mem.agent_id.map(|u| u.to_string()),
-                    mem.user_id.map(|u| u.to_string()),
-                    mem.superseded_by.map(|u| u.to_string()),
-                    opt_dt_to_str(mem.invalid_at),
-                ],
-            )?;
-            conn.execute(
-                "INSERT OR REPLACE INTO memory_fts (memory_id, memory_type, namespace_id, content) VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    mem.id.to_string(),
-                    "observation",
-                    mem.namespace_id.to_string(),
-                    mem.content,
-                ],
-            )?;
-            Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+        self.save_memory_with_embedding(&Memory::Observation(mem.clone()), None)
     }
 
     fn get_observation_in_namespace(
@@ -1743,6 +1822,13 @@ impl StorageTrait for SqliteBackend {
                 "DELETE FROM memory_fts \
                  WHERE memory_type = 'observation' \
                    AND memory_id IN (SELECT id FROM observation_memories \
+                                      WHERE episode_id = ?1 AND namespace_id = ?2)",
+                params![&ep_str, &ns_str],
+            )?;
+            conn.execute(
+                "DELETE FROM memory_embeddings
+                 WHERE namespace_id = ?2 AND memory_type = 'observation'
+                   AND memory_id IN (SELECT id FROM observation_memories
                                       WHERE episode_id = ?1 AND namespace_id = ?2)",
                 params![&ep_str, &ns_str],
             )?;
@@ -2085,18 +2171,19 @@ impl StorageTrait for SqliteBackend {
         invalid_at: DateTime<Utc>,
     ) -> StorageResult<bool> {
         let conn = lock_conn!(self);
+        let transaction = conn.unchecked_transaction()?;
         let id = id.to_string();
         let namespace_id = namespace_id.to_string();
         let superseded_by = superseded_by.to_string();
         let invalid_at = invalid_at.to_rfc3339();
 
-        for table in [
-            "episodic_memories",
-            "semantic_memories",
-            "procedural_memories",
-            "observation_memories",
+        for (table, memory_type) in [
+            ("episodic_memories", "episodic"),
+            ("semantic_memories", "semantic"),
+            ("procedural_memories", "procedural"),
+            ("observation_memories", "observation"),
         ] {
-            let updated = conn.execute(
+            let updated = transaction.execute(
                 &format!(
                     "UPDATE {table} SET superseded_by = ?1, invalid_at = ?2 \
                      WHERE id = ?3 AND namespace_id = ?4 AND superseded_by IS NULL"
@@ -2104,10 +2191,17 @@ impl StorageTrait for SqliteBackend {
                 params![&superseded_by, &invalid_at, &id, &namespace_id],
             )?;
             if updated > 0 {
+                transaction.execute(
+                    "DELETE FROM memory_embeddings
+                     WHERE namespace_id = ?1 AND memory_type = ?2 AND memory_id = ?3",
+                    params![&namespace_id, memory_type, &id],
+                )?;
+                transaction.commit()?;
                 return Ok(true);
             }
         }
 
+        transaction.commit()?;
         Ok(false)
     }
 
@@ -2389,6 +2483,15 @@ impl StorageTrait for SqliteBackend {
                         memory.type_name()
                     ],
                 )?;
+                conn.execute(
+                    "DELETE FROM memory_embeddings
+                      WHERE namespace_id = ?1 AND memory_type = ?2 AND memory_id = ?3",
+                    params![
+                        row_namespace.to_string(),
+                        memory.type_name(),
+                        memory.id().to_string()
+                    ],
+                )?;
             }
 
             // Persist inside the transaction: if this fails we roll back and
@@ -2539,6 +2642,11 @@ impl StorageTrait for SqliteBackend {
                       WHERE memory_id = ?1 AND namespace_id = ?2 AND memory_type = ?3",
                     params![fts_id, &ns_str, memory_type],
                 )?;
+                conn.execute(
+                    "DELETE FROM memory_embeddings
+                      WHERE memory_id = ?1 AND namespace_id = ?2 AND memory_type = ?3",
+                    params![fts_id, &ns_str, memory_type],
+                )?;
             }
 
             Ok(total)
@@ -2620,6 +2728,10 @@ impl StorageTrait for SqliteBackend {
             // Purge FTS entries for this namespace.
             conn.execute(
                 "DELETE FROM memory_fts WHERE namespace_id = ?1",
+                params![&ns_str],
+            )?;
+            conn.execute(
+                "DELETE FROM memory_embeddings WHERE namespace_id = ?1",
                 params![&ns_str],
             )?;
 
@@ -3036,6 +3148,11 @@ fn erase_observations_for_entity(
               WHERE memory_id = ?1 AND namespace_id = ?2 AND memory_type = 'observation'",
             params![&passage, ns_str],
         )?;
+        conn.execute(
+            "DELETE FROM memory_embeddings
+              WHERE memory_id = ?1 AND namespace_id = ?2 AND memory_type = 'observation'",
+            params![&passage, ns_str],
+        )?;
     }
 
     Ok(observations)
@@ -3090,6 +3207,11 @@ fn erase_memories_for_entity(
     for memory in &memories {
         conn.execute(
             "DELETE FROM memory_fts
+              WHERE memory_id = ?1 AND namespace_id = ?2 AND memory_type = ?3",
+            params![memory.id().to_string(), ns_str, memory.type_name()],
+        )?;
+        conn.execute(
+            "DELETE FROM memory_embeddings
               WHERE memory_id = ?1 AND namespace_id = ?2 AND memory_type = ?3",
             params![memory.id().to_string(), ns_str, memory.type_name()],
         )?;
@@ -3515,7 +3637,10 @@ fn row_to_observation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding_space::EmbeddingSpaceId;
+    use crate::storage::bounded::{EmbeddingRecord, MemoryRef, embedding_source_text};
     use crate::types::*;
+    use sha2::{Digest, Sha256};
     use tempfile::TempDir;
 
     fn setup() -> (TempDir, SqliteBackend) {
@@ -3528,6 +3653,361 @@ mod tests {
         let ns = Namespace::new("test");
         db.save_namespace(&ns).unwrap();
         ns
+    }
+
+    fn fixture_memory() -> (SqliteBackend, Namespace, Memory) {
+        let path = tempfile::tempdir().unwrap().keep();
+        let db = SqliteBackend::open(&path).unwrap();
+        let ns = make_namespace(&db);
+        let memory = Memory::Episodic(EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "canonical source",
+        ));
+        (db, ns, memory)
+    }
+
+    fn register_embedding_space(db: &SqliteBackend, id: &str, dimension: usize) {
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO embedding_spaces
+             (id, canonical_identity_json, class, dimension, created_at)
+             VALUES (?1, '{}', 'mock', ?2, ?3)",
+            params![
+                id,
+                i64::try_from(dimension).unwrap(),
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .unwrap();
+    }
+
+    fn canonical_source_sha256(memory: &Memory) -> String {
+        hex::encode(Sha256::digest(embedding_source_text(memory).as_bytes()))
+    }
+
+    fn embedding_record(memory: &Memory, space: &str, embedding: Vec<f32>) -> EmbeddingRecord {
+        EmbeddingRecord {
+            namespace_id: match memory {
+                Memory::Episodic(memory) => memory.namespace_id,
+                Memory::Semantic(memory) => memory.namespace_id,
+                Memory::Procedural(memory) => memory.namespace_id,
+                Memory::Observation(memory) => memory.namespace_id,
+            },
+            memory_ref: MemoryRef::from_memory(memory),
+            embedding_space_id: EmbeddingSpaceId(space.to_string()),
+            source_sha256: canonical_source_sha256(memory),
+            embedding,
+        }
+    }
+
+    fn embedding_record_with_source_hash(
+        memory: &Memory,
+        source_sha256: String,
+    ) -> EmbeddingRecord {
+        let mut record = embedding_record(memory, "test-space", vec![1.0; 4]);
+        record.source_sha256 = source_sha256;
+        record
+    }
+
+    fn embedding_count(db: &SqliteBackend, namespace_id: Uuid) -> i64 {
+        db.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM memory_embeddings WHERE namespace_id = ?1",
+                [namespace_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn atomic_save_rolls_back_source_when_embedding_is_invalid() {
+        let (db, ns, memory) = fixture_memory();
+        let invalid = embedding_record(&memory, "missing-space", vec![1.0; 4]);
+        assert!(
+            db.save_memory_with_embedding(&memory, Some(&invalid))
+                .is_err()
+        );
+        assert!(
+            db.get_episodic_in_namespace(memory.id(), ns.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn source_hash_change_rejects_stale_embedding_commit() {
+        let (db, _, memory) = fixture_memory();
+        register_embedding_space(&db, "test-space", 4);
+        let stale = embedding_record_with_source_hash(&memory, "00".repeat(32));
+        assert!(matches!(
+            db.save_memory_with_embedding(&memory, Some(&stale)),
+            Err(StorageError::Context(_))
+        ));
+    }
+
+    #[test]
+    fn atomic_save_validates_namespace_ref_dimension_and_finite_components() {
+        let (db, ns, memory) = fixture_memory();
+        register_embedding_space(&db, "test-space", 4);
+
+        let mut wrong_namespace = embedding_record(&memory, "test-space", vec![1.0; 4]);
+        wrong_namespace.namespace_id = Uuid::new_v4();
+        assert!(
+            db.save_memory_with_embedding(&memory, Some(&wrong_namespace))
+                .is_err()
+        );
+
+        let mut wrong_ref = embedding_record(&memory, "test-space", vec![1.0; 4]);
+        wrong_ref.memory_ref.id = Uuid::new_v4();
+        assert!(
+            db.save_memory_with_embedding(&memory, Some(&wrong_ref))
+                .is_err()
+        );
+
+        let wrong_dimension = embedding_record(&memory, "test-space", vec![1.0; 3]);
+        assert!(
+            db.save_memory_with_embedding(&memory, Some(&wrong_dimension))
+                .is_err()
+        );
+
+        let non_finite = embedding_record(&memory, "test-space", vec![f32::NAN; 4]);
+        assert!(
+            db.save_memory_with_embedding(&memory, Some(&non_finite))
+                .is_err()
+        );
+
+        assert!(
+            db.get_episodic_in_namespace(memory.id(), ns.id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(embedding_count(&db, ns.id), 0);
+    }
+
+    #[test]
+    fn atomic_save_preserves_same_source_generations_and_replaces_stale_ones() {
+        let (db, ns, mut memory) = fixture_memory();
+        for space in ["space-a", "space-b", "space-c"] {
+            register_embedding_space(&db, space, 4);
+        }
+
+        let first = embedding_record(&memory, "space-a", vec![1.0; 4]);
+        db.save_memory_with_embedding(&memory, Some(&first))
+            .unwrap();
+        let second = embedding_record(&memory, "space-b", vec![2.0; 4]);
+        db.save_memory_with_embedding(&memory, Some(&second))
+            .unwrap();
+        assert_eq!(embedding_count(&db, ns.id), 2);
+
+        let Memory::Episodic(episodic) = &mut memory else {
+            unreachable!()
+        };
+        episodic.content = "replacement source".to_string();
+        let replacement = embedding_record(&memory, "space-c", vec![3.0; 4]);
+        db.save_memory_with_embedding(&memory, Some(&replacement))
+            .unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let rows: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT embedding_space_id, source_sha256 FROM memory_embeddings
+                 WHERE namespace_id = ?1 ORDER BY embedding_space_id",
+            )
+            .unwrap()
+            .query_map([ns.id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![("space-c".to_string(), canonical_source_sha256(&memory))]
+        );
+    }
+
+    #[test]
+    fn atomic_save_rejects_cross_namespace_replacement() {
+        let (db, owner, memory) = fixture_memory();
+        register_embedding_space(&db, "test-space", 4);
+        let owner_record = embedding_record(&memory, "test-space", vec![1.0; 4]);
+        db.save_memory_with_embedding(&memory, Some(&owner_record))
+            .unwrap();
+
+        let foreign = Namespace::new("foreign");
+        db.save_namespace(&foreign).unwrap();
+        let mut replacement = memory.clone();
+        let Memory::Episodic(episodic) = &mut replacement else {
+            unreachable!()
+        };
+        episodic.namespace_id = foreign.id;
+        episodic.content = "foreign replacement".to_string();
+        let foreign_record = embedding_record(&replacement, "test-space", vec![2.0; 4]);
+
+        assert!(
+            db.save_memory_with_embedding(&replacement, Some(&foreign_record))
+                .is_err()
+        );
+        assert!(
+            db.get_episodic_in_namespace(memory.id(), owner.id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.get_episodic_in_namespace(memory.id(), foreign.id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(embedding_count(&db, owner.id), 1);
+        assert_eq!(embedding_count(&db, foreign.id), 0);
+    }
+
+    #[test]
+    fn atomic_save_persists_every_memory_variant_with_its_generation() {
+        let (db, ns, episodic) = fixture_memory();
+        register_embedding_space(&db, "test-space", 4);
+        let episode_id = match &episodic {
+            Memory::Episodic(memory) => memory.episode_id,
+            _ => unreachable!(),
+        };
+        let memories = vec![
+            episodic,
+            Memory::Semantic(SemanticMemory::new(
+                ns.id,
+                Uuid::new_v4(),
+                "knows",
+                "transaction boundaries",
+                0.9,
+            )),
+            Memory::Procedural(ProceduralMemory::new(
+                ns.id,
+                "when saving",
+                "commit atomically",
+                Outcome::Success,
+                HashMap::new(),
+            )),
+            Memory::Observation(ObservationMemory::new(
+                ns.id,
+                episode_id,
+                "write",
+                "embedding",
+                "committed",
+                "embedding committed with source",
+            )),
+        ];
+
+        for memory in &memories {
+            let record = embedding_record(memory, "test-space", vec![1.0; 4]);
+            db.save_memory_with_embedding(memory, Some(&record))
+                .unwrap();
+        }
+
+        assert_eq!(embedding_count(&db, ns.id), 4);
+        assert!(
+            db.get_episodic_in_namespace(memories[0].id(), ns.id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.get_semantic_in_namespace(memories[1].id(), ns.id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.get_procedural_in_namespace(memories[2].id(), ns.id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.get_observation_in_namespace(memories[3].id(), ns.id)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn embedding_rows_follow_supersede_single_entity_and_namespace_deletes() {
+        let (db, ns, first) = fixture_memory();
+        register_embedding_space(&db, "test-space", 4);
+        let entity_id = match &first {
+            Memory::Episodic(memory) => memory.about_entity,
+            _ => unreachable!(),
+        };
+        let single = Memory::Procedural(ProceduralMemory::new(
+            ns.id,
+            "single",
+            "delete",
+            Outcome::Success,
+            HashMap::new(),
+        ));
+        let entity_scoped = Memory::Semantic(SemanticMemory::new(
+            ns.id, entity_id, "subject", "delete", 0.9,
+        ));
+        let purge = Memory::Procedural(ProceduralMemory::new(
+            ns.id,
+            "namespace",
+            "purge",
+            Outcome::Success,
+            HashMap::new(),
+        ));
+        for memory in [&first, &single, &entity_scoped, &purge] {
+            let record = embedding_record(memory, "test-space", vec![1.0; 4]);
+            db.save_memory_with_embedding(memory, Some(&record))
+                .unwrap();
+        }
+        assert_eq!(embedding_count(&db, ns.id), 4);
+
+        assert!(
+            db.supersede_memory_in_namespace(first.id(), ns.id, Uuid::new_v4(), Utc::now())
+                .unwrap()
+        );
+        assert_eq!(embedding_count(&db, ns.id), 3);
+
+        assert!(
+            db.delete_memory_by_id_in_namespace(single.id(), ns.id)
+                .unwrap()
+        );
+        assert_eq!(embedding_count(&db, ns.id), 2);
+
+        assert_eq!(db.delete_memories_by_entity(entity_id, ns.id).unwrap(), 2);
+        assert_eq!(embedding_count(&db, ns.id), 1);
+
+        assert_eq!(db.purge_namespace(ns.id).unwrap(), 1);
+        assert_eq!(embedding_count(&db, ns.id), 0);
+    }
+
+    #[test]
+    fn erase_entity_removes_observation_and_source_generations_atomically() {
+        let (db, ns, episodic) = fixture_memory();
+        register_embedding_space(&db, "test-space", 4);
+        let Memory::Episodic(source) = &episodic else {
+            unreachable!()
+        };
+        let mut entity = Entity::new("erase target", EntityKind::User);
+        entity.id = source.about_entity;
+        entity.namespace_id = ns.id;
+        db.save_entity(&entity).unwrap();
+        let observation = Memory::Observation(ObservationMemory::new(
+            ns.id,
+            source.episode_id,
+            "erase",
+            "observation",
+            "removed",
+            "erase observation",
+        ));
+        for memory in [&episodic, &observation] {
+            let record = embedding_record(memory, "test-space", vec![1.0; 4]);
+            db.save_memory_with_embedding(memory, Some(&record))
+                .unwrap();
+        }
+
+        let erased = db.erase_entity_capturing(entity.id, ns.id).unwrap();
+        assert_eq!(erased.memories.len(), 1);
+        assert_eq!(erased.observations.len(), 1);
+        assert_eq!(embedding_count(&db, ns.id), 0);
     }
 
     // -----------------------------------------------------------------------

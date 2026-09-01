@@ -11,6 +11,7 @@ use sqlx_core::query_as::query_as;
 use sqlx_core::raw_sql::raw_sql;
 use sqlx_core::row::Row;
 use sqlx_core::sql_str::AssertSqlSafe;
+use sqlx_core::transaction::Transaction;
 use sqlx_postgres::{PgPool, PgPoolOptions, PgRow, Postgres};
 use tokio::runtime::{Handle, Runtime};
 use uuid::Uuid;
@@ -22,9 +23,11 @@ use crate::types::{
 
 use super::{
     ActivityAggregate, ActivityEvent, ErasedRows, StorageError, StorageResult, StorageTrait,
-    cross_namespace_edge_id,
+    canonical_embedding_source_sha256, cross_namespace_edge_id, memory_namespace_id,
+    validate_record_matches_memory,
 };
 use crate::graph::EdgeType;
+use crate::storage::bounded::{EmbeddingRecord, MemoryType};
 
 // ---------------------------------------------------------------------------
 // Row type aliases (for complex tuple types used with query_as)
@@ -886,11 +889,344 @@ fn pgtext_to_embedding(s: Option<&str>) -> Vec<f32> {
     }
 }
 
+fn memory_type_str(memory_type: MemoryType) -> &'static str {
+    match memory_type {
+        MemoryType::Episodic => "episodic",
+        MemoryType::Semantic => "semantic",
+        MemoryType::Procedural => "procedural",
+        MemoryType::Observation => "observation",
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive source write keeps all four Memory variants on the same scoped SQL transaction"
+)]
+async fn save_memory_in_pg_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    memory: &Memory,
+) -> StorageResult<()> {
+    let namespace_id = memory_namespace_id(memory);
+    let namespace_exists: Option<(Uuid,)> =
+        query_as::<Postgres, _>("SELECT id FROM namespaces WHERE id = $1")
+            .bind(namespace_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+    if namespace_exists.is_none() {
+        return Err(StorageError::Context(format!(
+            "source namespace {namespace_id} is not registered"
+        )));
+    }
+
+    let existing_owner: Option<(Uuid,)> = match memory {
+        Memory::Episodic(memory) => {
+            query_as::<Postgres, _>("SELECT namespace_id FROM episodic_memories WHERE id = $1")
+                .bind(memory.id)
+                .fetch_optional(&mut **transaction)
+                .await
+        }
+        Memory::Semantic(memory) => {
+            query_as::<Postgres, _>("SELECT namespace_id FROM semantic_memories WHERE id = $1")
+                .bind(memory.id)
+                .fetch_optional(&mut **transaction)
+                .await
+        }
+        Memory::Procedural(memory) => {
+            query_as::<Postgres, _>("SELECT namespace_id FROM procedural_memories WHERE id = $1")
+                .bind(memory.id)
+                .fetch_optional(&mut **transaction)
+                .await
+        }
+        Memory::Observation(memory) => {
+            query_as::<Postgres, _>("SELECT namespace_id FROM observation_memories WHERE id = $1")
+                .bind(memory.id)
+                .fetch_optional(&mut **transaction)
+                .await
+        }
+    }
+    .map_err(sqlx_to_io)?;
+    if existing_owner.is_some_and(|(owner,)| owner != namespace_id) {
+        return Err(StorageError::Context(format!(
+            "memory {} already exists outside source namespace {namespace_id}",
+            memory.id()
+        )));
+    }
+
+    let result = match memory {
+        Memory::Episodic(memory) => {
+            query::<Postgres>(
+                r"INSERT INTO episodic_memories
+               (id, namespace_id, episode_id, source_entity, about_entity, content, summary,
+                embedding, context_intent, timestamp, stability, retrievability,
+                access_count, last_accessed, event_time, superseded_by, invalid_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13,
+                       $14, $15, $16, $17)
+               ON CONFLICT (id) DO UPDATE SET
+                   content = $6, summary = $7, embedding = $8::vector, context_intent = $9,
+                   stability = $11, retrievability = $12, access_count = $13,
+                   last_accessed = $14, event_time = $15, superseded_by = $16,
+                   invalid_at = $17
+               WHERE episodic_memories.namespace_id = EXCLUDED.namespace_id",
+            )
+            .bind(memory.id)
+            .bind(memory.namespace_id)
+            .bind(memory.episode_id)
+            .bind(memory.source_entity)
+            .bind(memory.about_entity)
+            .bind(&memory.content)
+            .bind(&memory.summary)
+            .bind(embedding_to_pgtext(&memory.embedding))
+            .bind(&memory.context_intent)
+            .bind(memory.timestamp)
+            .bind(memory.stability)
+            .bind(memory.retrievability)
+            .bind(i32::try_from(memory.access_count).unwrap_or(i32::MAX))
+            .bind(memory.last_accessed)
+            .bind(memory.event_time)
+            .bind(memory.superseded_by)
+            .bind(memory.invalid_at)
+            .execute(&mut **transaction)
+            .await
+        }
+        Memory::Semantic(memory) => {
+            let source_episodes = serde_json::to_value(&memory.source_episodes)?;
+            query::<Postgres>(
+                r"INSERT INTO semantic_memories
+                   (id, namespace_id, subject, predicate, object, object_entity, confidence,
+                    valid_at, invalid_at, source_episodes, embedding, stability, retrievability,
+                    superseded_by)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::vector, $12, $13,
+                           $14)
+                   ON CONFLICT (id) DO UPDATE SET
+                       predicate = $4, object = $5, object_entity = $6, confidence = $7,
+                       invalid_at = $9, source_episodes = $10, embedding = $11::vector,
+                       stability = $12, retrievability = $13, superseded_by = $14
+                   WHERE semantic_memories.namespace_id = EXCLUDED.namespace_id",
+            )
+            .bind(memory.id)
+            .bind(memory.namespace_id)
+            .bind(memory.subject)
+            .bind(&memory.predicate)
+            .bind(&memory.object)
+            .bind(memory.object_entity)
+            .bind(memory.confidence)
+            .bind(memory.valid_at)
+            .bind(memory.invalid_at)
+            .bind(&source_episodes)
+            .bind(embedding_to_pgtext(&memory.embedding))
+            .bind(memory.stability)
+            .bind(memory.retrievability)
+            .bind(memory.superseded_by)
+            .execute(&mut **transaction)
+            .await
+        }
+        Memory::Procedural(memory) => {
+            let context = serde_json::to_value(&memory.context)?;
+            let source_episodes = serde_json::to_value(&memory.source_episodes)?;
+            query::<Postgres>(
+                r"INSERT INTO procedural_memories
+                   (id, namespace_id, trigger_text, action, outcome, context, reliability,
+                    trial_count, success_count, source_episodes, embedding, created_at, last_used,
+                    superseded_by, invalid_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::vector, $12, $13,
+                           $14, $15)
+                   ON CONFLICT (id) DO UPDATE SET
+                       trigger_text = $3, action = $4, outcome = $5, context = $6,
+                       reliability = $7, trial_count = $8, success_count = $9,
+                       source_episodes = $10, embedding = $11::vector, last_used = $13,
+                       superseded_by = $14, invalid_at = $15
+                   WHERE procedural_memories.namespace_id = EXCLUDED.namespace_id",
+            )
+            .bind(memory.id)
+            .bind(memory.namespace_id)
+            .bind(&memory.trigger)
+            .bind(&memory.action)
+            .bind(outcome_to_str(&memory.outcome))
+            .bind(&context)
+            .bind(memory.reliability)
+            .bind(i32::try_from(memory.trial_count).unwrap_or(i32::MAX))
+            .bind(i32::try_from(memory.success_count).unwrap_or(i32::MAX))
+            .bind(&source_episodes)
+            .bind(embedding_to_pgtext(&memory.embedding))
+            .bind(memory.created_at)
+            .bind(memory.last_used)
+            .bind(memory.superseded_by)
+            .bind(memory.invalid_at)
+            .execute(&mut **transaction)
+            .await
+        }
+        Memory::Observation(memory) => {
+            query::<Postgres>(
+                r"INSERT INTO observation_memories
+               (id, namespace_id, episode_id, entity_type, instance, action, quantity, unit,
+                content, embedding, confidence, event_time, created_at, stability, retrievability,
+                superseded_by, invalid_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::vector, $11, $12, $13, $14,
+                       $15, $16, $17)
+               ON CONFLICT (id) DO UPDATE SET
+                   entity_type = $4, instance = $5, action = $6, quantity = $7, unit = $8,
+                   content = $9, embedding = $10::vector, confidence = $11,
+                   event_time = $12, stability = $14, retrievability = $15,
+                   superseded_by = $16, invalid_at = $17
+               WHERE observation_memories.namespace_id = EXCLUDED.namespace_id",
+            )
+            .bind(memory.id)
+            .bind(memory.namespace_id)
+            .bind(memory.episode_id)
+            .bind(&memory.entity_type)
+            .bind(&memory.instance)
+            .bind(&memory.action)
+            .bind(memory.quantity)
+            .bind(&memory.unit)
+            .bind(&memory.content)
+            .bind(embedding_to_pgtext(&memory.embedding))
+            .bind(memory.confidence)
+            .bind(memory.event_time)
+            .bind(memory.created_at)
+            .bind(memory.stability)
+            .bind(memory.retrievability)
+            .bind(memory.superseded_by)
+            .bind(memory.invalid_at)
+            .execute(&mut **transaction)
+            .await
+        }
+    }
+    .map_err(sqlx_to_io)?;
+
+    if result.rows_affected() != 1 {
+        return Err(StorageError::Context(format!(
+            "source write for {} was rejected by its namespace predicate",
+            memory.id()
+        )));
+    }
+    Ok(())
+}
+
+async fn reconcile_embedding_source_in_pg_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    memory: &Memory,
+) -> StorageResult<()> {
+    query::<Postgres>(
+        "DELETE FROM memory_embeddings
+         WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3
+           AND source_sha256 <> $4",
+    )
+    .bind(memory_namespace_id(memory))
+    .bind(memory_type_str(MemoryType::of(memory)))
+    .bind(memory.id())
+    .bind(canonical_embedding_source_sha256(memory))
+    .execute(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?;
+    Ok(())
+}
+
+async fn insert_embedding_in_pg_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    record: &EmbeddingRecord,
+) -> StorageResult<()> {
+    let dimension: Option<(i32,)> =
+        query_as::<Postgres, _>("SELECT dimension FROM embedding_spaces WHERE id = $1")
+            .bind(&record.embedding_space_id.0)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+    let dimension = dimension
+        .ok_or_else(|| {
+            StorageError::Context(format!(
+                "embedding space {} is not registered",
+                record.embedding_space_id.0
+            ))
+        })?
+        .0;
+    if usize::try_from(dimension).ok() != Some(record.embedding.len()) {
+        return Err(StorageError::Context(format!(
+            "embedding dimension {} does not match registered space dimension {dimension}",
+            record.embedding.len()
+        )));
+    }
+
+    let existing_owner: Option<(Uuid,)> = query_as::<Postgres, _>(
+        "SELECT namespace_id FROM memory_embeddings
+         WHERE memory_type = $1 AND memory_id = $2 AND embedding_space_id = $3",
+    )
+    .bind(memory_type_str(record.memory_ref.memory_type))
+    .bind(record.memory_ref.id)
+    .bind(&record.embedding_space_id.0)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?;
+    if existing_owner.is_some_and(|(owner,)| owner != record.namespace_id) {
+        return Err(StorageError::Context(format!(
+            "embedding key for {} already exists outside namespace {}",
+            record.memory_ref.id, record.namespace_id
+        )));
+    }
+
+    let embedding =
+        embedding_to_pgtext(&record.embedding).expect("validated embeddings are non-empty");
+    let result = query::<Postgres>(
+        "INSERT INTO memory_embeddings
+         (namespace_id, memory_type, memory_id, embedding_space_id, source_sha256,
+          embedding, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6::vector, NOW())
+         ON CONFLICT (memory_type, memory_id, embedding_space_id) DO UPDATE SET
+             source_sha256 = EXCLUDED.source_sha256,
+             embedding = EXCLUDED.embedding,
+             created_at = EXCLUDED.created_at
+         WHERE memory_embeddings.namespace_id = EXCLUDED.namespace_id",
+    )
+    .bind(record.namespace_id)
+    .bind(memory_type_str(record.memory_ref.memory_type))
+    .bind(record.memory_ref.id)
+    .bind(&record.embedding_space_id.0)
+    .bind(&record.source_sha256)
+    .bind(embedding)
+    .execute(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?;
+    if result.rows_affected() != 1 {
+        return Err(StorageError::Context(format!(
+            "embedding write for {} was rejected by its namespace predicate",
+            record.memory_ref.id
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // StorageTrait implementation
 // ---------------------------------------------------------------------------
 
 impl StorageTrait for PostgresBackend {
+    fn save_memory_with_embedding(
+        &self,
+        memory: &Memory,
+        embedding: Option<&EmbeddingRecord>,
+    ) -> StorageResult<()> {
+        if let Some(record) = embedding {
+            validate_record_matches_memory(record, memory)?;
+        }
+        let namespace_id = memory_namespace_id(memory);
+        self.block_on(async {
+            let mut conn = self.conn_with_namespace(UNSCOPED_NAMESPACE).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            query::<Postgres>("SELECT set_config('pensyve.namespace_id', $1, true)")
+                .bind(namespace_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
+            save_memory_in_pg_tx(&mut transaction, memory).await?;
+            reconcile_embedding_source_in_pg_tx(&mut transaction, memory).await?;
+            if let Some(record) = embedding {
+                insert_embedding_in_pg_tx(&mut transaction, record).await?;
+            }
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            Ok(())
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Namespaces
     // -----------------------------------------------------------------------
@@ -1147,47 +1483,7 @@ impl StorageTrait for PostgresBackend {
     // -----------------------------------------------------------------------
 
     fn save_episodic(&self, mem: &EpisodicMemory) -> StorageResult<()> {
-        let embedding_text = embedding_to_pgtext(&mem.embedding);
-        self.block_on(async {
-            let mut conn = self.scoped_conn(mem.namespace_id).await?;
-            // Note: the `episodic_memories` table was provisioned without an
-            // `event_time` column in the original schema. Runs `ALTER TABLE
-            // … ADD COLUMN IF NOT EXISTS` inside `run_schema` to keep this
-            // INSERT compatible with both fresh and upgraded databases.
-            query::<Postgres>(
-                r"INSERT INTO episodic_memories
-                   (id, namespace_id, episode_id, source_entity, about_entity, content, summary,
-                    embedding, context_intent, timestamp, stability, retrievability,
-                    access_count, last_accessed, event_time, superseded_by, invalid_at)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-                   ON CONFLICT (id) DO UPDATE SET
-                       content = $6, summary = $7, embedding = $8::vector, context_intent = $9,
-                       stability = $11, retrievability = $12, access_count = $13,
-                       last_accessed = $14, event_time = $15, superseded_by = $16,
-                       invalid_at = $17",
-            )
-            .bind(mem.id)
-            .bind(mem.namespace_id)
-            .bind(mem.episode_id)
-            .bind(mem.source_entity)
-            .bind(mem.about_entity)
-            .bind(&mem.content)
-            .bind(&mem.summary)
-            .bind(&embedding_text)
-            .bind(&mem.context_intent)
-            .bind(mem.timestamp)
-            .bind(mem.stability)
-            .bind(mem.retrievability)
-            .bind(i32::try_from(mem.access_count).unwrap_or(i32::MAX))
-            .bind(mem.last_accessed)
-            .bind(mem.event_time)
-            .bind(mem.superseded_by)
-            .bind(mem.invalid_at)
-            .execute(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
-            Ok(())
-        })
+        self.save_memory_with_embedding(&Memory::Episodic(mem.clone()), None)
     }
 
     fn get_episodic_in_namespace(
@@ -1302,40 +1598,7 @@ impl StorageTrait for PostgresBackend {
     // -----------------------------------------------------------------------
 
     fn save_semantic(&self, mem: &SemanticMemory) -> StorageResult<()> {
-        let embedding_text = embedding_to_pgtext(&mem.embedding);
-        let source_episodes = serde_json::to_value(&mem.source_episodes)?;
-        self.block_on(async {
-            let mut conn = self.scoped_conn(mem.namespace_id).await?;
-            query::<Postgres>(
-                r"INSERT INTO semantic_memories
-                   (id, namespace_id, subject, predicate, object, object_entity, confidence,
-                    valid_at, invalid_at, source_episodes, embedding, stability, retrievability,
-                    superseded_by)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::vector, $12, $13, $14)
-                   ON CONFLICT (id) DO UPDATE SET
-                       predicate = $4, object = $5, object_entity = $6, confidence = $7,
-                       invalid_at = $9, source_episodes = $10, embedding = $11::vector,
-                       stability = $12, retrievability = $13, superseded_by = $14",
-            )
-            .bind(mem.id)
-            .bind(mem.namespace_id)
-            .bind(mem.subject)
-            .bind(&mem.predicate)
-            .bind(&mem.object)
-            .bind(mem.object_entity)
-            .bind(mem.confidence)
-            .bind(mem.valid_at)
-            .bind(mem.invalid_at)
-            .bind(&source_episodes)
-            .bind(&embedding_text)
-            .bind(mem.stability)
-            .bind(mem.retrievability)
-            .bind(mem.superseded_by)
-            .execute(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
-            Ok(())
-        })
+        self.save_memory_with_embedding(&Memory::Semantic(mem.clone()), None)
     }
 
     fn get_semantic_in_namespace(
@@ -1394,44 +1657,7 @@ impl StorageTrait for PostgresBackend {
     // -----------------------------------------------------------------------
 
     fn save_procedural(&self, mem: &ProceduralMemory) -> StorageResult<()> {
-        let embedding_text = embedding_to_pgtext(&mem.embedding);
-        let outcome = outcome_to_str(&mem.outcome);
-        let context = serde_json::to_value(&mem.context)?;
-        let source_episodes = serde_json::to_value(&mem.source_episodes)?;
-        self.block_on(async {
-            let mut conn = self.scoped_conn(mem.namespace_id).await?;
-            query::<Postgres>(
-                r"INSERT INTO procedural_memories
-                   (id, namespace_id, trigger_text, action, outcome, context, reliability,
-                    trial_count, success_count, source_episodes, embedding, created_at, last_used,
-                    superseded_by, invalid_at)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::vector, $12, $13, $14, $15)
-                   ON CONFLICT (id) DO UPDATE SET
-                       trigger_text = $3, action = $4, outcome = $5, context = $6,
-                       reliability = $7, trial_count = $8, success_count = $9,
-                       source_episodes = $10, embedding = $11::vector, last_used = $13,
-                       superseded_by = $14, invalid_at = $15",
-            )
-            .bind(mem.id)
-            .bind(mem.namespace_id)
-            .bind(&mem.trigger)
-            .bind(&mem.action)
-            .bind(outcome)
-            .bind(&context)
-            .bind(mem.reliability)
-            .bind(i32::try_from(mem.trial_count).unwrap_or(i32::MAX))
-            .bind(i32::try_from(mem.success_count).unwrap_or(i32::MAX))
-            .bind(&source_episodes)
-            .bind(&embedding_text)
-            .bind(mem.created_at)
-            .bind(mem.last_used)
-            .bind(mem.superseded_by)
-            .bind(mem.invalid_at)
-            .execute(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
-            Ok(())
-        })
+        self.save_memory_with_embedding(&Memory::Procedural(mem.clone()), None)
     }
 
     fn get_procedural_in_namespace(
@@ -1491,43 +1717,7 @@ impl StorageTrait for PostgresBackend {
     // -----------------------------------------------------------------------
 
     fn save_observation(&self, mem: &ObservationMemory) -> StorageResult<()> {
-        let embedding_text = embedding_to_pgtext(&mem.embedding);
-        self.block_on(async {
-            let mut conn = self.scoped_conn(mem.namespace_id).await?;
-            query::<Postgres>(
-                r"INSERT INTO observation_memories
-                   (id, namespace_id, episode_id, entity_type, instance, action, quantity, unit,
-                    content, embedding, confidence, event_time, created_at, stability, retrievability,
-                    superseded_by, invalid_at)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::vector, $11, $12, $13, $14, $15, $16, $17)
-                   ON CONFLICT (id) DO UPDATE SET
-                       entity_type = $4, instance = $5, action = $6, quantity = $7, unit = $8,
-                       content = $9, embedding = $10::vector, confidence = $11,
-                       event_time = $12, stability = $14, retrievability = $15,
-                       superseded_by = $16, invalid_at = $17",
-            )
-            .bind(mem.id)
-            .bind(mem.namespace_id)
-            .bind(mem.episode_id)
-            .bind(&mem.entity_type)
-            .bind(&mem.instance)
-            .bind(&mem.action)
-            .bind(mem.quantity)
-            .bind(&mem.unit)
-            .bind(&mem.content)
-            .bind(&embedding_text)
-            .bind(mem.confidence)
-            .bind(mem.event_time)
-            .bind(mem.created_at)
-            .bind(mem.stability)
-            .bind(mem.retrievability)
-            .bind(mem.superseded_by)
-            .bind(mem.invalid_at)
-            .execute(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
-            Ok(())
-        })
+        self.save_memory_with_embedding(&Memory::Observation(mem.clone()), None)
     }
 
     fn get_observation_in_namespace(
@@ -1616,15 +1806,31 @@ impl StorageTrait for PostgresBackend {
     ) -> StorageResult<usize> {
         self.block_on(async move {
             let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            query::<Postgres>(
+                "DELETE FROM memory_embeddings
+                 WHERE namespace_id = $1 AND memory_type = 'observation'
+                   AND memory_id IN (
+                       SELECT id FROM observation_memories
+                       WHERE episode_id = $2 AND namespace_id = $1
+                   )",
+            )
+            .bind(namespace_id)
+            .bind(episode_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
             let result = query::<Postgres>(
                 "DELETE FROM observation_memories WHERE episode_id = $1 AND namespace_id = $2",
             )
             .bind(episode_id)
             .bind(namespace_id)
-            .execute(&mut *conn)
+            .execute(&mut *transaction)
             .await
             .map_err(sqlx_to_io)?;
-            Ok(usize::try_from(result.rows_affected()).unwrap_or(0))
+            let deleted = usize::try_from(result.rows_affected()).unwrap_or(0);
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            Ok(deleted)
         })
     }
 
@@ -1891,28 +2097,53 @@ impl StorageTrait for PostgresBackend {
     ) -> StorageResult<bool> {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
-            for sql in [
-                "UPDATE episodic_memories SET superseded_by = $1, invalid_at = $2 \
-                 WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
-                "UPDATE semantic_memories SET superseded_by = $1, invalid_at = $2 \
-                 WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
-                "UPDATE procedural_memories SET superseded_by = $1, invalid_at = $2 \
-                 WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
-                "UPDATE observation_memories SET superseded_by = $1, invalid_at = $2 \
-                 WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            for (sql, memory_type) in [
+                (
+                    "UPDATE episodic_memories SET superseded_by = $1, invalid_at = $2 \
+                     WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
+                    "episodic",
+                ),
+                (
+                    "UPDATE semantic_memories SET superseded_by = $1, invalid_at = $2 \
+                     WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
+                    "semantic",
+                ),
+                (
+                    "UPDATE procedural_memories SET superseded_by = $1, invalid_at = $2 \
+                     WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
+                    "procedural",
+                ),
+                (
+                    "UPDATE observation_memories SET superseded_by = $1, invalid_at = $2 \
+                     WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
+                    "observation",
+                ),
             ] {
                 let result = query::<Postgres>(sql)
                     .bind(superseded_by)
                     .bind(invalid_at)
                     .bind(id)
                     .bind(namespace_id)
-                    .execute(&mut *conn)
+                    .execute(&mut *transaction)
                     .await
                     .map_err(sqlx_to_io)?;
                 if result.rows_affected() > 0 {
+                    query::<Postgres>(
+                        "DELETE FROM memory_embeddings
+                         WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3",
+                    )
+                    .bind(namespace_id)
+                    .bind(memory_type)
+                    .bind(id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(sqlx_to_io)?;
+                    transaction.commit().await.map_err(sqlx_to_io)?;
                     return Ok(true);
                 }
             }
+            transaction.commit().await.map_err(sqlx_to_io)?;
             Ok(false)
         })
     }
@@ -1984,6 +2215,19 @@ impl StorageTrait for PostgresBackend {
             .map_err(sqlx_to_io)?;
             memories.extend(rows.into_iter().map(row_to_semantic).map(Memory::Semantic));
 
+            for memory in &memories {
+                query::<Postgres>(
+                    "DELETE FROM memory_embeddings
+                     WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3",
+                )
+                .bind(memory_namespace_id(memory))
+                .bind(memory_type_str(MemoryType::of(memory)))
+                .bind(memory.id())
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+            }
+
             // Persist inside the transaction. On `Err` the `?` drops `tx`,
             // which rolls back — nothing is deleted.
             persist(&memories)?;
@@ -2011,6 +2255,10 @@ impl StorageTrait for PostgresBackend {
     /// There is no full-text cleanup, unlike the `SQLite` backend: this schema
     /// indexes through a `fts_content` generated column on each table, so
     /// deleting the row deletes its index entry.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixed four-leg erase plus generation cleanup is intentionally one visible transaction"
+    )]
     fn erase_entity_capturing(
         &self,
         entity_id: Uuid,
@@ -2083,6 +2331,30 @@ impl StorageTrait for PostgresBackend {
                 .memories
                 .extend(rows.into_iter().map(row_to_semantic).map(Memory::Semantic));
 
+            for observation in &erased.observations {
+                query::<Postgres>(
+                    "DELETE FROM memory_embeddings
+                     WHERE namespace_id = $1 AND memory_type = 'observation' AND memory_id = $2",
+                )
+                .bind(observation.namespace_id)
+                .bind(observation.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+            }
+            for memory in &erased.memories {
+                query::<Postgres>(
+                    "DELETE FROM memory_embeddings
+                     WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3",
+                )
+                .bind(memory_namespace_id(memory))
+                .bind(memory_type_str(MemoryType::of(memory)))
+                .bind(memory.id())
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+            }
+
             // Leg 3 — graph edges. Same-namespace edges only, by construction:
             // an edge belongs to its source entity's namespace, so an edge from
             // another tenant pointing at this entity is not visible here and
@@ -2138,7 +2410,33 @@ impl StorageTrait for PostgresBackend {
     ) -> StorageResult<usize> {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
             let mut total = 0usize;
+
+            query::<Postgres>(
+                r"DELETE FROM memory_embeddings AS embedding
+                   WHERE embedding.namespace_id = $2
+                     AND (
+                       (embedding.memory_type = 'episodic' AND EXISTS (
+                         SELECT 1 FROM episodic_memories AS source
+                          WHERE source.id = embedding.memory_id
+                            AND (source.about_entity = $1 OR source.source_entity = $1)
+                            AND source.namespace_id = $2
+                       ))
+                       OR
+                       (embedding.memory_type = 'semantic' AND EXISTS (
+                         SELECT 1 FROM semantic_memories AS source
+                          WHERE source.id = embedding.memory_id
+                            AND (source.subject = $1 OR source.object_entity = $1)
+                            AND source.namespace_id = $2
+                       ))
+                     )",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
 
             // Delete episodic memories.
             let result = query::<Postgres>(
@@ -2147,7 +2445,7 @@ impl StorageTrait for PostgresBackend {
             )
             .bind(entity_id)
             .bind(namespace_id)
-            .execute(&mut *conn)
+            .execute(&mut *transaction)
             .await
             .map_err(sqlx_to_io)?;
             total += result.rows_affected() as usize;
@@ -2159,11 +2457,12 @@ impl StorageTrait for PostgresBackend {
             )
             .bind(entity_id)
             .bind(namespace_id)
-            .execute(&mut *conn)
+            .execute(&mut *transaction)
             .await
             .map_err(sqlx_to_io)?;
             total += result.rows_affected() as usize;
 
+            transaction.commit().await.map_err(sqlx_to_io)?;
             Ok(total)
         })
     }
@@ -2226,6 +2525,15 @@ impl StorageTrait for PostgresBackend {
                 deleted = true;
             }
 
+            query::<Postgres>(
+                "DELETE FROM memory_embeddings WHERE memory_id = $1 AND namespace_id = $2",
+            )
+            .bind(id)
+            .bind(namespace_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+
             transaction.commit().await.map_err(sqlx_to_io)?;
             Ok(deleted)
         })
@@ -2284,6 +2592,12 @@ impl StorageTrait for PostgresBackend {
                     .map_err(sqlx_to_io)?;
                 total += result.rows_affected() as usize;
             }
+
+            query::<Postgres>("DELETE FROM memory_embeddings WHERE namespace_id = $1")
+                .bind(namespace_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
 
             transaction.commit().await.map_err(sqlx_to_io)?;
             Ok(total)
