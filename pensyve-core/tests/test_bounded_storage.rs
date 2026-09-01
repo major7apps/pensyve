@@ -323,6 +323,20 @@ fn lexical_typographic_apostrophe_contraction_does_not_emit_residue() {
 }
 
 #[test]
+fn lexical_candidate_cap_ignores_meaningful_terms_after_many_stop_words() {
+    let (_dir, db, namespace) = sqlite_fixture();
+    save(&db, episodic(namespace.id, 1, "late"));
+    let scope = SearchScope::namespace(namespace.id);
+    let query = format!("{}late", "the ".repeat(256));
+
+    assert!(
+        db.search_lexical_hits(&query, &scope, 100)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn hydration_rejects_count_and_byte_overflow_before_returning_rows() {
     let (_dir, db, namespace) = sqlite_fixture();
     let memory_ref = save(&db, episodic(namespace.id, 1, &"large".repeat(64)));

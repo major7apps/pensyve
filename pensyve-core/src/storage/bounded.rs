@@ -207,25 +207,29 @@ const ENGLISH_LEXICAL_STOP_WORDS: &[&str] = &[
 /// internal punctuation. Apostrophes are retained just long enough to discard
 /// registered contractions as a unit, then separate any remaining terms.
 pub(crate) fn lexical_query_tokens(query: &str) -> Vec<String> {
-    query
+    let mut emitted = Vec::with_capacity(crate::storage::MAX_FTS_QUERY_TOKENS);
+    for token in query
         .split(|character: char| {
             !character.is_alphanumeric() && character != '\'' && character != '’'
         })
         .filter(|token| !token.is_empty())
-        .flat_map(|token| {
-            let normalized = token.replace('’', "'").to_lowercase();
-            if ENGLISH_LEXICAL_STOP_WORDS.contains(&normalized.as_str()) {
-                Vec::new()
-            } else {
-                normalized
-                    .split('\'')
-                    .filter(|term| !term.is_empty() && !ENGLISH_LEXICAL_STOP_WORDS.contains(term))
-                    .map(str::to_owned)
-                    .collect()
-            }
-        })
         .take(crate::storage::MAX_FTS_QUERY_TOKENS)
-        .collect()
+    {
+        let normalized = token.replace('’', "'").to_lowercase();
+        if ENGLISH_LEXICAL_STOP_WORDS.contains(&normalized.as_str()) {
+            continue;
+        }
+        for term in normalized
+            .split('\'')
+            .filter(|term| !term.is_empty() && !ENGLISH_LEXICAL_STOP_WORDS.contains(term))
+        {
+            emitted.push(term.to_owned());
+            if emitted.len() == crate::storage::MAX_FTS_QUERY_TOKENS {
+                return emitted;
+            }
+        }
+    }
+    emitted
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
