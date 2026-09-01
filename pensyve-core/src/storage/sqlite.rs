@@ -82,6 +82,7 @@ pub struct SqliteBackend {
 enum WorkspaceRacePoint {
     Vector,
     FinalContent,
+    Decay,
 }
 
 impl SqliteBackend {
@@ -4809,6 +4810,32 @@ impl StorageTrait for SqliteBackend {
     }
 }
 
+const SQLITE_COMPACT_DECAY_PAYLOAD_SQL: &str = r"SELECT type_order, id, reference_time, decay_value, trial_count, success_count
+      FROM (
+          SELECT 0 AS type_order, id,
+                 COALESCE(last_accessed, timestamp) AS reference_time,
+                 stability AS decay_value, NULL AS trial_count, NULL AS success_count
+          FROM episodic_memories
+          WHERE namespace_id = ?1
+            AND superseded_by IS NULL AND invalid_at IS NULL
+          UNION ALL
+          SELECT 1, id, valid_at, stability, NULL, NULL FROM semantic_memories
+          WHERE namespace_id = ?1
+            AND superseded_by IS NULL AND invalid_at IS NULL
+          UNION ALL
+          SELECT 2, id, COALESCE(last_used, created_at), reliability,
+                 trial_count, success_count
+          FROM procedural_memories
+          WHERE namespace_id = ?1
+            AND superseded_by IS NULL AND invalid_at IS NULL
+          UNION ALL
+          SELECT 3, id, NULL, NULL, NULL, NULL FROM observation_memories
+          WHERE namespace_id = ?1
+            AND superseded_by IS NULL AND invalid_at IS NULL
+      ) AS compact_decay
+      WHERE type_order > ?2 OR (type_order = ?2 AND id > ?3)
+      ORDER BY type_order, id LIMIT ?4";
+
 impl ConsolidationWorkspace for SqliteBackend {
     #[allow(
         clippy::too_many_lines,
@@ -5572,8 +5599,9 @@ impl ConsolidationWorkspace for SqliteBackend {
             .as_ref()
             .map_or_else(String::new, |cursor| cursor.id.to_string());
         let namespace = namespace_id.to_string();
-        let conn = lock_conn!(self);
-        let (row_count, timestamp_bytes): (i64, i64) = conn.query_row(
+        let mut conn = lock_conn!(self);
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+        let (row_count, timestamp_bytes): (i64, i64) = tx.query_row(
             r"SELECT COUNT(*), COALESCE(SUM(length(CAST(reference_time AS BLOB))), 0)
               FROM (
                   SELECT type_order, id, reference_time
@@ -5623,35 +5651,9 @@ impl ConsolidationWorkspace for SqliteBackend {
         #[cfg(test)]
         self.decay_payload_fetches
             .fetch_add(1, AtomicOrdering::SeqCst);
-        /* compact-decay-projection */
-        let mut stmt = conn.prepare(
-            r"SELECT type_order, id, reference_time, decay_value, trial_count, success_count
-              FROM (
-                  SELECT 0 AS type_order, id,
-                         COALESCE(last_accessed, timestamp) AS reference_time,
-                         stability AS decay_value, NULL AS trial_count, NULL AS success_count
-                  FROM episodic_memories
-                  WHERE namespace_id = ?1
-                    AND superseded_by IS NULL AND invalid_at IS NULL
-                  UNION ALL
-                  SELECT 1, id, valid_at, stability, NULL, NULL FROM semantic_memories
-                  WHERE namespace_id = ?1
-                    AND superseded_by IS NULL AND invalid_at IS NULL
-                  UNION ALL
-                  SELECT 2, id, COALESCE(last_used, created_at), reliability,
-                         trial_count, success_count
-                  FROM procedural_memories
-                  WHERE namespace_id = ?1
-                    AND superseded_by IS NULL AND invalid_at IS NULL
-                  UNION ALL
-                  SELECT 3, id, NULL, NULL, NULL, NULL FROM observation_memories
-                  WHERE namespace_id = ?1
-                    AND superseded_by IS NULL AND invalid_at IS NULL
-              ) AS compact_decay
-              WHERE type_order > ?2 OR (type_order = ?2 AND id > ?3)
-              ORDER BY type_order, id LIMIT ?4",
-        )?;
-        /* compact-decay-projection-end */
+        #[cfg(test)]
+        self.pause_workspace_race(WorkspaceRacePoint::Decay);
+        let mut stmt = tx.prepare(SQLITE_COMPACT_DECAY_PAYLOAD_SQL)?;
         let rows = stmt
             .query_map(
                 params![
@@ -5682,11 +5684,14 @@ impl ConsolidationWorkspace for SqliteBackend {
             .into_iter()
             .filter_map(sqlite_decay_record)
             .collect::<StorageResult<Vec<_>>>()?;
-        Ok(DecayPage {
+        drop(stmt);
+        let page = DecayPage {
             records,
             scanned_rows,
             next_cursor,
-        })
+        };
+        tx.commit()?;
+        Ok(page)
     }
 
     fn commit_decay(&self, namespace_id: Uuid, updates: &[DecayUpdate]) -> StorageResult<()> {
@@ -6943,30 +6948,148 @@ mod tests {
     }
 
     #[test]
-    fn compact_decay_projection_excludes_variable_payload_columns() {
-        let source = include_str!("sqlite.rs");
-        let start = source
-            .find("/* compact-decay-projection */")
-            .expect("compact decay projection marker");
-        let end = source[start..]
-            .find("/* compact-decay-projection-end */")
-            .expect("compact decay projection end");
-        let projection = &source[start..start + end];
-        for forbidden in [
-            "source.content",
-            ".summary",
-            "metadata_json",
-            "embedding.embedding",
-            "predicate AS",
-            "object AS",
-            "trigger_text AS",
-            "action AS",
-        ] {
-            assert!(
-                !projection.contains(forbidden),
-                "compact decay projection selected {forbidden}"
-            );
+    fn compact_decay_timestamp_preflight_and_fetch_share_one_sqlite_snapshot() {
+        let (dir, db) = setup();
+        let db = std::sync::Arc::new(db);
+        let namespace = make_namespace(&db);
+        let memory = EpisodicMemory::new(
+            namespace.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "compact timestamp race",
+        );
+        let expected_reference_time = memory.timestamp;
+        let memory_id = memory.id;
+        db.save_episodic(&memory).unwrap();
+        let one_row_budget = std::mem::size_of::<DecayPage>()
+            + std::mem::size_of::<DecayRecord>()
+            + std::mem::size_of::<SqliteDecayRow>()
+            + 36
+            + 64;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        db.set_workspace_race_barrier(WorkspaceRacePoint::Decay, barrier.clone());
+        let runner = db.clone();
+        let handle = std::thread::spawn(move || {
+            let workspace: &dyn ConsolidationWorkspace = runner.as_ref();
+            workspace.page_decay(namespace.id, None, MEMORY_PAGE_SIZE, one_row_budget)
+        });
+
+        barrier.wait();
+        let writer = Connection::open(dir.path().join("memories.db")).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            .unwrap();
+        writer
+            .execute(
+                "UPDATE episodic_memories SET timestamp = printf('%.*c', ?1, 'x') WHERE id = ?2",
+                params![1024 * 1024_i64, memory_id.to_string()],
+            )
+            .unwrap();
+        barrier.wait();
+
+        let page = handle
+            .join()
+            .expect("compact decay reader thread")
+            .expect("stable SQLite compact decay snapshot");
+        let [DecayRecord::Episodic { reference_time, .. }] = page.records.as_slice() else {
+            panic!("one episodic decay record expected");
+        };
+        assert_eq!(*reference_time, expected_reference_time);
+    }
+
+    #[test]
+    fn compact_decay_row_insertion_cannot_exceed_the_sqlite_preflight_budget() {
+        let (dir, db) = setup();
+        let db = std::sync::Arc::new(db);
+        let namespace = make_namespace(&db);
+        db.save_episodic(&EpisodicMemory::new(
+            namespace.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "compact insertion race",
+        ))
+        .unwrap();
+        let one_row_budget = std::mem::size_of::<DecayPage>()
+            + std::mem::size_of::<DecayRecord>()
+            + std::mem::size_of::<SqliteDecayRow>()
+            + 36
+            + 64;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        db.set_workspace_race_barrier(WorkspaceRacePoint::Decay, barrier.clone());
+        let runner = db.clone();
+        let handle = std::thread::spawn(move || {
+            let workspace: &dyn ConsolidationWorkspace = runner.as_ref();
+            workspace.page_decay(namespace.id, None, MEMORY_PAGE_SIZE, one_row_budget)
+        });
+
+        barrier.wait();
+        let writer = Connection::open(dir.path().join("memories.db")).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            .unwrap();
+        writer
+            .execute(
+                "INSERT INTO episodic_memories
+                    (id, namespace_id, episode_id, source_entity, about_entity, content, timestamp)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'racing insert', ?6)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    namespace.id.to_string(),
+                    Uuid::new_v4().to_string(),
+                    Uuid::new_v4().to_string(),
+                    Uuid::new_v4().to_string(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        barrier.wait();
+
+        let page = handle
+            .join()
+            .expect("compact decay reader thread")
+            .expect("stable SQLite compact decay snapshot");
+        assert_eq!(page.scanned_rows, 1);
+        assert_eq!(page.records.len(), 1);
+    }
+
+    #[test]
+    fn compact_decay_projection_is_the_exact_fixed_field_whitelist() {
+        fn normalized(sql: &str) -> String {
+            sql.split_whitespace().collect::<Vec<_>>().join(" ")
         }
+
+        let expected = r"SELECT type_order, id, reference_time, decay_value, trial_count, success_count
+              FROM (
+                  SELECT 0 AS type_order, id,
+                         COALESCE(last_accessed, timestamp) AS reference_time,
+                         stability AS decay_value, NULL AS trial_count, NULL AS success_count
+                  FROM episodic_memories
+                  WHERE namespace_id = ?1
+                    AND superseded_by IS NULL AND invalid_at IS NULL
+                  UNION ALL
+                  SELECT 1, id, valid_at, stability, NULL, NULL FROM semantic_memories
+                  WHERE namespace_id = ?1
+                    AND superseded_by IS NULL AND invalid_at IS NULL
+                  UNION ALL
+                  SELECT 2, id, COALESCE(last_used, created_at), reliability,
+                         trial_count, success_count
+                  FROM procedural_memories
+                  WHERE namespace_id = ?1
+                    AND superseded_by IS NULL AND invalid_at IS NULL
+                  UNION ALL
+                  SELECT 3, id, NULL, NULL, NULL, NULL FROM observation_memories
+                  WHERE namespace_id = ?1
+                    AND superseded_by IS NULL AND invalid_at IS NULL
+              ) AS compact_decay
+              WHERE type_order > ?2 OR (type_order = ?2 AND id > ?3)
+              ORDER BY type_order, id LIMIT ?4";
+        assert_eq!(
+            normalized(SQLITE_COMPACT_DECAY_PAYLOAD_SQL),
+            normalized(expected),
+            "compact decay payload query must remain the exact fixed-field whitelist"
+        );
     }
 
     fn embedding_count(db: &SqliteBackend, namespace_id: Uuid) -> i64 {

@@ -120,8 +120,8 @@ use crate::storage::bounded::{
     VectorSearchOutcome, VectorSearchRequest, embedding_source_text,
 };
 use crate::storage::consolidation_workspace::{
-    CONSOLIDATION_WORKING_STATE_BYTES, ClusterDecision, ConsolidationWorkspace, PromotionCommit,
-    RunId, WorkspaceCursor,
+    CONSOLIDATION_WORKING_STATE_BYTES, ClusterDecision, ConsolidationWorkspace, DecayPage,
+    DecayRecord, PromotionCommit, RunId, WorkspaceCursor,
 };
 use crate::storage::{StorageError, StorageTrait};
 use crate::types::{
@@ -1220,6 +1220,119 @@ fn consolidation_content_preflight_blocks_a_two_connection_postgres_race() {
 }
 
 #[test]
+fn compact_decay_timestamp_preflight_and_fetch_share_one_postgres_snapshot() {
+    let Some(admin_opts) =
+        skip_notice("compact_decay_timestamp_preflight_and_fetch_share_one_postgres_snapshot")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let writer = fixture.backend_as(&admin_opts, &fixture.role);
+    let namespace = Namespace::new("compact-decay-timestamp-race");
+    fixture.backend.save_namespace(&namespace).unwrap();
+    let memory = EpisodicMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "stable compact timestamp",
+    );
+    let expected_reference_time = memory.timestamp;
+    let memory_id = memory.id;
+    fixture.backend.save_episodic(&memory).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    fixture
+        .backend
+        .set_workspace_race_barrier(WorkspaceRacePoint::Decay, barrier.clone());
+    let workspace: &dyn ConsolidationWorkspace = &fixture.backend;
+
+    let page = std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            workspace.page_decay(namespace.id, None, 256, CONSOLIDATION_WORKING_STATE_BYTES)
+        });
+        barrier.wait();
+        writer.block_on(async {
+            let mut conn = writer.scoped_conn(namespace.id).await.unwrap();
+            query::<Postgres>(
+                "UPDATE episodic_memories SET timestamp = $1
+                 WHERE namespace_id = $2 AND id = $3",
+            )
+            .bind(expected_reference_time + chrono::Duration::days(7))
+            .bind(namespace.id)
+            .bind(memory_id)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        });
+        barrier.wait();
+        reader.join().expect("compact decay reader thread")
+    })
+    .expect("stable PostgreSQL compact decay snapshot");
+    let [DecayRecord::Episodic { reference_time, .. }] = page.records.as_slice() else {
+        panic!("one episodic compact decay record expected");
+    };
+    assert_eq!(*reference_time, expected_reference_time);
+}
+
+#[test]
+fn compact_decay_row_insertion_cannot_exceed_the_postgres_preflight_budget() {
+    let Some(admin_opts) =
+        skip_notice("compact_decay_row_insertion_cannot_exceed_the_postgres_preflight_budget")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let writer = fixture.backend_as(&admin_opts, &fixture.role);
+    let namespace = Namespace::new("compact-decay-insertion-race");
+    fixture.backend.save_namespace(&namespace).unwrap();
+    fixture
+        .backend
+        .save_episodic(&EpisodicMemory::new(
+            namespace.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "stable compact insertion",
+        ))
+        .unwrap();
+    let one_row_budget = std::mem::size_of::<DecayPage>()
+        + std::mem::size_of::<DecayRecord>()
+        + std::mem::size_of::<super::PgDecayRow>();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    fixture
+        .backend
+        .set_workspace_race_barrier(WorkspaceRacePoint::Decay, barrier.clone());
+    let workspace: &dyn ConsolidationWorkspace = &fixture.backend;
+
+    let page = std::thread::scope(|scope| {
+        let reader = scope.spawn(|| workspace.page_decay(namespace.id, None, 256, one_row_budget));
+        barrier.wait();
+        writer.block_on(async {
+            let mut conn = writer.scoped_conn(namespace.id).await.unwrap();
+            query::<Postgres>(
+                "INSERT INTO episodic_memories
+                    (id, namespace_id, episode_id, source_entity, about_entity, content, timestamp)
+                 VALUES ($1, $2, $3, $4, $5, 'racing insert', $6)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(namespace.id)
+            .bind(Uuid::new_v4())
+            .bind(Uuid::new_v4())
+            .bind(Uuid::new_v4())
+            .bind(Utc::now())
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        });
+        barrier.wait();
+        reader.join().expect("compact decay reader thread")
+    })
+    .expect("stable PostgreSQL compact decay snapshot");
+    assert_eq!(page.scanned_rows, 1);
+    assert_eq!(page.records.len(), 1);
+}
+
+#[test]
 fn consolidation_workspace_rejects_a_4097_member_promotion() {
     let Some(admin_opts) = skip_notice("consolidation_workspace_rejects_a_4097_member_promotion")
     else {
@@ -1290,19 +1403,21 @@ fn consolidation_workspace_rejects_a_4097_member_promotion() {
         .unwrap();
         anchor.0
     });
-    assert!(matches!(
-        workspace
-            .finalize_or_discard_cluster(
-                run,
-                MemoryRef {
-                    memory_type: MemoryType::Episodic,
-                    id: anchor_id,
-                },
-                CONSOLIDATION_WORKING_STATE_BYTES,
-            )
-            .unwrap(),
-        ClusterDecision::MemberBudgetExceeded { member_count: 4097 }
-    ));
+    for _ in 0..2 {
+        assert!(matches!(
+            workspace
+                .finalize_or_discard_cluster(
+                    run,
+                    MemoryRef {
+                        memory_type: MemoryType::Episodic,
+                        id: anchor_id,
+                    },
+                    CONSOLIDATION_WORKING_STATE_BYTES,
+                )
+                .unwrap(),
+            ClusterDecision::MemberBudgetExceeded { member_count: 4097 }
+        ));
+    }
     let promoted: (i64,) = fixture.rt.block_on(async {
         let mut conn = fixture.backend.scoped_conn(namespace.id).await.unwrap();
         query_as::<Postgres, _>(

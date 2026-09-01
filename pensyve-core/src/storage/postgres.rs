@@ -369,6 +369,7 @@ pub struct PostgresBackend {
 pub(super) enum WorkspaceRacePoint {
     Vector,
     FinalContent,
+    Decay,
 }
 
 impl PostgresBackend {
@@ -4556,6 +4557,36 @@ impl StorageTrait for PostgresBackend {
     }
 }
 
+const POSTGRES_COMPACT_DECAY_PAYLOAD_SQL: &str = r"SELECT type_order, id, reference_time, decay_value, trial_count, success_count
+      FROM (
+          SELECT 0 AS type_order, id,
+                 COALESCE(last_accessed, timestamp) AS reference_time,
+                 stability AS decay_value, NULL::integer AS trial_count,
+                 NULL::integer AS success_count
+          FROM episodic_memories
+          WHERE namespace_id = $1
+            AND superseded_by IS NULL AND invalid_at IS NULL
+          UNION ALL
+          SELECT 1, id, valid_at, stability, NULL::integer, NULL::integer
+          FROM semantic_memories
+          WHERE namespace_id = $1
+            AND superseded_by IS NULL AND invalid_at IS NULL
+          UNION ALL
+          SELECT 2, id, COALESCE(last_used, created_at), reliability,
+                 trial_count, success_count
+          FROM procedural_memories
+          WHERE namespace_id = $1
+            AND superseded_by IS NULL AND invalid_at IS NULL
+          UNION ALL
+          SELECT 3, id, NULL::timestamptz, NULL::real,
+                 NULL::integer, NULL::integer
+          FROM observation_memories
+          WHERE namespace_id = $1
+            AND superseded_by IS NULL AND invalid_at IS NULL
+      ) AS compact_decay
+      WHERE type_order > $2 OR (type_order = $2 AND id > $3)
+      ORDER BY type_order, id LIMIT $4";
+
 impl ConsolidationWorkspace for PostgresBackend {
     #[allow(
         clippy::too_many_lines,
@@ -4890,6 +4921,7 @@ impl ConsolidationWorkspace for PostgresBackend {
                         .saturating_mul(std::mem::size_of::<f32>()),
                 );
             }
+            drop(preflight);
             ensure_application_budget(
                 std::mem::size_of::<WorkspaceCandidatePage>()
                     .saturating_add(
@@ -5008,15 +5040,23 @@ impl ConsolidationWorkspace for PostgresBackend {
                  WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
                    AND workspace.assignment_anchor = $3
                  ORDER BY workspace.source_ordinal
+                 LIMIT $4
                  FOR SHARE OF workspace",
             )
             .bind(run.id)
             .bind(run.namespace_id)
             .bind(anchor.id)
+            .bind(
+                i64::try_from(
+                    crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS.saturating_add(1),
+                )
+                .unwrap_or(i64::MAX),
+            )
             .fetch_all(&mut *tx)
             .await
             .map_err(sqlx_to_io)?;
             let count = assigned.len();
+            drop(assigned);
             if count <= 1 {
                 query::<Postgres>(
                     "UPDATE consolidation_sources
@@ -5392,6 +5432,11 @@ impl ConsolidationWorkspace for PostgresBackend {
         let after_id = after.as_ref().map_or(Uuid::nil(), |cursor| cursor.id);
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            query::<Postgres>("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
             let row_count: (i64,) = query_as::<Postgres, _>(
                 "SELECT COUNT(*) FROM (
                      SELECT type_order, id FROM (
@@ -5419,7 +5464,7 @@ impl ConsolidationWorkspace for PostgresBackend {
             .bind(after_type)
             .bind(after_id)
             .bind(i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX))
-            .fetch_one(&mut *conn)
+            .fetch_one(&mut *tx)
             .await
             .map_err(sqlx_to_io)?;
             let row_count = usize::try_from(row_count.0)
@@ -5431,44 +5476,16 @@ impl ConsolidationWorkspace for PostgresBackend {
                 max_application_bytes,
                 "consolidation compact decay page",
             )?;
-            let rows: Vec<PgDecayRow> = query_as::<Postgres, _>(
-                "SELECT type_order, id, reference_time, decay_value, trial_count, success_count
-                 FROM (
-                     SELECT 0 AS type_order, id,
-                            COALESCE(last_accessed, timestamp) AS reference_time,
-                            stability AS decay_value, NULL::integer AS trial_count,
-                            NULL::integer AS success_count
-                     FROM episodic_memories
-                     WHERE namespace_id = $1
-                       AND superseded_by IS NULL AND invalid_at IS NULL
-                     UNION ALL
-                     SELECT 1, id, valid_at, stability, NULL::integer, NULL::integer
-                     FROM semantic_memories
-                     WHERE namespace_id = $1
-                       AND superseded_by IS NULL AND invalid_at IS NULL
-                     UNION ALL
-                     SELECT 2, id, COALESCE(last_used, created_at), reliability,
-                            trial_count, success_count
-                     FROM procedural_memories
-                     WHERE namespace_id = $1
-                       AND superseded_by IS NULL AND invalid_at IS NULL
-                     UNION ALL
-                     SELECT 3, id, NULL::timestamptz, NULL::real,
-                            NULL::integer, NULL::integer
-                     FROM observation_memories
-                     WHERE namespace_id = $1
-                       AND superseded_by IS NULL AND invalid_at IS NULL
-                 ) AS compact_decay
-                 WHERE type_order > $2 OR (type_order = $2 AND id > $3)
-                 ORDER BY type_order, id LIMIT $4",
-            )
-            .bind(namespace_id)
-            .bind(after_type)
-            .bind(after_id)
-            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
+            #[cfg(test)]
+            self.pause_workspace_race(WorkspaceRacePoint::Decay);
+            let rows: Vec<PgDecayRow> = query_as::<Postgres, _>(POSTGRES_COMPACT_DECAY_PAYLOAD_SQL)
+                .bind(namespace_id)
+                .bind(after_type)
+                .bind(after_id)
+                .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
             let has_more = row_count > limit;
             let next_cursor = has_more
                 .then(|| rows.last().map(pg_decay_cursor))
@@ -5479,11 +5496,13 @@ impl ConsolidationWorkspace for PostgresBackend {
                 .into_iter()
                 .filter_map(pg_decay_record)
                 .collect::<StorageResult<Vec<_>>>()?;
-            Ok(DecayPage {
+            let page = DecayPage {
                 records,
                 scanned_rows,
                 next_cursor,
-            })
+            };
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(page)
         })
     }
 
@@ -6320,10 +6339,12 @@ mod tests {
             },
             Contract {
                 label: "lock finalized members",
-                binds: 3,
+                binds: 4,
                 required: &[
                     "workspace.run_id = $1 AND workspace.namespace_id = $2",
                     "workspace.assignment_anchor = $3",
+                    "ORDER BY workspace.source_ordinal",
+                    "LIMIT $4",
                     "FOR SHARE OF workspace",
                     "fetch_all(&mut *tx)",
                 ],
@@ -6458,24 +6479,27 @@ mod tests {
                 required: &["run_id = $1 AND namespace_id = $2", "execute(&mut *conn)"],
             },
             Contract {
+                label: "start compact decay repeatable read",
+                binds: 0,
+                required: &[
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+                    "execute(&mut *tx)",
+                ],
+            },
+            Contract {
                 label: "preflight compact decay page",
                 binds: 4,
                 required: &[
                     "namespace_id = $1",
                     "type_order > $2 OR (type_order = $2 AND id > $3)",
                     "LIMIT $4",
-                    "fetch_one(&mut *conn)",
+                    "fetch_one(&mut *tx)",
                 ],
             },
             Contract {
                 label: "load compact decay page",
                 binds: 4,
-                required: &[
-                    "namespace_id = $1",
-                    "type_order > $2 OR (type_order = $2 AND id > $3)",
-                    "LIMIT $4",
-                    "fetch_all(&mut *conn)",
-                ],
+                required: &["POSTGRES_COMPACT_DECAY_PAYLOAD_SQL", "fetch_all(&mut *tx)"],
             },
             Contract {
                 label: "commit episodic decay",
@@ -6510,15 +6534,20 @@ mod tests {
                 "{} bind arity changed:\n{block}",
                 contract.label
             );
+            let sql = if block.contains("POSTGRES_COMPACT_DECAY_PAYLOAD_SQL") {
+                POSTGRES_COMPACT_DECAY_PAYLOAD_SQL
+            } else {
+                block
+            };
             for placeholder in 1..=contract.binds {
                 assert!(
-                    block.contains(&format!("${placeholder}")),
+                    sql.contains(&format!("${placeholder}")),
                     "{} no longer uses placeholder ${placeholder}:\n{block}",
                     contract.label
                 );
             }
             assert!(
-                !block.contains(&format!("${}", contract.binds + 1)),
+                !sql.contains(&format!("${}", contract.binds + 1)),
                 "{} uses an unbound placeholder:\n{block}",
                 contract.label
             );
@@ -6641,6 +6670,133 @@ mod tests {
         assert!(helper.contains("vector_dims(embedding.embedding)"));
         assert!(helper.contains("FOR SHARE"));
         assert!(helper.contains("&mut Transaction<'_, Postgres>"));
+    }
+
+    #[test]
+    fn consolidation_workspace_bounds_and_releases_postgres_lock_vectors() {
+        let source = include_str!("postgres.rs");
+        let workspace_start = source
+            .find("impl ConsolidationWorkspace for PostgresBackend")
+            .expect("workspace implementation");
+        let workspace_end = source[workspace_start..]
+            .find("type PgWorkspaceSourceRow")
+            .expect("workspace implementation end");
+        let workspace = &source[workspace_start..workspace_start + workspace_end];
+
+        let candidate_start = workspace
+            .find("fn page_later_unassigned")
+            .expect("candidate paging");
+        let candidate_end = workspace[candidate_start..]
+            .find("fn record_tentative_match")
+            .expect("candidate paging end");
+        let candidate = &workspace[candidate_start..candidate_start + candidate_end];
+        let drop_preflight = candidate
+            .find("drop(preflight);")
+            .expect("candidate preflight ownership must be released");
+        let payload_fetch = candidate
+            .find("let rows: Vec<PgWorkspaceEmbeddingRow>")
+            .expect("candidate payload fetch");
+        assert!(drop_preflight < payload_fetch);
+
+        let final_start = workspace
+            .find("fn finalize_or_discard_cluster")
+            .expect("finalization");
+        let final_end = workspace[final_start..]
+            .find("fn commit_promotion")
+            .expect("finalization end");
+        let finalization = &workspace[final_start..final_start + final_end];
+        for required in [
+            "ORDER BY workspace.source_ordinal\n                 LIMIT $4\n                 FOR SHARE OF workspace",
+            "MAX_PROMOTION_CLUSTER_MEMBERS.saturating_add(1)",
+            "let count = assigned.len();",
+            "drop(assigned);",
+            "if count > crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS",
+        ] {
+            assert!(
+                finalization.contains(required),
+                "bounded final lock path lost {required:?}"
+            );
+        }
+        let drop_assigned = finalization.find("drop(assigned);").unwrap();
+        let content_preflight = finalization
+            .find("let latest_content_bytes")
+            .expect("latest content preflight");
+        assert!(drop_assigned < content_preflight);
+    }
+
+    #[test]
+    fn compact_decay_postgres_projection_is_the_exact_fixed_field_whitelist() {
+        fn normalized(sql: &str) -> String {
+            sql.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+
+        let expected = r"SELECT type_order, id, reference_time, decay_value, trial_count, success_count
+                 FROM (
+                     SELECT 0 AS type_order, id,
+                            COALESCE(last_accessed, timestamp) AS reference_time,
+                            stability AS decay_value, NULL::integer AS trial_count,
+                            NULL::integer AS success_count
+                     FROM episodic_memories
+                     WHERE namespace_id = $1
+                       AND superseded_by IS NULL AND invalid_at IS NULL
+                     UNION ALL
+                     SELECT 1, id, valid_at, stability, NULL::integer, NULL::integer
+                     FROM semantic_memories
+                     WHERE namespace_id = $1
+                       AND superseded_by IS NULL AND invalid_at IS NULL
+                     UNION ALL
+                     SELECT 2, id, COALESCE(last_used, created_at), reliability,
+                            trial_count, success_count
+                     FROM procedural_memories
+                     WHERE namespace_id = $1
+                       AND superseded_by IS NULL AND invalid_at IS NULL
+                     UNION ALL
+                     SELECT 3, id, NULL::timestamptz, NULL::real,
+                            NULL::integer, NULL::integer
+                     FROM observation_memories
+                     WHERE namespace_id = $1
+                       AND superseded_by IS NULL AND invalid_at IS NULL
+                 ) AS compact_decay
+                 WHERE type_order > $2 OR (type_order = $2 AND id > $3)
+                 ORDER BY type_order, id LIMIT $4";
+        assert_eq!(
+            normalized(POSTGRES_COMPACT_DECAY_PAYLOAD_SQL),
+            normalized(expected),
+            "compact decay payload query must remain the exact fixed-field whitelist"
+        );
+    }
+
+    #[test]
+    fn compact_decay_postgres_preflight_and_payload_share_repeatable_read() {
+        let source = include_str!("postgres.rs");
+        let start = source
+            .find("fn page_decay(")
+            .expect("compact decay implementation");
+        let end = source[start..]
+            .find("fn commit_decay")
+            .expect("compact decay implementation end");
+        let decay = &source[start..start + end];
+        for required in [
+            "let mut tx = (&mut *conn).begin()",
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+            "fetch_one(&mut *tx)",
+            "query_as::<Postgres, _>(POSTGRES_COMPACT_DECAY_PAYLOAD_SQL)",
+            "fetch_all(&mut *tx)",
+            "tx.commit().await",
+        ] {
+            assert!(
+                decay.contains(required),
+                "compact decay snapshot path lost {required:?}"
+            );
+        }
+        for predicate in [
+            "namespace_id = $1",
+            "type_order > $2 OR (type_order = $2 AND id > $3)",
+            "ORDER BY type_order, id LIMIT $4",
+        ] {
+            assert!(decay.contains(predicate));
+            assert!(POSTGRES_COMPACT_DECAY_PAYLOAD_SQL.contains(predicate));
+        }
     }
 
     #[test]
