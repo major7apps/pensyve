@@ -116,8 +116,8 @@ use super::{POSTGRES_VECTOR_SEARCH_SQL, PostgresBackend, WorkspaceRacePoint};
 use crate::embedding_space::{EmbeddingSpace, EmbeddingSpaceId};
 use crate::storage::bounded::{
     EmbeddingRecord, EntityScope as BoundedEntityScope, IdentityScope, MAX_HYDRATED_BYTES,
-    MemoryPageRequest, MemoryRef, MemoryType, SearchScope, SearchUnavailable, VectorHit,
-    VectorSearchOutcome, VectorSearchRequest, embedding_source_text,
+    MAX_PROMOTION_CLUSTER_MEMBERS, MemoryPageRequest, MemoryRef, MemoryType, SearchScope,
+    SearchUnavailable, VectorHit, VectorSearchOutcome, VectorSearchRequest, embedding_source_text,
 };
 use crate::storage::consolidation_workspace::{
     CONSOLIDATION_WORKING_STATE_BYTES, ClusterDecision, ConsolidationWorkspace, DecayPage,
@@ -1330,6 +1330,215 @@ fn compact_decay_row_insertion_cannot_exceed_the_postgres_preflight_budget() {
     .expect("stable PostgreSQL compact decay snapshot");
     assert_eq!(page.scanned_rows, 1);
     assert_eq!(page.records.len(), 1);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one disposable two-connection fixture proves boundary serialization through promotion"
+)]
+fn consolidation_finalization_excludes_a_late_postgres_assignment() {
+    let Some(admin_opts) =
+        skip_notice("consolidation_finalization_excludes_a_late_postgres_assignment")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let writer = fixture.backend_as(&admin_opts, &fixture.role);
+    let namespace = Namespace::new("workspace-late-assignment-race");
+    fixture.backend.save_namespace(&namespace).unwrap();
+    register_embedding_space(&fixture, "workspace-late-assignment-space", "mock", 2);
+    let space = EmbeddingSpaceId("workspace-late-assignment-space".to_string());
+    let about = Uuid::new_v4();
+    fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace.id).await.unwrap();
+        let mut tx = (&mut *conn).begin().await.unwrap();
+        query::<Postgres>(
+            "INSERT INTO episodic_memories
+                (id, namespace_id, episode_id, source_entity, about_entity, content, timestamp)
+             SELECT md5('late-assignment-memory-' || ordinal)::uuid, $1,
+                    md5('late-assignment-episode-' || ordinal)::uuid, $2, $2,
+                    'late assignment source ' || ordinal,
+                    NOW() + ordinal * INTERVAL '1 second'
+             FROM generate_series(1, 4097) AS ordinal",
+        )
+        .bind(namespace.id)
+        .bind(about)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        query::<Postgres>(
+            "INSERT INTO memory_embeddings
+                (namespace_id, memory_type, memory_id, embedding_space_id,
+                 source_sha256, embedding, created_at)
+             SELECT $1, 'episodic', id, $2, repeat('a', 64), '[1,0]'::vector, NOW()
+             FROM episodic_memories WHERE namespace_id = $1",
+        )
+        .bind(namespace.id)
+        .bind(&space.0)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    });
+    let workspace: &dyn ConsolidationWorkspace = &fixture.backend;
+    let run = workspace.begin_or_resume(namespace.id, &space).unwrap();
+    let (anchor_id, late_id) = fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace.id).await.unwrap();
+        let rows: Vec<(Uuid, i64)> = query_as::<Postgres, _>(
+            "SELECT memory_id, source_ordinal FROM consolidation_sources
+             WHERE run_id = $1 AND namespace_id = $2
+               AND source_ordinal IN (1, 4097)
+             ORDER BY source_ordinal",
+        )
+        .bind(run.id)
+        .bind(namespace.id)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        let [(anchor_id, 1), (late_id, 4097)] = rows.as_slice() else {
+            panic!("boundary workspace rows");
+        };
+        query::<Postgres>(
+            "UPDATE consolidation_sources
+             SET assignment_anchor = $3, assignment_state = 'tentative'
+             WHERE run_id = $1 AND namespace_id = $2 AND source_ordinal <= $4",
+        )
+        .bind(run.id)
+        .bind(namespace.id)
+        .bind(*anchor_id)
+        .bind(i64::try_from(MAX_PROMOTION_CLUSTER_MEMBERS).unwrap())
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        (*anchor_id, *late_id)
+    });
+    let anchor = MemoryRef {
+        memory_type: MemoryType::Episodic,
+        id: anchor_id,
+    };
+    let late = MemoryRef {
+        memory_type: MemoryType::Episodic,
+        id: late_id,
+    };
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    fixture
+        .backend
+        .set_workspace_race_barrier(WorkspaceRacePoint::FinalMembership, barrier.clone());
+
+    let (decision, late_count) = std::thread::scope(|scope| {
+        let finalizer = scope.spawn(|| {
+            workspace.finalize_or_discard_cluster(run, anchor, CONSOLIDATION_WORKING_STATE_BYTES)
+        });
+        barrier.wait();
+        let (attempting, attempted) = std::sync::mpsc::sync_channel(0);
+        let late_assignment = scope.spawn(move || {
+            let writer_workspace: &dyn ConsolidationWorkspace = &writer;
+            attempting.send(()).unwrap();
+            writer_workspace.record_tentative_match(run, anchor, late)
+        });
+        attempted.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !late_assignment.is_finished(),
+            "late assignment must wait for the finalizer's durable lock"
+        );
+        barrier.wait();
+        let decision = finalizer
+            .join()
+            .expect("finalization thread")
+            .expect("bounded finalization");
+        let late_count = late_assignment
+            .join()
+            .expect("late assignment thread")
+            .expect("late assignment result");
+        (decision, late_count)
+    });
+    assert_eq!(late_count, 0);
+    let ClusterDecision::Finalized { promotion } = decision else {
+        panic!("the original 4,096 members must finalize");
+    };
+    assert_eq!(promotion.member_count, MAX_PROMOTION_CLUSTER_MEMBERS);
+    assert_eq!(promotion.provenance.len(), MAX_PROMOTION_CLUSTER_MEMBERS);
+
+    let durable: (i64, i64) = fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace.id).await.unwrap();
+        query_as::<Postgres, _>(
+            "SELECT
+                 COUNT(*) FILTER (
+                     WHERE assignment_anchor = $3 AND assignment_state = 'finalized'),
+                 COUNT(*) FILTER (
+                     WHERE memory_id = $4 AND assignment_anchor IS NULL
+                       AND assignment_state = 'unassigned')
+             FROM consolidation_sources WHERE run_id = $1 AND namespace_id = $2",
+        )
+        .bind(run.id)
+        .bind(namespace.id)
+        .bind(anchor.id)
+        .bind(late.id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+    });
+    assert_eq!(durable, (4096, 1));
+
+    let episodes = promotion
+        .provenance
+        .iter()
+        .map(|member| member.episode_id)
+        .collect::<Vec<_>>();
+    let (malformed, malformed_record) = semantic_promotion(
+        namespace.id,
+        about,
+        &promotion.latest.content,
+        episodes[..episodes.len() - 1].to_vec(),
+        &space.0,
+    );
+    let error = workspace
+        .commit_promotion(run, anchor, &malformed, &malformed_record)
+        .expect_err("promotion must reject a supplied member/provenance count mismatch");
+    assert!(error.to_string().contains("provenance"));
+
+    let (semantic, semantic_record) = semantic_promotion(
+        namespace.id,
+        about,
+        &promotion.latest.content,
+        episodes,
+        &space.0,
+    );
+    assert_eq!(
+        workspace
+            .commit_promotion(run, anchor, &semantic, &semantic_record)
+            .unwrap(),
+        PromotionCommit::Committed
+    );
+    let durable: (i64, i64) = fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace.id).await.unwrap();
+        query_as::<Postgres, _>(
+            "SELECT
+                 COUNT(*) FILTER (
+                     WHERE assignment_anchor = $3 AND assignment_state = 'promoted'),
+                 COUNT(*) FILTER (
+                     WHERE memory_id = $4 AND assignment_anchor IS NULL
+                       AND assignment_state = 'unassigned')
+             FROM consolidation_sources WHERE run_id = $1 AND namespace_id = $2",
+        )
+        .bind(run.id)
+        .bind(namespace.id)
+        .bind(anchor.id)
+        .bind(late.id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+    });
+    assert_eq!(durable, (4096, 1));
+    assert!(
+        fixture
+            .backend
+            .get_semantic_in_namespace(semantic.id(), namespace.id)
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]

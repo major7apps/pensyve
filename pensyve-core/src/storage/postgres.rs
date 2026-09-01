@@ -368,6 +368,7 @@ pub struct PostgresBackend {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum WorkspaceRacePoint {
     Vector,
+    FinalMembership,
     FinalContent,
     Decay,
 }
@@ -4990,21 +4991,47 @@ impl ConsolidationWorkspace for PostgresBackend {
     ) -> StorageResult<usize> {
         self.block_on(async {
             let mut conn = self.scoped_conn(run.namespace_id).await?;
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            // Durable cluster-mutation lock order: run row first, then workspace rows,
+            // then source/embedding/admission rows. Finalization and promotion use the
+            // same order, so separate processes serialize without a lock inversion.
+            let _: (Uuid,) = query_as::<Postgres, _>(
+                "SELECT run_id FROM consolidation_runs
+                 WHERE run_id = $1 AND namespace_id = $2
+                 FOR UPDATE",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
             let changed = query::<Postgres>(
-                "UPDATE consolidation_sources
+                "UPDATE consolidation_sources AS member
                  SET assignment_anchor = $3, assignment_state = 'tentative'
-                 WHERE run_id = $1 AND namespace_id = $2 AND memory_id = $4
-                   AND (assignment_state = 'unassigned' OR assignment_anchor = $3)",
+                 WHERE member.run_id = $1 AND member.namespace_id = $2
+                   AND member.memory_id = $4
+                   AND (member.assignment_state = 'unassigned'
+                        OR (member.assignment_anchor = $3
+                            AND member.assignment_state = 'tentative'))
+                   AND EXISTS (
+                       SELECT 1 FROM consolidation_sources AS anchor_row
+                       WHERE anchor_row.run_id = member.run_id
+                         AND anchor_row.namespace_id = member.namespace_id
+                         AND anchor_row.memory_id = $3
+                         AND anchor_row.assignment_state IN ('unassigned', 'tentative')
+                         AND (anchor_row.assignment_anchor IS NULL
+                              OR anchor_row.assignment_anchor = $3))",
             )
             .bind(run.id)
             .bind(run.namespace_id)
             .bind(anchor.id)
             .bind(member.id)
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await
             .map_err(sqlx_to_io)?
             .rows_affected();
             if changed == 0 {
+                tx.commit().await.map_err(sqlx_to_io)?;
                 return Ok(0);
             }
             let count: (i64,) = query_as::<Postgres, _>(
@@ -5014,11 +5041,13 @@ impl ConsolidationWorkspace for PostgresBackend {
             .bind(run.id)
             .bind(run.namespace_id)
             .bind(anchor.id)
-            .fetch_one(&mut *conn)
+            .fetch_one(&mut *tx)
             .await
             .map_err(sqlx_to_io)?;
-            usize::try_from(count.0)
-                .map_err(|_| StorageError::Context("negative workspace member count".into()))
+            let count = usize::try_from(count.0)
+                .map_err(|_| StorageError::Context("negative workspace member count".into()))?;
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(count)
         })
     }
 
@@ -5035,6 +5064,16 @@ impl ConsolidationWorkspace for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(run.namespace_id).await?;
             let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            let _: (Uuid,) = query_as::<Postgres, _>(
+                "SELECT run_id FROM consolidation_runs
+                 WHERE run_id = $1 AND namespace_id = $2
+                 FOR UPDATE",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
             let assigned: Vec<(Uuid,)> = query_as::<Postgres, _>(
                 "SELECT workspace.memory_id FROM consolidation_sources AS workspace
                  WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
@@ -5077,6 +5116,8 @@ impl ConsolidationWorkspace for PostgresBackend {
                     member_count: count,
                 });
             }
+            #[cfg(test)]
+            self.pause_workspace_race(WorkspaceRacePoint::FinalMembership);
             let latest_content_bytes: (i64,) = query_as::<Postgres, _>(
                 "SELECT octet_length(source.content)::BIGINT
                  FROM consolidation_sources AS workspace
@@ -5213,22 +5254,40 @@ impl ConsolidationWorkspace for PostgresBackend {
                     "promotion embedding does not use the workspace generation".into(),
                 ));
             }
-            let assigned: Vec<(Uuid,)> = query_as::<Postgres, _>(
-                "SELECT memory_id FROM consolidation_sources
+            let assigned: Vec<(Uuid, String)> = query_as::<Postgres, _>(
+                "SELECT memory_id, assignment_state FROM consolidation_sources
                  WHERE run_id = $1 AND namespace_id = $2
-                   AND assignment_anchor = $3 AND assignment_state = 'finalized'
+                   AND assignment_anchor = $3
                  ORDER BY source_ordinal
+                 LIMIT $4
                  FOR UPDATE",
             )
             .bind(run.id)
             .bind(run.namespace_id)
             .bind(anchor.id)
+            .bind(
+                i64::try_from(
+                    crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS.saturating_add(1),
+                )
+                .unwrap_or(i64::MAX),
+            )
             .fetch_all(&mut *tx)
             .await
             .map_err(sqlx_to_io)?;
-            if assigned.len() < 2 {
+            let assigned_count = assigned.len();
+            if !(2..=crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS)
+                .contains(&assigned_count)
+            {
                 return Err(StorageError::Context(
-                    "finalized promotion provenance does not match workspace membership".into(),
+                    "finalized promotion member count is outside the bounded workspace membership"
+                        .into(),
+                ));
+            }
+            if assigned.iter().any(|row| row.1 != "finalized")
+                || !assigned.iter().any(|row| row.0 == anchor.id)
+            {
+                return Err(StorageError::Context(
+                    "finalized promotion membership is internally inconsistent".into(),
                 ));
             }
             let valid: Vec<(Uuid, Uuid, DateTime<Utc>)> = query_as::<Postgres, _>(
@@ -5252,16 +5311,24 @@ impl ConsolidationWorkspace for PostgresBackend {
                    AND workspace.assignment_anchor = $3
                    AND workspace.assignment_state = 'finalized'
                  ORDER BY workspace.source_ordinal
+                 LIMIT $5
                  FOR SHARE OF source, source_embedding",
             )
             .bind(run.id)
             .bind(run.namespace_id)
             .bind(anchor.id)
             .bind(&space.0)
+            .bind(
+                i64::try_from(
+                    crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS.saturating_add(1),
+                )
+                .unwrap_or(i64::MAX),
+            )
             .fetch_all(&mut *tx)
             .await
             .map_err(sqlx_to_io)?;
-            if valid.iter().map(|row| row.0).collect::<Vec<_>>()
+            if valid.len() != assigned_count
+                || valid.iter().map(|row| row.0).collect::<Vec<_>>()
                 != assigned.iter().map(|row| row.0).collect::<Vec<_>>()
             {
                 query::<Postgres>(
@@ -5312,9 +5379,13 @@ impl ConsolidationWorkspace for PostgresBackend {
                 tx.commit().await.map_err(sqlx_to_io)?;
                 return Ok(PromotionCommit::Invalidated);
             }
-            if semantic.source_episodes != valid.iter().map(|row| row.1).collect::<Vec<_>>() {
+            drop(assigned);
+            if semantic.source_episodes.len() != assigned_count
+                || semantic.source_episodes
+                    != valid.iter().map(|row| row.1).collect::<Vec<_>>()
+            {
                 return Err(StorageError::Context(
-                    "semantic promotion provenance does not match locked workspace membership"
+                    "semantic promotion member count/provenance does not match locked workspace membership"
                         .into(),
                 ));
             }
@@ -6321,12 +6392,23 @@ mod tests {
                 ],
             },
             Contract {
+                label: "lock run for tentative assignment",
+                binds: 2,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2",
+                    "FOR UPDATE",
+                    "fetch_one(&mut *tx)",
+                ],
+            },
+            Contract {
                 label: "record tentative",
                 binds: 4,
                 required: &[
-                    "run_id = $1 AND namespace_id = $2 AND memory_id = $4",
-                    "assignment_anchor = $3",
-                    "execute(&mut *conn)",
+                    "member.run_id = $1 AND member.namespace_id = $2",
+                    "member.memory_id = $4",
+                    "anchor_row.assignment_state IN ('unassigned', 'tentative')",
+                    "anchor_row.assignment_anchor = $3",
+                    "execute(&mut *tx)",
                 ],
             },
             Contract {
@@ -6334,7 +6416,16 @@ mod tests {
                 binds: 3,
                 required: &[
                     "run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
-                    "fetch_one(&mut *conn)",
+                    "fetch_one(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "lock run for finalization",
+                binds: 2,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2",
+                    "FOR UPDATE",
+                    "fetch_one(&mut *tx)",
                 ],
             },
             Contract {
@@ -6407,21 +6498,26 @@ mod tests {
             },
             Contract {
                 label: "lock finalized assignments",
-                binds: 3,
+                binds: 4,
                 required: &[
+                    "SELECT memory_id, assignment_state",
                     "run_id = $1 AND namespace_id = $2",
                     "assignment_anchor = $3",
+                    "ORDER BY source_ordinal",
+                    "LIMIT $4",
                     "FOR UPDATE",
                     "fetch_all(&mut *tx)",
                 ],
             },
             Contract {
                 label: "validate active sources",
-                binds: 4,
+                binds: 5,
                 required: &[
                     "workspace.run_id = $1 AND workspace.namespace_id = $2",
                     "workspace.assignment_anchor = $3",
                     "source_embedding.embedding_space_id = $4",
+                    "ORDER BY workspace.source_ordinal",
+                    "LIMIT $5",
                     "FOR SHARE OF source, source_embedding",
                     "fetch_all(&mut *tx)",
                 ],
@@ -6572,7 +6668,7 @@ mod tests {
             "let latest: (Uuid, DateTime<Utc>, String)",
             "let rows: Vec<(Uuid, DateTime<Utc>)>",
             "let space: (String,)",
-            "let assigned: Vec<(Uuid,)>",
+            "let assigned: Vec<(Uuid, String)>",
             "let valid: Vec<(Uuid, Uuid, DateTime<Utc>)>",
             "let rows: Vec<(Option<Uuid>, Option<DateTime<Utc>>)>",
             "let rows: Vec<(Uuid, Uuid)>",
@@ -6722,6 +6818,98 @@ mod tests {
             .find("let latest_content_bytes")
             .expect("latest content preflight");
         assert!(drop_assigned < content_preflight);
+    }
+
+    #[test]
+    fn consolidation_cluster_mutations_share_a_durable_lock_and_revalidate_promotion() {
+        fn operation<'a>(workspace: &'a str, start: &str, end: &str) -> &'a str {
+            let start = workspace.find(start).expect("operation start");
+            let end = workspace[start..].find(end).expect("operation end");
+            &workspace[start..start + end]
+        }
+
+        let source = include_str!("postgres.rs");
+        let workspace_start = source
+            .find("impl ConsolidationWorkspace for PostgresBackend")
+            .expect("workspace implementation");
+        let workspace_end = source[workspace_start..]
+            .find("type PgWorkspaceSourceRow")
+            .expect("workspace implementation end");
+        let workspace = &source[workspace_start..workspace_start + workspace_end];
+
+        let tentative = operation(
+            workspace,
+            "fn record_tentative_match",
+            "fn finalize_or_discard_cluster",
+        );
+        let finalization = operation(
+            workspace,
+            "fn finalize_or_discard_cluster",
+            "fn commit_promotion",
+        );
+        let promotion = operation(workspace, "fn commit_promotion", "fn checkpoint");
+
+        for operation in [tentative, finalization, promotion] {
+            assert!(operation.contains("let mut tx = (&mut *conn).begin()"));
+            let run_lock = operation
+                .find("FROM consolidation_runs")
+                .expect("durable run lock");
+            let exclusive = operation[run_lock..]
+                .find("FOR UPDATE")
+                .map(|offset| run_lock + offset)
+                .expect("exclusive durable run lock");
+            let source_access = operation
+                .find("consolidation_sources")
+                .expect("membership access");
+            assert!(
+                exclusive < source_access,
+                "durable run lock must precede every membership row lock/mutation"
+            );
+        }
+
+        for required in [
+            "anchor_row.assignment_state IN ('unassigned', 'tentative')",
+            "anchor_row.assignment_anchor IS NULL",
+            "anchor_row.assignment_anchor = $3",
+            "execute(&mut *tx)",
+            "fetch_one(&mut *tx)",
+            "tx.commit().await",
+        ] {
+            assert!(
+                tentative.contains(required),
+                "late-assignment rejection lost {required:?}"
+            );
+        }
+
+        let final_lock = finalization.find("FROM consolidation_runs").unwrap();
+        let final_members = finalization
+            .find("let assigned: Vec<(Uuid,)>")
+            .expect("bounded final membership");
+        assert!(final_lock < final_members);
+
+        let semantic_write = promotion
+            .find("save_memory_in_pg_tx")
+            .expect("semantic promotion write");
+        for required in [
+            "LIMIT $4",
+            "LIMIT $5",
+            "MAX_PROMOTION_CLUSTER_MEMBERS.saturating_add(1)",
+            "let assigned_count = assigned.len();",
+            "!(2..=crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS)\n                .contains(&assigned_count)",
+            "assigned.iter().any(|row| row.1 != \"finalized\")",
+            "!assigned.iter().any(|row| row.0 == anchor.id)",
+            "valid.len() != assigned_count",
+            "semantic.source_episodes.len() != assigned_count",
+            "!= valid.iter().map(|row| row.1).collect::<Vec<_>>()",
+        ] {
+            let position = promotion
+                .find(required)
+                .unwrap_or_else(|| panic!("promotion revalidation lost {required:?}"));
+            assert!(
+                position < semantic_write,
+                "promotion revalidation {required:?} must precede semantic writes"
+            );
+        }
     }
 
     #[test]
