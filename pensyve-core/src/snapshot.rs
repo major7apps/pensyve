@@ -310,9 +310,7 @@ impl SnapshotArtifact {
         &self,
         visit: impl FnMut(Uuid) -> StorageResult<()>,
     ) -> StorageResult<()> {
-        let mut file = self.file.lock().map_err(|error| {
-            StorageError::LockPoisoned(format!("snapshot artifact file: {error}"))
-        })?;
+        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
         for_each_memory_id_in_opened_file_with(&mut file, visit, || {})
     }
 }
@@ -2688,6 +2686,44 @@ mod tests {
 
         assert_eq!(first_ids, second_ids);
         assert_eq!(first_ids.len(), outcome.snapshot.counts.total);
+    }
+
+    #[test]
+    fn cloned_artifact_lease_recovers_after_a_visitor_panic() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let outcome = forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            Some("subject"),
+            f.namespace.id,
+            &f.dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap();
+        let first = outcome.artifact.unwrap();
+        let second = first.clone();
+        let mut visited_before_panic = 0;
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            first
+                .for_each_memory_id(|_| {
+                    visited_before_panic += 1;
+                    panic!("visitor panic after an id");
+                })
+                .unwrap();
+        }));
+
+        assert!(panic.is_err());
+        assert_eq!(visited_before_panic, 1);
+        let mut recovered_ids = Vec::new();
+        second
+            .for_each_memory_id(|id| {
+                recovered_ids.push(id);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(recovered_ids.len(), outcome.snapshot.counts.total);
     }
 
     #[test]
