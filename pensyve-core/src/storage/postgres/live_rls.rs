@@ -140,6 +140,15 @@ const RLS_POLICIES: &[(&str, &str)] = &[
     ("procedural_memories", "namespace_isolation_procedural"),
     ("observation_memories", "namespace_isolation_observation"),
     ("edges", "namespace_isolation_edges"),
+    ("memory_embeddings", "namespace_isolation_memory_embeddings"),
+    (
+        "namespace_embedding_state",
+        "namespace_isolation_embedding_state",
+    ),
+    (
+        "embedding_backfill_queue",
+        "namespace_isolation_embedding_backfill_queue",
+    ),
 ];
 
 /// How Postgres renders the expected `USING` clause back out of `pg_policies`.
@@ -151,6 +160,21 @@ const RLS_POLICIES: &[(&str, &str)] = &[
 /// GUC, or switched to a different column.
 const EXPECTED_POLICY_QUAL: &str =
     "((namespace_id)::text = current_setting('pensyve.namespace_id'::text, true))";
+
+/// `embedding_*` tables compare native UUID values. Their policies are not
+/// interchangeable with the legacy text comparison because a migration must
+/// preserve the exact namespace type at the new storage boundary.
+const EXPECTED_EMBEDDING_POLICY_QUAL: &str =
+    "(namespace_id = (current_setting('pensyve.namespace_id'::text, true))::uuid)";
+
+fn expected_policy_qual(table: &str) -> &'static str {
+    match table {
+        "memory_embeddings" | "namespace_embedding_state" | "embedding_backfill_queue" => {
+            EXPECTED_EMBEDDING_POLICY_QUAL
+        }
+        _ => EXPECTED_POLICY_QUAL,
+    }
+}
 
 /// One `pg_policies` row: `(tablename, policyname, permissive, cmd, qual,
 /// with_check)`.
@@ -2909,13 +2933,13 @@ fn every_rls_table_has_exactly_one_namespace_policy() {
         );
         assert_eq!(
             qual.as_deref(),
-            Some(EXPECTED_POLICY_QUAL),
+            Some(expected_policy_qual(table)),
             "{policy} on {table} no longer isolates reads by namespace_id via the \
              pensyve.namespace_id GUC"
         );
         assert_eq!(
             with_check.as_deref(),
-            Some(EXPECTED_POLICY_QUAL),
+            Some(expected_policy_qual(table)),
             "{policy} on {table} no longer constrains writes: without WITH CHECK a \
              connection scoped to one namespace could INSERT or UPDATE a row into another"
         );
@@ -2960,8 +2984,8 @@ fn schema_declares_rls_for_every_expected_table() {
     // would otherwise satisfy these assertions without the schema declaring
     // anything.
     let normalized = sql_statements_only(super::SCHEMA);
-    let predicate = "namespace_id::text = current_setting('pensyve.namespace_id', true)";
     for (table, policy) in RLS_POLICIES {
+        let predicate = expected_policy_predicate(table);
         assert!(
             normalized.contains(&format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;")),
             "postgres_schema.sql no longer enables RLS on {table}"
@@ -2981,6 +3005,28 @@ fn schema_declares_rls_for_every_expected_table() {
             "postgres_schema.sql no longer declares {policy} on {table} with the expected \
              namespace_id predicate on both the read (USING) and write (WITH CHECK) halves"
         );
+    }
+}
+
+fn expected_policy_predicate(table: &str) -> &'static str {
+    match table {
+        "memory_embeddings" | "namespace_embedding_state" | "embedding_backfill_queue" => {
+            "namespace_id = current_setting('pensyve.namespace_id', true)::uuid"
+        }
+        _ => "namespace_id::text = current_setting('pensyve.namespace_id', true)",
+    }
+}
+
+#[test]
+fn schema_forces_rls_on_every_embedding_namespace_table() {
+    let sql = include_str!("../postgres_schema.sql");
+    for table in [
+        "memory_embeddings",
+        "namespace_embedding_state",
+        "embedding_backfill_queue",
+    ] {
+        assert!(sql.contains(&format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")));
+        assert!(sql.contains(&format!("ALTER TABLE {table} FORCE ROW LEVEL SECURITY")));
     }
 }
 

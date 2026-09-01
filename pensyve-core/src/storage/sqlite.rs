@@ -371,6 +371,71 @@ impl SqliteBackend {
             )?;
         }
 
+        // ----- Migration v6: versioned embedding generations. -----
+        //
+        // Inline memory-table embeddings predate provenance and are therefore
+        // legacy-unknown. New generation-specific vectors live separately so
+        // one memory can retain records for multiple immutable spaces.
+        if max_applied < 6 {
+            let transaction = conn.unchecked_transaction()?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS embedding_spaces (
+                    id TEXT PRIMARY KEY,
+                    canonical_identity_json TEXT NOT NULL,
+                    class TEXT NOT NULL CHECK (class IN ('real', 'mock', 'legacy_unknown')),
+                    dimension INTEGER NOT NULL CHECK (dimension > 0),
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS memory_embeddings (
+                    namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+                    memory_type TEXT NOT NULL CHECK (memory_type IN ('episodic', 'semantic', 'procedural', 'observation')),
+                    memory_id TEXT NOT NULL,
+                    embedding_space_id TEXT NOT NULL REFERENCES embedding_spaces(id),
+                    source_sha256 TEXT NOT NULL,
+                    embedding BLOB NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (memory_type, memory_id, embedding_space_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_embeddings_lookup
+                    ON memory_embeddings(namespace_id, embedding_space_id, memory_type, memory_id);
+
+                CREATE TABLE IF NOT EXISTS namespace_embedding_state (
+                    namespace_id TEXT PRIMARY KEY REFERENCES namespaces(id),
+                    active_read_space_id TEXT REFERENCES embedding_spaces(id),
+                    target_space_id TEXT REFERENCES embedding_spaces(id),
+                    state TEXT NOT NULL CHECK (state IN ('lexical_only', 'backfilling', 'ready', 'active')),
+                    barrier_sequence INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_namespace_embedding_state_namespace
+                    ON namespace_embedding_state(namespace_id);
+
+                CREATE TABLE IF NOT EXISTS embedding_backfill_queue (
+                    namespace_id TEXT NOT NULL REFERENCES namespaces(id),
+                    memory_type TEXT NOT NULL CHECK (memory_type IN ('episodic', 'semantic', 'procedural', 'observation')),
+                    memory_id TEXT NOT NULL,
+                    source_sha256 TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    last_error TEXT,
+                    PRIMARY KEY (namespace_id, memory_type, memory_id, sequence)
+                );
+                CREATE INDEX IF NOT EXISTS idx_embedding_backfill_queue_namespace_status_sequence
+                    ON embedding_backfill_queue(namespace_id, status, sequence);",
+            )?;
+            transaction.execute(
+                "INSERT INTO schema_versions (version, applied_at, description)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    6_i64,
+                    Utc::now().to_rfc3339(),
+                    "bounded runtime: add versioned embedding spaces, records, state, and backfill queue",
+                ],
+            )?;
+            transaction.commit()?;
+        }
+
         Ok(())
     }
 

@@ -327,6 +327,71 @@ CREATE TABLE IF NOT EXISTS activity_events (
 CREATE INDEX IF NOT EXISTS idx_activity_ns_date ON activity_events(namespace_id, created_at);
 
 -- ---------------------------------------------------------------------------
+-- Versioned Embedding Generations
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS embedding_spaces (
+    id                      TEXT PRIMARY KEY,
+    canonical_identity_json TEXT NOT NULL,
+    class                   TEXT NOT NULL CHECK (class IN ('real', 'mock', 'legacy_unknown')),
+    dimension               INTEGER NOT NULL CHECK (dimension > 0),
+    created_at              TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    namespace_id        UUID NOT NULL REFERENCES namespaces(id),
+    memory_type         TEXT NOT NULL CHECK (memory_type IN ('episodic', 'semantic', 'procedural', 'observation')),
+    memory_id           UUID NOT NULL,
+    embedding_space_id  TEXT NOT NULL REFERENCES embedding_spaces(id),
+    source_sha256       TEXT NOT NULL,
+    embedding           vector NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (memory_type, memory_id, embedding_space_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_embeddings_lookup
+    ON memory_embeddings(namespace_id, embedding_space_id, memory_type, memory_id);
+
+CREATE TABLE IF NOT EXISTS namespace_embedding_state (
+    namespace_id          UUID PRIMARY KEY REFERENCES namespaces(id),
+    active_read_space_id  TEXT REFERENCES embedding_spaces(id),
+    target_space_id       TEXT REFERENCES embedding_spaces(id),
+    state                 TEXT NOT NULL CHECK (state IN ('lexical_only', 'backfilling', 'ready', 'active')),
+    barrier_sequence      BIGINT NOT NULL,
+    updated_at            TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_namespace_embedding_state_namespace
+    ON namespace_embedding_state(namespace_id);
+
+CREATE TABLE IF NOT EXISTS embedding_backfill_queue (
+    namespace_id  UUID NOT NULL REFERENCES namespaces(id),
+    memory_type   TEXT NOT NULL CHECK (memory_type IN ('episodic', 'semantic', 'procedural', 'observation')),
+    memory_id     UUID NOT NULL,
+    source_sha256 TEXT NOT NULL,
+    sequence      BIGINT NOT NULL,
+    status        TEXT NOT NULL,
+    last_error    TEXT,
+    PRIMARY KEY (namespace_id, memory_type, memory_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_embedding_backfill_queue_namespace_status_sequence
+    ON embedding_backfill_queue(namespace_id, status, sequence);
+
+-- A production deployment may use the dedicated serving role described in
+-- docs/SECURITY.md. Development and test databases need not create it, so the
+-- per-table grants are conditional while the schema remains self-applicable.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pensyve_app') THEN
+        GRANT SELECT, INSERT, UPDATE, DELETE ON embedding_spaces TO pensyve_app;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON memory_embeddings TO pensyve_app;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON namespace_embedding_state TO pensyve_app;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON embedding_backfill_queue TO pensyve_app;
+    END IF;
+END $$;
+
+-- ---------------------------------------------------------------------------
 -- Row-Level Security (Postgres only)
 --
 -- Namespace isolation.  Each connection binds its namespace via
@@ -355,6 +420,9 @@ ALTER TABLE semantic_memories    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE procedural_memories  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE observation_memories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE edges                ENABLE ROW LEVEL SECURITY;
+ALTER TABLE memory_embeddings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE namespace_embedding_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE embedding_backfill_queue ENABLE ROW LEVEL SECURITY;
 
 -- DROP + CREATE rather than "create if absent": this file is re-applied on
 -- every startup, so an existing database has to pick up a corrected policy.
@@ -402,6 +470,21 @@ DROP POLICY IF EXISTS namespace_isolation_edges ON edges;
 CREATE POLICY namespace_isolation_edges ON edges
   USING (namespace_id::text = current_setting('pensyve.namespace_id', true))
   WITH CHECK (namespace_id::text = current_setting('pensyve.namespace_id', true));
+
+DROP POLICY IF EXISTS namespace_isolation_memory_embeddings ON memory_embeddings;
+CREATE POLICY namespace_isolation_memory_embeddings ON memory_embeddings
+  USING (namespace_id = current_setting('pensyve.namespace_id', true)::uuid)
+  WITH CHECK (namespace_id = current_setting('pensyve.namespace_id', true)::uuid);
+
+DROP POLICY IF EXISTS namespace_isolation_embedding_state ON namespace_embedding_state;
+CREATE POLICY namespace_isolation_embedding_state ON namespace_embedding_state
+  USING (namespace_id = current_setting('pensyve.namespace_id', true)::uuid)
+  WITH CHECK (namespace_id = current_setting('pensyve.namespace_id', true)::uuid);
+
+DROP POLICY IF EXISTS namespace_isolation_embedding_backfill_queue ON embedding_backfill_queue;
+CREATE POLICY namespace_isolation_embedding_backfill_queue ON embedding_backfill_queue
+  USING (namespace_id = current_setting('pensyve.namespace_id', true)::uuid)
+  WITH CHECK (namespace_id = current_setting('pensyve.namespace_id', true)::uuid);
 
 -- ---------------------------------------------------------------------------
 -- Enforcement
@@ -454,3 +537,6 @@ ALTER TABLE semantic_memories    FORCE ROW LEVEL SECURITY;
 ALTER TABLE procedural_memories  FORCE ROW LEVEL SECURITY;
 ALTER TABLE observation_memories FORCE ROW LEVEL SECURITY;
 ALTER TABLE edges                FORCE ROW LEVEL SECURITY;
+ALTER TABLE memory_embeddings FORCE ROW LEVEL SECURITY;
+ALTER TABLE namespace_embedding_state FORCE ROW LEVEL SECURITY;
+ALTER TABLE embedding_backfill_queue FORCE ROW LEVEL SECURITY;
