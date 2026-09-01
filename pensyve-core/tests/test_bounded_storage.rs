@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 
 use pensyve_core::embedding_space::EmbeddingSpaceId;
 use pensyve_core::storage::bounded::{
-    EmbeddingRecord, MAX_HYDRATED_BYTES, MemoryPageRequest, MemoryRef, MemoryType,
-    SQLITE_MAX_SCANNED_VECTORS, SearchScope, SearchUnavailable, VectorHit, VectorSearchOutcome,
-    VectorSearchRequest, embedding_source_text, sort_vector_hits,
+    EmbeddingRecord, EntityScope, IdentityScope, MAX_HYDRATED_BYTES, MemoryPageRequest, MemoryRef,
+    MemoryType, SQLITE_MAX_SCANNED_VECTORS, SearchScope, SearchUnavailable, VectorHit,
+    VectorSearchOutcome, VectorSearchRequest, embedding_source_text, sort_vector_hits,
 };
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::storage::{StorageError, StorageTrait};
@@ -166,6 +166,32 @@ fn lexical_limit_is_global_not_per_memory_table() {
 }
 
 #[test]
+fn bounded_lexical_excludes_observations_before_the_global_limit() {
+    let (_dir, db, namespace) = sqlite_fixture();
+    let valid = save(&db, episodic(namespace.id, 1, "crowd-token"));
+    for id in 2..=102 {
+        save(
+            &db,
+            observation(
+                namespace.id,
+                id,
+                "crowd-token crowd-token crowd-token crowd-token",
+            ),
+        );
+    }
+
+    let hits = db
+        .search_lexical_hits("crowd-token", &SearchScope::namespace(namespace.id), 100)
+        .unwrap();
+
+    assert!(
+        hits.iter()
+            .all(|hit| hit.memory_ref.memory_type != MemoryType::Observation)
+    );
+    assert!(hits.iter().any(|hit| hit.memory_ref == valid));
+}
+
+#[test]
 fn lexical_scope_and_tie_order_are_deterministic() {
     let (_dir, db, namespace) = sqlite_fixture();
     let foreign = Namespace::new("foreign");
@@ -189,9 +215,11 @@ fn lexical_scope_and_tie_order_are_deterministic() {
 
     let scoped = SearchScope {
         namespace_id: namespace.id,
-        agent_id: Some(agent),
-        user_id: Some(user),
-        entity_id: None,
+        identity: IdentityScope::ExactPair {
+            agent_id: Some(agent),
+            user_id: Some(user),
+        },
+        entity: EntityScope::Any,
     };
     let first = db
         .search_lexical_hits("scoped-token", &scoped, 100)
@@ -207,6 +235,130 @@ fn lexical_scope_and_tie_order_are_deterministic() {
             memory_type: MemoryType::Semantic,
             id: Uuid::from_u128(7),
         }]
+    );
+}
+
+#[test]
+fn exact_half_scope_filters_null_user_before_limit() {
+    let (dir, db, namespace) = sqlite_fixture();
+    register_embedding_space(dir.path(), "half-scope-space", 2);
+    let agent = Uuid::from_u128(201);
+    let wrong_user = Uuid::from_u128(202);
+    for id in 1..=101 {
+        let mut memory = episodic(namespace.id, id, "half-scope-token half-scope-token");
+        if let Memory::Episodic(memory) = &mut memory {
+            memory.agent_id = Some(agent);
+            memory.user_id = Some(wrong_user);
+        }
+        save_vector(&db, &memory, "half-scope-space", vec![1.0, 0.0]);
+    }
+    let mut expected = episodic(namespace.id, 1_000, "half-scope-token");
+    if let Memory::Episodic(memory) = &mut expected {
+        memory.agent_id = Some(agent);
+        memory.user_id = None;
+    }
+    let expected = save_vector(&db, &expected, "half-scope-space", vec![1.0, 0.0]);
+    let scope = SearchScope {
+        namespace_id: namespace.id,
+        identity: IdentityScope::ExactPair {
+            agent_id: Some(agent),
+            user_id: None,
+        },
+        entity: EntityScope::Any,
+    };
+
+    let hits = db
+        .search_lexical_hits("half-scope-token", &scope, 100)
+        .unwrap();
+    let page = db
+        .page_memories(&MemoryPageRequest::new(scope.clone(), None, 100, false).unwrap())
+        .unwrap();
+    let query = [1.0, 0.0];
+    let vector = complete_hits(
+        db.search_vector(
+            &VectorSearchRequest::new(scope, "half-scope-space", &query, 100, deadline()).unwrap(),
+        )
+        .unwrap(),
+    );
+
+    assert_eq!(
+        hits.iter().map(|hit| hit.memory_ref).collect::<Vec<_>>(),
+        vec![expected]
+    );
+    assert_eq!(
+        page.memories
+            .iter()
+            .map(MemoryRef::from_memory)
+            .collect::<Vec<_>>(),
+        vec![expected]
+    );
+    assert_eq!(
+        vector.iter().map(|hit| hit.memory_ref).collect::<Vec<_>>(),
+        vec![expected]
+    );
+}
+
+#[test]
+fn agent_across_users_filters_agent_before_limit_but_keeps_all_users() {
+    let (dir, db, namespace) = sqlite_fixture();
+    register_embedding_space(dir.path(), "agent-across-space", 2);
+    let agent = Uuid::from_u128(301);
+    for id in 1..=101 {
+        let mut memory = episodic(namespace.id, id, "agent-depth-token agent-depth-token");
+        if let Memory::Episodic(memory) = &mut memory {
+            memory.agent_id = Some(Uuid::from_u128(302));
+        }
+        save_vector(&db, &memory, "agent-across-space", vec![1.0, 0.0]);
+    }
+    let mut null_user = episodic(namespace.id, 1_000, "agent-depth-token");
+    let mut named_user = episodic(namespace.id, 1_001, "agent-depth-token");
+    if let Memory::Episodic(memory) = &mut null_user {
+        memory.agent_id = Some(agent);
+        memory.user_id = None;
+    }
+    if let Memory::Episodic(memory) = &mut named_user {
+        memory.agent_id = Some(agent);
+        memory.user_id = Some(Uuid::from_u128(303));
+    }
+    let expected = [
+        save_vector(&db, &null_user, "agent-across-space", vec![1.0, 0.0]),
+        save_vector(&db, &named_user, "agent-across-space", vec![1.0, 0.0]),
+    ];
+    let scope = SearchScope {
+        namespace_id: namespace.id,
+        identity: IdentityScope::AgentAcrossUsers(agent),
+        entity: EntityScope::Any,
+    };
+
+    let hits = db
+        .search_lexical_hits("agent-depth-token", &scope, 100)
+        .unwrap();
+    let page = db
+        .page_memories(&MemoryPageRequest::new(scope.clone(), None, 100, false).unwrap())
+        .unwrap();
+    let query = [1.0, 0.0];
+    let vector = complete_hits(
+        db.search_vector(
+            &VectorSearchRequest::new(scope, "agent-across-space", &query, 100, deadline())
+                .unwrap(),
+        )
+        .unwrap(),
+    );
+
+    assert_eq!(
+        hits.iter().map(|hit| hit.memory_ref).collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        page.memories
+            .iter()
+            .map(MemoryRef::from_memory)
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        vector.iter().map(|hit| hit.memory_ref).collect::<Vec<_>>(),
+        expected
     );
 }
 
@@ -455,6 +607,57 @@ fn complete_hits(outcome: VectorSearchOutcome) -> Vec<VectorHit> {
     }
 }
 
+#[test]
+fn prefer_entity_with_broad_enforces_four_to_one_quota_for_both_bounded_legs() {
+    let (dir, db, namespace) = sqlite_fixture();
+    register_embedding_space(dir.path(), "entity-preference-space", 2);
+    let entity = Uuid::from_u128(401);
+    for id in 1..=100 {
+        let mut memory = episodic(namespace.id, id, "entity-preference-token");
+        if let Memory::Episodic(memory) = &mut memory {
+            memory.about_entity = entity;
+        }
+        save_vector(&db, &memory, "entity-preference-space", vec![1.0, 0.0]);
+    }
+    for id in 1_001..=1_030 {
+        let memory = episodic(namespace.id, id, "entity-preference-token");
+        save_vector(&db, &memory, "entity-preference-space", vec![1.0, 0.0]);
+    }
+    let scope = SearchScope {
+        namespace_id: namespace.id,
+        identity: IdentityScope::Unscoped,
+        entity: EntityScope::PreferWithBroad(entity),
+    };
+
+    let lexical = db
+        .search_lexical_hits("entity-preference-token", &scope, 100)
+        .unwrap();
+    let query = [1.0, 0.0];
+    let request =
+        VectorSearchRequest::new(scope, "entity-preference-space", &query, 100, deadline())
+            .unwrap();
+    let vector = complete_hits(db.search_vector(&request).unwrap());
+
+    for refs in [
+        lexical.iter().map(|hit| hit.memory_ref).collect::<Vec<_>>(),
+        vector.iter().map(|hit| hit.memory_ref).collect::<Vec<_>>(),
+    ] {
+        assert_eq!(refs.len(), 100);
+        assert_eq!(
+            refs.iter()
+                .filter(|memory_ref| memory_ref.id.as_u128() <= 100)
+                .count(),
+            80
+        );
+        assert_eq!(
+            refs.iter()
+                .filter(|memory_ref| memory_ref.id.as_u128() >= 1_001)
+                .count(),
+            20
+        );
+    }
+}
+
 fn fixture_vector(seed: usize, dimension: usize) -> Vec<f32> {
     (0..dimension)
         .map(|index| {
@@ -525,6 +728,10 @@ fn sqlite_streaming_top_k_matches_bruteforce_oracle() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the fixture enumerates every vector eligibility predicate and its expected exclusion"
+)]
 fn sqlite_streaming_pushes_scope_generation_live_and_observation_predicates_into_sql() {
     let (dir, db, namespace) = sqlite_fixture();
     let foreign = Namespace::new("vector-foreign");
@@ -612,9 +819,11 @@ fn sqlite_streaming_pushes_scope_generation_live_and_observation_predicates_into
     let request = VectorSearchRequest::new(
         SearchScope {
             namespace_id: namespace.id,
-            agent_id: Some(agent),
-            user_id: Some(user),
-            entity_id: Some(entity),
+            identity: IdentityScope::ExactPair {
+                agent_id: Some(agent),
+                user_id: Some(user),
+            },
+            entity: EntityScope::Exact(entity),
         },
         "scope-space",
         &query,

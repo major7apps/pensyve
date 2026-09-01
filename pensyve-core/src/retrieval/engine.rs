@@ -13,8 +13,9 @@ use crate::graph::MemoryGraph;
 use crate::reranker::Reranker;
 use crate::rrf;
 use crate::storage::bounded::{
-    MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS, MAX_VECTOR_HITS, MemoryRef, SearchScope,
-    SearchUnavailable, VectorSearchOutcome, VectorSearchRequest,
+    EntityScope, IdentityScope, MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS,
+    MAX_VECTOR_HITS, MemoryRef, SearchScope, SearchUnavailable, VectorSearchOutcome,
+    VectorSearchRequest,
 };
 use crate::storage::{StorageTrait, memory_matches_scope as pensyve_core_scope_match};
 use crate::types::Memory;
@@ -30,6 +31,7 @@ struct GatheredCandidates {
     vector_map: BoundedScoreMap,
     bm25_map: BoundedScoreMap,
     semantic_status: SemanticStatus,
+    typed_ties: bool,
 }
 
 enum VectorSource<'a> {
@@ -689,6 +691,7 @@ impl<'a> RecallEngine<'a> {
             vector_map,
             bm25_map,
             semantic_status,
+            typed_ties,
         } = match self.vector_source {
             VectorSource::InMemory(_) => {
                 let (legacy_candidates, legacy_vector_map) = if let Some(emb) = pre_embedding {
@@ -817,7 +820,7 @@ impl<'a> RecallEngine<'a> {
         ranking_vec.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| memory_ref_tie_cmp(a.0, b.0, typed_ties))
         });
 
         // 2. BM25 ranking (from FTS results — already gathered)
@@ -828,7 +831,7 @@ impl<'a> RecallEngine<'a> {
         ranking_bm25.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| memory_ref_tie_cmp(a.0, b.0, typed_ties))
         });
 
         // 3. Activation ranking (ACT-R base-level activation)
@@ -853,7 +856,7 @@ impl<'a> RecallEngine<'a> {
         ranking_activation.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| memory_ref_tie_cmp(a.0, b.0, typed_ties))
         });
 
         // 4. Spreading activation / graph ranking
@@ -897,7 +900,7 @@ impl<'a> RecallEngine<'a> {
         ranking_intent.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| memory_ref_tie_cmp(a.0, b.0, typed_ties))
         });
 
         // 6. Confidence/reliability ranking
@@ -916,7 +919,7 @@ impl<'a> RecallEngine<'a> {
         ranking_confidence.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| memory_ref_tie_cmp(a.0, b.0, typed_ties))
         });
 
         // 7. Entity-affinity ranking
@@ -939,7 +942,7 @@ impl<'a> RecallEngine<'a> {
         ranking_entity.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| memory_ref_tie_cmp(a.0, b.0, typed_ties))
         });
 
         // Phase 2A/2C SelRoute mask: when the env-gate fired and the
@@ -1098,7 +1101,8 @@ impl<'a> RecallEngine<'a> {
         // Use adaptive k based on candidate pool size to preserve rank discrimination
         // at small corpus sizes (k=60 was designed for web-scale IR).
         let effective_k = rrf::adaptive_k(candidates.len(), self.config.rrf_k);
-        let rrf_results = reciprocal_rank_fusion_refs(&rankings, &rrf_weights, effective_k)?;
+        let rrf_results =
+            reciprocal_rank_fusion_refs(&rankings, &rrf_weights, effective_k, typed_ties)?;
 
         if matches!(self.vector_source, VectorSource::InMemory(_)) && start.elapsed() > timeout {
             return Err(RecallError::Timeout(self.config.recall_timeout_secs));
@@ -1519,15 +1523,20 @@ impl<'a> RecallEngine<'a> {
         runtime_space: &EmbeddingSpace,
         deadline: std::time::Instant,
     ) -> Result<GatheredCandidates, RecallError> {
+        let identity = if let Some(agent_id) = self.agent_only {
+            IdentityScope::AgentAcrossUsers(agent_id)
+        } else if self.agent_id.is_none() && self.user_id.is_none() {
+            IdentityScope::Unscoped
+        } else {
+            IdentityScope::ExactPair {
+                agent_id: self.agent_id,
+                user_id: self.user_id,
+            }
+        };
         let scope = SearchScope {
             namespace_id,
-            agent_id: self.agent_only.or(self.agent_id),
-            user_id: if self.agent_only.is_some() {
-                None
-            } else {
-                self.user_id
-            },
-            entity_id: target_entity,
+            identity,
+            entity: target_entity.map_or(EntityScope::Any, EntityScope::PreferWithBroad),
         };
         let mut lexical_hits = self.storage.search_lexical_hits(
             query,
@@ -1599,14 +1608,7 @@ impl<'a> RecallEngine<'a> {
                 .into());
             }
         }
-        if self.agent_id.is_some() || self.user_id.is_some() || self.agent_only.is_some() {
-            candidates.retain(|_, memory| {
-                pensyve_core_scope_match(memory, self.agent_id, self.user_id, self.agent_only)
-            });
-        }
-        if let Some(entity_id) = target_entity {
-            candidates.retain(|_, memory| memory_matches_entity(memory, entity_id));
-        }
+        candidates.retain(|_, memory| storage_scope_matches(memory, &scope));
         vector_map.retain(|memory_ref, _| candidates.contains_key(memory_ref));
         bm25_map.retain(|memory_ref, _| candidates.contains_key(memory_ref));
 
@@ -1615,6 +1617,7 @@ impl<'a> RecallEngine<'a> {
             vector_map,
             bm25_map,
             semantic_status,
+            typed_ties: true,
         })
     }
 
@@ -1815,6 +1818,7 @@ fn gathered_from_legacy(
         vector_map,
         bm25_map,
         semantic_status: SemanticStatus::Complete,
+        typed_ties: false,
     }
 }
 
@@ -1830,10 +1834,32 @@ fn memory_matches_entity(memory: &Memory, entity_id: Uuid) -> bool {
     }
 }
 
+fn storage_scope_matches(memory: &Memory, scope: &SearchScope) -> bool {
+    let (memory_agent, memory_user) = match memory {
+        Memory::Episodic(memory) => (memory.agent_id, memory.user_id),
+        Memory::Semantic(memory) => (memory.agent_id, memory.user_id),
+        Memory::Procedural(memory) => (memory.agent_id, memory.user_id),
+        Memory::Observation(memory) => (memory.agent_id, memory.user_id),
+    };
+    let identity_matches = match scope.identity {
+        IdentityScope::Unscoped => true,
+        IdentityScope::ExactPair { agent_id, user_id } => {
+            memory_agent == agent_id && memory_user == user_id
+        }
+        IdentityScope::AgentAcrossUsers(agent_id) => memory_agent == Some(agent_id),
+    };
+    let entity_matches = match scope.entity {
+        EntityScope::Any | EntityScope::PreferWithBroad(_) => true,
+        EntityScope::Exact(entity_id) => memory_matches_entity(memory, entity_id),
+    };
+    identity_matches && entity_matches
+}
+
 fn reciprocal_rank_fusion_refs(
     rankings: &[Vec<(MemoryRef, f32)>],
     weights: &[f32],
     k: u32,
+    typed_ties: bool,
 ) -> Result<Vec<(MemoryRef, f32)>, crate::rrf::RrfError> {
     if rankings.len() != weights.len() {
         return Err(crate::rrf::RrfError::Config(format!(
@@ -1858,9 +1884,17 @@ fn reciprocal_rank_fusion_refs(
         right
             .1
             .total_cmp(&left.1)
-            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| memory_ref_tie_cmp(left.0, right.0, typed_ties))
     });
     Ok(fused)
+}
+
+fn memory_ref_tie_cmp(left: MemoryRef, right: MemoryRef, typed_ties: bool) -> std::cmp::Ordering {
+    if typed_ties {
+        left.cmp(&right)
+    } else {
+        left.id.cmp(&right.id)
+    }
 }
 
 /// Score a single candidate using all fusion signals (legacy linear weighted sum).
@@ -1985,7 +2019,7 @@ fn score_candidate(
 /// 1. Take the top `min(scored.len(), reranker.max_k)` candidates as
 ///    the Vendi-eligible pool. The brief's `max_k = 50` caps Jacobi
 ///    cost; today's pipeline produces at most `RERANK_TOP_N = 20`.
-/// 2. Build the `(id, relevance, embedding)` triples by calling
+/// 2. Build the `(stable candidate index, relevance, embedding)` triples by calling
 ///    `embedding_lookup` on each pool candidate. Candidates whose
 ///    lookup returns `None` are silently skipped from the Vendi
 ///    input — they re-emerge in the residue drain (step 4) so we
@@ -2018,9 +2052,9 @@ where
 {
     let pool_size = scored.len().min(reranker.max_k);
     let mut vendi_input: Vec<(Uuid, f32, Vec<f32>)> = Vec::with_capacity(pool_size);
-    for cand in scored.iter().take(pool_size) {
+    for (index, cand) in scored.iter().take(pool_size).enumerate() {
         if let Some(emb) = embedding_lookup(cand) {
-            vendi_input.push((cand.memory_id, cand.final_score, emb));
+            vendi_input.push((stable_vendi_id(index), cand.final_score, emb));
         }
     }
 
@@ -2035,27 +2069,30 @@ where
     let route = crate::retrieval::vendi::VendiReranker::new(alpha, reranker.max_k);
     let reordered = crate::retrieval::vendi::timed_rerank(&route, &vendi_input, limit);
 
-    let mut by_id: std::collections::HashMap<Uuid, ScoredCandidate> = scored
-        .iter()
-        .take(pool_size)
-        .map(|c| (c.memory_id, c.clone()))
-        .collect();
+    let mut emitted = vec![false; pool_size];
     let tail: Vec<ScoredCandidate> = scored.iter().skip(pool_size).cloned().collect();
     let mut reordered_scored: Vec<ScoredCandidate> = Vec::with_capacity(scored.len());
     for (id, _vendi_score) in &reordered {
-        if let Some(c) = by_id.remove(id) {
-            reordered_scored.push(c);
+        let index = usize::try_from(id.as_u128().saturating_sub(1)).unwrap_or(usize::MAX);
+        if index < pool_size && !emitted[index] {
+            emitted[index] = true;
+            reordered_scored.push(scored[index].clone());
         }
     }
     // Drain the residue in original-pool order so the tail is
     // deterministic and matches pre-Vendi relevance ranking.
-    for cand in scored.iter().take(pool_size) {
-        if let Some(c) = by_id.remove(&cand.memory_id) {
-            reordered_scored.push(c);
+    for (index, cand) in scored.iter().take(pool_size).enumerate() {
+        if !emitted[index] {
+            emitted[index] = true;
+            reordered_scored.push(cand.clone());
         }
     }
     reordered_scored.extend(tail);
     reordered_scored
+}
+
+fn stable_vendi_id(index: usize) -> Uuid {
+    Uuid::from_u128(index as u128 + 1)
 }
 
 fn rerank_mmr_with_embeddings(
@@ -2698,9 +2735,11 @@ mod tests {
         let ns_id = Uuid::new_v4();
         let ep_id = Uuid::new_v4();
         let ent = Uuid::new_v4();
+        let mut memory = EpisodicMemory::new(ns_id, ep_id, ent, ent, "stub");
+        memory.id = id;
         ScoredCandidate {
             memory_id: id,
-            memory: Memory::Episodic(EpisodicMemory::new(ns_id, ep_id, ent, ent, "stub")),
+            memory: Memory::Episodic(memory),
             vector_score: final_score,
             bm25_score: 0.0,
             graph_score: 0.0,
@@ -2715,6 +2754,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn vendi_merge_preserves_cross_type_candidates_with_the_same_uuid() {
+        let shared_id = Uuid::from_u128(0xfeed);
+        let episodic = synthetic_candidate(shared_id, 1.0);
+        let mut semantic = synthetic_candidate(shared_id, 0.9);
+        let mut semantic_memory =
+            SemanticMemory::new(Uuid::new_v4(), Uuid::new_v4(), "predicate", "object", 1.0);
+        semantic_memory.id = shared_id;
+        semantic.memory = Memory::Semantic(semantic_memory);
+        let reranker = crate::retrieval::vendi::VendiReranker::new(0.5, 50);
+
+        let merged =
+            vendi_merge_candidates(vec![episodic, semantic], &reranker, None, 2, |candidate| {
+                match candidate.memory {
+                    Memory::Episodic(_) => Some(vec![1.0, 0.0]),
+                    Memory::Semantic(_) => Some(vec![0.0, 1.0]),
+                    Memory::Procedural(_) | Memory::Observation(_) => None,
+                }
+            });
+
+        assert_eq!(merged.len(), 2);
+        assert!(
+            merged
+                .iter()
+                .any(|candidate| matches!(candidate.memory, Memory::Episodic(_)))
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|candidate| matches!(candidate.memory, Memory::Semantic(_)))
+        );
+    }
+
     /// L2-normalize a vector in place (test helper — matches
     /// `VectorIndex::add`'s pre-normalization).
     fn l2_normalize(v: &mut [f32]) {
@@ -2724,6 +2796,42 @@ mod tests {
                 *x /= norm;
             }
         }
+    }
+
+    #[test]
+    fn compatibility_rrf_equal_signal_ties_use_uuid_order_across_memory_types() {
+        let semantic = MemoryRef {
+            memory_type: crate::storage::bounded::MemoryType::Semantic,
+            id: Uuid::from_u128(1),
+        };
+        let episodic = MemoryRef {
+            memory_type: crate::storage::bounded::MemoryType::Episodic,
+            id: Uuid::from_u128(2),
+        };
+        let rankings = vec![
+            vec![(episodic, 1.0), (semantic, 0.5)],
+            vec![(semantic, 1.0), (episodic, 0.5)],
+        ];
+        let episodic_memory = synthetic_candidate(episodic.id, 1.0).memory;
+        let mut semantic_memory =
+            SemanticMemory::new(Uuid::new_v4(), Uuid::new_v4(), "predicate", "object", 1.0);
+        semantic_memory.id = semantic.id;
+        let gathered = gathered_from_legacy(
+            HashMap::from([
+                (episodic.id, episodic_memory),
+                (semantic.id, Memory::Semantic(semantic_memory)),
+            ]),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert!(!gathered.typed_ties);
+        let fused =
+            reciprocal_rank_fusion_refs(&rankings, &[1.0, 1.0], 10, gathered.typed_ties).unwrap();
+
+        assert_eq!(fused[0].0, semantic);
+        assert_eq!(fused[1].0, episodic);
+        assert_eq!(fused[0].1, fused[1].1);
     }
 
     #[test]
@@ -4112,17 +4220,142 @@ mod tests {
             &[
                 SearchScope {
                     namespace_id,
-                    agent_id: Some(agent_id),
-                    user_id: Some(user_id),
-                    entity_id: Some(entity_id),
+                    identity: IdentityScope::ExactPair {
+                        agent_id: Some(agent_id),
+                        user_id: Some(user_id),
+                    },
+                    entity: EntityScope::PreferWithBroad(entity_id),
                 },
                 SearchScope {
                     namespace_id,
-                    agent_id: Some(agent_id),
-                    user_id: Some(user_id),
-                    entity_id: Some(entity_id),
+                    identity: IdentityScope::ExactPair {
+                        agent_id: Some(agent_id),
+                        user_id: Some(user_id),
+                    },
+                    entity: EntityScope::PreferWithBroad(entity_id),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn storage_backed_half_scope_and_agent_only_use_distinct_identity_modes() {
+        let namespace_id = Uuid::from_bytes([117; 16]);
+        let agent_id = Uuid::from_bytes([118; 16]);
+        let storage = CountingStorage::with_results(
+            VectorSearchOutcome::Complete(Vec::new()),
+            Vec::new(),
+            Vec::new(),
+        );
+        let embedder = OnnxEmbedder::new_mock(2);
+        let runtime_space = mock_space(2);
+        let config = test_config();
+
+        RecallEngine::new_storage_backed(&storage, &embedder, &runtime_space, &config)
+            .with_scope(Some(agent_id), None)
+            .recall("exact half scope", namespace_id, 10)
+            .unwrap();
+        RecallEngine::new_storage_backed(&storage, &embedder, &runtime_space, &config)
+            .with_agent_only(agent_id)
+            .recall("agent across users", namespace_id, 10)
+            .unwrap();
+
+        assert_eq!(
+            storage.scopes.lock().unwrap().as_slice(),
+            &[
+                SearchScope {
+                    namespace_id,
+                    identity: IdentityScope::ExactPair {
+                        agent_id: Some(agent_id),
+                        user_id: None,
+                    },
+                    entity: EntityScope::Any,
+                },
+                SearchScope {
+                    namespace_id,
+                    identity: IdentityScope::ExactPair {
+                        agent_id: Some(agent_id),
+                        user_id: None,
+                    },
+                    entity: EntityScope::Any,
+                },
+                SearchScope {
+                    namespace_id,
+                    identity: IdentityScope::AgentAcrossUsers(agent_id),
+                    entity: EntityScope::Any,
+                },
+                SearchScope {
+                    namespace_id,
+                    identity: IdentityScope::AgentAcrossUsers(agent_id),
+                    entity: EntityScope::Any,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn storage_backed_entity_recall_keeps_bounded_broad_context() {
+        let namespace_id = Uuid::from_bytes([119; 16]);
+        let entity_id = Uuid::from_bytes([120; 16]);
+        let mut preferred = bounded_memory(
+            namespace_id,
+            Uuid::from_bytes([121; 16]),
+            "entity broad context",
+        );
+        if let Memory::Episodic(memory) = &mut preferred {
+            memory.about_entity = entity_id;
+        }
+        let broad = bounded_memory(
+            namespace_id,
+            Uuid::from_bytes([122; 16]),
+            "entity broad context",
+        );
+        let refs = [
+            MemoryRef::from_memory(&preferred),
+            MemoryRef::from_memory(&broad),
+        ];
+        let storage = CountingStorage::with_results(
+            VectorSearchOutcome::Complete(vec![
+                VectorHit {
+                    memory_ref: refs[0],
+                    score: 1.0,
+                },
+                VectorHit {
+                    memory_ref: refs[1],
+                    score: 0.5,
+                },
+            ]),
+            vec![
+                LexicalHit {
+                    memory_ref: refs[0],
+                    rank: 1,
+                },
+                LexicalHit {
+                    memory_ref: refs[1],
+                    rank: 2,
+                },
+            ],
+            vec![preferred, broad],
+        );
+        let embedder = OnnxEmbedder::new_mock(2);
+        let runtime_space = mock_space(2);
+        let config = test_config();
+
+        let result = RecallEngine::new_storage_backed(&storage, &embedder, &runtime_space, &config)
+            .recall_with_entity("entity broad context", namespace_id, 10, Some(entity_id))
+            .unwrap();
+
+        assert_eq!(result.memories.len(), 2);
+        assert_eq!(storage.vector_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.lexical_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.hydration_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            storage
+                .scopes
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|scope| { scope.entity == EntityScope::PreferWithBroad(entity_id) })
         );
     }
 

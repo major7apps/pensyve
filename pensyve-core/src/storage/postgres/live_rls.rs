@@ -115,8 +115,9 @@ use uuid::Uuid;
 use super::{POSTGRES_VECTOR_SEARCH_SQL, PostgresBackend};
 use crate::embedding_space::EmbeddingSpaceId;
 use crate::storage::bounded::{
-    EmbeddingRecord, MAX_HYDRATED_BYTES, MemoryPageRequest, MemoryRef, MemoryType, SearchScope,
-    SearchUnavailable, VectorHit, VectorSearchOutcome, VectorSearchRequest, embedding_source_text,
+    EmbeddingRecord, EntityScope as BoundedEntityScope, IdentityScope, MAX_HYDRATED_BYTES,
+    MemoryPageRequest, MemoryRef, MemoryType, SearchScope, SearchUnavailable, VectorHit,
+    VectorSearchOutcome, VectorSearchRequest, embedding_source_text,
 };
 use crate::storage::{StorageError, StorageTrait};
 use crate::types::{
@@ -3945,9 +3946,11 @@ fn bounded_reads_match_sqlite_and_isolate_forced_rls() {
 
     let scope = SearchScope {
         namespace_id: namespace.id,
-        agent_id: Some(agent),
-        user_id: Some(user),
-        entity_id: Some(entity),
+        identity: IdentityScope::ExactPair {
+            agent_id: Some(agent),
+            user_id: Some(user),
+        },
+        entity: BoundedEntityScope::Exact(entity),
     };
     let sqlite_hits = sqlite
         .search_lexical_hits("boundedtoken", &scope, 100)
@@ -4027,6 +4030,184 @@ fn bounded_reads_match_sqlite_and_isolate_forced_rls() {
         sqlite
             .load_embedding_records(namespace.id, &space, &refs[..1])
             .expect("load sqlite generation")
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one cross-backend fixture proves all bounded mode parity in a single isolated database"
+)]
+fn bounded_explicit_scope_entity_preference_and_observation_exclusion_match_sqlite() {
+    let Some(admin_opts) = skip_notice(
+        "bounded_explicit_scope_entity_preference_and_observation_exclusion_match_sqlite",
+    ) else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let postgres = &fixture.backend;
+    let sqlite_dir = tempfile::tempdir().expect("sqlite bounded-scope tempdir");
+    let sqlite = crate::storage::sqlite::SqliteBackend::open(sqlite_dir.path())
+        .expect("open sqlite bounded-scope oracle");
+    let namespace = Namespace::new(format!("bounded-modes-{}", Uuid::new_v4().simple()));
+    for backend in [postgres as &dyn StorageTrait, &sqlite] {
+        backend.save_namespace(&namespace).expect("save namespace");
+    }
+    let agent = Uuid::new_v4();
+    let other_agent = Uuid::new_v4();
+    let user = Uuid::new_v4();
+    let entity = Uuid::new_v4();
+
+    let mut exact_null = EpisodicMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "halfscopetoken",
+    );
+    exact_null.id = Uuid::from_u128(10_001);
+    exact_null.agent_id = Some(agent);
+    let mut wrong_user = exact_null.clone();
+    wrong_user.id = Uuid::from_u128(10_002);
+    wrong_user.user_id = Some(user);
+
+    let mut across_null = exact_null.clone();
+    across_null.id = Uuid::from_u128(11_001);
+    across_null.content = "acrossuserstoken".into();
+    let mut across_user = across_null.clone();
+    across_user.id = Uuid::from_u128(11_002);
+    across_user.user_id = Some(user);
+    let mut wrong_agent = across_null.clone();
+    wrong_agent.id = Uuid::from_u128(11_003);
+    wrong_agent.agent_id = Some(other_agent);
+
+    let mut preferred = Vec::new();
+    for id in 12_001..=12_010 {
+        let mut memory = EpisodicMemory::new(
+            namespace.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            entity,
+            "entitypreferencetoken",
+        );
+        memory.id = Uuid::from_u128(id);
+        memory.about_entity = entity;
+        preferred.push(memory);
+    }
+    let mut broad = Vec::new();
+    for id in 13_001..=13_004 {
+        let mut memory = EpisodicMemory::new(
+            namespace.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "entitypreferencetoken",
+        );
+        memory.id = Uuid::from_u128(id);
+        broad.push(memory);
+    }
+    let mut valid_source = exact_null.clone();
+    valid_source.id = Uuid::from_u128(14_001);
+    valid_source.content = "observationcrowdtoken".into();
+    let mut observation = ObservationMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        "kind",
+        "instance",
+        "action",
+        "observationcrowdtoken observationcrowdtoken",
+    );
+    observation.id = Uuid::from_u128(14_002);
+
+    for backend in [postgres as &dyn StorageTrait, &sqlite] {
+        for memory in [
+            &exact_null,
+            &wrong_user,
+            &across_null,
+            &across_user,
+            &wrong_agent,
+            &valid_source,
+        ] {
+            backend.save_episodic(memory).expect("save scoped memory");
+        }
+        for memory in preferred.iter().chain(&broad) {
+            backend.save_episodic(memory).expect("save entity memory");
+        }
+        backend
+            .save_observation(&observation)
+            .expect("save observation");
+    }
+
+    let cases = [
+        (
+            "halfscopetoken",
+            SearchScope {
+                namespace_id: namespace.id,
+                identity: IdentityScope::ExactPair {
+                    agent_id: Some(agent),
+                    user_id: None,
+                },
+                entity: BoundedEntityScope::Any,
+            },
+            100,
+        ),
+        (
+            "acrossuserstoken",
+            SearchScope {
+                namespace_id: namespace.id,
+                identity: IdentityScope::AgentAcrossUsers(agent),
+                entity: BoundedEntityScope::Any,
+            },
+            100,
+        ),
+        (
+            "entitypreferencetoken",
+            SearchScope {
+                namespace_id: namespace.id,
+                identity: IdentityScope::Unscoped,
+                entity: BoundedEntityScope::PreferWithBroad(entity),
+            },
+            10,
+        ),
+        (
+            "observationcrowdtoken",
+            SearchScope::namespace(namespace.id),
+            100,
+        ),
+    ];
+    for (query, scope, limit) in cases {
+        let sqlite_hits = sqlite
+            .search_lexical_hits(query, &scope, limit)
+            .expect("sqlite bounded lexical");
+        let postgres_hits = postgres
+            .search_lexical_hits(query, &scope, limit)
+            .expect("Postgres bounded lexical");
+        assert_eq!(postgres_hits, sqlite_hits, "parity for {query}");
+    }
+
+    let preferred_hits = postgres
+        .search_lexical_hits(
+            "entitypreferencetoken",
+            &SearchScope {
+                namespace_id: namespace.id,
+                identity: IdentityScope::Unscoped,
+                entity: BoundedEntityScope::PreferWithBroad(entity),
+            },
+            10,
+        )
+        .expect("Postgres entity-preferred lexical");
+    assert_eq!(preferred_hits.len(), 10);
+    assert_eq!(
+        preferred_hits
+            .iter()
+            .filter(|hit| hit.memory_ref.id.as_u128() < 13_000)
+            .count(),
+        8
+    );
+    assert!(
+        preferred_hits
+            .iter()
+            .all(|hit| { hit.memory_ref.memory_type != MemoryType::Observation })
     );
 }
 
@@ -4426,9 +4607,11 @@ fn exact_pgvector_matches_sqlite_oracle_with_scope_ties_and_cross_type_ids() {
     let query_embedding = [1.0, 0.0];
     let scope = SearchScope {
         namespace_id: namespace.id,
-        agent_id: Some(agent),
-        user_id: Some(user),
-        entity_id: None,
+        identity: IdentityScope::ExactPair {
+            agent_id: Some(agent),
+            user_id: Some(user),
+        },
+        entity: BoundedEntityScope::Any,
     };
     let request = VectorSearchRequest::new(
         scope.clone(),

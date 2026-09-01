@@ -948,7 +948,10 @@ impl Ord for RankedVectorHit {
 }
 
 const SQLITE_VECTOR_SEARCH_SQL: &str = r"SELECT 'episodic' AS memory_type,
-               embeddings.memory_id, embeddings.embedding
+               embeddings.memory_id, embeddings.embedding,
+               CASE WHEN ?6 = 2 AND
+                    (memory.about_entity = ?7 OR memory.source_entity = ?7)
+                    THEN 1 ELSE 0 END AS entity_preferred
         FROM memory_embeddings AS embeddings
         JOIN episodic_memories AS memory
           ON memory.id = embeddings.memory_id
@@ -956,12 +959,17 @@ const SQLITE_VECTOR_SEARCH_SQL: &str = r"SELECT 'episodic' AS memory_type,
         WHERE embeddings.namespace_id = ?1
           AND embeddings.embedding_space_id = ?2
           AND embeddings.memory_type = 'episodic'
-          AND (?3 IS NULL OR memory.agent_id = ?3)
-          AND (?4 IS NULL OR memory.user_id = ?4)
-          AND (?5 IS NULL OR memory.about_entity = ?5 OR memory.source_entity = ?5)
+          AND (?3 = 0
+               OR (?3 = 1 AND memory.agent_id IS ?4 AND memory.user_id IS ?5)
+               OR (?3 = 2 AND memory.agent_id = ?4))
+          AND (?6 = 0 OR ?6 = 2
+               OR (?6 = 1 AND (memory.about_entity = ?7 OR memory.source_entity = ?7)))
           AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
         UNION ALL
-        SELECT 'semantic', embeddings.memory_id, embeddings.embedding
+        SELECT 'semantic', embeddings.memory_id, embeddings.embedding,
+               CASE WHEN ?6 = 2 AND
+                    (memory.subject = ?7 OR memory.object_entity = ?7)
+                    THEN 1 ELSE 0 END
         FROM memory_embeddings AS embeddings
         JOIN semantic_memories AS memory
           ON memory.id = embeddings.memory_id
@@ -969,12 +977,14 @@ const SQLITE_VECTOR_SEARCH_SQL: &str = r"SELECT 'episodic' AS memory_type,
         WHERE embeddings.namespace_id = ?1
           AND embeddings.embedding_space_id = ?2
           AND embeddings.memory_type = 'semantic'
-          AND (?3 IS NULL OR memory.agent_id = ?3)
-          AND (?4 IS NULL OR memory.user_id = ?4)
-          AND (?5 IS NULL OR memory.subject = ?5 OR memory.object_entity = ?5)
+          AND (?3 = 0
+               OR (?3 = 1 AND memory.agent_id IS ?4 AND memory.user_id IS ?5)
+               OR (?3 = 2 AND memory.agent_id = ?4))
+          AND (?6 = 0 OR ?6 = 2
+               OR (?6 = 1 AND (memory.subject = ?7 OR memory.object_entity = ?7)))
           AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
         UNION ALL
-        SELECT 'procedural', embeddings.memory_id, embeddings.embedding
+        SELECT 'procedural', embeddings.memory_id, embeddings.embedding, 0
         FROM memory_embeddings AS embeddings
         JOIN procedural_memories AS memory
           ON memory.id = embeddings.memory_id
@@ -982,9 +992,10 @@ const SQLITE_VECTOR_SEARCH_SQL: &str = r"SELECT 'episodic' AS memory_type,
         WHERE embeddings.namespace_id = ?1
           AND embeddings.embedding_space_id = ?2
           AND embeddings.memory_type = 'procedural'
-          AND (?3 IS NULL OR memory.agent_id = ?3)
-          AND (?4 IS NULL OR memory.user_id = ?4)
-          AND ?5 IS NULL
+          AND (?3 = 0
+               OR (?3 = 1 AND memory.agent_id IS ?4 AND memory.user_id IS ?5)
+               OR (?3 = 2 AND memory.agent_id = ?4))
+          AND (?6 = 0 OR ?6 = 2)
           AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL";
 
 fn vector_unavailable(reason: SearchUnavailable) -> VectorSearchOutcome {
@@ -1539,6 +1550,10 @@ impl StorageTrait for SqliteBackend {
         Some(&self.db_path)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one streaming pass keeps validation, deadline checks, typed decoding, and entity quotas fail-closed"
+    )]
     fn search_vector(
         &self,
         request: &VectorSearchRequest<'_>,
@@ -1555,9 +1570,11 @@ impl StorageTrait for SqliteBackend {
 
         let namespace = request.scope.namespace_id.to_string();
         let space = &request.embedding_space_id.0;
-        let agent = request.scope.agent_id.map(|value| value.to_string());
-        let user = request.scope.user_id.map(|value| value.to_string());
-        let entity = request.scope.entity_id.map(|value| value.to_string());
+        let (identity_mode, agent, user) = request.scope.identity_sql_parts();
+        let agent = agent.map(|value| value.to_string());
+        let user = user.map(|value| value.to_string());
+        let (entity_mode, entity) = request.scope.entity_sql_parts();
+        let entity = entity.map(|value| value.to_string());
         let conn = lock_conn!(self);
         if self.vector_deadline_expired(request.deadline, VectorDeadlineBoundary::AfterConnection) {
             return Ok(vector_unavailable(SearchUnavailable::DeadlineExceeded));
@@ -1592,9 +1609,19 @@ impl StorageTrait for SqliteBackend {
         }
 
         let mut statement = conn.prepare(SQLITE_VECTOR_SEARCH_SQL)?;
-        let mut rows = statement.query(params![namespace, space, agent, user, entity])?;
+        let mut rows = statement.query(params![
+            namespace,
+            space,
+            identity_mode,
+            agent,
+            user,
+            entity_mode,
+            entity
+        ])?;
         let mut scanned = 0_usize;
-        let mut heap = BinaryHeap::with_capacity(request.k);
+        let (preferred_quota, broad_quota) = request.scope.entity_quotas(request.k);
+        let mut preferred_heap = BinaryHeap::with_capacity(preferred_quota);
+        let mut broad_heap = BinaryHeap::with_capacity(broad_quota);
         while let Some(row) = rows.next()? {
             if scanned >= SQLITE_MAX_SCANNED_VECTORS {
                 return Ok(vector_unavailable(SearchUnavailable::ScanBudgetExceeded));
@@ -1627,23 +1654,39 @@ impl StorageTrait for SqliteBackend {
                 memory_ref: MemoryRef { memory_type, id },
                 score,
             });
-            if heap.len() < request.k {
-                heap.push(candidate);
-            } else if heap
-                .peek()
-                .is_some_and(|worst| candidate.cmp(worst) == CmpOrdering::Less)
-            {
-                heap.pop();
-                heap.push(candidate);
+            let entity_preferred = row.get::<_, i64>(3)? != 0;
+            let (heap, quota) = if entity_preferred {
+                (&mut preferred_heap, preferred_quota)
+            } else {
+                (&mut broad_heap, broad_quota)
+            };
+            if quota > 0 {
+                if heap.len() < quota {
+                    heap.push(candidate);
+                } else if heap
+                    .peek()
+                    .is_some_and(|worst| candidate.cmp(worst) == CmpOrdering::Less)
+                {
+                    heap.pop();
+                    heap.push(candidate);
+                }
             }
             scanned += 1;
         }
 
-        let mut hits = heap.into_iter().map(|ranked| ranked.0).collect::<Vec<_>>();
+        let mut hits = preferred_heap
+            .into_iter()
+            .chain(broad_heap)
+            .map(|ranked| ranked.0)
+            .collect::<Vec<_>>();
         sort_vector_hits(&mut hits);
         Ok(self.complete_vector_search(request.deadline, hits))
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one SQL statement keeps identity, entity quota, observation exclusion, and global limit atomic"
+    )]
     fn search_lexical_hits(
         &self,
         query: &str,
@@ -1661,64 +1704,98 @@ impl StorageTrait for SqliteBackend {
         }
 
         let namespace = scope.namespace_id.to_string();
-        let agent = scope.agent_id.map(|value| value.to_string());
-        let user = scope.user_id.map(|value| value.to_string());
-        let entity = scope.entity_id.map(|value| value.to_string());
+        let (identity_mode, agent, user) = scope.identity_sql_parts();
+        let agent = agent.map(|value| value.to_string());
+        let user = user.map(|value| value.to_string());
+        let (entity_mode, entity) = scope.entity_sql_parts();
+        let entity = entity.map(|value| value.to_string());
+        let (preferred_quota, broad_quota) = scope.entity_quotas(limit);
         let conn = lock_conn!(self);
         let mut stmt = conn.prepare(
-            r"SELECT f.memory_id, f.memory_type
+            r"WITH candidates AS (
+               SELECT f.memory_id, f.memory_type, f.rank AS score,
+                      CASE
+                          WHEN ?6 = 2 AND f.memory_type = 'episodic' THEN EXISTS (
+                              SELECT 1 FROM episodic_memories e
+                              WHERE e.id = f.memory_id AND e.namespace_id = ?2
+                                AND (e.about_entity = ?7 OR e.source_entity = ?7)
+                          )
+                          WHEN ?6 = 2 AND f.memory_type = 'semantic' THEN EXISTS (
+                              SELECT 1 FROM semantic_memories s
+                              WHERE s.id = f.memory_id AND s.namespace_id = ?2
+                                AND (s.subject = ?7 OR s.object_entity = ?7)
+                          )
+                          ELSE 0
+                      END AS entity_preferred
                FROM memory_fts AS f
                WHERE memory_fts MATCH ?1 AND f.namespace_id = ?2
                  AND (
                      (f.memory_type = 'episodic' AND EXISTS (
                          SELECT 1 FROM episodic_memories e
                          WHERE e.id = f.memory_id AND e.namespace_id = ?2
-                           AND (?3 IS NULL OR e.agent_id = ?3)
-                           AND (?4 IS NULL OR e.user_id = ?4)
-                           AND (?5 IS NULL OR e.about_entity = ?5 OR e.source_entity = ?5)
+                           AND (?3 = 0
+                                OR (?3 = 1 AND e.agent_id IS ?4 AND e.user_id IS ?5)
+                                OR (?3 = 2 AND e.agent_id = ?4))
+                           AND (?6 = 0 OR ?6 = 2 OR (?6 = 1
+                                AND (e.about_entity = ?7 OR e.source_entity = ?7)))
                            AND e.superseded_by IS NULL AND e.invalid_at IS NULL
                      ))
                      OR (f.memory_type = 'semantic' AND EXISTS (
                          SELECT 1 FROM semantic_memories s
                          WHERE s.id = f.memory_id AND s.namespace_id = ?2
-                           AND (?3 IS NULL OR s.agent_id = ?3)
-                           AND (?4 IS NULL OR s.user_id = ?4)
-                           AND (?5 IS NULL OR s.subject = ?5 OR s.object_entity = ?5)
+                           AND (?3 = 0
+                                OR (?3 = 1 AND s.agent_id IS ?4 AND s.user_id IS ?5)
+                                OR (?3 = 2 AND s.agent_id = ?4))
+                           AND (?6 = 0 OR ?6 = 2 OR (?6 = 1
+                                AND (s.subject = ?7 OR s.object_entity = ?7)))
                            AND s.superseded_by IS NULL AND s.invalid_at IS NULL
                      ))
                      OR (f.memory_type = 'procedural' AND EXISTS (
                          SELECT 1 FROM procedural_memories p
                          WHERE p.id = f.memory_id AND p.namespace_id = ?2
-                           AND (?3 IS NULL OR p.agent_id = ?3)
-                           AND (?4 IS NULL OR p.user_id = ?4)
-                           AND ?5 IS NULL
+                           AND (?3 = 0
+                                OR (?3 = 1 AND p.agent_id IS ?4 AND p.user_id IS ?5)
+                                OR (?3 = 2 AND p.agent_id = ?4))
+                           AND (?6 = 0 OR ?6 = 2)
                            AND p.superseded_by IS NULL AND p.invalid_at IS NULL
                      ))
-                     OR (f.memory_type = 'observation' AND EXISTS (
-                         SELECT 1 FROM observation_memories o
-                         WHERE o.id = f.memory_id AND o.namespace_id = ?2
-                           AND (?3 IS NULL OR o.agent_id = ?3)
-                           AND (?4 IS NULL OR o.user_id = ?4)
-                           AND ?5 IS NULL
-                           AND o.superseded_by IS NULL AND o.invalid_at IS NULL
-                     ))
                  )
-               ORDER BY bm25(memory_fts),
-                        CASE f.memory_type
+             ), ranked AS (
+               SELECT memory_id, memory_type, score, entity_preferred,
+                      row_number() OVER (
+                          PARTITION BY entity_preferred
+                          ORDER BY score,
+                                   CASE memory_type
+                                       WHEN 'episodic' THEN 0 WHEN 'semantic' THEN 1 ELSE 2
+                                   END,
+                                   memory_id
+                      ) AS entity_rank
+               FROM candidates
+             )
+               SELECT memory_id, memory_type FROM ranked
+               WHERE ?6 != 2
+                  OR (entity_preferred = 1 AND entity_rank <= ?8)
+                  OR (entity_preferred = 0 AND entity_rank <= ?9)
+               ORDER BY score,
+                        CASE memory_type
                             WHEN 'episodic' THEN 0 WHEN 'semantic' THEN 1
-                            WHEN 'procedural' THEN 2 ELSE 3
+                            ELSE 2
                         END,
-                        f.memory_id
-               LIMIT ?6",
+                        memory_id
+               LIMIT ?10",
         )?;
         let rows = stmt
             .query_map(
                 params![
                     escaped_query,
                     namespace,
+                    identity_mode,
                     agent,
                     user,
+                    entity_mode,
                     entity,
+                    i64::try_from(preferred_quota).unwrap_or(i64::MAX),
+                    i64::try_from(broad_quota).unwrap_or(i64::MAX),
                     i64::try_from(limit).unwrap_or(i64::MAX)
                 ],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
@@ -1883,47 +1960,57 @@ impl StorageTrait for SqliteBackend {
             .as_ref()
             .map_or_else(String::new, |cursor| cursor.id.to_string());
         let namespace = request.scope.namespace_id.to_string();
-        let agent = request.scope.agent_id.map(|value| value.to_string());
-        let user = request.scope.user_id.map(|value| value.to_string());
-        let entity = request.scope.entity_id.map(|value| value.to_string());
+        let (identity_mode, agent, user) = request.scope.identity_sql_parts();
+        let agent = agent.map(|value| value.to_string());
+        let user = user.map(|value| value.to_string());
+        let (entity_mode, entity) = request.scope.entity_sql_parts();
+        let entity = entity.map(|value| value.to_string());
         let conn = lock_conn!(self);
         let mut stmt = conn.prepare(
             r"SELECT memory_type, id FROM (
                    SELECT 0 AS type_order, 'episodic' AS memory_type, id
                    FROM episodic_memories
-                   WHERE namespace_id = ?1 AND (?2 IS NULL OR agent_id = ?2)
-                     AND (?3 IS NULL OR user_id = ?3)
-                     AND (?4 IS NULL OR about_entity = ?4 OR source_entity = ?4)
-                     AND (?5 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                   WHERE namespace_id = ?1
+                     AND (?2 = 0 OR (?2 = 1 AND agent_id IS ?3 AND user_id IS ?4)
+                          OR (?2 = 2 AND agent_id = ?3))
+                     AND (?5 = 0 OR ?5 = 2 OR (?5 = 1
+                          AND (about_entity = ?6 OR source_entity = ?6)))
+                     AND (?7 OR (superseded_by IS NULL AND invalid_at IS NULL))
                    UNION ALL
                    SELECT 1, 'semantic', id FROM semantic_memories
-                   WHERE namespace_id = ?1 AND (?2 IS NULL OR agent_id = ?2)
-                     AND (?3 IS NULL OR user_id = ?3)
-                     AND (?4 IS NULL OR subject = ?4 OR object_entity = ?4)
-                     AND (?5 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                   WHERE namespace_id = ?1
+                     AND (?2 = 0 OR (?2 = 1 AND agent_id IS ?3 AND user_id IS ?4)
+                          OR (?2 = 2 AND agent_id = ?3))
+                     AND (?5 = 0 OR ?5 = 2 OR (?5 = 1
+                          AND (subject = ?6 OR object_entity = ?6)))
+                     AND (?7 OR (superseded_by IS NULL AND invalid_at IS NULL))
                    UNION ALL
                    SELECT 2, 'procedural', id FROM procedural_memories
-                   WHERE namespace_id = ?1 AND (?2 IS NULL OR agent_id = ?2)
-                     AND (?3 IS NULL OR user_id = ?3)
-                     AND ?4 IS NULL
-                     AND (?5 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                   WHERE namespace_id = ?1
+                     AND (?2 = 0 OR (?2 = 1 AND agent_id IS ?3 AND user_id IS ?4)
+                          OR (?2 = 2 AND agent_id = ?3))
+                     AND (?5 = 0 OR ?5 = 2)
+                     AND (?7 OR (superseded_by IS NULL AND invalid_at IS NULL))
                    UNION ALL
                    SELECT 3, 'observation', id FROM observation_memories
-                   WHERE namespace_id = ?1 AND (?2 IS NULL OR agent_id = ?2)
-                     AND (?3 IS NULL OR user_id = ?3)
-                     AND ?4 IS NULL
-                     AND (?5 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                   WHERE namespace_id = ?1
+                     AND (?2 = 0 OR (?2 = 1 AND agent_id IS ?3 AND user_id IS ?4)
+                          OR (?2 = 2 AND agent_id = ?3))
+                     AND (?5 = 0 OR ?5 = 2)
+                     AND (?7 OR (superseded_by IS NULL AND invalid_at IS NULL))
                ) AS memories
-               WHERE type_order > ?6 OR (type_order = ?6 AND id > ?7)
+               WHERE type_order > ?8 OR (type_order = ?8 AND id > ?9)
                ORDER BY type_order, id
-               LIMIT ?8",
+               LIMIT ?10",
         )?;
         let rows = stmt
             .query_map(
                 params![
                     namespace,
+                    identity_mode,
                     agent,
                     user,
+                    entity_mode,
                     entity,
                     request.include_superseded,
                     after_type,

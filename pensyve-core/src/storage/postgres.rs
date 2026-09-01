@@ -864,7 +864,9 @@ const LIST_OBSERVATIONS_BY_ENTITY_INSTANCE_SQL: &str = r"SELECT id, namespace_id
 /// leg even when that row would fall outside the top-k; partial hits are never
 /// returned. pgvector itself rejects non-finite stored components.
 const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH candidates AS (
-    SELECT 0::smallint AS memory_type, embeddings.memory_id, embeddings.embedding
+    SELECT 0::smallint AS memory_type, embeddings.memory_id, embeddings.embedding,
+           $7::smallint = 2 AND
+               (memory.about_entity = $8 OR memory.source_entity = $8) AS entity_preferred
     FROM memory_embeddings AS embeddings
     JOIN episodic_memories AS memory
       ON memory.id = embeddings.memory_id
@@ -872,12 +874,17 @@ const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH candidates AS (
     WHERE embeddings.namespace_id = $2
       AND embeddings.embedding_space_id = $3
       AND embeddings.memory_type = 'episodic'
-      AND ($4::uuid IS NULL OR memory.agent_id = $4)
-      AND ($5::uuid IS NULL OR memory.user_id = $5)
-      AND ($6::uuid IS NULL OR memory.about_entity = $6 OR memory.source_entity = $6)
+      AND ($4::smallint = 0
+           OR ($4 = 1 AND memory.agent_id IS NOT DISTINCT FROM $5
+                      AND memory.user_id IS NOT DISTINCT FROM $6)
+           OR ($4 = 2 AND memory.agent_id = $5))
+      AND ($7::smallint = 0 OR $7 = 2 OR ($7 = 1
+           AND (memory.about_entity = $8 OR memory.source_entity = $8)))
       AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
     UNION ALL
-    SELECT 1::smallint, embeddings.memory_id, embeddings.embedding
+    SELECT 1::smallint, embeddings.memory_id, embeddings.embedding,
+           $7::smallint = 2 AND
+               (memory.subject = $8 OR memory.object_entity = $8)
     FROM memory_embeddings AS embeddings
     JOIN semantic_memories AS memory
       ON memory.id = embeddings.memory_id
@@ -885,12 +892,15 @@ const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH candidates AS (
     WHERE embeddings.namespace_id = $2
       AND embeddings.embedding_space_id = $3
       AND embeddings.memory_type = 'semantic'
-      AND ($4::uuid IS NULL OR memory.agent_id = $4)
-      AND ($5::uuid IS NULL OR memory.user_id = $5)
-      AND ($6::uuid IS NULL OR memory.subject = $6 OR memory.object_entity = $6)
+      AND ($4::smallint = 0
+           OR ($4 = 1 AND memory.agent_id IS NOT DISTINCT FROM $5
+                      AND memory.user_id IS NOT DISTINCT FROM $6)
+           OR ($4 = 2 AND memory.agent_id = $5))
+      AND ($7::smallint = 0 OR $7 = 2 OR ($7 = 1
+           AND (memory.subject = $8 OR memory.object_entity = $8)))
       AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
     UNION ALL
-    SELECT 2::smallint, embeddings.memory_id, embeddings.embedding
+    SELECT 2::smallint, embeddings.memory_id, embeddings.embedding, false
     FROM memory_embeddings AS embeddings
     JOIN procedural_memories AS memory
       ON memory.id = embeddings.memory_id
@@ -898,12 +908,14 @@ const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH candidates AS (
     WHERE embeddings.namespace_id = $2
       AND embeddings.embedding_space_id = $3
       AND embeddings.memory_type = 'procedural'
-      AND ($4::uuid IS NULL OR memory.agent_id = $4)
-      AND ($5::uuid IS NULL OR memory.user_id = $5)
-      AND $6::uuid IS NULL
+      AND ($4::smallint = 0
+           OR ($4 = 1 AND memory.agent_id IS NOT DISTINCT FROM $5
+                      AND memory.user_id IS NOT DISTINCT FROM $6)
+           OR ($4 = 2 AND memory.agent_id = $5))
+      AND ($7::smallint = 0 OR $7 = 2)
       AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
-), ranked AS (
-    SELECT memory_type, memory_id,
+), scored AS (
+    SELECT memory_type, memory_id, entity_preferred,
            CASE
              WHEN vector_dims(embedding) <> vector_dims($1::vector) THEN NULL
              WHEN vector_norm(embedding) = 0 THEN 1.0
@@ -913,12 +925,22 @@ const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH candidates AS (
                vector_dims(embedding) <> vector_dims($1::vector)
            ) OVER () AS invalid_stored_vector
     FROM candidates
+), ranked AS (
+    SELECT memory_type, memory_id, entity_preferred, distance, invalid_stored_vector,
+           row_number() OVER (
+               PARTITION BY entity_preferred
+               ORDER BY distance, memory_type, memory_id
+           ) AS entity_rank
+    FROM scored
 )
 SELECT memory_type, memory_id, 1.0 - distance AS cosine_similarity,
        invalid_stored_vector
 FROM ranked
+WHERE $7::smallint <> 2
+   OR (entity_preferred AND entity_rank <= $9)
+   OR (NOT entity_preferred AND entity_rank <= $10)
 ORDER BY distance ASC, memory_type ASC, memory_id ASC
-LIMIT $7";
+LIMIT $11";
 
 // ---------------------------------------------------------------------------
 // Error helpers
@@ -1522,14 +1544,21 @@ impl StorageTrait for PostgresBackend {
                 }
                 return Err(sqlx_to_io(error));
             }
+            let (identity_mode, agent, user) = request.scope.identity_sql_parts();
+            let (entity_mode, entity) = request.scope.entity_sql_parts();
+            let (preferred_quota, broad_quota) = request.scope.entity_quotas(request.k);
             let rows: Vec<(i16, Uuid, Option<f64>, bool)> =
                 match query_as::<Postgres, _>(POSTGRES_VECTOR_SEARCH_SQL)
                     .bind(query_embedding)
                     .bind(request.scope.namespace_id)
                     .bind(&request.embedding_space_id.0)
-                    .bind(request.scope.agent_id)
-                    .bind(request.scope.user_id)
-                    .bind(request.scope.entity_id)
+                    .bind(identity_mode)
+                    .bind(agent)
+                    .bind(user)
+                    .bind(entity_mode)
+                    .bind(entity)
+                    .bind(i64::try_from(preferred_quota).unwrap_or(i64::MAX))
+                    .bind(i64::try_from(broad_quota).unwrap_or(i64::MAX))
                     .bind(i64::try_from(request.k).unwrap_or(i64::MAX))
                     .fetch_all(&mut *transaction)
                     .await
@@ -1601,54 +1630,78 @@ impl StorageTrait for PostgresBackend {
         if tokens.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let tsquery = or_tsquery_fragment(6, tokens.len());
+        let tsquery = or_tsquery_fragment(10, tokens.len());
         let sql = format!(
-            "SELECT memory_type, id, score FROM ( \
-                 SELECT 'episodic' AS memory_type, id, ts_rank(fts_content, {tsquery}) AS score \
+            "WITH candidates AS ( \
+                 SELECT 'episodic' AS memory_type, id, ts_rank(fts_content, {tsquery}) AS score, \
+                        $6::smallint = 2 AND (about_entity = $7 OR source_entity = $7) \
+                            AS entity_preferred \
                  FROM episodic_memories \
-                 WHERE namespace_id = $1 AND ($3::uuid IS NULL OR agent_id = $3) \
-                   AND ($4::uuid IS NULL OR user_id = $4) \
-                   AND ($5::uuid IS NULL OR about_entity = $5 OR source_entity = $5) \
+                 WHERE namespace_id = $1 \
+                   AND ($3::smallint = 0 \
+                        OR ($3 = 1 AND agent_id IS NOT DISTINCT FROM $4 \
+                                   AND user_id IS NOT DISTINCT FROM $5) \
+                        OR ($3 = 2 AND agent_id = $4)) \
+                   AND ($6::smallint = 0 OR $6 = 2 OR ($6 = 1 \
+                        AND (about_entity = $7 OR source_entity = $7))) \
                    AND superseded_by IS NULL AND invalid_at IS NULL \
                    AND fts_content @@ {tsquery} \
                  UNION ALL \
-                 SELECT 'semantic', id, ts_rank(fts_content, {tsquery}) \
+                 SELECT 'semantic', id, ts_rank(fts_content, {tsquery}), \
+                        $6::smallint = 2 AND (subject = $7 OR object_entity = $7) \
                  FROM semantic_memories \
-                 WHERE namespace_id = $1 AND ($3::uuid IS NULL OR agent_id = $3) \
-                   AND ($4::uuid IS NULL OR user_id = $4) \
-                   AND ($5::uuid IS NULL OR subject = $5 OR object_entity = $5) \
+                 WHERE namespace_id = $1 \
+                   AND ($3::smallint = 0 \
+                        OR ($3 = 1 AND agent_id IS NOT DISTINCT FROM $4 \
+                                   AND user_id IS NOT DISTINCT FROM $5) \
+                        OR ($3 = 2 AND agent_id = $4)) \
+                   AND ($6::smallint = 0 OR $6 = 2 OR ($6 = 1 \
+                        AND (subject = $7 OR object_entity = $7))) \
                    AND superseded_by IS NULL AND invalid_at IS NULL \
                    AND fts_content @@ {tsquery} \
                  UNION ALL \
-                 SELECT 'procedural', id, ts_rank(fts_content, {tsquery}) \
+                 SELECT 'procedural', id, ts_rank(fts_content, {tsquery}), false \
                  FROM procedural_memories \
-                 WHERE namespace_id = $1 AND ($3::uuid IS NULL OR agent_id = $3) \
-                   AND ($4::uuid IS NULL OR user_id = $4) \
-                   AND $5::uuid IS NULL \
+                 WHERE namespace_id = $1 \
+                   AND ($3::smallint = 0 \
+                        OR ($3 = 1 AND agent_id IS NOT DISTINCT FROM $4 \
+                                   AND user_id IS NOT DISTINCT FROM $5) \
+                        OR ($3 = 2 AND agent_id = $4)) \
+                   AND ($6::smallint = 0 OR $6 = 2) \
                    AND superseded_by IS NULL AND invalid_at IS NULL \
                    AND fts_content @@ {tsquery} \
-                 UNION ALL \
-                 SELECT 'observation', id, ts_rank(fts_content, {tsquery}) \
-                 FROM observation_memories \
-                 WHERE namespace_id = $1 AND ($3::uuid IS NULL OR agent_id = $3) \
-                   AND ($4::uuid IS NULL OR user_id = $4) \
-                   AND $5::uuid IS NULL \
-                   AND superseded_by IS NULL AND invalid_at IS NULL \
-                   AND fts_content @@ {tsquery} \
-             ) AS ranked \
+             ), ranked AS ( \
+                 SELECT memory_type, id, score, entity_preferred, \
+                        row_number() OVER (PARTITION BY entity_preferred \
+                            ORDER BY score DESC, CASE memory_type \
+                                WHEN 'episodic' THEN 0 WHEN 'semantic' THEN 1 ELSE 2 END, id) \
+                            AS entity_rank \
+                 FROM candidates \
+             ) \
+             SELECT memory_type, id, score FROM ranked \
+             WHERE $6::smallint <> 2 \
+                OR (entity_preferred AND entity_rank <= $8) \
+                OR (NOT entity_preferred AND entity_rank <= $9) \
              ORDER BY score DESC, CASE memory_type \
                  WHEN 'episodic' THEN 0 WHEN 'semantic' THEN 1 \
-                 WHEN 'procedural' THEN 2 ELSE 3 END, id \
+                 ELSE 2 END, id \
              LIMIT $2"
         );
         self.block_on(async {
             let mut conn = self.scoped_conn(scope.namespace_id).await?;
+            let (identity_mode, agent, user) = scope.identity_sql_parts();
+            let (entity_mode, entity) = scope.entity_sql_parts();
+            let (preferred_quota, broad_quota) = scope.entity_quotas(limit);
             let mut query = query_as::<Postgres, (String, Uuid, f32)>(AssertSqlSafe(sql))
                 .bind(scope.namespace_id)
                 .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-                .bind(scope.agent_id)
-                .bind(scope.user_id)
-                .bind(scope.entity_id);
+                .bind(identity_mode)
+                .bind(agent)
+                .bind(user)
+                .bind(entity_mode)
+                .bind(entity)
+                .bind(i64::try_from(preferred_quota).unwrap_or(i64::MAX))
+                .bind(i64::try_from(broad_quota).unwrap_or(i64::MAX));
             for token in &tokens {
                 query = query.bind(token);
             }
@@ -1783,6 +1836,10 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one typed union applies every scope mode before cursor order and the page limit"
+    )]
     fn page_memories(&self, request: &MemoryPageRequest) -> StorageResult<MemoryPage> {
         if !(1..=MEMORY_PAGE_SIZE).contains(&request.limit) {
             return Err(StorageError::BudgetExceeded(format!(
@@ -1799,41 +1856,59 @@ impl StorageTrait for PostgresBackend {
             .map_or(Uuid::nil(), |cursor| cursor.id);
         self.block_on(async {
             let mut conn = self.scoped_conn(request.scope.namespace_id).await?;
+            let (identity_mode, agent, user) = request.scope.identity_sql_parts();
+            let (entity_mode, entity) = request.scope.entity_sql_parts();
             let rows: Vec<(String, Uuid)> = query_as::<Postgres, _>(
                 r"SELECT memory_type, id FROM (
                        SELECT 0 AS type_order, 'episodic'::text AS memory_type, id
                        FROM episodic_memories
-                       WHERE namespace_id = $1 AND ($2::uuid IS NULL OR agent_id = $2)
-                         AND ($3::uuid IS NULL OR user_id = $3)
-                         AND ($4::uuid IS NULL OR about_entity = $4 OR source_entity = $4)
-                         AND ($5 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                       WHERE namespace_id = $1
+                         AND ($2::smallint = 0 OR ($2 = 1
+                              AND agent_id IS NOT DISTINCT FROM $3
+                              AND user_id IS NOT DISTINCT FROM $4)
+                              OR ($2 = 2 AND agent_id = $3))
+                         AND ($5::smallint = 0 OR $5 = 2 OR ($5 = 1
+                              AND (about_entity = $6 OR source_entity = $6)))
+                         AND ($7 OR (superseded_by IS NULL AND invalid_at IS NULL))
                        UNION ALL
                        SELECT 1, 'semantic', id FROM semantic_memories
-                       WHERE namespace_id = $1 AND ($2::uuid IS NULL OR agent_id = $2)
-                         AND ($3::uuid IS NULL OR user_id = $3)
-                         AND ($4::uuid IS NULL OR subject = $4 OR object_entity = $4)
-                         AND ($5 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                       WHERE namespace_id = $1
+                         AND ($2::smallint = 0 OR ($2 = 1
+                              AND agent_id IS NOT DISTINCT FROM $3
+                              AND user_id IS NOT DISTINCT FROM $4)
+                              OR ($2 = 2 AND agent_id = $3))
+                         AND ($5::smallint = 0 OR $5 = 2 OR ($5 = 1
+                              AND (subject = $6 OR object_entity = $6)))
+                         AND ($7 OR (superseded_by IS NULL AND invalid_at IS NULL))
                        UNION ALL
                        SELECT 2, 'procedural', id FROM procedural_memories
-                       WHERE namespace_id = $1 AND ($2::uuid IS NULL OR agent_id = $2)
-                         AND ($3::uuid IS NULL OR user_id = $3)
-                         AND $4::uuid IS NULL
-                         AND ($5 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                       WHERE namespace_id = $1
+                         AND ($2::smallint = 0 OR ($2 = 1
+                              AND agent_id IS NOT DISTINCT FROM $3
+                              AND user_id IS NOT DISTINCT FROM $4)
+                              OR ($2 = 2 AND agent_id = $3))
+                         AND ($5::smallint = 0 OR $5 = 2)
+                         AND ($7 OR (superseded_by IS NULL AND invalid_at IS NULL))
                        UNION ALL
                        SELECT 3, 'observation', id FROM observation_memories
-                       WHERE namespace_id = $1 AND ($2::uuid IS NULL OR agent_id = $2)
-                         AND ($3::uuid IS NULL OR user_id = $3)
-                         AND $4::uuid IS NULL
-                         AND ($5 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                       WHERE namespace_id = $1
+                         AND ($2::smallint = 0 OR ($2 = 1
+                              AND agent_id IS NOT DISTINCT FROM $3
+                              AND user_id IS NOT DISTINCT FROM $4)
+                              OR ($2 = 2 AND agent_id = $3))
+                         AND ($5::smallint = 0 OR $5 = 2)
+                         AND ($7 OR (superseded_by IS NULL AND invalid_at IS NULL))
                    ) AS memories
-                   WHERE type_order > $6 OR (type_order = $6 AND id > $7)
+                   WHERE type_order > $8 OR (type_order = $8 AND id > $9)
                    ORDER BY type_order, id
-                   LIMIT $8",
+                   LIMIT $10",
             )
             .bind(request.scope.namespace_id)
-            .bind(request.scope.agent_id)
-            .bind(request.scope.user_id)
-            .bind(request.scope.entity_id)
+            .bind(identity_mode)
+            .bind(agent)
+            .bind(user)
+            .bind(entity_mode)
+            .bind(entity)
             .bind(request.include_superseded)
             .bind(after_type)
             .bind(after_id)
@@ -3860,9 +3935,13 @@ mod tests {
         assert!(!POSTGRES_VECTOR_SEARCH_SQL.contains("observation_memories"));
         assert!(
             POSTGRES_VECTOR_SEARCH_SQL
-                .contains("ORDER BY distance ASC, memory_type ASC, memory_id ASC\nLIMIT $7")
+                .contains("ORDER BY distance ASC, memory_type ASC, memory_id ASC\nLIMIT $11")
         );
-        assert_eq!(POSTGRES_VECTOR_SEARCH_SQL.matches("LIMIT $7").count(), 1);
+        assert_eq!(POSTGRES_VECTOR_SEARCH_SQL.matches("LIMIT $11").count(), 1);
+        assert!(POSTGRES_VECTOR_SEARCH_SQL.contains("IS NOT DISTINCT FROM $5"));
+        assert!(POSTGRES_VECTOR_SEARCH_SQL.contains("IS NOT DISTINCT FROM $6"));
+        assert!(POSTGRES_VECTOR_SEARCH_SQL.contains("entity_rank <= $9"));
+        assert!(POSTGRES_VECTOR_SEARCH_SQL.contains("entity_rank <= $10"));
         assert!(!POSTGRES_VECTOR_SEARCH_SQL.contains("get_all_memories"));
     }
 
@@ -3882,6 +3961,26 @@ mod tests {
             !invalid_flag.contains("vector_norm"),
             "zero norm is valid and must not poison the whole result"
         );
+    }
+
+    #[test]
+    fn bounded_lexical_sql_applies_explicit_modes_and_quotas_before_limit() {
+        let source = include_str!("postgres.rs");
+        let start = source
+            .find("let tsquery = or_tsquery_fragment(10")
+            .expect("bounded lexical SQL start");
+        let end = source[start..]
+            .find("self.block_on(async")
+            .expect("bounded lexical SQL end");
+        let sql = &source[start..start + end];
+
+        assert!(sql.contains("IS NOT DISTINCT FROM $4"));
+        assert!(sql.contains("IS NOT DISTINCT FROM $5"));
+        assert!(sql.contains("$3 = 2 AND agent_id = $4"));
+        assert!(sql.contains("entity_rank <= $8"));
+        assert!(sql.contains("entity_rank <= $9"));
+        assert!(sql.find("entity_rank <= $9").unwrap() < sql.find("LIMIT $2").unwrap());
+        assert!(!sql.contains("observation_memories"));
     }
 
     #[test]

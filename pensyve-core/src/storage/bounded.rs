@@ -277,13 +277,36 @@ pub struct EmbeddingRecord {
     pub embedding: Vec<f32>,
 }
 
-/// Namespace and optional agent/user/entity constraints applied before retrieval.
+/// Identity predicate applied before every bounded retrieval limit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdentityScope {
+    /// Do not constrain agent or user identity.
+    Unscoped,
+    /// Match both columns with null-safe equality; `None` means SQL `NULL`.
+    ExactPair {
+        agent_id: Option<Uuid>,
+        user_id: Option<Uuid>,
+    },
+    /// Match an agent while allowing memories for any user (including `NULL`).
+    AgentAcrossUsers(Uuid),
+}
+
+/// Entity predicate applied before bounded retrieval limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntityScope {
+    Any,
+    Exact(Uuid),
+    /// Reserve four fifths of each first-stage cap for entity matches and one
+    /// fifth for non-matching broad context.
+    PreferWithBroad(Uuid),
+}
+
+/// Namespace plus explicit identity and entity constraints.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchScope {
     pub namespace_id: Uuid,
-    pub agent_id: Option<Uuid>,
-    pub user_id: Option<Uuid>,
-    pub entity_id: Option<Uuid>,
+    pub identity: IdentityScope,
+    pub entity: EntityScope,
 }
 
 impl SearchScope {
@@ -291,16 +314,50 @@ impl SearchScope {
     pub fn namespace(namespace_id: Uuid) -> Self {
         Self {
             namespace_id,
-            agent_id: None,
-            user_id: None,
-            entity_id: None,
+            identity: IdentityScope::Unscoped,
+            entity: EntityScope::Any,
         }
     }
 
     #[must_use]
     pub fn for_entity(mut self, entity_id: Uuid) -> Self {
-        self.entity_id = Some(entity_id);
+        self.entity = EntityScope::Exact(entity_id);
         self
+    }
+
+    #[must_use]
+    pub fn prefer_entity_with_broad(mut self, entity_id: Uuid) -> Self {
+        self.entity = EntityScope::PreferWithBroad(entity_id);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn identity_sql_parts(&self) -> (i16, Option<Uuid>, Option<Uuid>) {
+        match self.identity {
+            IdentityScope::Unscoped => (0, None, None),
+            IdentityScope::ExactPair { agent_id, user_id } => (1, agent_id, user_id),
+            IdentityScope::AgentAcrossUsers(agent_id) => (2, Some(agent_id), None),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn entity_sql_parts(&self) -> (i16, Option<Uuid>) {
+        match self.entity {
+            EntityScope::Any => (0, None),
+            EntityScope::Exact(entity_id) => (1, Some(entity_id)),
+            EntityScope::PreferWithBroad(entity_id) => (2, Some(entity_id)),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn entity_quotas(&self, limit: usize) -> (usize, usize) {
+        match self.entity {
+            EntityScope::PreferWithBroad(_) => {
+                let broad = limit / 5;
+                (limit - broad, broad)
+            }
+            EntityScope::Any | EntityScope::Exact(_) => (limit, limit),
+        }
     }
 }
 
