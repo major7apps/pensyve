@@ -10,6 +10,9 @@ use fastembed::{
     UserDefinedEmbeddingModel,
 };
 
+use crate::embedding_space::{
+    EmbeddingSpace, EmbeddingSpaceDescriptor, LocalArtifactFiles, MOCK_ALGORITHM_VERSION,
+};
 use crate::network_policy::{NetworkPolicy, NetworkRequiredError};
 
 // ---------------------------------------------------------------------------
@@ -77,6 +80,7 @@ const CACHE_ERROR_PREFIX: &str = "[embedding-cache] ";
 
 #[derive(Clone, Debug)]
 struct LocalEmbeddingFiles {
+    revision: String,
     config: PathBuf,
     onnx: PathBuf,
     special_tokens_map: PathBuf,
@@ -141,6 +145,7 @@ fn preflight_model_cache(
         }
     }
     Ok(LocalEmbeddingFiles {
+        revision,
         config: snapshot.join("config.json"),
         onnx,
         special_tokens_map: snapshot.join("special_tokens_map.json"),
@@ -397,7 +402,10 @@ fn build_pool_with_policy(
 
 pub struct OnnxEmbedder {
     dimensions: usize,
+    descriptor: Option<EmbeddingSpaceDescriptor>,
     inner: EmbedderInner,
+    space: OnceLock<EmbeddingSpace>,
+    space_init: Mutex<()>,
 }
 
 impl OnnxEmbedder {
@@ -462,10 +470,13 @@ impl OnnxEmbedder {
 
         Ok(Self {
             dimensions: dims,
+            descriptor: Some(embedding_space_descriptor(model_name, dims, &model_enum)),
             inner: EmbedderInner::Real {
                 pool,
                 next: AtomicUsize::new(0),
             },
+            space: OnceLock::new(),
+            space_init: Mutex::new(()),
         })
     }
 
@@ -508,6 +519,7 @@ impl OnnxEmbedder {
         let (model_enum, dims, hf_model_code, model_file) = resolve_model(model_name)?;
         Ok(Self {
             dimensions: dims,
+            descriptor: Some(embedding_space_descriptor(model_name, dims, &model_enum)),
             inner: EmbedderInner::Lazy {
                 model: model_enum,
                 hf_model_code,
@@ -517,6 +529,8 @@ impl OnnxEmbedder {
                 pool: Mutex::new(None),
                 next: AtomicUsize::new(0),
             },
+            space: OnceLock::new(),
+            space_init: Mutex::new(()),
         })
     }
 
@@ -613,7 +627,10 @@ impl OnnxEmbedder {
     pub fn new_mock(dimensions: usize) -> Self {
         Self {
             dimensions,
+            descriptor: None,
             inner: EmbedderInner::Mock,
+            space: OnceLock::new(),
+            space_init: Mutex::new(()),
         }
     }
 
@@ -655,6 +672,103 @@ impl OnnxEmbedder {
     /// Return the embedding dimensionality.
     pub fn dimensions(&self) -> usize {
         self.dimensions
+    }
+
+    /// Return the exact immutable embedding space used by this embedder.
+    ///
+    /// Real spaces are only constructed from an on-disk certified cache: a
+    /// model name and dimension never stand in for artifact provenance.
+    pub fn embedding_space(&self) -> EmbeddingResult<&EmbeddingSpace> {
+        if let Some(space) = self.space.get() {
+            return Ok(space);
+        }
+        let _guard = self.space_init.lock().map_err(|error| {
+            EmbeddingError::Inference(format!("embedding-space lock poisoned: {error}"))
+        })?;
+        if let Some(space) = self.space.get() {
+            return Ok(space);
+        }
+        let resolved = match &self.inner {
+            EmbedderInner::Mock => Ok(EmbeddingSpace::mock(
+                self.dimensions,
+                MOCK_ALGORITHM_VERSION,
+            )),
+            EmbedderInner::Real { .. } => self.resolve_exact_local_files().and_then(|files| {
+                EmbeddingSpace::from_hashed_files(
+                    self.descriptor
+                        .as_ref()
+                        .expect("real embedder has a descriptor"),
+                    &files,
+                )
+                .map_err(|error| {
+                    cache_model_load_error(format!(
+                        "failed to hash certified local embedding artifacts: {error}"
+                    ))
+                })
+            }),
+            EmbedderInner::Lazy { .. } => {
+                self.ensure_lazy_pool()?;
+                self.resolve_exact_local_files().and_then(|files| {
+                    EmbeddingSpace::from_hashed_files(
+                        self.descriptor
+                            .as_ref()
+                            .expect("lazy embedder has a descriptor"),
+                        &files,
+                    )
+                    .map_err(|error| {
+                        cache_model_load_error(format!(
+                            "failed to hash certified local embedding artifacts: {error}"
+                        ))
+                    })
+                })
+            }
+        }?;
+        self.space.set(resolved).map_err(|_| {
+            EmbeddingError::Inference("embedding space was concurrently initialized".into())
+        })?;
+        self.space.get().ok_or_else(|| {
+            EmbeddingError::Inference("embedding space initialization did not persist".into())
+        })
+    }
+
+    fn resolve_exact_local_files(&self) -> EmbeddingResult<LocalArtifactFiles> {
+        let descriptor = self.descriptor.as_ref().ok_or_else(|| {
+            EmbeddingError::Inference("mock embedder has no local artifacts".into())
+        })?;
+        let (_, _, hf_model_code, model_file) = resolve_model(&descriptor.model_name)?;
+        let cache_dir = resolved_fastembed_cache_dir()?;
+        let files = preflight_model_cache(&cache_dir, hf_model_code, model_file)
+            .map_err(cache_model_load_error)?;
+        Ok(LocalArtifactFiles {
+            revision: files.revision,
+            config: files.config,
+            onnx: files.onnx,
+            special_tokens_map: files.special_tokens_map,
+            tokenizer: files.tokenizer,
+            tokenizer_config: files.tokenizer_config,
+        })
+    }
+}
+
+fn embedding_space_descriptor(
+    model_name: &str,
+    dimensions: usize,
+    model: &EmbeddingModel,
+) -> EmbeddingSpaceDescriptor {
+    let pooling = match model {
+        EmbeddingModel::GTEBaseENV15 => "cls",
+        EmbeddingModel::AllMiniLML6V2 => "mean",
+        _ => "fastembed-default",
+    };
+    EmbeddingSpaceDescriptor {
+        model_name: model_name.to_owned(),
+        dimensions,
+        pooling: pooling.to_owned(),
+        normalized: true,
+        query_prefix: String::new(),
+        document_prefix: String::new(),
+        truncation: 512,
+        runtime: "fastembed-6.0.1/onnxruntime".to_owned(),
     }
 }
 

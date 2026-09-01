@@ -7,6 +7,7 @@ use crate::types::{
     SemanticMemory,
 };
 
+pub mod bounded;
 pub mod sqlite;
 
 #[cfg(feature = "postgres")]
@@ -30,6 +31,8 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("Storage context: {0}")]
     Context(String),
+    #[error("Unsupported storage capability: {0}")]
+    Unsupported(String),
     #[error("Mutex lock poisoned: {0}")]
     LockPoisoned(String),
 }
@@ -89,6 +92,28 @@ pub(crate) const MAX_FTS_QUERY_TOKENS: usize = 256;
 // ---------------------------------------------------------------------------
 
 pub trait StorageTrait: Send + Sync {
+    /// Bounded vector retrieval. Backends must opt in explicitly; the
+    /// fail-closed default never falls back to a namespace-wide bulk load.
+    fn search_vector(
+        &self,
+        _request: &bounded::VectorSearchRequest<'_>,
+    ) -> StorageResult<bounded::VectorSearchOutcome> {
+        Ok(bounded::VectorSearchOutcome::Unavailable(
+            bounded::SearchUnavailable::UnsupportedBackend,
+        ))
+    }
+
+    /// Bounded lexical candidate retrieval. Unlike legacy FTS hydration, this
+    /// default is an explicit unsupported error rather than an unbounded path.
+    fn search_lexical_hits(
+        &self,
+        _query: &str,
+        _scope: &bounded::SearchScope,
+        _limit: usize,
+    ) -> StorageResult<Vec<bounded::LexicalHit>> {
+        Err(StorageError::Unsupported("bounded lexical search".into()))
+    }
+
     /// Filesystem path of the underlying `SQLite` file, when the backend is
     /// disk-backed. Returns `None` for in-memory backends, the (future)
     /// Postgres backend, or any backend that has no single-file location.

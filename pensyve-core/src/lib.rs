@@ -5,6 +5,7 @@ pub mod config;
 pub mod consolidation;
 pub mod decay;
 pub mod embedding;
+pub mod embedding_space;
 pub mod extraction;
 pub mod feedback;
 pub mod gdpr;
