@@ -16,7 +16,7 @@ use sqlx_postgres::{PgConnection, PgPool, PgPoolOptions, PgRow, Postgres};
 use tokio::runtime::{Handle, Runtime};
 use uuid::Uuid;
 
-use crate::embedding_space::EmbeddingSpaceId;
+use crate::embedding_space::{EmbeddingSpace, EmbeddingSpaceId};
 use crate::types::{
     Edge, Entity, EntityKind, Episode, EpisodicMemory, Memory, Namespace, ObservationMemory,
     Outcome, ProceduralMemory, SemanticMemory,
@@ -31,8 +31,8 @@ use crate::graph::EdgeType;
 use crate::storage::bounded::{
     EmbeddingRecord, LexicalHit, MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS,
     MAX_VECTOR_HITS, MEMORY_PAGE_SIZE, MemoryPage, MemoryPageRequest, MemoryRef, MemoryType,
-    PageCursor, SearchScope, SearchUnavailable, VectorHit, VectorSearchOutcome,
-    VectorSearchRequest, lexical_query_tokens,
+    NamespaceEmbeddingPhase, NamespaceEmbeddingState, PageCursor, SearchScope, SearchUnavailable,
+    VectorHit, VectorSearchOutcome, VectorSearchRequest, lexical_query_tokens,
 };
 
 // ---------------------------------------------------------------------------
@@ -1440,6 +1440,71 @@ async fn load_memory_without_embedding_pg(
 // ---------------------------------------------------------------------------
 
 impl StorageTrait for PostgresBackend {
+    fn get_namespace_embedding_state(
+        &self,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<NamespaceEmbeddingState>> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let row = query_as::<
+                Postgres,
+                (
+                    Uuid,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    i64,
+                    DateTime<Utc>,
+                ),
+            >(
+                "SELECT state.namespace_id, state.active_read_space_id,
+                        state.target_space_id,
+                        active.canonical_identity_json,
+                        target.canonical_identity_json,
+                        state.state, state.barrier_sequence, state.updated_at
+                 FROM namespace_embedding_state AS state
+                 LEFT JOIN embedding_spaces AS active
+                   ON active.id = state.active_read_space_id
+                 LEFT JOIN embedding_spaces AS target
+                   ON target.id = state.target_space_id
+                 WHERE state.namespace_id = $1",
+            )
+            .bind(namespace_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let Some((
+                stored_namespace,
+                active_id,
+                target_id,
+                active,
+                target,
+                phase,
+                barrier_sequence,
+                updated_at,
+            )) = row
+            else {
+                return Ok(None);
+            };
+            let parse_space = |json: Option<String>| -> StorageResult<Option<EmbeddingSpace>> {
+                json.map(|value| serde_json::from_str(&value).map_err(StorageError::from))
+                    .transpose()
+            };
+            Ok(Some(NamespaceEmbeddingState {
+                namespace_id: stored_namespace,
+                active_read_space_id: active_id.map(EmbeddingSpaceId),
+                target_space_id: target_id.map(EmbeddingSpaceId),
+                active_read_space: parse_space(active)?,
+                target_space: parse_space(target)?,
+                phase: NamespaceEmbeddingPhase::parse(&phase)?,
+                barrier_sequence,
+                updated_at,
+            }))
+        })
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "one transaction keeps deadline, validation, exact query, and fail-closed decoding inseparable"

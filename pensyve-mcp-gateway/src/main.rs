@@ -20,10 +20,10 @@ use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::postgres::PostgresBackend;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::Namespace;
-use pensyve_core::vector::VectorIndex;
 
 use pensyve_mcp_tools::{PensyveMcpServer, PensyveState};
 
+use pensyve_mcp_gateway::admission::{MIB, RecallAdmission, enforce_recall_admission};
 use pensyve_mcp_gateway::auth::{self, AuthContext, AuthLayer};
 use pensyve_mcp_gateway::cache;
 use pensyve_mcp_gateway::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
@@ -41,7 +41,6 @@ struct InitResources {
     storage: Arc<dyn StorageTrait>,
     embedder: Arc<OnnxEmbedder>,
     namespace: Namespace,
-    vector_index: VectorIndex,
     retrieval_config: RetrievalConfig,
     strict_reranker: Option<Arc<Reranker>>,
 }
@@ -248,41 +247,6 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
     );
 
     let embedder = Arc::new(embedder);
-    let dimensions = embedder.dimensions();
-
-    let mut index = VectorIndex::new(dimensions, 1024);
-    if let Ok(memories) = storage.get_all_memories_by_namespace(namespace.id) {
-        let mut loaded = 0usize;
-        for memory in &memories {
-            // Observations are recall-time enrichment — they attach to
-            // top-k session groups via `recall_grouped::attach_observations_to_groups`
-            // and MUST NOT enter the RRF candidate pool.
-            if matches!(memory, pensyve_core::types::Memory::Observation(_)) {
-                continue;
-            }
-            let embedding = memory.embedding();
-            if !embedding.is_empty() {
-                let result = match memory {
-                    pensyve_core::types::Memory::Semantic(s) => {
-                        index.add_with_entity(memory.id(), embedding, s.subject)
-                    }
-                    pensyve_core::types::Memory::Episodic(e) => {
-                        index.add_with_entity(memory.id(), embedding, e.about_entity)
-                    }
-                    pensyve_core::types::Memory::Procedural(_) => index.add(memory.id(), embedding),
-                    pensyve_core::types::Memory::Observation(_) => unreachable!(),
-                };
-                if result.is_ok() {
-                    loaded += 1;
-                }
-            }
-        }
-        tracing::info!(
-            "Loaded {loaded}/{} memories into vector index",
-            memories.len()
-        );
-    }
-
     let retrieval_config = RetrievalConfig {
         default_limit: 5,
         max_candidates: 100,
@@ -298,7 +262,6 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
         storage,
         embedder,
         namespace,
-        vector_index: index,
         retrieval_config,
         strict_reranker,
     })
@@ -350,26 +313,24 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
     let snapshot_root = PensyveState::snapshot_root_for(&config.storage_path);
     let snapshot_retention = PensyveState::snapshot_retention_from_env();
     let tenant_mgr = if let Some(reranker) = res.strict_reranker {
-        TenantStateManager::new_with_preinitialized_reranker(
+        TenantStateManager::new_storage_backed_with_preinitialized_reranker(
             res.storage,
             res.embedder,
             res.retrieval_config,
             res.namespace,
-            res.vector_index,
             snapshot_root,
             snapshot_retention,
             reranker,
-        )
+        )?
     } else {
-        TenantStateManager::new(
+        TenantStateManager::new_storage_backed(
             res.storage,
             res.embedder,
             res.retrieval_config,
             res.namespace,
-            res.vector_index,
             snapshot_root,
             snapshot_retention,
-        )
+        )?
     };
 
     let ct = CancellationToken::new();
@@ -472,7 +433,9 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
     // Create per-tenant MCP service factory. In stateless mode, a new service
     // is created per request. The tenant ID is passed via tokio::task_local
     // (safe across .await thread migrations, unlike std::thread_local).
+    let recall_admission = Arc::new(RecallAdmission::new(8, 64 * MIB));
     let state_for_factory = app_state.clone();
+    let admission_for_factory = Arc::clone(&recall_admission);
     let mcp_service: StreamableHttpService<PensyveMcpServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || {
@@ -484,7 +447,11 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                     Some(id) => state_for_factory.tenant_mgr.get_tenant_state(&id)?,
                     None => state_for_factory.tenant_mgr.default_state(),
                 };
-                Ok(PensyveMcpServer::with_scope(pensyve_state, scope))
+                Ok(PensyveMcpServer::with_scope_and_admission(
+                    pensyve_state,
+                    scope,
+                    Arc::clone(&admission_for_factory),
+                ))
             },
             Arc::default(),
             {
@@ -531,6 +498,10 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                 .gzip(true)
                 .br(true),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            recall_admission,
+            enforce_recall_admission,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             tenant_and_usage_middleware,
@@ -833,6 +804,8 @@ async fn metrics_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     req: axum::http::Request<axum::body::Body>,
 ) -> axum::response::Response {
+    use std::fmt::Write as _;
+
     use axum::http::header;
 
     let not_found = || {
@@ -854,7 +827,17 @@ async fn metrics_handler(
         return not_found();
     }
 
-    let body = pensyve_core::observability::metrics().prometheus_text();
+    let mut body = pensyve_core::observability::metrics().prometheus_text();
+    let _ = writeln!(
+        body,
+        "# HELP pensyve_recall_overload_total Recall requests rejected by bounded admission."
+    );
+    let _ = writeln!(body, "# TYPE pensyve_recall_overload_total counter");
+    let _ = writeln!(
+        body,
+        "pensyve_recall_overload_total {}",
+        pensyve_mcp_tools::recall_overload_count()
+    );
     axum::response::Response::builder()
         .header(
             header::CONTENT_TYPE,

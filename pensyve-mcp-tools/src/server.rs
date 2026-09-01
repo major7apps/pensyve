@@ -17,7 +17,7 @@ use crate::params::{
     AccountParams, EpisodeEndParams, EpisodeStartParams, ForgetMemoryParams, ForgetParams,
     InspectParams, ObserveParams, RecallParams, RememberParams, StatusParams,
 };
-use crate::state::PensyveState;
+use crate::state::{MIB, PensyveState, RecallAdmission, VectorRuntime};
 
 fn memory_type_name(memory: &Memory) -> &'static str {
     memory.type_name()
@@ -61,6 +61,7 @@ fn get_or_create_entity(
 pub struct PensyveMcpServer {
     pub state: Arc<PensyveState>,
     pub scope: String,
+    admission: Arc<RecallAdmission>,
     #[expect(dead_code, reason = "used by #[tool_router] macro via rmcp framework")]
     tool_router: ToolRouter<Self>,
 }
@@ -68,14 +69,28 @@ pub struct PensyveMcpServer {
 impl PensyveMcpServer {
     /// Create a new server with the given state and default `mcp` scope.
     pub fn new(state: Arc<PensyveState>) -> Self {
-        Self::with_scope(state, "mcp".to_string())
+        Self::with_scope_and_admission(
+            state,
+            "mcp".to_string(),
+            Arc::new(RecallAdmission::new(8, 64 * MIB)),
+        )
     }
 
     /// Create a new server with an explicit scope for tool-level access control.
     pub fn with_scope(state: Arc<PensyveState>, scope: String) -> Self {
+        Self::with_scope_and_admission(state, scope, Arc::new(RecallAdmission::new(8, 64 * MIB)))
+    }
+
+    /// Create a server that shares the gateway's process-wide recall budget.
+    pub fn with_scope_and_admission(
+        state: Arc<PensyveState>,
+        scope: String,
+        admission: Arc<RecallAdmission>,
+    ) -> Self {
         Self {
             state,
             scope,
+            admission,
             tool_router: Self::tool_router(),
         }
     }
@@ -126,6 +141,16 @@ impl PensyveMcpServer {
         let limit = params.limit.unwrap_or(5).clamp(1, 100) as usize;
         let state = &self.state;
 
+        let _reservation = self.admission.try_acquire(8 * MIB).map_err(|_| {
+            tracing::warn!(
+                event = "recall_overload",
+                surface = "mcp",
+                reserved_bytes = self.admission.reserved_bytes(),
+                "recall_overload"
+            );
+            "Retryable internal error: recall overloaded; retry after 1 second".to_string()
+        })?;
+
         // Resolve the optional entity parameter to an entity UUID for entity-affinity ranking.
         let target_entity = if let Some(ref entity_name) = params.entity {
             state
@@ -140,12 +165,18 @@ impl PensyveMcpServer {
 
         // Embed the query BEFORE acquiring the read lock — avoids holding the
         // vector index lock while waiting on the embedding Mutex.
-        let embedder = state.embedder.clone();
-        let query_text = params.query.clone();
-        let query_embedding = tokio::task::spawn_blocking(move || embedder.embed(&query_text))
-            .await
-            .ok()
-            .and_then(Result::ok);
+        let semantic_enabled = matches!(state.vector_runtime, VectorRuntime::InMemory(_))
+            || state.vector_runtime.semantic_space().is_some();
+        let query_embedding = if semantic_enabled {
+            let embedder = state.embedder.clone();
+            let query_text = params.query.clone();
+            tokio::task::spawn_blocking(move || embedder.embed(&query_text))
+                .await
+                .ok()
+                .and_then(Result::ok)
+        } else {
+            None
+        };
 
         // Resolve the reranker off the runtime too, and before the read
         // lock: first resolution synchronously loads a ~280MB ONNX model
@@ -165,27 +196,46 @@ impl PensyveMcpServer {
         });
 
         // Hold the read lock only for the retrieval phase, not embedding or serialization.
-        let result = {
-            let vector_index = state.vector_index.read().await;
-            let mut engine = RecallEngine::new(
-                state.storage.as_ref(),
-                &state.embedder,
-                &vector_index,
-                &state.retrieval_config,
-            );
-            if let Some(r) = reranker.as_deref() {
-                engine = engine.with_reranker(r);
-            }
-            engine
-                .recall_with_embedding(
+        let result = match &state.vector_runtime {
+            VectorRuntime::InMemory(vector_index) => {
+                let vector_index = vector_index.read().await;
+                let mut engine = RecallEngine::new(
+                    state.storage.as_ref(),
+                    &state.embedder,
+                    &vector_index,
+                    &state.retrieval_config,
+                );
+                if let Some(r) = reranker.as_deref() {
+                    engine = engine.with_reranker(r);
+                }
+                engine.recall_with_embedding(
                     &params.query,
                     query_embedding.as_deref(),
                     state.namespace.id,
                     limit,
                     target_entity,
                 )
-                .map_err(|e| format!("Error recalling memories: {e}"))?
+            }
+            VectorRuntime::StorageBacked { .. } => {
+                let mut engine = RecallEngine::new_storage_backed_with_vector_space(
+                    state.storage.as_ref(),
+                    &state.embedder,
+                    state.vector_runtime.semantic_space(),
+                    &state.retrieval_config,
+                );
+                if let Some(r) = reranker.as_deref() {
+                    engine = engine.with_reranker(r);
+                }
+                engine.recall_with_embedding(
+                    &params.query,
+                    query_embedding.as_deref(),
+                    state.namespace.id,
+                    limit,
+                    target_entity,
+                )
+            }
         };
+        let result = result.map_err(|e| format!("Error recalling memories: {e}"))?;
 
         let memories: Vec<serde_json::Value> = result
             .memories
@@ -272,9 +322,11 @@ impl PensyveMcpServer {
 
         match embed_result {
             Ok(Ok(embedding)) => {
-                let mut vector_index = state.vector_index.write().await;
-                if let Err(err) = vector_index.add_with_entity(mem.id, &embedding, entity.id) {
-                    tracing::warn!("Failed to add to vector index: {err}");
+                if let VectorRuntime::InMemory(vector_index) = &state.vector_runtime {
+                    let mut vector_index = vector_index.write().await;
+                    if let Err(err) = vector_index.add_with_entity(mem.id, &embedding, entity.id) {
+                        tracing::warn!("Failed to add to vector index: {err}");
+                    }
                 }
                 mem.embedding = embedding;
             }
@@ -544,10 +596,13 @@ impl PensyveMcpServer {
 
         match embed_result {
             Ok(Ok(embedding)) => {
-                let mut vector_index = state.vector_index.write().await;
-                if let Err(err) = vector_index.add_with_entity(mem.id, &embedding, about_entity.id)
-                {
-                    tracing::warn!("Failed to add to vector index: {err}");
+                if let VectorRuntime::InMemory(vector_index) = &state.vector_runtime {
+                    let mut vector_index = vector_index.write().await;
+                    if let Err(err) =
+                        vector_index.add_with_entity(mem.id, &embedding, about_entity.id)
+                    {
+                        tracing::warn!("Failed to add to vector index: {err}");
+                    }
                 }
                 mem.embedding = embedding;
             }
@@ -660,8 +715,10 @@ impl PensyveMcpServer {
             // The snapshot holds exactly the rows the delete removed, so it is
             // also the authoritative list for vector-index cleanup — O(1) per
             // entry, not an O(n) rebuild.
-            if !snapshot.memories.is_empty() {
-                let mut vi = task_state.vector_index.write().await;
+            if !snapshot.memories.is_empty()
+                && let VectorRuntime::InMemory(vector_index) = &task_state.vector_runtime
+            {
+                let mut vi = vector_index.write().await;
                 for id in snapshot.memory_ids() {
                     let _ = vi.remove(id);
                 }
@@ -759,8 +816,8 @@ impl PensyveMcpServer {
             .delete_memory_by_id_in_namespace(memory_id, state.namespace.id)
             .map_err(|err| format!("Error deleting memory: {err}"))?;
 
-        if deleted {
-            let mut vi = state.vector_index.write().await;
+        if deleted && let VectorRuntime::InMemory(vector_index) = &state.vector_runtime {
+            let mut vi = vector_index.write().await;
             let _ = vi.remove(memory_id);
         }
 
@@ -963,9 +1020,9 @@ impl PensyveMcpServer {
             }
         }
 
-        let vector_count = {
-            let vi = state.vector_index.read().await;
-            vi.len()
+        let vector_count = match &state.vector_runtime {
+            VectorRuntime::InMemory(vector_index) => vector_index.read().await.len(),
+            VectorRuntime::StorageBacked { .. } => 0,
         };
 
         serde_json::to_string(&serde_json::json!({
@@ -1016,7 +1073,6 @@ impl PensyveMcpServer {
     }
 }
 
-#[allow(clippy::unused_async_trait_impl)] // rmcp generates the async handler surface
 #[tool_handler]
 impl ServerHandler for PensyveMcpServer {
     fn get_info(&self) -> ServerInfo {
@@ -1092,7 +1148,7 @@ mod tests {
         let state = Arc::new(PensyveState {
             storage: Arc::new(storage) as Arc<dyn StorageTrait>,
             embedder: Arc::new(embedder),
-            vector_index: RwLock::new(VectorIndex::new(dimensions, 16)),
+            vector_runtime: VectorRuntime::InMemory(RwLock::new(VectorIndex::new(dimensions, 16))),
             namespace,
             retrieval_config: test_retrieval_config(),
             is_remote,
@@ -1114,6 +1170,36 @@ mod tests {
             .get_all_memories_by_namespace_including_superseded(server.state.namespace.id)
             .unwrap()
             .len()
+    }
+
+    #[tokio::test]
+    async fn recall_overload_is_a_retryable_mcp_internal_error_before_entity_lookup() {
+        let snapshot_root = tempfile::tempdir().unwrap();
+        let fixture = forget_fixture(snapshot_root.path().join("snapshots"), false);
+        let admission = Arc::new(RecallAdmission::new(1, 8 * MIB));
+        let _held = admission.acquire(8 * MIB).await.unwrap();
+        let server = PensyveMcpServer::with_scope_and_admission(
+            Arc::clone(&fixture.server.state),
+            "mcp".to_string(),
+            Arc::clone(&admission),
+        );
+
+        let error = server
+            .recall(Parameters(RecallParams {
+                query: "must not embed".to_string(),
+                entity: Some("missing-entity".to_string()),
+                types: None,
+                limit: None,
+                min_confidence: None,
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Retryable internal error: recall overloaded; retry after 1 second"
+        );
+        assert_eq!(admission.overload_count(), 1);
     }
 
     #[tokio::test]
@@ -1485,7 +1571,7 @@ mod tests {
             servers.push(PensyveMcpServer::new(Arc::new(PensyveState {
                 storage: storage.clone(),
                 embedder: embedder.clone(),
-                vector_index: RwLock::new(VectorIndex::new(768, 1024)),
+                vector_runtime: VectorRuntime::InMemory(RwLock::new(VectorIndex::new(768, 1024))),
                 namespace,
                 retrieval_config: test_retrieval_config(),
                 is_remote: true,

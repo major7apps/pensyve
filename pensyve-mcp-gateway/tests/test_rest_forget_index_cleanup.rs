@@ -35,6 +35,7 @@ use pensyve_mcp_gateway::rest;
 use pensyve_mcp_gateway::tenant::TenantStateManager;
 use pensyve_mcp_gateway::usage::UsageReporter;
 use pensyve_mcp_gateway::usage_counter::UsageCounter;
+use pensyve_mcp_tools::{PensyveState, VectorRuntime};
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -42,6 +43,13 @@ use uuid::Uuid;
 
 const TEST_TENANT: &str = "test-index-cleanup-tenant";
 const DIMENSIONS: usize = 768;
+
+fn vector_index(state: &PensyveState) -> &tokio::sync::RwLock<VectorIndex> {
+    match &state.vector_runtime {
+        VectorRuntime::InMemory(index) => index,
+        VectorRuntime::StorageBacked { .. } => panic!("compatibility fixture must be in-memory"),
+    }
+}
 
 fn retrieval_config() -> RetrievalConfig {
     RetrievalConfig {
@@ -79,7 +87,7 @@ fn app_state(dir: &TempDir, snapshot_root: PathBuf) -> Arc<AppState> {
         .save_namespace(&namespace)
         .expect("save default namespace");
 
-    let tenant_mgr = TenantStateManager::new(
+    let tenant_mgr = TenantStateManager::new_in_memory(
         storage,
         Arc::new(OnnxEmbedder::new_mock(DIMENSIONS)),
         retrieval_config(),
@@ -212,7 +220,7 @@ async fn seed(state: &AppState) -> Seeded {
         .expect("save unrelated semantic");
 
     {
-        let mut index = ps.vector_index.write().await;
+        let mut index = vector_index(&ps).write().await;
         index
             .add_with_entity(
                 source_side.id,
@@ -247,7 +255,7 @@ async fn assert_all_indexed(state: &AppState, seeded: &Seeded) {
         .tenant_mgr
         .get_tenant_state(TEST_TENANT)
         .expect("tenant state");
-    let index = ps.vector_index.read().await;
+    let index = vector_index(&ps).read().await;
     for (label, id) in &seeded.deletable {
         assert!(
             index.get(*id).is_some(),
@@ -263,7 +271,7 @@ async fn assert_deletable_gone_from_index(state: &AppState, seeded: &Seeded) {
         .tenant_mgr
         .get_tenant_state(TEST_TENANT)
         .expect("tenant state");
-    let index = ps.vector_index.read().await;
+    let index = vector_index(&ps).read().await;
     for (label, id) in &seeded.deletable {
         assert!(
             index.get(*id).is_none(),

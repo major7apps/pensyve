@@ -69,7 +69,7 @@ fn make_mgr(dir: &tempfile::TempDir) -> Arc<TenantStateManager> {
     storage.save_namespace(&ns).expect("save default ns");
     let embedder = Arc::new(OnnxEmbedder::new_mock(768));
     let idx = VectorIndex::new(768, 1024);
-    let mgr = Arc::new(TenantStateManager::new(
+    let mgr = Arc::new(TenantStateManager::new_in_memory(
         storage,
         embedder,
         RetrievalConfig {

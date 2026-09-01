@@ -4,7 +4,10 @@ mod state;
 
 pub use params::*;
 pub use server::PensyveMcpServer;
-pub use state::PensyveState;
+pub use state::{
+    MIB, PensyveState, RecallAdmission, RecallOverloaded, RecallReservation, VectorRuntime,
+    recall_overload_count,
+};
 
 /// Tenant identifier inserted into HTTP request extensions by the gateway's
 /// auth middleware. Tool handlers use this to resolve per-tenant namespaces.

@@ -59,7 +59,7 @@ fn app_state(dir: &TempDir) -> Arc<AppState> {
         .save_namespace(&namespace)
         .expect("save default namespace");
 
-    let tenant_mgr = TenantStateManager::new(
+    let tenant_mgr = TenantStateManager::new_in_memory(
         storage,
         Arc::new(OnnxEmbedder::new_mock(768)),
         retrieval_config(),

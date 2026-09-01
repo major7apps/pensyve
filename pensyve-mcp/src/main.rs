@@ -2,18 +2,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
-use rmcp::ServiceExt;
-use tokio::sync::RwLock;
-
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::{OnnxEmbedder, is_model_available_offline};
 use pensyve_core::network_policy::NetworkPolicy;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::Namespace;
-use pensyve_core::vector::VectorIndex;
-
-use pensyve_mcp_tools::{PensyveMcpServer, PensyveState};
+use pensyve_mcp_tools::{PensyveMcpServer, PensyveState, VectorRuntime};
+use rmcp::ServiceExt;
 
 fn resolve_storage_path() -> PathBuf {
     if let Ok(path) = std::env::var("PENSYVE_PATH") {
@@ -202,50 +198,13 @@ fn build_eager_embedder(stored_dims: Option<usize>) -> anyhow::Result<OnnxEmbedd
 /// non-observation memory with a non-empty embedding. `None` for a fresh
 /// namespace. Drives model choice in `build_embedder` so we never pick a
 /// model that orphans the stored vectors.
+#[cfg(test)]
 fn stored_embedding_dims(memories: &[pensyve_core::types::Memory]) -> Option<usize> {
     memories
         .iter()
         .filter(|m| !matches!(m, pensyve_core::types::Memory::Observation(_)))
         .map(|m| m.embedding().len())
         .find(|&len| len > 0)
-}
-
-fn build_vector_index(memories: &[pensyve_core::types::Memory], dimensions: usize) -> VectorIndex {
-    let mut index = VectorIndex::new(dimensions, 1024);
-
-    let mut loaded = 0usize;
-    for memory in memories {
-        // Observations are recall-time enrichment — they attach to
-        // top-k session groups via `recall_grouped::attach_observations_to_groups`
-        // and MUST NOT enter the RRF candidate pool.
-        if matches!(memory, pensyve_core::types::Memory::Observation(_)) {
-            continue;
-        }
-        let embedding = memory.embedding();
-        if !embedding.is_empty() {
-            let result = match memory {
-                pensyve_core::types::Memory::Semantic(s) => {
-                    index.add_with_entity(memory.id(), embedding, s.subject)
-                }
-                pensyve_core::types::Memory::Episodic(e) => {
-                    index.add_with_entity(memory.id(), embedding, e.about_entity)
-                }
-                pensyve_core::types::Memory::Procedural(_) => index.add(memory.id(), embedding),
-                pensyve_core::types::Memory::Observation(_) => unreachable!(),
-            };
-            if let Err(e) = result {
-                tracing::warn!("Skipping memory in index load: {e}");
-            } else {
-                loaded += 1;
-            }
-        }
-    }
-    tracing::info!(
-        "Loaded {loaded}/{} memories into vector index",
-        memories.len()
-    );
-
-    index
 }
 
 #[tokio::main]
@@ -279,22 +238,13 @@ async fn main() -> Result<()> {
         Err(e) => return Err(anyhow::anyhow!("Storage error: {e}")),
     };
 
-    // Fetch memories once: they drive both the embedder's model choice
-    // (existing embedding dimensionality wins) and the vector index build.
-    let memories = storage
-        .get_all_memories_by_namespace(namespace.id)
-        .unwrap_or_else(|e| {
-            tracing::warn!("Failed to load memories for vector index: {e}");
-            Vec::new()
-        });
-
-    // Initialize embedder — lazy by default (see `build_embedder`).
-    let embedder = build_embedder(stored_embedding_dims(&memories))?;
-
-    let dimensions = embedder.dimensions();
-
-    // Load existing embeddings into the vector index.
-    let vector_index = build_vector_index(&memories, dimensions);
+    // Initialize the configured runtime without hydrating the namespace corpus.
+    // The persisted namespace embedding state is the read-side activation gate.
+    let embedder = build_embedder(None)?;
+    let storage = Arc::new(storage) as Arc<dyn StorageTrait>;
+    let vector_runtime =
+        VectorRuntime::resolve_storage_backed(storage.as_ref(), &embedder, namespace.id)
+            .map_err(anyhow::Error::msg)?;
 
     let retrieval_config = RetrievalConfig {
         default_limit: 5,
@@ -308,9 +258,9 @@ async fn main() -> Result<()> {
     };
 
     let state = Arc::new(PensyveState {
-        storage: Arc::new(storage) as Arc<dyn StorageTrait>,
+        storage,
         embedder: Arc::new(embedder),
-        vector_index: RwLock::new(vector_index),
+        vector_runtime,
         namespace,
         retrieval_config,
         is_remote: false,

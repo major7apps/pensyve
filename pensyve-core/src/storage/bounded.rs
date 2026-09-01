@@ -1,8 +1,9 @@
 use std::time::Instant;
 
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::embedding_space::EmbeddingSpaceId;
+use crate::embedding_space::{EmbeddingSpace, EmbeddingSpaceId};
 use crate::storage::{StorageError, StorageResult};
 use crate::types::Memory;
 
@@ -275,6 +276,53 @@ pub struct EmbeddingRecord {
     pub embedding_space_id: EmbeddingSpaceId,
     pub source_sha256: String,
     pub embedding: Vec<f32>,
+}
+
+/// Read-side lifecycle for one namespace's embedding generations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NamespaceEmbeddingPhase {
+    LexicalOnly,
+    Backfilling,
+    Ready,
+    Active,
+}
+
+impl NamespaceEmbeddingPhase {
+    pub(crate) fn parse(value: &str) -> StorageResult<Self> {
+        match value {
+            "lexical_only" => Ok(Self::LexicalOnly),
+            "backfilling" => Ok(Self::Backfilling),
+            "ready" => Ok(Self::Ready),
+            "active" => Ok(Self::Active),
+            other => Err(StorageError::Context(format!(
+                "unknown namespace embedding phase {other:?}"
+            ))),
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LexicalOnly => "lexical_only",
+            Self::Backfilling => "backfilling",
+            Self::Ready => "ready",
+            Self::Active => "active",
+        }
+    }
+}
+
+/// Namespace-scoped read view of embedding migration state and its immutable
+/// space identities. Mutation and cutover are intentionally separate APIs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamespaceEmbeddingState {
+    pub namespace_id: Uuid,
+    pub active_read_space_id: Option<EmbeddingSpaceId>,
+    pub target_space_id: Option<EmbeddingSpaceId>,
+    pub active_read_space: Option<EmbeddingSpace>,
+    pub target_space: Option<EmbeddingSpace>,
+    pub phase: NamespaceEmbeddingPhase,
+    pub barrier_sequence: i64,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Identity predicate applied before every bounded retrieval limit.

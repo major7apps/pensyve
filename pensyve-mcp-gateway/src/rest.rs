@@ -23,7 +23,7 @@ use pensyve_core::types::{
     ContentType, Entity, EntityKind, Episode, EpisodicMemory, Memory, Outcome, SemanticMemory,
 };
 use pensyve_core::vector::VectorIndex;
-use pensyve_mcp_tools::PensyveState;
+use pensyve_mcp_tools::{PensyveState, VectorRuntime};
 
 use crate::AppState;
 
@@ -681,8 +681,8 @@ async fn perform_supersession(
         ));
     }
 
-    {
-        let mut vector_index = ps.vector_index.write().await;
+    if let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime {
+        let mut vector_index = vector_index.write().await;
         let add_result = match &new {
             Memory::Semantic(memory) => {
                 vector_index.add_with_entity(new_id, &memory.embedding, memory.subject)
@@ -691,7 +691,6 @@ async fn perform_supersession(
                 vector_index.add_with_entity(new_id, &memory.embedding, memory.about_entity)
             }
             Memory::Procedural(memory) => vector_index.add(new_id, &memory.embedding),
-            // Observations enrich grouped recall and never enter the RRF vector pool.
             Memory::Observation(_) => Ok(()),
         };
         if let Err(err) = add_result {
@@ -827,12 +826,18 @@ async fn recall(
 
     // Embed the query BEFORE acquiring the read lock — embedding serializes on
     // a Mutex, so holding the vector index lock while waiting would block reads.
-    let embedder = ps.embedder.clone();
-    let query_text = body.query.clone();
-    let query_embedding = tokio::task::spawn_blocking(move || embedder.embed(&query_text))
-        .await
-        .ok()
-        .and_then(Result::ok);
+    let semantic_enabled = matches!(ps.vector_runtime, VectorRuntime::InMemory(_))
+        || ps.vector_runtime.semantic_space().is_some();
+    let query_embedding = if semantic_enabled {
+        let embedder = ps.embedder.clone();
+        let query_text = body.query.clone();
+        tokio::task::spawn_blocking(move || embedder.embed(&query_text))
+            .await
+            .ok()
+            .and_then(Result::ok)
+    } else {
+        None
+    };
 
     // Resolve the reranker off the runtime too, and before the read lock:
     // first resolution synchronously loads a ~280MB ONNX model (or blocks on
@@ -853,32 +858,51 @@ async fn recall(
             });
 
     // Hold read lock only for retrieval — allows concurrent recalls.
-    let result = {
-        let vector_index = ps.vector_index.read().await;
-        let mut engine = RecallEngine::new(
-            ps.storage.as_ref(),
-            &ps.embedder,
-            &vector_index,
-            &ps.retrieval_config,
-        );
-        if let Some(r) = reranker.as_deref() {
-            engine = engine.with_reranker(r);
-        }
-        engine
-            .recall_with_embedding(
+    let result = match &ps.vector_runtime {
+        VectorRuntime::InMemory(vector_index) => {
+            let vector_index = vector_index.read().await;
+            let mut engine = RecallEngine::new(
+                ps.storage.as_ref(),
+                &ps.embedder,
+                &vector_index,
+                &ps.retrieval_config,
+            );
+            if let Some(r) = reranker.as_deref() {
+                engine = engine.with_reranker(r);
+            }
+            engine.recall_with_embedding(
                 &body.query,
                 query_embedding.as_deref(),
                 ps.namespace.id,
                 limit,
                 entity_id,
             )
-            .map_err(|e| {
-                RestError(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Recall error: {e}"),
-                )
-            })?
+        }
+        VectorRuntime::StorageBacked { .. } => {
+            let mut engine = RecallEngine::new_storage_backed_with_vector_space(
+                ps.storage.as_ref(),
+                &ps.embedder,
+                ps.vector_runtime.semantic_space(),
+                &ps.retrieval_config,
+            );
+            if let Some(r) = reranker.as_deref() {
+                engine = engine.with_reranker(r);
+            }
+            engine.recall_with_embedding(
+                &body.query,
+                query_embedding.as_deref(),
+                ps.namespace.id,
+                limit,
+                entity_id,
+            )
+        }
     };
+    let result = result.map_err(|e| {
+        RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Recall error: {e}"),
+        )
+    })?;
 
     let (memories, returned_memories) =
         filter_recall_results(&result, body.types.as_deref(), body.min_confidence);
@@ -922,6 +946,10 @@ async fn recall(
 /// `RecallGroupedGroup`s instead of a flat memory list. The TS and Python
 /// SDKs map this endpoint to `recallGrouped` / `recall_grouped`; a Go SDK
 /// equivalent is a follow-up.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one handler keeps request validation, bounded dispatch, and response shaping together"
+)]
 async fn recall_grouped(
     State(state): State<Arc<AppState>>,
     axum::Extension(auth_ctx): axum::Extension<AuthContext>,
@@ -934,12 +962,18 @@ async fn recall_grouped(
 
     // Embed the query off the lock — embedding serializes on a Mutex, so
     // holding the vector index lock during embedding would block reads.
-    let embedder = ps.embedder.clone();
-    let query_text = body.query.clone();
-    let query_embedding = tokio::task::spawn_blocking(move || embedder.embed(&query_text))
-        .await
-        .ok()
-        .and_then(Result::ok);
+    let semantic_enabled = matches!(ps.vector_runtime, VectorRuntime::InMemory(_))
+        || ps.vector_runtime.semantic_space().is_some();
+    let query_embedding = if semantic_enabled {
+        let embedder = ps.embedder.clone();
+        let query_text = body.query.clone();
+        tokio::task::spawn_blocking(move || embedder.embed(&query_text))
+            .await
+            .ok()
+            .and_then(Result::ok)
+    } else {
+        None
+    };
 
     // Resolve the reranker off the runtime too, and before the read lock —
     // see the identical rationale in `recall` above.
@@ -955,31 +989,52 @@ async fn recall_grouped(
             });
 
     // Hold the read lock only for the actual retrieval call.
-    let result = {
-        let vector_index = ps.vector_index.read().await;
-        let mut engine = RecallEngine::new(
-            ps.storage.as_ref(),
-            &ps.embedder,
-            &vector_index,
-            &ps.retrieval_config,
-        );
-        if let Some(r) = reranker.as_deref() {
-            engine = engine.with_reranker(r);
-        }
-        let flat = engine
-            .recall_with_embedding(
+    let flat = match &ps.vector_runtime {
+        VectorRuntime::InMemory(vector_index) => {
+            let vector_index = vector_index.read().await;
+            let mut engine = RecallEngine::new(
+                ps.storage.as_ref(),
+                &ps.embedder,
+                &vector_index,
+                &ps.retrieval_config,
+            );
+            if let Some(r) = reranker.as_deref() {
+                engine = engine.with_reranker(r);
+            }
+            engine.recall_with_embedding(
                 &body.query,
                 query_embedding.as_deref(),
                 ps.namespace.id,
                 limit,
                 None,
             )
-            .map_err(|e| {
-                RestError(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Recall error: {e}"),
-                )
-            })?;
+        }
+        VectorRuntime::StorageBacked { .. } => {
+            let mut engine = RecallEngine::new_storage_backed_with_vector_space(
+                ps.storage.as_ref(),
+                &ps.embedder,
+                ps.vector_runtime.semantic_space(),
+                &ps.retrieval_config,
+            );
+            if let Some(r) = reranker.as_deref() {
+                engine = engine.with_reranker(r);
+            }
+            engine.recall_with_embedding(
+                &body.query,
+                query_embedding.as_deref(),
+                ps.namespace.id,
+                limit,
+                None,
+            )
+        }
+    }
+    .map_err(|e| {
+        RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Recall error: {e}"),
+        )
+    })?;
+    let result = {
         let groups =
             pensyve_core::recall_grouped::group_by_session(flat.memories, order, max_groups);
         // Attach per-episode observations to the top-k groups. Must mirror
@@ -1065,9 +1120,11 @@ async fn remember(
 
     match embed_result {
         Ok(Ok(embedding)) => {
-            let mut vector_index = ps.vector_index.write().await;
-            if let Err(err) = vector_index.add_with_entity(mem.id, &embedding, entity.id) {
-                tracing::warn!("Failed to add to vector index: {err}");
+            if let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime {
+                let mut vector_index = vector_index.write().await;
+                if let Err(err) = vector_index.add_with_entity(mem.id, &embedding, entity.id) {
+                    tracing::warn!("Failed to add to vector index: {err}");
+                }
             }
             mem.embedding = embedding;
         }
@@ -1231,8 +1288,10 @@ async fn forget_entity(
         // The snapshot holds exactly the rows the delete removed, so it is
         // also the authoritative list for vector-index cleanup — O(1) per
         // entry, not O(n) rebuild.
-        if forgotten_count > 0 {
-            let mut vi = ps_task.vector_index.write().await;
+        if forgotten_count > 0
+            && let VectorRuntime::InMemory(vector_index) = &ps_task.vector_runtime
+        {
+            let mut vi = vector_index.write().await;
             for id in snapshot.memory_ids() {
                 let _ = vi.remove(id);
             }
@@ -1313,8 +1372,8 @@ async fn delete_memory(
     }
 
     // Remove single entry from vector index — O(1).
-    {
-        let mut vi = ps.vector_index.write().await;
+    if let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime {
+        let mut vi = vector_index.write().await;
         let _ = vi.remove(memory_id);
     }
 
@@ -1342,12 +1401,11 @@ async fn purge_all_memories(
     })?;
 
     // Clear the vector index.
-    let dims = {
-        let vi = ps.vector_index.read().await;
-        vi.dimensions()
-    };
-    let mut vi = ps.vector_index.write().await;
-    *vi = VectorIndex::new(dims, 1024);
+    if let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime {
+        let dims = vector_index.read().await.dimensions();
+        let mut vi = vector_index.write().await;
+        *vi = VectorIndex::new(dims, 1024);
+    }
 
     Ok(Json(serde_json::json!({ "deleted": deleted_count })))
 }
@@ -1684,9 +1742,12 @@ async fn observe(
 
     match embed_result {
         Ok(Ok(embedding)) => {
-            let mut vector_index = ps.vector_index.write().await;
-            if let Err(err) = vector_index.add_with_entity(mem.id, &embedding, about_entity.id) {
-                tracing::warn!("Failed to add to vector index: {err}");
+            if let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime {
+                let mut vector_index = vector_index.write().await;
+                if let Err(err) = vector_index.add_with_entity(mem.id, &embedding, about_entity.id)
+                {
+                    tracing::warn!("Failed to add to vector index: {err}");
+                }
             }
             mem.embedding = embedding;
         }
@@ -1962,9 +2023,11 @@ async fn episode_message(
 
     match embed_result {
         Ok(Ok(embedding)) => {
-            let mut vector_index = ps.vector_index.write().await;
-            if let Err(err) = vector_index.add_with_entity(mem.id, &embedding, entity.id) {
-                tracing::warn!("Failed to add to vector index: {err}");
+            if let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime {
+                let mut vector_index = vector_index.write().await;
+                if let Err(err) = vector_index.add_with_entity(mem.id, &embedding, entity.id) {
+                    tracing::warn!("Failed to add to vector index: {err}");
+                }
             }
             mem.embedding = embedding;
         }
@@ -2376,8 +2439,10 @@ async fn gdpr_erase(
         // a concurrent writer inserts a matching row: the erase deletes it, the
         // pre-list never saw it, and its index entry survives the request that
         // was supposed to destroy its content (#268).
-        if !erased.memories.is_empty() {
-            let mut vi = ps_task.vector_index.write().await;
+        if !erased.memories.is_empty()
+            && let VectorRuntime::InMemory(vector_index) = &ps_task.vector_runtime
+        {
+            let mut vi = vector_index.write().await;
             for memory in &erased.memories {
                 let _ = vi.remove(memory.id());
             }
@@ -2426,12 +2491,18 @@ async fn a2a_recall(
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(5) as usize;
 
-    let embedder = ps.embedder.clone();
-    let query_text = query.clone();
-    let query_embedding = tokio::task::spawn_blocking(move || embedder.embed(&query_text))
-        .await
-        .ok()
-        .and_then(Result::ok);
+    let semantic_enabled = matches!(ps.vector_runtime, VectorRuntime::InMemory(_))
+        || ps.vector_runtime.semantic_space().is_some();
+    let query_embedding = if semantic_enabled {
+        let embedder = ps.embedder.clone();
+        let query_text = query.clone();
+        tokio::task::spawn_blocking(move || embedder.embed(&query_text))
+            .await
+            .ok()
+            .and_then(Result::ok)
+    } else {
+        None
+    };
 
     // Resolve the reranker off the runtime too, and before the read lock —
     // see the identical rationale in `recall` above.
@@ -2446,40 +2517,58 @@ async fn a2a_recall(
                 None
             });
 
-    let vector_index = ps.vector_index.read().await;
-    let mut engine = RecallEngine::new(
-        ps.storage.as_ref(),
-        &ps.embedder,
-        &vector_index,
-        &ps.retrieval_config,
-    );
-    if let Some(r) = reranker.as_deref() {
-        engine = engine.with_reranker(r);
-    }
-
-    match engine.recall_with_embedding(
-        &query,
-        query_embedding.as_deref(),
-        ps.namespace.id,
-        limit,
-        None,
-    ) {
-        Ok(result) => {
-            let memories: Vec<serde_json::Value> = result
-                .memories
-                .iter()
-                .map(|c| {
-                    json!({
-                        "id": c.memory_id.to_string(),
-                        "content": memory_content(&c.memory),
-                        "score": c.final_score,
-                    })
-                })
-                .collect();
-            Ok(json!({"memories": memories}))
+    let result = match &ps.vector_runtime {
+        VectorRuntime::InMemory(vector_index) => {
+            let vector_index = vector_index.read().await;
+            let mut engine = RecallEngine::new(
+                ps.storage.as_ref(),
+                &ps.embedder,
+                &vector_index,
+                &ps.retrieval_config,
+            );
+            if let Some(r) = reranker.as_deref() {
+                engine = engine.with_reranker(r);
+            }
+            engine.recall_with_embedding(
+                &query,
+                query_embedding.as_deref(),
+                ps.namespace.id,
+                limit,
+                None,
+            )
         }
-        Err(e) => Err(format!("Recall error: {e}")),
+        VectorRuntime::StorageBacked { .. } => {
+            let mut engine = RecallEngine::new_storage_backed_with_vector_space(
+                ps.storage.as_ref(),
+                &ps.embedder,
+                ps.vector_runtime.semantic_space(),
+                &ps.retrieval_config,
+            );
+            if let Some(r) = reranker.as_deref() {
+                engine = engine.with_reranker(r);
+            }
+            engine.recall_with_embedding(
+                &query,
+                query_embedding.as_deref(),
+                ps.namespace.id,
+                limit,
+                None,
+            )
+        }
     }
+    .map_err(|error| format!("Recall error: {error}"))?;
+    let memories: Vec<serde_json::Value> = result
+        .memories
+        .iter()
+        .map(|candidate| {
+            json!({
+                "id": candidate.memory_id.to_string(),
+                "content": memory_content(&candidate.memory),
+                "score": candidate.final_score,
+            })
+        })
+        .collect();
+    Ok(json!({"memories": memories}))
 }
 
 /// Handle the `memory.remember` capability for A2A task requests.
@@ -2560,8 +2649,10 @@ async fn a2a_forget(
         let outcome = forget_entity_blocking(&ps, entity_id, owned_name).await?;
         let snapshot = &outcome.snapshot;
 
-        if !snapshot.memories.is_empty() {
-            let mut vi = ps.vector_index.write().await;
+        if !snapshot.memories.is_empty()
+            && let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime
+        {
+            let mut vi = vector_index.write().await;
             for id in snapshot.memory_ids() {
                 let _ = vi.remove(id);
             }

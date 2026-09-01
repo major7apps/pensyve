@@ -152,6 +152,17 @@ pub(crate) const MAX_FTS_QUERY_TOKENS: usize = 256;
 // ---------------------------------------------------------------------------
 
 pub trait StorageTrait: Send + Sync {
+    /// Read one namespace's embedding lifecycle row and joined immutable
+    /// spaces. The namespace predicate is mandatory even when backend RLS is
+    /// enabled. External backends without versioned generations remain
+    /// lexical-only through the compatibility default.
+    fn get_namespace_embedding_state(
+        &self,
+        _namespace_id: Uuid,
+    ) -> StorageResult<Option<bounded::NamespaceEmbeddingState>> {
+        Ok(None)
+    }
+
     /// Bounded vector retrieval. Backends must opt in explicitly; the
     /// fail-closed default never falls back to a namespace-wide bulk load.
     fn search_vector(

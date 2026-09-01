@@ -7,6 +7,7 @@
 //! the crate is internal to the workspace and the version bumps in lockstep
 //! with the binary.
 
+pub mod admission;
 pub mod auth;
 pub mod cache;
 pub mod circuit_breaker;

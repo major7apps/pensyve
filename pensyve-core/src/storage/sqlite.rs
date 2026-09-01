@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
-use crate::embedding_space::EmbeddingSpaceId;
+use crate::embedding_space::{EmbeddingSpace, EmbeddingSpaceId};
 use crate::types::{
     ContentType, Edge, Entity, EntityKind, Episode, EpisodicMemory, Memory, Namespace,
     ObservationMemory, Outcome, ProceduralMemory, SemanticMemory,
@@ -24,8 +24,9 @@ use crate::graph::EdgeType;
 use crate::storage::bounded::{
     EmbeddingRecord, LexicalHit, MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS,
     MAX_VECTOR_HITS, MEMORY_PAGE_SIZE, MemoryPage, MemoryPageRequest, MemoryRef, MemoryType,
-    PageCursor, SQLITE_MAX_SCANNED_VECTORS, SearchScope, SearchUnavailable, VectorHit,
-    VectorSearchOutcome, VectorSearchRequest, lexical_query_tokens, sort_vector_hits,
+    NamespaceEmbeddingPhase, NamespaceEmbeddingState, PageCursor, SQLITE_MAX_SCANNED_VECTORS,
+    SearchScope, SearchUnavailable, VectorHit, VectorSearchOutcome, VectorSearchRequest,
+    lexical_query_tokens, sort_vector_hits,
 };
 
 // ---------------------------------------------------------------------------
@@ -1542,6 +1543,78 @@ fn load_memory_without_embedding_in_conn(
 // ---------------------------------------------------------------------------
 
 impl StorageTrait for SqliteBackend {
+    fn get_namespace_embedding_state(
+        &self,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<NamespaceEmbeddingState>> {
+        let conn = lock_conn!(self);
+        let row = conn
+            .query_row(
+                "SELECT state.namespace_id, state.active_read_space_id,
+                        state.target_space_id,
+                        active.canonical_identity_json,
+                        target.canonical_identity_json,
+                        state.state, state.barrier_sequence, state.updated_at
+                 FROM namespace_embedding_state AS state
+                 LEFT JOIN embedding_spaces AS active
+                   ON active.id = state.active_read_space_id
+                 LEFT JOIN embedding_spaces AS target
+                   ON target.id = state.target_space_id
+                 WHERE state.namespace_id = ?1",
+                [namespace_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            stored_namespace,
+            active_id,
+            target_id,
+            active,
+            target,
+            phase,
+            barrier_sequence,
+            updated_at,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let stored_namespace = Uuid::parse_str(&stored_namespace).map_err(|error| {
+            StorageError::Context(format!("invalid namespace embedding state UUID: {error}"))
+        })?;
+        let parse_space = |json: Option<String>| -> StorageResult<Option<EmbeddingSpace>> {
+            json.map(|value| serde_json::from_str(&value).map_err(StorageError::from))
+                .transpose()
+        };
+        let updated_at = DateTime::parse_from_rfc3339(&updated_at)
+            .map_err(|error| {
+                StorageError::Context(format!(
+                    "invalid namespace embedding state updated_at: {error}"
+                ))
+            })?
+            .with_timezone(&Utc);
+        Ok(Some(NamespaceEmbeddingState {
+            namespace_id: stored_namespace,
+            active_read_space_id: active_id.map(EmbeddingSpaceId),
+            target_space_id: target_id.map(EmbeddingSpaceId),
+            active_read_space: parse_space(active)?,
+            target_space: parse_space(target)?,
+            phase: NamespaceEmbeddingPhase::parse(&phase)?,
+            barrier_sequence,
+            updated_at,
+        }))
+    }
+
     // -----------------------------------------------------------------------
     // Disk path (G2)
     // -----------------------------------------------------------------------

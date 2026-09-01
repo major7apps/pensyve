@@ -8,7 +8,7 @@ use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::{Namespace, ObservationMemory, Outcome, ProceduralMemory};
 use pensyve_core::vector::VectorIndex;
-use pensyve_mcp_tools::{PensyveMcpServer, PensyveState};
+use pensyve_mcp_tools::{PensyveMcpServer, PensyveState, VectorRuntime};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -38,7 +38,7 @@ fn create_test_state_with_reranker(
     Arc::new(PensyveState {
         storage: Arc::new(storage) as Arc<dyn StorageTrait>,
         embedder: Arc::new(embedder),
-        vector_index: RwLock::new(index),
+        vector_runtime: VectorRuntime::InMemory(RwLock::new(index)),
         namespace,
         retrieval_config: RetrievalConfig {
             default_limit: 5,

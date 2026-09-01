@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use pensyve_core::embedding_space::EmbeddingSpaceId;
+use pensyve_core::embedding_space::{EmbeddingSpace, EmbeddingSpaceId};
 use pensyve_core::storage::bounded::{
     EmbeddingRecord, EntityScope, IdentityScope, MAX_HYDRATED_BYTES, MemoryPageRequest, MemoryRef,
     MemoryType, SQLITE_MAX_SCANNED_VECTORS, SearchScope, SearchUnavailable, VectorHit,
@@ -73,6 +73,58 @@ fn sqlite_fixture() -> (TempDir, SqliteBackend, Namespace) {
     let namespace = Namespace::new("bounded-storage");
     db.save_namespace(&namespace).unwrap();
     (dir, db, namespace)
+}
+
+#[test]
+fn namespace_embedding_state_is_scoped_and_resolves_joined_spaces() {
+    let (dir, db, namespace) = sqlite_fixture();
+    let foreign = Namespace::new("foreign-embedding-state");
+    db.save_namespace(&foreign).unwrap();
+    let active = EmbeddingSpace::mock(2, "active-v1");
+    let target = EmbeddingSpace::mock(3, "target-v2");
+    let connection = rusqlite::Connection::open(dir.path().join("memories.db")).unwrap();
+    for space in [&active, &target] {
+        connection
+            .execute(
+                "INSERT INTO embedding_spaces
+                 (id, canonical_identity_json, class, dimension, created_at)
+                 VALUES (?1, ?2, 'mock', ?3, '2026-08-31T00:00:00Z')",
+                rusqlite::params![
+                    space.id().0,
+                    space.canonical_json(),
+                    i64::try_from(space.dimensions).unwrap()
+                ],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "INSERT INTO namespace_embedding_state
+             (namespace_id, active_read_space_id, target_space_id, state,
+              barrier_sequence, updated_at)
+             VALUES (?1, ?2, ?3, 'backfilling', 17, '2026-08-31T01:02:03Z')",
+            rusqlite::params![namespace.id.to_string(), active.id().0, target.id().0],
+        )
+        .unwrap();
+
+    let state = db
+        .get_namespace_embedding_state(namespace.id)
+        .unwrap()
+        .expect("state row");
+
+    assert_eq!(state.namespace_id, namespace.id);
+    assert_eq!(state.active_read_space_id, Some(active.id()));
+    assert_eq!(state.target_space_id, Some(target.id()));
+    assert_eq!(state.active_read_space, Some(active));
+    assert_eq!(state.target_space, Some(target));
+    assert_eq!(state.phase.as_str(), "backfilling");
+    assert_eq!(state.barrier_sequence, 17);
+    assert_eq!(state.updated_at.to_rfc3339(), "2026-08-31T01:02:03+00:00");
+    assert!(
+        db.get_namespace_embedding_state(foreign.id)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[allow(clippy::needless_pass_by_value)]

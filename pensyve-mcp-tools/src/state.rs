@@ -1,15 +1,222 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
+use pensyve_core::embedding_space::EmbeddingSpace;
 use pensyve_core::reranker::Reranker;
 use pensyve_core::snapshot::RetentionPolicy;
 use pensyve_core::storage::StorageTrait;
+use pensyve_core::storage::bounded::{NamespaceEmbeddingPhase, NamespaceEmbeddingState};
 use pensyve_core::types::Namespace;
 use pensyve_core::vector::VectorIndex;
+
+pub const MIB: usize = 1024 * 1024;
+static RECALL_OVERLOAD_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Process-level admission for bounded recall work.
+pub struct RecallAdmission {
+    permits: Arc<Semaphore>,
+    reserved_bytes: Arc<AtomicUsize>,
+    overloads: AtomicU64,
+    max_bytes: usize,
+}
+
+impl RecallAdmission {
+    #[must_use]
+    pub fn new(permits: usize, max_bytes: usize) -> Self {
+        assert!(permits > 0, "recall admission requires at least one permit");
+        assert!(max_bytes > 0, "recall admission requires a byte budget");
+        Self {
+            permits: Arc::new(Semaphore::new(permits)),
+            reserved_bytes: Arc::new(AtomicUsize::new(0)),
+            overloads: AtomicU64::new(0),
+            max_bytes,
+        }
+    }
+
+    /// Fairly wait for a concurrency permit, then reserve the requested bytes.
+    pub async fn acquire(&self, bytes: usize) -> Result<RecallReservation, RecallOverloaded> {
+        self.validate_bytes(bytes)?;
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| RecallOverloaded)?;
+        self.reserve_bytes(bytes, permit)
+    }
+
+    /// Admit immediately or return a retryable overload without doing work.
+    pub fn try_acquire(&self, bytes: usize) -> Result<RecallReservation, RecallOverloaded> {
+        let result = self.validate_bytes(bytes).and_then(|()| {
+            let permit = Arc::clone(&self.permits)
+                .try_acquire_owned()
+                .map_err(|_| RecallOverloaded)?;
+            self.reserve_bytes(bytes, permit)
+        });
+        if result.is_err() {
+            self.overloads.fetch_add(1, Ordering::Relaxed);
+            RECALL_OVERLOAD_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    #[must_use]
+    pub fn reserved_bytes(&self) -> usize {
+        self.reserved_bytes.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn overload_count(&self) -> u64 {
+        self.overloads.load(Ordering::Relaxed)
+    }
+
+    fn validate_bytes(&self, bytes: usize) -> Result<(), RecallOverloaded> {
+        if bytes == 0 || bytes > self.max_bytes {
+            return Err(RecallOverloaded);
+        }
+        Ok(())
+    }
+
+    fn reserve_bytes(
+        &self,
+        bytes: usize,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<RecallReservation, RecallOverloaded> {
+        let result =
+            self.reserved_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current
+                        .checked_add(bytes)
+                        .filter(|next| *next <= self.max_bytes)
+                });
+        if result.is_err() {
+            return Err(RecallOverloaded);
+        }
+        Ok(RecallReservation {
+            _permit: permit,
+            reserved_bytes: Arc::clone(&self.reserved_bytes),
+            bytes,
+        })
+    }
+}
+
+/// Process-wide content-free overload counter exported by the gateway.
+#[must_use]
+pub fn recall_overload_count() -> u64 {
+    RECALL_OVERLOAD_TOTAL.load(Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecallOverloaded;
+
+impl std::fmt::Display for RecallOverloaded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("recall overloaded; retry later")
+    }
+}
+
+impl std::error::Error for RecallOverloaded {}
+
+/// RAII reservation released on every exit path, including task cancellation.
+pub struct RecallReservation {
+    _permit: OwnedSemaphorePermit,
+    reserved_bytes: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+/// Vector retrieval mode. Shipping constructors use `StorageBacked`; the
+/// in-memory branch remains only while compatibility callers are converted.
+pub enum VectorRuntime {
+    StorageBacked {
+        space: Arc<EmbeddingSpace>,
+        semantic_active: bool,
+    },
+    InMemory(RwLock<VectorIndex>),
+}
+
+impl VectorRuntime {
+    pub fn storage_backed(
+        runtime_space: EmbeddingSpace,
+        namespace_state: Option<&NamespaceEmbeddingState>,
+    ) -> Result<Self, String> {
+        let runtime_id = runtime_space.id();
+        let semantic_active = match namespace_state {
+            Some(state) if state.phase == NamespaceEmbeddingPhase::Active => {
+                let active_id = state.active_read_space_id.as_ref().ok_or_else(|| {
+                    "active namespace embedding state has no active read space id".to_string()
+                })?;
+                let active_space = state.active_read_space.as_ref().ok_or_else(|| {
+                    "active namespace embedding state has no joined active space".to_string()
+                })?;
+                if active_space.id() != *active_id {
+                    return Err(
+                        "active embedding-space identity does not match its canonical metadata"
+                            .to_string(),
+                    );
+                }
+                if *active_id != runtime_id {
+                    return Err(format!(
+                        "active embedding space {} does not match runtime space {}",
+                        active_id.0, runtime_id.0
+                    ));
+                }
+                true
+            }
+            Some(_) | None => false,
+        };
+        Ok(Self::StorageBacked {
+            space: Arc::new(runtime_space),
+            semantic_active,
+        })
+    }
+
+    pub fn resolve_storage_backed(
+        storage: &dyn StorageTrait,
+        embedder: &OnnxEmbedder,
+        namespace_id: uuid::Uuid,
+    ) -> Result<Self, String> {
+        let state = storage
+            .get_namespace_embedding_state(namespace_id)
+            .map_err(|error| format!("failed to resolve namespace embedding state: {error}"))?;
+        let runtime_space = embedder
+            .embedding_space()
+            .map_err(|error| format!("failed to resolve runtime embedding space: {error}"))?
+            .clone();
+        Self::storage_backed(runtime_space, state.as_ref())
+    }
+
+    #[must_use]
+    pub fn semantic_space(&self) -> Option<&EmbeddingSpace> {
+        match self {
+            Self::StorageBacked {
+                space,
+                semantic_active: true,
+            } => Some(space),
+            Self::StorageBacked {
+                semantic_active: false,
+                ..
+            }
+            | Self::InMemory(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn space(&self) -> &EmbeddingSpace {
+        match self {
+            Self::StorageBacked { space, .. } => space,
+            Self::InMemory(_) => panic!("in-memory vector runtime has no immutable space"),
+        }
+    }
+}
+
+impl Drop for RecallReservation {
+    fn drop(&mut self) {
+        self.reserved_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
 
 /// Model name used for the lazily-resolved cross-encoder reranker. Matches
 /// the default in `pensyve-python`'s `Pensyve(reranker="BGERerankerBase")`.
@@ -89,7 +296,7 @@ fn retention_bound(
 pub struct PensyveState {
     pub storage: Arc<dyn StorageTrait>,
     pub embedder: Arc<OnnxEmbedder>,
-    pub vector_index: RwLock<VectorIndex>,
+    pub vector_runtime: VectorRuntime,
     pub namespace: Namespace,
     pub retrieval_config: RetrievalConfig,
     /// True when running as a remote gateway (Streamable HTTP), false for local (stdio).
@@ -222,6 +429,8 @@ fn resolve_reranker() -> Option<Arc<Reranker>> {
 )]
 mod tests {
     use super::*;
+    use pensyve_core::embedding_space::{EmbeddingSpace, EmbeddingSpaceId};
+    use pensyve_core::storage::bounded::{NamespaceEmbeddingPhase, NamespaceEmbeddingState};
 
     /// Sets `PENSYVE_RERANKER=0` exactly once for this test binary. Uses
     /// `Once` (rather than a bare `set_var` per test) so the mutation is
@@ -235,6 +444,76 @@ mod tests {
             // reader observes the environment — no data race.
             unsafe { std::env::set_var("PENSYVE_RERANKER", "0") };
         });
+    }
+
+    #[test]
+    fn inactive_phases_and_no_row_do_not_activate_semantic_recall() {
+        let runtime_space = EmbeddingSpace::mock(8, "target-runtime");
+        for phase in [
+            NamespaceEmbeddingPhase::LexicalOnly,
+            NamespaceEmbeddingPhase::Backfilling,
+            NamespaceEmbeddingPhase::Ready,
+        ] {
+            let state = NamespaceEmbeddingState {
+                namespace_id: uuid::Uuid::new_v4(),
+                active_read_space_id: None,
+                target_space_id: Some(runtime_space.id()),
+                active_read_space: None,
+                target_space: Some(runtime_space.clone()),
+                phase,
+                barrier_sequence: 9,
+                updated_at: "2026-08-31T00:00:00Z".parse().unwrap(),
+            };
+
+            let runtime = VectorRuntime::storage_backed(runtime_space.clone(), Some(&state))
+                .expect("inactive phase remains lexical-only");
+            assert!(runtime.semantic_space().is_none(), "phase {phase:?}");
+            assert_eq!(
+                runtime.space().id(),
+                EmbeddingSpaceId(state.target_space_id.unwrap().0)
+            );
+        }
+        let no_row = VectorRuntime::storage_backed(runtime_space, None).unwrap();
+        assert!(no_row.semantic_space().is_none());
+    }
+
+    #[test]
+    fn active_read_space_mismatch_fails_closed() {
+        let runtime_space = EmbeddingSpace::mock(8, "runtime");
+        let active_space = EmbeddingSpace::mock(8, "different-active");
+        let state = NamespaceEmbeddingState {
+            namespace_id: uuid::Uuid::new_v4(),
+            active_read_space_id: Some(active_space.id()),
+            target_space_id: None,
+            active_read_space: Some(active_space),
+            target_space: None,
+            phase: NamespaceEmbeddingPhase::Active,
+            barrier_sequence: 10,
+            updated_at: "2026-08-31T00:00:00Z".parse().unwrap(),
+        };
+
+        assert!(VectorRuntime::storage_backed(runtime_space, Some(&state)).is_err());
+    }
+
+    #[test]
+    fn exact_active_read_space_activates_semantic_recall() {
+        let runtime_space = EmbeddingSpace::mock(8, "active-runtime");
+        let state = NamespaceEmbeddingState {
+            namespace_id: uuid::Uuid::new_v4(),
+            active_read_space_id: Some(runtime_space.id()),
+            target_space_id: None,
+            active_read_space: Some(runtime_space.clone()),
+            target_space: None,
+            phase: NamespaceEmbeddingPhase::Active,
+            barrier_sequence: 11,
+            updated_at: "2026-08-31T00:00:00Z".parse().unwrap(),
+        };
+
+        let runtime = VectorRuntime::storage_backed(runtime_space, Some(&state)).unwrap();
+        assert_eq!(
+            runtime.semantic_space().map(EmbeddingSpace::id),
+            state.active_read_space_id
+        );
     }
 
     const TEST_MAX: u32 = MAX_SNAPSHOT_RETENTION_DAYS;

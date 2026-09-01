@@ -113,7 +113,7 @@ use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 use super::{POSTGRES_VECTOR_SEARCH_SQL, PostgresBackend};
-use crate::embedding_space::EmbeddingSpaceId;
+use crate::embedding_space::{EmbeddingSpace, EmbeddingSpaceId};
 use crate::storage::bounded::{
     EmbeddingRecord, EntityScope as BoundedEntityScope, IdentityScope, MAX_HYDRATED_BYTES,
     MemoryPageRequest, MemoryRef, MemoryType, SearchScope, SearchUnavailable, VectorHit,
@@ -529,6 +529,78 @@ fn register_embedding_space(fixture: &Fixture, id: &str, class: &str, dimension:
         .await
         .expect("register embedding space");
     });
+}
+
+#[test]
+fn namespace_embedding_state_read_is_scoped_by_explicit_postgres_predicate() {
+    let Some(admin_opts) =
+        skip_notice("namespace_embedding_state_read_is_scoped_by_explicit_postgres_predicate")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    fixture.relax_rls();
+    let requested = Namespace::new("embedding-state-requested");
+    let foreign = Namespace::new("embedding-state-foreign");
+    fixture
+        .backend
+        .save_namespace(&requested)
+        .expect("save requested namespace");
+    fixture
+        .backend
+        .save_namespace(&foreign)
+        .expect("save foreign namespace");
+
+    let active = EmbeddingSpace::mock(2, "postgres-active-v1");
+    let target = EmbeddingSpace::mock(3, "postgres-target-v2");
+    fixture.rt.block_on(async {
+        for space in [&active, &target] {
+            query::<Postgres>(
+                "INSERT INTO embedding_spaces
+                 (id, canonical_identity_json, class, dimension, created_at)
+                 VALUES ($1, $2, 'mock', $3, NOW())",
+            )
+            .bind(space.id().0)
+            .bind(space.canonical_json())
+            .bind(i32::try_from(space.dimensions).expect("test dimension fits i32"))
+            .execute(fixture.backend.pool())
+            .await
+            .expect("register canonical embedding space");
+        }
+        for (namespace_id, phase, barrier) in [
+            (requested.id, "backfilling", 17_i64),
+            (foreign.id, "active", 99_i64),
+        ] {
+            query::<Postgres>(
+                "INSERT INTO namespace_embedding_state
+                 (namespace_id, active_read_space_id, target_space_id, state,
+                  barrier_sequence, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, NOW())",
+            )
+            .bind(namespace_id)
+            .bind(active.id().0)
+            .bind(target.id().0)
+            .bind(phase)
+            .bind(barrier)
+            .execute(fixture.backend.pool())
+            .await
+            .expect("insert namespace embedding state");
+        }
+    });
+
+    let state = fixture
+        .backend
+        .get_namespace_embedding_state(requested.id)
+        .expect("read requested namespace state")
+        .expect("requested state row");
+
+    assert_eq!(state.namespace_id, requested.id);
+    assert_eq!(state.active_read_space_id, Some(active.id()));
+    assert_eq!(state.target_space_id, Some(target.id()));
+    assert_eq!(state.active_read_space, Some(active));
+    assert_eq!(state.target_space, Some(target));
+    assert_eq!(state.phase.as_str(), "backfilling");
+    assert_eq!(state.barrier_sequence, 17);
 }
 
 fn canonical_source_sha256(memory: &Memory) -> String {

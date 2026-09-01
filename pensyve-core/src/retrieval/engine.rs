@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::activation;
 use crate::config::RetrievalConfig;
 use crate::decay;
-use crate::embedding::OnnxEmbedder;
+use crate::embedding::{EmbeddingResult, OnnxEmbedder};
 use crate::embedding_space::EmbeddingSpace;
 use crate::graph::MemoryGraph;
 use crate::reranker::Reranker;
@@ -34,9 +34,26 @@ struct GatheredCandidates {
     typed_ties: bool,
 }
 
+trait QueryEmbedder: Send + Sync {
+    fn embed(&self, text: &str) -> EmbeddingResult<Vec<f32>>;
+    fn embedding_space(&self) -> EmbeddingResult<&EmbeddingSpace>;
+}
+
+impl QueryEmbedder for OnnxEmbedder {
+    fn embed(&self, text: &str) -> EmbeddingResult<Vec<f32>> {
+        Self::embed(self, text)
+    }
+
+    fn embedding_space(&self) -> EmbeddingResult<&EmbeddingSpace> {
+        Self::embedding_space(self)
+    }
+}
+
 enum VectorSource<'a> {
     InMemory(&'a VectorIndex),
-    StorageBacked { runtime_space: &'a EmbeddingSpace },
+    StorageBacked {
+        runtime_space: Option<&'a EmbeddingSpace>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -339,7 +356,7 @@ pub enum DiversityStatus {
 
 pub struct RecallEngine<'a> {
     storage: &'a dyn StorageTrait,
-    embedder: &'a OnnxEmbedder,
+    embedder: &'a dyn QueryEmbedder,
     vector_source: VectorSource<'a>,
     config: &'a RetrievalConfig,
     /// Optional graph for BFS-based graph scoring.
@@ -413,6 +430,28 @@ impl<'a> RecallEngine<'a> {
         storage: &'a dyn StorageTrait,
         embedder: &'a OnnxEmbedder,
         runtime_space: &'a EmbeddingSpace,
+        config: &'a RetrievalConfig,
+    ) -> Self {
+        Self::new_storage_backed_with_vector_space(storage, embedder, Some(runtime_space), config)
+    }
+
+    /// Construct bounded storage-backed recall with an explicitly optional
+    /// semantic leg. `None` is lexical-only and never invokes the embedder or
+    /// backend vector search; the legacy constructor keeps its existing
+    /// always-semantic meaning.
+    pub fn new_storage_backed_with_vector_space(
+        storage: &'a dyn StorageTrait,
+        embedder: &'a OnnxEmbedder,
+        runtime_space: Option<&'a EmbeddingSpace>,
+        config: &'a RetrievalConfig,
+    ) -> Self {
+        Self::new_storage_backed_with_query_embedder(storage, embedder, runtime_space, config)
+    }
+
+    fn new_storage_backed_with_query_embedder(
+        storage: &'a dyn StorageTrait,
+        embedder: &'a dyn QueryEmbedder,
+        runtime_space: Option<&'a EmbeddingSpace>,
         config: &'a RetrievalConfig,
     ) -> Self {
         Self {
@@ -1211,9 +1250,9 @@ impl<'a> RecallEngine<'a> {
             DiversityStatus::NotRequested
         };
         let storage_diversity_embeddings = match self.vector_source {
-            VectorSource::StorageBacked { runtime_space }
-                if diversity_requested && !scored.is_empty() =>
-            {
+            VectorSource::StorageBacked {
+                runtime_space: Some(runtime_space),
+            } if diversity_requested && !scored.is_empty() => {
                 match self.load_storage_diversity_embeddings(namespace_id, runtime_space, &scored) {
                     Ok(embeddings) => Some(embeddings),
                     Err(reason) => {
@@ -1221,6 +1260,13 @@ impl<'a> RecallEngine<'a> {
                         None
                     }
                 }
+            }
+            VectorSource::StorageBacked {
+                runtime_space: None,
+            } if diversity_requested && !scored.is_empty() => {
+                diversity_status =
+                    DiversityStatus::Unavailable(SearchUnavailable::NoActiveEmbeddingSpace);
+                None
             }
             _ => None,
         };
@@ -1520,7 +1566,7 @@ impl<'a> RecallEngine<'a> {
         namespace_id: Uuid,
         max_candidates: usize,
         target_entity: Option<Uuid>,
-        runtime_space: &EmbeddingSpace,
+        runtime_space: Option<&EmbeddingSpace>,
         deadline: std::time::Instant,
     ) -> Result<GatheredCandidates, RecallError> {
         let identity = if let Some(agent_id) = self.agent_only {
@@ -1550,14 +1596,21 @@ impl<'a> RecallEngine<'a> {
         });
         lexical_hits.truncate(MAX_LEXICAL_HITS);
 
-        let (vector_hits, semantic_status) = self.search_storage_vectors(
-            query,
-            pre_embedding,
-            &scope,
-            max_candidates,
-            runtime_space,
-            deadline,
-        )?;
+        let (vector_hits, semantic_status) = if let Some(runtime_space) = runtime_space {
+            self.search_storage_vectors(
+                query,
+                pre_embedding,
+                &scope,
+                max_candidates,
+                runtime_space,
+                deadline,
+            )?
+        } else {
+            (
+                Vec::new(),
+                SemanticStatus::Unavailable(SearchUnavailable::NoActiveEmbeddingSpace),
+            )
+        };
 
         let mut vector_map = BTreeMap::new();
         for hit in vector_hits {
@@ -3422,6 +3475,36 @@ mod tests {
         scopes: Mutex<Vec<SearchScope>>,
     }
 
+    struct CountingQueryEmbedder {
+        inner: OnnxEmbedder,
+        embed_calls: AtomicUsize,
+        identity_calls: AtomicUsize,
+    }
+
+    impl CountingQueryEmbedder {
+        fn new(dimensions: usize) -> Self {
+            Self {
+                inner: OnnxEmbedder::new_mock(dimensions),
+                embed_calls: AtomicUsize::new(0),
+                identity_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl QueryEmbedder for CountingQueryEmbedder {
+        fn embed(&self, text: &str) -> crate::embedding::EmbeddingResult<Vec<f32>> {
+            self.embed_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.embed(text)
+        }
+
+        fn embedding_space(
+            &self,
+        ) -> crate::embedding::EmbeddingResult<&crate::embedding_space::EmbeddingSpace> {
+            self.identity_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.embedding_space()
+        }
+    }
+
     impl CountingStorage {
         fn with_results(
             vector_outcome: VectorSearchOutcome,
@@ -3754,6 +3837,77 @@ mod tests {
 
     fn mock_space(dimensions: usize) -> EmbeddingSpace {
         EmbeddingSpace::mock(dimensions, MOCK_ALGORITHM_VERSION)
+    }
+
+    #[test]
+    fn storage_backed_disabled_vector_leg_skips_embedding_and_vector_search() {
+        let namespace_id = Uuid::from_bytes([78; 16]);
+        let id = Uuid::from_bytes([79; 16]);
+        let memory = bounded_memory(namespace_id, id, "lexical only query");
+        let memory_ref = MemoryRef::from_memory(&memory);
+        let storage = CountingStorage::with_results(
+            VectorSearchOutcome::Complete(vec![VectorHit {
+                memory_ref,
+                score: 1.0,
+            }]),
+            vec![LexicalHit {
+                memory_ref,
+                rank: 1,
+            }],
+            vec![memory],
+        );
+        let embedder = CountingQueryEmbedder::new(2);
+        let config = test_config();
+
+        let result = RecallEngine::new_storage_backed_with_query_embedder(
+            &storage, &embedder, None, &config,
+        )
+        .recall_with_embedding("lexical only query", None, namespace_id, 10, None)
+        .unwrap();
+
+        assert_eq!(embedder.embed_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(embedder.identity_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(storage.vector_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(storage.lexical_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.memories.len(), 1);
+        assert_eq!(
+            result.semantic_status,
+            SemanticStatus::Unavailable(SearchUnavailable::NoActiveEmbeddingSpace)
+        );
+    }
+
+    #[test]
+    fn storage_backed_active_vector_leg_embeds_and_searches_once() {
+        let namespace_id = Uuid::from_bytes([76; 16]);
+        let id = Uuid::from_bytes([77; 16]);
+        let memory = bounded_memory(namespace_id, id, "active semantic query");
+        let memory_ref = MemoryRef::from_memory(&memory);
+        let storage = CountingStorage::with_results(
+            VectorSearchOutcome::Complete(vec![VectorHit {
+                memory_ref,
+                score: 1.0,
+            }]),
+            Vec::new(),
+            vec![memory],
+        );
+        let embedder = CountingQueryEmbedder::new(2);
+        let runtime_space = mock_space(2);
+        let config = test_config();
+
+        let result = RecallEngine::new_storage_backed_with_query_embedder(
+            &storage,
+            &embedder,
+            Some(&runtime_space),
+            &config,
+        )
+        .recall_with_embedding("active semantic query", None, namespace_id, 10, None)
+        .unwrap();
+
+        assert_eq!(embedder.embed_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(embedder.identity_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.vector_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.semantic_status, SemanticStatus::Complete);
+        assert_eq!(result.memories.len(), 1);
     }
 
     #[test]

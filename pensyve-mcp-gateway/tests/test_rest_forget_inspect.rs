@@ -19,12 +19,20 @@ use pensyve_mcp_gateway::rest;
 use pensyve_mcp_gateway::tenant::TenantStateManager;
 use pensyve_mcp_gateway::usage::UsageReporter;
 use pensyve_mcp_gateway::usage_counter::UsageCounter;
+use pensyve_mcp_tools::{PensyveState, VectorRuntime};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const TEST_TENANT: &str = "test-rest-tenant";
+
+fn vector_index(state: &PensyveState) -> &tokio::sync::RwLock<VectorIndex> {
+    match &state.vector_runtime {
+        VectorRuntime::InMemory(index) => index,
+        VectorRuntime::StorageBacked { .. } => panic!("compatibility fixture must be in-memory"),
+    }
+}
 
 fn retrieval_config() -> RetrievalConfig {
     RetrievalConfig {
@@ -62,7 +70,7 @@ fn app_state(dir: &TempDir) -> Arc<AppState> {
         .save_namespace(&namespace)
         .expect("save default namespace");
 
-    let tenant_mgr = TenantStateManager::new(
+    let tenant_mgr = TenantStateManager::new_in_memory(
         storage,
         Arc::new(OnnxEmbedder::new_mock(768)),
         retrieval_config(),
@@ -500,8 +508,7 @@ async fn supersede_creates_live_replacement_and_excludes_old_from_retrieval_inde
         .get_tenant_state(TEST_TENANT)
         .expect("tenant state");
     assert!(
-        pensyve_state
-            .vector_index
+        vector_index(&pensyve_state)
             .read()
             .await
             .get(old_id)
@@ -559,7 +566,7 @@ async fn supersede_creates_live_replacement_and_excludes_old_from_retrieval_inde
     assert_eq!(new_hits.len(), 1);
     assert_eq!(new_hits[0].id(), new_id);
 
-    let vector_index = pensyve_state.vector_index.read().await;
+    let vector_index = vector_index(&pensyve_state).read().await;
     assert!(vector_index.get(old_id).is_none());
     assert!(vector_index.get(new_id).is_some());
     drop(vector_index);

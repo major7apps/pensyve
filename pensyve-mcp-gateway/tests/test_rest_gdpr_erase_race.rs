@@ -46,6 +46,7 @@ use pensyve_mcp_gateway::rest;
 use pensyve_mcp_gateway::tenant::TenantStateManager;
 use pensyve_mcp_gateway::usage::UsageReporter;
 use pensyve_mcp_gateway::usage_counter::UsageCounter;
+use pensyve_mcp_tools::{PensyveState, VectorRuntime};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -53,6 +54,13 @@ use uuid::Uuid;
 
 const TEST_TENANT: &str = "test-gdpr-erase-race-tenant";
 const DIMENSIONS: usize = 768;
+
+fn vector_index(state: &PensyveState) -> &tokio::sync::RwLock<VectorIndex> {
+    match &state.vector_runtime {
+        VectorRuntime::InMemory(index) => index,
+        VectorRuntime::StorageBacked { .. } => panic!("compatibility fixture must be in-memory"),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The fake
@@ -508,7 +516,7 @@ async fn app_state(
         .expect("save default namespace");
 
     let racing = Arc::new(RacingStorage::new(inner));
-    let tenant_mgr = TenantStateManager::new(
+    let tenant_mgr = TenantStateManager::new_in_memory(
         racing.clone() as Arc<dyn StorageTrait>,
         Arc::new(OnnxEmbedder::new_mock(DIMENSIONS)),
         retrieval_config(),
@@ -576,7 +584,7 @@ async fn app_state(
     // present by the time the erase's cleanup runs. They are seeded together
     // here because a synchronous `StorageTrait` method cannot reach the index.
     {
-        let mut index = ps.vector_index.write().await;
+        let mut index = vector_index(&ps).write().await;
         index
             .add_with_entity(settled.id, &settled.embedding, entity.id)
             .expect("index settled memory");
@@ -617,7 +625,7 @@ async fn gdpr_erase_strips_the_index_of_a_row_written_after_a_pre_list_would_hav
         .tenant_mgr
         .get_tenant_state(TEST_TENANT)
         .expect("tenant state");
-    let index = ps.vector_index.read().await;
+    let index = vector_index(&ps).read().await;
     assert!(
         index.get(seeded.settled).is_none(),
         "the settled row's index entry must go with its row"
@@ -661,7 +669,7 @@ async fn gdpr_erase_finishes_its_index_cleanup_after_the_client_disconnects() {
         .expect("tenant state");
 
     // Park the cleanup: whoever owns it will block here until this is dropped.
-    let index_guard = ps.vector_index.write().await;
+    let index_guard = vector_index(&ps).write().await;
 
     let (url, cancellation) = start_test_server(state.clone()).await;
     let request_url = format!("{url}/v1/gdpr/erase/{}", seeded.entity_name);
@@ -687,7 +695,7 @@ async fn gdpr_erase_finishes_its_index_cleanup_after_the_client_disconnects() {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let stranded: Vec<Uuid> = {
-            let index = ps.vector_index.read().await;
+            let index = vector_index(&ps).read().await;
             [seeded.settled, seeded.racer]
                 .into_iter()
                 .filter(|id| index.get(*id).is_some())
