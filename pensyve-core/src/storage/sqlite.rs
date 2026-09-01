@@ -1,6 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -20,8 +23,9 @@ use super::{
 use crate::graph::EdgeType;
 use crate::storage::bounded::{
     EmbeddingRecord, LexicalHit, MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS,
-    MEMORY_PAGE_SIZE, MemoryPage, MemoryPageRequest, MemoryRef, MemoryType, PageCursor,
-    SearchScope, lexical_query_tokens,
+    MAX_VECTOR_HITS, MEMORY_PAGE_SIZE, MemoryPage, MemoryPageRequest, MemoryRef, MemoryType,
+    PageCursor, SQLITE_MAX_SCANNED_VECTORS, SearchScope, SearchUnavailable, VectorHit,
+    VectorSearchOutcome, VectorSearchRequest, lexical_query_tokens, sort_vector_hits,
 };
 
 // ---------------------------------------------------------------------------
@@ -50,6 +54,10 @@ pub struct SqliteBackend {
     /// `rusqlite::Connection` instead of borrowing this backend's
     /// mutex-guarded one.
     db_path: PathBuf,
+    #[cfg(test)]
+    decoded_vectors_live: AtomicUsize,
+    #[cfg(test)]
+    decoded_vectors_peak: AtomicUsize,
 }
 
 impl SqliteBackend {
@@ -68,9 +76,37 @@ impl SqliteBackend {
         let backend = Self {
             conn: Mutex::new(conn),
             db_path,
+            #[cfg(test)]
+            decoded_vectors_live: AtomicUsize::new(0),
+            #[cfg(test)]
+            decoded_vectors_peak: AtomicUsize::new(0),
         };
         backend.run_schema()?;
         Ok(backend)
+    }
+
+    #[cfg(test)]
+    fn reset_vector_decode_instrumentation(&self) {
+        self.decoded_vectors_live.store(0, AtomicOrdering::SeqCst);
+        self.decoded_vectors_peak.store(0, AtomicOrdering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn peak_live_decoded_row_vectors(&self) -> usize {
+        self.decoded_vectors_peak.load(AtomicOrdering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn begin_vector_decode(&self) -> VectorDecodeGuard<'_> {
+        let live = self
+            .decoded_vectors_live
+            .fetch_add(1, AtomicOrdering::SeqCst)
+            + 1;
+        self.decoded_vectors_peak
+            .fetch_max(live, AtomicOrdering::SeqCst);
+        VectorDecodeGuard {
+            live: &self.decoded_vectors_live,
+        }
     }
 
     fn run_schema(&self) -> StorageResult<()> {
@@ -588,6 +624,18 @@ impl SqliteBackend {
     }
 }
 
+#[cfg(test)]
+struct VectorDecodeGuard<'a> {
+    live: &'a AtomicUsize,
+}
+
+#[cfg(test)]
+impl Drop for VectorDecodeGuard<'_> {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, AtomicOrdering::SeqCst);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Schema
 // ---------------------------------------------------------------------------
@@ -760,6 +808,79 @@ fn blob_to_embedding(bytes: &[u8]) -> Vec<f32> {
         .iter()
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect()
+}
+
+struct RankedVectorHit(VectorHit);
+
+impl PartialEq for RankedVectorHit {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == CmpOrdering::Equal
+    }
+}
+
+impl Eq for RankedVectorHit {}
+
+impl PartialOrd for RankedVectorHit {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedVectorHit {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        other
+            .0
+            .score
+            .total_cmp(&self.0.score)
+            .then_with(|| {
+                self.0
+                    .memory_ref
+                    .memory_type
+                    .cmp(&other.0.memory_ref.memory_type)
+            })
+            .then_with(|| self.0.memory_ref.id.cmp(&other.0.memory_ref.id))
+    }
+}
+
+const SQLITE_VECTOR_SEARCH_SQL: &str = r"SELECT 'episodic' AS memory_type,
+               embeddings.memory_id, embeddings.embedding
+        FROM memory_embeddings AS embeddings
+        JOIN episodic_memories AS memory
+          ON memory.id = embeddings.memory_id
+         AND memory.namespace_id = embeddings.namespace_id
+        WHERE embeddings.namespace_id = ?1
+          AND embeddings.embedding_space_id = ?2
+          AND (?3 IS NULL OR memory.agent_id = ?3)
+          AND (?4 IS NULL OR memory.user_id = ?4)
+          AND (?5 IS NULL OR memory.about_entity = ?5 OR memory.source_entity = ?5)
+          AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
+        UNION ALL
+        SELECT 'semantic', embeddings.memory_id, embeddings.embedding
+        FROM memory_embeddings AS embeddings
+        JOIN semantic_memories AS memory
+          ON memory.id = embeddings.memory_id
+         AND memory.namespace_id = embeddings.namespace_id
+        WHERE embeddings.namespace_id = ?1
+          AND embeddings.embedding_space_id = ?2
+          AND (?3 IS NULL OR memory.agent_id = ?3)
+          AND (?4 IS NULL OR memory.user_id = ?4)
+          AND (?5 IS NULL OR memory.subject = ?5 OR memory.object_entity = ?5)
+          AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
+        UNION ALL
+        SELECT 'procedural', embeddings.memory_id, embeddings.embedding
+        FROM memory_embeddings AS embeddings
+        JOIN procedural_memories AS memory
+          ON memory.id = embeddings.memory_id
+         AND memory.namespace_id = embeddings.namespace_id
+        WHERE embeddings.namespace_id = ?1
+          AND embeddings.embedding_space_id = ?2
+          AND (?3 IS NULL OR memory.agent_id = ?3)
+          AND (?4 IS NULL OR memory.user_id = ?4)
+          AND ?5 IS NULL
+          AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL";
+
+fn vector_unavailable(reason: SearchUnavailable) -> VectorSearchOutcome {
+    VectorSearchOutcome::Unavailable(reason)
 }
 
 fn memory_type_str(memory_type: MemoryType) -> &'static str {
@@ -1308,6 +1429,113 @@ impl StorageTrait for SqliteBackend {
 
     fn db_path(&self) -> Option<&Path> {
         Some(&self.db_path)
+    }
+
+    fn search_vector(
+        &self,
+        request: &VectorSearchRequest<'_>,
+    ) -> StorageResult<VectorSearchOutcome> {
+        if !(1..=MAX_VECTOR_HITS).contains(&request.k) {
+            return Err(StorageError::Context(format!(
+                "vector search k must be within 1..={MAX_VECTOR_HITS}, got {}",
+                request.k
+            )));
+        }
+        if std::time::Instant::now() >= request.deadline {
+            return Ok(vector_unavailable(SearchUnavailable::DeadlineExceeded));
+        }
+
+        let namespace = request.scope.namespace_id.to_string();
+        let space = &request.embedding_space_id.0;
+        let agent = request.scope.agent_id.map(|value| value.to_string());
+        let user = request.scope.user_id.map(|value| value.to_string());
+        let entity = request.scope.entity_id.map(|value| value.to_string());
+        let conn = lock_conn!(self);
+        let expected_dimension = conn
+            .query_row(
+                "SELECT dimension FROM embedding_spaces WHERE id = ?1",
+                [space],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(expected_dimension) = expected_dimension else {
+            return Ok(vector_unavailable(
+                SearchUnavailable::NoActiveEmbeddingSpace,
+            ));
+        };
+        let Ok(expected_dimension) = usize::try_from(expected_dimension) else {
+            return Ok(vector_unavailable(SearchUnavailable::InvalidStoredVector));
+        };
+        if request.query_embedding.len() != expected_dimension
+            || request
+                .query_embedding
+                .iter()
+                .any(|value| !value.is_finite())
+        {
+            return Err(StorageError::Context(format!(
+                "query embedding must contain {expected_dimension} finite components"
+            )));
+        }
+
+        let mut statement = conn.prepare(SQLITE_VECTOR_SEARCH_SQL)?;
+        let mut rows = statement.query(params![namespace, space, agent, user, entity])?;
+        let mut scanned = 0_usize;
+        let mut heap = BinaryHeap::with_capacity(request.k);
+        while let Some(row) = rows.next()? {
+            if scanned >= SQLITE_MAX_SCANNED_VECTORS {
+                return Ok(vector_unavailable(SearchUnavailable::ScanBudgetExceeded));
+            }
+            if std::time::Instant::now() >= request.deadline {
+                return Ok(vector_unavailable(SearchUnavailable::DeadlineExceeded));
+            }
+
+            let rusqlite::types::ValueRef::Blob(bytes) = row.get_ref(2)? else {
+                return Ok(vector_unavailable(SearchUnavailable::InvalidStoredVector));
+            };
+            if bytes.len() % std::mem::size_of::<f32>() != 0 {
+                return Ok(vector_unavailable(SearchUnavailable::InvalidStoredVector));
+            }
+            #[cfg(test)]
+            let _decode_guard = self.begin_vector_decode();
+            let vector = blob_to_embedding(bytes);
+            if vector.len() != expected_dimension
+                || vector.is_empty()
+                || vector.iter().any(|value| !value.is_finite())
+            {
+                return Ok(vector_unavailable(SearchUnavailable::InvalidStoredVector));
+            }
+            let score = crate::embedding::cosine_similarity(request.query_embedding, &vector);
+            if !score.is_finite() {
+                return Ok(vector_unavailable(SearchUnavailable::InvalidStoredVector));
+            }
+            let memory_type = match row.get::<_, String>(0)?.as_str() {
+                "episodic" => MemoryType::Episodic,
+                "semantic" => MemoryType::Semantic,
+                "procedural" => MemoryType::Procedural,
+                _ => return Ok(vector_unavailable(SearchUnavailable::InvalidStoredVector)),
+            };
+            let Ok(id) = Uuid::parse_str(&row.get::<_, String>(1)?) else {
+                return Ok(vector_unavailable(SearchUnavailable::InvalidStoredVector));
+            };
+            let candidate = RankedVectorHit(VectorHit {
+                memory_ref: MemoryRef { memory_type, id },
+                score,
+            });
+            if heap.len() < request.k {
+                heap.push(candidate);
+            } else if heap
+                .peek()
+                .is_some_and(|worst| candidate.cmp(worst) == CmpOrdering::Less)
+            {
+                heap.pop();
+                heap.push(candidate);
+            }
+            scanned += 1;
+        }
+
+        let mut hits = heap.into_iter().map(|ranked| ranked.0).collect::<Vec<_>>();
+        sort_vector_hits(&mut hits);
+        Ok(VectorSearchOutcome::Complete(hits))
     }
 
     fn search_lexical_hits(
@@ -4222,6 +4450,46 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap()
+    }
+
+    #[test]
+    fn search_streams_one_decoded_row_vector_at_a_time() {
+        let (db, ns, _) = fixture_memory();
+        register_embedding_space(&db, "test-space", 4);
+        for index in 1..=100 {
+            let memory = Memory::Episodic(EpisodicMemory::new(
+                ns.id,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                format!("working-set fixture {index}"),
+            ));
+            db.save_memory_with_embedding(
+                &memory,
+                Some(&embedding_record(
+                    &memory,
+                    "test-space",
+                    vec![index as f32, 1.0, 2.0, 3.0],
+                )),
+            )
+            .unwrap();
+        }
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let request = VectorSearchRequest::new(
+            SearchScope::namespace(ns.id),
+            "test-space",
+            &query,
+            10,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        db.reset_vector_decode_instrumentation();
+
+        assert!(matches!(
+            db.search_vector(&request).unwrap(),
+            VectorSearchOutcome::Complete(hits) if hits.len() == 10
+        ));
+        assert_eq!(db.peak_live_decoded_row_vectors(), 1);
     }
 
     #[test]

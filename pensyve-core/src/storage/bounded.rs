@@ -375,12 +375,17 @@ pub fn sort_vector_hits(hits: &mut [VectorHit]) {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SearchUnavailable {
+    NoActiveEmbeddingSpace,
+    RuntimeSpaceMismatch,
     UnsupportedBackend,
+    DeadlineExceeded,
+    ScanBudgetExceeded,
+    InvalidStoredVector,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum VectorSearchOutcome {
-    Hits(Vec<VectorHit>),
+    Complete(Vec<VectorHit>),
     Unavailable(SearchUnavailable),
 }
 

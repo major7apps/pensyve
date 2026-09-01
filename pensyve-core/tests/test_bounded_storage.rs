@@ -4,8 +4,9 @@ use std::time::{Duration, Instant};
 
 use pensyve_core::embedding_space::EmbeddingSpaceId;
 use pensyve_core::storage::bounded::{
-    EmbeddingRecord, MAX_HYDRATED_BYTES, MemoryPageRequest, MemoryRef, MemoryType, SearchScope,
-    VectorHit, VectorSearchRequest, embedding_source_text, sort_vector_hits,
+    EmbeddingRecord, MAX_HYDRATED_BYTES, MemoryPageRequest, MemoryRef, MemoryType,
+    SQLITE_MAX_SCANNED_VECTORS, SearchScope, SearchUnavailable, VectorHit, VectorSearchOutcome,
+    VectorSearchRequest, embedding_source_text, sort_vector_hits,
 };
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::storage::{StorageError, StorageTrait};
@@ -442,6 +443,314 @@ fn embedding_record(memory: &Memory, space: &str, embedding: Vec<f32>) -> Embedd
         embedding_space_id: EmbeddingSpaceId(space.to_owned()),
         source_sha256: hex::encode(Sha256::digest(embedding_source_text(memory).as_bytes())),
         embedding,
+    }
+}
+
+fn complete_hits(outcome: VectorSearchOutcome) -> Vec<VectorHit> {
+    match outcome {
+        VectorSearchOutcome::Complete(hits) => hits,
+        VectorSearchOutcome::Unavailable(reason) => {
+            panic!("expected complete vector search, got {reason:?}")
+        }
+    }
+}
+
+fn fixture_vector(seed: usize, dimension: usize) -> Vec<f32> {
+    (0..dimension)
+        .map(|index| {
+            let value = (seed.wrapping_mul(index + 3).wrapping_add(index * 7 + 11)) % 29;
+            value as f32 - 14.0
+        })
+        .collect()
+}
+
+fn brute_force_cosine(left: &[f32], right: &[f32]) -> f32 {
+    let dot = left
+        .iter()
+        .zip(right)
+        .map(|(left, right)| left * right)
+        .sum::<f32>();
+    let left_norm = left.iter().map(|value| value * value).sum::<f32>().sqrt();
+    let right_norm = right.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if left_norm == 0.0 || right_norm == 0.0 {
+        0.0
+    } else {
+        dot / (left_norm * right_norm)
+    }
+}
+
+fn save_vector(db: &SqliteBackend, memory: &Memory, space: &str, embedding: Vec<f32>) -> MemoryRef {
+    let memory_ref = MemoryRef::from_memory(memory);
+    db.save_memory_with_embedding(memory, Some(&embedding_record(memory, space, embedding)))
+        .unwrap();
+    memory_ref
+}
+
+#[test]
+fn sqlite_streaming_top_k_matches_bruteforce_oracle() {
+    let (dir, db, namespace) = sqlite_fixture();
+    let dimension = 16;
+    let query = fixture_vector(10_001, dimension);
+    register_embedding_space(dir.path(), "exact-space", dimension);
+    let mut oracle = Vec::new();
+
+    for id in 1..=1_000_u128 {
+        let memory = match id % 3 {
+            0 => episodic(namespace.id, id, "exact episodic"),
+            1 => semantic(namespace.id, id, "exact semantic"),
+            _ => procedural(namespace.id, id, "exact procedural"),
+        };
+        let embedding = fixture_vector(usize::try_from(id).unwrap(), dimension);
+        oracle.push(VectorHit {
+            memory_ref: save_vector(&db, &memory, "exact-space", embedding.clone()),
+            score: brute_force_cosine(&query, &embedding),
+        });
+    }
+    sort_vector_hits(&mut oracle);
+    oracle.truncate(25);
+    let request = VectorSearchRequest::new(
+        SearchScope::namespace(namespace.id),
+        "exact-space",
+        &query,
+        25,
+        Instant::now() + Duration::from_secs(30),
+    )
+    .unwrap();
+
+    let hits = complete_hits(db.search_vector(&request).unwrap());
+    assert_eq!(
+        hits.iter().map(|hit| hit.memory_ref).collect::<Vec<_>>(),
+        oracle.iter().map(|hit| hit.memory_ref).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn sqlite_streaming_pushes_scope_generation_live_and_observation_predicates_into_sql() {
+    let (dir, db, namespace) = sqlite_fixture();
+    let foreign = Namespace::new("vector-foreign");
+    db.save_namespace(&foreign).unwrap();
+    register_embedding_space(dir.path(), "scope-space", 2);
+    register_embedding_space(dir.path(), "old-space", 2);
+    let agent = Uuid::from_u128(900);
+    let user = Uuid::from_u128(901);
+    let entity = Uuid::from_u128(902);
+
+    let mut own_episodic = episodic(namespace.id, 1, "own episodic");
+    if let Memory::Episodic(memory) = &mut own_episodic {
+        memory.agent_id = Some(agent);
+        memory.user_id = Some(user);
+        memory.about_entity = entity;
+    }
+    let mut own_semantic = semantic(namespace.id, 2, "own semantic");
+    if let Memory::Semantic(memory) = &mut own_semantic {
+        memory.agent_id = Some(agent);
+        memory.user_id = Some(user);
+        memory.subject = entity;
+    }
+    let episodic_ref = save_vector(&db, &own_episodic, "scope-space", vec![1.0, 0.0]);
+    let semantic_ref = save_vector(&db, &own_semantic, "scope-space", vec![1.0, 0.0]);
+    let expected = vec![episodic_ref, semantic_ref];
+
+    let mut wrong_agent = episodic(namespace.id, 3, "wrong agent");
+    if let Memory::Episodic(memory) = &mut wrong_agent {
+        memory.agent_id = Some(Uuid::from_u128(903));
+        memory.user_id = Some(user);
+        memory.about_entity = entity;
+    }
+    let mut wrong_user = semantic(namespace.id, 4, "wrong user");
+    if let Memory::Semantic(memory) = &mut wrong_user {
+        memory.agent_id = Some(agent);
+        memory.user_id = Some(Uuid::from_u128(904));
+        memory.subject = entity;
+    }
+    let mut wrong_entity = episodic(namespace.id, 5, "wrong entity");
+    if let Memory::Episodic(memory) = &mut wrong_entity {
+        memory.agent_id = Some(agent);
+        memory.user_id = Some(user);
+        memory.about_entity = Uuid::from_u128(905);
+        memory.source_entity = Uuid::from_u128(906);
+    }
+    let mut superseded = episodic(namespace.id, 6, "superseded");
+    if let Memory::Episodic(memory) = &mut superseded {
+        memory.agent_id = Some(agent);
+        memory.user_id = Some(user);
+        memory.about_entity = entity;
+        memory.superseded_by = Some(Uuid::from_u128(907));
+    }
+    let mut invalid = semantic(namespace.id, 7, "invalid");
+    if let Memory::Semantic(memory) = &mut invalid {
+        memory.agent_id = Some(agent);
+        memory.user_id = Some(user);
+        memory.subject = entity;
+        memory.invalid_at = Some(chrono::Utc::now());
+    }
+    let mut foreign_memory = episodic(foreign.id, 8, "foreign");
+    if let Memory::Episodic(memory) = &mut foreign_memory {
+        memory.agent_id = Some(agent);
+        memory.user_id = Some(user);
+        memory.about_entity = entity;
+    }
+    let mut observation = observation(namespace.id, 9, "observation");
+    if let Memory::Observation(memory) = &mut observation {
+        memory.agent_id = Some(agent);
+        memory.user_id = Some(user);
+    }
+    for memory in [
+        wrong_agent,
+        wrong_user,
+        wrong_entity,
+        superseded,
+        invalid,
+        foreign_memory,
+        observation,
+    ] {
+        save_vector(&db, &memory, "scope-space", vec![1.0, 0.0]);
+    }
+    save_vector(&db, &own_episodic, "old-space", vec![0.0, 1.0]);
+
+    let query = [1.0, 0.0];
+    let request = VectorSearchRequest::new(
+        SearchScope {
+            namespace_id: namespace.id,
+            agent_id: Some(agent),
+            user_id: Some(user),
+            entity_id: Some(entity),
+        },
+        "scope-space",
+        &query,
+        100,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+
+    assert_eq!(
+        complete_hits(db.search_vector(&request).unwrap())
+            .iter()
+            .map(|hit| hit.memory_ref)
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
+fn sqlite_streaming_discards_partial_hits_when_deadline_expires() {
+    let (dir, db, namespace) = sqlite_fixture();
+    register_embedding_space(dir.path(), "deadline-space", 2);
+    for id in 1..=100 {
+        let memory = episodic(namespace.id, id, "deadline");
+        save_vector(&db, &memory, "deadline-space", vec![1.0, id as f32]);
+    }
+    let query = [1.0, 0.0];
+    let request = VectorSearchRequest::new(
+        SearchScope::namespace(namespace.id),
+        "deadline-space",
+        &query,
+        10,
+        Instant::now(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.search_vector(&request).unwrap(),
+        VectorSearchOutcome::Unavailable(SearchUnavailable::DeadlineExceeded)
+    );
+}
+
+fn seed_scan_budget_fixture(path: &Path, namespace_id: Uuid, count: usize) {
+    let mut connection = rusqlite::Connection::open(path.join("memories.db")).unwrap();
+    let transaction = connection.transaction().unwrap();
+    {
+        let mut source = transaction
+            .prepare(
+                "INSERT INTO procedural_memories
+                 (id, namespace_id, trigger_text, action, outcome, context, created_at)
+                 VALUES (?1, ?2, 'budget', 'budget', 'SUCCESS', '{}',
+                         '2026-08-31T00:00:00Z')",
+            )
+            .unwrap();
+        let mut embedding = transaction
+            .prepare(
+                "INSERT INTO memory_embeddings
+                 (namespace_id, memory_type, memory_id, embedding_space_id, source_sha256,
+                  embedding, created_at)
+                 VALUES (?1, 'procedural', ?2, 'budget-space', 'fixture', ?3,
+                         '2026-08-31T00:00:00Z')",
+            )
+            .unwrap();
+        let namespace = namespace_id.to_string();
+        let blob = 1.0_f32.to_le_bytes();
+        for index in 1..=count {
+            let id = Uuid::from_u128(index as u128).to_string();
+            source.execute(rusqlite::params![&id, &namespace]).unwrap();
+            embedding
+                .execute(rusqlite::params![&namespace, &id, blob.as_slice()])
+                .unwrap();
+        }
+    }
+    transaction.commit().unwrap();
+}
+
+#[test]
+fn sqlite_streaming_discards_partial_hits_when_scan_budget_expires() {
+    let (dir, db, namespace) = sqlite_fixture();
+    register_embedding_space(dir.path(), "budget-space", 1);
+    seed_scan_budget_fixture(dir.path(), namespace.id, SQLITE_MAX_SCANNED_VECTORS + 1);
+    let query = [1.0];
+    let request = VectorSearchRequest::new(
+        SearchScope::namespace(namespace.id),
+        "budget-space",
+        &query,
+        10,
+        Instant::now() + Duration::from_secs(30),
+    )
+    .unwrap();
+
+    assert_eq!(
+        db.search_vector(&request).unwrap(),
+        VectorSearchOutcome::Unavailable(SearchUnavailable::ScanBudgetExceeded)
+    );
+}
+
+#[test]
+fn sqlite_streaming_rejects_truncated_wrong_dimension_and_non_finite_vectors() {
+    let corruptions = [
+        ("truncated", vec![0_u8; 3]),
+        ("wrong-dimension", 1.0_f32.to_le_bytes().to_vec()),
+        (
+            "non-finite",
+            [f32::NAN.to_le_bytes(), 1.0_f32.to_le_bytes()].concat(),
+        ),
+    ];
+
+    for (name, bytes) in corruptions {
+        let (dir, db, namespace) = sqlite_fixture();
+        register_embedding_space(dir.path(), "corrupt-space", 2);
+        let memory = episodic(namespace.id, 1, name);
+        let memory_ref = save_vector(&db, &memory, "corrupt-space", vec![1.0, 0.0]);
+        let connection = rusqlite::Connection::open(dir.path().join("memories.db")).unwrap();
+        connection
+            .execute(
+                "UPDATE memory_embeddings SET embedding = ?1
+                 WHERE memory_type = 'episodic' AND memory_id = ?2
+                   AND embedding_space_id = 'corrupt-space'",
+                rusqlite::params![bytes, memory_ref.id.to_string()],
+            )
+            .unwrap();
+        let query = [1.0, 0.0];
+        let request = VectorSearchRequest::new(
+            SearchScope::namespace(namespace.id),
+            "corrupt-space",
+            &query,
+            1,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.search_vector(&request).unwrap(),
+            VectorSearchOutcome::Unavailable(SearchUnavailable::InvalidStoredVector),
+            "corruption case {name}"
+        );
     }
 }
 
