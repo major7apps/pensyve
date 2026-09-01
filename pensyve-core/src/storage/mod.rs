@@ -52,6 +52,17 @@ pub(crate) fn memory_namespace_id(memory: &Memory) -> Uuid {
     }
 }
 
+pub(crate) fn memory_is_live(memory: &Memory) -> bool {
+    match memory {
+        Memory::Episodic(memory) => memory.superseded_by.is_none() && memory.invalid_at.is_none(),
+        Memory::Semantic(memory) => memory.superseded_by.is_none() && memory.invalid_at.is_none(),
+        Memory::Procedural(memory) => memory.superseded_by.is_none() && memory.invalid_at.is_none(),
+        Memory::Observation(memory) => {
+            memory.superseded_by.is_none() && memory.invalid_at.is_none()
+        }
+    }
+}
+
 /// SHA-256 of the canonical UTF-8 source document used for embedding.
 ///
 /// Shipping runtimes and backfill must share this exact path so provenance is

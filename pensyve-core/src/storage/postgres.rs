@@ -31,8 +31,8 @@ use super::{
     ActivityAggregate, ActivityEvent, BulkMutationSummary, BulkPageGuard, BulkPageKind,
     CapturedMemory, ErasedRows, ErasureSummary, StorageError, StorageResult, StorageTrait,
     bounded_bulk_page_size, canonical_embedding_source_sha256,
-    canonical_embedding_source_text_sha256, cross_namespace_edge_id, memory_namespace_id,
-    validate_record_matches_memory,
+    canonical_embedding_source_text_sha256, cross_namespace_edge_id, memory_is_live,
+    memory_namespace_id, validate_record_matches_memory,
 };
 use crate::graph::EdgeType;
 use crate::storage::bounded::{
@@ -910,6 +910,15 @@ const LIST_OBSERVATIONS_BY_ENTITY_INSTANCE_SQL: &str = r"SELECT id, namespace_id
       WHERE namespace_id = $1 AND instance = $2 AND superseded_by IS NULL
       ORDER BY created_at DESC LIMIT $3";
 
+type PgVectorSearchRow = (
+    Option<i16>,
+    Option<Uuid>,
+    Option<f64>,
+    Option<bool>,
+    String,
+    Option<String>,
+);
+
 /// One exact, global top-k over the three first-stage memory kinds.
 ///
 /// `memory_type` is the [`MemoryType`] discriminant rather than its stored text
@@ -917,7 +926,11 @@ const LIST_OBSERVATIONS_BY_ENTITY_INSTANCE_SQL: &str = r"SELECT id, namespace_id
 /// invalid flag makes one malformed eligible vector fail the whole semantic
 /// leg even when that row would fall outside the top-k; partial hits are never
 /// returned. pgvector itself rejects non-finite stored components.
-const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH candidates AS (
+const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH lifecycle AS (
+    SELECT state, active_read_space_id
+    FROM namespace_embedding_state
+    WHERE namespace_id = $2
+), candidates AS (
     SELECT 0::smallint AS memory_type, embeddings.memory_id, embeddings.embedding,
            $7::smallint = 2 AND COALESCE((memory.about_entity = $8
                OR memory.source_entity = $8), FALSE) AS entity_preferred
@@ -925,9 +938,12 @@ const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH candidates AS (
     JOIN episodic_memories AS memory
       ON memory.id = embeddings.memory_id
      AND memory.namespace_id = embeddings.namespace_id
+    CROSS JOIN lifecycle
     WHERE embeddings.namespace_id = $2
       AND embeddings.embedding_space_id = $3
       AND embeddings.memory_type = 'episodic'
+      AND lifecycle.state = 'active'
+      AND lifecycle.active_read_space_id = $3
       AND ($4::smallint = 0
            OR ($4 = 1 AND memory.agent_id IS NOT DISTINCT FROM $5
                       AND memory.user_id IS NOT DISTINCT FROM $6)
@@ -943,9 +959,12 @@ const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH candidates AS (
     JOIN semantic_memories AS memory
       ON memory.id = embeddings.memory_id
      AND memory.namespace_id = embeddings.namespace_id
+    CROSS JOIN lifecycle
     WHERE embeddings.namespace_id = $2
       AND embeddings.embedding_space_id = $3
       AND embeddings.memory_type = 'semantic'
+      AND lifecycle.state = 'active'
+      AND lifecycle.active_read_space_id = $3
       AND ($4::smallint = 0
            OR ($4 = 1 AND memory.agent_id IS NOT DISTINCT FROM $5
                       AND memory.user_id IS NOT DISTINCT FROM $6)
@@ -959,9 +978,12 @@ const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH candidates AS (
     JOIN procedural_memories AS memory
       ON memory.id = embeddings.memory_id
      AND memory.namespace_id = embeddings.namespace_id
+    CROSS JOIN lifecycle
     WHERE embeddings.namespace_id = $2
       AND embeddings.embedding_space_id = $3
       AND embeddings.memory_type = 'procedural'
+      AND lifecycle.state = 'active'
+      AND lifecycle.active_read_space_id = $3
       AND ($4::smallint = 0
            OR ($4 = 1 AND memory.agent_id IS NOT DISTINCT FROM $5
                       AND memory.user_id IS NOT DISTINCT FROM $6)
@@ -986,15 +1008,24 @@ const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH candidates AS (
                ORDER BY distance, memory_type, memory_id
            ) AS entity_rank
     FROM scored
+), limited AS (
+    SELECT memory_type, memory_id, distance, invalid_stored_vector
+    FROM ranked
+    WHERE $7::smallint <> 2
+       OR (entity_preferred AND entity_rank <= $9)
+       OR (NOT entity_preferred AND entity_rank <= $10)
+    ORDER BY distance ASC, memory_type ASC, memory_id ASC
+    LIMIT $11
 )
-SELECT memory_type, memory_id, 1.0 - distance AS cosine_similarity,
-       invalid_stored_vector
-FROM ranked
-WHERE $7::smallint <> 2
-   OR (entity_preferred AND entity_rank <= $9)
-   OR (NOT entity_preferred AND entity_rank <= $10)
-ORDER BY distance ASC, memory_type ASC, memory_id ASC
-LIMIT $11";
+SELECT limited.memory_type, limited.memory_id,
+       1.0 - limited.distance AS cosine_similarity,
+       limited.invalid_stored_vector, lifecycle.state,
+       lifecycle.active_read_space_id
+FROM lifecycle
+LEFT JOIN limited ON TRUE
+ORDER BY limited.distance ASC NULLS LAST,
+         limited.memory_type ASC NULLS LAST,
+         limited.memory_id ASC NULLS LAST";
 
 // ---------------------------------------------------------------------------
 // Error helpers
@@ -1905,6 +1936,27 @@ async fn enqueue_uncovered_pg_sources(
     Ok(())
 }
 
+/// Serialize embedding coverage changes in one namespace.
+///
+/// Every caller must take this durable row first, then lifecycle state, then
+/// source/embedding/queue rows. Unlike a possibly absent lifecycle row, the
+/// namespace row exists before any source or migration transition can begin.
+async fn lock_namespace_embedding_serialization_pg_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    namespace_id: Uuid,
+) -> StorageResult<()> {
+    let namespace =
+        query_as::<Postgres, (Uuid,)>("SELECT id FROM namespaces WHERE id = $1 FOR UPDATE")
+            .bind(namespace_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+    if namespace.is_none() {
+        return Err(StorageError::NotFound(format!("namespace {namespace_id}")));
+    }
+    Ok(())
+}
+
 async fn validate_active_embedding_write_pg_tx(
     transaction: &mut Transaction<'_, Postgres>,
     memory: &Memory,
@@ -2000,6 +2052,51 @@ async fn validate_active_embedding_write_pg_tx(
         "active embedding space {active_space} requires an atomic embedding for source {}",
         memory.id()
     )))
+}
+
+async fn validate_restore_embedding_lifecycle_pg_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    page: &[CapturedMemory],
+) -> StorageResult<()> {
+    let Some(first) = page.first() else {
+        return Ok(());
+    };
+    let namespace_id = memory_namespace_id(&first.memory);
+    let state = query_as::<Postgres, (String, Option<String>)>(
+        "SELECT state, active_read_space_id FROM namespace_embedding_state
+         WHERE namespace_id = $1 FOR UPDATE",
+    )
+    .bind(namespace_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?;
+    let Some((phase, active_space)) = state else {
+        return Ok(());
+    };
+    if phase != "active" {
+        return Ok(());
+    }
+    let Some(active_space) = active_space else {
+        return Err(StorageError::Context(
+            "active embedding lifecycle has no active space".into(),
+        ));
+    };
+    for captured in page
+        .iter()
+        .filter(|captured| memory_is_live(&captured.memory))
+    {
+        if !captured
+            .embeddings
+            .iter()
+            .any(|record| record.embedding_space_id.0 == active_space)
+        {
+            return Err(StorageError::Context(format!(
+                "active embedding space {active_space} requires explicit restore provenance for source {}",
+                captured.memory.id()
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn memory_page_from_pg_ids(
@@ -2172,17 +2269,7 @@ impl StorageTrait for PostgresBackend {
                 .execute(&mut *transaction)
                 .await
                 .map_err(sqlx_to_io)?;
-            let exists = query_as::<Postgres, (bool,)>(
-                "SELECT EXISTS(SELECT 1 FROM namespaces WHERE id = $1)",
-            )
-            .bind(namespace_id)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(sqlx_to_io)?
-            .0;
-            if !exists {
-                return Err(StorageError::NotFound(format!("namespace {namespace_id}")).into());
-            }
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
             let target_id = target_space.id();
             let canonical_json = target_space.canonical_json();
             let class = match target_space.class {
@@ -2411,6 +2498,7 @@ impl StorageTrait for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
             let state = query_as::<Postgres, (String, Option<String>)>(
                 "SELECT state, target_space_id FROM namespace_embedding_state
                  WHERE namespace_id = $1 FOR UPDATE",
@@ -2571,6 +2659,7 @@ impl StorageTrait for PostgresBackend {
                 .execute(&mut *transaction)
                 .await
                 .map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
             let phase = query_as::<Postgres, (String, Option<String>)>(
                 "SELECT state, target_space_id FROM namespace_embedding_state
                  WHERE namespace_id = $1 FOR UPDATE",
@@ -2655,6 +2744,7 @@ impl StorageTrait for PostgresBackend {
                 .execute(&mut *transaction)
                 .await
                 .map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
             let phase = query_as::<Postgres, (String, Option<String>, Option<String>)>(
                 "SELECT state, active_read_space_id, target_space_id FROM namespace_embedding_state
                  WHERE namespace_id = $1 FOR UPDATE",
@@ -2715,6 +2805,7 @@ impl StorageTrait for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
             let state = query_as::<Postgres, (String, Option<String>, Option<String>)>(
                 "SELECT state, active_read_space_id, target_space_id
                  FROM namespace_embedding_state
@@ -2804,11 +2895,14 @@ impl StorageTrait for PostgresBackend {
                 return Err(sqlx_to_io(error));
             }
 
-            let lifecycle = match query_as::<Postgres, (String, Option<String>)>(
-                "SELECT state, active_read_space_id FROM namespace_embedding_state
-                 WHERE namespace_id = $1",
+            let lifecycle = match query_as::<Postgres, (String, Option<String>, Option<i32>)>(
+                "SELECT lifecycle.state, lifecycle.active_read_space_id, spaces.dimension
+                 FROM namespace_embedding_state AS lifecycle
+                 LEFT JOIN embedding_spaces AS spaces ON spaces.id = $2
+                 WHERE lifecycle.namespace_id = $1",
             )
             .bind(request.scope.namespace_id)
+            .bind(&request.embedding_space_id.0)
             .fetch_optional(&mut *transaction)
             .await
             {
@@ -2820,10 +2914,18 @@ impl StorageTrait for PostgresBackend {
                     return Err(sqlx_to_io(error));
                 }
             };
-            match lifecycle {
-                Some((phase, Some(active_space)))
-                    if phase == "active" && active_space == request.embedding_space_id.0 => {}
-                Some((phase, Some(_))) if phase == "active" => {
+            let expected_dimension = match lifecycle {
+                Some((phase, Some(active_space), dimension))
+                    if phase == "active" && active_space == request.embedding_space_id.0 =>
+                {
+                    let Some(dimension) = dimension else {
+                        return Ok(VectorSearchOutcome::Unavailable(
+                            SearchUnavailable::NoActiveEmbeddingSpace,
+                        ));
+                    };
+                    dimension
+                }
+                Some((phase, Some(_), _)) if phase == "active" => {
                     return Ok(VectorSearchOutcome::Unavailable(
                         SearchUnavailable::RuntimeSpaceMismatch,
                     ));
@@ -2832,27 +2934,6 @@ impl StorageTrait for PostgresBackend {
                     return Ok(VectorSearchOutcome::Unavailable(
                         SearchUnavailable::NoActiveEmbeddingSpace,
                     ));
-                }
-            }
-
-            let expected_dimension = match query_as::<Postgres, (i32,)>(
-                "SELECT dimension FROM embedding_spaces WHERE id = $1",
-            )
-            .bind(&request.embedding_space_id.0)
-            .fetch_optional(&mut *transaction)
-            .await
-            {
-                Ok(Some((dimension,))) => dimension,
-                Ok(None) => {
-                    return Ok(VectorSearchOutcome::Unavailable(
-                        SearchUnavailable::NoActiveEmbeddingSpace,
-                    ));
-                }
-                Err(error) => {
-                    if let Some(reason) = vector_error_reason(&error) {
-                        return Ok(VectorSearchOutcome::Unavailable(reason));
-                    }
-                    return Err(sqlx_to_io(error));
                 }
             };
             let Ok(expected_dimension) = usize::try_from(expected_dimension) else {
@@ -2875,6 +2956,28 @@ impl StorageTrait for PostgresBackend {
                     return Ok(VectorSearchOutcome::Unavailable(
                         SearchUnavailable::DeadlineExceeded,
                     ));
+                }
+                let lifecycle = query_as::<Postgres, (String, Option<String>)>(
+                    "SELECT state, active_read_space_id FROM namespace_embedding_state
+                     WHERE namespace_id = $1",
+                )
+                .bind(request.scope.namespace_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
+                match lifecycle {
+                    Some((phase, Some(active_space)))
+                        if phase == "active" && active_space == request.embedding_space_id.0 => {}
+                    Some((phase, Some(_))) if phase == "active" => {
+                        return Ok(VectorSearchOutcome::Unavailable(
+                            SearchUnavailable::RuntimeSpaceMismatch,
+                        ));
+                    }
+                    _ => {
+                        return Ok(VectorSearchOutcome::Unavailable(
+                            SearchUnavailable::NoActiveEmbeddingSpace,
+                        ));
+                    }
                 }
                 transaction.commit().await.map_err(sqlx_to_io)?;
                 return Ok(VectorSearchOutcome::Complete(Vec::new()));
@@ -2901,7 +3004,7 @@ impl StorageTrait for PostgresBackend {
             let (identity_mode, agent, user) = request.scope.identity_sql_parts();
             let (entity_mode, entity) = request.scope.entity_sql_parts();
             let (preferred_quota, broad_quota) = request.scope.entity_quotas(request.k);
-            let rows: Vec<(i16, Uuid, Option<f64>, bool)> =
+            let rows: Vec<PgVectorSearchRow> =
                 match query_as::<Postgres, _>(POSTGRES_VECTOR_SEARCH_SQL)
                     .bind(query_embedding)
                     .bind(request.scope.namespace_id)
@@ -2925,13 +3028,33 @@ impl StorageTrait for PostgresBackend {
                         return Err(sqlx_to_io(error));
                     }
                 };
-            if rows.len() > request.k || rows.iter().any(|row| row.3) {
+            let Some((_, _, _, _, phase, active_space)) = rows.first() else {
+                return Ok(VectorSearchOutcome::Unavailable(
+                    SearchUnavailable::NoActiveEmbeddingSpace,
+                ));
+            };
+            if phase == "active"
+                && active_space.as_deref() != Some(request.embedding_space_id.0.as_str())
+            {
+                return Ok(VectorSearchOutcome::Unavailable(
+                    SearchUnavailable::RuntimeSpaceMismatch,
+                ));
+            }
+            if phase != "active" {
+                return Ok(VectorSearchOutcome::Unavailable(
+                    SearchUnavailable::NoActiveEmbeddingSpace,
+                ));
+            }
+            if rows.len() > request.k || rows.iter().any(|row| row.3 == Some(true)) {
                 return Ok(VectorSearchOutcome::Unavailable(
                     SearchUnavailable::InvalidStoredVector,
                 ));
             }
             let mut hits = Vec::with_capacity(rows.len());
-            for (memory_type, id, score, _invalid_stored_vector) in rows {
+            for (memory_type, id, score, _invalid_stored_vector, _, _) in rows {
+                let (Some(memory_type), Some(id)) = (memory_type, id) else {
+                    continue;
+                };
                 let memory_type = match memory_type {
                     0 => MemoryType::Episodic,
                     1 => MemoryType::Semantic,
@@ -3438,6 +3561,7 @@ impl StorageTrait for PostgresBackend {
                 .execute(&mut *transaction)
                 .await
                 .map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
             validate_active_embedding_write_pg_tx(
                 &mut transaction,
                 memory,
@@ -3486,13 +3610,9 @@ impl StorageTrait for PostgresBackend {
                 .execute(&mut *transaction)
                 .await
                 .map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
+            validate_restore_embedding_lifecycle_pg_tx(&mut transaction, page).await?;
             for captured in page {
-                validate_active_embedding_write_pg_tx(
-                    &mut transaction,
-                    &captured.memory,
-                    &captured.embeddings,
-                )
-                .await?;
                 save_memory_in_pg_tx(&mut transaction, &captured.memory).await?;
                 reconcile_embedding_source_in_pg_tx(&mut transaction, &captured.memory).await?;
                 for record in &captured.embeddings {
@@ -4087,6 +4207,7 @@ impl StorageTrait for PostgresBackend {
         self.block_on(async move {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
             query::<Postgres>(
                 "DELETE FROM memory_embeddings
                  WHERE namespace_id = $1 AND memory_type = 'observation'
@@ -4398,6 +4519,7 @@ impl StorageTrait for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
             validate_active_embedding_write_pg_tx(
                 &mut transaction,
                 replacement,
@@ -4445,6 +4567,7 @@ impl StorageTrait for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
             for (sql, memory_type) in [
                 (
                     "UPDATE episodic_memories SET superseded_by = $1, invalid_at = $2 \
@@ -4556,6 +4679,7 @@ impl StorageTrait for PostgresBackend {
             // deployment today.
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut tx, namespace_id).await?;
             let mut memories = Vec::new();
 
             let rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
@@ -4664,6 +4788,7 @@ impl StorageTrait for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut tx, namespace_id).await?;
             let mut summary = BulkMutationSummary::default();
             loop {
                 let refs: Vec<(String, Uuid)> =
@@ -4803,6 +4928,7 @@ impl StorageTrait for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut tx, namespace_id).await?;
             let mut erased = ErasedRows::default();
 
             // Leg 1 — observations. MUST precede the episodic delete: the only
@@ -4947,6 +5073,7 @@ impl StorageTrait for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
             let mut total = 0usize;
 
             query::<Postgres>(
@@ -5015,6 +5142,7 @@ impl StorageTrait for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut tx, namespace_id).await?;
             query::<Postgres>(
                 "DELETE FROM memory_embeddings
                  WHERE namespace_id = $2 AND memory_type = 'observation'
@@ -5127,6 +5255,7 @@ impl StorageTrait for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
             let mut deleted = false;
 
             let result = query::<Postgres>(
@@ -5229,6 +5358,7 @@ impl StorageTrait for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
             let mut total = 0usize;
 
             for sql in [
@@ -6217,6 +6347,7 @@ impl ConsolidationWorkspace for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(run.namespace_id).await?;
             let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut tx, run.namespace_id).await?;
             let space: (String,) = query_as::<Postgres, _>(
                 "SELECT embedding_space_id FROM consolidation_runs
                  WHERE run_id = $1 AND namespace_id = $2
@@ -7072,8 +7203,11 @@ mod tests {
         assert!(!POSTGRES_VECTOR_SEARCH_SQL.contains("observation_memories"));
         assert!(
             POSTGRES_VECTOR_SEARCH_SQL
-                .contains("ORDER BY distance ASC, memory_type ASC, memory_id ASC\nLIMIT $11")
+                .contains("ORDER BY distance ASC, memory_type ASC, memory_id ASC\n    LIMIT $11")
         );
+        assert!(POSTGRES_VECTOR_SEARCH_SQL.contains(
+            "ORDER BY limited.distance ASC NULLS LAST,\n         limited.memory_type ASC NULLS LAST,\n         limited.memory_id ASC NULLS LAST"
+        ));
         assert_eq!(POSTGRES_VECTOR_SEARCH_SQL.matches("LIMIT $11").count(), 1);
         assert!(POSTGRES_VECTOR_SEARCH_SQL.contains("IS NOT DISTINCT FROM $5"));
         assert!(POSTGRES_VECTOR_SEARCH_SQL.contains("IS NOT DISTINCT FROM $6"));

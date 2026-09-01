@@ -7,6 +7,8 @@ use pensyve_core::embedding_migration::{
 };
 use pensyve_core::embedding_space::{EmbeddingSpace, EmbeddingSpaceId};
 use pensyve_core::retrieval::SemanticStatus;
+#[cfg(feature = "postgres")]
+use pensyve_core::storage::CapturedMemory;
 use pensyve_core::storage::bounded::{
     MemoryRef, NamespaceEmbeddingPhase, SearchScope, SearchUnavailable, VectorSearchOutcome,
     VectorSearchRequest,
@@ -453,8 +455,20 @@ fn migration_crosses_two_full_source_page_boundaries() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one contract pins the shared PostgreSQL lifecycle lock order end to end"
+)]
 fn postgres_migration_static_contracts_are_bounded_scoped_and_lifecycle_authoritative() {
     let source = include_str!("../src/storage/postgres.rs");
+    let namespace_lock = source
+        .split_once("async fn lock_namespace_embedding_serialization_pg_tx(")
+        .unwrap()
+        .1
+        .split_once("async fn validate_active_embedding_write_pg_tx(")
+        .unwrap()
+        .0;
+    assert!(namespace_lock.contains("SELECT id FROM namespaces WHERE id = $1 FOR UPDATE"));
     let migration = source
         .split_once("fn begin_embedding_migration(")
         .unwrap()
@@ -497,6 +511,16 @@ fn postgres_migration_static_contracts_are_bounded_scoped_and_lifecycle_authorit
         .0;
     assert!(write_gate.contains("namespace_embedding_state"));
     assert!(write_gate.contains("FOR UPDATE"));
+    let vector_sql = source
+        .split_once("const POSTGRES_VECTOR_SEARCH_SQL")
+        .unwrap()
+        .1
+        .split_once("// Error helpers")
+        .unwrap()
+        .0;
+    assert!(vector_sql.contains("namespace_embedding_state"));
+    assert!(vector_sql.contains("lifecycle.state = 'active'"));
+    assert!(vector_sql.contains("lifecycle.active_read_space_id = $3"));
     let vector = source
         .split_once("fn search_vector(")
         .unwrap()
@@ -504,8 +528,495 @@ fn postgres_migration_static_contracts_are_bounded_scoped_and_lifecycle_authorit
         .split_once("fn search_lexical_hits(")
         .unwrap()
         .0;
-    assert!(vector.contains("namespace_embedding_state"));
-    assert!(vector.contains("active_read_space_id"));
+    assert!(vector.contains("LEFT JOIN embedding_spaces AS spaces"));
+    assert!(vector.contains("POSTGRES_VECTOR_SEARCH_SQL"));
+
+    for (start, end, later) in [
+        (
+            "fn begin_embedding_migration(",
+            "fn page_embedding_backfill(",
+            "namespace_embedding_state",
+        ),
+        (
+            "fn commit_embedding_backfill_page(",
+            "fn verify_embedding_migration(",
+            "namespace_embedding_state",
+        ),
+        (
+            "fn verify_embedding_migration(",
+            "fn activate_embedding_migration(",
+            "namespace_embedding_state",
+        ),
+        (
+            "fn activate_embedding_migration(",
+            "fn rollback_embedding_migration_to_lexical(",
+            "namespace_embedding_state",
+        ),
+        (
+            "fn rollback_embedding_migration_to_lexical(",
+            "fn search_vector(",
+            "namespace_embedding_state",
+        ),
+        (
+            "fn save_memory_with_embedding(",
+            "fn restore_memory_page(",
+            "validate_active_embedding_write_pg_tx",
+        ),
+        (
+            "fn restore_memory_page(",
+            "// Namespaces",
+            "validate_restore_embedding_lifecycle_pg_tx",
+        ),
+        (
+            "fn save_superseding_memory_with_embedding(",
+            "fn supersede_memory_in_namespace(",
+            "validate_active_embedding_write_pg_tx",
+        ),
+    ] {
+        let operation = source
+            .split_once(start)
+            .unwrap()
+            .1
+            .split_once(end)
+            .unwrap()
+            .0;
+        let namespace = operation
+            .find("lock_namespace_embedding_serialization_pg_tx")
+            .unwrap_or_else(|| panic!("{start} does not lock the durable namespace row"));
+        let dependent = operation
+            .find(later)
+            .unwrap_or_else(|| panic!("{start} lost dependent state/source access"));
+        assert!(
+            namespace < dependent,
+            "{start} violates namespace-first lock order"
+        );
+    }
+
+    let restore = source
+        .split_once("fn restore_memory_page(")
+        .unwrap()
+        .1
+        .split_once("// Namespaces")
+        .unwrap()
+        .0;
+    assert!(!restore.contains("validate_active_embedding_write_pg_tx"));
+    assert!(restore.contains("validate_restore_embedding_lifecycle_pg_tx"));
+
+    for (start, end, mutation) in [
+        (
+            "fn delete_observations_by_episode(",
+            "fn save_superseding_memory_with_embedding(",
+            "DELETE FROM memory_embeddings",
+        ),
+        (
+            "fn supersede_memory_in_namespace(",
+            "// Deletion",
+            "UPDATE episodic_memories",
+        ),
+        (
+            "fn delete_memories_by_entity_capturing_with_embeddings(",
+            "fn delete_memories_by_entity_paged(",
+            "DELETE FROM episodic_memories",
+        ),
+        (
+            "fn delete_memories_by_entity_paged(",
+            "fn erase_entity_capturing(",
+            "ENTITY_FORGET_PAGE_REFS_SQL",
+        ),
+        (
+            "fn erase_entity_capturing(",
+            "fn delete_memories_by_entity(",
+            "DELETE FROM observation_memories",
+        ),
+        (
+            "fn delete_memories_by_entity(",
+            "fn erase_entity_bounded(",
+            "DELETE FROM memory_embeddings",
+        ),
+        (
+            "fn erase_entity_bounded(",
+            "fn delete_memory_by_id_in_namespace(",
+            "DELETE FROM memory_embeddings",
+        ),
+        (
+            "fn delete_memory_by_id_in_namespace(",
+            "fn purge_namespace(",
+            "DELETE FROM episodic_memories",
+        ),
+        (
+            "fn purge_namespace(",
+            "// Entities (bulk)",
+            "DELETE FROM episodic_memories",
+        ),
+        (
+            "fn commit_promotion(",
+            "fn checkpoint(",
+            "save_memory_in_pg_tx",
+        ),
+    ] {
+        let operation = source
+            .split_once(start)
+            .unwrap()
+            .1
+            .split_once(end)
+            .unwrap()
+            .0;
+        let namespace = operation
+            .find("lock_namespace_embedding_serialization_pg_tx")
+            .unwrap_or_else(|| panic!("{start} does not lock the durable namespace row"));
+        let mutation = operation
+            .find(mutation)
+            .unwrap_or_else(|| panic!("{start} lost its source mutation"));
+        assert!(
+            namespace < mutation,
+            "{start} violates namespace-first lock order"
+        );
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn wait_for_postgres_lock_wait(
+    storage: &pensyve_core::storage::PostgresBackend,
+    query_fragment: &str,
+) {
+    use sqlx_core::query_as::query_as;
+    use sqlx_postgres::Postgres;
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let pattern = format!("%{query_fragment}%");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let waiting = runtime.block_on(async {
+            let mut conn = storage.pool().acquire().await.unwrap();
+            query_as::<Postgres, (bool,)>(
+                "SELECT EXISTS(
+                     SELECT 1 FROM pg_stat_activity
+                      WHERE datname = current_database()
+                        AND pid != pg_backend_pid()
+                        AND wait_event_type = 'Lock'
+                        AND query LIKE $1
+                 )",
+            )
+            .bind(&pattern)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+            .0
+        });
+        if waiting {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for PostgreSQL query containing {query_fragment:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_rollback_between_eligibility_and_vector_fetch_returns_unavailable() {
+    use sqlx_core::acquire::Acquire;
+    use sqlx_core::query::query;
+    use sqlx_postgres::Postgres;
+
+    let Ok(database_url) = std::env::var("PENSYVE_TEST_DATABASE_URL") else {
+        eprintln!("skipped: PENSYVE_TEST_DATABASE_URL is unset");
+        return;
+    };
+    let storage = pensyve_core::storage::PostgresBackend::new(&database_url).unwrap();
+    let search_handle = pensyve_core::storage::PostgresBackend::new(&database_url).unwrap();
+    let namespace = Namespace::new(format!("embedding-search-race-{}", uuid::Uuid::new_v4()));
+    storage.save_namespace(&namespace).unwrap();
+    let mut entity = Entity::new("search-race-subject", EntityKind::Agent);
+    entity.namespace_id = namespace.id;
+    storage.save_entity(&entity).unwrap();
+    let memory = Memory::Semantic(SemanticMemory::new(
+        namespace.id,
+        entity.id,
+        "race",
+        "rollback",
+        0.9,
+    ));
+    storage.save_memory_with_embedding(&memory, None).unwrap();
+    let embedder = OnnxEmbedder::new_mock(4);
+    let migration = EmbeddingMigration::new(&storage, &embedder, namespace.id);
+    migration.start().unwrap();
+    migration
+        .backfill(256, &BackfillCancellation::new())
+        .unwrap();
+    migration.verify().unwrap();
+    migration.activate().unwrap();
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut coordinator = runtime.block_on(storage.pool().acquire()).unwrap();
+    runtime
+        .block_on(storage.set_namespace_config(&mut coordinator, namespace.id))
+        .unwrap();
+    let mut table_lock = runtime.block_on((&mut *coordinator).begin()).unwrap();
+    runtime
+        .block_on(
+            query::<Postgres>("LOCK TABLE embedding_spaces IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *table_lock),
+        )
+        .unwrap();
+
+    let namespace_id = namespace.id;
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let search_thread = std::thread::spawn(move || {
+        let search_embedder = OnnxEmbedder::new_mock(4);
+        result_tx
+            .send(vector_search(
+                &search_handle,
+                namespace_id,
+                &search_embedder,
+            ))
+            .unwrap();
+    });
+    wait_for_postgres_lock_wait(&storage, "LEFT JOIN embedding_spaces AS spaces");
+
+    migration.rollback_lexical().unwrap();
+    runtime.block_on(table_lock.commit()).unwrap();
+
+    assert!(matches!(
+        result_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        VectorSearchOutcome::Unavailable(SearchUnavailable::NoActiveEmbeddingSpace)
+    ));
+    search_thread.join().unwrap();
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_source_only_writer_serializes_before_absent_state_first_activation() {
+    use sqlx_core::acquire::Acquire;
+    use sqlx_core::query::query;
+    use sqlx_postgres::Postgres;
+
+    let Ok(database_url) = std::env::var("PENSYVE_TEST_DATABASE_URL") else {
+        eprintln!("skipped: PENSYVE_TEST_DATABASE_URL is unset");
+        return;
+    };
+    let storage = pensyve_core::storage::PostgresBackend::new(&database_url).unwrap();
+    let writer = pensyve_core::storage::PostgresBackend::new(&database_url).unwrap();
+    let migrator = pensyve_core::storage::PostgresBackend::new(&database_url).unwrap();
+    let namespace = Namespace::new(format!("embedding-write-race-{}", uuid::Uuid::new_v4()));
+    storage.save_namespace(&namespace).unwrap();
+    let mut entity = Entity::new("write-race-subject", EntityKind::Agent);
+    entity.namespace_id = namespace.id;
+    storage.save_entity(&entity).unwrap();
+    let memory = Memory::Semantic(SemanticMemory::new(
+        namespace.id,
+        entity.id,
+        "race",
+        "first activation",
+        0.9,
+    ));
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut coordinator = runtime.block_on(storage.pool().acquire()).unwrap();
+    runtime
+        .block_on(storage.set_namespace_config(&mut coordinator, namespace.id))
+        .unwrap();
+    let mut table_lock = runtime.block_on((&mut *coordinator).begin()).unwrap();
+    runtime
+        .block_on(
+            query::<Postgres>("LOCK TABLE semantic_memories IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *table_lock),
+        )
+        .unwrap();
+
+    let writer_memory = memory.clone();
+    let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+    let writer_thread = std::thread::spawn(move || {
+        writer_tx
+            .send(writer.save_memory_with_embedding(&writer_memory, None))
+            .unwrap();
+    });
+    wait_for_postgres_lock_wait(&storage, "INSERT INTO semantic_memories");
+
+    let namespace_id = namespace.id;
+    let (migration_tx, migration_rx) = std::sync::mpsc::channel();
+    let migration_thread = std::thread::spawn(move || {
+        let embedder = OnnxEmbedder::new_mock(4);
+        let migration = EmbeddingMigration::new(&migrator, &embedder, namespace_id);
+        let result = (|| {
+            migration.start()?;
+            migration.backfill(256, &BackfillCancellation::new())?;
+            migration.verify()?;
+            migration.activate()
+        })()
+        .map(|state| state.phase)
+        .map_err(|error: MigrationError| error.to_string());
+        migration_tx.send(result).unwrap();
+    });
+    wait_for_postgres_lock_wait(
+        &storage,
+        "SELECT id FROM namespaces WHERE id = $1 FOR UPDATE",
+    );
+    assert!(matches!(
+        migration_rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+
+    runtime.block_on(table_lock.commit()).unwrap();
+    writer_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        migration_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap(),
+        NamespaceEmbeddingPhase::Active
+    );
+    writer_thread.join().unwrap();
+    migration_thread.join().unwrap();
+    assert!(matches!(
+        vector_search(&storage, namespace.id, &OnnxEmbedder::new_mock(4)),
+        VectorSearchOutcome::Complete(ref hits) if !hits.is_empty()
+    ));
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one live parity test covers fresh order independence and active rollback"
+)]
+fn postgres_restore_is_order_independent_and_requires_explicit_active_provenance() {
+    let Ok(database_url) = std::env::var("PENSYVE_TEST_DATABASE_URL") else {
+        eprintln!("skipped: PENSYVE_TEST_DATABASE_URL is unset");
+        return;
+    };
+    let storage = pensyve_core::storage::PostgresBackend::new(&database_url).unwrap();
+    let embedder_a = OnnxEmbedder::new_mock(4);
+    let embedder_b = OnnxEmbedder::new_mock(5);
+    for embedder in [&embedder_a, &embedder_b] {
+        let registry = Namespace::new(format!("restore-registry-{}", uuid::Uuid::new_v4()));
+        storage.save_namespace(&registry).unwrap();
+        EmbeddingMigration::new(&storage, embedder, registry.id)
+            .start()
+            .unwrap();
+    }
+
+    for embeddings_first in [true, false] {
+        let namespace = Namespace::new(format!("restore-order-{}", uuid::Uuid::new_v4()));
+        storage.save_namespace(&namespace).unwrap();
+        let mixed = Memory::Semantic(SemanticMemory::new(
+            namespace.id,
+            uuid::Uuid::new_v4(),
+            "restore",
+            "mixed",
+            0.9,
+        ));
+        let without_record = Memory::Semantic(SemanticMemory::new(
+            namespace.id,
+            uuid::Uuid::new_v4(),
+            "restore",
+            "partial",
+            0.9,
+        ));
+        let mut records = vec![
+            embedding_record_for_memory(
+                &mixed,
+                embedder_a.embedding_space().unwrap(),
+                embedder_a.embed("restore mixed").unwrap(),
+            ),
+            embedding_record_for_memory(
+                &mixed,
+                embedder_b.embedding_space().unwrap(),
+                embedder_b.embed("restore mixed").unwrap(),
+            ),
+        ];
+        if !embeddings_first {
+            records.reverse();
+        }
+        let mixed_entry = CapturedMemory {
+            memory: mixed.clone(),
+            embeddings: records,
+        };
+        let partial_entry = CapturedMemory {
+            memory: without_record,
+            embeddings: Vec::new(),
+        };
+        let page = if embeddings_first {
+            vec![mixed_entry, partial_entry]
+        } else {
+            vec![partial_entry, mixed_entry]
+        };
+        storage.restore_memory_page(&page).unwrap();
+        assert!(
+            storage
+                .get_namespace_embedding_state(namespace.id)
+                .unwrap()
+                .is_none()
+        );
+        for embedder in [&embedder_a, &embedder_b] {
+            assert_eq!(
+                storage
+                    .load_embedding_records(
+                        namespace.id,
+                        &embedder.embedding_space().unwrap().id(),
+                        &[MemoryRef::from_memory(&mixed)],
+                    )
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    let active_namespace = Namespace::new(format!("restore-active-{}", uuid::Uuid::new_v4()));
+    storage.save_namespace(&active_namespace).unwrap();
+    let existing = Memory::Semantic(SemanticMemory::new(
+        active_namespace.id,
+        uuid::Uuid::new_v4(),
+        "active",
+        "existing",
+        0.9,
+    ));
+    let existing_record = embedding_record_for_memory(
+        &existing,
+        embedder_a.embedding_space().unwrap(),
+        embedder_a.embed("active existing").unwrap(),
+    );
+    storage
+        .save_memory_with_embedding(&existing, Some(&existing_record))
+        .unwrap();
+    let inserted = Memory::Semantic(SemanticMemory::new(
+        active_namespace.id,
+        uuid::Uuid::new_v4(),
+        "active",
+        "inserted",
+        0.9,
+    ));
+    let inserted_record = embedding_record_for_memory(
+        &inserted,
+        embedder_a.embedding_space().unwrap(),
+        embedder_a.embed("active inserted").unwrap(),
+    );
+    assert!(
+        storage
+            .restore_memory_page(&[
+                CapturedMemory {
+                    memory: inserted.clone(),
+                    embeddings: vec![inserted_record],
+                },
+                CapturedMemory {
+                    memory: existing,
+                    embeddings: Vec::new(),
+                },
+            ])
+            .is_err()
+    );
+    assert!(
+        storage
+            .get_semantic_in_namespace(inserted.id(), active_namespace.id)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[cfg(feature = "postgres")]

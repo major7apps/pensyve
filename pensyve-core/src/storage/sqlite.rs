@@ -24,8 +24,8 @@ use super::{
     ActivityAggregate, ActivityEvent, BulkMutationSummary, BulkPageGuard, BulkPageKind,
     CapturedMemory, ErasedRows, ErasureSummary, StorageError, StorageResult, StorageTrait,
     bounded_bulk_page_size, canonical_embedding_source_sha256,
-    canonical_embedding_source_text_sha256, cross_namespace_edge_id, memory_namespace_id,
-    validate_record_matches_memory,
+    canonical_embedding_source_text_sha256, cross_namespace_edge_id, memory_is_live,
+    memory_namespace_id, validate_record_matches_memory,
 };
 use crate::graph::EdgeType;
 use crate::storage::bounded::{
@@ -1973,6 +1973,51 @@ fn validate_active_embedding_write_in_conn(
     )))
 }
 
+fn validate_restore_embedding_lifecycle_in_conn(
+    conn: &Connection,
+    page: &[CapturedMemory],
+) -> StorageResult<()> {
+    let Some(first) = page.first() else {
+        return Ok(());
+    };
+    let namespace_id = memory_namespace_id(&first.memory);
+    let state = conn
+        .query_row(
+            "SELECT state, active_read_space_id FROM namespace_embedding_state
+             WHERE namespace_id = ?1",
+            [namespace_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let Some((phase, active_space)) = state else {
+        return Ok(());
+    };
+    if phase != "active" {
+        return Ok(());
+    }
+    let Some(active_space) = active_space else {
+        return Err(StorageError::Context(
+            "active embedding lifecycle has no active space".into(),
+        ));
+    };
+    for captured in page
+        .iter()
+        .filter(|captured| memory_is_live(&captured.memory))
+    {
+        if !captured
+            .embeddings
+            .iter()
+            .any(|record| record.embedding_space_id.0 == active_space)
+        {
+            return Err(StorageError::Context(format!(
+                "active embedding space {active_space} requires explicit restore provenance for source {}",
+                captured.memory.id()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn load_memory_without_embedding_in_conn(
     conn: &Connection,
     namespace_id: Uuid,
@@ -3647,12 +3692,8 @@ impl StorageTrait for SqliteBackend {
         let transaction =
             conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let result = (|| {
+            validate_restore_embedding_lifecycle_in_conn(&transaction, page)?;
             for captured in page {
-                validate_active_embedding_write_in_conn(
-                    &transaction,
-                    &captured.memory,
-                    &captured.embeddings,
-                )?;
                 save_memory_in_conn(&transaction, &captured.memory)?;
                 reconcile_embedding_source_in_conn(&transaction, &captured.memory)?;
                 for record in &captured.embeddings {
@@ -11665,6 +11706,165 @@ mod tests {
             db.get_semantic_in_namespace(second.id(), ns.id)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn restore_memory_page_keeps_mixed_generations_inert_and_is_order_independent() {
+        let (_dir, db) = setup();
+        register_embedding_space(&db, "restore-mixed-a", 2);
+        register_embedding_space(&db, "restore-mixed-b", 3);
+
+        for embeddings_first in [true, false] {
+            let ns = Namespace::new(format!("restore-order-{embeddings_first}"));
+            db.save_namespace(&ns).unwrap();
+            let mixed = Memory::Semantic(SemanticMemory::new(
+                ns.id,
+                Uuid::new_v4(),
+                "restores",
+                "mixed generations",
+                0.9,
+            ));
+            let without_record = Memory::Episodic(EpisodicMemory::new(
+                ns.id,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                "partial snapshot entry",
+            ));
+            let mut mixed_records = vec![
+                embedding_record(&mixed, "restore-mixed-a", vec![0.1, 0.2]),
+                embedding_record(&mixed, "restore-mixed-b", vec![0.3, 0.4, 0.5]),
+            ];
+            if !embeddings_first {
+                mixed_records.reverse();
+            }
+            let mixed_entry = CapturedMemory {
+                memory: mixed.clone(),
+                embeddings: mixed_records,
+            };
+            let partial_entry = CapturedMemory {
+                memory: without_record.clone(),
+                embeddings: Vec::new(),
+            };
+            let page = if embeddings_first {
+                vec![mixed_entry, partial_entry]
+            } else {
+                vec![partial_entry, mixed_entry]
+            };
+
+            db.restore_memory_page(&page).unwrap();
+
+            assert!(db.get_namespace_embedding_state(ns.id).unwrap().is_none());
+            assert!(
+                db.get_semantic_in_namespace(mixed.id(), ns.id)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                db.get_episodic_in_namespace(without_record.id(), ns.id)
+                    .unwrap()
+                    .is_some()
+            );
+            for space in ["restore-mixed-a", "restore-mixed-b"] {
+                assert_eq!(
+                    db.load_embedding_records(
+                        ns.id,
+                        &EmbeddingSpaceId(space.into()),
+                        &[MemoryRef::from_memory(&mixed)],
+                    )
+                    .unwrap()
+                    .len(),
+                    1
+                );
+                let outcome = db
+                    .search_vector(
+                        &VectorSearchRequest::new(
+                            SearchScope::namespace(ns.id),
+                            EmbeddingSpaceId(space.into()),
+                            if space == "restore-mixed-a" {
+                                &[0.1, 0.2]
+                            } else {
+                                &[0.3, 0.4, 0.5]
+                            },
+                            5,
+                            std::time::Instant::now() + std::time::Duration::from_secs(5),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    outcome,
+                    VectorSearchOutcome::Unavailable(SearchUnavailable::NoActiveEmbeddingSpace)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn restore_memory_page_requires_explicit_active_provenance_and_rolls_back() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        register_embedding_space(&db, "restore-active", 2);
+        let existing = Memory::Semantic(SemanticMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            "active",
+            "coverage",
+            0.9,
+        ));
+        let existing_record = embedding_record(&existing, "restore-active", vec![0.1, 0.2]);
+        db.save_memory_with_embedding(&existing, Some(&existing_record))
+            .unwrap();
+        let inserted = Memory::Episodic(EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "must roll back",
+        ));
+        let inserted_record = embedding_record(&inserted, "restore-active", vec![0.3, 0.4]);
+
+        let error = db
+            .restore_memory_page(&[
+                CapturedMemory {
+                    memory: inserted.clone(),
+                    embeddings: vec![inserted_record],
+                },
+                CapturedMemory {
+                    memory: existing.clone(),
+                    embeddings: Vec::new(),
+                },
+            ])
+            .unwrap_err();
+
+        assert!(error.to_string().contains("active embedding space"));
+        assert!(
+            db.get_episodic_in_namespace(inserted.id(), ns.id)
+                .unwrap()
+                .is_none()
+        );
+        let active_space: Option<String> = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT active_read_space_id FROM namespace_embedding_state
+                 WHERE namespace_id = ?1 AND state = 'active'",
+                [ns.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_space.as_deref(), Some("restore-active"));
+        assert_eq!(
+            db.load_embedding_records(
+                ns.id,
+                &EmbeddingSpaceId("restore-active".into()),
+                &[MemoryRef::from_memory(&existing)],
+            )
+            .unwrap()
+            .len(),
+            1
         );
     }
 
