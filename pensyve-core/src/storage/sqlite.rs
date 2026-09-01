@@ -32,7 +32,7 @@ use crate::storage::consolidation_workspace::{
     ClusterDecision, ClusterProvenance, ConsolidationWorkspace, LatestClusterMember, NamespacePage,
     NamespacePageCursor, PromotionAggregate, PromotionCommit, RunId, WorkspaceAssignment,
     WorkspaceCandidatePage, WorkspaceCursor, WorkspaceEmbeddingSource, WorkspaceSource,
-    WorkspaceSourcePage,
+    WorkspaceSourcePage, ensure_application_budget,
 };
 
 // ---------------------------------------------------------------------------
@@ -66,6 +66,8 @@ pub struct SqliteBackend {
     #[cfg(test)]
     decoded_vectors_peak: AtomicUsize,
     #[cfg(test)]
+    workspace_payload_fetches: AtomicUsize,
+    #[cfg(test)]
     forced_deadline_boundary: AtomicU8,
 }
 
@@ -89,6 +91,8 @@ impl SqliteBackend {
             decoded_vectors_live: AtomicUsize::new(0),
             #[cfg(test)]
             decoded_vectors_peak: AtomicUsize::new(0),
+            #[cfg(test)]
+            workspace_payload_fetches: AtomicUsize::new(0),
             #[cfg(test)]
             forced_deadline_boundary: AtomicU8::new(0),
         };
@@ -123,6 +127,17 @@ impl SqliteBackend {
         VectorDecodeGuard {
             live: &self.decoded_vectors_live,
         }
+    }
+
+    #[cfg(test)]
+    fn reset_workspace_payload_fetches(&self) {
+        self.workspace_payload_fetches
+            .store(0, AtomicOrdering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn workspace_payload_fetches(&self) -> usize {
+        self.workspace_payload_fetches.load(AtomicOrdering::SeqCst)
     }
 
     #[cfg(test)]
@@ -4877,6 +4892,7 @@ impl ConsolidationWorkspace for SqliteBackend {
         run: RunId,
         after: Option<WorkspaceCursor>,
         limit: usize,
+        max_application_bytes: usize,
     ) -> StorageResult<WorkspaceSourcePage> {
         if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
             return Err(StorageError::BudgetExceeded(format!(
@@ -4894,11 +4910,8 @@ impl ConsolidationWorkspace for SqliteBackend {
             )?,
         };
         let mut stmt = conn.prepare(
-            "SELECT workspace.memory_id, workspace.about_entity, workspace.episode_id,
-                    workspace.source_timestamp, source.content,
-                    workspace.source_sha256, workspace.source_ordinal
+            "SELECT workspace.memory_id, workspace.about_entity, workspace.source_ordinal
              FROM consolidation_sources AS workspace
-             JOIN episodic_memories AS source ON source.id = workspace.memory_id
              WHERE workspace.run_id = ?1 AND workspace.source_ordinal > ?2
                AND workspace.assignment_state NOT IN ('discarded', 'promoted')
                AND (workspace.assignment_anchor IS NULL
@@ -4912,11 +4925,7 @@ impl ConsolidationWorkspace for SqliteBackend {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(2)?,
                     ))
                 },
             )?
@@ -4925,6 +4934,15 @@ impl ConsolidationWorkspace for SqliteBackend {
             .into_iter()
             .map(workspace_source_from_sqlite)
             .collect::<StorageResult<Vec<_>>>()?;
+        ensure_application_budget(
+            std::mem::size_of::<WorkspaceSourcePage>().saturating_add(
+                records
+                    .len()
+                    .saturating_mul(std::mem::size_of::<WorkspaceSource>()),
+            ),
+            max_application_bytes,
+            "consolidation source page",
+        )?;
         let next_cursor = (records.len() == limit)
             .then(|| {
                 records.last().map(|source| WorkspaceCursor {
@@ -4942,6 +4960,7 @@ impl ConsolidationWorkspace for SqliteBackend {
         &self,
         run: RunId,
         source: MemoryRef,
+        max_application_bytes: usize,
     ) -> StorageResult<WorkspaceEmbeddingSource> {
         if source.memory_type != MemoryType::Episodic {
             return Err(StorageError::Context(
@@ -4949,15 +4968,20 @@ impl ConsolidationWorkspace for SqliteBackend {
             ));
         }
         let conn = lock_conn!(self);
-        sqlite_workspace_embedding_source(&conn, run, source.id)
+        sqlite_workspace_embedding_source(&conn, run, source.id, max_application_bytes)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "candidate metadata preflight and payload fetch stay adjacent to prove allocation ordering"
+    )]
     fn page_later_unassigned(
         &self,
         run: RunId,
         anchor: MemoryRef,
         after: Option<WorkspaceCursor>,
         limit: usize,
+        max_application_bytes: usize,
     ) -> StorageResult<WorkspaceCandidatePage> {
         if !(1..=crate::storage::bounded::CONSOLIDATION_COMPARISON_PAGE_SIZE).contains(&limit) {
             return Err(StorageError::BudgetExceeded(format!(
@@ -4975,15 +4999,67 @@ impl ConsolidationWorkspace for SqliteBackend {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let cursor = after.map_or(anchor_ordinal, |cursor| cursor.source_ordinal);
+        let (row_count, encoded_bytes, dimension): (i64, i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(length(embedding.embedding)), 0),
+                    COALESCE(MAX(spaces.dimension), 0)
+             FROM (
+                 SELECT workspace.memory_id
+                 FROM consolidation_sources AS workspace
+                 WHERE workspace.run_id = ?1 AND workspace.about_entity = ?2
+                   AND workspace.source_ordinal > ?3
+                   AND workspace.assignment_state = 'unassigned'
+                 ORDER BY workspace.source_ordinal LIMIT ?4
+             ) AS page
+             JOIN consolidation_runs AS runs ON runs.run_id = ?1
+             JOIN memory_embeddings AS embedding
+               ON embedding.namespace_id = runs.namespace_id
+              AND embedding.memory_type = 'episodic'
+              AND embedding.memory_id = page.memory_id
+              AND embedding.embedding_space_id = runs.embedding_space_id
+             JOIN consolidation_sources AS source_snapshot
+               ON source_snapshot.run_id = runs.run_id
+              AND source_snapshot.memory_id = page.memory_id
+              AND embedding.source_sha256 = source_snapshot.source_sha256
+             JOIN embedding_spaces AS spaces ON spaces.id = runs.embedding_space_id",
+            params![
+                &run_text,
+                &anchor_entity,
+                cursor,
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let row_count = usize::try_from(row_count)
+            .map_err(|_| StorageError::Context("negative candidate page count".into()))?;
+        let encoded_bytes = usize::try_from(encoded_bytes)
+            .map_err(|_| StorageError::Context("negative candidate payload bytes".into()))?;
+        let dimension = usize::try_from(dimension)
+            .map_err(|_| StorageError::Context("negative candidate dimension".into()))?;
+        ensure_application_budget(
+            std::mem::size_of::<WorkspaceCandidatePage>()
+                .saturating_add(
+                    row_count.saturating_mul(std::mem::size_of::<WorkspaceEmbeddingSource>()),
+                )
+                .saturating_add(
+                    row_count.saturating_mul(std::mem::size_of::<SqliteWorkspaceEmbeddingRow>()),
+                )
+                .saturating_add(row_count.saturating_mul(36))
+                .saturating_add(encoded_bytes)
+                .saturating_add(
+                    row_count
+                        .saturating_mul(dimension)
+                        .saturating_mul(std::mem::size_of::<f32>()),
+                ),
+            max_application_bytes,
+            "consolidation candidate page",
+        )?;
+        #[cfg(test)]
+        self.workspace_payload_fetches
+            .fetch_add(1, AtomicOrdering::SeqCst);
         let mut stmt = conn.prepare(
-            "SELECT workspace.memory_id, workspace.about_entity, workspace.episode_id,
-                    workspace.source_timestamp, source.content,
-                    workspace.source_sha256, workspace.source_ordinal,
-                    runs.namespace_id, runs.embedding_space_id, embedding.embedding
+            "SELECT workspace.memory_id, workspace.source_ordinal, embedding.embedding
              FROM consolidation_sources AS workspace
              JOIN consolidation_runs AS runs ON runs.run_id = workspace.run_id
-             JOIN episodic_memories AS source
-               ON source.id = workspace.memory_id AND source.namespace_id = runs.namespace_id
              JOIN memory_embeddings AS embedding
                ON embedding.namespace_id = runs.namespace_id
               AND embedding.memory_type = 'episodic'
@@ -5006,15 +5082,8 @@ impl ConsolidationWorkspace for SqliteBackend {
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, i64>(6)?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, String>(8)?,
-                        row.get::<_, Vec<u8>>(9)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
                     ))
                 },
             )?
@@ -5026,7 +5095,7 @@ impl ConsolidationWorkspace for SqliteBackend {
         let next_cursor = (records.len() == limit)
             .then(|| {
                 records.last().map(|source| WorkspaceCursor {
-                    source_ordinal: source.source.ordinal,
+                    source_ordinal: source.ordinal,
                 })
             })
             .flatten();
@@ -5071,6 +5140,7 @@ impl ConsolidationWorkspace for SqliteBackend {
         &self,
         run: RunId,
         anchor: MemoryRef,
+        max_application_bytes: usize,
     ) -> StorageResult<ClusterDecision> {
         let conn = lock_conn!(self);
         let run = run.id.to_string();
@@ -5097,6 +5167,28 @@ impl ConsolidationWorkspace for SqliteBackend {
                 member_count: count,
             });
         }
+        let latest_content_bytes: i64 = conn.query_row(
+            "SELECT length(CAST(source.content AS BLOB))
+             FROM consolidation_sources AS workspace
+             JOIN episodic_memories AS source ON source.id = workspace.memory_id
+             WHERE workspace.run_id = ?1 AND workspace.assignment_anchor = ?2
+             ORDER BY workspace.source_timestamp DESC, workspace.memory_id DESC
+             LIMIT 1",
+            params![&run, &anchor],
+            |row| row.get(0),
+        )?;
+        let latest_content_bytes = usize::try_from(latest_content_bytes)
+            .map_err(|_| StorageError::Context("negative final content bytes".into()))?;
+        ensure_application_budget(
+            std::mem::size_of::<PromotionAggregate>()
+                .saturating_add(latest_content_bytes)
+                .saturating_add(count.saturating_mul(std::mem::size_of::<ClusterProvenance>()))
+                .saturating_add(count.saturating_mul(std::mem::size_of::<(String, String)>()))
+                .saturating_add(count.saturating_add(1).saturating_mul(80))
+                .saturating_add(std::mem::size_of::<(String, String, String)>()),
+            max_application_bytes,
+            "consolidation finalized cluster",
+        )?;
         conn.execute(
             "UPDATE consolidation_sources SET assignment_state = 'finalized'
              WHERE run_id = ?1 AND assignment_anchor = ?2",
@@ -5390,77 +5482,41 @@ impl ConsolidationWorkspace for SqliteBackend {
     }
 }
 
-type SqliteWorkspaceSourceRow = (String, String, String, String, String, String, i64);
+type SqliteWorkspaceSourceRow = (String, String, i64);
 
 fn workspace_source_from_sqlite(row: SqliteWorkspaceSourceRow) -> StorageResult<WorkspaceSource> {
-    let (id, about_entity, episode_id, timestamp, content, source_sha256, ordinal) = row;
+    let (id, about_entity, ordinal) = row;
     Ok(WorkspaceSource {
         memory_ref: MemoryRef {
             memory_type: MemoryType::Episodic,
             id: parse_uuid(&id)?,
         },
         about_entity: parse_uuid(&about_entity)?,
-        episode_id: parse_uuid(&episode_id)?,
-        timestamp: str_to_dt(&timestamp),
-        content,
-        source_sha256,
         ordinal,
     })
 }
 
-type SqliteWorkspaceEmbeddingRow = (
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    i64,
-    String,
-    String,
-    Vec<u8>,
-);
+type SqliteWorkspaceEmbeddingRow = (String, i64, Vec<u8>);
 
 fn workspace_embedding_source_from_sqlite(
     row: SqliteWorkspaceEmbeddingRow,
 ) -> StorageResult<WorkspaceEmbeddingSource> {
-    let (
-        id,
-        about_entity,
-        episode_id,
-        timestamp,
-        content,
-        source_sha256,
-        ordinal,
-        namespace,
-        space,
-        embedding,
-    ) = row;
-    let source = workspace_source_from_sqlite((
-        id,
-        about_entity,
-        episode_id,
-        timestamp,
-        content,
-        source_sha256.clone(),
-        ordinal,
-    ))?;
+    let (id, ordinal, embedding) = row;
+    let memory_ref = MemoryRef {
+        memory_type: MemoryType::Episodic,
+        id: parse_uuid(&id)?,
+    };
     let embedding = blob_to_embedding(&embedding);
     if embedding.is_empty() || embedding.iter().any(|value| !value.is_finite()) {
         return Err(StorageError::Context(format!(
             "workspace embedding for {} is empty or non-finite",
-            source.memory_ref.id
+            memory_ref.id
         )));
     }
     Ok(WorkspaceEmbeddingSource {
-        embedding: EmbeddingRecord {
-            namespace_id: parse_uuid(&namespace)?,
-            memory_ref: source.memory_ref,
-            embedding_space_id: EmbeddingSpaceId(space),
-            source_sha256,
-            embedding,
-        },
-        source,
+        memory_ref,
+        ordinal,
+        embedding,
     })
 }
 
@@ -5468,16 +5524,40 @@ fn sqlite_workspace_embedding_source(
     conn: &Connection,
     run: RunId,
     memory_id: Uuid,
+    max_application_bytes: usize,
 ) -> StorageResult<WorkspaceEmbeddingSource> {
-    let row = conn.query_row(
-        "SELECT workspace.memory_id, workspace.about_entity, workspace.episode_id,
-                workspace.source_timestamp, source.content, workspace.source_sha256,
-                workspace.source_ordinal, runs.namespace_id, runs.embedding_space_id,
-                embedding.embedding
+    let (encoded_bytes, dimension): (i64, i64) = conn.query_row(
+        "SELECT length(embedding.embedding), spaces.dimension
          FROM consolidation_sources AS workspace
          JOIN consolidation_runs AS runs ON runs.run_id = workspace.run_id
-         JOIN episodic_memories AS source
-           ON source.id = workspace.memory_id AND source.namespace_id = runs.namespace_id
+         JOIN memory_embeddings AS embedding
+           ON embedding.namespace_id = runs.namespace_id
+          AND embedding.memory_type = 'episodic'
+          AND embedding.memory_id = workspace.memory_id
+          AND embedding.embedding_space_id = runs.embedding_space_id
+          AND embedding.source_sha256 = workspace.source_sha256
+         JOIN embedding_spaces AS spaces ON spaces.id = runs.embedding_space_id
+         WHERE workspace.run_id = ?1 AND workspace.memory_id = ?2",
+        params![run.id.to_string(), memory_id.to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let encoded_bytes = usize::try_from(encoded_bytes)
+        .map_err(|_| StorageError::Context("negative anchor payload bytes".into()))?;
+    let dimension = usize::try_from(dimension)
+        .map_err(|_| StorageError::Context("negative anchor dimension".into()))?;
+    ensure_application_budget(
+        std::mem::size_of::<WorkspaceEmbeddingSource>()
+            .saturating_add(std::mem::size_of::<SqliteWorkspaceEmbeddingRow>())
+            .saturating_add(36)
+            .saturating_add(encoded_bytes)
+            .saturating_add(dimension.saturating_mul(std::mem::size_of::<f32>())),
+        max_application_bytes,
+        "consolidation anchor",
+    )?;
+    let row = conn.query_row(
+        "SELECT workspace.memory_id, workspace.source_ordinal, embedding.embedding
+         FROM consolidation_sources AS workspace
+         JOIN consolidation_runs AS runs ON runs.run_id = workspace.run_id
          JOIN memory_embeddings AS embedding
            ON embedding.namespace_id = runs.namespace_id
           AND embedding.memory_type = 'episodic'
@@ -5486,20 +5566,7 @@ fn sqlite_workspace_embedding_source(
           AND embedding.source_sha256 = workspace.source_sha256
          WHERE workspace.run_id = ?1 AND workspace.memory_id = ?2",
         params![run.id.to_string(), memory_id.to_string()],
-        |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-                row.get(8)?,
-                row.get(9)?,
-            ))
-        },
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     workspace_embedding_source_from_sqlite(row)
 }
@@ -6126,6 +6193,7 @@ fn row_to_observation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::OnnxEmbedder;
     use crate::embedding_space::EmbeddingSpaceId;
     use crate::storage::bounded::{EmbeddingRecord, MemoryRef, embedding_source_text};
     use crate::storage::embedding_record_for_memory;
@@ -6200,6 +6268,61 @@ mod tests {
         let mut record = embedding_record(memory, "test-space", vec![1.0; 4]);
         record.source_sha256 = source_sha256;
         record
+    }
+
+    #[test]
+    fn candidate_budget_preflight_runs_before_payload_select() {
+        let (_dir, db) = setup();
+        let namespace = make_namespace(&db);
+        let embedder = OnnxEmbedder::new_mock(8);
+        db.initialize_local_runtime_space(namespace.id, embedder.embedding_space().unwrap())
+            .unwrap();
+        let episode = Episode::new(namespace.id, vec![Uuid::new_v4()]);
+        db.save_episode(&episode).unwrap();
+        let entity = Uuid::new_v4();
+        for _ in 0..=64 {
+            let memory = Memory::Episodic(EpisodicMemory::new(
+                namespace.id,
+                episode.id,
+                Uuid::new_v4(),
+                entity,
+                "candidate preflight",
+            ));
+            let record = embedding_record(
+                &memory,
+                &embedder.embedding_space().unwrap().id().0,
+                vec![1.0; 8],
+            );
+            db.save_memory_with_embedding(&memory, Some(&record))
+                .unwrap();
+        }
+        let workspace: &dyn ConsolidationWorkspace = &db;
+        let run = workspace
+            .begin_or_resume(namespace.id, &embedder.embedding_space().unwrap().id())
+            .unwrap();
+        let anchor = workspace
+            .next_sources(run, None, 256, usize::MAX)
+            .unwrap()
+            .records[0]
+            .memory_ref;
+        db.reset_workspace_payload_fetches();
+
+        let error = workspace
+            .page_later_unassigned(
+                run,
+                anchor,
+                None,
+                64,
+                64 * 8 * std::mem::size_of::<f32>() - 1,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, StorageError::BudgetExceeded(_)));
+        assert_eq!(
+            db.workspace_payload_fetches(),
+            0,
+            "candidate payload SELECT must not run after a failed preflight"
+        );
     }
 
     fn embedding_count(db: &SqliteBackend, namespace_id: Uuid) -> i64 {

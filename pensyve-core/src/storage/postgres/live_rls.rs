@@ -120,7 +120,8 @@ use crate::storage::bounded::{
     VectorSearchOutcome, VectorSearchRequest, embedding_source_text,
 };
 use crate::storage::consolidation_workspace::{
-    ClusterDecision, ConsolidationWorkspace, PromotionCommit, RunId, WorkspaceCursor,
+    CONSOLIDATION_WORKING_STATE_BYTES, ClusterDecision, ConsolidationWorkspace, PromotionCommit,
+    RunId, WorkspaceCursor,
 };
 use crate::storage::{StorageError, StorageTrait};
 use crate::types::{
@@ -821,21 +822,31 @@ fn consolidation_workspace_lifecycle_is_transactional_resumable_and_rls_scoped()
         workspace.begin_or_resume(namespace.id, &space).unwrap(),
         run
     );
-    let first_page = workspace.next_sources(run, None, 2).unwrap();
+    let first_page = workspace
+        .next_sources(run, None, 2, CONSOLIDATION_WORKING_STATE_BYTES)
+        .unwrap();
     assert_eq!(first_page.records.len(), 2);
     let page_cursor = first_page
         .next_cursor
         .expect("two of four has another page");
     workspace.checkpoint(run, page_cursor).unwrap();
     assert_eq!(
-        workspace.next_sources(run, None, 8).unwrap().records.len(),
+        workspace
+            .next_sources(run, None, 8, CONSOLIDATION_WORKING_STATE_BYTES)
+            .unwrap()
+            .records
+            .len(),
         2
     );
     workspace
         .checkpoint(run, WorkspaceCursor::default())
         .unwrap();
     assert_eq!(
-        workspace.next_sources(run, None, 8).unwrap().records.len(),
+        workspace
+            .next_sources(run, None, 8, CONSOLIDATION_WORKING_STATE_BYTES)
+            .unwrap()
+            .records
+            .len(),
         4
     );
 
@@ -843,12 +854,16 @@ fn consolidation_workspace_lifecycle_is_transactional_resumable_and_rls_scoped()
         id: run.id,
         namespace_id: foreign.id,
     };
-    assert!(workspace.next_sources(foreign_run_id, None, 8).is_err());
+    assert!(
+        workspace
+            .next_sources(foreign_run_id, None, 8, CONSOLIDATION_WORKING_STATE_BYTES,)
+            .is_err()
+    );
     let foreign_run = workspace.begin_or_resume(foreign.id, &space).unwrap();
     assert_ne!(foreign_run.id, run.id);
     assert_eq!(
         workspace
-            .next_sources(foreign_run, None, 8)
+            .next_sources(foreign_run, None, 8, CONSOLIDATION_WORKING_STATE_BYTES)
             .unwrap()
             .records
             .len(),
@@ -856,7 +871,12 @@ fn consolidation_workspace_lifecycle_is_transactional_resumable_and_rls_scoped()
     );
 
     let records = workspace
-        .next_sources(run, Some(WorkspaceCursor::default()), 8)
+        .next_sources(
+            run,
+            Some(WorkspaceCursor::default()),
+            8,
+            CONSOLIDATION_WORKING_STATE_BYTES,
+        )
         .unwrap()
         .records;
     let anchor = records[0].memory_ref;
@@ -867,16 +887,17 @@ fn consolidation_workspace_lifecycle_is_transactional_resumable_and_rls_scoped()
         1
     );
     let candidates = workspace
-        .page_later_unassigned(run, anchor, None, 8)
+        .page_later_unassigned(run, anchor, None, 8, CONSOLIDATION_WORKING_STATE_BYTES)
         .unwrap();
     assert_eq!(candidates.records.len(), 3);
     for candidate in candidates.records {
         workspace
-            .record_tentative_match(run, anchor, candidate.source.memory_ref)
+            .record_tentative_match(run, anchor, candidate.memory_ref)
             .unwrap();
     }
-    let ClusterDecision::Finalized { promotion } =
-        workspace.finalize_or_discard_cluster(run, anchor).unwrap()
+    let ClusterDecision::Finalized { promotion } = workspace
+        .finalize_or_discard_cluster(run, anchor, CONSOLIDATION_WORKING_STATE_BYTES)
+        .unwrap()
     else {
         panic!("four matching rows must finalize");
     };
@@ -941,7 +962,11 @@ fn consolidation_workspace_lifecycle_is_transactional_resumable_and_rls_scoped()
     let ClusterDecision::Finalized {
         promotion: replacement,
     } = workspace
-        .finalize_or_discard_cluster(run, replacement_anchor_ref)
+        .finalize_or_discard_cluster(
+            run,
+            replacement_anchor_ref,
+            CONSOLIDATION_WORKING_STATE_BYTES,
+        )
         .unwrap()
     else {
         panic!("replacement pair must finalize");
@@ -981,7 +1006,11 @@ fn consolidation_workspace_lifecycle_is_transactional_resumable_and_rls_scoped()
             .is_none()
     );
     assert_eq!(
-        workspace.next_sources(run, None, 16).unwrap().records.len(),
+        workspace
+            .next_sources(run, None, 16, CONSOLIDATION_WORKING_STATE_BYTES)
+            .unwrap()
+            .records
+            .len(),
         6
     );
 }
@@ -1065,6 +1094,7 @@ fn consolidation_workspace_rejects_a_4097_member_promotion() {
                     memory_type: MemoryType::Episodic,
                     id: anchor_id,
                 },
+                CONSOLIDATION_WORKING_STATE_BYTES,
             )
             .unwrap(),
         ClusterDecision::MemberBudgetExceeded { member_count: 4097 }

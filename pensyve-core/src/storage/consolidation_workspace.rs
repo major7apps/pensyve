@@ -4,11 +4,25 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::embedding_space::EmbeddingSpaceId;
+use crate::storage::StorageError;
 use crate::storage::StorageResult;
 use crate::storage::bounded::{EmbeddingRecord, MemoryRef};
 use crate::types::Memory;
 
 pub const CONSOLIDATION_WORKING_STATE_BYTES: usize = 32 * 1024 * 1024;
+
+pub(crate) fn ensure_application_budget(
+    required: usize,
+    maximum: usize,
+    label: &str,
+) -> StorageResult<()> {
+    if required > maximum {
+        return Err(StorageError::BudgetExceeded(format!(
+            "{label} requires {required} application bytes; remaining budget is {maximum}"
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RunId {
@@ -25,17 +39,14 @@ pub struct WorkspaceCursor {
 pub struct WorkspaceSource {
     pub memory_ref: MemoryRef,
     pub about_entity: Uuid,
-    pub episode_id: Uuid,
-    pub timestamp: DateTime<Utc>,
-    pub content: String,
-    pub source_sha256: String,
     pub ordinal: i64,
 }
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceEmbeddingSource {
-    pub source: WorkspaceSource,
-    pub embedding: EmbeddingRecord,
+    pub memory_ref: MemoryRef,
+    pub ordinal: i64,
+    pub embedding: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -47,19 +58,14 @@ pub struct WorkspaceSourcePage {
 impl WorkspaceSource {
     #[must_use]
     pub fn application_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.content.capacity() + self.source_sha256.capacity()
+        std::mem::size_of::<Self>()
     }
 }
 
 impl WorkspaceEmbeddingSource {
     #[must_use]
     pub fn application_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self.source.content.capacity()
-            + self.source.source_sha256.capacity()
-            + self.embedding.embedding_space_id.0.capacity()
-            + self.embedding.source_sha256.capacity()
-            + self.embedding.embedding.capacity() * std::mem::size_of::<f32>()
+        std::mem::size_of::<Self>() + self.embedding.capacity() * std::mem::size_of::<f32>()
     }
 }
 
@@ -158,10 +164,15 @@ pub trait ConsolidationWorkspace: Send + Sync {
         run: RunId,
         after: Option<WorkspaceCursor>,
         limit: usize,
+        max_application_bytes: usize,
     ) -> StorageResult<WorkspaceSourcePage>;
 
-    fn load_source(&self, run: RunId, source: MemoryRef)
-    -> StorageResult<WorkspaceEmbeddingSource>;
+    fn load_source(
+        &self,
+        run: RunId,
+        source: MemoryRef,
+        max_application_bytes: usize,
+    ) -> StorageResult<WorkspaceEmbeddingSource>;
 
     fn page_later_unassigned(
         &self,
@@ -169,6 +180,7 @@ pub trait ConsolidationWorkspace: Send + Sync {
         anchor: MemoryRef,
         after: Option<WorkspaceCursor>,
         limit: usize,
+        max_application_bytes: usize,
     ) -> StorageResult<WorkspaceCandidatePage>;
 
     fn record_tentative_match(
@@ -182,6 +194,7 @@ pub trait ConsolidationWorkspace: Send + Sync {
         &self,
         run: RunId,
         anchor: MemoryRef,
+        max_application_bytes: usize,
     ) -> StorageResult<ClusterDecision>;
 
     /// Revalidate the complete finalized assignment and atomically either

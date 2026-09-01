@@ -306,6 +306,10 @@ fn main() -> Result<()> {
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::result_large_err,
+    reason = "public ConsolidationError::Partial compatibility requires unboxed committed stats"
+)]
 async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
     // Recovery artifacts belong inside the directory that backups and volume
     // mounts cover; the shared bound prevents any one tenant from growing it
@@ -612,13 +616,7 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                                     ..
                                 },
                             )) => {
-                                let reason_code = match reason {
-                                    pensyve_core::consolidation::ConsolidationIncomplete::Cancelled => "cancelled",
-                                    pensyve_core::consolidation::ConsolidationIncomplete::DurationExceeded => "duration_exceeded",
-                                    pensyve_core::consolidation::ConsolidationIncomplete::ClusterMemberBudgetExceeded { .. } => "cluster_member_budget_exceeded",
-                                    pensyve_core::consolidation::ConsolidationIncomplete::SourceChanged => "source_changed",
-                                    pensyve_core::consolidation::ConsolidationIncomplete::CoalescedPending => "coalesced_pending",
-                                };
+                                let reason_code = reason.reason_code();
                                 let _ = storage.log_activity(
                                     ns_id,
                                     "consolidate",

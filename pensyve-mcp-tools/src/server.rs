@@ -39,6 +39,28 @@ fn strip_embedding(val: &mut serde_json::Value) {
     }
 }
 
+fn consolidation_activity(
+    outcome: &pensyve_core::consolidation::ConsolidationOutcome,
+    trigger: &str,
+) -> serde_json::Value {
+    let (stats, completion_status, incomplete_reason) = match outcome {
+        pensyve_core::consolidation::ConsolidationOutcome::Complete { stats } => {
+            (stats, "complete", None)
+        }
+        pensyve_core::consolidation::ConsolidationOutcome::Incomplete { stats, reason, .. } => {
+            (stats, "incomplete", Some(reason.reason_code()))
+        }
+    };
+    serde_json::json!({
+        "promoted": stats.promoted,
+        "decayed": stats.decayed,
+        "archived": stats.archived,
+        "trigger": trigger,
+        "status": completion_status,
+        "incomplete_reason": incomplete_reason,
+    })
+}
+
 fn persist_runtime_memory(state: &PensyveState, memory: &Memory) -> Result<(), String> {
     let record = state
         .vector_runtime
@@ -512,8 +534,9 @@ impl PensyveMcpServer {
             // #226: `spawn_blocking`, not `spawn` — the engine is synchronous,
             // so on a runtime worker it parks that worker for the whole run.
             // The engine coalesces per namespace, so a burst of episode_end
-            // calls on one namespace does not pile up threads here: all but
-            // one return immediately, and the run in flight covers them.
+            // calls on one namespace does not pile up threads here. A complete
+            // owner reruns immediately; an incomplete owner leaves typed
+            // durable pending work.
             tokio::task::spawn_blocking(move || {
                 let config = pensyve_core::config::ConsolidationConfig::default();
                 // G1/P3a: ConsolidationEngine::run gained `policy` + `cancel`.
@@ -521,7 +544,7 @@ impl PensyveMcpServer {
                 // safest default; this background spawn is fire-and-forget
                 // (no external cancel signal) so a fresh CancellationToken
                 // (never cancelled) is appropriate.
-                match pensyve_core::consolidation::ConsolidationEngine::run(
+                match pensyve_core::consolidation::ConsolidationEngine::run_bounded(
                     storage.as_ref(),
                     &embedder,
                     &config,
@@ -529,20 +552,31 @@ impl PensyveMcpServer {
                     &pensyve_core::network_policy::NetworkPolicy::Disabled,
                     &tokio_util::sync::CancellationToken::new(),
                 ) {
-                    Ok(stats) => {
-                        if stats.promoted > 0 {
-                            tracing::info!(promoted = stats.promoted, "Post-episode consolidation");
-                        }
+                    Ok(outcome) => {
                         let _ = storage.log_activity(
                             ns_id,
                             "consolidate",
-                            &serde_json::json!({
-                                "promoted": stats.promoted,
-                                "decayed": stats.decayed,
-                                "archived": stats.archived,
-                                "trigger": "episode_end",
-                            }),
+                            &consolidation_activity(&outcome, "episode_end"),
                         );
+                        match outcome {
+                            pensyve_core::consolidation::ConsolidationOutcome::Complete {
+                                stats,
+                            } => {
+                                if stats.promoted > 0 {
+                                    tracing::info!(
+                                        promoted = stats.promoted,
+                                        "Post-episode consolidation"
+                                    );
+                                }
+                            }
+                            pensyve_core::consolidation::ConsolidationOutcome::Incomplete {
+                                reason,
+                                ..
+                            } => tracing::info!(
+                                reason = reason.reason_code(),
+                                "Post-episode consolidation checkpointed incomplete"
+                            ),
+                        }
                     }
                     Err(e) => {
                         // #260: a failed run may follow runs of the same call
@@ -1154,6 +1188,24 @@ mod tests {
 
     use std::io::BufRead;
     use std::path::PathBuf;
+
+    #[test]
+    fn background_consolidation_activity_preserves_typed_incomplete_status() {
+        let outcome = pensyve_core::consolidation::ConsolidationOutcome::Incomplete {
+            stats: pensyve_core::consolidation::ConsolidationStats {
+                promoted: 2,
+                ..pensyve_core::consolidation::ConsolidationStats::default()
+            },
+            cursor: pensyve_core::storage::consolidation_workspace::WorkspaceCursor::default(),
+            reason: pensyve_core::consolidation::ConsolidationIncomplete::DurationExceeded,
+        };
+
+        let activity = consolidation_activity(&outcome, "episode_end");
+
+        assert_eq!(activity["promoted"], 2);
+        assert_eq!(activity["status"], "incomplete");
+        assert_eq!(activity["incomplete_reason"], "duration_exceeded");
+    }
 
     /// A server backed by a temp database, holding one entity ("subject") with
     /// two memories: one where it is the `about_entity` of an episodic turn,

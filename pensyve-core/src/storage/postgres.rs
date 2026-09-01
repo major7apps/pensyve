@@ -38,7 +38,7 @@ use crate::storage::consolidation_workspace::{
     ClusterDecision, ClusterProvenance, ConsolidationWorkspace, LatestClusterMember, NamespacePage,
     NamespacePageCursor, PromotionAggregate, PromotionCommit, RunId, WorkspaceAssignment,
     WorkspaceCandidatePage, WorkspaceCursor, WorkspaceEmbeddingSource, WorkspaceSource,
-    WorkspaceSourcePage,
+    WorkspaceSourcePage, ensure_application_budget,
 };
 
 // ---------------------------------------------------------------------------
@@ -4663,6 +4663,7 @@ impl ConsolidationWorkspace for PostgresBackend {
         run: RunId,
         after: Option<WorkspaceCursor>,
         limit: usize,
+        max_application_bytes: usize,
     ) -> StorageResult<WorkspaceSourcePage> {
         if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
             return Err(StorageError::BudgetExceeded(format!(
@@ -4687,13 +4688,8 @@ impl ConsolidationWorkspace for PostgresBackend {
             };
             let rows: Vec<PgWorkspaceSourceRow> = query_as::<Postgres, _>(
                 "SELECT workspace.memory_id, workspace.about_entity,
-                            workspace.episode_id, workspace.source_timestamp,
-                            source.content, workspace.source_sha256,
                             workspace.source_ordinal
                      FROM consolidation_sources AS workspace
-                     JOIN episodic_memories AS source
-                       ON source.id = workspace.memory_id
-                      AND source.namespace_id = workspace.namespace_id
                      WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
                        AND workspace.source_ordinal > $3
                        AND workspace.assignment_state NOT IN ('discarded', 'promoted')
@@ -4710,23 +4706,24 @@ impl ConsolidationWorkspace for PostgresBackend {
             .map_err(sqlx_to_io)?;
             let records = rows
                 .into_iter()
-                .map(
-                    |(id, about_entity, episode_id, timestamp, content, hash, ordinal)| {
-                        WorkspaceSource {
-                            memory_ref: MemoryRef {
-                                memory_type: MemoryType::Episodic,
-                                id,
-                            },
-                            about_entity,
-                            episode_id,
-                            timestamp,
-                            content,
-                            source_sha256: hash,
-                            ordinal,
-                        }
+                .map(|(id, about_entity, ordinal)| WorkspaceSource {
+                    memory_ref: MemoryRef {
+                        memory_type: MemoryType::Episodic,
+                        id,
                     },
-                )
+                    about_entity,
+                    ordinal,
+                })
                 .collect::<Vec<_>>();
+            ensure_application_budget(
+                std::mem::size_of::<WorkspaceSourcePage>().saturating_add(
+                    records
+                        .len()
+                        .saturating_mul(std::mem::size_of::<WorkspaceSource>()),
+                ),
+                max_application_bytes,
+                "consolidation source page",
+            )?;
             let next_cursor = (records.len() == limit)
                 .then(|| {
                     records.last().map(|source| WorkspaceCursor {
@@ -4745,19 +4742,25 @@ impl ConsolidationWorkspace for PostgresBackend {
         &self,
         run: RunId,
         source: MemoryRef,
+        max_application_bytes: usize,
     ) -> StorageResult<WorkspaceEmbeddingSource> {
         self.block_on(async {
             let mut conn = self.scoped_conn(run.namespace_id).await?;
-            pg_workspace_embedding_source(&mut conn, run, source.id).await
+            pg_workspace_embedding_source(&mut conn, run, source.id, max_application_bytes).await
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "candidate metadata preflight and payload fetch stay adjacent to prove allocation ordering"
+    )]
     fn page_later_unassigned(
         &self,
         run: RunId,
         anchor: MemoryRef,
         after: Option<WorkspaceCursor>,
         limit: usize,
+        max_application_bytes: usize,
     ) -> StorageResult<WorkspaceCandidatePage> {
         if !(1..=crate::storage::bounded::CONSOLIDATION_COMPARISON_PAGE_SIZE).contains(&limit) {
             return Err(StorageError::BudgetExceeded(format!(
@@ -4778,19 +4781,70 @@ impl ConsolidationWorkspace for PostgresBackend {
             .await
             .map_err(sqlx_to_io)?;
             let cursor = after.map_or(ordinal, |cursor| cursor.source_ordinal);
+            let preflight: (i64, i64, i32) = query_as::<Postgres, _>(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(octet_length(embedding.embedding::text)), 0)::BIGINT,
+                        COALESCE(MAX(spaces.dimension), 0)
+                 FROM (
+                     SELECT workspace.memory_id
+                     FROM consolidation_sources AS workspace
+                     WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                       AND workspace.about_entity = $3 AND workspace.source_ordinal > $4
+                       AND workspace.assignment_state = 'unassigned'
+                     ORDER BY workspace.source_ordinal LIMIT $5
+                 ) AS page
+                 JOIN consolidation_runs AS runs
+                   ON runs.run_id = $1 AND runs.namespace_id = $2
+                 JOIN memory_embeddings AS embedding
+                   ON embedding.namespace_id = $2
+                  AND embedding.memory_type = 'episodic'
+                  AND embedding.memory_id = page.memory_id
+                  AND embedding.embedding_space_id = runs.embedding_space_id
+                 JOIN consolidation_sources AS source_snapshot
+                   ON source_snapshot.run_id = runs.run_id
+                  AND source_snapshot.namespace_id = runs.namespace_id
+                  AND source_snapshot.memory_id = page.memory_id
+                  AND embedding.source_sha256 = source_snapshot.source_sha256
+                 JOIN embedding_spaces AS spaces ON spaces.id = runs.embedding_space_id",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(entity)
+            .bind(cursor)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let row_count = usize::try_from(preflight.0)
+                .map_err(|_| StorageError::Context("negative candidate page count".into()))?;
+            let encoded_bytes = usize::try_from(preflight.1)
+                .map_err(|_| StorageError::Context("negative candidate payload bytes".into()))?;
+            let dimension = usize::try_from(preflight.2)
+                .map_err(|_| StorageError::Context("negative candidate dimension".into()))?;
+            ensure_application_budget(
+                std::mem::size_of::<WorkspaceCandidatePage>()
+                    .saturating_add(
+                        row_count.saturating_mul(std::mem::size_of::<WorkspaceEmbeddingSource>()),
+                    )
+                    .saturating_add(
+                        row_count.saturating_mul(std::mem::size_of::<PgWorkspaceEmbeddingRow>()),
+                    )
+                    .saturating_add(encoded_bytes)
+                    .saturating_add(
+                        row_count
+                            .saturating_mul(dimension)
+                            .saturating_mul(std::mem::size_of::<f32>()),
+                    ),
+                max_application_bytes,
+                "consolidation candidate page",
+            )?;
             let rows: Vec<PgWorkspaceEmbeddingRow> = query_as::<Postgres, _>(
-                "SELECT workspace.memory_id, workspace.about_entity,
-                        workspace.episode_id, workspace.source_timestamp,
-                        source.content, workspace.source_sha256,
-                        workspace.source_ordinal, runs.embedding_space_id,
+                "SELECT workspace.memory_id, workspace.source_ordinal,
                         embedding.embedding::text, spaces.dimension
                  FROM consolidation_sources AS workspace
                  JOIN consolidation_runs AS runs
                    ON runs.run_id = workspace.run_id
                   AND runs.namespace_id = workspace.namespace_id
-                 JOIN episodic_memories AS source
-                   ON source.id = workspace.memory_id
-                  AND source.namespace_id = workspace.namespace_id
                  JOIN memory_embeddings AS embedding
                    ON embedding.namespace_id = workspace.namespace_id
                   AND embedding.memory_type = 'episodic'
@@ -4818,7 +4872,7 @@ impl ConsolidationWorkspace for PostgresBackend {
             let next_cursor = (records.len() == limit)
                 .then(|| {
                     records.last().map(|source| WorkspaceCursor {
-                        source_ordinal: source.source.ordinal,
+                        source_ordinal: source.ordinal,
                     })
                 })
                 .flatten();
@@ -4869,10 +4923,15 @@ impl ConsolidationWorkspace for PostgresBackend {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "member/content preflight and finalization stay adjacent in one namespace-scoped operation"
+    )]
     fn finalize_or_discard_cluster(
         &self,
         run: RunId,
         anchor: MemoryRef,
+        max_application_bytes: usize,
     ) -> StorageResult<ClusterDecision> {
         self.block_on(async {
             let mut conn = self.scoped_conn(run.namespace_id).await?;
@@ -4907,6 +4966,36 @@ impl ConsolidationWorkspace for PostgresBackend {
                     member_count: count,
                 });
             }
+            let latest_content_bytes: (i64,) = query_as::<Postgres, _>(
+                "SELECT octet_length(source.content)::BIGINT
+                 FROM consolidation_sources AS workspace
+                 JOIN episodic_memories AS source
+                   ON source.id = workspace.memory_id
+                  AND source.namespace_id = workspace.namespace_id
+                 WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                   AND workspace.assignment_anchor = $3
+                 ORDER BY workspace.source_timestamp DESC, workspace.memory_id DESC
+                 LIMIT 1",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let latest_content_bytes = usize::try_from(latest_content_bytes.0)
+                .map_err(|_| StorageError::Context("negative final content bytes".into()))?;
+            ensure_application_budget(
+                std::mem::size_of::<PromotionAggregate>()
+                    .saturating_add(latest_content_bytes)
+                    .saturating_add(count.saturating_mul(std::mem::size_of::<ClusterProvenance>()))
+                    .saturating_add(
+                        count.saturating_mul(std::mem::size_of::<(Uuid, DateTime<Utc>)>()),
+                    )
+                    .saturating_add(std::mem::size_of::<(Uuid, DateTime<Utc>, String)>()),
+                max_application_bytes,
+                "consolidation finalized cluster",
+            )?;
             query::<Postgres>(
                 "UPDATE consolidation_sources SET assignment_state = 'finalized'
                  WHERE run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
@@ -5243,27 +5332,15 @@ impl ConsolidationWorkspace for PostgresBackend {
     }
 }
 
-type PgWorkspaceSourceRow = (Uuid, Uuid, Uuid, DateTime<Utc>, String, String, i64);
+type PgWorkspaceSourceRow = (Uuid, Uuid, i64);
 
-type PgWorkspaceEmbeddingRow = (
-    Uuid,
-    Uuid,
-    Uuid,
-    DateTime<Utc>,
-    String,
-    String,
-    i64,
-    String,
-    String,
-    i32,
-);
+type PgWorkspaceEmbeddingRow = (Uuid, i64, String, i32);
 
 fn pg_workspace_embedding_from_row(
-    namespace_id: Uuid,
+    _namespace_id: Uuid,
     row: PgWorkspaceEmbeddingRow,
 ) -> StorageResult<WorkspaceEmbeddingSource> {
-    let (id, about_entity, episode_id, timestamp, content, hash, ordinal, space, encoded, dim) =
-        row;
+    let (id, ordinal, encoded, dim) = row;
     let embedding = pgtext_to_embedding(Some(&encoded));
     if usize::try_from(dim).ok() != Some(embedding.len())
         || embedding.is_empty()
@@ -5278,22 +5355,9 @@ fn pg_workspace_embedding_from_row(
         id,
     };
     Ok(WorkspaceEmbeddingSource {
-        source: WorkspaceSource {
-            memory_ref,
-            about_entity,
-            episode_id,
-            timestamp,
-            content,
-            source_sha256: hash.clone(),
-            ordinal,
-        },
-        embedding: EmbeddingRecord {
-            namespace_id,
-            memory_ref,
-            embedding_space_id: EmbeddingSpaceId(space),
-            source_sha256: hash,
-            embedding,
-        },
+        memory_ref,
+        ordinal,
+        embedding,
     })
 }
 
@@ -5301,17 +5365,47 @@ async fn pg_workspace_embedding_source(
     conn: &mut PgConnection,
     run: RunId,
     memory_id: Uuid,
+    max_application_bytes: usize,
 ) -> StorageResult<WorkspaceEmbeddingSource> {
-    let row: PgWorkspaceEmbeddingRow = query_as::<Postgres, _>(
-        "SELECT workspace.memory_id, workspace.about_entity,
-                workspace.episode_id, workspace.source_timestamp, source.content,
-                workspace.source_sha256, workspace.source_ordinal,
-                runs.embedding_space_id, embedding.embedding::text, spaces.dimension
+    let preflight: (i64, i32) = query_as::<Postgres, _>(
+        "SELECT octet_length(embedding.embedding::text)::BIGINT, spaces.dimension
          FROM consolidation_sources AS workspace
          JOIN consolidation_runs AS runs
            ON runs.run_id = workspace.run_id AND runs.namespace_id = workspace.namespace_id
-         JOIN episodic_memories AS source
-           ON source.id = workspace.memory_id AND source.namespace_id = workspace.namespace_id
+         JOIN memory_embeddings AS embedding
+           ON embedding.namespace_id = workspace.namespace_id
+          AND embedding.memory_type = 'episodic'
+          AND embedding.memory_id = workspace.memory_id
+          AND embedding.embedding_space_id = runs.embedding_space_id
+          AND embedding.source_sha256 = workspace.source_sha256
+         JOIN embedding_spaces AS spaces ON spaces.id = runs.embedding_space_id
+         WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+           AND workspace.memory_id = $3",
+    )
+    .bind(run.id)
+    .bind(run.namespace_id)
+    .bind(memory_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(sqlx_to_io)?;
+    let encoded_bytes = usize::try_from(preflight.0)
+        .map_err(|_| StorageError::Context("negative anchor payload bytes".into()))?;
+    let dimension = usize::try_from(preflight.1)
+        .map_err(|_| StorageError::Context("negative anchor dimension".into()))?;
+    ensure_application_budget(
+        std::mem::size_of::<WorkspaceEmbeddingSource>()
+            .saturating_add(std::mem::size_of::<PgWorkspaceEmbeddingRow>())
+            .saturating_add(encoded_bytes)
+            .saturating_add(dimension.saturating_mul(std::mem::size_of::<f32>())),
+        max_application_bytes,
+        "consolidation anchor",
+    )?;
+    let row: PgWorkspaceEmbeddingRow = query_as::<Postgres, _>(
+        "SELECT workspace.memory_id, workspace.source_ordinal,
+                embedding.embedding::text, spaces.dimension
+         FROM consolidation_sources AS workspace
+         JOIN consolidation_runs AS runs
+           ON runs.run_id = workspace.run_id AND runs.namespace_id = workspace.namespace_id
          JOIN memory_embeddings AS embedding
            ON embedding.namespace_id = workspace.namespace_id
           AND embedding.memory_type = 'episodic'
@@ -5841,6 +5935,18 @@ mod tests {
                 ],
             },
             Contract {
+                label: "preflight candidate payload",
+                binds: 5,
+                required: &[
+                    "workspace.run_id = $1 AND workspace.namespace_id = $2",
+                    "workspace.about_entity = $3",
+                    "workspace.source_ordinal > $4",
+                    "LIMIT $5",
+                    "SUM(octet_length(embedding.embedding::text))",
+                    "fetch_one(&mut *conn)",
+                ],
+            },
+            Contract {
                 label: "page candidates",
                 binds: 5,
                 required: &[
@@ -5882,6 +5988,17 @@ mod tests {
                 required: &[
                     "run_id = $1 AND namespace_id = $2 AND memory_id = $3",
                     "execute(&mut *conn)",
+                ],
+            },
+            Contract {
+                label: "preflight latest content",
+                binds: 3,
+                required: &[
+                    "workspace.run_id = $1 AND workspace.namespace_id = $2",
+                    "workspace.assignment_anchor = $3",
+                    "octet_length(source.content)::BIGINT",
+                    "LIMIT 1",
+                    "fetch_one(&mut *conn)",
                 ],
             },
             Contract {
@@ -6043,6 +6160,7 @@ mod tests {
             "let source_count: (i64,)",
             "let rows: Vec<PgWorkspaceSourceRow>",
             "let (entity, ordinal): (Uuid, i64)",
+            "let preflight: (i64, i64, i32)",
             "let rows: Vec<PgWorkspaceEmbeddingRow>",
             "let latest: (Uuid, DateTime<Utc>, String)",
             "let rows: Vec<(Uuid, DateTime<Utc>)>",
@@ -6071,15 +6189,19 @@ mod tests {
             .expect("single-source loader end");
         let helper = &source[helper_start..helper_start + helper_end];
         let helper_blocks = query_blocks(helper);
-        assert_eq!(helper_blocks.len(), 1);
-        let helper_query = helper_blocks[0];
-        assert_eq!(helper_query.matches(".bind(").count(), 3);
+        assert_eq!(helper_blocks.len(), 2);
+        let preflight_query = helper_blocks[0];
+        assert_eq!(preflight_query.matches(".bind(").count(), 3);
+        assert!(preflight_query.contains("octet_length(embedding.embedding::text)::BIGINT"));
+        let payload_query = helper_blocks[1];
+        assert_eq!(payload_query.matches(".bind(").count(), 3);
         for required in [
             "workspace.run_id = $1 AND workspace.namespace_id = $2",
             "workspace.memory_id = $3",
             "fetch_one(&mut *conn)",
         ] {
-            assert!(helper_query.contains(required));
+            assert!(preflight_query.contains(required));
+            assert!(payload_query.contains(required));
         }
         assert!(helper.contains("let row: PgWorkspaceEmbeddingRow"));
         assert!(helper.contains("pg_workspace_embedding_from_row(run.namespace_id, row)"));

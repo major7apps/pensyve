@@ -201,7 +201,8 @@ fn i5_pre_cancelled_token_returns_cancelled_immediately() {
     clippy::items_after_statements,
     clippy::cast_possible_wrap,
     clippy::duration_suboptimal_units,
-    reason = "test code: N_ROWS const sits next to its single use site for readability; loop index i fits comfortably in i64; explicit ms units make wall-clock budgets easier to read in test assertions"
+    clippy::result_large_err,
+    reason = "test code: N_ROWS const sits next to its single use site for readability; loop index i fits comfortably in i64; explicit ms units make wall-clock budgets easier to read in test assertions; the public Partial variant intentionally keeps stats unboxed"
 )]
 async fn i5_long_running_consolidation_cancels_within_budget() {
     let tmp = TempDir::new().unwrap();

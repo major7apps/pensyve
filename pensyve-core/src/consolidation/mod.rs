@@ -55,11 +55,13 @@ pub mod dmem;
 pub(crate) mod gate;
 pub mod typed_slots;
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -68,14 +70,14 @@ use crate::decay;
 use crate::embedding::{OnnxEmbedder, cosine_similarity};
 use crate::network_policy::{NetworkPolicy, NetworkRequiredError};
 use crate::storage::bounded::{
-    CONSOLIDATION_COMPARISON_PAGE_SIZE, MEMORY_PAGE_SIZE, MemoryPageRequest, SearchScope,
-    embedding_source_text,
+    CONSOLIDATION_COMPARISON_PAGE_SIZE, EmbeddingRecord, MEMORY_PAGE_SIZE, MemoryPageRequest,
+    MemoryRef, SearchScope, embedding_source_text,
 };
 use crate::storage::consolidation_workspace::{
     CONSOLIDATION_WORKING_STATE_BYTES, ClusterDecision, ConsolidationWorkspace, PromotionCommit,
     RunId, WorkspaceCursor,
 };
-use crate::storage::{StorageError, StorageTrait, embedding_record_for_memory};
+use crate::storage::{StorageError, StorageResult, StorageTrait};
 use crate::types::{Memory, SemanticMemory, SlotKind};
 
 use self::typed_slots::{TypedSlotLlm, TypedSlots, extract_slots};
@@ -129,7 +131,7 @@ pub enum ConsolidationError {
     Partial {
         /// Stats for the runs that completed before the failing one. Already
         /// written to storage — the error does not roll them back.
-        partial: Box<ConsolidationStats>,
+        partial: ConsolidationStats,
         /// The failure that ended the final run.
         #[source]
         source: Box<ConsolidationError>,
@@ -154,7 +156,7 @@ impl ConsolidationError {
             source
         } else {
             Self::Partial {
-                partial: Box::new(committed),
+                partial: committed,
                 source: Box::new(source),
             }
         }
@@ -177,6 +179,21 @@ pub enum ConsolidationIncomplete {
     ClusterMemberBudgetExceeded { member_count: usize },
     SourceChanged,
     CoalescedPending,
+    WorkingStateBudgetExceeded,
+}
+
+impl ConsolidationIncomplete {
+    #[must_use]
+    pub const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::DurationExceeded => "duration_exceeded",
+            Self::ClusterMemberBudgetExceeded { .. } => "cluster_member_budget_exceeded",
+            Self::SourceChanged => "source_changed",
+            Self::CoalescedPending => "coalesced_pending",
+            Self::WorkingStateBudgetExceeded => "working_state_budget_exceeded",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -402,6 +419,60 @@ fn global_consolidation_permit() -> &'static FairPermit {
 
 pub struct ConsolidationEngine;
 
+#[derive(Debug, Default)]
+struct CandidatePageTracker {
+    live: Cell<usize>,
+    peak: Cell<usize>,
+}
+
+impl CandidatePageTracker {
+    fn acquire<T>(
+        &self,
+        fetch: impl FnOnce() -> StorageResult<T>,
+    ) -> StorageResult<CandidatePageLease<'_, T>> {
+        if self.live() != 0 {
+            return Err(StorageError::BudgetExceeded(
+                "a consolidation candidate page is already live".into(),
+            ));
+        }
+        let value = fetch()?;
+        self.live.set(self.live() + 1);
+        self.peak.set(self.peak.get().max(self.live()));
+        Ok(CandidatePageLease {
+            value,
+            tracker: self,
+        })
+    }
+
+    fn live(&self) -> usize {
+        self.live.get()
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.get()
+    }
+}
+
+#[derive(Debug)]
+struct CandidatePageLease<'a, T> {
+    value: T,
+    tracker: &'a CandidatePageTracker,
+}
+
+impl<T> std::ops::Deref for CandidatePageLease<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<T> Drop for CandidatePageLease<'_, T> {
+    fn drop(&mut self) {
+        self.tracker.live.set(self.tracker.live() - 1);
+    }
+}
+
 const SIMILARITY_THRESHOLD: f32 = 0.8;
 
 // Test seam state for `injected_run_failure`. Thread-local rather than
@@ -465,6 +536,10 @@ fn injected_run_failure(_namespace_id: Uuid) -> Option<ConsolidationError> {
     None
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "public ConsolidationError::Partial compatibility requires unboxed committed stats"
+)]
 impl ConsolidationEngine {
     /// Run all consolidation jobs for a namespace.
     ///
@@ -495,9 +570,9 @@ impl ConsolidationEngine {
     ///
     /// Triggers coalesce rather than queue. A call made while another run is
     /// in flight for the namespace does no work and returns zeroed stats with
-    /// [`ConsolidationStats::coalesced`] set; the run already going will run
-    /// once more and cover it, so nothing is dropped. See the `gate` module
-    /// docs for why queueing was rejected and why coalescing is lossless.
+    /// [`ConsolidationStats::coalesced`] set. A complete owner runs once more;
+    /// an incomplete owner leaves typed durable pending work for a later
+    /// trigger or sweep. See the `gate` module docs.
     ///
     /// A caller that does own the namespace may therefore perform several
     /// consecutive runs, and the returned stats are the total across them.
@@ -690,16 +765,24 @@ impl ConsolidationEngine {
     fn observe_working_state(
         stats: &mut ConsolidationStats,
         bytes: usize,
-    ) -> Result<(), ConsolidationError> {
+    ) -> Option<ConsolidationIncomplete> {
         stats.metrics.peak_working_state_bytes = stats.metrics.peak_working_state_bytes.max(bytes);
         if bytes > CONSOLIDATION_WORKING_STATE_BYTES {
-            return Err(StorageError::BudgetExceeded(format!(
-                "consolidation working state requires {bytes} bytes; maximum is \
-                 {CONSOLIDATION_WORKING_STATE_BYTES}"
-            ))
-            .into());
+            return Some(ConsolidationIncomplete::WorkingStateBudgetExceeded);
         }
-        Ok(())
+        None
+    }
+
+    fn workspace_payload<T>(result: StorageResult<T>) -> Result<Option<T>, ConsolidationError> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(StorageError::BudgetExceeded(_)) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn remaining_working_state(retained: usize) -> usize {
+        CONSOLIDATION_WORKING_STATE_BYTES.saturating_sub(retained)
     }
 
     #[allow(
@@ -719,6 +802,7 @@ impl ConsolidationEngine {
         cursor: &mut WorkspaceCursor,
     ) -> Result<Option<ConsolidationIncomplete>, ConsolidationError> {
         let mut page_cursor = None;
+        let candidate_pages = CandidatePageTracker::default();
         loop {
             if cancel.is_cancelled() {
                 workspace.checkpoint(run, *cursor)?;
@@ -728,7 +812,16 @@ impl ConsolidationEngine {
                 workspace.checkpoint(run, *cursor)?;
                 return Ok(Some(ConsolidationIncomplete::DurationExceeded));
             }
-            let page = workspace.next_sources(run, page_cursor, MEMORY_PAGE_SIZE)?;
+            let Some(page) = Self::workspace_payload(workspace.next_sources(
+                run,
+                page_cursor,
+                MEMORY_PAGE_SIZE,
+                CONSOLIDATION_WORKING_STATE_BYTES,
+            ))?
+            else {
+                workspace.checkpoint(run, *cursor)?;
+                return Ok(Some(ConsolidationIncomplete::WorkingStateBudgetExceeded));
+            };
             let source_page_rows = page.records.len();
             let source_page_bytes = page.application_bytes();
             stats.metrics.max_source_page_request =
@@ -737,7 +830,10 @@ impl ConsolidationEngine {
                 stats.metrics.max_source_page_rows.max(source_page_rows);
             stats.metrics.max_source_page_bytes =
                 stats.metrics.max_source_page_bytes.max(source_page_bytes);
-            Self::observe_working_state(stats, source_page_bytes)?;
+            if let Some(reason) = Self::observe_working_state(stats, source_page_bytes) {
+                workspace.checkpoint(run, *cursor)?;
+                return Ok(Some(reason));
+            }
             if page.records.is_empty() {
                 return Ok(None);
             }
@@ -760,10 +856,24 @@ impl ConsolidationEngine {
                     workspace.checkpoint(run, *cursor)?;
                     continue;
                 }
-                let anchor = workspace.load_source(run, anchor_ref)?;
+                let Some(anchor) = Self::workspace_payload(workspace.load_source(
+                    run,
+                    anchor_ref,
+                    Self::remaining_working_state(source_page_bytes),
+                ))?
+                else {
+                    workspace.checkpoint(run, *cursor)?;
+                    return Ok(Some(ConsolidationIncomplete::WorkingStateBudgetExceeded));
+                };
                 let anchor_bytes = anchor.application_bytes();
                 stats.metrics.max_anchor_bytes = stats.metrics.max_anchor_bytes.max(anchor_bytes);
-                Self::observe_working_state(stats, source_page_bytes.saturating_add(anchor_bytes))?;
+                if let Some(reason) = Self::observe_working_state(
+                    stats,
+                    source_page_bytes.saturating_add(anchor_bytes),
+                ) {
+                    workspace.checkpoint(run, *cursor)?;
+                    return Ok(Some(reason));
+                }
                 let mut candidate_cursor = None;
                 loop {
                     if cancel.is_cancelled() {
@@ -774,12 +884,21 @@ impl ConsolidationEngine {
                         workspace.checkpoint(run, *cursor)?;
                         return Ok(Some(ConsolidationIncomplete::DurationExceeded));
                     }
-                    let candidates = workspace.page_later_unassigned(
-                        run,
-                        anchor_ref,
-                        candidate_cursor,
-                        CONSOLIDATION_COMPARISON_PAGE_SIZE,
-                    )?;
+                    let candidate_result = candidate_pages.acquire(|| {
+                        workspace.page_later_unassigned(
+                            run,
+                            anchor_ref,
+                            candidate_cursor,
+                            CONSOLIDATION_COMPARISON_PAGE_SIZE,
+                            Self::remaining_working_state(
+                                source_page_bytes.saturating_add(anchor_bytes),
+                            ),
+                        )
+                    });
+                    let Some(candidates) = Self::workspace_payload(candidate_result)? else {
+                        workspace.checkpoint(run, *cursor)?;
+                        return Ok(Some(ConsolidationIncomplete::WorkingStateBudgetExceeded));
+                    };
                     let candidate_page_rows = candidates.records.len();
                     let candidate_page_bytes = candidates.application_bytes();
                     stats.metrics.max_candidate_page_request = stats
@@ -795,24 +914,25 @@ impl ConsolidationEngine {
                         .max_candidate_page_bytes
                         .max(candidate_page_bytes);
                     stats.metrics.candidate_pages += 1;
-                    stats.metrics.peak_candidate_pages = stats.metrics.peak_candidate_pages.max(1);
-                    Self::observe_working_state(
+                    stats.metrics.peak_candidate_pages = candidate_pages.peak();
+                    if let Some(reason) = Self::observe_working_state(
                         stats,
                         source_page_bytes
                             .saturating_add(anchor_bytes)
                             .saturating_add(candidate_page_bytes),
-                    )?;
+                    ) {
+                        workspace.checkpoint(run, *cursor)?;
+                        return Ok(Some(reason));
+                    }
                     let next_candidates = candidates.next_cursor;
-                    for candidate in candidates.records {
-                        if cosine_similarity(
-                            &anchor.embedding.embedding,
-                            &candidate.embedding.embedding,
-                        ) > SIMILARITY_THRESHOLD
+                    for candidate in &candidates.records {
+                        if cosine_similarity(&anchor.embedding, &candidate.embedding)
+                            > SIMILARITY_THRESHOLD
                         {
                             let count = workspace.record_tentative_match(
                                 run,
                                 anchor_ref,
-                                candidate.source.memory_ref,
+                                candidate.memory_ref,
                             )?;
                             if count > crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS {
                                 workspace.checkpoint(run, *cursor)?;
@@ -830,7 +950,19 @@ impl ConsolidationEngine {
                     candidate_cursor = Some(next);
                 }
 
-                match workspace.finalize_or_discard_cluster(run, anchor_ref)? {
+                let Some(decision) =
+                    Self::workspace_payload(workspace.finalize_or_discard_cluster(
+                        run,
+                        anchor_ref,
+                        Self::remaining_working_state(
+                            source_page_bytes.saturating_add(anchor_bytes),
+                        ),
+                    ))?
+                else {
+                    workspace.checkpoint(run, *cursor)?;
+                    return Ok(Some(ConsolidationIncomplete::WorkingStateBudgetExceeded));
+                };
+                match decision {
                     ClusterDecision::SingletonDiscarded => {}
                     ClusterDecision::MemberBudgetExceeded { member_count } => {
                         workspace.checkpoint(run, *cursor)?;
@@ -848,25 +980,30 @@ impl ConsolidationEngine {
                             .metrics
                             .max_finalized_metadata_bytes
                             .max(promotion_bytes);
-                        Self::observe_working_state(
+                        if let Some(reason) = Self::observe_working_state(
                             stats,
                             source_page_bytes
                                 .saturating_add(anchor_bytes)
                                 .saturating_add(promotion_bytes),
-                        )?;
+                        ) {
+                            workspace.checkpoint(run, *cursor)?;
+                            return Ok(Some(reason));
+                        }
                         let confidence = (promotion.member_count as f32 * 0.3).min(1.0);
+                        let provenance = promotion.provenance;
+                        let provenance_bytes =
+                            provenance.capacity().saturating_mul(std::mem::size_of::<
+                                crate::storage::consolidation_workspace::ClusterProvenance,
+                            >());
                         let mut semantic = SemanticMemory::new(
                             namespace_id,
                             source.about_entity,
                             "mentioned",
-                            promotion.latest.content.clone(),
+                            promotion.latest.content,
                             confidence,
                         );
-                        semantic.source_episodes = promotion
-                            .provenance
-                            .iter()
-                            .map(|member| member.episode_id)
-                            .collect();
+                        semantic.source_episodes =
+                            provenance.iter().map(|member| member.episode_id).collect();
                         let wrapped = Memory::Semantic(semantic);
                         let semantic_bytes = match &wrapped {
                             Memory::Semantic(semantic) => {
@@ -879,36 +1016,55 @@ impl ConsolidationEngine {
                             }
                             _ => unreachable!("consolidation promotion is semantic"),
                         };
-                        let embedding = {
-                            let canonical_source = embedding_source_text(&wrapped);
-                            Self::observe_working_state(
-                                stats,
-                                source_page_bytes
-                                    .saturating_add(anchor_bytes)
-                                    .saturating_add(promotion_bytes)
-                                    .saturating_add(semantic_bytes)
-                                    .saturating_add(canonical_source.capacity()),
-                            )?;
-                            embedder.embed(&canonical_source)?
+                        let canonical_bytes = match &wrapped {
+                            Memory::Semantic(semantic) => semantic
+                                .predicate
+                                .len()
+                                .saturating_add(1)
+                                .saturating_add(semantic.object.len()),
+                            _ => unreachable!("consolidation promotion is semantic"),
                         };
-                        let record = embedding_record_for_memory(
-                            &wrapped,
-                            embedder.embedding_space()?,
+                        let predicted_embedding_bytes = embedder
+                            .dimensions()
+                            .saturating_mul(std::mem::size_of::<f32>());
+                        if let Some(reason) = Self::observe_working_state(
+                            stats,
+                            source_page_bytes
+                                .saturating_add(anchor_bytes)
+                                .saturating_add(semantic_bytes)
+                                .saturating_add(provenance_bytes)
+                                .saturating_add(canonical_bytes)
+                                .saturating_add(predicted_embedding_bytes),
+                        ) {
+                            workspace.checkpoint(run, *cursor)?;
+                            return Ok(Some(reason));
+                        }
+                        let canonical_source = embedding_source_text(&wrapped);
+                        let embedding = embedder.embed(&canonical_source)?;
+                        let record = EmbeddingRecord {
+                            namespace_id,
+                            memory_ref: MemoryRef::from_memory(&wrapped),
+                            embedding_space_id: embedder.embedding_space()?.id(),
+                            source_sha256: hex::encode(Sha256::digest(canonical_source.as_bytes())),
                             embedding,
-                        );
+                        };
                         let record_bytes = std::mem::size_of::<
                             crate::storage::bounded::EmbeddingRecord,
                         >() + record.embedding_space_id.0.capacity()
                             + record.source_sha256.capacity()
                             + record.embedding.capacity() * std::mem::size_of::<f32>();
-                        Self::observe_working_state(
+                        if let Some(reason) = Self::observe_working_state(
                             stats,
                             source_page_bytes
                                 .saturating_add(anchor_bytes)
-                                .saturating_add(promotion_bytes)
                                 .saturating_add(semantic_bytes)
+                                .saturating_add(provenance_bytes)
+                                .saturating_add(canonical_source.capacity())
                                 .saturating_add(record_bytes),
-                        )?;
+                        ) {
+                            workspace.checkpoint(run, *cursor)?;
+                            return Ok(Some(reason));
+                        }
                         match workspace.commit_promotion(run, anchor_ref, &wrapped, &record)? {
                             PromotionCommit::Committed => stats.promoted += 1,
                             PromotionCommit::NotAdmitted => {}
@@ -1732,8 +1888,63 @@ mod tests {
     use super::*;
     use crate::config::{ConsolidationConfig, PensyveConfig};
     use crate::embedding::OnnxEmbedder;
+    use crate::storage::embedding_record_for_memory;
     use crate::storage::sqlite::SqliteBackend;
     use crate::types::{Episode, EpisodicMemory, Namespace};
+
+    #[test]
+    fn candidate_page_lease_rejects_second_fetch_before_storage_access() {
+        let tracker = CandidatePageTracker::default();
+        let fetches = std::cell::Cell::new(0);
+        let first = tracker
+            .acquire(|| {
+                fetches.set(fetches.get() + 1);
+                Ok::<_, StorageError>(())
+            })
+            .unwrap();
+
+        let error = tracker
+            .acquire(|| {
+                fetches.set(fetches.get() + 1);
+                Ok::<_, StorageError>(())
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, StorageError::BudgetExceeded(_)));
+        assert_eq!(fetches.get(), 1, "second page must not be fetched");
+        assert_eq!(tracker.live(), 1);
+        assert_eq!(tracker.peak(), 1);
+        drop(first);
+        assert_eq!(tracker.live(), 0);
+    }
+
+    #[test]
+    fn incomplete_reason_codes_cover_every_shipping_outcome() {
+        let cases = [
+            (ConsolidationIncomplete::Cancelled, "cancelled"),
+            (
+                ConsolidationIncomplete::DurationExceeded,
+                "duration_exceeded",
+            ),
+            (
+                ConsolidationIncomplete::ClusterMemberBudgetExceeded { member_count: 4097 },
+                "cluster_member_budget_exceeded",
+            ),
+            (ConsolidationIncomplete::SourceChanged, "source_changed"),
+            (
+                ConsolidationIncomplete::CoalescedPending,
+                "coalesced_pending",
+            ),
+            (
+                ConsolidationIncomplete::WorkingStateBudgetExceeded,
+                "working_state_budget_exceeded",
+            ),
+        ];
+
+        for (reason, code) in cases {
+            assert_eq!(reason.reason_code(), code);
+        }
+    }
 
     fn make_storage(tmp: &str) -> SqliteBackend {
         SqliteBackend::open(&PathBuf::from(tmp)).expect("open storage")
@@ -2169,6 +2380,23 @@ mod tests {
         assert_eq!(stats.promoted, 0);
         assert_eq!(stats.decayed, 0);
         assert_eq!(stats.archived, 0);
+    }
+
+    #[test]
+    fn public_partial_error_field_remains_an_unboxed_stats_value() {
+        let expected = ConsolidationStats {
+            promoted: 1,
+            ..ConsolidationStats::default()
+        };
+        let error = ConsolidationError::Partial {
+            partial: expected.clone(),
+            source: Box::new(ConsolidationError::Cancelled("test".into())),
+        };
+        let ConsolidationError::Partial { partial, .. } = error else {
+            unreachable!();
+        };
+        let actual: ConsolidationStats = partial;
+        assert_eq!(actual.promoted, expected.promoted);
     }
 
     #[test]

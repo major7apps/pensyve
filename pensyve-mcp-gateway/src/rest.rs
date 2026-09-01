@@ -2144,14 +2144,14 @@ async fn episode_end(
         // #226: `spawn_blocking`, not `spawn` — the engine is synchronous, so
         // on a runtime worker it parks that worker for the whole run. The
         // engine coalesces per namespace, so a burst of episode_end calls on
-        // one namespace does not pile up threads here: all but one return
-        // immediately, and the run in flight covers them.
+        // one namespace does not pile up threads here. A complete owner reruns
+        // immediately; an incomplete owner leaves typed durable pending work.
         tokio::task::spawn_blocking(move || {
             let config = pensyve_core::config::ConsolidationConfig::default();
             // G1/P3a: pass Disabled + fresh CancellationToken; this is a
             // fire-and-forget background spawn after episode_end with no
             // external cancel signal source.
-            match pensyve_core::consolidation::ConsolidationEngine::run(
+            match pensyve_core::consolidation::ConsolidationEngine::run_bounded(
                 storage.as_ref(),
                 &embedder,
                 &config,
@@ -2159,7 +2159,9 @@ async fn episode_end(
                 &pensyve_core::network_policy::NetworkPolicy::Disabled,
                 &tokio_util::sync::CancellationToken::new(),
             ) {
-                Ok(consolidation_stats) => {
+                Ok(pensyve_core::consolidation::ConsolidationOutcome::Complete {
+                    stats: consolidation_stats,
+                }) => {
                     if consolidation_stats.promoted > 0 {
                         tracing::info!(
                             promoted = consolidation_stats.promoted,
@@ -2174,7 +2176,31 @@ async fn episode_end(
                             "decayed": consolidation_stats.decayed,
                             "archived": consolidation_stats.archived,
                             "trigger": "episode_end",
+                            "status": "complete",
                         }),
+                    );
+                }
+                Ok(pensyve_core::consolidation::ConsolidationOutcome::Incomplete {
+                    stats: consolidation_stats,
+                    reason,
+                    ..
+                }) => {
+                    let reason_code = reason.reason_code();
+                    let _ = storage.log_activity(
+                        ns_id,
+                        "consolidate",
+                        &serde_json::json!({
+                            "promoted": consolidation_stats.promoted,
+                            "decayed": consolidation_stats.decayed,
+                            "archived": consolidation_stats.archived,
+                            "trigger": "episode_end",
+                            "status": "incomplete",
+                            "incomplete_reason": reason_code,
+                        }),
+                    );
+                    tracing::info!(
+                        reason = reason_code,
+                        "Post-episode consolidation checkpointed incomplete"
                     );
                 }
                 Err(e) => {
@@ -2253,6 +2279,10 @@ async fn episode_end(
 // Consolidation handler
 // ---------------------------------------------------------------------------
 
+#[allow(
+    clippy::result_large_err,
+    reason = "public ConsolidationError::Partial compatibility requires unboxed committed stats"
+)]
 async fn consolidate(
     State(state): State<Arc<AppState>>,
     axum::Extension(auth_ctx): axum::Extension<AuthContext>,
@@ -2263,15 +2293,16 @@ async fn consolidate(
     // #226: this on-demand endpoint is a fourth path into the engine, so it
     // coalesces per namespace like the sweep and the `episode_end` spawns. Run
     // it on the blocking pool rather than parking a runtime worker for the
-    // duration. A call made while another run is in flight returns zeroed
-    // stats immediately — that run covers this trigger's evidence.
+    // duration. A call made while another run is in flight returns typed
+    // coalesced-pending state; complete owners rerun immediately, while an
+    // incomplete owner leaves durable pending work for resumption.
     let run_storage = ps.storage.clone();
     let run_embedder = ps.embedder.clone();
     let ns_id = ps.namespace.id;
     let consolidation_result = tokio::task::spawn_blocking(move || {
         // G1/P3a: pass Disabled + fresh CancellationToken. Synchronous REST
         // path — no external cancel signal source today.
-        pensyve_core::consolidation::ConsolidationEngine::run(
+        pensyve_core::consolidation::ConsolidationEngine::run_bounded(
             run_storage.as_ref(),
             &run_embedder,
             &config,
@@ -2288,7 +2319,7 @@ async fn consolidate(
         )
     })?;
 
-    let consolidation_result = match consolidation_result {
+    let consolidation_outcome = match consolidation_result {
         Ok(consolidated) => consolidated,
         Err(e) => {
             // #260: a failed run may follow runs of the same call that already
@@ -2313,6 +2344,15 @@ async fn consolidate(
         }
     };
 
+    let (consolidation_result, status, incomplete_reason) = match consolidation_outcome {
+        pensyve_core::consolidation::ConsolidationOutcome::Complete { stats } => {
+            (stats, "complete", None)
+        }
+        pensyve_core::consolidation::ConsolidationOutcome::Incomplete { stats, reason, .. } => {
+            (stats, "incomplete", Some(reason.reason_code()))
+        }
+    };
+
     let _ = ps.storage.log_activity(
         ps.namespace.id,
         "consolidate",
@@ -2320,6 +2360,8 @@ async fn consolidate(
             "promoted": consolidation_result.promoted,
             "decayed": consolidation_result.decayed,
             "archived": consolidation_result.archived,
+            "status": status,
+            "incomplete_reason": incomplete_reason,
         }),
     );
 
@@ -2330,6 +2372,8 @@ async fn consolidate(
         // #260: zeroed counts alone cannot tell a request that coalesced into
         // a run already in flight from one that ran and found nothing to do.
         "coalesced": consolidation_result.coalesced,
+        "status": status,
+        "incomplete_reason": incomplete_reason,
     })))
 }
 

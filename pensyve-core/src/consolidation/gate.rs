@@ -49,12 +49,11 @@
 //! written after that snapshot, and a skipped trigger's evidence would sit
 //! unconsolidated until some later trigger or the periodic sweep.
 //!
-//! The pending flag is what closes that hole. A trigger either sets the flag
-//! before the owner checks it — and is covered by a re-run whose snapshot is
-//! taken afterwards — or finds the namespace already released, and runs
-//! itself. Both sides of that decision happen under one registry lock, so
-//! there is no interleaving in which a trigger is told it was coalesced and
-//! then no run follows.
+//! The pending flag closes that hole for a complete owner: the owner re-runs
+//! with a fresh snapshot before releasing. An incomplete owner deliberately
+//! declines an immediate re-run; its durable checkpoint and the coalesced
+//! caller's typed `CoalescedPending` outcome make resumption explicit, and a
+//! later trigger or periodic sweep refreshes the source snapshot.
 //!
 //! Two consequences worth stating plainly. While triggers keep arriving during
 //! each run, the owning caller keeps running — that is a namespace under
@@ -62,10 +61,9 @@
 //! costs one thread. And `max_duration_secs` bounds a *run*, not a caller: an
 //! owner that re-runs spends that budget once per run, so a caller which waits
 //! for its own return value (the `/consolidate` endpoint) can take longer than
-//! one budget under sustained triggering. Capping the re-runs was the obvious
-//! alternative and it is not available: releasing the namespace with the flag
-//! still set discards it, which is precisely the dropped work this design
-//! exists to avoid, and nothing else is scheduled to pick it up.
+//! one budget under sustained triggering. Incomplete outcomes are the bounded
+//! exception: they release the process claim and rely on durable resumption
+//! instead of extending the same caller indefinitely.
 //!
 //! ## Scope
 //!
@@ -81,8 +79,9 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use uuid::Uuid;
 
 /// Namespaces with a run in flight. The value is the pending flag: `true`
-/// means at least one further trigger arrived while the run was going, so the
-/// owner must run again before releasing the namespace.
+/// means at least one further trigger arrived while the run was going. A
+/// complete owner runs again before release; an incomplete owner releases for
+/// later durable resumption.
 ///
 /// Presence *is* the ownership claim, so an entry exists only while a run is
 /// actually in flight — the map does not grow with the number of namespaces
@@ -154,8 +153,8 @@ pub enum Dispatch<T> {
     /// from its final run.
     Ran(T),
     /// A run was already in flight. Nothing executed here — the namespace was
-    /// marked pending, so the in-flight run will run again and cover this
-    /// trigger's evidence.
+    /// marked pending. A complete owner will run again; an incomplete owner
+    /// returns typed pending state for later durable resumption.
     Coalesced,
 }
 
@@ -198,10 +197,10 @@ fn finish_or_rerun(namespace_id: Uuid) -> bool {
 /// parallel.
 ///
 /// If a run already owns the namespace, returns [`Dispatch::Coalesced`]
-/// immediately without invoking `f`; the owner will run again on its behalf.
-/// Otherwise `f` runs, and re-runs for as long as further triggers arrive,
-/// subject to `should_rerun` — which lets the caller decline a re-run after an
-/// error or a cancellation.
+/// immediately without invoking `f`. Otherwise `f` runs, and a complete owner
+/// re-runs while further triggers arrive. `should_rerun` lets an incomplete or
+/// failed owner release for later resumption rather than promise an immediate
+/// retry.
 ///
 /// A panic in `f` propagates after the namespace is released, so it neither
 /// wedges the namespace nor leaves an entry behind.

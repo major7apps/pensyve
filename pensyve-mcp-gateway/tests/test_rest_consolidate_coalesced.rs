@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use axum::Extension;
 use chrono::Utc;
 use pensyve_core::config::{ConsolidationConfig, RetrievalConfig};
-use pensyve_core::consolidation::ConsolidationEngine;
+use pensyve_core::consolidation::{ConsolidationEngine, ConsolidationOutcome};
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::network_policy::NetworkPolicy;
 use pensyve_core::storage::sqlite::SqliteBackend;
@@ -209,7 +209,7 @@ async fn consolidate_reports_whether_the_request_coalesced() {
         let storage = ps.storage.clone();
         let embedder = ps.embedder.clone();
         std::thread::spawn(move || {
-            ConsolidationEngine::run(
+            ConsolidationEngine::run_bounded(
                 storage.as_ref(),
                 &embedder,
                 &ConsolidationConfig::default(),
@@ -246,8 +246,13 @@ async fn consolidate_reports_whether_the_request_coalesced() {
         coalesced["promoted"], 0,
         "a coalesced request does no work of its own"
     );
+    assert_eq!(coalesced["status"], "incomplete");
+    assert_eq!(coalesced["incomplete_reason"], "coalesced_pending");
 
-    let owner_stats = owner.join().expect("owner thread");
+    let ConsolidationOutcome::Complete { stats: owner_stats } = owner.join().expect("owner thread")
+    else {
+        panic!("uncancelled owner must complete");
+    };
     assert_eq!(
         owner_stats.promoted, CLUSTERS,
         "the owner's total should span both of its runs"
@@ -262,4 +267,6 @@ async fn consolidate_reports_whether_the_request_coalesced() {
         "a request that ran must not report itself as coalesced"
     );
     assert_eq!(ran["promoted"], 0, "everything was already promoted");
+    assert_eq!(ran["status"], "complete");
+    assert!(ran["incomplete_reason"].is_null());
 }

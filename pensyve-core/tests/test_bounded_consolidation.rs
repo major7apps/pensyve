@@ -146,7 +146,9 @@ fn finalize_pair(
     let run = workspace
         .begin_or_resume(namespace_id, &embedder.embedding_space().unwrap().id())
         .unwrap();
-    let page = workspace.next_sources(run, None, 256).unwrap();
+    let page = workspace
+        .next_sources(run, None, 256, CONSOLIDATION_WORKING_STATE_BYTES)
+        .unwrap();
     assert_eq!(page.records.len(), 2);
     let anchor = page.records[0].memory_ref;
     let member = page.records[1].memory_ref;
@@ -162,8 +164,9 @@ fn finalize_pair(
             .unwrap(),
         2
     );
-    let ClusterDecision::Finalized { promotion } =
-        workspace.finalize_or_discard_cluster(run, anchor).unwrap()
+    let ClusterDecision::Finalized { promotion } = workspace
+        .finalize_or_discard_cluster(run, anchor, CONSOLIDATION_WORKING_STATE_BYTES)
+        .unwrap()
     else {
         panic!("two members must finalize");
     };
@@ -668,6 +671,86 @@ fn duration_checkpoint_resumes_and_promotes_exactly_once() {
 }
 
 #[test]
+fn oversized_persisted_final_content_returns_typed_budget_before_promotion() {
+    let (_tmp, storage, embedder, namespace, episode) = setup("bounded-persisted-content");
+    let entity = Uuid::new_v4();
+    let now = Utc::now();
+    save_episode_memory(&storage, &embedder, &episode, entity, "same", now);
+    let latest = save_episode_memory(
+        &storage,
+        &embedder,
+        &episode,
+        entity,
+        "same",
+        now + Duration::seconds(1),
+    );
+    let conn = rusqlite::Connection::open(storage.db_path().unwrap()).unwrap();
+    conn.execute(
+        "UPDATE episodic_memories SET content = printf('%.*c', ?1, 'x') WHERE id = ?2",
+        rusqlite::params![
+            i64::try_from(CONSOLIDATION_WORKING_STATE_BYTES + 1).unwrap(),
+            latest.id.to_string()
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let outcome = ConsolidationEngine::run_bounded(
+        &storage,
+        &embedder,
+        &config(),
+        namespace.id,
+        &NetworkPolicy::Disabled,
+        &CancellationToken::new(),
+    )
+    .expect("an oversized persisted payload is a typed incomplete outcome");
+    let ConsolidationOutcome::Incomplete { reason, stats, .. } = outcome else {
+        panic!("oversized persisted final content must not report complete");
+    };
+    assert_eq!(reason, ConsolidationIncomplete::WorkingStateBudgetExceeded);
+    assert_eq!(stats.promoted, 0);
+    assert_eq!(stats.decayed, 0);
+}
+
+#[test]
+fn active_dimension_rejects_a_64_vector_page_before_fetch() {
+    let (_tmp, storage, embedder, namespace, episode) = setup("bounded-vector-preflight");
+    let entity = Uuid::new_v4();
+    let now = Utc::now();
+    for offset in 0..=64 {
+        save_episode_memory(
+            &storage,
+            &embedder,
+            &episode,
+            entity,
+            "same",
+            now + Duration::microseconds(offset),
+        );
+    }
+    let workspace = storage.consolidation_workspace().unwrap();
+    let run = workspace
+        .begin_or_resume(namespace.id, &embedder.embedding_space().unwrap().id())
+        .unwrap();
+    let sources = workspace
+        .next_sources(run, None, 256, CONSOLIDATION_WORKING_STATE_BYTES)
+        .unwrap();
+    let anchor = sources.records[0].memory_ref;
+    let error = workspace
+        .page_later_unassigned(
+            run,
+            anchor,
+            None,
+            64,
+            64 * 8 * std::mem::size_of::<f32>() - 1,
+        )
+        .expect_err("the dimension preflight must reject before vector payload fetch");
+    assert!(matches!(
+        error,
+        pensyve_core::storage::StorageError::BudgetExceeded(_)
+    ));
+}
+
+#[test]
 fn exactly_cluster_member_budget_can_finalize() {
     let (_tmp, storage, embedder, namespace, episode) = setup("bounded-exact-budget");
     let entity = Uuid::new_v4();
@@ -760,4 +843,20 @@ fn shipping_consolidation_and_periodic_sweep_have_no_bulk_or_cache_enumeration()
         first.namespace_ids.contains(&storage_only.id)
             || second.namespace_ids.contains(&storage_only.id)
     );
+}
+
+#[test]
+fn every_shipping_consolidation_caller_preserves_typed_bounded_outcomes() {
+    for path in [
+        "../pensyve-mcp-gateway/src/main.rs",
+        "../pensyve-mcp-gateway/src/rest.rs",
+        "../pensyve-mcp-tools/src/server.rs",
+        "../pensyve-python/src/lib.rs",
+    ] {
+        let source = fs::read_to_string(path).unwrap();
+        assert!(
+            !source.contains("ConsolidationEngine::run("),
+            "shipping caller {path} flattened typed incomplete outcomes through compatibility run"
+        );
+    }
 }

@@ -1852,7 +1852,9 @@ impl PyPensyve {
 
     /// Run the consolidation engine (episodic→semantic promotion + FSRS decay).
     ///
-    /// Returns a dict with keys: promoted, decayed, archived.
+    /// Returns a dict with keys: promoted, decayed, archived, coalesced,
+    /// status, and `incomplete_reason`. `status` is `"complete"` or
+    /// `"incomplete"`; the reason is a stable code or None.
     ///
     /// Args:
     ///     entity: Unused in Phase 2; consolidation runs namespace-wide (default: None).
@@ -1869,12 +1871,12 @@ impl PyPensyve {
         // mirrors the Pensyve handle's fail-closed default. The PyO3
         // binding is synchronous and exposes no cancellation primitive
         // to Python today, so a fresh never-cancelled token is correct.
-        let stats = py
+        let outcome = py
             .detach(move || {
                 let _permit = LOCAL_OPERATION_LOCK
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                ConsolidationEngine::run(
+                ConsolidationEngine::run_bounded(
                     inner.storage.as_ref(),
                     inner.embedder.as_ref(),
                     &inner.consolidation_config,
@@ -1886,11 +1888,22 @@ impl PyPensyve {
             })
             .map_err(PyRuntimeError::new_err)?;
 
+        let (stats, completion_status, incomplete_reason) = match outcome {
+            pensyve_core::consolidation::ConsolidationOutcome::Complete { stats } => {
+                (stats, "complete", None)
+            }
+            pensyve_core::consolidation::ConsolidationOutcome::Incomplete {
+                stats, reason, ..
+            } => (stats, "incomplete", Some(reason.reason_code())),
+        };
+
         let dict = pyo3::types::PyDict::new(py);
         dict.set_item("promoted", stats.promoted)?;
         dict.set_item("decayed", stats.decayed)?;
         dict.set_item("archived", stats.archived)?;
         dict.set_item("coalesced", stats.coalesced)?;
+        dict.set_item("status", completion_status)?;
+        dict.set_item("incomplete_reason", incomplete_reason)?;
         Ok(dict)
     }
 
@@ -2505,6 +2518,40 @@ mod tests {
         assert_eq!(in_flight.load(Ordering::SeqCst), 0);
         std::fs::remove_dir_all(dir_a).unwrap();
         std::fs::remove_dir_all(dir_b).unwrap();
+    }
+
+    #[test]
+    fn python_consolidate_serializes_duration_incomplete_as_typed_status() {
+        Python::initialize();
+        let dir = std::env::temp_dir().join(format!("pensyve-python-test-{}", Uuid::new_v4()));
+        let mut handle = python_test_handle(&dir, "python-incomplete-consolidation");
+        Arc::get_mut(&mut handle.inner)
+            .expect("test handle is uniquely owned")
+            .consolidation_config
+            .max_duration_secs = 0;
+
+        Python::attach(|py| {
+            let response = handle.consolidate(py, None).unwrap();
+            assert_eq!(
+                response
+                    .get_item("status")
+                    .unwrap()
+                    .expect("status field")
+                    .extract::<String>()
+                    .unwrap(),
+                "incomplete"
+            );
+            assert_eq!(
+                response
+                    .get_item("incomplete_reason")
+                    .unwrap()
+                    .expect("incomplete reason field")
+                    .extract::<String>()
+                    .unwrap(),
+                "duration_exceeded"
+            );
+        });
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
