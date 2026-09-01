@@ -30,8 +30,9 @@ use super::{
 use crate::graph::EdgeType;
 use crate::storage::bounded::{
     EmbeddingRecord, LexicalHit, MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS,
-    MEMORY_PAGE_SIZE, MemoryPage, MemoryPageRequest, MemoryRef, MemoryType, PageCursor,
-    SearchScope, lexical_query_tokens,
+    MAX_VECTOR_HITS, MEMORY_PAGE_SIZE, MemoryPage, MemoryPageRequest, MemoryRef, MemoryType,
+    PageCursor, SearchScope, SearchUnavailable, VectorHit, VectorSearchOutcome,
+    VectorSearchRequest, lexical_query_tokens,
 };
 
 // ---------------------------------------------------------------------------
@@ -855,6 +856,72 @@ const LIST_OBSERVATIONS_BY_ENTITY_INSTANCE_SQL: &str = r"SELECT id, namespace_id
       WHERE namespace_id = $1 AND instance = $2 AND superseded_by IS NULL
       ORDER BY created_at DESC LIMIT $3";
 
+/// One exact, global top-k over the three first-stage memory kinds.
+///
+/// `memory_type` is the [`MemoryType`] discriminant rather than its stored text
+/// so SQL tie order stays identical to `SQLite`'s typed order. The windowed
+/// invalid flag makes one malformed eligible vector fail the whole semantic
+/// leg even when that row would fall outside the top-k; partial hits are never
+/// returned. pgvector itself rejects non-finite stored components.
+const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH candidates AS (
+    SELECT 0::smallint AS memory_type, embeddings.memory_id, embeddings.embedding
+    FROM memory_embeddings AS embeddings
+    JOIN episodic_memories AS memory
+      ON memory.id = embeddings.memory_id
+     AND memory.namespace_id = embeddings.namespace_id
+    WHERE embeddings.namespace_id = $2
+      AND embeddings.embedding_space_id = $3
+      AND embeddings.memory_type = 'episodic'
+      AND ($4::uuid IS NULL OR memory.agent_id = $4)
+      AND ($5::uuid IS NULL OR memory.user_id = $5)
+      AND ($6::uuid IS NULL OR memory.about_entity = $6 OR memory.source_entity = $6)
+      AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
+    UNION ALL
+    SELECT 1::smallint, embeddings.memory_id, embeddings.embedding
+    FROM memory_embeddings AS embeddings
+    JOIN semantic_memories AS memory
+      ON memory.id = embeddings.memory_id
+     AND memory.namespace_id = embeddings.namespace_id
+    WHERE embeddings.namespace_id = $2
+      AND embeddings.embedding_space_id = $3
+      AND embeddings.memory_type = 'semantic'
+      AND ($4::uuid IS NULL OR memory.agent_id = $4)
+      AND ($5::uuid IS NULL OR memory.user_id = $5)
+      AND ($6::uuid IS NULL OR memory.subject = $6 OR memory.object_entity = $6)
+      AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
+    UNION ALL
+    SELECT 2::smallint, embeddings.memory_id, embeddings.embedding
+    FROM memory_embeddings AS embeddings
+    JOIN procedural_memories AS memory
+      ON memory.id = embeddings.memory_id
+     AND memory.namespace_id = embeddings.namespace_id
+    WHERE embeddings.namespace_id = $2
+      AND embeddings.embedding_space_id = $3
+      AND embeddings.memory_type = 'procedural'
+      AND ($4::uuid IS NULL OR memory.agent_id = $4)
+      AND ($5::uuid IS NULL OR memory.user_id = $5)
+      AND $6::uuid IS NULL
+      AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
+), ranked AS (
+    SELECT memory_type, memory_id,
+           CASE
+             WHEN vector_dims(embedding) = vector_dims($1::vector)
+              AND vector_norm(embedding) > 0
+             THEN embedding <=> $1::vector
+             ELSE NULL
+           END AS distance,
+           bool_or(
+               vector_dims(embedding) <> vector_dims($1::vector)
+               OR vector_norm(embedding) <= 0
+           ) OVER () AS invalid_stored_vector
+    FROM candidates
+)
+SELECT memory_type, memory_id, 1.0 - distance AS cosine_similarity,
+       invalid_stored_vector
+FROM ranked
+ORDER BY distance ASC, memory_type ASC, memory_id ASC
+LIMIT $7";
+
 // ---------------------------------------------------------------------------
 // Error helpers
 // ---------------------------------------------------------------------------
@@ -866,6 +933,30 @@ fn io_err(e: impl std::fmt::Display) -> super::StorageError {
 #[allow(clippy::needless_pass_by_value)]
 fn sqlx_to_io(e: sqlx_core::error::Error) -> super::StorageError {
     super::StorageError::Io(std::io::Error::other(e.to_string()))
+}
+
+fn remaining_statement_timeout_ms(deadline: std::time::Instant) -> Option<u64> {
+    let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+    let millis = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+    (millis > 0).then(|| millis.min(i32::MAX as u64))
+}
+
+fn postgres_vector_error_reason(code: Option<&str>, message: &str) -> Option<SearchUnavailable> {
+    if code == Some("57014") {
+        return Some(SearchUnavailable::DeadlineExceeded);
+    }
+    if code.is_some_and(|code| code.starts_with("22"))
+        && message.to_ascii_lowercase().contains("vector")
+    {
+        return Some(SearchUnavailable::InvalidStoredVector);
+    }
+    None
+}
+
+fn vector_error_reason(error: &sqlx_core::error::Error) -> Option<SearchUnavailable> {
+    let database_error = error.as_database_error()?;
+    let code = database_error.code();
+    postgres_vector_error_reason(code.as_deref(), database_error.message())
 }
 
 /// SQL fragment OR-combining one `plainto_tsquery` per query token, with
@@ -1310,6 +1401,155 @@ async fn load_memory_without_embedding_pg(
 // ---------------------------------------------------------------------------
 
 impl StorageTrait for PostgresBackend {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transaction keeps deadline, validation, exact query, and fail-closed decoding inseparable"
+    )]
+    fn search_vector(
+        &self,
+        request: &VectorSearchRequest<'_>,
+    ) -> StorageResult<VectorSearchOutcome> {
+        if !(1..=MAX_VECTOR_HITS).contains(&request.k) {
+            return Err(StorageError::Context(format!(
+                "vector search k must be within 1..={MAX_VECTOR_HITS}, got {}",
+                request.k
+            )));
+        }
+        if remaining_statement_timeout_ms(request.deadline).is_none() {
+            return Ok(VectorSearchOutcome::Unavailable(
+                SearchUnavailable::DeadlineExceeded,
+            ));
+        }
+
+        self.block_on(async {
+            let mut conn = self.scoped_conn(request.scope.namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            let Some(timeout_ms) = remaining_statement_timeout_ms(request.deadline) else {
+                return Ok(VectorSearchOutcome::Unavailable(
+                    SearchUnavailable::DeadlineExceeded,
+                ));
+            };
+            query::<Postgres>("SELECT set_config('statement_timeout', $1, true)")
+                .bind(format!("{timeout_ms}ms"))
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
+
+            let expected_dimension = match query_as::<Postgres, (i32,)>(
+                "SELECT dimension FROM embedding_spaces WHERE id = $1",
+            )
+            .bind(&request.embedding_space_id.0)
+            .fetch_optional(&mut *transaction)
+            .await
+            {
+                Ok(Some((dimension,))) => dimension,
+                Ok(None) => {
+                    return Ok(VectorSearchOutcome::Unavailable(
+                        SearchUnavailable::NoActiveEmbeddingSpace,
+                    ));
+                }
+                Err(error) => {
+                    if let Some(reason) = vector_error_reason(&error) {
+                        return Ok(VectorSearchOutcome::Unavailable(reason));
+                    }
+                    return Err(sqlx_to_io(error));
+                }
+            };
+            let Ok(expected_dimension) = usize::try_from(expected_dimension) else {
+                return Ok(VectorSearchOutcome::Unavailable(
+                    SearchUnavailable::InvalidStoredVector,
+                ));
+            };
+            if request.query_embedding.len() != expected_dimension
+                || request
+                    .query_embedding
+                    .iter()
+                    .any(|value| !value.is_finite())
+            {
+                return Err(StorageError::Context(format!(
+                    "query embedding must contain {expected_dimension} finite components"
+                )));
+            }
+            if request.query_embedding.iter().all(|value| *value == 0.0) {
+                if remaining_statement_timeout_ms(request.deadline).is_none() {
+                    return Ok(VectorSearchOutcome::Unavailable(
+                        SearchUnavailable::DeadlineExceeded,
+                    ));
+                }
+                transaction.commit().await.map_err(sqlx_to_io)?;
+                return Ok(VectorSearchOutcome::Complete(Vec::new()));
+            }
+
+            let query_embedding = embedding_to_pgtext(request.query_embedding)
+                .expect("a dimension-validated query embedding is non-empty");
+            let rows: Vec<(i16, Uuid, Option<f64>, bool)> =
+                match query_as::<Postgres, _>(POSTGRES_VECTOR_SEARCH_SQL)
+                    .bind(query_embedding)
+                    .bind(request.scope.namespace_id)
+                    .bind(&request.embedding_space_id.0)
+                    .bind(request.scope.agent_id)
+                    .bind(request.scope.user_id)
+                    .bind(request.scope.entity_id)
+                    .bind(i64::try_from(request.k).unwrap_or(i64::MAX))
+                    .fetch_all(&mut *transaction)
+                    .await
+                {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        if let Some(reason) = vector_error_reason(&error) {
+                            return Ok(VectorSearchOutcome::Unavailable(reason));
+                        }
+                        return Err(sqlx_to_io(error));
+                    }
+                };
+            if rows.len() > request.k || rows.iter().any(|row| row.3) {
+                return Ok(VectorSearchOutcome::Unavailable(
+                    SearchUnavailable::InvalidStoredVector,
+                ));
+            }
+            let mut hits = Vec::with_capacity(rows.len());
+            for (memory_type, id, score, _invalid_stored_vector) in rows {
+                let memory_type = match memory_type {
+                    0 => MemoryType::Episodic,
+                    1 => MemoryType::Semantic,
+                    2 => MemoryType::Procedural,
+                    _ => {
+                        return Ok(VectorSearchOutcome::Unavailable(
+                            SearchUnavailable::InvalidStoredVector,
+                        ));
+                    }
+                };
+                let Some(score) = score else {
+                    return Ok(VectorSearchOutcome::Unavailable(
+                        SearchUnavailable::InvalidStoredVector,
+                    ));
+                };
+                let score = score as f32;
+                if !score.is_finite() {
+                    return Ok(VectorSearchOutcome::Unavailable(
+                        SearchUnavailable::InvalidStoredVector,
+                    ));
+                }
+                hits.push(VectorHit {
+                    memory_ref: MemoryRef { memory_type, id },
+                    score,
+                });
+            }
+            if remaining_statement_timeout_ms(request.deadline).is_none() {
+                return Ok(VectorSearchOutcome::Unavailable(
+                    SearchUnavailable::DeadlineExceeded,
+                ));
+            }
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            if std::time::Instant::now() >= request.deadline {
+                return Ok(VectorSearchOutcome::Unavailable(
+                    SearchUnavailable::DeadlineExceeded,
+                ));
+            }
+            Ok(VectorSearchOutcome::Complete(hits))
+        })
+    }
+
     fn search_lexical_hits(
         &self,
         query_str: &str,
@@ -3555,6 +3795,63 @@ mod live_rls;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_pgvector_sql_is_one_bounded_parameterized_union_with_stable_order() {
+        assert_eq!(POSTGRES_VECTOR_SEARCH_SQL.matches("UNION ALL").count(), 2);
+        assert_eq!(
+            POSTGRES_VECTOR_SEARCH_SQL
+                .matches("embeddings.namespace_id = $2")
+                .count(),
+            3
+        );
+        assert_eq!(
+            POSTGRES_VECTOR_SEARCH_SQL
+                .matches("embeddings.embedding_space_id = $3")
+                .count(),
+            3
+        );
+        for memory_type in ["episodic", "semantic", "procedural"] {
+            assert!(
+                POSTGRES_VECTOR_SEARCH_SQL
+                    .contains(&format!("embeddings.memory_type = '{memory_type}'"))
+            );
+        }
+        assert!(!POSTGRES_VECTOR_SEARCH_SQL.contains("observation_memories"));
+        assert!(
+            POSTGRES_VECTOR_SEARCH_SQL
+                .contains("ORDER BY distance ASC, memory_type ASC, memory_id ASC\nLIMIT $7")
+        );
+        assert_eq!(POSTGRES_VECTOR_SEARCH_SQL.matches("LIMIT $7").count(), 1);
+        assert!(!POSTGRES_VECTOR_SEARCH_SQL.contains("get_all_memories"));
+    }
+
+    #[test]
+    fn exact_pgvector_timeout_is_positive_bounded_and_query_cancel_maps_to_deadline() {
+        let expired = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(remaining_statement_timeout_ms(expired), None);
+
+        let one_second = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        assert!(
+            remaining_statement_timeout_ms(one_second)
+                .is_some_and(|timeout_ms| (1..=1_000).contains(&timeout_ms))
+        );
+
+        assert!(
+            postgres_vector_error_reason(Some("57014"), "canceling statement")
+                .is_some_and(|reason| reason == SearchUnavailable::DeadlineExceeded)
+        );
+        assert!(
+            postgres_vector_error_reason(Some("22000"), "different vector dimensions")
+                .is_some_and(|reason| reason == SearchUnavailable::InvalidStoredVector)
+        );
+        assert_eq!(
+            postgres_vector_error_reason(Some("08006"), "connection failure"),
+            None
+        );
+    }
 
     #[test]
     fn postgres_schema_has_idempotent_supersession_alters() {

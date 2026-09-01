@@ -99,6 +99,7 @@
 //! so out loud). Those tests name the reason in their own docs.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -110,11 +111,11 @@ use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions, Postgres};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
-use super::PostgresBackend;
+use super::{POSTGRES_VECTOR_SEARCH_SQL, PostgresBackend};
 use crate::embedding_space::EmbeddingSpaceId;
 use crate::storage::bounded::{
     EmbeddingRecord, MAX_HYDRATED_BYTES, MemoryPageRequest, MemoryRef, MemoryType, SearchScope,
-    embedding_source_text,
+    SearchUnavailable, VectorHit, VectorSearchOutcome, VectorSearchRequest, embedding_source_text,
 };
 use crate::storage::{StorageError, StorageTrait};
 use crate::types::{
@@ -4235,4 +4236,499 @@ fn postgres_source_projections_round_trip_persisted_scope() {
     for memory in &bulk {
         assert_memory_scope(memory, agent_id, user_id);
     }
+}
+
+fn save_exact_vector(
+    postgres: &PostgresBackend,
+    sqlite: &crate::storage::sqlite::SqliteBackend,
+    memory: &Memory,
+    space: &str,
+    embedding: Vec<f32>,
+) {
+    let record = embedding_record(memory, space, embedding);
+    postgres
+        .save_memory_with_embedding(memory, Some(&record))
+        .expect("save Postgres exact-search fixture");
+    sqlite
+        .save_memory_with_embedding(memory, Some(&record))
+        .expect("save SQLite exact-search fixture");
+}
+
+fn complete_vector_hits(outcome: VectorSearchOutcome) -> Vec<VectorHit> {
+    match outcome {
+        VectorSearchOutcome::Complete(hits) => hits,
+        VectorSearchOutcome::Unavailable(reason) => {
+            panic!("expected complete vector search, got {reason:?}")
+        }
+    }
+}
+
+fn vector_refs(hits: &[VectorHit]) -> Vec<MemoryRef> {
+    hits.iter().map(|hit| hit.memory_ref).collect()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn exact_pgvector_matches_sqlite_oracle_with_scope_ties_and_cross_type_ids() {
+    let Some(admin_opts) =
+        skip_notice("exact_pgvector_matches_sqlite_oracle_with_scope_ties_and_cross_type_ids")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let postgres = &fixture.backend;
+    let sqlite_dir = tempfile::tempdir().expect("sqlite exact-search tempdir");
+    let sqlite = crate::storage::sqlite::SqliteBackend::open(sqlite_dir.path())
+        .expect("open sqlite exact-search oracle");
+    let namespace = Namespace::new(format!("exact-own-{}", Uuid::new_v4().simple()));
+    let foreign = Namespace::new(format!("exact-foreign-{}", Uuid::new_v4().simple()));
+    for backend in [postgres as &dyn StorageTrait, &sqlite] {
+        backend
+            .save_namespace(&namespace)
+            .expect("save own namespace");
+        backend
+            .save_namespace(&foreign)
+            .expect("save foreign namespace");
+    }
+    for space in ["exact-space", "other-space"] {
+        register_embedding_space(&fixture, space, "real", 2);
+        register_sqlite_embedding_space(sqlite_dir.path(), space, 2);
+    }
+
+    let agent = Uuid::new_v4();
+    let user = Uuid::new_v4();
+    let entity = Uuid::new_v4();
+    let collision_id = Uuid::from_u128(7_001);
+
+    let mut episodic = EpisodicMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        entity,
+        "exact episodic",
+    );
+    episodic.id = collision_id;
+    episodic.agent_id = Some(agent);
+    episodic.user_id = Some(user);
+    let mut semantic = SemanticMemory::new(namespace.id, entity, "exact", "semantic", 1.0);
+    semantic.id = collision_id;
+    semantic.agent_id = Some(agent);
+    semantic.user_id = Some(user);
+    let mut procedural = ProceduralMemory::new(
+        namespace.id,
+        "exact",
+        "procedural",
+        Outcome::Success,
+        HashMap::new(),
+    );
+    procedural.id = collision_id;
+    procedural.agent_id = Some(agent);
+    procedural.user_id = Some(user);
+    let mut observation = ObservationMemory::new(
+        namespace.id,
+        episodic.episode_id,
+        "exact",
+        "observation",
+        "exclude",
+        "exact observation",
+    );
+    observation.id = collision_id;
+    observation.agent_id = Some(agent);
+    observation.user_id = Some(user);
+    for memory in [
+        Memory::Episodic(episodic),
+        Memory::Semantic(semantic),
+        Memory::Procedural(procedural),
+        Memory::Observation(observation),
+    ] {
+        save_exact_vector(postgres, &sqlite, &memory, "exact-space", vec![1.0, 0.0]);
+    }
+
+    let mut lower = EpisodicMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        entity,
+        "lower ranked",
+    );
+    lower.id = Uuid::from_u128(7_002);
+    lower.agent_id = Some(agent);
+    lower.user_id = Some(user);
+    save_exact_vector(
+        postgres,
+        &sqlite,
+        &Memory::Episodic(lower.clone()),
+        "exact-space",
+        vec![0.0, 1.0],
+    );
+
+    let mut wrong_agent = lower.clone();
+    wrong_agent.id = Uuid::from_u128(7_003);
+    wrong_agent.agent_id = Some(Uuid::new_v4());
+    save_exact_vector(
+        postgres,
+        &sqlite,
+        &Memory::Episodic(wrong_agent),
+        "exact-space",
+        vec![1.0, 0.0],
+    );
+    let mut wrong_user = lower.clone();
+    wrong_user.id = Uuid::from_u128(7_004);
+    wrong_user.user_id = Some(Uuid::new_v4());
+    save_exact_vector(
+        postgres,
+        &sqlite,
+        &Memory::Episodic(wrong_user),
+        "exact-space",
+        vec![1.0, 0.0],
+    );
+    let mut superseded = lower.clone();
+    superseded.id = Uuid::from_u128(7_005);
+    superseded.superseded_by = Some(Uuid::new_v4());
+    save_exact_vector(
+        postgres,
+        &sqlite,
+        &Memory::Episodic(superseded),
+        "exact-space",
+        vec![1.0, 0.0],
+    );
+    let mut invalid = lower.clone();
+    invalid.id = Uuid::from_u128(7_006);
+    invalid.invalid_at = Some(Utc::now());
+    save_exact_vector(
+        postgres,
+        &sqlite,
+        &Memory::Episodic(invalid),
+        "exact-space",
+        vec![1.0, 0.0],
+    );
+    let mut other_generation = lower.clone();
+    other_generation.id = Uuid::from_u128(7_007);
+    save_exact_vector(
+        postgres,
+        &sqlite,
+        &Memory::Episodic(other_generation),
+        "other-space",
+        vec![1.0, 0.0],
+    );
+    let mut foreign_memory = lower;
+    foreign_memory.id = Uuid::from_u128(7_008);
+    foreign_memory.namespace_id = foreign.id;
+    save_exact_vector(
+        postgres,
+        &sqlite,
+        &Memory::Episodic(foreign_memory),
+        "exact-space",
+        vec![1.0, 0.0],
+    );
+
+    let query_embedding = [1.0, 0.0];
+    let scope = SearchScope {
+        namespace_id: namespace.id,
+        agent_id: Some(agent),
+        user_id: Some(user),
+        entity_id: None,
+    };
+    let request = VectorSearchRequest::new(
+        scope.clone(),
+        "exact-space",
+        &query_embedding,
+        100,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .expect("exact request");
+    let postgres_hits = complete_vector_hits(postgres.search_vector(&request).unwrap());
+    let sqlite_hits = complete_vector_hits(sqlite.search_vector(&request).unwrap());
+    assert_eq!(vector_refs(&postgres_hits), vector_refs(&sqlite_hits));
+    assert_eq!(
+        vector_refs(&postgres_hits),
+        vec![
+            MemoryRef {
+                memory_type: MemoryType::Episodic,
+                id: collision_id,
+            },
+            MemoryRef {
+                memory_type: MemoryType::Semantic,
+                id: collision_id,
+            },
+            MemoryRef {
+                memory_type: MemoryType::Procedural,
+                id: collision_id,
+            },
+            MemoryRef {
+                memory_type: MemoryType::Episodic,
+                id: Uuid::from_u128(7_002),
+            },
+        ]
+    );
+
+    let entity_request = VectorSearchRequest::new(
+        scope.for_entity(entity),
+        "exact-space",
+        &query_embedding,
+        100,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .expect("entity request");
+    let postgres_entity = complete_vector_hits(postgres.search_vector(&entity_request).unwrap());
+    let sqlite_entity = complete_vector_hits(sqlite.search_vector(&entity_request).unwrap());
+    assert_eq!(vector_refs(&postgres_entity), vector_refs(&sqlite_entity));
+    assert_eq!(postgres_entity.len(), 3);
+
+    let top_two_request = VectorSearchRequest::new(
+        request.scope.clone(),
+        "exact-space",
+        &query_embedding,
+        2,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .expect("top-two request");
+    assert_eq!(
+        vector_refs(&complete_vector_hits(
+            postgres.search_vector(&top_two_request).unwrap()
+        )),
+        vector_refs(&complete_vector_hits(
+            sqlite.search_vector(&top_two_request).unwrap()
+        ))
+    );
+}
+
+#[test]
+fn exact_pgvector_validates_query_space_deadline_and_stored_zero_norm() {
+    let Some(admin_opts) =
+        skip_notice("exact_pgvector_validates_query_space_deadline_and_stored_zero_norm")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+    let namespace = Namespace::new(format!("exact-validation-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&namespace).unwrap();
+    register_embedding_space(&fixture, "validation-space", "real", 2);
+    let memory = Memory::Episodic(EpisodicMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "invalid stored zero vector",
+    ));
+    backend
+        .save_memory_with_embedding(
+            &memory,
+            Some(&embedding_record(
+                &memory,
+                "validation-space",
+                vec![0.0, 0.0],
+            )),
+        )
+        .unwrap();
+    let scope = SearchScope::namespace(namespace.id);
+    let finite = [1.0, 0.0];
+    let request = VectorSearchRequest::new(
+        scope.clone(),
+        "validation-space",
+        &finite,
+        10,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(
+        backend.search_vector(&request).unwrap(),
+        VectorSearchOutcome::Unavailable(SearchUnavailable::InvalidStoredVector)
+    );
+
+    let zero = [0.0, 0.0];
+    let zero_request = VectorSearchRequest::new(
+        scope.clone(),
+        "validation-space",
+        &zero,
+        10,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(
+        backend.search_vector(&zero_request).unwrap(),
+        VectorSearchOutcome::Complete(Vec::new())
+    );
+
+    let missing_request = VectorSearchRequest::new(
+        scope.clone(),
+        "missing-space",
+        &finite,
+        10,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(
+        backend.search_vector(&missing_request).unwrap(),
+        VectorSearchOutcome::Unavailable(SearchUnavailable::NoActiveEmbeddingSpace)
+    );
+
+    let wrong_dimension = [1.0];
+    let dimension_request = VectorSearchRequest::new(
+        scope.clone(),
+        "validation-space",
+        &wrong_dimension,
+        10,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(matches!(
+        backend.search_vector(&dimension_request),
+        Err(StorageError::Context(_))
+    ));
+
+    let non_finite = [f32::NAN, 0.0];
+    let non_finite_request = VectorSearchRequest::new(
+        scope.clone(),
+        "validation-space",
+        &non_finite,
+        10,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(matches!(
+        backend.search_vector(&non_finite_request),
+        Err(StorageError::Context(_))
+    ));
+
+    let expired_request =
+        VectorSearchRequest::new(scope, "validation-space", &finite, 10, Instant::now()).unwrap();
+    assert_eq!(
+        backend.search_vector(&expired_request).unwrap(),
+        VectorSearchOutcome::Unavailable(SearchUnavailable::DeadlineExceeded)
+    );
+}
+
+#[test]
+fn exact_pgvector_forced_rls_blocks_foreign_row_after_test_removes_namespace_predicates() {
+    let Some(admin_opts) = skip_notice(
+        "exact_pgvector_forced_rls_blocks_foreign_row_after_test_removes_namespace_predicates",
+    ) else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+    let own = Namespace::new(format!("exact-rls-own-{}", Uuid::new_v4().simple()));
+    let foreign = Namespace::new(format!("exact-rls-foreign-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&own).unwrap();
+    backend.save_namespace(&foreign).unwrap();
+    register_embedding_space(&fixture, "rls-space", "real", 2);
+    for (namespace_id, id) in [(own.id, 7_101_u128), (foreign.id, 7_102)] {
+        let mut memory = EpisodicMemory::new(
+            namespace_id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "forced RLS exact vector",
+        );
+        memory.id = Uuid::from_u128(id);
+        let memory = Memory::Episodic(memory);
+        backend
+            .save_memory_with_embedding(
+                &memory,
+                Some(&embedding_record(&memory, "rls-space", vec![1.0, 0.0])),
+            )
+            .unwrap();
+    }
+
+    let sql_without_explicit_namespace =
+        POSTGRES_VECTOR_SEARCH_SQL.replace("embeddings.namespace_id = $2", "$2::uuid IS NOT NULL");
+    assert_eq!(
+        POSTGRES_VECTOR_SEARCH_SQL
+            .matches("embeddings.namespace_id = $2")
+            .count(),
+        3
+    );
+    assert!(!sql_without_explicit_namespace.contains("embeddings.namespace_id = $2"));
+    let rows: Vec<(i16, Uuid, Option<f64>, bool)> = fixture.rt.block_on(async {
+        let mut conn = backend.scoped_conn(own.id).await.unwrap();
+        query_as::<Postgres, _>(AssertSqlSafe(sql_without_explicit_namespace))
+            .bind("[1,0]")
+            .bind(own.id)
+            .bind("rls-space")
+            .bind(None::<Uuid>)
+            .bind(None::<Uuid>)
+            .bind(None::<Uuid>)
+            .bind(100_i64)
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap()
+    });
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, Uuid::from_u128(7_101));
+}
+
+fn sum_plan_metric(value: &serde_json::Value, key: &str) -> u64 {
+    match value {
+        serde_json::Value::Object(fields) => fields
+            .iter()
+            .map(|(name, value)| {
+                if name == key {
+                    value.as_u64().unwrap_or(0)
+                } else {
+                    sum_plan_metric(value, key)
+                }
+            })
+            .sum(),
+        serde_json::Value::Array(values) => {
+            values.iter().map(|value| sum_plan_metric(value, key)).sum()
+        }
+        _ => 0,
+    }
+}
+
+#[test]
+fn exact_pgvector_explain_is_bounded_scoped_and_does_not_spill() {
+    let Some(admin_opts) =
+        skip_notice("exact_pgvector_explain_is_bounded_scoped_and_does_not_spill")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+    let namespace = Namespace::new(format!("exact-plan-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&namespace).unwrap();
+    register_embedding_space(&fixture, "plan-space", "real", 2);
+    let memory = Memory::Episodic(EpisodicMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "representative exact plan",
+    ));
+    backend
+        .save_memory_with_embedding(
+            &memory,
+            Some(&embedding_record(&memory, "plan-space", vec![1.0, 0.0])),
+        )
+        .unwrap();
+
+    let explain_sql =
+        format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {POSTGRES_VECTOR_SEARCH_SQL}");
+    let plan: serde_json::Value = fixture.rt.block_on(async {
+        let mut conn = backend.scoped_conn(namespace.id).await.unwrap();
+        query_as::<Postgres, (serde_json::Value,)>(AssertSqlSafe(explain_sql))
+            .bind("[1,0]")
+            .bind(namespace.id)
+            .bind("plan-space")
+            .bind(None::<Uuid>)
+            .bind(None::<Uuid>)
+            .bind(None::<Uuid>)
+            .bind(100_i64)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+            .0
+    });
+    let rendered = plan.to_string();
+    assert!(rendered.contains("namespace_id"));
+    assert!(rendered.contains("embedding_space_id"));
+    assert!(plan[0]["Plan"]["Actual Rows"].as_u64().unwrap_or(101) <= 100);
+    assert_eq!(sum_plan_metric(&plan, "Temp Read Blocks"), 0);
+    assert_eq!(sum_plan_metric(&plan, "Temp Written Blocks"), 0);
+    eprintln!(
+        "exact pgvector representative execution time: {:?} ms",
+        plan[0]["Execution Time"]
+    );
 }
