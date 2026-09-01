@@ -56,10 +56,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
-use crate::storage::{StorageError, StorageResult, StorageTrait};
+use crate::embedding_space::EmbeddingSpaceId;
+use crate::storage::bounded::{EmbeddingRecord, MemoryRef, MemoryType};
+use crate::storage::{
+    CapturedMemory, StorageError, StorageResult, StorageTrait, validate_record_matches_memory,
+};
 use crate::types::Memory;
 
 /// On-disk format version. Bump on any breaking change to [`ForgetSnapshot`];
@@ -93,9 +97,99 @@ pub struct ForgetSnapshot {
     /// rather than silently claiming protection it never had.
     #[serde(default)]
     pub owner_only: bool,
-    /// Full memory rows, embeddings included, so a restore is byte-faithful to
-    /// what the storage layer can read back.
+    /// Full source rows, including their legacy inline embeddings.
     pub memories: Vec<Memory>,
+    /// Immutable versioned embedding generations removed with `memories`.
+    /// Absent in original format-v1 archives, which decode as source-only.
+    #[serde(default, with = "embedding_records_serde")]
+    pub embedding_records: Vec<EmbeddingRecord>,
+}
+
+mod embedding_records_serde {
+    use super::{
+        Deserialize, Deserializer, EmbeddingRecord, EmbeddingSpaceId, MemoryRef, MemoryType,
+        Serialize, Serializer, Uuid,
+    };
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum SerializableMemoryType {
+        Episodic,
+        Semantic,
+        Procedural,
+        Observation,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct SerializableEmbeddingRecord {
+        namespace_id: Uuid,
+        memory_type: SerializableMemoryType,
+        memory_id: Uuid,
+        embedding_space_id: String,
+        source_sha256: String,
+        embedding: Vec<f32>,
+    }
+
+    impl From<MemoryType> for SerializableMemoryType {
+        fn from(value: MemoryType) -> Self {
+            match value {
+                MemoryType::Episodic => Self::Episodic,
+                MemoryType::Semantic => Self::Semantic,
+                MemoryType::Procedural => Self::Procedural,
+                MemoryType::Observation => Self::Observation,
+            }
+        }
+    }
+
+    impl From<SerializableMemoryType> for MemoryType {
+        fn from(value: SerializableMemoryType) -> Self {
+            match value {
+                SerializableMemoryType::Episodic => Self::Episodic,
+                SerializableMemoryType::Semantic => Self::Semantic,
+                SerializableMemoryType::Procedural => Self::Procedural,
+                SerializableMemoryType::Observation => Self::Observation,
+            }
+        }
+    }
+
+    pub fn serialize<S>(records: &[EmbeddingRecord], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        records
+            .iter()
+            .map(|record| SerializableEmbeddingRecord {
+                namespace_id: record.namespace_id,
+                memory_type: record.memory_ref.memory_type.into(),
+                memory_id: record.memory_ref.id,
+                embedding_space_id: record.embedding_space_id.0.clone(),
+                source_sha256: record.source_sha256.clone(),
+                embedding: record.embedding.clone(),
+            })
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<EmbeddingRecord>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<SerializableEmbeddingRecord>::deserialize(deserializer).map(|records| {
+            records
+                .into_iter()
+                .map(|record| EmbeddingRecord {
+                    namespace_id: record.namespace_id,
+                    memory_ref: MemoryRef {
+                        memory_type: record.memory_type.into(),
+                        id: record.memory_id,
+                    },
+                    embedding_space_id: EmbeddingSpaceId(record.embedding_space_id),
+                    source_sha256: record.source_sha256,
+                    embedding: record.embedding,
+                })
+                .collect()
+        })
+    }
 }
 
 /// Whether this platform can restrict a snapshot file to its owner.
@@ -297,7 +391,15 @@ fn forget_entity_bounded_with(
     let mut captured: Option<ForgetSnapshot> = None;
     let mut path: Option<PathBuf> = None;
 
-    let mut persist = |memories: &[Memory]| -> StorageResult<()> {
+    let mut persist = |captured_memories: &[CapturedMemory]| -> StorageResult<()> {
+        let memories: Vec<Memory> = captured_memories
+            .iter()
+            .map(|captured| captured.memory.clone())
+            .collect();
+        let embedding_records: Vec<EmbeddingRecord> = captured_memories
+            .iter()
+            .flat_map(|captured| captured.embeddings.iter().cloned())
+            .collect();
         // The artifact is per-namespace, so a row from another namespace would
         // be a cross-tenant leak into it. The backends' `namespace_id`
         // predicates are what prevent that; this verifies it at the point the
@@ -314,6 +416,11 @@ fn forget_entity_bounded_with(
                 memory_namespace(foreign)
             )));
         }
+        for captured in captured_memories {
+            for record in &captured.embeddings {
+                validate_record_matches_memory(record, &captured.memory)?;
+            }
+        }
 
         let snapshot = ForgetSnapshot {
             format_version: FORMAT_VERSION,
@@ -323,7 +430,8 @@ fn forget_entity_bounded_with(
             namespace_id,
             captured_at: Utc::now(),
             owner_only: OWNER_ONLY_SUPPORTED,
-            memories: memories.to_vec(),
+            memories,
+            embedding_records,
         };
 
         if !snapshot.is_empty() {
@@ -334,7 +442,11 @@ fn forget_entity_bounded_with(
         Ok(())
     };
 
-    storage.delete_memories_by_entity_capturing(entity_id, namespace_id, &mut persist)?;
+    storage.delete_memories_by_entity_capturing_with_embeddings(
+        entity_id,
+        namespace_id,
+        &mut persist,
+    )?;
 
     // Enforces the trait contract that `persist` runs exactly once. A backend
     // that deleted without calling it would have destroyed data uncaptured, so
@@ -742,11 +854,17 @@ pub fn restore(
     let mut outcome = RestoreOutcome::default();
 
     for memory in &snapshot.memories {
-        match memory {
-            Memory::Episodic(m) => storage.save_episodic(m)?,
-            Memory::Semantic(m) => storage.save_semantic(m)?,
-            Memory::Procedural(m) => storage.save_procedural(m)?,
-            Memory::Observation(m) => storage.save_observation(m)?,
+        let records: Vec<&EmbeddingRecord> = snapshot
+            .embedding_records
+            .iter()
+            .filter(|record| record.memory_ref == MemoryRef::from_memory(memory))
+            .collect();
+        if records.is_empty() {
+            storage.save_memory_with_embedding(memory, None)?;
+        } else {
+            for record in records {
+                storage.save_memory_with_embedding(memory, Some(record))?;
+            }
         }
         outcome.restored += 1;
     }
@@ -855,6 +973,7 @@ mod tests {
             captured_at: Utc::now(),
             owner_only: OWNER_ONLY_SUPPORTED,
             memories,
+            embedding_records: Vec::new(),
         }
     }
 
@@ -1666,10 +1785,9 @@ mod tests {
         assert!(reloaded.owner_only);
     }
 
-    /// `owner_only` was added after the first snapshots were written. It is
-    /// `#[serde(default)]` rather than a `FORMAT_VERSION` bump, because bumping
-    /// would make `read_file` reject those snapshots outright — refusing to
-    /// restore recoverable data over a field that does not affect the rows.
+    /// `owner_only` and `embedding_records` were added after the first
+    /// snapshots were written. They use `#[serde(default)]` rather than a
+    /// `FORMAT_VERSION` bump, because old source rows remain recoverable.
     #[test]
     fn a_snapshot_written_before_owner_only_existed_still_restores() {
         let f = fixture();
@@ -1690,6 +1808,7 @@ mod tests {
         let mut raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         raw.as_object_mut().unwrap().remove("owner_only");
+        raw.as_object_mut().unwrap().remove("embedding_records");
         assert_eq!(raw["format_version"], FORMAT_VERSION);
         std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
 
@@ -1699,6 +1818,7 @@ mod tests {
             !reloaded.owner_only,
             "an absent field must read as unprotected, never as protected"
         );
+        assert!(reloaded.embedding_records.is_empty());
         assert_eq!(reloaded.memory_ids(), outcome.snapshot.memory_ids());
         let restored = restore(&f.storage, &reloaded).unwrap();
         assert_eq!(restored.restored, outcome.snapshot.memories.len());

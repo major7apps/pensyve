@@ -6,14 +6,15 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
+use crate::embedding_space::EmbeddingSpaceId;
 use crate::types::{
     ContentType, Edge, Entity, EntityKind, Episode, EpisodicMemory, Memory, Namespace,
     ObservationMemory, Outcome, ProceduralMemory, SemanticMemory,
 };
 
 use super::{
-    ActivityAggregate, ActivityEvent, ErasedRows, StorageError, StorageResult, StorageTrait,
-    canonical_embedding_source_sha256, cross_namespace_edge_id, memory_namespace_id,
+    ActivityAggregate, ActivityEvent, CapturedMemory, ErasedRows, StorageError, StorageResult,
+    StorageTrait, canonical_embedding_source_sha256, cross_namespace_edge_id, memory_namespace_id,
     validate_record_matches_memory,
 };
 use crate::graph::EdgeType;
@@ -952,10 +953,16 @@ fn save_memory_in_conn(conn: &Connection, memory: &Memory) -> StorageResult<()> 
         }
     };
 
+    let memory_type = memory_type_str(memory_type);
     conn.execute(
-        "INSERT OR REPLACE INTO memory_fts (memory_id, memory_type, namespace_id, content)
+        "DELETE FROM memory_fts
+         WHERE memory_id = ?1 AND memory_type = ?2 AND namespace_id = ?3",
+        params![&id, memory_type, &namespace],
+    )?;
+    conn.execute(
+        "INSERT INTO memory_fts (memory_id, memory_type, namespace_id, content)
          VALUES (?1, ?2, ?3, ?4)",
-        params![&id, memory_type_str(memory_type), &namespace, fts_content],
+        params![&id, memory_type, &namespace, fts_content],
     )?;
     Ok(())
 }
@@ -1032,6 +1039,42 @@ fn insert_embedding_in_conn(conn: &Connection, record: &EmbeddingRecord) -> Stor
         ],
     )?;
     Ok(())
+}
+
+fn take_embedding_records_in_conn(
+    conn: &Connection,
+    memory: &Memory,
+) -> StorageResult<Vec<EmbeddingRecord>> {
+    let namespace_id = memory_namespace_id(memory);
+    let memory_type = memory.type_name();
+    let memory_id = memory.id();
+    let mut stmt = conn.prepare(
+        "SELECT embedding_space_id, source_sha256, embedding
+         FROM memory_embeddings
+         WHERE namespace_id = ?1 AND memory_type = ?2 AND memory_id = ?3
+         ORDER BY embedding_space_id",
+    )?;
+    let records = stmt
+        .query_map(
+            params![namespace_id.to_string(), memory_type, memory_id.to_string()],
+            |row| {
+                Ok(EmbeddingRecord {
+                    namespace_id,
+                    memory_ref: crate::storage::bounded::MemoryRef::from_memory(memory),
+                    embedding_space_id: EmbeddingSpaceId(row.get(0)?),
+                    source_sha256: row.get(1)?,
+                    embedding: blob_to_embedding(row.get_ref(2)?.as_blob()?),
+                })
+            },
+        )?
+        .collect::<Result<_, _>>()?;
+    drop(stmt);
+    conn.execute(
+        "DELETE FROM memory_embeddings
+         WHERE namespace_id = ?1 AND memory_type = ?2 AND memory_id = ?3",
+        params![namespace_id.to_string(), memory_type, memory_id.to_string()],
+    )?;
+    Ok(records)
 }
 
 // ---------------------------------------------------------------------------
@@ -2422,13 +2465,39 @@ impl StorageTrait for SqliteBackend {
         namespace_id: Uuid,
         persist: &mut dyn FnMut(&[Memory]) -> StorageResult<()>,
     ) -> StorageResult<Vec<Memory>> {
+        let mut persist_sources = |captured: &[CapturedMemory]| {
+            let memories: Vec<Memory> = captured
+                .iter()
+                .map(|captured| captured.memory.clone())
+                .collect();
+            persist(&memories)
+        };
+        self.delete_memories_by_entity_capturing_with_embeddings(
+            entity_id,
+            namespace_id,
+            &mut persist_sources,
+        )
+        .map(|captured| {
+            captured
+                .into_iter()
+                .map(|captured| captured.memory)
+                .collect()
+        })
+    }
+
+    fn delete_memories_by_entity_capturing_with_embeddings(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+        persist: &mut dyn FnMut(&[CapturedMemory]) -> StorageResult<()>,
+    ) -> StorageResult<Vec<CapturedMemory>> {
         let conn = lock_conn!(self);
         let id_str = entity_id.to_string();
         let ns_str = namespace_id.to_string();
 
         conn.execute_batch("BEGIN")?;
 
-        let result = (|| -> StorageResult<Vec<Memory>> {
+        let result = (|| -> StorageResult<Vec<CapturedMemory>> {
             let mut memories = Vec::new();
 
             let mut stmt = conn.prepare(
@@ -2461,19 +2530,23 @@ impl StorageTrait for SqliteBackend {
                 memories.push(Memory::Semantic(row?));
             }
 
+            let mut captured: Vec<CapturedMemory> = memories
+                .into_iter()
+                .map(|memory| CapturedMemory {
+                    memory,
+                    embeddings: Vec::new(),
+                })
+                .collect();
+
             // Strip the FTS rows for exactly what we just deleted, qualified by
             // each row's own namespace and type — `memory_fts` is keyed by
             // `memory_id`, which identifies nothing on its own. Ids repeat
             // across namespaces, and within one namespace the same id can name
             // both an episodic and a semantic row, so an under-qualified delete
             // strips an index entry whose base row is still live.
-            for memory in &memories {
-                let row_namespace = match memory {
-                    Memory::Episodic(m) => m.namespace_id,
-                    Memory::Semantic(m) => m.namespace_id,
-                    Memory::Procedural(m) => m.namespace_id,
-                    Memory::Observation(m) => m.namespace_id,
-                };
+            for unit in &mut captured {
+                let memory = &unit.memory;
+                let row_namespace = memory_namespace_id(memory);
                 conn.execute(
                     "DELETE FROM memory_fts
                       WHERE memory_id = ?1 AND namespace_id = ?2 AND memory_type = ?3",
@@ -2483,28 +2556,20 @@ impl StorageTrait for SqliteBackend {
                         memory.type_name()
                     ],
                 )?;
-                conn.execute(
-                    "DELETE FROM memory_embeddings
-                      WHERE namespace_id = ?1 AND memory_type = ?2 AND memory_id = ?3",
-                    params![
-                        row_namespace.to_string(),
-                        memory.type_name(),
-                        memory.id().to_string()
-                    ],
-                )?;
+                unit.embeddings = take_embedding_records_in_conn(&conn, memory)?;
             }
 
             // Persist inside the transaction: if this fails we roll back and
             // nothing is deleted.
-            persist(&memories)?;
+            persist(&captured)?;
 
-            Ok(memories)
+            Ok(captured)
         })();
 
         match result {
-            Ok(memories) => {
+            Ok(captured) => {
                 conn.execute_batch("COMMIT")?;
-                Ok(memories)
+                Ok(captured)
             }
             Err(e) => {
                 let _ = conn.execute_batch("ROLLBACK");
@@ -3722,6 +3787,69 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    fn fts_contents(db: &SqliteBackend, memory: &Memory) -> Vec<String> {
+        let namespace_id = memory_namespace_id(memory).to_string();
+        let memory_id = memory.id().to_string();
+        let memory_type = memory.type_name();
+        db.conn
+            .lock()
+            .unwrap()
+            .prepare(
+                "SELECT content FROM memory_fts
+                 WHERE memory_id = ?1 AND memory_type = ?2 AND namespace_id = ?3
+                 ORDER BY rowid",
+            )
+            .unwrap()
+            .query_map(params![memory_id, memory_type, namespace_id], |row| {
+                row.get(0)
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn fts_replacement_keeps_one_current_row_across_repeated_and_changed_source_saves() {
+        let (db, _, mut memory) = fixture_memory();
+
+        db.save_memory_with_embedding(&memory, None).unwrap();
+        db.save_memory_with_embedding(&memory, None).unwrap();
+        assert_eq!(fts_contents(&db, &memory), vec!["canonical source"]);
+
+        let Memory::Episodic(episodic) = &mut memory else {
+            unreachable!()
+        };
+        episodic.content = "replacement source".to_string();
+        db.save_memory_with_embedding(&memory, None).unwrap();
+
+        assert_eq!(fts_contents(&db, &memory), vec!["replacement source"]);
+    }
+
+    #[test]
+    fn fts_replacement_rollback_preserves_the_previous_row() {
+        let (db, ns, mut memory) = fixture_memory();
+        db.save_memory_with_embedding(&memory, None).unwrap();
+
+        let Memory::Episodic(episodic) = &mut memory else {
+            unreachable!()
+        };
+        episodic.content = "rejected replacement".to_string();
+        let invalid = embedding_record(&memory, "missing-space", vec![1.0; 4]);
+
+        assert!(
+            db.save_memory_with_embedding(&memory, Some(&invalid))
+                .is_err()
+        );
+        assert_eq!(fts_contents(&db, &memory), vec!["canonical source"]);
+        assert_eq!(
+            db.get_episodic_in_namespace(memory.id(), ns.id)
+                .unwrap()
+                .unwrap()
+                .content,
+            "canonical source"
+        );
     }
 
     #[test]

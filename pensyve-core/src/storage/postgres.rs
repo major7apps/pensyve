@@ -16,14 +16,15 @@ use sqlx_postgres::{PgPool, PgPoolOptions, PgRow, Postgres};
 use tokio::runtime::{Handle, Runtime};
 use uuid::Uuid;
 
+use crate::embedding_space::EmbeddingSpaceId;
 use crate::types::{
     Edge, Entity, EntityKind, Episode, EpisodicMemory, Memory, Namespace, ObservationMemory,
     Outcome, ProceduralMemory, SemanticMemory,
 };
 
 use super::{
-    ActivityAggregate, ActivityEvent, ErasedRows, StorageError, StorageResult, StorageTrait,
-    canonical_embedding_source_sha256, cross_namespace_edge_id, memory_namespace_id,
+    ActivityAggregate, ActivityEvent, CapturedMemory, ErasedRows, StorageError, StorageResult,
+    StorageTrait, canonical_embedding_source_sha256, cross_namespace_edge_id, memory_namespace_id,
     validate_record_matches_memory,
 };
 use crate::graph::EdgeType;
@@ -919,40 +920,6 @@ async fn save_memory_in_pg_tx(
         )));
     }
 
-    let existing_owner: Option<(Uuid,)> = match memory {
-        Memory::Episodic(memory) => {
-            query_as::<Postgres, _>("SELECT namespace_id FROM episodic_memories WHERE id = $1")
-                .bind(memory.id)
-                .fetch_optional(&mut **transaction)
-                .await
-        }
-        Memory::Semantic(memory) => {
-            query_as::<Postgres, _>("SELECT namespace_id FROM semantic_memories WHERE id = $1")
-                .bind(memory.id)
-                .fetch_optional(&mut **transaction)
-                .await
-        }
-        Memory::Procedural(memory) => {
-            query_as::<Postgres, _>("SELECT namespace_id FROM procedural_memories WHERE id = $1")
-                .bind(memory.id)
-                .fetch_optional(&mut **transaction)
-                .await
-        }
-        Memory::Observation(memory) => {
-            query_as::<Postgres, _>("SELECT namespace_id FROM observation_memories WHERE id = $1")
-                .bind(memory.id)
-                .fetch_optional(&mut **transaction)
-                .await
-        }
-    }
-    .map_err(sqlx_to_io)?;
-    if existing_owner.is_some_and(|(owner,)| owner != namespace_id) {
-        return Err(StorageError::Context(format!(
-            "memory {} already exists outside source namespace {namespace_id}",
-            memory.id()
-        )));
-    }
-
     let result = match memory {
         Memory::Episodic(memory) => {
             query::<Postgres>(
@@ -1144,23 +1111,6 @@ async fn insert_embedding_in_pg_tx(
         return Err(StorageError::Context(format!(
             "embedding dimension {} does not match registered space dimension {dimension}",
             record.embedding.len()
-        )));
-    }
-
-    let existing_owner: Option<(Uuid,)> = query_as::<Postgres, _>(
-        "SELECT namespace_id FROM memory_embeddings
-         WHERE memory_type = $1 AND memory_id = $2 AND embedding_space_id = $3",
-    )
-    .bind(memory_type_str(record.memory_ref.memory_type))
-    .bind(record.memory_ref.id)
-    .bind(&record.embedding_space_id.0)
-    .fetch_optional(&mut **transaction)
-    .await
-    .map_err(sqlx_to_io)?;
-    if existing_owner.is_some_and(|(owner,)| owner != record.namespace_id) {
-        return Err(StorageError::Context(format!(
-            "embedding key for {} already exists outside namespace {}",
-            record.memory_ref.id, record.namespace_id
         )));
     }
 
@@ -2174,6 +2124,32 @@ impl StorageTrait for PostgresBackend {
         namespace_id: Uuid,
         persist: &mut dyn FnMut(&[Memory]) -> StorageResult<()>,
     ) -> StorageResult<Vec<Memory>> {
+        let mut persist_sources = |captured: &[CapturedMemory]| {
+            let memories: Vec<Memory> = captured
+                .iter()
+                .map(|captured| captured.memory.clone())
+                .collect();
+            persist(&memories)
+        };
+        self.delete_memories_by_entity_capturing_with_embeddings(
+            entity_id,
+            namespace_id,
+            &mut persist_sources,
+        )
+        .map(|captured| {
+            captured
+                .into_iter()
+                .map(|captured| captured.memory)
+                .collect()
+        })
+    }
+
+    fn delete_memories_by_entity_capturing_with_embeddings(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+        persist: &mut dyn FnMut(&[CapturedMemory]) -> StorageResult<()>,
+    ) -> StorageResult<Vec<CapturedMemory>> {
         self.block_on(async {
             // Bound to the namespace being forgotten, not left unscoped: this
             // method knows its namespace, and an unscoped connection would
@@ -2215,7 +2191,40 @@ impl StorageTrait for PostgresBackend {
             .map_err(sqlx_to_io)?;
             memories.extend(rows.into_iter().map(row_to_semantic).map(Memory::Semantic));
 
-            for memory in &memories {
+            let mut captured: Vec<CapturedMemory> = memories
+                .into_iter()
+                .map(|memory| CapturedMemory {
+                    memory,
+                    embeddings: Vec::new(),
+                })
+                .collect();
+
+            for unit in &mut captured {
+                let memory = &unit.memory;
+                let rows: Vec<(String, String, String)> = query_as::<Postgres, _>(
+                    "SELECT embedding_space_id, source_sha256, embedding::text
+                     FROM memory_embeddings
+                     WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3
+                     ORDER BY embedding_space_id",
+                )
+                .bind(memory_namespace_id(memory))
+                .bind(memory_type_str(MemoryType::of(memory)))
+                .bind(memory.id())
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+                unit.embeddings = rows
+                    .into_iter()
+                    .map(
+                        |(embedding_space_id, source_sha256, embedding)| EmbeddingRecord {
+                            namespace_id: memory_namespace_id(memory),
+                            memory_ref: crate::storage::bounded::MemoryRef::from_memory(memory),
+                            embedding_space_id: EmbeddingSpaceId(embedding_space_id),
+                            source_sha256,
+                            embedding: pgtext_to_embedding(Some(&embedding)),
+                        },
+                    )
+                    .collect();
                 query::<Postgres>(
                     "DELETE FROM memory_embeddings
                      WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3",
@@ -2230,11 +2239,11 @@ impl StorageTrait for PostgresBackend {
 
             // Persist inside the transaction. On `Err` the `?` drops `tx`,
             // which rolls back — nothing is deleted.
-            persist(&memories)?;
+            persist(&captured)?;
 
             tx.commit().await.map_err(sqlx_to_io)?;
 
-            Ok(memories)
+            Ok(captured)
         })
     }
 

@@ -126,6 +126,14 @@ pub struct ErasedRows {
     pub entity_deleted: bool,
 }
 
+/// One recoverable source-memory unit and every immutable embedding generation
+/// deleted with it.
+#[derive(Debug, Clone)]
+pub struct CapturedMemory {
+    pub memory: Memory,
+    pub embeddings: Vec<bounded::EmbeddingRecord>,
+}
+
 /// Maximum whitespace-delimited tokens an FTS query contributes to the search
 /// expression; both backends truncate identically so their candidate sets stay
 /// comparable (#225).
@@ -688,6 +696,34 @@ pub trait StorageTrait: Send + Sync {
         namespace_id: Uuid,
         persist: &mut dyn FnMut(&[Memory]) -> StorageResult<()>,
     ) -> StorageResult<Vec<Memory>>;
+
+    /// Generation-aware counterpart to
+    /// [`StorageTrait::delete_memories_by_entity_capturing`]. Backends that
+    /// store immutable embedding generations override this so each source and
+    /// all of its generations are captured and persisted in the same delete
+    /// transaction. The default preserves compatibility for backends that only
+    /// store source rows.
+    fn delete_memories_by_entity_capturing_with_embeddings(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+        persist: &mut dyn FnMut(&[CapturedMemory]) -> StorageResult<()>,
+    ) -> StorageResult<Vec<CapturedMemory>> {
+        let mut captured = Vec::new();
+        let mut persist_sources = |memories: &[Memory]| {
+            captured = memories
+                .iter()
+                .cloned()
+                .map(|memory| CapturedMemory {
+                    memory,
+                    embeddings: Vec::new(),
+                })
+                .collect();
+            persist(&captured)
+        };
+        self.delete_memories_by_entity_capturing(entity_id, namespace_id, &mut persist_sources)?;
+        Ok(captured)
+    }
 
     /// Erase everything belonging to `entity_id` within `namespace_id` in ONE
     /// transaction, and hand back the rows it removed.

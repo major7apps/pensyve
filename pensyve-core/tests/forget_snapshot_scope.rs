@@ -12,13 +12,17 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use pensyve_core::embedding_space::EmbeddingSpaceId;
 use pensyve_core::snapshot;
 use pensyve_core::storage::StorageTrait;
+use pensyve_core::storage::bounded::{EmbeddingRecord, MemoryRef, embedding_source_text};
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::{
     Entity, EntityKind, Episode, EpisodicMemory, Memory, Namespace, Outcome, ProceduralMemory,
     SemanticMemory,
 };
+use rusqlite::{Connection, params};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// Everything the fixture seeds, tagged so failures name the missing shape
@@ -410,4 +414,96 @@ fn restore_is_idempotent() {
     snapshot::restore(storage, &outcome.snapshot).unwrap();
 
     assert_eq!(live_ids(storage, fixture.namespace.id), before);
+}
+
+#[test]
+fn snapshot_round_trips_versioned_embedding_generations() {
+    let fixture = seed();
+    let memory = fixture
+        .storage
+        .get_all_memories_by_namespace_including_superseded(fixture.namespace.id)
+        .unwrap()
+        .into_iter()
+        .find(|memory| match memory {
+            Memory::Episodic(memory) => memory.about_entity == fixture.target.id,
+            _ => false,
+        })
+        .expect("target memory");
+    let connection = Connection::open(fixture.db_path.join("memories.db")).unwrap();
+    for space in ["snapshot-space-a", "snapshot-space-b"] {
+        connection
+            .execute(
+                "INSERT INTO embedding_spaces
+                 (id, canonical_identity_json, class, dimension, created_at)
+                 VALUES (?1, '{}', 'mock', 4, datetime('now'))",
+                [space],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let source_sha256 = hex::encode(Sha256::digest(embedding_source_text(&memory).as_bytes()));
+    let records = vec![
+        EmbeddingRecord {
+            namespace_id: fixture.namespace.id,
+            memory_ref: MemoryRef::from_memory(&memory),
+            embedding_space_id: EmbeddingSpaceId("snapshot-space-a".to_string()),
+            source_sha256: source_sha256.clone(),
+            embedding: vec![0.25, 0.5, 0.75, 1.0],
+        },
+        EmbeddingRecord {
+            namespace_id: fixture.namespace.id,
+            memory_ref: MemoryRef::from_memory(&memory),
+            embedding_space_id: EmbeddingSpaceId("snapshot-space-b".to_string()),
+            source_sha256,
+            embedding: vec![1.0, 0.75, 0.5, 0.25],
+        },
+    ];
+    for record in &records {
+        fixture
+            .storage
+            .save_memory_with_embedding(&memory, Some(record))
+            .unwrap();
+    }
+
+    let outcome = snapshot::forget_entity_bounded(
+        &fixture.storage,
+        fixture.target.id,
+        None,
+        fixture.namespace.id,
+        &fixture.snapshot_root(),
+        snapshot::RetentionPolicy::UNBOUNDED,
+    )
+    .unwrap();
+    assert_eq!(outcome.snapshot.embedding_records, records);
+
+    let path = outcome.path.expect("generation-bearing snapshot file");
+    let reloaded = snapshot::read_file(&path).unwrap();
+    assert_eq!(reloaded.embedding_records, records);
+
+    snapshot::restore(&fixture.storage, &reloaded).unwrap();
+
+    let connection = Connection::open(fixture.db_path.join("memories.db")).unwrap();
+    for record in &records {
+        let restored: (String, Vec<u8>) = connection
+            .query_row(
+                "SELECT source_sha256, embedding FROM memory_embeddings
+                 WHERE namespace_id = ?1 AND memory_type = 'episodic'
+                   AND memory_id = ?2 AND embedding_space_id = ?3",
+                params![
+                    fixture.namespace.id.to_string(),
+                    memory.id().to_string(),
+                    record.embedding_space_id.0
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(restored.0, record.source_sha256);
+        let restored_vector: Vec<f32> = restored
+            .1
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert_eq!(restored_vector, record.embedding);
+    }
 }

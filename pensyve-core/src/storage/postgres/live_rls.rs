@@ -685,15 +685,26 @@ fn assert_embedding_write_rejects_cross_namespace_replacement(fixture: &Fixture,
         vec![2.0; 4],
     );
 
-    assert!(
-        fixture
-            .backend
-            .save_memory_with_embedding(
-                &Memory::Episodic(replacement.clone()),
-                Some(&foreign_record)
-            )
-            .is_err()
-    );
+    let error = fixture
+        .backend
+        .save_memory_with_embedding(
+            &Memory::Episodic(replacement.clone()),
+            Some(&foreign_record),
+        )
+        .expect_err("cross-namespace replacement must be rejected");
+    if relax_rls {
+        assert!(
+            matches!(
+                error,
+                StorageError::Context(ref message)
+                    if message == &format!(
+                        "source write for {} was rejected by its namespace predicate",
+                        replacement.id
+                    )
+            ),
+            "relaxed RLS must reach the explicit upsert predicate rejection, got: {error}"
+        );
+    }
     assert!(
         fixture
             .backend
@@ -3500,6 +3511,33 @@ fn only_bound_connections_reach_policied_tables() {
              allowlisted `unbound()` call."
         );
     }
+}
+
+/// Transactional upserts reject a colliding id through their namespace-qualified
+/// `ON CONFLICT ... WHERE` clauses. An ownership probe without the requested
+/// namespace predicate bypasses that defense when RLS is relaxed and can also
+/// disclose that another tenant owns the id.
+#[test]
+fn transactional_writes_have_no_unscoped_ownership_probes() {
+    let source = rust_code_only(include_str!("../postgres.rs"));
+    for table in [
+        "episodic_memories",
+        "semantic_memories",
+        "procedural_memories",
+        "observation_memories",
+    ] {
+        let forbidden = format!("SELECT namespace_id FROM {table} WHERE id = $1");
+        assert!(
+            !source.contains(&forbidden),
+            "postgres.rs probes {table} ownership without the requested namespace; rely on the \
+             qualified upsert and its affected-row rejection instead"
+        );
+    }
+    assert!(
+        !source.contains("SELECT namespace_id FROM memory_embeddings"),
+        "postgres.rs probes generation ownership without the requested namespace; rely on the \
+         qualified upsert and its affected-row rejection instead"
+    );
 }
 
 /// The other half of the `unbound()` rule: what the SQL it executes may do.
