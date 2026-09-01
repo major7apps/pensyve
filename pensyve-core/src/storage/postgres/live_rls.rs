@@ -4094,18 +4094,23 @@ fn bounded_explicit_scope_entity_preference_and_observation_exclusion_match_sqli
         memory.about_entity = entity;
         preferred.push(memory);
     }
-    let mut broad = Vec::new();
-    for id in 13_001..=13_004 {
-        let mut memory = EpisodicMemory::new(
-            namespace.id,
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            "entitypreferencetoken",
-        );
-        memory.id = Uuid::from_u128(id);
-        broad.push(memory);
-    }
+    let mut broad = EpisodicMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "entitypreferencetoken",
+    );
+    broad.id = Uuid::from_u128(13_001);
+    let mut nullable_semantic_broad = SemanticMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        "entitypreferencetoken",
+        "nullable broad context",
+        1.0,
+    );
+    nullable_semantic_broad.id = Uuid::from_u128(13_002);
+    nullable_semantic_broad.object_entity = None;
     let mut valid_source = exact_null.clone();
     valid_source.id = Uuid::from_u128(14_001);
     valid_source.content = "observationcrowdtoken".into();
@@ -4130,9 +4135,13 @@ fn bounded_explicit_scope_entity_preference_and_observation_exclusion_match_sqli
         ] {
             backend.save_episodic(memory).expect("save scoped memory");
         }
-        for memory in preferred.iter().chain(&broad) {
+        for memory in &preferred {
             backend.save_episodic(memory).expect("save entity memory");
         }
+        backend.save_episodic(&broad).expect("save broad memory");
+        backend
+            .save_semantic(&nullable_semantic_broad)
+            .expect("save nullable semantic broad context");
         backend
             .save_observation(&observation)
             .expect("save observation");
@@ -4204,6 +4213,10 @@ fn bounded_explicit_scope_entity_preference_and_observation_exclusion_match_sqli
             .count(),
         8
     );
+    assert!(preferred_hits.iter().any(|hit| {
+        hit.memory_ref.memory_type == MemoryType::Semantic
+            && hit.memory_ref.id == nullable_semantic_broad.id
+    }));
     assert!(
         preferred_hits
             .iter()

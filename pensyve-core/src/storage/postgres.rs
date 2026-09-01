@@ -865,8 +865,8 @@ const LIST_OBSERVATIONS_BY_ENTITY_INSTANCE_SQL: &str = r"SELECT id, namespace_id
 /// returned. pgvector itself rejects non-finite stored components.
 const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH candidates AS (
     SELECT 0::smallint AS memory_type, embeddings.memory_id, embeddings.embedding,
-           $7::smallint = 2 AND
-               (memory.about_entity = $8 OR memory.source_entity = $8) AS entity_preferred
+           $7::smallint = 2 AND COALESCE((memory.about_entity = $8
+               OR memory.source_entity = $8), FALSE) AS entity_preferred
     FROM memory_embeddings AS embeddings
     JOIN episodic_memories AS memory
       ON memory.id = embeddings.memory_id
@@ -883,8 +883,8 @@ const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH candidates AS (
       AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
     UNION ALL
     SELECT 1::smallint, embeddings.memory_id, embeddings.embedding,
-           $7::smallint = 2 AND
-               (memory.subject = $8 OR memory.object_entity = $8)
+           $7::smallint = 2 AND COALESCE((memory.subject = $8
+               OR memory.object_entity = $8), FALSE)
     FROM memory_embeddings AS embeddings
     JOIN semantic_memories AS memory
       ON memory.id = embeddings.memory_id
@@ -1634,7 +1634,8 @@ impl StorageTrait for PostgresBackend {
         let sql = format!(
             "WITH candidates AS ( \
                  SELECT 'episodic' AS memory_type, id, ts_rank(fts_content, {tsquery}) AS score, \
-                        $6::smallint = 2 AND (about_entity = $7 OR source_entity = $7) \
+                        $6::smallint = 2 AND COALESCE((about_entity = $7 \
+                            OR source_entity = $7), FALSE) \
                             AS entity_preferred \
                  FROM episodic_memories \
                  WHERE namespace_id = $1 \
@@ -1648,7 +1649,8 @@ impl StorageTrait for PostgresBackend {
                    AND fts_content @@ {tsquery} \
                  UNION ALL \
                  SELECT 'semantic', id, ts_rank(fts_content, {tsquery}), \
-                        $6::smallint = 2 AND (subject = $7 OR object_entity = $7) \
+                        $6::smallint = 2 AND COALESCE((subject = $7 \
+                            OR object_entity = $7), FALSE) \
                  FROM semantic_memories \
                  WHERE namespace_id = $1 \
                    AND ($3::smallint = 0 \
@@ -3981,6 +3983,24 @@ mod tests {
         assert!(sql.contains("entity_rank <= $9"));
         assert!(sql.find("entity_rank <= $9").unwrap() < sql.find("LIMIT $2").unwrap());
         assert!(!sql.contains("observation_memories"));
+    }
+
+    #[test]
+    fn preferred_entity_flags_are_total_before_quota_partitioning() {
+        assert_eq!(
+            POSTGRES_VECTOR_SEARCH_SQL.matches("AND COALESCE((").count(),
+            2
+        );
+
+        let source = include_str!("postgres.rs");
+        let start = source
+            .find("let tsquery = or_tsquery_fragment(10")
+            .expect("bounded lexical SQL start");
+        let end = source[start..]
+            .find("self.block_on(async")
+            .expect("bounded lexical SQL end");
+        let sql = &source[start..start + end];
+        assert_eq!(sql.matches("AND COALESCE((").count(), 2);
     }
 
     #[test]
