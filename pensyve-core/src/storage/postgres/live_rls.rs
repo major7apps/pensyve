@@ -4689,6 +4689,190 @@ fn sum_plan_metric(value: &serde_json::Value, key: &str) -> u64 {
     }
 }
 
+fn plan_has_exact_vector_result_order(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => {
+            if let Some(plan) = fields.get("Plan") {
+                return plan_has_exact_vector_result_order(plan);
+            }
+            let is_sort = matches!(
+                fields.get("Node Type").and_then(serde_json::Value::as_str),
+                Some("Sort" | "Incremental Sort")
+            );
+            let has_keys = fields
+                .get("Sort Key")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|keys| {
+                    let expected = ["distance", "memory_type", "memory_id"];
+                    keys.len() == expected.len()
+                        && keys.iter().zip(expected).all(|(key, expected)| {
+                            key.as_str().is_some_and(|key| {
+                                let key = key.to_ascii_lowercase();
+                                key.contains(expected) && !key.contains("desc")
+                            })
+                        })
+                });
+            if is_sort {
+                return has_keys;
+            }
+            fields
+                .get("Plans")
+                .and_then(serde_json::Value::as_array)
+                .filter(|plans| plans.len() == 1)
+                .is_some_and(|plans| plan_has_exact_vector_result_order(&plans[0]))
+        }
+        serde_json::Value::Array(values) if values.len() == 1 => {
+            plan_has_exact_vector_result_order(&values[0])
+        }
+        _ => false,
+    }
+}
+
+fn plan_has_explicit_vector_scope(
+    value: &serde_json::Value,
+    rls_bypassed: bool,
+    namespace_id: &str,
+    embedding_space_id: &str,
+) -> bool {
+    fn matching_embedding_scans(
+        value: &serde_json::Value,
+        namespace_id: &str,
+        embedding_space_id: &str,
+    ) -> usize {
+        match value {
+            serde_json::Value::Object(fields) => {
+                let this_scan = usize::from(
+                    fields
+                        .get("Relation Name")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("memory_embeddings")
+                        && {
+                            let rendered = value.to_string();
+                            rendered.contains("namespace_id")
+                                && rendered.contains(namespace_id)
+                                && rendered.contains("embedding_space_id")
+                                && rendered.contains(embedding_space_id)
+                        },
+                );
+                this_scan
+                    + fields
+                        .values()
+                        .map(|value| {
+                            matching_embedding_scans(value, namespace_id, embedding_space_id)
+                        })
+                        .sum::<usize>()
+            }
+            serde_json::Value::Array(values) => values
+                .iter()
+                .map(|value| matching_embedding_scans(value, namespace_id, embedding_space_id))
+                .sum(),
+            _ => 0,
+        }
+    }
+
+    rls_bypassed && matching_embedding_scans(value, namespace_id, embedding_space_id) == 3
+}
+
+#[test]
+fn exact_pgvector_representative_plan_rejects_a_missing_or_wrong_global_sort() {
+    let plan_without_sort = serde_json::json!({
+        "Node Type": "Limit",
+        "Plans": [{ "Node Type": "WindowAgg" }]
+    });
+    let plan_with_wrong_order = serde_json::json!({
+        "Node Type": "Limit",
+        "Plans": [{
+            "Node Type": "Sort",
+            "Sort Key": ["memory_type", "distance", "memory_id"]
+        }]
+    });
+    let plan_with_exact_order = serde_json::json!({
+        "Node Type": "Limit",
+        "Plans": [{
+            "Node Type": "Sort",
+            "Sort Key": ["distance", "memory_type", "memory_id"]
+        }]
+    });
+    let plan_with_only_a_branch_sort = serde_json::json!({
+        "Node Type": "Limit",
+        "Plans": [{
+            "Node Type": "WindowAgg",
+            "Plans": [{
+                "Node Type": "Append",
+                "Plans": [
+                    {
+                        "Node Type": "Sort",
+                        "Sort Key": ["distance", "memory_type", "memory_id"]
+                    },
+                    { "Node Type": "Seq Scan" },
+                    { "Node Type": "Seq Scan" }
+                ]
+            }]
+        }]
+    });
+
+    assert!(
+        !plan_has_exact_vector_result_order(&plan_without_sort),
+        "a bounded plan without the final distance/type/id sort is not representative proof"
+    );
+    assert!(
+        !plan_has_exact_vector_result_order(&plan_with_wrong_order),
+        "a Sort node with the wrong key order is not representative proof"
+    );
+    assert!(
+        !plan_has_exact_vector_result_order(&plan_with_only_a_branch_sort),
+        "a correctly keyed sort inside only one UNION branch is not a global result sort"
+    );
+    assert!(
+        plan_has_exact_vector_result_order(&plan_with_exact_order),
+        "the exact ascending distance/type/id sort must be accepted"
+    );
+}
+
+#[test]
+fn exact_pgvector_representative_plan_rejects_scope_filters_without_rls_bypass_proof() {
+    const NAMESPACE: &str = "00000000-0000-0000-0000-000000000001";
+    let policy_indistinguishable_plan = serde_json::json!({
+        "Node Type": "Append",
+        "Plans": [
+            {
+                "Node Type": "Seq Scan",
+                "Relation Name": "memory_embeddings",
+                "Filter": format!("namespace_id = '{NAMESPACE}'::uuid AND embedding_space_id = 'plan-space'::text")
+            },
+            {
+                "Node Type": "Seq Scan",
+                "Relation Name": "memory_embeddings",
+                "Filter": format!("namespace_id = '{NAMESPACE}'::uuid AND embedding_space_id = 'plan-space'::text")
+            },
+            {
+                "Node Type": "Seq Scan",
+                "Relation Name": "memory_embeddings",
+                "Filter": format!("namespace_id = '{NAMESPACE}'::uuid AND embedding_space_id = 'plan-space'::text")
+            }
+        ]
+    });
+
+    assert!(
+        !plan_has_explicit_vector_scope(
+            &policy_indistinguishable_plan,
+            false,
+            NAMESPACE,
+            "plan-space",
+        ),
+        "filters from an RLS-enforced plan cannot prove the query predicates exist"
+    );
+    assert!(
+        plan_has_explicit_vector_scope(
+            &policy_indistinguishable_plan,
+            true,
+            NAMESPACE,
+            "plan-space",
+        ),
+        "the same three branch filters are explicit evidence once RLS is demonstrably bypassed"
+    );
+}
+
 const REPRESENTATIVE_EXACT_PLAN_CANDIDATES: i64 = 18_076;
 
 fn seed_representative_exact_plan(fixture: &Fixture, namespace_id: Uuid, embedding_space_id: &str) {
@@ -4759,6 +4943,46 @@ fn seed_representative_exact_plan(fixture: &Fixture, namespace_id: Uuid, embeddi
     });
 }
 
+fn explain_representative_exact_plan(
+    fixture: &Fixture,
+    admin_opts: &PgConnectOptions,
+    namespace_id: Uuid,
+    embedding_space_id: &str,
+) -> (serde_json::Value, String, bool) {
+    let explain_sql =
+        format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {POSTGRES_VECTOR_SEARCH_SQL}");
+    with_admin_pool(&fixture.rt, admin_opts, &fixture.database, |rt, pool| {
+        rt.block_on(async {
+            let (role, superuser, bypassrls): (String, bool, bool) = query_as::<Postgres, _>(
+                "SELECT current_user, rolsuper, rolbypassrls
+                 FROM pg_roles WHERE rolname = current_user",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("inspect the representative EXPLAIN role's RLS exemptions");
+            let rls_bypassed = superuser || bypassrls;
+            assert!(
+                rls_bypassed,
+                "representative EXPLAIN role {role:?} is neither superuser nor BYPASSRLS; \
+                 its plan cannot distinguish explicit namespace predicates from policy injection"
+            );
+            let plan = query_as::<Postgres, (serde_json::Value,)>(AssertSqlSafe(explain_sql))
+                .bind("[1,0]")
+                .bind(namespace_id)
+                .bind(embedding_space_id)
+                .bind(None::<Uuid>)
+                .bind(None::<Uuid>)
+                .bind(None::<Uuid>)
+                .bind(100_i64)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+                .0;
+            (plan, role, rls_bypassed)
+        })
+    })
+}
+
 #[test]
 fn exact_pgvector_explain_is_bounded_scoped_and_does_not_spill() {
     let Some(admin_opts) =
@@ -4787,23 +5011,26 @@ fn exact_pgvector_explain_is_bounded_scoped_and_does_not_spill() {
     });
     assert_eq!(candidate_count, REPRESENTATIVE_EXACT_PLAN_CANDIDATES);
 
-    let explain_sql =
-        format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {POSTGRES_VECTOR_SEARCH_SQL}");
-    let plan: serde_json::Value = fixture.rt.block_on(async {
-        let mut conn = backend.scoped_conn(namespace.id).await.unwrap();
-        query_as::<Postgres, (serde_json::Value,)>(AssertSqlSafe(explain_sql))
-            .bind("[1,0]")
-            .bind(namespace.id)
-            .bind("plan-space")
-            .bind(None::<Uuid>)
-            .bind(None::<Uuid>)
-            .bind(None::<Uuid>)
-            .bind(100_i64)
-            .fetch_one(&mut *conn)
-            .await
-            .unwrap()
-            .0
-    });
+    let (plan, explain_role, rls_bypassed) =
+        explain_representative_exact_plan(&fixture, &admin_opts, namespace.id, "plan-space");
+    assert!(
+        rls_bypassed,
+        "EXPLAIN role {explain_role:?} lost RLS bypass"
+    );
+    assert!(
+        plan_has_explicit_vector_scope(
+            &plan,
+            rls_bypassed,
+            &namespace.id.to_string(),
+            "plan-space",
+        ),
+        "the RLS-bypassed plan must retain explicit namespace and embedding-space predicates \
+         in all three memory_embeddings branches"
+    );
+    assert!(
+        plan_has_exact_vector_result_order(&plan),
+        "the plan must globally sort by distance ASC, memory_type ASC, memory_id ASC"
+    );
     let rendered = plan.to_string();
     for relation in [
         "episodic_memories",
@@ -4820,12 +5047,12 @@ fn exact_pgvector_explain_is_bounded_scoped_and_does_not_spill() {
         rendered.contains("WindowAgg"),
         "global validation window was not planned"
     );
-    assert!(rendered.matches("namespace_id").count() >= 3);
-    assert!(rendered.matches("embedding_space_id").count() >= 3);
     assert!(plan[0]["Plan"]["Actual Rows"].as_u64().unwrap_or(101) <= 100);
     assert_eq!(sum_plan_metric(&plan, "Temp Read Blocks"), 0);
     assert_eq!(sum_plan_metric(&plan, "Temp Written Blocks"), 0);
-    assert!(!rendered.contains("\"Sort Space Type\":\"Disk\""));
+    let rendered_lowercase = rendered.to_ascii_lowercase();
+    assert!(!rendered_lowercase.contains("\"sort space type\":\"disk\""));
+    assert!(!rendered_lowercase.contains("\"sort method\":\"external"));
     eprintln!(
         "exact pgvector representative execution time: {:?} ms",
         plan[0]["Execution Time"]
