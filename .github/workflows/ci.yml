@@ -46,6 +46,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - name: Check bounded shipping runtime callers
+        run: bash scripts/check-bounded-runtime-callers.sh
       - name: Run tests
         run: cargo test --workspace
 

@@ -1,5 +1,5 @@
-//! The GDPR erase handler must strip the vector index of the rows the erase
-//! actually deleted, not of a set it listed beforehand (#268).
+//! The GDPR erase handler must atomically delete exact embedding generations
+//! for the rows the erase actually deleted (#268).
 //!
 //! The handler used to call `list_memories_by_entity_including_superseded`,
 //! then run the erase, then remove the listed ids from the index. Anything a
@@ -29,15 +29,17 @@ use axum::Extension;
 use chrono::{DateTime, Utc};
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
+use pensyve_core::embedding_space::EmbeddingSpaceId;
+use pensyve_core::storage::bounded::{EmbeddingRecord, MemoryRef, NamespaceEmbeddingState};
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::storage::{
-    ActivityAggregate, ActivityEvent, ErasedRows, StorageResult, StorageTrait,
+    ActivityAggregate, ActivityEvent, ErasedRows, ErasureSummary, StorageResult, StorageTrait,
+    embedding_record_for_memory,
 };
 use pensyve_core::types::{
     Edge, Entity, EntityKind, Episode, EpisodicMemory, Memory, Namespace, ObservationMemory,
     ProceduralMemory, SemanticMemory,
 };
-use pensyve_core::vector::VectorIndex;
 use pensyve_mcp_gateway::AppState;
 use pensyve_mcp_gateway::auth::{AuthContext, AuthValidator};
 use pensyve_mcp_gateway::config::GatewayConfig;
@@ -46,7 +48,6 @@ use pensyve_mcp_gateway::rest;
 use pensyve_mcp_gateway::tenant::TenantStateManager;
 use pensyve_mcp_gateway::usage::UsageReporter;
 use pensyve_mcp_gateway::usage_counter::UsageCounter;
-use pensyve_mcp_tools::{PensyveState, VectorRuntime};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -54,13 +55,6 @@ use uuid::Uuid;
 
 const TEST_TENANT: &str = "test-gdpr-erase-race-tenant";
 const DIMENSIONS: usize = 768;
-
-fn vector_index(state: &PensyveState) -> &tokio::sync::RwLock<VectorIndex> {
-    match &state.vector_runtime {
-        VectorRuntime::InMemory(index) => index,
-        VectorRuntime::StorageBacked { .. } => panic!("compatibility fixture must be in-memory"),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // The fake
@@ -73,8 +67,9 @@ fn vector_index(state: &PensyveState) -> &tokio::sync::RwLock<VectorIndex> {
 /// erase. That is the row a pre-list taken by the handler would have missed.
 struct RacingStorage {
     inner: Arc<SqliteBackend>,
-    racer: Mutex<Option<EpisodicMemory>>,
+    racer: Mutex<Option<(Memory, EmbeddingRecord)>>,
     committed: Mutex<Option<mpsc::UnboundedSender<()>>>,
+    after_commit_release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 impl RacingStorage {
@@ -83,22 +78,28 @@ impl RacingStorage {
             inner,
             racer: Mutex::new(None),
             committed: Mutex::new(None),
+            after_commit_release: Mutex::new(None),
         }
     }
 
     /// Load the row the writer will land mid-erase. Called after the tenant's
     /// namespace exists, which is what the row has to be keyed on.
-    fn arm(&self, racer: EpisodicMemory) {
-        *self.racer.lock().expect("racer lock") = Some(racer);
+    fn arm(&self, racer: Memory, record: EmbeddingRecord) {
+        *self.racer.lock().expect("racer lock") = Some((racer, record));
     }
 
     /// A receiver that fires once the erase transaction has **committed** and
     /// before the caller has done any of its post-commit bookkeeping. That is
     /// the window a dropped handler future strands.
-    fn signal_on_commit(&self) -> mpsc::UnboundedReceiver<()> {
+    fn signal_on_commit(&self) -> (mpsc::UnboundedReceiver<()>, std::sync::mpsc::Sender<()>) {
         let (tx, rx) = mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         *self.committed.lock().expect("commit-signal lock") = Some(tx);
-        rx
+        *self
+            .after_commit_release
+            .lock()
+            .expect("post-commit release lock") = Some(release_rx);
+        (rx, release_tx)
     }
 }
 
@@ -108,12 +109,29 @@ impl StorageTrait for RacingStorage {
         entity_id: Uuid,
         namespace_id: Uuid,
     ) -> StorageResult<ErasedRows> {
-        if let Some(racer) = self.racer.lock().expect("racer lock").take() {
-            self.inner.save_episodic(&racer)?;
+        self.inner.erase_entity_capturing(entity_id, namespace_id)
+    }
+
+    fn erase_entity_bounded(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<ErasureSummary> {
+        if let Some((racer, record)) = self.racer.lock().expect("racer lock").take() {
+            self.inner
+                .save_memory_with_embedding(&racer, Some(&record))?;
         }
-        let erased = self.inner.erase_entity_capturing(entity_id, namespace_id)?;
+        let erased = self.inner.erase_entity_bounded(entity_id, namespace_id)?;
         if let Some(tx) = self.committed.lock().expect("commit-signal lock").take() {
             let _ = tx.send(());
+        }
+        if let Some(release) = self
+            .after_commit_release
+            .lock()
+            .expect("post-commit release lock")
+            .take()
+        {
+            let _ = release.recv();
         }
         Ok(erased)
     }
@@ -122,6 +140,28 @@ impl StorageTrait for RacingStorage {
 
     fn db_path(&self) -> Option<&std::path::Path> {
         self.inner.db_path()
+    }
+    fn get_namespace_embedding_state(
+        &self,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<NamespaceEmbeddingState>> {
+        self.inner.get_namespace_embedding_state(namespace_id)
+    }
+    fn save_memory_with_embedding(
+        &self,
+        memory: &Memory,
+        embedding: Option<&EmbeddingRecord>,
+    ) -> StorageResult<()> {
+        self.inner.save_memory_with_embedding(memory, embedding)
+    }
+    fn load_embedding_records(
+        &self,
+        namespace_id: Uuid,
+        embedding_space_id: &EmbeddingSpaceId,
+        memory_refs: &[MemoryRef],
+    ) -> StorageResult<Vec<EmbeddingRecord>> {
+        self.inner
+            .load_embedding_records(namespace_id, embedding_space_id, memory_refs)
     }
     fn save_namespace(&self, ns: &Namespace) -> StorageResult<()> {
         self.inner.save_namespace(ns)
@@ -405,6 +445,9 @@ impl StorageTrait for RacingStorage {
     fn count_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
         self.inner.count_entities_by_namespace(namespace_id)
     }
+    fn count_observations_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
+        self.inner.count_observations_by_namespace(namespace_id)
+    }
     fn log_activity(
         &self,
         namespace_id: Uuid,
@@ -514,17 +557,28 @@ async fn app_state(
     inner
         .save_namespace(&default_namespace)
         .expect("save default namespace");
+    let tenant_namespace = Namespace::new(format!("tenant:{TEST_TENANT}"));
+    inner
+        .save_namespace(&tenant_namespace)
+        .expect("save tenant namespace");
+    let embedder = Arc::new(OnnxEmbedder::new_mock(DIMENSIONS));
+    inner
+        .initialize_local_runtime_space(
+            tenant_namespace.id,
+            embedder.embedding_space().expect("mock embedding space"),
+        )
+        .expect("initialize tenant embedding space");
 
     let racing = Arc::new(RacingStorage::new(inner));
-    let tenant_mgr = TenantStateManager::new_in_memory(
+    let tenant_mgr = TenantStateManager::new_storage_backed(
         racing.clone() as Arc<dyn StorageTrait>,
-        Arc::new(OnnxEmbedder::new_mock(DIMENSIONS)),
+        embedder,
         retrieval_config(),
         default_namespace,
-        VectorIndex::new(DIMENSIONS, 1024),
         snapshot_root,
         pensyve_core::snapshot::RetentionPolicy::UNBOUNDED,
-    );
+    )
+    .expect("construct storage-backed tenant manager");
     let config = gateway_config(dir);
 
     let state = Arc::new(AppState {
@@ -568,9 +622,15 @@ async fn app_state(
         "a turn that predates the request",
     );
     settled.embedding = embedding(0.1);
+    let settled = Memory::Episodic(settled);
+    let settled_record = embedding_record_for_memory(
+        &settled,
+        ps.vector_runtime.space(),
+        settled.embedding().to_vec(),
+    );
     ps.storage
-        .save_episodic(&settled)
-        .expect("save settled memory");
+        .save_memory_with_embedding(&settled, Some(&settled_record))
+        .expect("save settled source and generation");
 
     // Not written yet. `RacingStorage` writes it once the erase starts, which is
     // after the point a pre-list would have been taken.
@@ -582,32 +642,25 @@ async fn app_state(
         "a turn that lands mid-erase",
     );
     racer.embedding = embedding(0.2);
-    racing.arm(racer.clone());
-
-    // The concurrent writer indexes its row as it writes it, so both entries are
-    // present by the time the erase's cleanup runs. They are seeded together
-    // here because a synchronous `StorageTrait` method cannot reach the index.
-    {
-        let mut index = vector_index(&ps).write().await;
-        index
-            .add_with_entity(settled.id, &settled.embedding, entity.id)
-            .expect("index settled memory");
-        index
-            .add_with_entity(racer.id, &racer.embedding, entity.id)
-            .expect("index racing memory");
-    }
+    let racer = Memory::Episodic(racer);
+    let racer_record = embedding_record_for_memory(
+        &racer,
+        ps.vector_runtime.space(),
+        racer.embedding().to_vec(),
+    );
+    racing.arm(racer.clone(), racer_record);
 
     let seeded = Seeded {
         entity_name: entity.name.clone(),
-        settled: settled.id,
-        racer: racer.id,
+        settled: settled.id(),
+        racer: racer.id(),
     };
 
     (state, seeded, racing)
 }
 
 #[tokio::test]
-async fn gdpr_erase_strips_the_index_of_a_row_written_after_a_pre_list_would_have_run() {
+async fn gdpr_erase_strips_the_generation_of_a_row_written_during_the_erase() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (state, seeded, _racing) = app_state(&dir, dir.path().join("snapshots")).await;
 
@@ -629,16 +682,22 @@ async fn gdpr_erase_strips_the_index_of_a_row_written_after_a_pre_list_would_hav
         .tenant_mgr
         .get_tenant_state(TEST_TENANT)
         .expect("tenant state");
-    let index = vector_index(&ps).read().await;
+    let refs = [
+        MemoryRef {
+            memory_type: pensyve_core::storage::bounded::MemoryType::Episodic,
+            id: seeded.settled,
+        },
+        MemoryRef {
+            memory_type: pensyve_core::storage::bounded::MemoryType::Episodic,
+            id: seeded.racer,
+        },
+    ];
     assert!(
-        index.get(seeded.settled).is_none(),
-        "the settled row's index entry must go with its row"
-    );
-    assert!(
-        index.get(seeded.racer).is_none(),
-        "the row written after a pre-list would have been taken was deleted by the \
-         erase, so its index entry must go too — cleanup driven from a pre-list \
-         leaves it behind, pointing at content the request destroyed (#268)"
+        ps.storage
+            .load_embedding_records(ps.namespace.id, &ps.vector_runtime.space().id(), &refs)
+            .expect("load post-erase generations")
+            .is_empty(),
+        "the erase must delete both settled and racing generations atomically"
     );
 
     cancellation.cancel();
@@ -662,18 +721,15 @@ async fn gdpr_erase_strips_the_index_of_a_row_written_after_a_pre_list_would_hav
 /// waits for `RacingStorage` to signal that the transaction committed, aborts
 /// the request, and only then releases the lock.
 #[tokio::test]
-async fn gdpr_erase_finishes_its_index_cleanup_after_the_client_disconnects() {
+async fn gdpr_erase_finishes_after_the_client_disconnects() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (state, seeded, racing) = app_state(&dir, dir.path().join("snapshots")).await;
-    let mut committed = racing.signal_on_commit();
+    let (mut committed, release_after_commit) = racing.signal_on_commit();
 
     let ps = state
         .tenant_mgr
         .get_tenant_state(TEST_TENANT)
         .expect("tenant state");
-
-    // Park the cleanup: whoever owns it will block here until this is dropped.
-    let index_guard = vector_index(&ps).write().await;
 
     let (url, cancellation) = start_test_server(state.clone()).await;
     let request_url = format!("{url}/v1/gdpr/erase/{}", seeded.entity_name);
@@ -687,10 +743,12 @@ async fn gdpr_erase_finishes_its_index_cleanup_after_the_client_disconnects() {
         .expect("the erase must reach its commit point")
         .expect("commit signal");
 
-    // The client hangs up, then the lock frees.
+    // The client hangs up while the detached task remains paused after commit.
     request.abort();
     let _ = request.await;
-    drop(index_guard);
+    release_after_commit
+        .send(())
+        .expect("release detached erase task");
 
     // The cleanup must still happen. Polled rather than asserted once: it now
     // runs on a task nothing awaits, so "eventually" is the only honest
@@ -698,22 +756,27 @@ async fn gdpr_erase_finishes_its_index_cleanup_after_the_client_disconnects() {
     // never gets there at all.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let stranded: Vec<Uuid> = {
-            let index = vector_index(&ps).read().await;
-            [seeded.settled, seeded.racer]
-                .into_iter()
-                .filter(|id| index.get(*id).is_some())
-                .collect()
-        };
+        let refs = [
+            MemoryRef {
+                memory_type: pensyve_core::storage::bounded::MemoryType::Episodic,
+                id: seeded.settled,
+            },
+            MemoryRef {
+                memory_type: pensyve_core::storage::bounded::MemoryType::Episodic,
+                id: seeded.racer,
+            },
+        ];
+        let stranded = ps
+            .storage
+            .load_embedding_records(ps.namespace.id, &ps.vector_runtime.space().id(), &refs)
+            .expect("load generations after disconnect");
         if stranded.is_empty() {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the erase committed and the client disconnected, and these index entries \
-             were never cleaned up: {stranded:?}. They now point at content the request \
-             destroyed. Run the erase and its bookkeeping on a spawned task, the way \
-             `forget_entity` does."
+            "the erase committed and the client disconnected, and these generations \
+             survived: {stranded:?}"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }

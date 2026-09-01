@@ -5671,6 +5671,17 @@ impl StorageTrait for SqliteBackend {
         Ok(count as usize)
     }
 
+    fn count_observations_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
+        let conn = lock_conn!(self);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM observation_memories \
+             WHERE namespace_id = ?1 AND superseded_by IS NULL",
+            params![namespace_id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     // -------------------------------------------------------------------
     // Activity logging
     // -------------------------------------------------------------------
@@ -10962,6 +10973,7 @@ mod tests {
         }
 
         assert_eq!(db.count_memories_by_namespace(ns.id).unwrap(), (1, 1, 1));
+        assert_eq!(db.count_observations_by_namespace(ns.id).unwrap(), 1);
 
         let active = db.get_all_memories_by_namespace(ns.id).unwrap();
         assert_eq!(

@@ -16,9 +16,9 @@ use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::snapshot::RetentionPolicy;
 use pensyve_core::storage::StorageTrait;
+use pensyve_core::storage::bounded::{MemoryRef, MemoryType};
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::Namespace;
-use pensyve_core::vector::VectorIndex;
 use pensyve_mcp_gateway::AppState;
 use pensyve_mcp_gateway::auth::{AuthContext, AuthValidator};
 use pensyve_mcp_gateway::config::GatewayConfig;
@@ -27,7 +27,6 @@ use pensyve_mcp_gateway::rest;
 use pensyve_mcp_gateway::tenant::TenantStateManager;
 use pensyve_mcp_gateway::usage::UsageReporter;
 use pensyve_mcp_gateway::usage_counter::UsageCounter;
-use pensyve_mcp_tools::{PensyveState, VectorRuntime};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -35,13 +34,6 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 const TEST_TENANT: &str = "test-rest-tenant";
-
-fn vector_index(state: &PensyveState) -> &tokio::sync::RwLock<VectorIndex> {
-    match &state.vector_runtime {
-        VectorRuntime::InMemory(index) => index,
-        VectorRuntime::StorageBacked { .. } => panic!("compatibility fixture must be in-memory"),
-    }
-}
 
 fn retrieval_config() -> RetrievalConfig {
     RetrievalConfig {
@@ -85,22 +77,32 @@ fn app_state_with_retention(
     snapshot_root: PathBuf,
     snapshot_retention: RetentionPolicy,
 ) -> Arc<AppState> {
-    let storage =
-        Arc::new(SqliteBackend::open(dir.path()).expect("open storage")) as Arc<dyn StorageTrait>;
+    let storage = Arc::new(SqliteBackend::open(dir.path()).expect("open storage"));
     let namespace = Namespace::new("default");
     storage
         .save_namespace(&namespace)
         .expect("save default namespace");
+    let tenant_namespace = Namespace::new(format!("tenant:{TEST_TENANT}"));
+    storage
+        .save_namespace(&tenant_namespace)
+        .expect("save tenant namespace");
+    let embedder = Arc::new(OnnxEmbedder::new_mock(768));
+    storage
+        .initialize_local_runtime_space(
+            tenant_namespace.id,
+            embedder.embedding_space().expect("mock embedding space"),
+        )
+        .expect("initialize tenant embedding space");
 
-    let tenant_mgr = TenantStateManager::new_in_memory(
-        storage,
-        Arc::new(OnnxEmbedder::new_mock(768)),
+    let tenant_mgr = TenantStateManager::new_storage_backed(
+        storage as Arc<dyn StorageTrait>,
+        embedder,
         retrieval_config(),
         namespace,
-        VectorIndex::new(768, 1024),
         snapshot_root,
         snapshot_retention,
-    );
+    )
+    .expect("construct storage-backed tenant manager");
     let config = gateway_config(dir);
 
     Arc::new(AppState {
@@ -214,20 +216,24 @@ async fn a2a_forget(client: &reqwest::Client, url: &str, entity: &str) -> Value 
     response.json().await.expect("a2a forget response JSON")
 }
 
-/// Asserts every id is present in the vector index. Run before a forget so the
-/// absence checks afterward prove removal rather than never-indexed ids.
-async fn assert_indexed(state: &AppState, ids: &[Uuid]) {
+/// Assert every semantic source has its exact active embedding generation.
+fn assert_generations_present(state: &AppState, ids: &[Uuid]) {
     let ps = state
         .tenant_mgr
         .get_tenant_state(TEST_TENANT)
         .expect("tenant state");
-    let vector_index = vector_index(&ps).read().await;
-    for id in ids {
-        assert!(
-            vector_index.get(*id).is_some(),
-            "memory {id} must be indexed before the forget"
-        );
-    }
+    let refs: Vec<_> = ids
+        .iter()
+        .map(|id| MemoryRef {
+            memory_type: MemoryType::Semantic,
+            id: *id,
+        })
+        .collect();
+    let records = ps
+        .storage
+        .load_embedding_records(ps.namespace.id, &ps.vector_runtime.space().id(), &refs)
+        .expect("load semantic generations");
+    assert_eq!(records.len(), ids.len());
 }
 
 /// Asserts the reference points at a real snapshot holding exactly `expected`
@@ -312,7 +318,7 @@ async fn rest_forget_writes_a_snapshot_and_returns_its_reference() {
     let client = reqwest::Client::new();
     let tea = remember(&client, &url, "alice", "likes tea").await;
     let rust = remember(&client, &url, "alice", "uses rust").await;
-    assert_indexed(&state, &[tea, rust]).await;
+    assert_generations_present(&state, &[tea, rust]);
 
     let response = forget(&client, &url, "alice").await;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
@@ -335,10 +341,7 @@ async fn rest_forget_writes_a_snapshot_and_returns_its_reference() {
     pensyve_core::snapshot::restore_file(ps.storage.as_ref(), &snapshot_path).expect("restore");
     assert_eq!(stored_memory_count(&state), 2);
 
-    let vector_index = vector_index(&ps).read().await;
-    assert!(vector_index.get(tea).is_none());
-    assert!(vector_index.get(rust).is_none());
-    drop(vector_index);
+    assert_generations_present(&state, &[tea, rust]);
     cancellation.cancel();
 }
 
@@ -391,7 +394,7 @@ async fn a2a_forget_writes_a_snapshot_and_returns_its_reference() {
     let client = reqwest::Client::new();
     let tea = remember(&client, &url, "alice", "likes tea").await;
     let rust = remember(&client, &url, "alice", "uses rust").await;
-    assert_indexed(&state, &[tea, rust]).await;
+    assert_generations_present(&state, &[tea, rust]);
 
     let body = a2a_forget(&client, &url, "alice").await;
     assert_eq!(body["status"], "completed");
@@ -412,10 +415,7 @@ async fn a2a_forget_writes_a_snapshot_and_returns_its_reference() {
     pensyve_core::snapshot::restore_file(ps.storage.as_ref(), &snapshot_path).expect("restore");
     assert_eq!(stored_memory_count(&state), 2);
 
-    let vector_index = vector_index(&ps).read().await;
-    assert!(vector_index.get(tea).is_none());
-    assert!(vector_index.get(rust).is_none());
-    drop(vector_index);
+    assert_generations_present(&state, &[tea, rust]);
     cancellation.cancel();
 }
 

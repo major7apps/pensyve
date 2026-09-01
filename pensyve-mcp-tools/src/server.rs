@@ -8,7 +8,7 @@ use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use uuid::Uuid;
 
 use pensyve_core::retrieval::RecallEngine;
-use pensyve_core::storage::bounded::embedding_source_text;
+use pensyve_core::storage::bounded::{MemoryPageRequest, SearchScope, embedding_source_text};
 use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{
     ContentType, Entity, EntityKind, Episode, EpisodicMemory, Memory, Outcome, SemanticMemory,
@@ -513,12 +513,8 @@ impl PensyveMcpServer {
         // Count episodic memories in this namespace for the response.
         let memories_created = state
             .storage
-            .get_all_memories_by_namespace(state.namespace.id)
-            .map_or(0, |mems| {
-                mems.iter()
-                    .filter(|m| matches!(m, Memory::Episodic(_)))
-                    .count()
-            });
+            .count_memories_by_namespace(state.namespace.id)
+            .map_or(0, |(episodic, _, _)| episodic);
 
         let _ = state.storage.log_activity(
             state.namespace.id,
@@ -944,31 +940,45 @@ impl PensyveMcpServer {
         let type_filter = params.memory_type.as_deref();
 
         if params.entity.is_empty() {
-            let stored = state
-                .storage
-                .get_all_memories_by_namespace(state.namespace.id)
-                .map_err(|err| format!("Error listing memories: {err}"))?;
             let mut memories = Vec::new();
-            for memory in stored {
-                let type_name = memory_type_name(&memory);
-                if type_filter.is_some_and(|filter| filter != type_name) {
-                    continue;
+            let mut after = None;
+            loop {
+                let request = MemoryPageRequest::new(
+                    SearchScope::namespace(state.namespace.id),
+                    after,
+                    limit - memories.len(),
+                    false,
+                )
+                .map_err(|err| format!("Error preparing memory page: {err}"))?;
+                let page = state
+                    .storage
+                    .page_memories(&request)
+                    .map_err(|err| format!("Error listing memories: {err}"))?;
+                for memory in page.memories {
+                    let type_name = memory_type_name(&memory);
+                    if type_filter.is_some_and(|filter| filter != type_name) {
+                        continue;
+                    }
+                    let mut val = match memory {
+                        Memory::Episodic(mem) => serde_json::to_value(mem),
+                        Memory::Semantic(mem) => serde_json::to_value(mem),
+                        Memory::Procedural(mem) => serde_json::to_value(mem),
+                        Memory::Observation(mem) => serde_json::to_value(mem),
+                    }
+                    .unwrap_or_default();
+                    strip_embedding(&mut val);
+                    if let serde_json::Value::Object(ref mut map) = val {
+                        map.insert("_type".to_string(), serde_json::json!(type_name));
+                    }
+                    memories.push(val);
+                    if memories.len() == limit {
+                        break;
+                    }
                 }
-                let mut val = match memory {
-                    Memory::Episodic(mem) => serde_json::to_value(mem),
-                    Memory::Semantic(mem) => serde_json::to_value(mem),
-                    Memory::Procedural(mem) => serde_json::to_value(mem),
-                    Memory::Observation(mem) => serde_json::to_value(mem),
-                }
-                .unwrap_or_default();
-                strip_embedding(&mut val);
-                if let serde_json::Value::Object(ref mut map) = val {
-                    map.insert("_type".to_string(), serde_json::json!(type_name));
-                }
-                memories.push(val);
-                if memories.len() == limit {
+                if memories.len() == limit || page.next_cursor.is_none() {
                     break;
                 }
+                after = page.next_cursor;
             }
 
             return serde_json::to_string(&serde_json::json!({
@@ -1314,6 +1324,43 @@ mod tests {
             "Retryable internal error: recall overloaded; retry after 1 second"
         );
         assert_eq!(admission.overload_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn namespace_inspect_pages_past_nonmatching_types_without_exceeding_the_limit() {
+        let snapshot_root = tempfile::tempdir().unwrap();
+        let fixture = forget_fixture(snapshot_root.path().join("snapshots"), false);
+        let namespace_id = fixture.server.state.namespace.id;
+        let episode = Episode::new(namespace_id, Vec::new());
+        fixture.server.state.storage.save_episode(&episode).unwrap();
+        for index in 0..101 {
+            fixture
+                .server
+                .state
+                .storage
+                .save_episodic(&EpisodicMemory::new(
+                    namespace_id,
+                    episode.id,
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    format!("nonmatching episodic {index}"),
+                ))
+                .unwrap();
+        }
+
+        let response = fixture
+            .server
+            .inspect(Parameters(InspectParams {
+                entity: String::new(),
+                memory_type: Some("semantic".into()),
+                limit: Some(1),
+            }))
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["memory_count"], 1);
+        assert_eq!(response["memories"].as_array().unwrap().len(), 1);
+        assert_eq!(response["memories"][0]["_type"], "semantic");
     }
 
     #[test]

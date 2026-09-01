@@ -1285,6 +1285,13 @@ pub trait StorageTrait: Send + Sync {
         namespace_id: Uuid,
     ) -> StorageResult<(usize, usize, usize)>; // (episodic, semantic, procedural)
 
+    /// Count active observations in a namespace without loading memory content.
+    fn count_observations_by_namespace(&self, _namespace_id: Uuid) -> StorageResult<usize> {
+        Err(StorageError::Unsupported(
+            "observation count by namespace".into(),
+        ))
+    }
+
     /// Count entities in a namespace.
     fn count_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize>;
 

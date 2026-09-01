@@ -12,7 +12,6 @@ use pensyve_core::snapshot::RetentionPolicy;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::Namespace;
-use pensyve_core::vector::VectorIndex;
 use pensyve_mcp_gateway::AppState;
 use pensyve_mcp_gateway::admission::{
     MIB, RecallAdmission, enforce_recall_admission, recall_overload_count,
@@ -36,7 +35,7 @@ fn a2a_app_state(dir: &TempDir, admission: Arc<RecallAdmission>) -> Arc<AppState
     storage
         .save_namespace(&namespace)
         .expect("save default namespace");
-    let tenant_mgr = TenantStateManager::new_in_memory(
+    let tenant_mgr = TenantStateManager::new_storage_backed(
         storage,
         Arc::new(OnnxEmbedder::new_mock(8)),
         RetrievalConfig {
@@ -50,10 +49,10 @@ fn a2a_app_state(dir: &TempDir, admission: Arc<RecallAdmission>) -> Arc<AppState
             max_depth: 4,
         },
         namespace,
-        VectorIndex::new(8, 32),
         dir.path().join("snapshots"),
         RetentionPolicy::UNBOUNDED,
-    );
+    )
+    .expect("construct storage-backed tenant manager");
     assert!(
         tenant_mgr
             .default_state()

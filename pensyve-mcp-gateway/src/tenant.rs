@@ -11,9 +11,6 @@ use pensyve_core::reranker::Reranker;
 use pensyve_core::snapshot::RetentionPolicy;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::types::Namespace;
-use pensyve_core::vector::VectorIndex;
-use tokio::sync::RwLock;
-
 use pensyve_mcp_tools::{PensyveState, VectorRuntime};
 
 const MAX_CACHED_TENANTS: usize = 1_024;
@@ -26,15 +23,6 @@ struct TenantMetadata {
     // resolved PensyveState can retain this cache entry after eviction.
     namespace: Namespace,
     last_accessed: Instant,
-}
-
-#[derive(Clone)]
-enum TenantRuntimeMode {
-    StorageBacked,
-    InMemory {
-        dimensions: usize,
-        states: Arc<DashMap<Uuid, Arc<PensyveState>>>,
-    },
 }
 
 /// Manages per-tenant `PensyveState` instances.
@@ -54,7 +42,6 @@ pub struct TenantStateManager {
     embedder: Arc<OnnxEmbedder>,
     retrieval_config: RetrievalConfig,
     default_state: Arc<PensyveState>,
-    runtime_mode: TenantRuntimeMode,
     tenants: DashMap<String, TenantMetadata>,
     cache_gate: Mutex<()>,
     clock: TenantClock,
@@ -126,50 +113,6 @@ impl TenantStateManager {
         )
     }
 
-    /// Explicit compatibility constructor for tests that exercise index
-    /// mutation behavior pending their Task 10 storage conversion.
-    #[doc(hidden)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_in_memory(
-        storage: Arc<dyn StorageTrait>,
-        embedder: Arc<OnnxEmbedder>,
-        retrieval_config: RetrievalConfig,
-        default_namespace: Namespace,
-        default_vector_index: VectorIndex,
-        snapshot_root: PathBuf,
-        snapshot_retention: RetentionPolicy,
-    ) -> Self {
-        let dimensions = default_vector_index.dimensions();
-        let reranker_cell = Arc::new(OnceLock::new());
-        let default_state = Arc::new(PensyveState {
-            storage: storage.clone(),
-            embedder: embedder.clone(),
-            vector_runtime: VectorRuntime::InMemory(RwLock::new(default_vector_index)),
-            namespace: default_namespace,
-            retrieval_config: retrieval_config.clone(),
-            is_remote: true,
-            reranker_cell: reranker_cell.clone(),
-            snapshot_root: snapshot_root.clone(),
-            snapshot_retention,
-        });
-        Self {
-            storage,
-            embedder,
-            retrieval_config,
-            default_state,
-            runtime_mode: TenantRuntimeMode::InMemory {
-                dimensions,
-                states: Arc::new(DashMap::new()),
-            },
-            tenants: DashMap::new(),
-            cache_gate: Mutex::new(()),
-            clock: Arc::new(Instant::now),
-            reranker_cell,
-            snapshot_root,
-            snapshot_retention,
-        }
-    }
-
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn new_with_clock(
@@ -230,7 +173,6 @@ impl TenantStateManager {
             embedder,
             retrieval_config,
             default_state,
-            runtime_mode: TenantRuntimeMode::StorageBacked,
             tenants: DashMap::new(),
             cache_gate: Mutex::new(()),
             clock,
@@ -351,36 +293,12 @@ impl TenantStateManager {
         &self,
         namespace: Namespace,
     ) -> Result<Arc<PensyveState>, std::io::Error> {
-        let vector_runtime = match &self.runtime_mode {
-            TenantRuntimeMode::StorageBacked => VectorRuntime::resolve_storage_backed(
-                self.storage.as_ref(),
-                &self.embedder,
-                namespace.id,
-            )
-            .map_err(std::io::Error::other)?,
-            TenantRuntimeMode::InMemory { dimensions, states } => {
-                if let Some(state) = states.get(&namespace.id) {
-                    return Ok(Arc::clone(state.value()));
-                }
-                let state = Arc::new(PensyveState {
-                    storage: self.storage.clone(),
-                    embedder: self.embedder.clone(),
-                    vector_runtime: VectorRuntime::InMemory(RwLock::new(VectorIndex::new(
-                        *dimensions,
-                        1_024,
-                    ))),
-                    namespace,
-                    retrieval_config: self.retrieval_config.clone(),
-                    is_remote: true,
-                    reranker_cell: self.reranker_cell.clone(),
-                    snapshot_root: self.snapshot_root.clone(),
-                    snapshot_retention: self.snapshot_retention,
-                });
-                return Ok(Arc::clone(
-                    states.entry(state.namespace.id).or_insert(state).value(),
-                ));
-            }
-        };
+        let vector_runtime = VectorRuntime::resolve_storage_backed(
+            self.storage.as_ref(),
+            &self.embedder,
+            namespace.id,
+        )
+        .map_err(std::io::Error::other)?;
         Ok(Arc::new(PensyveState {
             storage: self.storage.clone(),
             embedder: self.embedder.clone(),

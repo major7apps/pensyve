@@ -1467,13 +1467,6 @@ async fn purge_all_memories(
         )
     })?;
 
-    // Clear the vector index.
-    if let VectorRuntime::InMemory(vector_index) = &ps.vector_runtime {
-        let dims = vector_index.read().await.dimensions();
-        let mut vi = vector_index.write().await;
-        *vi = VectorIndex::new(dims, 1024);
-    }
-
     Ok(Json(serde_json::json!({ "deleted": deleted_count })))
 }
 
@@ -1514,26 +1507,18 @@ async fn stats(
     let ps = get_pensyve_state(&state, &auth_ctx)?;
     let ns = &ps.namespace;
 
-    let mut semantic_count = 0usize;
-    let mut episodic_count = 0usize;
-    let mut procedural_count = 0usize;
-    let mut observation_count = 0usize;
-
-    if let Ok(memories) = ps.storage.get_all_memories_by_namespace(ns.id) {
-        for mem in &memories {
-            match mem {
-                Memory::Semantic(_) => semantic_count += 1,
-                Memory::Episodic(_) => episodic_count += 1,
-                Memory::Procedural(_) => procedural_count += 1,
-                Memory::Observation(_) => observation_count += 1,
-            }
-        }
-    }
-
+    let (episodic_count, semantic_count, procedural_count) = ps
+        .storage
+        .count_memories_by_namespace(ns.id)
+        .unwrap_or_default();
+    let observation_count = ps
+        .storage
+        .count_observations_by_namespace(ns.id)
+        .unwrap_or_default();
     let entity_count = ps
         .storage
-        .list_entities_by_namespace(ns.id)
-        .map_or(0, |v| v.len());
+        .count_entities_by_namespace(ns.id)
+        .unwrap_or_default();
 
     Ok(Json(StatsResponse {
         namespace: ns.name.clone(),

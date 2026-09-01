@@ -4,13 +4,13 @@ use std::sync::Arc;
 use axum::Extension;
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
-use pensyve_core::storage::StorageTrait;
+use pensyve_core::storage::bounded::{MemoryRef, MemoryType};
 use pensyve_core::storage::sqlite::SqliteBackend;
+use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{
-    Entity, EntityKind, EpisodicMemory, Namespace, ObservationMemory, Outcome, ProceduralMemory,
-    SemanticMemory,
+    Entity, EntityKind, EpisodicMemory, Memory, Namespace, ObservationMemory, Outcome,
+    ProceduralMemory, SemanticMemory,
 };
-use pensyve_core::vector::VectorIndex;
 use pensyve_mcp_gateway::AppState;
 use pensyve_mcp_gateway::auth::{AuthContext, AuthValidator};
 use pensyve_mcp_gateway::config::GatewayConfig;
@@ -19,20 +19,12 @@ use pensyve_mcp_gateway::rest;
 use pensyve_mcp_gateway::tenant::TenantStateManager;
 use pensyve_mcp_gateway::usage::UsageReporter;
 use pensyve_mcp_gateway::usage_counter::UsageCounter;
-use pensyve_mcp_tools::{PensyveState, VectorRuntime};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const TEST_TENANT: &str = "test-rest-tenant";
-
-fn vector_index(state: &PensyveState) -> &tokio::sync::RwLock<VectorIndex> {
-    match &state.vector_runtime {
-        VectorRuntime::InMemory(index) => index,
-        VectorRuntime::StorageBacked { .. } => panic!("compatibility fixture must be in-memory"),
-    }
-}
 
 fn retrieval_config() -> RetrievalConfig {
     RetrievalConfig {
@@ -45,6 +37,18 @@ fn retrieval_config() -> RetrievalConfig {
         beam_width: 10,
         max_depth: 4,
     }
+}
+
+fn save_with_generation(state: &pensyve_mcp_tools::PensyveState, memory: &Memory) {
+    let record = embedding_record_for_memory(
+        memory,
+        state.vector_runtime.space(),
+        memory.embedding().to_vec(),
+    );
+    state
+        .storage
+        .save_memory_with_embedding(memory, Some(&record))
+        .expect("save source and exact generation");
 }
 
 fn gateway_config(dir: &TempDir) -> GatewayConfig {
@@ -63,22 +67,32 @@ fn gateway_config(dir: &TempDir) -> GatewayConfig {
 }
 
 fn app_state(dir: &TempDir) -> Arc<AppState> {
-    let storage =
-        Arc::new(SqliteBackend::open(dir.path()).expect("open storage")) as Arc<dyn StorageTrait>;
+    let storage = Arc::new(SqliteBackend::open(dir.path()).expect("open storage"));
     let namespace = Namespace::new("default");
     storage
         .save_namespace(&namespace)
         .expect("save default namespace");
+    let tenant_namespace = Namespace::new(format!("tenant:{TEST_TENANT}"));
+    storage
+        .save_namespace(&tenant_namespace)
+        .expect("save tenant namespace");
+    let embedder = Arc::new(OnnxEmbedder::new_mock(768));
+    storage
+        .initialize_local_runtime_space(
+            tenant_namespace.id,
+            embedder.embedding_space().expect("mock embedding space"),
+        )
+        .expect("initialize tenant embedding space");
 
-    let tenant_mgr = TenantStateManager::new_in_memory(
-        storage,
-        Arc::new(OnnxEmbedder::new_mock(768)),
+    let tenant_mgr = TenantStateManager::new_storage_backed(
+        storage as Arc<dyn StorageTrait>,
+        embedder,
         retrieval_config(),
         namespace,
-        VectorIndex::new(768, 1024),
         dir.path().join("snapshots"),
         pensyve_core::snapshot::RetentionPolicy::UNBOUNDED,
-    );
+    )
+    .expect("construct storage-backed tenant manager");
     let config = gateway_config(dir);
 
     Arc::new(AppState {
@@ -307,12 +321,9 @@ async fn inspect_by_entity_returns_instance_matched_observations_and_no_procedur
         "mentioned",
         "Alice was mentioned",
     );
-    matching.embedding = vec![0.1, 0.2];
-    pensyve_state
-        .storage
-        .save_observation(&matching)
-        .expect("save matching observation");
-    let other = ObservationMemory::new(
+    matching.embedding = vec![0.1; 768];
+    save_with_generation(&pensyve_state, &Memory::Observation(matching.clone()));
+    let mut other = ObservationMemory::new(
         pensyve_state.namespace.id,
         Uuid::new_v4(),
         "person",
@@ -320,21 +331,17 @@ async fn inspect_by_entity_returns_instance_matched_observations_and_no_procedur
         "mentioned",
         "Bob was mentioned",
     );
-    pensyve_state
-        .storage
-        .save_observation(&other)
-        .expect("save other observation");
-    let procedural = ProceduralMemory::new(
+    other.embedding = vec![0.2; 768];
+    save_with_generation(&pensyve_state, &Memory::Observation(other));
+    let mut procedural = ProceduralMemory::new(
         pensyve_state.namespace.id,
         "on timeout",
         "retry",
         Outcome::Success,
         HashMap::new(),
     );
-    pensyve_state
-        .storage
-        .save_procedural(&procedural)
-        .expect("save procedural memory");
+    procedural.embedding = vec![0.3; 768];
+    save_with_generation(&pensyve_state, &Memory::Procedural(procedural));
 
     let response = inspect(&client, &url, "alice").await;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
@@ -370,11 +377,8 @@ async fn inspect_browse_mode_returns_all_memory_kinds_without_embeddings() {
         alice_id,
         "Alice likes tea",
     );
-    episodic.embedding = vec![0.1, 0.2];
-    pensyve_state
-        .storage
-        .save_episodic(&episodic)
-        .expect("save episodic memory");
+    episodic.embedding = vec![0.1; 768];
+    save_with_generation(&pensyve_state, &Memory::Episodic(episodic));
     let mut procedural = ProceduralMemory::new(
         pensyve_state.namespace.id,
         "when brewing tea",
@@ -382,11 +386,8 @@ async fn inspect_browse_mode_returns_all_memory_kinds_without_embeddings() {
         Outcome::Success,
         HashMap::new(),
     );
-    procedural.embedding = vec![0.1, 0.2];
-    pensyve_state
-        .storage
-        .save_procedural(&procedural)
-        .expect("save procedural memory");
+    procedural.embedding = vec![0.2; 768];
+    save_with_generation(&pensyve_state, &Memory::Procedural(procedural));
     let mut observation = ObservationMemory::new(
         pensyve_state.namespace.id,
         Uuid::new_v4(),
@@ -395,11 +396,8 @@ async fn inspect_browse_mode_returns_all_memory_kinds_without_embeddings() {
         "mentioned",
         "Alice was mentioned",
     );
-    observation.embedding = vec![0.1, 0.2];
-    pensyve_state
-        .storage
-        .save_observation(&observation)
-        .expect("save observation memory");
+    observation.embedding = vec![0.3; 768];
+    save_with_generation(&pensyve_state, &Memory::Observation(observation));
 
     let response = inspect(&client, &url, "").await;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
@@ -502,7 +500,7 @@ async fn stats_after_forget_reflect_decremented_memory_counts() {
 }
 
 #[tokio::test]
-async fn supersede_creates_live_replacement_and_excludes_old_from_retrieval_indexes() {
+async fn supersede_creates_live_replacement_and_excludes_old_generation() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (url, state, cancellation) = start_test_server(&dir).await;
     let client = reqwest::Client::new();
@@ -511,12 +509,21 @@ async fn supersede_creates_live_replacement_and_excludes_old_from_retrieval_inde
         .tenant_mgr
         .get_tenant_state(TEST_TENANT)
         .expect("tenant state");
-    assert!(
-        vector_index(&pensyve_state)
-            .read()
-            .await
-            .get(old_id)
-            .is_some()
+    let old_ref = MemoryRef {
+        memory_type: MemoryType::Semantic,
+        id: old_id,
+    };
+    assert_eq!(
+        pensyve_state
+            .storage
+            .load_embedding_records(
+                pensyve_state.namespace.id,
+                &pensyve_state.vector_runtime.space().id(),
+                &[old_ref],
+            )
+            .expect("load old generation")
+            .len(),
+        1
     );
 
     let response = supersede(&client, &url, old_id, "currenttoken value").await;
@@ -570,10 +577,22 @@ async fn supersede_creates_live_replacement_and_excludes_old_from_retrieval_inde
     assert_eq!(new_hits.len(), 1);
     assert_eq!(new_hits[0].id(), new_id);
 
-    let vector_index = vector_index(&pensyve_state).read().await;
-    assert!(vector_index.get(old_id).is_none());
-    assert!(vector_index.get(new_id).is_some());
-    drop(vector_index);
+    let records = pensyve_state
+        .storage
+        .load_embedding_records(
+            pensyve_state.namespace.id,
+            &pensyve_state.vector_runtime.space().id(),
+            &[
+                old_ref,
+                MemoryRef {
+                    memory_type: MemoryType::Semantic,
+                    id: new_id,
+                },
+            ],
+        )
+        .expect("load post-supersession generations");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].memory_ref.id, new_id);
     cancellation.cancel();
 }
 

@@ -5540,6 +5540,21 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    fn count_observations_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let (count,): (i64,) = query_as::<Postgres, _>(
+                "SELECT COUNT(*) FROM observation_memories \
+                 WHERE namespace_id = $1 AND superseded_by IS NULL",
+            )
+            .bind(namespace_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(count as usize)
+        })
+    }
+
     // -------------------------------------------------------------------
     // Activity logging
     // -------------------------------------------------------------------
@@ -7166,6 +7181,23 @@ mod live_rls;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observation_count_uses_scoped_connection_and_explicit_active_namespace_predicate() {
+        let source = include_str!("postgres.rs");
+        let body = source
+            .split_once("fn count_observations_by_namespace(")
+            .expect("observation count method")
+            .1
+            .split_once("// -------------------------------------------------------------------")
+            .expect("observation count terminator")
+            .0;
+        assert!(body.contains("self.scoped_conn(namespace_id)"));
+        assert!(body.contains("FROM observation_memories"));
+        assert!(body.contains("namespace_id = $1"));
+        assert!(body.contains("superseded_by IS NULL"));
+        assert!(body.contains(".bind(namespace_id)"));
+    }
 
     #[test]
     fn exact_pgvector_sql_is_one_bounded_parameterized_union_with_stable_order() {

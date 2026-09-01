@@ -313,19 +313,8 @@ fn count_memories(
     storage: &SqliteBackend,
     namespace_id: uuid::Uuid,
 ) -> Result<MemoryCounts, Box<dyn std::error::Error>> {
-    let all_memories = storage.get_all_memories_by_namespace(namespace_id)?;
-    let mut episodic = 0usize;
-    let mut semantic = 0usize;
-    let mut procedural = 0usize;
-    let mut observation = 0usize;
-    for mem in &all_memories {
-        match mem {
-            Memory::Episodic(_) => episodic += 1,
-            Memory::Semantic(_) => semantic += 1,
-            Memory::Procedural(_) => procedural += 1,
-            Memory::Observation(_) => observation += 1,
-        }
-    }
+    let (episodic, semantic, procedural) = storage.count_memories_by_namespace(namespace_id)?;
+    let observation = storage.count_observations_by_namespace(namespace_id)?;
     Ok(MemoryCounts {
         episodic,
         semantic,
@@ -550,8 +539,8 @@ fn cmd_status(
     let counts = count_memories(&storage, ns.id)?;
 
     let entities = storage
-        .list_entities_by_namespace(ns.id)
-        .map_or(0, |v| v.len());
+        .count_entities_by_namespace(ns.id)
+        .unwrap_or_default();
 
     let storage_bytes = db_size(&path);
 

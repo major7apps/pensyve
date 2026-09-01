@@ -18,7 +18,6 @@ use pensyve_core::network_policy::NetworkPolicy;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{Episode, EpisodicMemory, Memory, Namespace};
-use pensyve_core::vector::VectorIndex;
 use pensyve_mcp_gateway::AppState;
 use pensyve_mcp_gateway::auth::{AuthContext, AuthValidator};
 use pensyve_mcp_gateway::config::GatewayConfig;
@@ -78,15 +77,15 @@ fn app_state(dir: &TempDir) -> Arc<AppState> {
         .expect("save default namespace");
     let embedder = Arc::new(OnnxEmbedder::new_mock(EMBEDDING_DIMS));
 
-    let tenant_mgr = TenantStateManager::new_in_memory(
+    let tenant_mgr = TenantStateManager::new_storage_backed(
         storage,
         embedder,
         retrieval_config(),
         namespace,
-        VectorIndex::new(EMBEDDING_DIMS, 1024),
         dir.path().join("snapshots"),
         pensyve_core::snapshot::RetentionPolicy::UNBOUNDED,
-    );
+    )
+    .expect("construct storage-backed tenant manager");
     let config = gateway_config(dir);
 
     Arc::new(AppState {
