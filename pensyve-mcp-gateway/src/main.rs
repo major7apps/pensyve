@@ -12,9 +12,12 @@ use tracing_subscriber::EnvFilter;
 
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::{OnnxEmbedder, resolved_fastembed_cache_dir};
+use pensyve_core::embedding_migration::{BackfillCancellation, EmbeddingMigration, MigrationError};
+use pensyve_core::embedding_space::EmbeddingSpaceId;
 use pensyve_core::network_policy::NetworkPolicy;
 use pensyve_core::reranker::Reranker;
 use pensyve_core::storage::StorageTrait;
+use pensyve_core::storage::bounded::NamespaceEmbeddingPhase;
 use pensyve_core::storage::postgres::PostgresBackend;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::Namespace;
@@ -275,6 +278,128 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
     })
 }
 
+/// Operator mode: `pensyve-mcp-gateway backfill-embeddings` brings every
+/// namespace onto the embedding generation this process loaded, then exits.
+const BACKFILL_EMBEDDINGS_MODE: &str = "backfill-embeddings";
+
+/// Bounded per-namespace source page for the backfill loop.
+const BACKFILL_PAGE: usize = 256;
+
+/// Consecutive backfill rounds that attempt items without committing any
+/// before the namespace is reported as stalled instead of spinning.
+const BACKFILL_STALL_ROUNDS: usize = 3;
+
+enum BackfillResult {
+    AlreadyActive,
+    Activated { committed: usize },
+}
+
+/// Run the embedding migration lifecycle (begin, backfill, verify, activate)
+/// for every namespace the storage pages out, resuming namespaces already in
+/// flight on this generation and skipping ones already active on it. Each
+/// namespace is scoped through `StorageTrait`, so the serving role's
+/// row-level security applies exactly as it does when serving traffic.
+fn backfill_embeddings(storage: &dyn StorageTrait, embedder: &OnnxEmbedder) -> Result<()> {
+    let runtime_space = embedder
+        .embedding_space()
+        .map_err(|error| anyhow::anyhow!("runtime embedding space: {error}"))?
+        .id();
+    tracing::info!(space = %runtime_space.0, "embedding backfill starting");
+    let cancellation = BackfillCancellation::new();
+    let mut after = None;
+    let (mut activated, mut already_active, mut failed) = (0_usize, 0_usize, 0_usize);
+    loop {
+        let page = storage
+            .page_namespaces(after, BACKFILL_PAGE)
+            .map_err(|error| anyhow::anyhow!("page namespaces: {error}"))?;
+        for namespace_id in page.namespace_ids {
+            match backfill_namespace(
+                storage,
+                embedder,
+                namespace_id,
+                &runtime_space,
+                &cancellation,
+            ) {
+                Ok(BackfillResult::AlreadyActive) => already_active += 1,
+                Ok(BackfillResult::Activated { committed }) => {
+                    activated += 1;
+                    tracing::info!(%namespace_id, committed, "namespace activated");
+                }
+                Err(error) => {
+                    failed += 1;
+                    tracing::error!(%namespace_id, %error, "namespace backfill failed");
+                }
+            }
+        }
+        after = page.next_cursor;
+        if after.is_none() {
+            break;
+        }
+    }
+    tracing::info!(
+        activated,
+        already_active,
+        failed,
+        "embedding backfill finished"
+    );
+    if failed > 0 {
+        anyhow::bail!("{failed} namespace(s) failed to backfill; see log");
+    }
+    Ok(())
+}
+
+fn backfill_namespace(
+    storage: &dyn StorageTrait,
+    embedder: &OnnxEmbedder,
+    namespace_id: uuid::Uuid,
+    runtime_space: &EmbeddingSpaceId,
+    cancellation: &BackfillCancellation,
+) -> Result<BackfillResult, MigrationError> {
+    let state = storage.get_namespace_embedding_state(namespace_id)?;
+    let on_this_generation = |space: Option<&EmbeddingSpaceId>| space == Some(runtime_space);
+    if let Some(state) = &state
+        && state.phase == NamespaceEmbeddingPhase::Active
+        && on_this_generation(state.active_read_space_id.as_ref())
+    {
+        return Ok(BackfillResult::AlreadyActive);
+    }
+    let migration = EmbeddingMigration::new(storage, embedder, namespace_id);
+    let in_flight = state.as_ref().is_some_and(|state| {
+        matches!(
+            state.phase,
+            NamespaceEmbeddingPhase::Backfilling | NamespaceEmbeddingPhase::Ready
+        ) && on_this_generation(state.target_space_id.as_ref())
+    });
+    if !in_flight {
+        migration.start()?;
+    }
+    let mut committed = 0_usize;
+    let mut stalled_rounds = 0_usize;
+    loop {
+        let outcome = migration.backfill(BACKFILL_PAGE, cancellation)?;
+        committed += outcome.committed;
+        if outcome.attempted == 0 {
+            break;
+        }
+        if outcome.committed == 0 {
+            stalled_rounds += 1;
+            if stalled_rounds >= BACKFILL_STALL_ROUNDS {
+                tracing::warn!(
+                    %namespace_id,
+                    requeued = outcome.requeued,
+                    "backfill is not making progress; leaving namespace in flight"
+                );
+                break;
+            }
+        } else {
+            stalled_rounds = 0;
+        }
+    }
+    migration.verify()?;
+    migration.activate()?;
+    Ok(BackfillResult::Activated { committed })
+}
+
 fn main() -> Result<()> {
     // JSON formatter with span attributes flattened into each event record
     // (Phase 23/A): the TracingLayer middleware wraps every request handler
@@ -306,6 +431,9 @@ fn main() -> Result<()> {
     // Init resources BEFORE tokio runtime to avoid nested runtime panic
     // when PostgresBackend creates its own internal runtime.
     let res = init_resources(&config)?;
+    if std::env::args().nth(1).as_deref() == Some(BACKFILL_EMBEDDINGS_MODE) {
+        return backfill_embeddings(res.storage.as_ref(), res.embedder.as_ref());
+    }
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
