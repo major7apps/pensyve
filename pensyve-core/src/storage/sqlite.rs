@@ -4568,14 +4568,16 @@ impl StorageTrait for SqliteBackend {
             // caller-supplied `episode_id` alone selects rows across tenants.
             conn.execute(
                 "DELETE FROM kg_triples \
-                 WHERE passage_id IN (SELECT id FROM observation_memories \
+                 WHERE namespace_id = ?2 \
+                   AND passage_id IN (SELECT id FROM observation_memories \
                                        WHERE episode_id = ?1 AND namespace_id = ?2)",
                 params![&ep_str, &ns_str],
             )?;
             conn.execute(
                 "DELETE FROM kg_passage_entities \
                  WHERE passage_id IN (SELECT id FROM observation_memories \
-                                       WHERE episode_id = ?1 AND namespace_id = ?2)",
+                                       WHERE episode_id = ?1 AND namespace_id = ?2) \
+                   AND entity_id IN (SELECT id FROM kg_entities WHERE namespace_id = ?2)",
                 params![&ep_str, &ns_str],
             )?;
             conn.execute(
@@ -11288,6 +11290,20 @@ mod tests {
         .unwrap()
     }
 
+    fn kg_triples_count_in_namespace(
+        db: &SqliteBackend,
+        passage_id: Uuid,
+        namespace_id: Uuid,
+    ) -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM kg_triples WHERE passage_id = ?1 AND namespace_id = ?2",
+            params![passage_id.to_string(), namespace_id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
     fn kg_passage_entities_count_for_passage(db: &SqliteBackend, passage_id: Uuid) -> i64 {
         let conn = db.conn.lock().unwrap();
         conn.query_row(
@@ -11366,6 +11382,61 @@ mod tests {
             kg_entities_count_for_namespace(&db, ns.id),
             2,
             "kg_entities are namespace-scoped and must NOT cascade with an episode delete"
+        );
+    }
+
+    #[test]
+    fn delete_observations_by_episode_kg_cascade_is_confined_to_its_namespace() {
+        let (_dir, db) = setup();
+        let ns_a = make_namespace(&db);
+        let ns_b = Namespace::new("other-ns");
+        db.save_namespace(&ns_b).unwrap();
+        let episode = Uuid::new_v4();
+
+        let observation = ObservationMemory::new(ns_a.id, episode, "x", "y", "z", "an observation");
+        db.save_observation(&observation).unwrap();
+
+        let a_subject = seed_kg_entity(&db, ns_a.id, "S-A");
+        let a_object = seed_kg_entity(&db, ns_a.id, "O-A");
+        seed_kg_triple(&db, ns_a.id, observation.id, a_subject, a_object);
+
+        let b_subject = seed_kg_entity(&db, ns_b.id, "S-B");
+        let b_object = seed_kg_entity(&db, ns_b.id, "O-B");
+        seed_kg_triple(&db, ns_b.id, observation.id, b_subject, b_object);
+
+        assert_eq!(
+            kg_passage_entities_count_in_namespace(&db, observation.id, ns_a.id),
+            2
+        );
+        assert_eq!(
+            kg_passage_entities_count_in_namespace(&db, observation.id, ns_b.id),
+            2,
+            "B's rows must exist before the delete, or their absence afterwards proves nothing"
+        );
+        assert_eq!(
+            kg_triples_count_in_namespace(&db, observation.id, ns_b.id),
+            1,
+            "B's triple must exist before the delete, or its absence afterwards proves nothing"
+        );
+
+        let deleted = db.delete_observations_by_episode(ns_a.id, episode).unwrap();
+        assert_eq!(deleted, 1, "namespace A's observation must be deleted");
+
+        assert_eq!(
+            kg_passage_entities_count_in_namespace(&db, observation.id, ns_a.id),
+            0,
+            "namespace A's own passage-entity rows must cascade with its observation"
+        );
+        assert_eq!(
+            kg_passage_entities_count_in_namespace(&db, observation.id, ns_b.id),
+            2,
+            "namespace B's passage-entity rows were deleted by an episode cleanup issued for \
+             namespace A"
+        );
+        assert_eq!(
+            kg_triples_count_in_namespace(&db, observation.id, ns_b.id),
+            1,
+            "namespace B's triple was deleted by an episode cleanup issued for namespace A"
         );
     }
 
