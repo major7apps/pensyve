@@ -1,6 +1,6 @@
 [package]
 name = "pensyve-mcp-gateway"
-version = "3.2.0"
+version = "4.0.0"
 edition = "2024"
 description = "Remote MCP gateway for Pensyve Cloud — Streamable HTTP transport"
 rust-version = "1.88"
@@ -18,8 +18,8 @@ name = "pensyve-mcp-gateway"
 path = "src/main.rs"
 
 [dependencies]
-pensyve-core = { path = "../pensyve-core", version = "3.2.0", features = ["postgres", "observation-extraction"] }
-pensyve-mcp-tools = { path = "../pensyve-mcp-tools", version = "3.2.0" }
+pensyve-core = { path = "../pensyve-core", version = "4.0.0", features = ["postgres", "observation-extraction"] }
+pensyve-mcp-tools = { path = "../pensyve-mcp-tools", version = "4.0.0" }
 rmcp = { version = "3.1", features = ["server", "transport-streamable-http-server", "macros"] }
 axum = "0.8"
 tower-http = { version = "0.7", features = ["compression-gzip", "compression-br"] }

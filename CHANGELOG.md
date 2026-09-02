@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-09-02
+
+Bounded runtime and embedding provenance. Shipping runtimes no longer hold a
+resident vector corpus; retrieval is storage-backed and every stored vector
+carries the immutable identity of the embedding generation that produced it.
+Existing deployments upgrade in two steps (owner-connected schema startup, then
+a one-time `backfill-embeddings` run); until the backfill activates a namespace,
+that namespace serves lexical/graph retrieval only.
+
+### Breaking
+
+- **`ConsolidationWorkspace` gains a required `cursor(run)` method.** External
+  implementors must return the persisted resume cursor; both built-in backends do.
+- **`StorageTrait` grows bounded, storage-backed retrieval methods with
+  fail-closed defaults.** Custom backends compile unchanged but return an explicit
+  unsupported outcome for storage-backed search, paging, and the embedding
+  lifecycle until they implement them; the shipping runtimes require them.
+- **Schema v6/v7 on both backends** (versioned embedding spaces, embedding
+  records, namespace lifecycle state, backfill queue, durable consolidation
+  workspace). On PostgreSQL the serving role cannot apply it: start the new
+  build once on an owner connection, then serve as `pensyve_app` again.
+- **CLI embedding-space maintenance commands require `--storage-path`.**
+- **Python: observation extraction takes its own permit.** Recall, remember, and
+  consolidation no longer wait behind an extractor round trip.
+
+### Upgrade
+
+1. Deploy the new build; if the serving role cannot apply the schema, run the
+   owner-connected startup (`docs/SECURITY.md`).
+2. Run `pensyve-mcp-gateway backfill-embeddings` once against the same
+   database with the same model bundle; it activates every namespace on the
+   loaded embedding generation and is safe to re-run.
+
 ### Changed
 
 - **Shipping Rust runtimes now use storage-backed exact retrieval exclusively.**
@@ -24,11 +57,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   256-row pages, 64-row consolidation comparisons, 4,096-member promotion clusters,
   hosted recall admission of 8 / 64 MiB, and 1,024 cached tenant metadata entries
   with 30-minute idle expiry.
-- **Deployment guidance corrected.** Earlier full-GTE-plus-BGE and 4 GiB sizing is
-  superseded. This candidate does not select or download a production model and
-  does not authorize a production backfill, cutover, infrastructure change, or
-  release; certified real-model evidence and a separately approved rollout remain
-  required.
+- **Hosted gateway shape.** The production task now runs at 512 CPU / 2048 MiB
+  with the pinned GTE model bundle in the image and BGE reranking off unless
+  `PENSYVE_RERANKER=1`; the earlier 4 GiB strict-runtime sizing is superseded.
 
 ### Added
 
