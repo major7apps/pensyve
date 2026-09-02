@@ -80,7 +80,13 @@ fn save_episode_memory_with_embedding(
 }
 
 fn config() -> ConsolidationConfig {
-    PensyveConfig::default().consolidation
+    let mut config = PensyveConfig::default().consolidation;
+    // These tests exercise the member, page, and working-state budgets; the
+    // 4,096-member fixtures can outlast the 60 s default on a busy CI runner,
+    // which would report DurationExceeded instead of the budget under test.
+    // The duration budget has its own test, which sets its own value.
+    config.max_duration_secs = 600;
+    config
 }
 
 fn run(
