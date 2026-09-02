@@ -436,7 +436,9 @@ CREATE INDEX IF NOT EXISTS idx_consolidation_sources_scan
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pensyve_app') THEN
-        GRANT SELECT, INSERT, UPDATE, DELETE ON embedding_spaces TO pensyve_app;
+        -- Provenance rows are append-only: an update would silently redefine an
+        -- id that other namespaces already reference.
+        GRANT SELECT, INSERT ON embedding_spaces TO pensyve_app;
         GRANT SELECT, INSERT, UPDATE, DELETE ON memory_embeddings TO pensyve_app;
         GRANT SELECT, INSERT, UPDATE, DELETE ON namespace_embedding_state TO pensyve_app;
         GRANT SELECT, INSERT, UPDATE, DELETE ON embedding_backfill_queue TO pensyve_app;

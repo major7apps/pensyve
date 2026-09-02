@@ -17,6 +17,7 @@ use uuid::Uuid;
 use crate::admission::MIB;
 use crate::auth::AuthContext;
 
+use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::embedding_space::EmbeddingSpace;
 use pensyve_core::retrieval::RecallEngine;
 use pensyve_core::retrieval::contradictions::detect_contradictions;
@@ -877,6 +878,27 @@ async fn health() -> impl IntoResponse {
     }))
 }
 
+/// Embed the recall query on the blocking pool. A failure is logged and the
+/// request continues lexical-only, so an unhealthy embedder shows up in the
+/// gateway log instead of masquerading as a semantic recall with no hits.
+async fn embed_query_or_degrade(
+    embedder: &Arc<OnnxEmbedder>,
+    query_text: String,
+) -> Option<Vec<f32>> {
+    let embedder = Arc::clone(embedder);
+    match tokio::task::spawn_blocking(move || embedder.embed(&query_text)).await {
+        Ok(Ok(embedding)) => Some(embedding),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "query embedding failed; recall degrades to lexical-only");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, "query embedding task failed; recall degrades to lexical-only");
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn recall(
     State(state): State<Arc<AppState>>,
@@ -919,12 +941,7 @@ async fn recall(
 
     let semantic_enabled = runtime_wants_embedding(&ps)?;
     let query_embedding = if semantic_enabled {
-        let embedder = ps.embedder.clone();
-        let query_text = body.query.clone();
-        tokio::task::spawn_blocking(move || embedder.embed(&query_text))
-            .await
-            .ok()
-            .and_then(Result::ok)
+        embed_query_or_degrade(&ps.embedder, body.query.clone()).await
     } else {
         None
     };
@@ -1032,12 +1049,7 @@ async fn recall_grouped(
 
     let semantic_enabled = runtime_wants_embedding(&ps)?;
     let query_embedding = if semantic_enabled {
-        let embedder = ps.embedder.clone();
-        let query_text = body.query.clone();
-        tokio::task::spawn_blocking(move || embedder.embed(&query_text))
-            .await
-            .ok()
-            .and_then(Result::ok)
+        embed_query_or_degrade(&ps.embedder, body.query.clone()).await
     } else {
         None
     };
@@ -2380,12 +2392,7 @@ async fn a2a_recall(
         .map_err(|error| format!("Runtime space error: {error}"))?;
     let semantic_enabled = active_space.is_some();
     let query_embedding = if semantic_enabled {
-        let embedder = ps.embedder.clone();
-        let query_text = query.clone();
-        tokio::task::spawn_blocking(move || embedder.embed(&query_text))
-            .await
-            .ok()
-            .and_then(Result::ok)
+        embed_query_or_degrade(&ps.embedder, query.clone()).await
     } else {
         None
     };

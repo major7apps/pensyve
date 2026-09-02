@@ -166,7 +166,9 @@ pub fn export_entity_data(
     let mut after = None;
     loop {
         let page = storage.page_gdpr_personal_data(namespace_id, entity_id, after, 256)?;
-        exports.extend(page.memories.iter().map(personal_memory_json));
+        for memory in &page.memories {
+            exports.push(personal_memory_json(memory)?);
+        }
         after = page.next_cursor;
         if after.is_none() {
             break;
@@ -223,7 +225,7 @@ pub fn export_entity_data_to_writer(
                 &mut digest,
                 &serde_json::json!({
                     "kind": "memory",
-                    "record": personal_memory_value(memory),
+                    "record": personal_memory_value(memory)?,
                 }),
             )?;
             memory_records += 1;
@@ -270,12 +272,12 @@ fn write_export_frame(
     Ok(())
 }
 
-fn personal_memory_json(memory: &Memory) -> String {
-    personal_memory_value(memory).to_string()
+fn personal_memory_json(memory: &Memory) -> Result<String, StorageError> {
+    Ok(personal_memory_value(memory)?.to_string())
 }
 
-fn personal_memory_value(memory: &Memory) -> serde_json::Value {
-    match memory {
+fn personal_memory_value(memory: &Memory) -> Result<serde_json::Value, StorageError> {
+    Ok(match memory {
         Memory::Episodic(memory) => serde_json::json!({
             "type": "episodic",
             "id": memory.id.to_string(),
@@ -304,8 +306,12 @@ fn personal_memory_value(memory: &Memory) -> serde_json::Value {
             "event_time": memory.event_time.map(|time| time.to_rfc3339()),
             "created_at": memory.created_at.to_rfc3339(),
         }),
-        Memory::Procedural(_) => unreachable!("GDPR personal-data pages exclude procedures"),
-    }
+        Memory::Procedural(_) => {
+            return Err(StorageError::Context(
+                "GDPR personal-data pages exclude procedures".into(),
+            ));
+        }
+    })
 }
 
 #[cfg(test)]

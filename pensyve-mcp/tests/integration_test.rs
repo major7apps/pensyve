@@ -12,7 +12,7 @@ use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::embedding_space::EmbeddingSpace;
 use pensyve_core::retrieval::RecallEngine;
-use pensyve_core::storage::bounded::MemoryRef;
+use pensyve_core::storage::bounded::{MemoryRef, embedding_source_text};
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{
@@ -90,10 +90,17 @@ impl TestState {
         }
     }
 
-    fn save_semantic_with_embedding(&self, mut semantic: SemanticMemory, text: &str) {
-        let embedding = self.embedder.embed(text).expect("mock embed");
-        semantic.embedding.clone_from(&embedding);
-        let memory = Memory::Semantic(semantic);
+    /// Embeds the memory's canonical source text so the stored vector and the
+    /// record's provenance hash describe the same document.
+    fn save_semantic_with_embedding(&self, semantic: SemanticMemory) {
+        let mut memory = Memory::Semantic(semantic);
+        let embedding = self
+            .embedder
+            .embed(&embedding_source_text(&memory))
+            .expect("mock embed");
+        if let Memory::Semantic(semantic) = &mut memory {
+            semantic.embedding.clone_from(&embedding);
+        }
         let record = embedding_record_for_memory(&memory, &self.runtime_space, embedding);
         self.storage
             .save_memory_with_embedding(&memory, Some(&record))
@@ -239,7 +246,7 @@ async fn test_forget_removes_all_memories_for_entity() {
             format!("fact {i}"),
             1.0,
         );
-        state.save_semantic_with_embedding(mem, &format!("fact {i}"));
+        state.save_semantic_with_embedding(mem);
     }
 
     // Confirm they're there.
@@ -309,7 +316,6 @@ async fn test_inspect_lists_semantic_memories_for_entity() {
 
     // Store two semantic memories.
     for i in 0..2_u32 {
-        let fact = format!("knows thing {i}");
         let mem = SemanticMemory::new(
             state.namespace.id,
             entity.id,
@@ -317,7 +323,7 @@ async fn test_inspect_lists_semantic_memories_for_entity() {
             format!("thing {i}"),
             0.8,
         );
-        state.save_semantic_with_embedding(mem, &fact);
+        state.save_semantic_with_embedding(mem);
     }
 
     let limit = 20_usize;

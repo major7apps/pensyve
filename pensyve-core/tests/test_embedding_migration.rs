@@ -1137,12 +1137,21 @@ fn postgres_embedding_migration_state_machine() {
 
     migration.start().unwrap();
     let mut committed = 0;
-    while committed < 257 {
+    // 257 sources need two pages; a stalled page must fail, not spin forever.
+    for _ in 0..4 {
+        if committed >= 257 {
+            break;
+        }
         let progress = migration
             .backfill(256, &BackfillCancellation::new())
             .unwrap();
+        assert!(
+            progress.committed > 0,
+            "backfill stalled at {committed} committed rows"
+        );
         committed += progress.committed;
     }
+    assert_eq!(committed, 257);
     assert_eq!(committed, 257);
     assert_eq!(
         migration.verify().unwrap().phase,
