@@ -373,7 +373,19 @@ fn cmd_recall(
         );
         OnnxEmbedder::new_mock(768)
     });
-    let active_space = resolve_local_semantic_space(&storage, &embedder, ns.id)?;
+    // A silent mock fallback must never become the namespace's active
+    // embedding generation: the next run with a real model would mismatch it
+    // and lose semantic search. Stay lexical-only without touching the
+    // lifecycle instead.
+    let runtime_class = embedder
+        .embedding_space()
+        .map_err(|error| format!("runtime embedding space: {error}"))?
+        .class;
+    let active_space = if runtime_class == EmbeddingClass::Mock {
+        None
+    } else {
+        resolve_local_semantic_space(&storage, &embedder, ns.id)?
+    };
 
     let config = RetrievalConfig {
         default_limit: limit,

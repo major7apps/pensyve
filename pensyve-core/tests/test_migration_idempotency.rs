@@ -25,7 +25,7 @@ use rusqlite::{Connection, params};
 use tempfile::TempDir;
 use uuid::Uuid;
 
-use pensyve_core::storage::sqlite::SqliteBackend;
+use pensyve_core::storage::sqlite::{LATEST_SCHEMA_VERSION, SqliteBackend};
 
 const PROJECTION_TABLES: &[&str] = &[
     "episodic_memories",
@@ -107,15 +107,13 @@ fn fresh_store_migration_is_idempotent() {
         // Fresh-store open lands every registered migration in one pass.
         assert_eq!(
             rows.len(),
-            6,
-            "expected v=1 through v=6 migration rows, got {rows:?}"
+            usize::try_from(LATEST_SCHEMA_VERSION).unwrap(),
+            "expected v=1 through v={LATEST_SCHEMA_VERSION} migration rows, got {rows:?}"
         );
-        assert_eq!(rows[0].0, 1, "expected version=1");
-        assert_eq!(rows[1].0, 2, "expected version=2");
-        assert_eq!(rows[2].0, 3, "expected version=3");
-        assert_eq!(rows[3].0, 4, "expected version=4");
-        assert_eq!(rows[4].0, 5, "expected version=5");
-        assert_eq!(rows[5].0, 6, "expected version=6");
+        for (index, row) in rows.iter().enumerate() {
+            let expected = i64::try_from(index + 1).unwrap();
+            assert_eq!(row.0, expected, "expected version={expected}");
+        }
 
         assert_migration_v1_landed(&conn);
     }
@@ -153,12 +151,11 @@ fn fresh_store_migration_is_idempotent() {
             rows, versions_first,
             "schema_versions changed on re-open: {rows:?} vs {versions_first:?}"
         );
-        // Six registered migrations; all must remain stable
-        // across reopens.
+        // Every registered migration must remain stable across reopens.
         assert_eq!(
             rows.len(),
-            6,
-            "duplicate schema_versions row inserted on re-run; expected 6, got {rows:?}"
+            usize::try_from(LATEST_SCHEMA_VERSION).unwrap(),
+            "duplicate schema_versions row inserted on re-run; expected {LATEST_SCHEMA_VERSION}, got {rows:?}"
         );
 
         for (i, table) in PROJECTION_TABLES.iter().enumerate() {
@@ -340,8 +337,8 @@ fn v2_1_fixture_upgrade_lands_alters_and_preserves_rows() {
     let rows = schema_version_rows(&conn);
     assert_eq!(
         rows.len(),
-        6,
-        "expected v=1 through v=6 schema_versions rows, got {rows:?}"
+        usize::try_from(LATEST_SCHEMA_VERSION).unwrap(),
+        "expected v=1 through v={LATEST_SCHEMA_VERSION} schema_versions rows, got {rows:?}"
     );
     assert_eq!(rows[0].0, 1);
     assert_eq!(rows[1].0, 2);
@@ -383,7 +380,7 @@ fn v2_1_fixture_upgrade_lands_alters_and_preserves_rows() {
     let rows = schema_version_rows(&conn);
     assert_eq!(
         rows.len(),
-        6,
-        "duplicate schema_versions row on re-run against fixture; expected 6, got {rows:?}"
+        usize::try_from(LATEST_SCHEMA_VERSION).unwrap(),
+        "duplicate schema_versions row on re-run against fixture; expected {LATEST_SCHEMA_VERSION}, got {rows:?}"
     );
 }

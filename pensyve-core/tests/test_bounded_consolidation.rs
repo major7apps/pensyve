@@ -831,10 +831,21 @@ fn shipping_decay_does_not_call_full_memory_paging() {
     let start = core
         .find("fn decay_bounded(")
         .expect("bounded decay function");
-    let end = core[start..]
-        .find("\n    }\n}\n\n// ---------------------------------------------------------------------------")
-        .expect("bounded decay function end");
-    let decay = &core[start..start + end];
+    // Bound the slice at the next method or the end of the impl block, not at a
+    // comment banner that any reformat could move.
+    let body = &core[start..];
+    let end = [
+        "\n    fn ",
+        "\n    pub fn ",
+        "\n    pub(crate) fn ",
+        "\n}\n",
+    ]
+    .iter()
+    .filter_map(|marker| body[1..].find(marker).map(|offset| offset + 1))
+    .min()
+    .expect("bounded decay function end");
+    let decay = &body[..end];
+    assert!(decay.contains("fn decay_bounded("));
     assert!(!decay.contains("page_memories"));
     assert!(!decay.contains("MemoryPageRequest"));
 }
@@ -906,7 +917,12 @@ fn cluster_member_budget_is_typed_and_has_no_semantic_or_decay_write() {
 #[test]
 fn shipping_consolidation_and_periodic_sweep_have_no_bulk_or_cache_enumeration() {
     let core = fs::read_to_string("src/consolidation/mod.rs").unwrap();
-    let shipping_core = core.split("#[cfg(test)]").next().unwrap();
+    // Split at the test module, not the first `#[cfg(test)]` seam: test-only
+    // hooks sit between shipping functions, and the guard has to reach the
+    // bounded promotion and decay loops that follow them.
+    let shipping_core = core.split("\nmod tests {").next().unwrap();
+    assert!(shipping_core.contains("fn run_locked_bounded("));
+    assert!(shipping_core.contains("fn decay_bounded("));
     assert!(!shipping_core.contains("get_all_memories_by_namespace"));
     let gateway = fs::read_to_string("../pensyve-mcp-gateway/src/main.rs").unwrap();
     assert!(!gateway.contains("active_namespace_ids()"));

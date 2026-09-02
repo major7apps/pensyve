@@ -242,8 +242,14 @@ async fn main() -> Result<()> {
     };
 
     // Initialize the configured runtime without hydrating the namespace corpus.
-    // The persisted namespace embedding state is the read-side activation gate.
-    let embedder = build_embedder(None)?;
+    // The persisted namespace embedding state is the read-side activation gate,
+    // and its active generation's dimensionality picks the model so an
+    // existing namespace never starts against a mismatched runtime space.
+    let stored_dims = storage
+        .get_namespace_embedding_state(namespace.id)
+        .map_err(|error| anyhow::anyhow!("Failed to read namespace embedding state: {error}"))?
+        .and_then(|state| state.active_read_space.map(|space| space.dimensions));
+    let embedder = build_embedder(stored_dims)?;
     let runtime_space = embedder
         .embedding_space()
         .map_err(|error| anyhow::anyhow!("Failed to resolve runtime embedding space: {error}"))?

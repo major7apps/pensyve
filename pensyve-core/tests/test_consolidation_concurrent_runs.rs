@@ -16,7 +16,7 @@
 //! zeroed stats, and the run already in flight runs once more so the coalesced
 //! trigger's evidence is still consolidated.
 
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -35,6 +35,15 @@ use uuid::Uuid;
 
 /// Distinct promotable clusters seeded per namespace.
 const CLUSTERS: usize = 48;
+
+/// `ConsolidationEngine::run*` waits on one process-global permit. Tests in
+/// this binary run on parallel threads, so without serialization one test's
+/// owner run can queue behind another test's until it reports
+/// `DurationExceeded` instead of the race it was written to observe.
+fn permit_serial() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 fn make_config() -> ConsolidationConfig {
     PensyveConfig::default().consolidation
@@ -142,6 +151,7 @@ fn race_window_stays_wide_enough_to_detect() {
     const MIN_MARGIN: f64 = 200.0;
     const SKEW_TRIALS: usize = 9;
 
+    let _serial = permit_serial();
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(SqliteBackend::open(tmp.path()).expect("open storage"));
     let embedder = Arc::new(OnnxEmbedder::new_mock(64));
@@ -190,6 +200,7 @@ fn race_window_stays_wide_enough_to_detect() {
 /// cluster exactly once between them.
 #[test]
 fn concurrent_runs_on_one_namespace_do_not_double_promote() {
+    let _serial = permit_serial();
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(SqliteBackend::open(tmp.path()).expect("open storage"));
     let embedder = Arc::new(OnnxEmbedder::new_mock(64));
@@ -252,6 +263,7 @@ fn evidence_arriving_mid_run_is_not_dropped_by_coalescing() {
     const SEEDED: usize = CLUSTERS * 4;
     const LATE_CONTENT: &str = "late evidence the in-flight run cannot see";
 
+    let _serial = permit_serial();
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(SqliteBackend::open(tmp.path()).expect("open storage"));
     let embedder = Arc::new(OnnxEmbedder::new_mock(64));
@@ -328,6 +340,7 @@ fn evidence_arriving_mid_run_is_not_dropped_by_coalescing() {
 fn coalesced_trigger_is_typed_pending_when_owner_becomes_incomplete() {
     const SEEDED: usize = CLUSTERS * 4;
 
+    let _serial = permit_serial();
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(SqliteBackend::open(tmp.path()).expect("open storage"));
     let embedder = Arc::new(OnnxEmbedder::new_mock(64));

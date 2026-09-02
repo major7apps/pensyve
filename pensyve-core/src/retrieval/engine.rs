@@ -794,7 +794,7 @@ impl<'a> RecallEngine<'a> {
             typed_ties,
         } = match self.vector_source {
             VectorSource::InMemory(_) => {
-                let (legacy_candidates, legacy_vector_map) = if let Some(emb) = pre_embedding {
+                let (mut legacy_candidates, legacy_vector_map) = if let Some(emb) = pre_embedding {
                     if target_entity.is_some() {
                         self.gather_candidates_dual_path(
                             emb,
@@ -823,6 +823,12 @@ impl<'a> RecallEngine<'a> {
                 } else {
                     self.gather_candidates(query, namespace_id, max_candidates)?
                 };
+                if let Some(filter) = filter {
+                    // The legacy gatherers know nothing about typed filters;
+                    // apply the predicate here so `recall_grouped` honors
+                    // `types` on both vector sources.
+                    legacy_candidates.retain(|_, memory| filter.matches(memory));
+                }
                 let legacy_bm25_map = if legacy_candidates.is_empty() {
                     HashMap::new()
                 } else {
@@ -902,6 +908,13 @@ impl<'a> RecallEngine<'a> {
             });
         }
 
+        // Storage-backed engines enforce the deadline inside the exact search
+        // (`VectorSearchRequest::deadline`), and a deadline hit degrades to the
+        // lexical/graph legs with `SemanticStatus::Unavailable` instead of
+        // failing the request — the bounded-runtime contract prefers a typed,
+        // degraded answer over a timeout error. Only the legacy resident index
+        // has no per-stage deadline, so only it keeps the wall-clock cuts here
+        // and after fusion.
         if matches!(self.vector_source, VectorSource::InMemory(_)) && start.elapsed() > timeout {
             return Err(RecallError::Timeout(self.config.recall_timeout_secs));
         }

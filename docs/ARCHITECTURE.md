@@ -70,7 +70,7 @@
 | `embedding.rs` | ONNX embeddings via `fastembed`; stored as raw f32 BLOBs |
 | `vector.rs` | Cosine-similarity primitives; shipping runtimes use storage-backed search rather than a resident corpus index |
 | `graph.rs` | Entity relationship graph via `petgraph`; BFS traversal for proximity scoring |
-| `retrieval.rs` | `RecallEngine` — 8-signal fusion with weighted sum, cross-encoder reranking, `QueryIntent` classifier |
+| `retrieval.rs` | `RecallEngine` — 8-signal fusion with weighted sum, optional cross-encoder reranking (only when a reranker is configured), `QueryIntent` classifier |
 | `decay.rs` | FSRS forgetting curve: `R(t, S) = (1 + t/(9*S))^(-1)` |
 | `consolidation.rs` | Background "dreaming": episodic-to-semantic promotion, decay, archival |
 | `procedural.rs` | Beta-binomial Bayesian reliability for action-outcome procedures |
@@ -125,7 +125,7 @@ Namespace (isolation boundary)
          → BM25 search (FTS5 lexical matching)
          → Graph traversal (petgraph BFS from entity)
          → Fusion scoring (8-signal weighted sum)
-         → Cross-encoder reranking (top-20)
+         → Cross-encoder reranking (top-20; only when a reranker is configured)
          → FSRS reinforcement (accessed memories strengthened)
          → Return ranked results
 

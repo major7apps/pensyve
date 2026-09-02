@@ -751,6 +751,17 @@ fn wait_for_postgres_lock_wait(
     }
 }
 
+/// The live tests below share one database and each opens the backend,
+/// which applies the schema; concurrent `CREATE EXTENSION IF NOT EXISTS` calls
+/// race on `pg_extension_name_index`, so they run one at a time.
+#[cfg(feature = "postgres")]
+fn postgres_serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_rollback_between_eligibility_and_vector_fetch_returns_unavailable() {
@@ -762,6 +773,7 @@ fn postgres_rollback_between_eligibility_and_vector_fetch_returns_unavailable() 
         eprintln!("skipped: PENSYVE_TEST_DATABASE_URL is unset");
         return;
     };
+    let _serial = postgres_serial();
     let storage = pensyve_core::storage::PostgresBackend::new(&database_url).unwrap();
     let search_handle = pensyve_core::storage::PostgresBackend::new(&database_url).unwrap();
     let namespace = Namespace::new(format!("embedding-search-race-{}", uuid::Uuid::new_v4()));
@@ -787,14 +799,22 @@ fn postgres_rollback_between_eligibility_and_vector_fetch_returns_unavailable() 
     migration.activate().unwrap();
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
+    // Pool connections return themselves to the pool on drop, which needs a
+    // Tokio context; keep the runtime entered for the coordinator's lifetime.
+    let _tokio = runtime.enter();
     let mut coordinator = runtime.block_on(storage.pool().acquire()).unwrap();
     runtime
         .block_on(storage.set_namespace_config(&mut coordinator, namespace.id))
         .unwrap();
+    // Freeze the search after its lifecycle/eligibility read and before the
+    // vector fetch: the fetch is the first statement that touches
+    // `memory_embeddings`, while the rollback below never does, so it can
+    // land in between. (Locking `embedding_spaces` would block the rollback's
+    // own lifecycle re-read and deadlock the test against itself.)
     let mut table_lock = runtime.block_on((&mut *coordinator).begin()).unwrap();
     runtime
         .block_on(
-            query::<Postgres>("LOCK TABLE embedding_spaces IN ACCESS EXCLUSIVE MODE")
+            query::<Postgres>("LOCK TABLE memory_embeddings IN ACCESS EXCLUSIVE MODE")
                 .execute(&mut *table_lock),
         )
         .unwrap();
@@ -811,7 +831,7 @@ fn postgres_rollback_between_eligibility_and_vector_fetch_returns_unavailable() 
             ))
             .unwrap();
     });
-    wait_for_postgres_lock_wait(&storage, "LEFT JOIN embedding_spaces AS spaces");
+    wait_for_postgres_lock_wait(&storage, "FROM memory_embeddings AS embeddings");
 
     migration.rollback_lexical().unwrap();
     runtime.block_on(table_lock.commit()).unwrap();
@@ -834,6 +854,7 @@ fn postgres_source_only_writer_precedes_first_activation_without_stale_coverage(
         eprintln!("skipped: PENSYVE_TEST_DATABASE_URL is unset");
         return;
     };
+    let _serial = postgres_serial();
     let storage = pensyve_core::storage::PostgresBackend::new(&database_url).unwrap();
     let writer = pensyve_core::storage::PostgresBackend::new(&database_url).unwrap();
     let migrator = pensyve_core::storage::PostgresBackend::new(&database_url).unwrap();
@@ -858,6 +879,9 @@ fn postgres_source_only_writer_precedes_first_activation_without_stale_coverage(
     );
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
+    // Pool connections return themselves to the pool on drop, which needs a
+    // Tokio context; keep the runtime entered for the coordinator's lifetime.
+    let _tokio = runtime.enter();
     let mut coordinator = runtime.block_on(storage.pool().acquire()).unwrap();
     runtime
         .block_on(storage.set_namespace_config(&mut coordinator, namespace.id))
@@ -887,10 +911,10 @@ fn postgres_source_only_writer_precedes_first_activation_without_stale_coverage(
         let migration = EmbeddingMigration::new(&migrator, &embedder, namespace_id);
         activation_tx.send(migration.activate()).unwrap();
     });
-    wait_for_postgres_lock_wait(
-        &storage,
-        "SELECT id FROM namespaces WHERE id = $1 FOR UPDATE",
-    );
+    // Activation inspects coverage before it takes the namespace serialization
+    // lock, so its first blocked statement is the coverage scan over the
+    // table the writer's insert is parked on.
+    wait_for_postgres_lock_wait(&storage, "FROM semantic_memories");
     assert!(matches!(
         activation_rx.try_recv(),
         Err(std::sync::mpsc::TryRecvError::Empty)
@@ -901,15 +925,21 @@ fn postgres_source_only_writer_precedes_first_activation_without_stale_coverage(
         .recv_timeout(Duration::from_secs(5))
         .unwrap()
         .unwrap();
-    assert!(matches!(
-        activation_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-        Err(MigrationError::CoverageIncomplete {
-            total: 1,
-            missing: 1,
-            stale: 0,
-            pending: 0,
-        })
-    ));
+    // The source-only write lands under the namespace serialization lock
+    // first, enqueues its source, and moves the namespace back to
+    // `Backfilling`; the activation that queued behind it is refused rather
+    // than activating on the coverage it inspected before the write.
+    let activation = activation_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        matches!(
+            activation,
+            Err(MigrationError::InvalidTransition {
+                current: NamespaceEmbeddingPhase::Backfilling,
+                requested: "activate",
+            })
+        ),
+        "activation must not run on coverage inspected before the write: {activation:?}"
+    );
     writer_thread.join().unwrap();
     activation_thread.join().unwrap();
     assert_eq!(
@@ -918,7 +948,7 @@ fn postgres_source_only_writer_precedes_first_activation_without_stale_coverage(
             .unwrap()
             .unwrap()
             .phase,
-        NamespaceEmbeddingPhase::Ready
+        NamespaceEmbeddingPhase::Backfilling
     );
     assert_eq!(
         storage
@@ -943,6 +973,7 @@ fn postgres_restore_is_order_independent_and_requires_explicit_active_provenance
         eprintln!("skipped: PENSYVE_TEST_DATABASE_URL is unset");
         return;
     };
+    let _serial = postgres_serial();
     let storage = pensyve_core::storage::PostgresBackend::new(&database_url).unwrap();
     let embedder_a = OnnxEmbedder::new_mock(4);
     let embedder_b = OnnxEmbedder::new_mock(5);
@@ -1079,6 +1110,7 @@ fn postgres_embedding_migration_state_machine() {
         eprintln!("skipped: PENSYVE_TEST_DATABASE_URL is unset");
         return;
     };
+    let _serial = postgres_serial();
     let storage = pensyve_core::storage::PostgresBackend::new(&database_url).unwrap();
     let stale_handle = pensyve_core::storage::PostgresBackend::new(&database_url).unwrap();
     let namespace = Namespace::new(format!("embedding-migration-{}", uuid::Uuid::new_v4()));

@@ -4325,7 +4325,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_extraction_persists_observation_and_embedding_record_together() {
+        // `fake_embed` returns four values, so a 4-dimensional active space is
+        // the matching happy path for the failure cases below.
+        let (_dir, db, ns, ep, space) = setup_active_storage(4);
+        let observation = ObservationMemory::new(
+            ns.id,
+            ep,
+            "game_played",
+            "AC Odyssey",
+            "played",
+            "played AC Odyssey",
+        );
+        let reference = MemoryRef {
+            memory_type: MemoryType::Observation,
+            id: observation.id,
+        };
+        let extractor = MockExtractor {
+            fixed: vec![observation],
+        };
+
+        let persisted = commit_extraction_for_episode_in_space(
+            &db,
+            &extractor,
+            ns.id,
+            ep,
+            CancellationToken::new(),
+            Some(&space),
+            fake_embed,
+        )
+        .await;
+
+        assert_eq!(persisted, 1);
+        let stored = db
+            .list_observations_by_episode_ids(ns.id, &[ep], 100)
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, reference.id);
+        let records = db
+            .load_embedding_records(ns.id, &space.id(), &[reference])
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].embedding, vec![1.0_f32; 4]);
+    }
+
+    #[tokio::test]
     async fn active_extraction_failure_leaves_neither_source_nor_embedding() {
+        // A 2-dimensional active space against `fake_embed`'s four values is
+        // the intended dimension mismatch that makes the atomic write fail.
         let (_dir, db, ns, ep, space) = setup_active_storage(2);
         let observation = ObservationMemory::new(
             ns.id,

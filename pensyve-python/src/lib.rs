@@ -39,6 +39,11 @@ static TRACING_INIT: Once = Once::new();
 static EMBEDDING_MODEL_NAME: OnceLock<String> = OnceLock::new();
 static EMBEDDING_DIMS: OnceLock<usize> = OnceLock::new();
 static LOCAL_OPERATION_LOCK: Mutex<()> = Mutex::new(());
+/// Observation extraction waits on an extractor endpoint. It is bounded by
+/// its own permit so a slow endpoint never stalls recall, remember, or
+/// consolidation behind [`LOCAL_OPERATION_LOCK`]; the embedder's single
+/// session still serializes the embedding work extraction performs.
+static EXTRACTION_LOCK: Mutex<()> = Mutex::new(());
 const SHIPPING_EMBEDDING_POOL_SIZE: usize = 1;
 
 #[cfg(test)]
@@ -2028,7 +2033,7 @@ impl PyPensyve {
             .map_err(|error| PyRuntimeError::new_err(format!("Runtime space error: {error}")))?
             .cloned();
         let total = py.detach(|| {
-            let _permit = LOCAL_OPERATION_LOCK
+            let _permit = EXTRACTION_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             runtime.block_on(async move {
@@ -2246,7 +2251,7 @@ impl PyEpisode {
         let messages = self.messages.clone();
         let persisted = py
             .detach(move || {
-                let _permit = LOCAL_OPERATION_LOCK
+                let permit = LOCAL_OPERATION_LOCK
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let mut episode = types::Episode::new(namespace_id, participants.clone());
@@ -2308,11 +2313,17 @@ impl PyEpisode {
                         .push((namespace_id, episode_id));
                     return Ok(0);
                 }
+                // The episode rows and their embedding records are durable;
+                // hand the local permit back before waiting on the extractor.
+                drop(permit);
                 let (Some(extractor), Some(runtime)) =
                     (inner.extractor.clone(), inner.extractor_runtime.clone())
                 else {
                     return Ok(0);
                 };
+                let _extraction = EXTRACTION_LOCK
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let storage = inner.storage.clone();
                 let embedder = inner.embedder.clone();
                 let active_space = inner

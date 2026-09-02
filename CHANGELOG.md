@@ -30,6 +30,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release; certified real-model evidence and a separately approved rollout remain
   required.
 
+### Fixed
+
+- **Entity-wide forget closes a snapshot page before the 4 MiB ceiling** instead
+  of rejecting the whole forget when a full 256-row page of individually valid
+  rows exceeds it in aggregate; the remaining rows form the next page.
+- **Consolidation resumes from its persisted cursor.** A cancellation or duration
+  budget that fires before the first page no longer checkpoints the origin over a
+  previously scanned run. `ConsolidationWorkspace` gains `cursor(run)`.
+- **`ConsolidationStats::archived` counts persisted decay updates only.** Semantic
+  memories decay but are never archived, and the bounded loop stopped reporting
+  them as if they were.
+- **`recall_grouped` honors `types` on the legacy in-memory vector source** as well
+  as on storage-backed engines.
+- **Python: observation extraction takes its own permit.** Recall, remember, and
+  consolidation no longer queue behind an extractor round trip; the episode's own
+  rows are durable before the local permit is released.
+- **CLI: a silent mock-embedder fallback stays lexical-only** and never activates a
+  mock generation that a later real model would mismatch.
+- **stdio MCP picks the embedding model from the namespace's active generation**
+  (its persisted dimensionality), so an existing namespace never starts against a
+  mismatched runtime space.
+- **`pensyve_inspect` rejects an unknown `memory_type`** with the same error as
+  `pensyve_recall` instead of answering with an empty page.
+- **Recall overload metrics count awaiting-path rejections** as well as immediate
+  ones.
+- Redundant indexes on `namespace_embedding_state(namespace_id)` and
+  `consolidation_runs(namespace_id, embedding_space_id)` are no longer created;
+  the primary key and unique constraint already index those columns.
+
 ## [3.2.0] - 2026-08-21
 
 ### Changed

@@ -767,7 +767,7 @@ fn embedding_space_descriptor(
         query_prefix: String::new(),
         document_prefix: String::new(),
         truncation: 512,
-        runtime: "fastembed-6.0.1/onnxruntime".to_owned(),
+        runtime: FASTEMBED_RUNTIME.to_owned(),
     }
 }
 
@@ -865,6 +865,11 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Runtime component of every fastembed-backed embedding-space identity. A
+/// unit test pins it to the version resolved in `Cargo.lock`, so a dependency
+/// bump cannot leave vectors stamped with a stale runtime.
+const FASTEMBED_RUNTIME: &str = "fastembed-6.0.1/onnxruntime";
 
 #[cfg(test)]
 #[allow(
@@ -1221,6 +1226,25 @@ mod tests {
             "Similar sentences should have higher similarity: sim_ab={:.4}, sim_ac={:.4}",
             sim_ab,
             sim_ac
+        );
+    }
+
+    #[test]
+    fn runtime_descriptor_tracks_the_resolved_fastembed_version() {
+        let lock = include_str!("../../Cargo.lock");
+        let version = lock
+            .split("[[package]]")
+            .find(|package| package.contains("name = \"fastembed\""))
+            .and_then(|package| {
+                package
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix("version = \""))
+            })
+            .map(|rest| rest.trim_end_matches('"'))
+            .expect("fastembed is resolved in Cargo.lock");
+        assert_eq!(
+            FASTEMBED_RUNTIME,
+            format!("fastembed-{version}/onnxruntime")
         );
     }
 }

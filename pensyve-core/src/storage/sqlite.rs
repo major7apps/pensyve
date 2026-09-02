@@ -91,6 +91,11 @@ enum WorkspaceRacePoint {
     Decay,
 }
 
+/// Highest version in the registered `SQLite` migration registry. Every fresh
+/// open lands `1..=LATEST_SCHEMA_VERSION` in one pass; migration tests compare
+/// against this instead of a hand-maintained count.
+pub const LATEST_SCHEMA_VERSION: i64 = 7;
+
 impl SqliteBackend {
     /// Open (or create) the `SQLite` database at `dir/memories.db`.
     /// Creates the directory if it does not exist.
@@ -610,9 +615,6 @@ impl SqliteBackend {
                     barrier_sequence INTEGER NOT NULL,
                     updated_at TEXT NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS idx_namespace_embedding_state_namespace
-                    ON namespace_embedding_state(namespace_id);
-
                 CREATE TABLE IF NOT EXISTS embedding_backfill_queue (
                     namespace_id TEXT NOT NULL REFERENCES namespaces(id),
                     memory_type TEXT NOT NULL CHECK (memory_type IN ('episodic', 'semantic', 'procedural', 'observation')),
@@ -652,9 +654,6 @@ impl SqliteBackend {
                     updated_at TEXT NOT NULL,
                     UNIQUE(namespace_id, embedding_space_id)
                 );
-                CREATE INDEX IF NOT EXISTS idx_consolidation_runs_namespace
-                    ON consolidation_runs(namespace_id, embedding_space_id);
-
                 CREATE TABLE IF NOT EXISTS consolidation_sources (
                     run_id TEXT NOT NULL REFERENCES consolidation_runs(run_id) ON DELETE CASCADE,
                     namespace_id TEXT NOT NULL REFERENCES namespaces(id),
@@ -1581,7 +1580,7 @@ fn capture_and_delete_entity_page_in_conn(
            ORDER BY type_order, id
            LIMIT ?3",
     )?;
-    let refs = stmt
+    let mut refs = stmt
         .query_map(
             params![
                 namespace_id.to_string(),
@@ -1602,7 +1601,11 @@ fn capture_and_delete_entity_page_in_conn(
         .collect::<StorageResult<Vec<_>>>()?;
     drop(stmt);
 
+    // Close the page before the byte ceiling instead of rejecting it: the
+    // caller loops until an empty page, so the rows left behind are simply the
+    // next page. A single frame is bounded separately and always fits alone.
     let mut page_bytes = 0_usize;
+    let mut fitted = 0_usize;
     for memory_ref in &refs {
         let source_bytes = capture_payload_bytes_in_conn(conn, namespace_id, *memory_ref)?;
         if source_bytes > SNAPSHOT_MAX_FRAME_BYTES {
@@ -1611,15 +1614,16 @@ fn capture_and_delete_entity_page_in_conn(
                 memory_ref.memory_type, memory_ref.id
             )));
         }
-        page_bytes = page_bytes.checked_add(source_bytes).ok_or_else(|| {
+        let next_bytes = page_bytes.checked_add(source_bytes).ok_or_else(|| {
             StorageError::BudgetExceeded("snapshot page byte count overflow".into())
         })?;
-        if page_bytes > SNAPSHOT_MAX_PAGE_BYTES {
-            return Err(StorageError::BudgetExceeded(format!(
-                "snapshot page contains {page_bytes} payload bytes; maximum is {SNAPSHOT_MAX_PAGE_BYTES}"
-            )));
+        if fitted > 0 && next_bytes > SNAPSHOT_MAX_PAGE_BYTES {
+            break;
         }
+        page_bytes = next_bytes;
+        fitted += 1;
     }
+    refs.truncate(fitted);
 
     let mut captured = Vec::with_capacity(refs.len());
     for memory_ref in refs {
@@ -6814,6 +6818,16 @@ impl ConsolidationWorkspace for SqliteBackend {
         } else {
             PromotionCommit::NotAdmitted
         })
+    }
+
+    fn cursor(&self, run: RunId) -> StorageResult<WorkspaceCursor> {
+        let conn = lock_conn!(self);
+        let source_ordinal = conn.query_row(
+            "SELECT cursor_ordinal FROM consolidation_runs WHERE run_id = ?1",
+            params![run.id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(WorkspaceCursor { source_ordinal })
     }
 
     fn checkpoint(&self, run: RunId, cursor: WorkspaceCursor) -> StorageResult<()> {

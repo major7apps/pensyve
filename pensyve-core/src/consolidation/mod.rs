@@ -727,7 +727,10 @@ impl ConsolidationEngine {
             .consolidation_workspace()
             .ok_or_else(|| StorageError::Unsupported("durable consolidation workspace".into()))?;
         let run = workspace.begin_or_resume(namespace_id, &active_space)?;
-        let mut cursor = WorkspaceCursor::default();
+        // Resume from the persisted cursor so an early checkpoint (cancellation
+        // or duration budget before the first page) never rewinds a
+        // previously scanned run to the origin.
+        let mut cursor = workspace.cursor(run)?;
 
         if cancel.is_cancelled() {
             workspace.checkpoint(run, cursor)?;
@@ -840,7 +843,7 @@ impl ConsolidationEngine {
             let source_page_rows = page.records.len();
             let source_page_bytes = page.application_bytes();
             stats.metrics.max_source_page_request =
-                stats.metrics.max_source_page_request.max(source_page_rows);
+                stats.metrics.max_source_page_request.max(MEMORY_PAGE_SIZE);
             stats.metrics.max_source_page_rows =
                 stats.metrics.max_source_page_rows.max(source_page_rows);
             stats.metrics.max_source_page_bytes =
@@ -919,7 +922,7 @@ impl ConsolidationEngine {
                     stats.metrics.max_candidate_page_request = stats
                         .metrics
                         .max_candidate_page_request
-                        .max(candidate_page_rows);
+                        .max(CONSOLIDATION_COMPARISON_PAGE_SIZE);
                     stats.metrics.max_candidate_page_rows = stats
                         .metrics
                         .max_candidate_page_rows
@@ -1207,16 +1210,10 @@ impl ConsolidationEngine {
                         page_decayed += 1;
                     }
 
-                    DecayRecord::Semantic {
-                        valid_at,
-                        stability,
-                    } => {
-                        let elapsed = decay::elapsed_days(valid_at, now);
-                        let retrievability = decay::retrievability(stability, elapsed);
-
-                        if retrievability < threshold {
-                            page_archived += 1;
-                        }
+                    DecayRecord::Semantic { .. } => {
+                        // Semantic memories are never archived by decay and
+                        // carry no persisted update, so they count as decayed
+                        // only; `archived` reports persisted changes alone.
                         page_decayed += 1;
                     }
 

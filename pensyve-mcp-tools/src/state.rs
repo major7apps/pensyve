@@ -39,12 +39,17 @@ impl RecallAdmission {
 
     /// Fairly wait for a concurrency permit, then reserve the requested bytes.
     pub async fn acquire(&self, bytes: usize) -> Result<RecallReservation, RecallOverloaded> {
-        self.validate_bytes(bytes)?;
-        let permit = Arc::clone(&self.permits)
-            .acquire_owned()
-            .await
-            .map_err(|_| RecallOverloaded)?;
-        self.reserve_bytes(bytes, permit)
+        let result = match self.validate_bytes(bytes) {
+            Ok(()) => match Arc::clone(&self.permits).acquire_owned().await {
+                Ok(permit) => self.reserve_bytes(bytes, permit),
+                Err(_) => Err(RecallOverloaded),
+            },
+            Err(overloaded) => Err(overloaded),
+        };
+        if result.is_err() {
+            self.record_overload();
+        }
+        result
     }
 
     /// Admit immediately or return a retryable overload without doing work.
@@ -56,10 +61,16 @@ impl RecallAdmission {
             self.reserve_bytes(bytes, permit)
         });
         if result.is_err() {
-            self.overloads.fetch_add(1, Ordering::Relaxed);
-            RECALL_OVERLOAD_TOTAL.fetch_add(1, Ordering::Relaxed);
+            self.record_overload();
         }
         result
+    }
+
+    /// Every rejection, awaiting or immediate, lands in the same counters that
+    /// back `pensyve_recall_overload_total`.
+    fn record_overload(&self) {
+        self.overloads.fetch_add(1, Ordering::Relaxed);
+        RECALL_OVERLOAD_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
 
     #[must_use]

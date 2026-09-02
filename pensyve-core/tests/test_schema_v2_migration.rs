@@ -33,7 +33,7 @@ use rusqlite::{Connection, params};
 use tempfile::TempDir;
 use uuid::Uuid;
 
-use pensyve_core::storage::sqlite::SqliteBackend;
+use pensyve_core::storage::sqlite::{LATEST_SCHEMA_VERSION, SqliteBackend};
 
 /// Six new NULLABLE columns added by the v=2 migration.
 const V2_NEW_COLUMNS: &[&str] = &[
@@ -109,14 +109,12 @@ fn fresh_store_lands_v2_migration() {
     let versions = schema_version_rows(&conn);
     assert_eq!(
         versions.len(),
-        5,
-        "expected v=1 through v=5 migration rows, got {versions:?}"
+        usize::try_from(LATEST_SCHEMA_VERSION).unwrap(),
+        "expected v=1 through v={LATEST_SCHEMA_VERSION} migration rows, got {versions:?}"
     );
-    assert_eq!(versions[0].0, 1);
-    assert_eq!(versions[1].0, 2);
-    assert_eq!(versions[2].0, 3);
-    assert_eq!(versions[3].0, 4);
-    assert_eq!(versions[4].0, 5);
+    for (index, version) in versions.iter().enumerate() {
+        assert_eq!(version.0, i64::try_from(index + 1).unwrap());
+    }
 
     // observation_memories has the new columns.
     assert_v2_columns_present(&conn);
@@ -177,8 +175,8 @@ fn v2_migration_idempotent_on_third_open() {
     let versions = schema_version_rows(&conn);
     assert_eq!(
         versions.len(),
-        5,
-        "exactly 5 schema_versions rows after 3 opens (v=1 through v=5); got {versions:?}"
+        usize::try_from(LATEST_SCHEMA_VERSION).unwrap(),
+        "exactly {LATEST_SCHEMA_VERSION} schema_versions rows after 3 opens; got {versions:?}"
     );
     assert_v2_columns_present(&conn);
 }
@@ -377,12 +375,12 @@ fn v1_only_fixture_upgrades_to_v2() {
     // v=2 columns now present.
     assert_v2_columns_present(&conn);
 
-    // schema_versions has v=1 through v=5 again.
+    // schema_versions has every registered version again.
     let versions = schema_version_rows(&conn);
     assert_eq!(
         versions.len(),
-        5,
-        "expected v=1 through v=5 after upgrade; got {versions:?}"
+        usize::try_from(LATEST_SCHEMA_VERSION).unwrap(),
+        "expected v=1 through v={LATEST_SCHEMA_VERSION} after upgrade; got {versions:?}"
     );
 
     // The legacy row survived with NULL across all new columns.

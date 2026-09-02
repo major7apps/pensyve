@@ -385,9 +385,6 @@ CREATE TABLE IF NOT EXISTS namespace_embedding_state (
     updated_at            TIMESTAMPTZ NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_namespace_embedding_state_namespace
-    ON namespace_embedding_state(namespace_id);
-
 CREATE TABLE IF NOT EXISTS embedding_backfill_queue (
     namespace_id  UUID NOT NULL REFERENCES namespaces(id),
     memory_type   TEXT NOT NULL CHECK (memory_type IN ('episodic', 'semantic', 'procedural', 'observation')),
@@ -412,8 +409,6 @@ CREATE TABLE IF NOT EXISTS consolidation_runs (
     updated_at          TIMESTAMPTZ NOT NULL,
     UNIQUE(namespace_id, embedding_space_id)
 );
-CREATE INDEX IF NOT EXISTS idx_consolidation_runs_namespace
-    ON consolidation_runs(namespace_id, embedding_space_id);
 
 CREATE TABLE IF NOT EXISTS consolidation_sources (
     run_id              UUID NOT NULL REFERENCES consolidation_runs(run_id) ON DELETE CASCADE,

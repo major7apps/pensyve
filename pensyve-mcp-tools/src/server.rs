@@ -915,14 +915,7 @@ impl PensyveMcpServer {
                 Some("semantic") => Some(MemoryType::Semantic),
                 Some("procedural") => Some(MemoryType::Procedural),
                 Some("observation") => Some(MemoryType::Observation),
-                Some(_) => {
-                    return serde_json::to_string(&serde_json::json!({
-                        "entity": "",
-                        "memory_count": 0,
-                        "memories": [],
-                    }))
-                    .map_err(|e| format!("Serialization error: {e}"));
-                }
+                Some(other) => return Err(format!("unknown memory type '{other}'")),
             };
             let request = MemoryPageRequest::new(
                 SearchScope::namespace(state.namespace.id),
@@ -1142,6 +1135,9 @@ impl PensyveMcpServer {
     }
 }
 
+// `tool_handler` expands `call_tool`/`list_tools` as `async fn` bodies with no
+// `.await`; Rust 1.98 clippy flags that, and the trait signature is fixed by rmcp.
+#[allow(clippy::unused_async_trait_impl)]
 #[tool_handler]
 impl ServerHandler for PensyveMcpServer {
     fn get_info(&self) -> ServerInfo {

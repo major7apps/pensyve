@@ -14,15 +14,14 @@ use std::path::PathBuf;
 
 use pensyve_core::embedding_space::EmbeddingSpaceId;
 use pensyve_core::snapshot;
-use pensyve_core::storage::StorageTrait;
-use pensyve_core::storage::bounded::{EmbeddingRecord, MemoryRef, embedding_source_text};
+use pensyve_core::storage::bounded::{EmbeddingRecord, MemoryRef};
 use pensyve_core::storage::sqlite::SqliteBackend;
+use pensyve_core::storage::{StorageTrait, canonical_embedding_source_sha256};
 use pensyve_core::types::{
     Entity, EntityKind, Episode, EpisodicMemory, Memory, Namespace, Outcome, ProceduralMemory,
     SemanticMemory,
 };
 use rusqlite::{Connection, params};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// Everything the fixture seeds, tagged so failures name the missing shape
@@ -447,7 +446,7 @@ fn snapshot_round_trips_versioned_embedding_generations() {
     }
     drop(connection);
 
-    let source_sha256 = hex::encode(Sha256::digest(embedding_source_text(&memory).as_bytes()));
+    let source_sha256 = canonical_embedding_source_sha256(&memory);
     let records = vec![
         EmbeddingRecord {
             namespace_id: fixture.namespace.id,
@@ -501,10 +500,11 @@ fn snapshot_round_trips_versioned_embedding_generations() {
             )
             .unwrap();
         assert_eq!(restored.0, record.source_sha256);
-        let restored_vector: Vec<f32> = restored
-            .1
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        let (chunks, remainder) = restored.1.as_chunks::<4>();
+        assert!(remainder.is_empty());
+        let restored_vector: Vec<f32> = chunks
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect();
         assert_eq!(restored_vector, record.embedding);
     }

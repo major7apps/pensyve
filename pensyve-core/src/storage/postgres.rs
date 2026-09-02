@@ -5023,7 +5023,7 @@ impl StorageTrait for PostgresBackend {
                 if refs.is_empty() {
                     break;
                 }
-                let refs = refs
+                let mut refs = refs
                     .into_iter()
                     .map(|(memory_type, id)| {
                         Ok((
@@ -5035,7 +5035,12 @@ impl StorageTrait for PostgresBackend {
                         ))
                     })
                     .collect::<StorageResult<Vec<_>>>()?;
+                // Close the page before the byte ceiling instead of rejecting
+                // it: the caller loops until an empty page, so rows left behind
+                // form the next page. Locks taken on rows past the cut simply
+                // release with the transaction.
                 let mut page_bytes = 0_usize;
+                let mut fitted = 0_usize;
                 for (_, memory_ref) in &refs {
                     if !lock_typed_source_for_capture(&mut tx, namespace_id, *memory_ref).await? {
                         return Err(StorageError::Context(format!(
@@ -5051,15 +5056,16 @@ impl StorageTrait for PostgresBackend {
                             memory_ref.memory_type, memory_ref.id
                         )));
                     }
-                    page_bytes = page_bytes.checked_add(source_bytes).ok_or_else(|| {
+                    let next_bytes = page_bytes.checked_add(source_bytes).ok_or_else(|| {
                         StorageError::BudgetExceeded("snapshot page byte count overflow".into())
                     })?;
-                    if page_bytes > SNAPSHOT_MAX_PAGE_BYTES {
-                        return Err(StorageError::BudgetExceeded(format!(
-                            "snapshot page contains {page_bytes} payload bytes; maximum is {SNAPSHOT_MAX_PAGE_BYTES}"
-                        )));
+                    if fitted > 0 && next_bytes > SNAPSHOT_MAX_PAGE_BYTES {
+                        break;
                     }
+                    page_bytes = next_bytes;
+                    fitted += 1;
                 }
+                refs.truncate(fitted);
                 let mut page = Vec::with_capacity(refs.len());
                 for (memory_type, memory_ref) in refs {
                     let id = memory_ref.id;
@@ -6874,6 +6880,22 @@ impl ConsolidationWorkspace for PostgresBackend {
         })
     }
 
+    fn cursor(&self, run: RunId) -> StorageResult<WorkspaceCursor> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            let (source_ordinal,): (i64,) = query_as::<Postgres, _>(
+                "SELECT cursor_ordinal FROM consolidation_runs
+                 WHERE run_id = $1 AND namespace_id = $2",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(WorkspaceCursor { source_ordinal })
+        })
+    }
+
     fn checkpoint(&self, run: RunId, cursor: WorkspaceCursor) -> StorageResult<()> {
         self.block_on(async {
             let mut conn = self.scoped_conn(run.namespace_id).await?;
@@ -8038,6 +8060,15 @@ mod tests {
                 required: &[
                     "run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
                     "execute(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "read resume cursor",
+                binds: 2,
+                required: &[
+                    "SELECT cursor_ordinal FROM consolidation_runs",
+                    "run_id = $1 AND namespace_id = $2",
+                    "fetch_one(&mut *conn)",
                 ],
             },
             Contract {

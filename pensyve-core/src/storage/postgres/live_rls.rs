@@ -101,7 +101,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use sha2::{Digest, Sha256};
 use sqlx_core::acquire::Acquire;
 use sqlx_core::query::query;
@@ -543,6 +543,77 @@ fn register_embedding_space(fixture: &Fixture, id: &str, class: &str, dimension:
         .await
         .expect("register embedding space");
     });
+}
+
+/// Marks `space` as the namespace's active read space, mirroring what the first
+/// embedded API save does for an empty namespace. Fixtures that seed rows with
+/// raw SQL never pass through that path, so they activate here.
+fn activate_namespace_space(fixture: &Fixture, namespace_id: Uuid, space: &str) {
+    fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace_id).await.unwrap();
+        query::<Postgres>(
+            "INSERT INTO namespace_embedding_state
+             (namespace_id, active_read_space_id, target_space_id, state,
+              barrier_sequence, updated_at)
+             VALUES ($1, $2, NULL, 'active', 0, NOW())",
+        )
+        .bind(namespace_id)
+        .bind(space)
+        .execute(&mut *conn)
+        .await
+        .expect("activate namespace embedding space");
+    });
+}
+
+/// Moves one memory's only embedding to `space` behind the API on both
+/// backends. An active namespace refuses to write a memory whose sole vector
+/// belongs to another generation, so the "other generation" fixture row is
+/// produced by relocating a valid active-space embedding after the fact.
+fn move_embedding_to_space(
+    fixture: &Fixture,
+    sqlite_path: &std::path::Path,
+    memory: &Memory,
+    space: &str,
+) {
+    let memory_ref = MemoryRef::from_memory(memory);
+    let memory_type = match memory_ref.memory_type {
+        MemoryType::Episodic => "episodic",
+        MemoryType::Semantic => "semantic",
+        MemoryType::Procedural => "procedural",
+        MemoryType::Observation => "observation",
+    };
+    fixture.rt.block_on(async {
+        let namespace_id = match memory {
+            Memory::Episodic(memory) => memory.namespace_id,
+            Memory::Semantic(memory) => memory.namespace_id,
+            Memory::Procedural(memory) => memory.namespace_id,
+            Memory::Observation(memory) => memory.namespace_id,
+        };
+        let mut conn = fixture.backend.scoped_conn(namespace_id).await.unwrap();
+        let moved = query::<Postgres>(
+            "UPDATE memory_embeddings SET embedding_space_id = $1
+             WHERE namespace_id = $2 AND memory_type = $3 AND memory_id = $4",
+        )
+        .bind(space)
+        .bind(namespace_id)
+        .bind(memory_type)
+        .bind(memory_ref.id)
+        .execute(&mut *conn)
+        .await
+        .expect("move Postgres embedding to another space")
+        .rows_affected();
+        assert_eq!(moved, 1);
+    });
+    let connection = rusqlite::Connection::open(sqlite_path.join("memories.db"))
+        .expect("open sqlite generation fixture");
+    let moved = connection
+        .execute(
+            "UPDATE memory_embeddings SET embedding_space_id = ?1
+             WHERE memory_type = ?2 AND memory_id = ?3",
+            rusqlite::params![space, memory_type, memory_ref.id.to_string()],
+        )
+        .expect("move sqlite embedding to another space");
+    assert_eq!(moved, 1);
 }
 
 #[test]
@@ -1230,13 +1301,15 @@ fn compact_decay_timestamp_preflight_and_fetch_share_one_postgres_snapshot() {
     let writer = fixture.backend_as(&admin_opts, &fixture.role);
     let namespace = Namespace::new("compact-decay-timestamp-race");
     fixture.backend.save_namespace(&namespace).unwrap();
-    let memory = EpisodicMemory::new(
+    let mut memory = EpisodicMemory::new(
         namespace.id,
         Uuid::new_v4(),
         Uuid::new_v4(),
         Uuid::new_v4(),
         "stable compact timestamp",
     );
+    // `timestamptz` is microsecond-precise; the round trip must compare like with like.
+    memory.timestamp = memory.timestamp.trunc_subsecs(6);
     let expected_reference_time = memory.timestamp;
     let memory_id = memory.id;
     fixture.backend.save_episodic(&memory).unwrap();
@@ -1348,6 +1421,7 @@ fn consolidation_finalization_excludes_a_late_postgres_assignment() {
     let namespace = Namespace::new("workspace-late-assignment-race");
     fixture.backend.save_namespace(&namespace).unwrap();
     register_embedding_space(&fixture, "workspace-late-assignment-space", "mock", 2);
+    activate_namespace_space(&fixture, namespace.id, "workspace-late-assignment-space");
     let space = EmbeddingSpaceId("workspace-late-assignment-space".to_string());
     let about = Uuid::new_v4();
     fixture.rt.block_on(async {
@@ -1551,6 +1625,7 @@ fn consolidation_workspace_rejects_a_4097_member_promotion() {
     let namespace = Namespace::new("workspace-boundary");
     fixture.backend.save_namespace(&namespace).unwrap();
     register_embedding_space(&fixture, "workspace-boundary-space", "mock", 2);
+    activate_namespace_space(&fixture, namespace.id, "workspace-boundary-space");
     fixture.rt.block_on(async {
         let mut conn = fixture.backend.scoped_conn(namespace.id).await.unwrap();
         let mut tx = (&mut *conn).begin().await.unwrap();
@@ -5936,12 +6011,19 @@ fn exact_pgvector_matches_sqlite_oracle_with_scope_ties_and_cross_type_ids() {
     );
     let mut other_generation = lower.clone();
     other_generation.id = Uuid::from_u128(7_007);
+    let other_generation = Memory::Episodic(other_generation);
     save_exact_vector(
         postgres,
         &sqlite,
-        &Memory::Episodic(other_generation),
-        "other-space",
+        &other_generation,
+        "exact-space",
         vec![1.0, 0.0],
+    );
+    move_embedding_to_space(
+        &fixture,
+        sqlite_dir.path(),
+        &other_generation,
+        "other-space",
     );
     let mut foreign_memory = lower;
     foreign_memory.id = Uuid::from_u128(7_008);
@@ -6103,9 +6185,17 @@ fn exact_pgvector_validates_query_space_deadline_and_stored_zero_norm() {
         Instant::now() + Duration::from_secs(5),
     )
     .unwrap();
+    // The namespace became active in "validation-space" on its first embedded
+    // save, so an unknown space is a runtime mismatch rather than a missing
+    // lifecycle; SQLite is the oracle for that ordering.
+    let postgres_missing = backend.search_vector(&missing_request).unwrap();
     assert_eq!(
-        backend.search_vector(&missing_request).unwrap(),
-        VectorSearchOutcome::Unavailable(SearchUnavailable::NoActiveEmbeddingSpace)
+        postgres_missing,
+        sqlite.search_vector(&missing_request).unwrap()
+    );
+    assert_eq!(
+        postgres_missing,
+        VectorSearchOutcome::Unavailable(SearchUnavailable::RuntimeSpaceMismatch)
     );
 
     let wrong_dimension = [1.0];
@@ -6185,22 +6275,19 @@ fn exact_pgvector_forced_rls_blocks_foreign_row_after_test_removes_namespace_pre
         3
     );
     assert!(!sql_without_explicit_namespace.contains("embeddings.namespace_id = $2"));
-    let rows: Vec<(i16, Uuid, Option<f64>, bool)> = fixture.rt.block_on(async {
+    let rows: Vec<super::PgVectorSearchRow> = fixture.rt.block_on(async {
         let mut conn = backend.scoped_conn(own.id).await.unwrap();
-        query_as::<Postgres, _>(AssertSqlSafe(sql_without_explicit_namespace))
-            .bind("[1,0]")
-            .bind(own.id)
-            .bind("rls-space")
-            .bind(None::<Uuid>)
-            .bind(None::<Uuid>)
-            .bind(None::<Uuid>)
-            .bind(100_i64)
-            .fetch_all(&mut *conn)
-            .await
-            .unwrap()
+        bind_exact_search_params(
+            query_as::<Postgres, _>(AssertSqlSafe(sql_without_explicit_namespace)),
+            own.id,
+            "rls-space",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap()
     });
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].1, Uuid::from_u128(7_101));
+    assert_eq!(rows[0].1, Some(Uuid::from_u128(7_101)));
 }
 
 fn sum_plan_metric(value: &serde_json::Value, key: &str) -> u64 {
@@ -6476,6 +6563,32 @@ fn seed_representative_exact_plan(fixture: &Fixture, namespace_id: Uuid, embeddi
     });
 }
 
+/// Binds the production `POSTGRES_VECTOR_SEARCH_SQL` contract for a `[1,0]`
+/// query: unscoped identity, any entity, top-100, every first-stage type,
+/// no confidence floor. Keep in step with `PostgresBackend::search_vector`.
+fn bind_exact_search_params<'q, O>(
+    query: sqlx_core::query_as::QueryAs<'q, Postgres, O, sqlx_postgres::PgArguments>,
+    namespace_id: Uuid,
+    embedding_space_id: &'q str,
+) -> sqlx_core::query_as::QueryAs<'q, Postgres, O, sqlx_postgres::PgArguments> {
+    query
+        .bind("[1,0]")
+        .bind(namespace_id)
+        .bind(embedding_space_id)
+        .bind(0_i16)
+        .bind(None::<Uuid>)
+        .bind(None::<Uuid>)
+        .bind(0_i16)
+        .bind(None::<Uuid>)
+        .bind(100_i64)
+        .bind(100_i64)
+        .bind(100_i64)
+        .bind(true)
+        .bind(true)
+        .bind(true)
+        .bind(None::<f32>)
+}
+
 fn explain_representative_exact_plan(
     fixture: &Fixture,
     admin_opts: &PgConnectOptions,
@@ -6499,18 +6612,15 @@ fn explain_representative_exact_plan(
                 "representative EXPLAIN role {role:?} is neither superuser nor BYPASSRLS; \
                  its plan cannot distinguish explicit namespace predicates from policy injection"
             );
-            let plan = query_as::<Postgres, (serde_json::Value,)>(AssertSqlSafe(explain_sql))
-                .bind("[1,0]")
-                .bind(namespace_id)
-                .bind(embedding_space_id)
-                .bind(None::<Uuid>)
-                .bind(None::<Uuid>)
-                .bind(None::<Uuid>)
-                .bind(100_i64)
-                .fetch_one(pool)
-                .await
-                .unwrap()
-                .0;
+            let plan = bind_exact_search_params(
+                query_as::<Postgres, (serde_json::Value,)>(AssertSqlSafe(explain_sql)),
+                namespace_id,
+                embedding_space_id,
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            .0;
             (plan, role, rls_bypassed)
         })
     })
@@ -6528,6 +6638,7 @@ fn exact_pgvector_explain_is_bounded_scoped_and_does_not_spill() {
     let namespace = Namespace::new(format!("exact-plan-{}", Uuid::new_v4().simple()));
     backend.save_namespace(&namespace).unwrap();
     register_embedding_space(&fixture, "plan-space", "real", 2);
+    activate_namespace_space(&fixture, namespace.id, "plan-space");
     seed_representative_exact_plan(&fixture, namespace.id, "plan-space");
     let candidate_count: i64 = fixture.rt.block_on(async {
         let mut conn = backend.scoped_conn(namespace.id).await.unwrap();

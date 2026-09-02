@@ -211,6 +211,10 @@ pub trait ConsolidationWorkspace: Send + Sync {
 
     fn checkpoint(&self, run: RunId, cursor: WorkspaceCursor) -> StorageResult<()>;
 
+    /// The persisted resume point for `run`: the last checkpointed cursor, or
+    /// the origin for a run that has never checkpointed.
+    fn cursor(&self, run: RunId) -> StorageResult<WorkspaceCursor>;
+
     fn complete(&self, run: RunId) -> StorageResult<()>;
 
     /// Page only the fixed-size fields consumed by decay. The cursor traverses
