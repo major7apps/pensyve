@@ -34,7 +34,9 @@ it as `Dockerfile` at the repository root:
 FROM rust:1.97-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p pensyve-mcp-gateway
+# The CLI comes along so the verification and migration commands in this guide
+# actually exist inside the container.
+RUN cargo build --release -p pensyve-mcp-gateway -p pensyve-cli
 
 # ---- models ----
 # Baked in at build time so the container never reaches the network to embed.
@@ -49,10 +51,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
 # ---- runtime ----
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libssl3 ca-certificates libstdc++6 curl \
+      libssl3 ca-certificates libstdc++6 curl sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build  /src/target/release/pensyve-mcp-gateway /usr/local/bin/
+COPY --from=build  /src/target/release/pensyve             /usr/local/bin/
 COPY --from=models /opt/pensyve/models /opt/pensyve/models
 
 ENV PENSYVE_PATH=/data
@@ -162,7 +165,11 @@ to end up staring at an empty instance.
 **1. Put the file on the volume as `memories.db`.**
 
 ```bash
-# With the service stopped, from a Railway shell on the volume:
+# With the service stopped, from a Railway shell on the volume.
+# Refuse to clobber a store that is already there: if the gateway booted once
+# before you installed the export, it created an empty memories.db, and if it
+# booted and ran, that file is real data.
+[ -e /data/memories.db ] && { echo "already present - move it aside first"; exit 1; }
 mv /data/579fbd27-....db /data/memories.db
 ```
 
@@ -181,7 +188,7 @@ in the same file, untouched and unreachable.
 whose namespace you want served, as `key:user-id`, comma-separated for more than
 one:
 
-```
+```dotenv
 PENSYVE_API_KEYS=psy_your_key
 PENSYVE_KEY_USER_MAP=psy_your_key:4173c1db-6da1-4505-a7a9-0b0e437e94ee
 ```
@@ -266,8 +273,10 @@ the new generation. Lexical recall keeps working throughout.
 ## Operating it
 
 **Back up the volume.** One SQLite file is easy to copy and easy to lose. Snapshot
-`/data` on a schedule; `sqlite3 /data/memories.db ".backup /tmp/backup.db"` is
-safe against a running gateway.
+`/data` on a schedule. `sqlite3 /data/memories.db ".backup /data/backup.db"` is
+safe to run against a live gateway — write it inside the volume, not to `/tmp`,
+which does not survive a restart — then copy it off the volume to wherever you
+actually keep backups.
 
 **Watch disk.** The gateway writes WAL alongside the store. Leave headroom.
 

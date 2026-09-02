@@ -45,11 +45,29 @@
 //! row-level security, so RLS must not be treated as the boundary here: the
 //! predicate on each call is what keeps one tenant's export free of another
 //! tenant's rows.
+//!
+//! # Consistency
+//!
+//! **This is not a point-in-time snapshot.** Each entity list, episode page,
+//! memory page and embedding batch is its own read, so a namespace still taking
+//! writes can be copied mid-flight. Because memory paging orders by random
+//! UUID, a row inserted below the cursor is missed rather than merely late, and
+//! a supersession that lands between two pages can leave the copy with both
+//! rows live or with a `superseded_by` pointing at a row that never crossed.
+//! The per-page destination writes are atomic individually; the export as a
+//! whole is not.
+//!
+//! Nothing here can fix that on its own — it needs the source to hold one
+//! repeatable-read snapshot across every read, or the namespace to be quiesced.
+//! Until then, export a namespace while its writers are idle when the artifact
+//! has to be exact, and re-compare counts against the source afterwards to see
+//! what moved underneath.
 
 use uuid::Uuid;
 
 use crate::storage::bounded::{
-    EpisodePageCursor, MAX_FUSED_HITS, MEMORY_PAGE_SIZE, MemoryPageRequest, MemoryRef, SearchScope,
+    EpisodePageCursor, MAX_FUSED_HITS, MEMORY_PAGE_SIZE, MemoryPageRequest, MemoryRef,
+    NamespaceEmbeddingPhase, SearchScope,
 };
 use crate::storage::{CapturedMemory, StorageError, StorageResult, StorageTrait};
 use crate::types::Memory;
@@ -109,23 +127,39 @@ pub fn export_namespace(
     // 2. Embedding lifecycle. Registering the source's *active read* space (not
     //    whatever the local runtime would produce) is what makes the copied
     //    vectors usable as-is: they were produced by that transformation, and
-    //    the destination must agree about which one it was. A namespace still
-    //    mid-migration has no settled generation to copy under, so it is
-    //    refused rather than exported into an ambiguous state.
+    //    the destination must agree about which one it was.
+    //
+    //    Each phase is answered on its own rather than inferred from whether a
+    //    space happens to be joined. Reading "has an active space" as "is
+    //    exportable" gets both edges wrong: a legitimately lexical-only
+    //    namespace has none and would be refused despite having nothing to
+    //    carry, and a namespace mid-migration still has its *old* active space,
+    //    so it would export as though settled while silently dropping the
+    //    generation being built.
     let embedding_space = match source.get_namespace_embedding_state(namespace_id)? {
-        Some(state) => {
+        // No lifecycle row and an explicitly lexical-only namespace are the
+        // same thing to an export: memories, no vectors.
+        None => None,
+        Some(state) if state.phase == NamespaceEmbeddingPhase::LexicalOnly => None,
+        Some(state) if state.phase == NamespaceEmbeddingPhase::Active => {
+            // `Active` without a joined space would mean the lifecycle row and
+            // the spaces table disagree, which is corruption rather than a
+            // state to export around.
             let space = state.active_read_space.clone().ok_or_else(|| {
                 StorageError::Context(format!(
-                    "namespace {namespace_id} is in phase {:?} with no active read space; \
-                     finish or roll back the embedding migration before exporting",
-                    state.phase
+                    "namespace {namespace_id} is active but has no joined active read space"
                 ))
             })?;
             destination.initialize_local_runtime_space(namespace_id, &space)?;
             Some(space)
         }
-        // Lexical-only namespace: no generation, so no vectors to carry.
-        None => None,
+        Some(state) => {
+            return Err(StorageError::Context(format!(
+                "namespace {namespace_id} is mid-migration (phase {:?}); finish or roll it \
+                 back before exporting, so the copy carries one settled generation",
+                state.phase
+            )));
+        }
     };
     let space_id = embedding_space
         .as_ref()
@@ -509,6 +543,68 @@ mod tests {
         assert_eq!(
             dest_db.count_memories_by_namespace(namespace.id).unwrap(),
             (total, 0, 0)
+        );
+    }
+
+    /// A namespace that never had an embedding generation still exports.
+    ///
+    /// Its lifecycle row exists and reads `LexicalOnly` with no active space.
+    /// Treating "no active space" as the failure case refused these outright,
+    /// which is wrong: there is nothing to carry, not something missing.
+    #[test]
+    fn a_lexical_only_namespace_exports_its_memories_without_vectors() {
+        let (_source_dir, source_db) = store();
+        let namespace = Namespace::new("tenant:lexical");
+        source_db.save_namespace(&namespace).unwrap();
+
+        let episode = Episode::new(namespace.id, vec![Uuid::new_v4()]);
+        source_db.save_episode(&episode).unwrap();
+        let memory = Memory::Episodic(EpisodicMemory::new(
+            namespace.id,
+            episode.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "no vectors here",
+        ));
+        source_db.save_memory_with_embedding(&memory, None).unwrap();
+
+        let (_dest_dir, dest_db) = store();
+        let counts = export_namespace(&source_db, &dest_db, namespace.id)
+            .expect("a lexical-only namespace is exportable");
+
+        assert_eq!(counts.episodic, 1);
+        assert_eq!(counts.embeddings, 0, "there were no vectors to carry");
+        assert_eq!(
+            dest_db.count_memories_by_namespace(namespace.id).unwrap(),
+            (1, 0, 0)
+        );
+    }
+
+    /// A namespace mid-migration is refused rather than quietly exported.
+    ///
+    /// It still has its *old* active space joined, so a check that only asked
+    /// "is a space present?" would accept it and drop the generation being
+    /// built, producing a copy that looks settled and is not.
+    #[test]
+    fn a_namespace_mid_migration_is_refused() {
+        let embedder = OnnxEmbedder::new_mock(DIMS);
+        let space = embedder.embedding_space().expect("mock space").clone();
+        let (_source_dir, source_db) = store();
+        let (namespace, _) = seed(&source_db, &space, "migrating");
+
+        // Begin a migration onto a second generation and leave it in flight.
+        let target = EmbeddingSpace::mock(DIMS, "v2");
+        source_db
+            .begin_embedding_migration(namespace.id, &target)
+            .expect("begin migration");
+
+        let (_dest_dir, dest_db) = store();
+        let error = export_namespace(&source_db, &dest_db, namespace.id)
+            .expect_err("an in-flight migration must not export");
+        let message = error.to_string();
+        assert!(
+            message.contains("mid-migration"),
+            "error should name the in-flight migration, got: {message}"
         );
     }
 

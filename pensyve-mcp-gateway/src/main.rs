@@ -116,8 +116,24 @@ fn reranker_runtime_metadata(
     }
 }
 
+/// Whether startup may create the serving namespace it was pointed at.
+///
+/// Serving needs the namespace to exist and creates it on first boot. The
+/// read-only operator modes must not: they run against the production store,
+/// and a mistyped or unset `PENSYVE_NAMESPACE` would otherwise have an export
+/// -- a command whose whole contract is that it only reads -- silently insert a
+/// row into the customer database before it ever got to the export.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum NamespacePolicy {
+    CreateIfMissing,
+    ReadOnly,
+}
+
 #[allow(clippy::too_many_lines)]
-fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
+fn init_resources_with(
+    config: &GatewayConfig,
+    namespace_policy: NamespacePolicy,
+) -> Result<InitResources> {
     let strict_local_models = std::env::var("PENSYVE_REQUIRE_LOCAL_MODELS").as_deref() == Ok("1");
     let allow_mock_embedder_value = std::env::var_os("PENSYVE_ALLOW_MOCK_EMBEDDER");
     let allow_mock_embedder = allow_mock_embedder_value
@@ -162,12 +178,15 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
     let namespace_name = &config.namespace;
     let namespace = match storage.get_namespace_by_name(namespace_name) {
         Ok(Some(ns)) => ns,
-        Ok(None) => {
+        Ok(None) if namespace_policy == NamespacePolicy::CreateIfMissing => {
             let ns = Namespace::new(namespace_name);
             storage.save_namespace(&ns)?;
             tracing::info!("Created namespace '{namespace_name}' (id={})", ns.id);
             ns
         }
+        // Never persisted. The operator modes address their own namespace by
+        // id and never read this one; it exists only to satisfy the struct.
+        Ok(None) => Namespace::new(namespace_name),
         Err(e) => return Err(anyhow::anyhow!("Storage error: {e}")),
     };
 
@@ -320,6 +339,52 @@ fn parse_export_args(args: &[String]) -> Result<ExportArgs> {
     })
 }
 
+/// Build both export artifacts inside `staging`, and hand back the tallies.
+///
+/// Split out from the publish step so every failure path has one place to be
+/// cleaned up from, and so the `SQLite` store is closed — checkpointing and
+/// removing its write-ahead log — before anything moves the file. Publishing a
+/// store whose most recent writes still live in a `-wal` beside it would hand
+/// the customer a database missing its last pages.
+fn export_to_staging(
+    storage: &dyn StorageTrait,
+    args: &ExportArgs,
+    staging: &std::path::Path,
+) -> Result<pensyve_core::namespace_export::ExportCounts> {
+    let counts = {
+        let destination = SqliteBackend::open(staging)?;
+        let counts =
+            pensyve_core::namespace_export::export_namespace(storage, &destination, args.namespace)
+                .map_err(|error| anyhow::anyhow!("export namespace: {error}"))?;
+
+        if args.json.is_some() {
+            let mut file = std::fs::File::create(staging.join("sidecar.json"))?;
+            let manifest = pensyve_core::gdpr::export_namespace_data_to_writer(
+                storage,
+                args.namespace,
+                &mut file,
+            )
+            .map_err(|error| anyhow::anyhow!("json sidecar: {error}"))?;
+            tracing::info!(
+                memory_records = manifest.memory_records,
+                total_records = manifest.total_records,
+                stream_sha256 = %manifest.stream_sha256,
+                "json sidecar written"
+            );
+        }
+        counts
+    };
+
+    let wal = staging.join("memories.db-wal");
+    if wal.exists() {
+        anyhow::bail!(
+            "{} still has a write-ahead log after close; refusing to publish a partial store",
+            wal.display()
+        );
+    }
+    Ok(counts)
+}
+
 /// Copy one namespace into a fresh `SQLite` store, plus an optional JSON sidecar.
 ///
 /// The source store is only read. `SqliteBackend::open` takes a *directory* and
@@ -354,45 +419,31 @@ fn export_namespace_command(
     std::fs::create_dir_all(parent)?;
     let staging = parent.join(format!(".pensyve-export-{}", uuid::Uuid::new_v4()));
 
-    let counts = {
-        let destination = SqliteBackend::open(&staging)?;
-        let counts =
-            pensyve_core::namespace_export::export_namespace(storage, &destination, args.namespace)
-                .map_err(|error| anyhow::anyhow!("export namespace: {error}"))?;
-
-        if let Some(json) = &args.json {
-            let mut file = std::fs::File::create(json)?;
-            let manifest = pensyve_core::gdpr::export_namespace_data_to_writer(
-                storage,
-                args.namespace,
-                &mut file,
-            )
-            .map_err(|error| anyhow::anyhow!("json sidecar: {error}"))?;
-            tracing::info!(
-                path = %json.display(),
-                memory_records = manifest.memory_records,
-                total_records = manifest.total_records,
-                stream_sha256 = %manifest.stream_sha256,
-                "json sidecar written"
-            );
+    // Every artifact is built under `staging` and published by rename at the
+    // end, so a failed run leaves nothing behind under a name an operator might
+    // mistake for a finished export — and, just as important, leaves the
+    // requested paths free for the retry. Writing the sidecar straight to its
+    // final path would strand a truncated stream there and then trip the
+    // overwrite guard above on the next attempt.
+    let staged = export_to_staging(storage, args, &staging);
+    let counts = match staged {
+        Ok(counts) => counts,
+        Err(error) => {
+            if let Err(cleanup) = std::fs::remove_dir_all(&staging) {
+                tracing::warn!(
+                    path = %staging.display(),
+                    %cleanup,
+                    "could not remove export staging directory after a failed run"
+                );
+            }
+            return Err(error);
         }
-        counts
-        // `destination` is dropped here, closing the last connection so SQLite
-        // checkpoints and removes the WAL. Moving the file before that would
-        // hand over a database whose most recent writes live in a sidecar file
-        // left behind.
     };
 
-    let staged_db = staging.join("memories.db");
-    let wal = staging.join("memories.db-wal");
-    if wal.exists() {
-        anyhow::bail!(
-            "{} still has a write-ahead log after close; refusing to publish a \
-             partial store",
-            wal.display()
-        );
+    std::fs::rename(staging.join("memories.db"), &args.sqlite)?;
+    if let Some(json) = &args.json {
+        std::fs::rename(staging.join("sidecar.json"), json)?;
     }
-    std::fs::rename(&staged_db, &args.sqlite)?;
     std::fs::remove_dir_all(&staging)?;
 
     // Whether the copied vectors are usable as-is on a self-hosted instance is
@@ -426,7 +477,11 @@ fn export_namespace_command(
         vectors_reusable,
         "namespace export complete"
     );
-    if !vectors_reusable {
+    // Only a namespace that actually has vectors can have unusable ones. A
+    // lexical-only namespace also fails the equality check above, and warning
+    // there would send the recipient off to migrate an embedding generation
+    // that does not exist.
+    if exported_space.is_some() && !vectors_reusable {
         tracing::warn!(
             "this build's embedder does not reproduce the exported embedding space; \
              the recipient must run an embedding migration before semantic recall works"
@@ -585,19 +640,31 @@ fn main() -> Result<()> {
         "pensyve-mcp-gateway starting"
     );
 
+    // The operator mode is decided before anything touches storage. Startup
+    // creates the serving namespace when it is missing, so choosing the policy
+    // after initialization would already have written to the customer database
+    // by the time a read-only export began.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mode = argv.first().map(String::as_str);
+    let namespace_policy = match mode {
+        Some(EXPORT_NAMESPACE_MODE) => NamespacePolicy::ReadOnly,
+        _ => NamespacePolicy::CreateIfMissing,
+    };
+    // Parse before connecting, so a usage error costs nothing and cannot reach
+    // the database at all.
+    let export = match mode {
+        Some(EXPORT_NAMESPACE_MODE) => Some(parse_export_args(&argv[1..])?),
+        _ => None,
+    };
+
     // Init resources BEFORE tokio runtime to avoid nested runtime panic
     // when PostgresBackend creates its own internal runtime.
-    let res = init_resources(&config)?;
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    match argv.first().map(String::as_str) {
-        Some(BACKFILL_EMBEDDINGS_MODE) => {
-            return backfill_embeddings(res.storage.as_ref(), res.embedder.as_ref());
-        }
-        Some(EXPORT_NAMESPACE_MODE) => {
-            let parsed = parse_export_args(&argv[1..])?;
-            return export_namespace_command(res.storage.as_ref(), res.embedder.as_ref(), &parsed);
-        }
-        _ => {}
+    let res = init_resources_with(&config, namespace_policy)?;
+    if let Some(parsed) = export {
+        return export_namespace_command(res.storage.as_ref(), res.embedder.as_ref(), &parsed);
+    }
+    if mode == Some(BACKFILL_EMBEDDINGS_MODE) {
+        return backfill_embeddings(res.storage.as_ref(), res.embedder.as_ref());
     }
 
     tokio::runtime::Builder::new_multi_thread()
