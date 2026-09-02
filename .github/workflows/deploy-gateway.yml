@@ -1,5 +1,16 @@
 name: Build & Deploy Gateway
 
+# Rolls the hosted MCP gateway to the exact commit that triggered the run:
+# build the ARM64 binary and image, push it to ECR under the commit SHA,
+# register a task-definition revision derived from the live service (so the
+# tofu-owned shape, roles, secrets, and environment carry over unchanged),
+# update the one service, and wait for ECS to report it stable. The service's
+# deployment circuit breaker rolls back automatically if the new tasks fail.
+#
+# A build whose schema is newer than the stamped production schema will not
+# start as the serving role; run the owner-connected startup from
+# docs/SECURITY.md first, then re-dispatch.
+
 on:
   workflow_dispatch:
   push:
@@ -10,10 +21,15 @@ on:
       - "pensyve-mcp-gateway/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".github/workflows/deploy-gateway.yml"
 
 permissions:
   id-token: write
   contents: read
+
+concurrency:
+  group: pensyve-production-gateway
+  cancel-in-progress: false
 
 env:
   AWS_REGION: us-east-2
@@ -35,81 +51,83 @@ jobs:
     name: Build & Deploy
     needs: [test]
     runs-on: ubuntu-24.04-arm
+    environment: production
     steps:
       - uses: actions/checkout@v7
-
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-
       - name: Login to ECR
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
-
       - name: Build release binary
         run: cargo build --release -p pensyve-mcp-gateway
-
-      - name: Build and push Docker image
+      - name: Build and push image
+        id: image
         env:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+          set -euo pipefail
+          docker build --build-arg SOURCE_SHA="$IMAGE_TAG" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
             -f pensyve-mcp-gateway/Dockerfile .
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
-            $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-
-      - name: Deploy to ECS
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          digest=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$IMAGE_TAG" \
+            --query 'imageDetails[0].imageDigest' --output text)
+          [[ "$digest" == sha256:* ]]
+          echo "ref=$ECR_REGISTRY/$ECR_REPOSITORY@$digest" >> "$GITHUB_OUTPUT"
+      - name: Register revision derived from the live service and roll it
         env:
-          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
         run: |
-          # Get the current task definition (managed by OpenTofu)
-          TASK_DEF=$(aws ecs describe-services \
-            --cluster $ECS_CLUSTER \
-            --services $ECS_SERVICE \
-            --query 'services[0].taskDefinition' \
-            --output text)
-
-          # Get the full task definition JSON, update the image and ensure
-          # MCP_ALLOWED_HOSTS is present (required by rmcp ≥1.4 for DNS
-          # rebinding protection on public endpoints).
-          aws ecs describe-task-definition \
-            --task-definition "$TASK_DEF" \
-            --query 'taskDefinition' \
-            | jq --arg IMAGE "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+          set -euo pipefail
+          current=$(aws ecs describe-services --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" --query 'services[0].taskDefinition' --output text)
+          echo "deriving from $current"
+          aws ecs describe-task-definition --task-definition "$current" \
+            --query taskDefinition --output json \
+            | jq --arg IMAGE "$IMAGE_REF" \
               'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy, .enableFaultInjection)
-               | .containerDefinitions[0].image = $IMAGE
-               | if (.containerDefinitions[0].environment | map(.name) | index("MCP_ALLOWED_HOSTS") | not)
-                 then .containerDefinitions[0].environment += [{"name":"MCP_ALLOWED_HOSTS","value":"mcp.pensyve.com"}]
-                 else . end' \
-            > /tmp/task-def.json
-
-          # Register new revision with updated image (preserves all secrets/env vars from tofu)
-          NEW_TASK_DEF=$(aws ecs register-task-definition \
-            --cli-input-json file:///tmp/task-def.json \
-            --query 'taskDefinition.taskDefinitionArn' \
-            --output text)
-
-          # Update service to use the new revision
-          aws ecs update-service \
-            --cluster $ECS_CLUSTER \
-            --service $ECS_SERVICE \
-            --task-definition "$NEW_TASK_DEF"
-
+               | .containerDefinitions[0].image = $IMAGE' \
+            > "$RUNNER_TEMP/task-def.json"
+          new=$(aws ecs register-task-definition \
+            --cli-input-json "file://$RUNNER_TEMP/task-def.json" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "registered $new"
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+            --task-definition "$new" --query 'service.taskDefinition' --output text
+          {
+            echo "### Gateway rollout"
+            echo "- image: \`$IMAGE_REF\`"
+            echo "- previous: \`$current\`"
+            echo "- new: \`$new\`"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Wait for stability
         timeout-minutes: 15
         run: |
-          aws ecs wait services-stable \
-            --cluster $ECS_CLUSTER \
-            --services $ECS_SERVICE
-
+          set -euo pipefail
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+          # services-stable returns on task counts; the deployment's rollout state can
+          # still read IN_PROGRESS for a few seconds after that. Wait for a terminal state.
+          for _ in $(seq 1 60); do
+            aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+              --query 'services[0].deployments[*].{status:status,td:taskDefinition,rollout:rolloutState,reason:rolloutStateReason}' \
+              --output json > "$RUNNER_TEMP/deployments.json"
+            if jq -e '[.[] | select(.status=="PRIMARY")] | all(.rollout != "IN_PROGRESS")' \
+              "$RUNNER_TEMP/deployments.json" >/dev/null; then break; fi
+            sleep 10
+          done
+          cat "$RUNNER_TEMP/deployments.json"
+          # A completed rollback is "stable" too; fail if the primary is not the revision we registered.
+          jq -e '[.[] | select(.status=="PRIMARY")] | length == 1 and all(.rollout == "COMPLETED" and (.reason | test("rolling back") | not))' \
+            "$RUNNER_TEMP/deployments.json" >/dev/null
       - name: Verify health
         run: |
+          set -euo pipefail
           sleep 10
           curl -sf --max-time 10 https://mcp.pensyve.com/health
+          curl -sf --max-time 10 https://mcp.pensyve.com/ready

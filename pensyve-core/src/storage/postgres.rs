@@ -1,6 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use std::future::Future;
+#[cfg(test)]
+use std::sync::{Arc, Barrier, Mutex};
 
 use chrono::{DateTime, Utc};
 use sqlx_core::acquire::Acquire;
@@ -11,20 +13,41 @@ use sqlx_core::query_as::query_as;
 use sqlx_core::raw_sql::raw_sql;
 use sqlx_core::row::Row;
 use sqlx_core::sql_str::AssertSqlSafe;
-use sqlx_postgres::{PgPool, PgPoolOptions, PgRow, Postgres};
+use sqlx_core::transaction::Transaction;
+use sqlx_postgres::{PgConnection, PgPool, PgPoolOptions, PgRow, Postgres};
 use tokio::runtime::{Handle, Runtime};
 use uuid::Uuid;
 
+use crate::embedding_migration::{
+    BackfillCommit, BackfillItem, BackfillOutcome, MigrationCoverage, MigrationError,
+};
+use crate::embedding_space::{EmbeddingSpace, EmbeddingSpaceId};
 use crate::types::{
     Edge, Entity, EntityKind, Episode, EpisodicMemory, Memory, Namespace, ObservationMemory,
     Outcome, ProceduralMemory, SemanticMemory,
 };
 
 use super::{
-    ActivityAggregate, ActivityEvent, ErasedRows, StorageError, StorageResult, StorageTrait,
-    cross_namespace_edge_id,
+    ActivityAggregate, ActivityEvent, BulkMutationSummary, BulkPageGuard, BulkPageKind,
+    CapturedMemory, ErasedRows, ErasureSummary, StorageError, StorageResult, StorageTrait,
+    bounded_bulk_page_size, canonical_embedding_source_sha256,
+    canonical_embedding_source_text_sha256, cross_namespace_edge_id, memory_is_live,
+    memory_namespace_id, validate_record_matches_memory,
 };
 use crate::graph::EdgeType;
+use crate::storage::bounded::{
+    EmbeddingRecord, LexicalHit, MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS,
+    MAX_VECTOR_HITS, MEMORY_PAGE_SIZE, MemoryFilter, MemoryPage, MemoryPageRequest, MemoryRef,
+    MemoryType, NamespaceEmbeddingPhase, NamespaceEmbeddingState, PageCursor,
+    SNAPSHOT_MAX_FRAME_BYTES, SNAPSHOT_MAX_PAGE_BYTES, SearchScope, SearchUnavailable, VectorHit,
+    VectorSearchOutcome, VectorSearchRequest, lexical_query_tokens,
+};
+use crate::storage::consolidation_workspace::{
+    ClusterDecision, ClusterProvenance, ConsolidationWorkspace, DecayPage, DecayRecord,
+    DecayUpdate, LatestClusterMember, NamespacePage, NamespacePageCursor, PromotionAggregate,
+    PromotionCommit, RunId, WorkspaceAssignment, WorkspaceCandidatePage, WorkspaceCursor,
+    WorkspaceEmbeddingSource, WorkspaceSource, WorkspaceSourcePage, ensure_application_budget,
+};
 
 // ---------------------------------------------------------------------------
 // Row type aliases (for complex tuple types used with query_as)
@@ -48,6 +71,8 @@ struct EpisodicRow {
     event_time: Option<DateTime<Utc>>,
     superseded_by: Option<Uuid>,
     invalid_at: Option<DateTime<Utc>>,
+    agent_id: Option<Uuid>,
+    user_id: Option<Uuid>,
 }
 
 impl<'r> FromRow<'r, PgRow> for EpisodicRow {
@@ -70,44 +95,97 @@ impl<'r> FromRow<'r, PgRow> for EpisodicRow {
             event_time: row.try_get("event_time")?,
             superseded_by: row.try_get("superseded_by")?,
             invalid_at: row.try_get("invalid_at")?,
+            agent_id: row.try_get("agent_id")?,
+            user_id: row.try_get("user_id")?,
         })
     }
 }
 
-type SemanticRow = (
-    Uuid,
-    Uuid,
-    Uuid,
-    String,
-    String,
-    Option<Uuid>,
-    f32,
-    DateTime<Utc>,
-    Option<DateTime<Utc>>,
-    serde_json::Value,
-    Option<String>,
-    f32,
-    f32,
-    Option<Uuid>,
-);
+struct SemanticRow {
+    id: Uuid,
+    namespace_id: Uuid,
+    subject: Uuid,
+    predicate: String,
+    object: String,
+    object_entity: Option<Uuid>,
+    confidence: f32,
+    valid_at: DateTime<Utc>,
+    invalid_at: Option<DateTime<Utc>>,
+    source_episodes: serde_json::Value,
+    embedding_text: Option<String>,
+    stability: f32,
+    retrievability: f32,
+    superseded_by: Option<Uuid>,
+    agent_id: Option<Uuid>,
+    user_id: Option<Uuid>,
+}
 
-type ProceduralRow = (
-    Uuid,
-    Uuid,
-    String,
-    String,
-    String,
-    serde_json::Value,
-    f32,
-    i32,
-    i32,
-    serde_json::Value,
-    Option<String>,
-    DateTime<Utc>,
-    Option<DateTime<Utc>>,
-    Option<Uuid>,
-    Option<DateTime<Utc>>,
-);
+impl<'r> FromRow<'r, PgRow> for SemanticRow {
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx_core::error::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            namespace_id: row.try_get("namespace_id")?,
+            subject: row.try_get("subject")?,
+            predicate: row.try_get("predicate")?,
+            object: row.try_get("object")?,
+            object_entity: row.try_get("object_entity")?,
+            confidence: row.try_get("confidence")?,
+            valid_at: row.try_get("valid_at")?,
+            invalid_at: row.try_get("invalid_at")?,
+            source_episodes: row.try_get("source_episodes")?,
+            embedding_text: row.try_get("embedding")?,
+            stability: row.try_get("stability")?,
+            retrievability: row.try_get("retrievability")?,
+            superseded_by: row.try_get("superseded_by")?,
+            agent_id: row.try_get("agent_id")?,
+            user_id: row.try_get("user_id")?,
+        })
+    }
+}
+
+struct ProceduralRow {
+    id: Uuid,
+    namespace_id: Uuid,
+    trigger: String,
+    action: String,
+    outcome: String,
+    context: serde_json::Value,
+    reliability: f32,
+    trial_count: i32,
+    success_count: i32,
+    source_episodes: serde_json::Value,
+    embedding_text: Option<String>,
+    created_at: DateTime<Utc>,
+    last_used: Option<DateTime<Utc>>,
+    superseded_by: Option<Uuid>,
+    invalid_at: Option<DateTime<Utc>>,
+    agent_id: Option<Uuid>,
+    user_id: Option<Uuid>,
+}
+
+impl<'r> FromRow<'r, PgRow> for ProceduralRow {
+    fn from_row(row: &'r PgRow) -> Result<Self, sqlx_core::error::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            namespace_id: row.try_get("namespace_id")?,
+            trigger: row.try_get("trigger_text")?,
+            action: row.try_get("action")?,
+            outcome: row.try_get("outcome")?,
+            context: row.try_get("context")?,
+            reliability: row.try_get("reliability")?,
+            trial_count: row.try_get("trial_count")?,
+            success_count: row.try_get("success_count")?,
+            source_episodes: row.try_get("source_episodes")?,
+            embedding_text: row.try_get("embedding")?,
+            created_at: row.try_get("created_at")?,
+            last_used: row.try_get("last_used")?,
+            superseded_by: row.try_get("superseded_by")?,
+            invalid_at: row.try_get("invalid_at")?,
+            agent_id: row.try_get("agent_id")?,
+            user_id: row.try_get("user_id")?,
+        })
+    }
+}
 
 struct ObservationRow {
     id: Uuid,
@@ -127,6 +205,8 @@ struct ObservationRow {
     retrievability: f32,
     superseded_by: Option<Uuid>,
     invalid_at: Option<DateTime<Utc>>,
+    agent_id: Option<Uuid>,
+    user_id: Option<Uuid>,
 }
 
 impl<'r> FromRow<'r, PgRow> for ObservationRow {
@@ -149,6 +229,8 @@ impl<'r> FromRow<'r, PgRow> for ObservationRow {
             retrievability: row.try_get("retrievability")?,
             superseded_by: row.try_get("superseded_by")?,
             invalid_at: row.try_get("invalid_at")?,
+            agent_id: row.try_get("agent_id")?,
+            user_id: row.try_get("user_id")?,
         })
     }
 }
@@ -284,6 +366,17 @@ pub struct PostgresBackend {
     /// `self.pool.begin()` check out an unbound connection.
     pool: ScopedPool,
     rt: Runtime,
+    #[cfg(test)]
+    workspace_race_barrier: Mutex<Option<(WorkspaceRacePoint, Arc<Barrier>)>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WorkspaceRacePoint {
+    Vector,
+    FinalMembership,
+    FinalContent,
+    Decay,
 }
 
 impl PostgresBackend {
@@ -326,6 +419,8 @@ impl PostgresBackend {
         let backend = Self {
             pool: ScopedPool::new(pool),
             rt,
+            #[cfg(test)]
+            workspace_race_barrier: Mutex::new(None),
         };
         backend.start()?;
         Ok(backend)
@@ -337,6 +432,8 @@ impl PostgresBackend {
         let backend = Self {
             pool: ScopedPool::new(pool),
             rt,
+            #[cfg(test)]
+            workspace_race_barrier: Mutex::new(None),
         };
         backend.start()?;
         Ok(backend)
@@ -349,6 +446,32 @@ impl PostgresBackend {
         self.run_schema()?;
         self.warn_on_rls_exempt_role();
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_workspace_race_barrier(
+        &self,
+        point: WorkspaceRacePoint,
+        barrier: Arc<Barrier>,
+    ) {
+        *self.workspace_race_barrier.lock().unwrap() = Some((point, barrier));
+    }
+
+    #[cfg(test)]
+    fn pause_workspace_race(&self, point: WorkspaceRacePoint) {
+        let barrier = {
+            let mut hook = self.workspace_race_barrier.lock().unwrap();
+            match hook.as_ref() {
+                Some((configured, _)) if *configured == point => {
+                    hook.take().map(|(_, barrier)| barrier)
+                }
+                _ => None,
+            }
+        };
+        if let Some(barrier) = barrier {
+            barrier.wait();
+            barrier.wait();
+        }
     }
 
     // `with_default_namespace` is gone. It existed so the `StorageTrait`
@@ -708,7 +831,7 @@ impl PostgresBackend {
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           summary, embedding::text AS embedding, context_intent, timestamp, stability,
                           retrievability, access_count, last_accessed, event_time,
-                          superseded_by, invalid_at
+                          superseded_by, invalid_at, agent_id, user_id
                    FROM episodic_memories
                    WHERE namespace_id = $1 AND ($2 OR superseded_by IS NULL)",
             )
@@ -722,7 +845,7 @@ impl PostgresBackend {
             let rows: Vec<SemanticRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
                           valid_at, invalid_at, source_episodes, embedding::text, stability,
-                          retrievability, superseded_by
+                          retrievability, superseded_by, agent_id, user_id
                    FROM semantic_memories
                    WHERE namespace_id = $1 AND ($2 OR superseded_by IS NULL)",
             )
@@ -736,7 +859,7 @@ impl PostgresBackend {
             let rows: Vec<ProceduralRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
                           trial_count, success_count, source_episodes, embedding::text, created_at,
-                          last_used, superseded_by, invalid_at
+                          last_used, superseded_by, invalid_at, agent_id, user_id
                    FROM procedural_memories
                    WHERE namespace_id = $1 AND ($2 OR superseded_by IS NULL)",
             )
@@ -754,7 +877,7 @@ impl PostgresBackend {
             let rows: Vec<ObservationRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
                           unit, content, embedding::text AS embedding, confidence, event_time, created_at,
-                          stability, retrievability, superseded_by, invalid_at
+                          stability, retrievability, superseded_by, invalid_at, agent_id, user_id
                    FROM observation_memories
                    WHERE namespace_id = $1 AND ($2 OR superseded_by IS NULL)",
             )
@@ -783,10 +906,130 @@ const SCHEMA: &str = include_str!("postgres_schema.sql");
 const LIST_OBSERVATIONS_BY_ENTITY_INSTANCE_SQL: &str = r"SELECT id, namespace_id, episode_id, entity_type, instance, action,
              quantity, unit, content, embedding::text AS embedding, confidence,
              event_time, created_at, stability, retrievability, superseded_by,
-             invalid_at
+             invalid_at, agent_id, user_id
       FROM observation_memories
       WHERE namespace_id = $1 AND instance = $2 AND superseded_by IS NULL
       ORDER BY created_at DESC LIMIT $3";
+
+type PgVectorSearchRow = (
+    Option<i16>,
+    Option<Uuid>,
+    Option<f64>,
+    Option<bool>,
+    String,
+    Option<String>,
+);
+
+/// One exact, global top-k over the allowed first-stage memory kinds.
+///
+/// `memory_type` is the [`MemoryType`] discriminant rather than its stored text
+/// so SQL tie order stays identical to `SQLite`'s typed order. The windowed
+/// invalid flag makes one malformed eligible vector fail the whole semantic
+/// leg even when that row would fall outside the top-k; partial hits are never
+/// returned. pgvector itself rejects non-finite stored components.
+const POSTGRES_VECTOR_SEARCH_SQL: &str = r"WITH lifecycle AS (
+    SELECT state, active_read_space_id
+    FROM namespace_embedding_state
+    WHERE namespace_id = $2
+), candidates AS (
+    SELECT 0::smallint AS memory_type, embeddings.memory_id, embeddings.embedding,
+           $7::smallint = 2 AND COALESCE((memory.about_entity = $8
+               OR memory.source_entity = $8), FALSE) AS entity_preferred
+    FROM memory_embeddings AS embeddings
+    JOIN episodic_memories AS memory
+      ON memory.id = embeddings.memory_id
+     AND memory.namespace_id = embeddings.namespace_id
+    CROSS JOIN lifecycle
+    WHERE embeddings.namespace_id = $2
+      AND embeddings.embedding_space_id = $3
+      AND embeddings.memory_type = 'episodic'
+      AND lifecycle.state = 'active'
+      AND lifecycle.active_read_space_id = $3
+      AND ($4::smallint = 0
+           OR ($4 = 1 AND memory.agent_id IS NOT DISTINCT FROM $5
+                      AND memory.user_id IS NOT DISTINCT FROM $6)
+           OR ($4 = 2 AND memory.agent_id = $5))
+      AND ($7::smallint = 0 OR $7 = 2 OR ($7 = 1
+           AND (memory.about_entity = $8 OR memory.source_entity = $8)))
+      AND $12 AND ($15::real IS NULL OR 1.0 >= $15)
+      AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
+    UNION ALL
+    SELECT 1::smallint, embeddings.memory_id, embeddings.embedding,
+           $7::smallint = 2 AND COALESCE((memory.subject = $8
+               OR memory.object_entity = $8), FALSE)
+    FROM memory_embeddings AS embeddings
+    JOIN semantic_memories AS memory
+      ON memory.id = embeddings.memory_id
+     AND memory.namespace_id = embeddings.namespace_id
+    CROSS JOIN lifecycle
+    WHERE embeddings.namespace_id = $2
+      AND embeddings.embedding_space_id = $3
+      AND embeddings.memory_type = 'semantic'
+      AND lifecycle.state = 'active'
+      AND lifecycle.active_read_space_id = $3
+      AND ($4::smallint = 0
+           OR ($4 = 1 AND memory.agent_id IS NOT DISTINCT FROM $5
+                      AND memory.user_id IS NOT DISTINCT FROM $6)
+           OR ($4 = 2 AND memory.agent_id = $5))
+      AND ($7::smallint = 0 OR $7 = 2 OR ($7 = 1
+           AND (memory.subject = $8 OR memory.object_entity = $8)))
+      AND $13 AND ($15::real IS NULL OR memory.confidence >= $15)
+      AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
+    UNION ALL
+    SELECT 2::smallint, embeddings.memory_id, embeddings.embedding, false
+    FROM memory_embeddings AS embeddings
+    JOIN procedural_memories AS memory
+      ON memory.id = embeddings.memory_id
+     AND memory.namespace_id = embeddings.namespace_id
+    CROSS JOIN lifecycle
+    WHERE embeddings.namespace_id = $2
+      AND embeddings.embedding_space_id = $3
+      AND embeddings.memory_type = 'procedural'
+      AND lifecycle.state = 'active'
+      AND lifecycle.active_read_space_id = $3
+      AND ($4::smallint = 0
+           OR ($4 = 1 AND memory.agent_id IS NOT DISTINCT FROM $5
+                      AND memory.user_id IS NOT DISTINCT FROM $6)
+           OR ($4 = 2 AND memory.agent_id = $5))
+      AND ($7::smallint = 0 OR $7 = 2)
+      AND $14 AND ($15::real IS NULL OR memory.reliability >= $15)
+      AND memory.superseded_by IS NULL AND memory.invalid_at IS NULL
+), scored AS (
+    SELECT memory_type, memory_id, entity_preferred,
+           CASE
+             WHEN vector_dims(embedding) <> vector_dims($1::vector) THEN NULL
+             WHEN vector_norm(embedding) = 0 THEN 1.0
+             ELSE embedding <=> $1::vector
+           END AS distance,
+           bool_or(
+               vector_dims(embedding) <> vector_dims($1::vector)
+           ) OVER () AS invalid_stored_vector
+    FROM candidates
+), ranked AS (
+    SELECT memory_type, memory_id, entity_preferred, distance, invalid_stored_vector,
+           row_number() OVER (
+               PARTITION BY entity_preferred
+               ORDER BY distance, memory_type, memory_id
+           ) AS entity_rank
+    FROM scored
+), limited AS (
+    SELECT memory_type, memory_id, distance, invalid_stored_vector
+    FROM ranked
+    WHERE $7::smallint <> 2
+       OR (entity_preferred AND entity_rank <= $9)
+       OR (NOT entity_preferred AND entity_rank <= $10)
+    ORDER BY distance ASC, memory_type ASC, memory_id ASC
+    LIMIT $11
+)
+SELECT limited.memory_type, limited.memory_id,
+       1.0 - limited.distance AS cosine_similarity,
+       limited.invalid_stored_vector, lifecycle.state,
+       lifecycle.active_read_space_id
+FROM lifecycle
+LEFT JOIN limited ON TRUE
+ORDER BY limited.distance ASC NULLS LAST,
+         limited.memory_type ASC NULLS LAST,
+         limited.memory_id ASC NULLS LAST";
 
 // ---------------------------------------------------------------------------
 // Error helpers
@@ -799,6 +1042,49 @@ fn io_err(e: impl std::fmt::Display) -> super::StorageError {
 #[allow(clippy::needless_pass_by_value)]
 fn sqlx_to_io(e: sqlx_core::error::Error) -> super::StorageError {
     super::StorageError::Io(std::io::Error::other(e.to_string()))
+}
+
+#[derive(Clone, Copy)]
+struct StatementTimeoutBudget {
+    deadline: std::time::Instant,
+}
+
+impl StatementTimeoutBudget {
+    fn new(deadline: std::time::Instant) -> Self {
+        Self { deadline }
+    }
+
+    fn remaining_ms(self) -> Option<u64> {
+        self.remaining_ms_at(std::time::Instant::now())
+    }
+
+    fn remaining_ms_at(self, now: std::time::Instant) -> Option<u64> {
+        let remaining = self.deadline.checked_duration_since(now)?;
+        let millis = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+        (millis > 0).then(|| millis.min(i32::MAX as u64))
+    }
+}
+
+fn statement_timeout_value(timeout_ms: u64) -> String {
+    format!("{timeout_ms}ms")
+}
+
+fn postgres_vector_error_reason(code: Option<&str>, message: &str) -> Option<SearchUnavailable> {
+    if code == Some("57014") {
+        return Some(SearchUnavailable::DeadlineExceeded);
+    }
+    if code.is_some_and(|code| code.starts_with("22"))
+        && message.to_ascii_lowercase().contains("vector")
+    {
+        return Some(SearchUnavailable::InvalidStoredVector);
+    }
+    None
+}
+
+fn vector_error_reason(error: &sqlx_core::error::Error) -> Option<SearchUnavailable> {
+    let database_error = error.as_database_error()?;
+    let code = database_error.code();
+    postgres_vector_error_reason(code.as_deref(), database_error.message())
 }
 
 /// SQL fragment OR-combining one `plainto_tsquery` per query token, with
@@ -886,11 +1172,2627 @@ fn pgtext_to_embedding(s: Option<&str>) -> Vec<f32> {
     }
 }
 
+fn memory_type_str(memory_type: MemoryType) -> &'static str {
+    match memory_type {
+        MemoryType::Episodic => "episodic",
+        MemoryType::Semantic => "semantic",
+        MemoryType::Procedural => "procedural",
+        MemoryType::Observation => "observation",
+    }
+}
+
+fn supersede_update_sql(memory_type: MemoryType) -> &'static str {
+    match memory_type {
+        MemoryType::Episodic => {
+            "UPDATE episodic_memories SET superseded_by = $1, invalid_at = $2 \
+             WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL"
+        }
+        MemoryType::Semantic => {
+            "UPDATE semantic_memories SET superseded_by = $1, invalid_at = $2 \
+             WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL"
+        }
+        MemoryType::Procedural => {
+            "UPDATE procedural_memories SET superseded_by = $1, invalid_at = $2 \
+             WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL"
+        }
+        MemoryType::Observation => {
+            "UPDATE observation_memories SET superseded_by = $1, invalid_at = $2 \
+             WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL"
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive source write keeps all four Memory variants on the same scoped SQL transaction"
+)]
+async fn save_memory_in_pg_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    memory: &Memory,
+) -> StorageResult<()> {
+    let namespace_id = memory_namespace_id(memory);
+    let namespace_exists: Option<(Uuid,)> =
+        query_as::<Postgres, _>("SELECT id FROM namespaces WHERE id = $1")
+            .bind(namespace_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+    if namespace_exists.is_none() {
+        return Err(StorageError::Context(format!(
+            "source namespace {namespace_id} is not registered"
+        )));
+    }
+
+    let result = match memory {
+        Memory::Episodic(memory) => {
+            query::<Postgres>(
+                r"INSERT INTO episodic_memories
+               (id, namespace_id, episode_id, source_entity, about_entity, content, summary,
+                embedding, context_intent, timestamp, stability, retrievability,
+                access_count, last_accessed, event_time, superseded_by, invalid_at, agent_id,
+                user_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13,
+                       $14, $15, $16, $17, $18, $19)
+               ON CONFLICT (id) DO UPDATE SET
+                   content = $6, summary = $7, embedding = $8::vector, context_intent = $9,
+                   stability = $11, retrievability = $12, access_count = $13,
+                   last_accessed = $14, event_time = $15, superseded_by = $16,
+                   invalid_at = $17, agent_id = $18, user_id = $19
+               WHERE episodic_memories.namespace_id = EXCLUDED.namespace_id",
+            )
+            .bind(memory.id)
+            .bind(memory.namespace_id)
+            .bind(memory.episode_id)
+            .bind(memory.source_entity)
+            .bind(memory.about_entity)
+            .bind(&memory.content)
+            .bind(&memory.summary)
+            .bind(embedding_to_pgtext(&memory.embedding))
+            .bind(&memory.context_intent)
+            .bind(memory.timestamp)
+            .bind(memory.stability)
+            .bind(memory.retrievability)
+            .bind(i32::try_from(memory.access_count).unwrap_or(i32::MAX))
+            .bind(memory.last_accessed)
+            .bind(memory.event_time)
+            .bind(memory.superseded_by)
+            .bind(memory.invalid_at)
+            .bind(memory.agent_id)
+            .bind(memory.user_id)
+            .execute(&mut **transaction)
+            .await
+        }
+        Memory::Semantic(memory) => {
+            let source_episodes = serde_json::to_value(&memory.source_episodes)?;
+            query::<Postgres>(
+                r"INSERT INTO semantic_memories
+                   (id, namespace_id, subject, predicate, object, object_entity, confidence,
+                    valid_at, invalid_at, source_episodes, embedding, stability, retrievability,
+                    superseded_by, agent_id, user_id)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::vector, $12, $13,
+                           $14, $15, $16)
+                   ON CONFLICT (id) DO UPDATE SET
+                       predicate = $4, object = $5, object_entity = $6, confidence = $7,
+                       invalid_at = $9, source_episodes = $10, embedding = $11::vector,
+                       stability = $12, retrievability = $13, superseded_by = $14,
+                       agent_id = $15, user_id = $16
+                   WHERE semantic_memories.namespace_id = EXCLUDED.namespace_id",
+            )
+            .bind(memory.id)
+            .bind(memory.namespace_id)
+            .bind(memory.subject)
+            .bind(&memory.predicate)
+            .bind(&memory.object)
+            .bind(memory.object_entity)
+            .bind(memory.confidence)
+            .bind(memory.valid_at)
+            .bind(memory.invalid_at)
+            .bind(&source_episodes)
+            .bind(embedding_to_pgtext(&memory.embedding))
+            .bind(memory.stability)
+            .bind(memory.retrievability)
+            .bind(memory.superseded_by)
+            .bind(memory.agent_id)
+            .bind(memory.user_id)
+            .execute(&mut **transaction)
+            .await
+        }
+        Memory::Procedural(memory) => {
+            let context = serde_json::to_value(&memory.context)?;
+            let source_episodes = serde_json::to_value(&memory.source_episodes)?;
+            query::<Postgres>(
+                r"INSERT INTO procedural_memories
+                   (id, namespace_id, trigger_text, action, outcome, context, reliability,
+                    trial_count, success_count, source_episodes, embedding, created_at, last_used,
+                    superseded_by, invalid_at, agent_id, user_id)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::vector, $12, $13,
+                           $14, $15, $16, $17)
+                   ON CONFLICT (id) DO UPDATE SET
+                       trigger_text = $3, action = $4, outcome = $5, context = $6,
+                       reliability = $7, trial_count = $8, success_count = $9,
+                       source_episodes = $10, embedding = $11::vector, last_used = $13,
+                       superseded_by = $14, invalid_at = $15, agent_id = $16, user_id = $17
+                   WHERE procedural_memories.namespace_id = EXCLUDED.namespace_id",
+            )
+            .bind(memory.id)
+            .bind(memory.namespace_id)
+            .bind(&memory.trigger)
+            .bind(&memory.action)
+            .bind(outcome_to_str(&memory.outcome))
+            .bind(&context)
+            .bind(memory.reliability)
+            .bind(i32::try_from(memory.trial_count).unwrap_or(i32::MAX))
+            .bind(i32::try_from(memory.success_count).unwrap_or(i32::MAX))
+            .bind(&source_episodes)
+            .bind(embedding_to_pgtext(&memory.embedding))
+            .bind(memory.created_at)
+            .bind(memory.last_used)
+            .bind(memory.superseded_by)
+            .bind(memory.invalid_at)
+            .bind(memory.agent_id)
+            .bind(memory.user_id)
+            .execute(&mut **transaction)
+            .await
+        }
+        Memory::Observation(memory) => {
+            query::<Postgres>(
+                r"INSERT INTO observation_memories
+               (id, namespace_id, episode_id, entity_type, instance, action, quantity, unit,
+                content, embedding, confidence, event_time, created_at, stability, retrievability,
+                superseded_by, invalid_at, agent_id, user_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::vector, $11, $12, $13, $14,
+                       $15, $16, $17, $18, $19)
+               ON CONFLICT (id) DO UPDATE SET
+                   entity_type = $4, instance = $5, action = $6, quantity = $7, unit = $8,
+                   content = $9, embedding = $10::vector, confidence = $11,
+                   event_time = $12, stability = $14, retrievability = $15,
+                   superseded_by = $16, invalid_at = $17, agent_id = $18, user_id = $19
+               WHERE observation_memories.namespace_id = EXCLUDED.namespace_id",
+            )
+            .bind(memory.id)
+            .bind(memory.namespace_id)
+            .bind(memory.episode_id)
+            .bind(&memory.entity_type)
+            .bind(&memory.instance)
+            .bind(&memory.action)
+            .bind(memory.quantity)
+            .bind(&memory.unit)
+            .bind(&memory.content)
+            .bind(embedding_to_pgtext(&memory.embedding))
+            .bind(memory.confidence)
+            .bind(memory.event_time)
+            .bind(memory.created_at)
+            .bind(memory.stability)
+            .bind(memory.retrievability)
+            .bind(memory.superseded_by)
+            .bind(memory.invalid_at)
+            .bind(memory.agent_id)
+            .bind(memory.user_id)
+            .execute(&mut **transaction)
+            .await
+        }
+    }
+    .map_err(sqlx_to_io)?;
+
+    if result.rows_affected() != 1 {
+        return Err(StorageError::Context(format!(
+            "source write for {} was rejected by its namespace predicate",
+            memory.id()
+        )));
+    }
+    Ok(())
+}
+
+async fn reconcile_embedding_source_in_pg_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    memory: &Memory,
+) -> StorageResult<()> {
+    let namespace_id = memory_namespace_id(memory);
+    let memory_type = memory_type_str(MemoryType::of(memory));
+    let memory_id = memory.id();
+    let source_sha256 = canonical_embedding_source_sha256(memory);
+    query::<Postgres>(
+        "DELETE FROM memory_embeddings
+         WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3
+           AND source_sha256 <> $4",
+    )
+    .bind(namespace_id)
+    .bind(memory_type)
+    .bind(memory_id)
+    .bind(&source_sha256)
+    .execute(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?;
+
+    let lifecycle = query_as::<Postgres, (String, Option<String>)>(
+        "SELECT state, target_space_id FROM namespace_embedding_state
+         WHERE namespace_id = $1 FOR UPDATE",
+    )
+    .bind(namespace_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?;
+    let Some((phase, target_space_id)) = lifecycle else {
+        return Ok(());
+    };
+    if phase != "backfilling" && phase != "ready" {
+        return Ok(());
+    }
+    if target_space_id.is_none() {
+        return Err(StorageError::Context(format!(
+            "{phase} embedding lifecycle has no target space"
+        )));
+    }
+
+    query::<Postgres>(
+        "DELETE FROM embedding_backfill_queue
+         WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3
+           AND status = 'pending'",
+    )
+    .bind(namespace_id)
+    .bind(memory_type)
+    .bind(memory_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?;
+    let next_sequence = query_as::<Postgres, (i64,)>(
+        "SELECT MAX(maximum) + 1 FROM (
+             SELECT COALESCE(MAX(sequence), 0) AS maximum
+               FROM embedding_backfill_queue WHERE namespace_id = $1
+             UNION ALL
+             SELECT barrier_sequence FROM namespace_embedding_state
+              WHERE namespace_id = $1
+         ) AS bounds",
+    )
+    .bind(namespace_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?
+    .0;
+    query::<Postgres>(
+        "INSERT INTO embedding_backfill_queue
+         (namespace_id, memory_type, memory_id, source_sha256, sequence,
+          status, last_error)
+         VALUES ($1, $2, $3, $4, $5, 'pending', NULL)",
+    )
+    .bind(namespace_id)
+    .bind(memory_type)
+    .bind(memory_id)
+    .bind(source_sha256)
+    .bind(next_sequence)
+    .execute(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?;
+    if phase == "ready" {
+        query::<Postgres>(
+            "UPDATE namespace_embedding_state
+             SET state = 'backfilling', updated_at = $1
+             WHERE namespace_id = $2 AND state = 'ready'",
+        )
+        .bind(Utc::now())
+        .bind(namespace_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(sqlx_to_io)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum SourceLockMode {
+    Capture,
+    Generation,
+}
+
+const ENTITY_FORGET_PAGE_REFS_SQL: &str = r"SELECT memory_type, id FROM (
+       SELECT 0 AS type_order, 'episodic'::text AS memory_type, id
+       FROM episodic_memories
+       WHERE namespace_id = $1
+         AND (about_entity = $2 OR source_entity = $2)
+       UNION ALL
+       SELECT 1, 'semantic', id FROM semantic_memories
+       WHERE namespace_id = $1
+         AND (subject = $2 OR object_entity = $2)
+   ) AS memories
+   ORDER BY type_order, id
+   LIMIT $3";
+
+fn typed_source_lock_sql(memory_type: MemoryType, mode: SourceLockMode) -> &'static str {
+    match (memory_type, mode) {
+        (MemoryType::Episodic, SourceLockMode::Capture) => {
+            "SELECT id FROM episodic_memories WHERE id = $1 AND namespace_id = $2 FOR UPDATE"
+        }
+        (MemoryType::Semantic, SourceLockMode::Capture) => {
+            "SELECT id FROM semantic_memories WHERE id = $1 AND namespace_id = $2 FOR UPDATE"
+        }
+        (MemoryType::Procedural, SourceLockMode::Capture) => {
+            "SELECT id FROM procedural_memories WHERE id = $1 AND namespace_id = $2 FOR UPDATE"
+        }
+        (MemoryType::Observation, SourceLockMode::Capture) => {
+            "SELECT id FROM observation_memories WHERE id = $1 AND namespace_id = $2 FOR UPDATE"
+        }
+        (MemoryType::Episodic, SourceLockMode::Generation) => {
+            "SELECT id FROM episodic_memories WHERE id = $1 AND namespace_id = $2 FOR KEY SHARE"
+        }
+        (MemoryType::Semantic, SourceLockMode::Generation) => {
+            "SELECT id FROM semantic_memories WHERE id = $1 AND namespace_id = $2 FOR KEY SHARE"
+        }
+        (MemoryType::Procedural, SourceLockMode::Generation) => {
+            "SELECT id FROM procedural_memories WHERE id = $1 AND namespace_id = $2 FOR KEY SHARE"
+        }
+        (MemoryType::Observation, SourceLockMode::Generation) => {
+            "SELECT id FROM observation_memories WHERE id = $1 AND namespace_id = $2 FOR KEY SHARE"
+        }
+    }
+}
+
+async fn lock_typed_source(
+    conn: &mut PgConnection,
+    namespace_id: Uuid,
+    memory_ref: MemoryRef,
+    mode: SourceLockMode,
+) -> StorageResult<bool> {
+    let row: Option<(Uuid,)> =
+        query_as::<Postgres, _>(typed_source_lock_sql(memory_ref.memory_type, mode))
+            .bind(memory_ref.id)
+            .bind(namespace_id)
+            .fetch_optional(conn)
+            .await
+            .map_err(sqlx_to_io)?;
+    Ok(row.is_some())
+}
+
+async fn lock_typed_source_for_capture(
+    conn: &mut PgConnection,
+    namespace_id: Uuid,
+    memory_ref: MemoryRef,
+) -> StorageResult<bool> {
+    lock_typed_source(conn, namespace_id, memory_ref, SourceLockMode::Capture).await
+}
+
+async fn capture_payload_bytes_pg_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    namespace_id: Uuid,
+    memory_ref: MemoryRef,
+) -> StorageResult<usize> {
+    let source_sql = match memory_ref.memory_type {
+        MemoryType::Episodic => {
+            "SELECT (octet_length(content) + COALESCE(octet_length(summary), 0)
+                    + COALESCE(octet_length(embedding::text), 0))::bigint
+             FROM episodic_memories WHERE namespace_id = $1 AND id = $2"
+        }
+        MemoryType::Semantic => {
+            "SELECT (octet_length(predicate) + octet_length(object)
+                    + COALESCE(octet_length(embedding::text), 0))::bigint
+             FROM semantic_memories WHERE namespace_id = $1 AND id = $2"
+        }
+        MemoryType::Procedural | MemoryType::Observation => {
+            return Err(StorageError::Context(
+                "entity snapshot selected a non-entity memory type".into(),
+            ));
+        }
+    };
+    let (source_bytes,): (i64,) = query_as::<Postgres, _>(source_sql)
+        .bind(namespace_id)
+        .bind(memory_ref.id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(sqlx_to_io)?;
+    let (generation_bytes,): (i64,) = query_as::<Postgres, _>(
+        "SELECT COALESCE(SUM(octet_length(embedding::text)
+                + octet_length(embedding_space_id) + octet_length(source_sha256)), 0)::bigint
+         FROM memory_embeddings
+         WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3",
+    )
+    .bind(namespace_id)
+    .bind(memory_type_str(memory_ref.memory_type))
+    .bind(memory_ref.id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?;
+    let source_bytes = usize::try_from(source_bytes)
+        .map_err(|_| StorageError::BudgetExceeded("negative snapshot source bytes".into()))?;
+    let generation_bytes = usize::try_from(generation_bytes)
+        .map_err(|_| StorageError::BudgetExceeded("negative snapshot generation bytes".into()))?;
+    source_bytes
+        .checked_add(generation_bytes)
+        .ok_or_else(|| StorageError::BudgetExceeded("snapshot source byte count overflow".into()))
+}
+
+#[cfg(test)]
+mod capture_lock_probe {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    use super::MemoryRef;
+
+    #[derive(Default)]
+    struct State {
+        reached: bool,
+        released: bool,
+    }
+
+    struct Control {
+        state: Mutex<State>,
+        changed: Condvar,
+    }
+
+    fn controls() -> &'static Mutex<BTreeMap<MemoryRef, Arc<Control>>> {
+        static CONTROLS: OnceLock<Mutex<BTreeMap<MemoryRef, Arc<Control>>>> = OnceLock::new();
+        CONTROLS.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    pub(super) struct Pause {
+        memory_ref: MemoryRef,
+        control: Arc<Control>,
+    }
+
+    pub(super) fn install(memory_ref: MemoryRef) -> Pause {
+        let control = Arc::new(Control {
+            state: Mutex::new(State::default()),
+            changed: Condvar::new(),
+        });
+        let old = controls()
+            .lock()
+            .unwrap()
+            .insert(memory_ref, Arc::clone(&control));
+        assert!(old.is_none(), "capture pause already installed");
+        Pause {
+            memory_ref,
+            control,
+        }
+    }
+
+    impl Pause {
+        pub(super) fn wait_until_reached(&self, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            let mut state = self.control.state.lock().unwrap();
+            while !state.reached {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return false;
+                };
+                let (next, timed_out) =
+                    self.control.changed.wait_timeout(state, remaining).unwrap();
+                state = next;
+                if timed_out.timed_out() && !state.reached {
+                    return false;
+                }
+            }
+            true
+        }
+
+        pub(super) fn release(&self) {
+            let mut state = self.control.state.lock().unwrap();
+            state.released = true;
+            self.control.changed.notify_all();
+        }
+    }
+
+    impl Drop for Pause {
+        fn drop(&mut self) {
+            self.release();
+            controls().lock().unwrap().remove(&self.memory_ref);
+        }
+    }
+
+    pub(super) fn after_capture(memory_ref: MemoryRef) {
+        let Some(control) = controls().lock().unwrap().get(&memory_ref).cloned() else {
+            return;
+        };
+        let mut state = control.state.lock().unwrap();
+        state.reached = true;
+        control.changed.notify_all();
+        while !state.released {
+            state = control.changed.wait(state).unwrap();
+        }
+    }
+}
+
+async fn insert_embedding_in_pg_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    record: &EmbeddingRecord,
+) -> StorageResult<()> {
+    if !lock_typed_source(
+        transaction,
+        record.namespace_id,
+        record.memory_ref,
+        SourceLockMode::Generation,
+    )
+    .await?
+    {
+        return Err(StorageError::Context(format!(
+            "embedding source {:?}/{} does not exist in namespace {}",
+            record.memory_ref.memory_type, record.memory_ref.id, record.namespace_id
+        )));
+    }
+    let dimension: Option<(i32,)> =
+        query_as::<Postgres, _>("SELECT dimension FROM embedding_spaces WHERE id = $1")
+            .bind(&record.embedding_space_id.0)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+    let dimension = dimension
+        .ok_or_else(|| {
+            StorageError::Context(format!(
+                "embedding space {} is not registered",
+                record.embedding_space_id.0
+            ))
+        })?
+        .0;
+    if usize::try_from(dimension).ok() != Some(record.embedding.len()) {
+        return Err(StorageError::Context(format!(
+            "embedding dimension {} does not match registered space dimension {dimension}",
+            record.embedding.len()
+        )));
+    }
+
+    let embedding =
+        embedding_to_pgtext(&record.embedding).expect("validated embeddings are non-empty");
+    let result = query::<Postgres>(
+        "INSERT INTO memory_embeddings
+         (namespace_id, memory_type, memory_id, embedding_space_id, source_sha256,
+          embedding, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6::vector, NOW())
+         ON CONFLICT (memory_type, memory_id, embedding_space_id) DO UPDATE SET
+             source_sha256 = EXCLUDED.source_sha256,
+             embedding = EXCLUDED.embedding,
+             created_at = EXCLUDED.created_at
+         WHERE memory_embeddings.namespace_id = EXCLUDED.namespace_id",
+    )
+    .bind(record.namespace_id)
+    .bind(memory_type_str(record.memory_ref.memory_type))
+    .bind(record.memory_ref.id)
+    .bind(&record.embedding_space_id.0)
+    .bind(&record.source_sha256)
+    .bind(embedding)
+    .execute(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?;
+    if result.rows_affected() != 1 {
+        return Err(StorageError::Context(format!(
+            "embedding write for {} was rejected by its namespace predicate",
+            record.memory_ref.id
+        )));
+    }
+    Ok(())
+}
+
+fn memory_type_from_str(value: &str) -> StorageResult<MemoryType> {
+    match value {
+        "episodic" => Ok(MemoryType::Episodic),
+        "semantic" => Ok(MemoryType::Semantic),
+        "procedural" => Ok(MemoryType::Procedural),
+        "observation" => Ok(MemoryType::Observation),
+        other => Err(StorageError::Context(format!(
+            "unknown stored memory type {other:?}"
+        ))),
+    }
+}
+
+fn memory_type_order(memory_type: MemoryType) -> i32 {
+    match memory_type {
+        MemoryType::Episodic => 0,
+        MemoryType::Semantic => 1,
+        MemoryType::Procedural => 2,
+        MemoryType::Observation => 3,
+    }
+}
+
+async fn load_memory_without_embedding_pg(
+    conn: &mut PgConnection,
+    namespace_id: Uuid,
+    memory_ref: MemoryRef,
+) -> StorageResult<Option<Memory>> {
+    match memory_ref.memory_type {
+        MemoryType::Episodic => {
+            let row = query_as::<Postgres, EpisodicRow>(
+                r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
+                          summary, NULL::text AS embedding, context_intent, timestamp, stability,
+                          retrievability, access_count, last_accessed, event_time, superseded_by,
+                          invalid_at, agent_id, user_id
+                   FROM episodic_memories WHERE id = $1 AND namespace_id = $2",
+            )
+            .bind(memory_ref.id)
+            .bind(namespace_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(row.map(row_to_episodic).map(Memory::Episodic))
+        }
+        MemoryType::Semantic => {
+            let row = query_as::<Postgres, SemanticRow>(
+                r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
+                          valid_at, invalid_at, source_episodes, NULL::text AS embedding, stability,
+                          retrievability, superseded_by, agent_id, user_id
+                   FROM semantic_memories WHERE id = $1 AND namespace_id = $2",
+            )
+            .bind(memory_ref.id)
+            .bind(namespace_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(row.map(row_to_semantic).map(Memory::Semantic))
+        }
+        MemoryType::Procedural => {
+            let row = query_as::<Postgres, ProceduralRow>(
+                r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
+                          trial_count, success_count, source_episodes, NULL::text AS embedding,
+                          created_at, last_used, superseded_by, invalid_at, agent_id, user_id
+                   FROM procedural_memories WHERE id = $1 AND namespace_id = $2",
+            )
+            .bind(memory_ref.id)
+            .bind(namespace_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(row.map(row_to_procedural).map(Memory::Procedural))
+        }
+        MemoryType::Observation => {
+            let row = query_as::<Postgres, ObservationRow>(
+                r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
+                          unit, content, NULL::text AS embedding, confidence, event_time, created_at,
+                          stability, retrievability, superseded_by, invalid_at, agent_id, user_id
+                   FROM observation_memories WHERE id = $1 AND namespace_id = $2",
+            )
+            .bind(memory_ref.id)
+            .bind(namespace_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(row.map(row_to_observation).map(Memory::Observation))
+        }
+    }
+}
+
+async fn pg_migration_source_page(
+    conn: &mut PgConnection,
+    namespace_id: Uuid,
+    after: Option<MemoryRef>,
+    target_space_id: Option<&EmbeddingSpaceId>,
+    kind: BulkPageKind,
+) -> StorageResult<BulkPageGuard<Vec<(MemoryRef, String, Option<String>)>>> {
+    let limit = bounded_bulk_page_size(namespace_id, kind, MEMORY_PAGE_SIZE)?;
+    let after_type = after.map_or(-1_i16, |cursor| match cursor.memory_type {
+        MemoryType::Episodic => 0,
+        MemoryType::Semantic => 1,
+        MemoryType::Procedural => 2,
+        MemoryType::Observation => 3,
+    });
+    let after_id = after.map_or_else(Uuid::nil, |cursor| cursor.id);
+    let refs = query_as::<Postgres, (String, Uuid, String, Option<String>)>(
+        "SELECT sources.memory_type, sources.id, sources.source_text,
+                generation.source_sha256
+         FROM (
+             SELECT 0 AS type_order, 'episodic'::text AS memory_type, id,
+                    content AS source_text
+               FROM episodic_memories
+              WHERE namespace_id = $1 AND superseded_by IS NULL AND invalid_at IS NULL
+             UNION ALL
+             SELECT 1, 'semantic', id, predicate || ' ' || object FROM semantic_memories
+              WHERE namespace_id = $1 AND superseded_by IS NULL AND invalid_at IS NULL
+             UNION ALL
+             SELECT 2, 'procedural', id, trigger_text || chr(10) || action FROM procedural_memories
+              WHERE namespace_id = $1 AND superseded_by IS NULL AND invalid_at IS NULL
+             UNION ALL
+             SELECT 3, 'observation', id, content FROM observation_memories
+              WHERE namespace_id = $1 AND superseded_by IS NULL AND invalid_at IS NULL
+         ) AS sources
+         LEFT JOIN memory_embeddings AS generation
+           ON generation.namespace_id = $1
+          AND generation.memory_type = sources.memory_type
+          AND generation.memory_id = sources.id
+          AND generation.embedding_space_id = $5
+         WHERE type_order > $2 OR (type_order = $2 AND sources.id > $3)
+         ORDER BY type_order, sources.id LIMIT $4",
+    )
+    .bind(namespace_id)
+    .bind(after_type)
+    .bind(after_id)
+    .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+    .bind(target_space_id.map(|space| space.0.as_str()))
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(sqlx_to_io)?
+    .into_iter()
+    .map(|(memory_type, id, source_text, stored_hash)| {
+        Ok((
+            MemoryRef {
+                memory_type: memory_type_from_str(&memory_type)?,
+                id,
+            },
+            canonical_embedding_source_text_sha256(&source_text),
+            stored_hash,
+        ))
+    })
+    .collect::<StorageResult<Vec<_>>>()?;
+    Ok(BulkPageGuard::new(refs, namespace_id, kind))
+}
+
+async fn pg_migration_coverage(
+    conn: &mut PgConnection,
+    namespace_id: Uuid,
+    target_space_id: &EmbeddingSpaceId,
+    kind: BulkPageKind,
+) -> StorageResult<MigrationCoverage> {
+    let mut coverage = MigrationCoverage::default();
+    let mut after = None;
+    loop {
+        let page = pg_migration_source_page(conn, namespace_id, after, Some(target_space_id), kind)
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+        coverage.total += page.len();
+        for (_, source_hash, stored_hash) in page.iter() {
+            match stored_hash {
+                None => coverage.missing += 1,
+                Some(hash) if hash != source_hash => {
+                    coverage.stale += 1;
+                }
+                Some(_) => {}
+            }
+        }
+        after = page.last().map(|row| row.0);
+        let complete = page.len() < MEMORY_PAGE_SIZE;
+        drop(page);
+        if complete {
+            break;
+        }
+    }
+    let pending = query_as::<Postgres, (i64,)>(
+        "SELECT COUNT(*) FROM embedding_backfill_queue
+         WHERE namespace_id = $1 AND status = 'pending'",
+    )
+    .bind(namespace_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(sqlx_to_io)?
+    .0;
+    coverage.pending = usize::try_from(pending).map_err(|error| {
+        StorageError::Context(format!("invalid pending backfill count: {error}"))
+    })?;
+    Ok(coverage)
+}
+
+async fn delete_pg_backfill_item(
+    transaction: &mut Transaction<'_, Postgres>,
+    namespace_id: Uuid,
+    item: &BackfillItem,
+) -> StorageResult<()> {
+    query::<Postgres>(
+        "DELETE FROM embedding_backfill_queue
+         WHERE namespace_id = $1 AND memory_type = $2
+           AND memory_id = $3 AND sequence = $4",
+    )
+    .bind(namespace_id)
+    .bind(memory_type_str(item.memory_ref.memory_type))
+    .bind(item.memory_ref.id)
+    .bind(item.sequence)
+    .execute(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?;
+    Ok(())
+}
+
+async fn enqueue_uncovered_pg_sources(
+    conn: &mut PgConnection,
+    namespace_id: Uuid,
+    target_space_id: &EmbeddingSpaceId,
+) -> StorageResult<()> {
+    let mut after = None;
+    loop {
+        let page = pg_migration_source_page(
+            conn,
+            namespace_id,
+            after,
+            Some(target_space_id),
+            BulkPageKind::EmbeddingMigrationVerify,
+        )
+        .await?;
+        if page.is_empty() {
+            break;
+        }
+        for (memory_ref, source_sha256, stored_hash) in page.iter() {
+            if stored_hash.as_deref() == Some(source_sha256.as_str()) {
+                continue;
+            }
+            let already_queued = query_as::<Postgres, (bool,)>(
+                "SELECT EXISTS(
+                 SELECT 1 FROM embedding_backfill_queue
+                  WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3
+                    AND source_sha256 = $4 AND status = 'pending'
+             )",
+            )
+            .bind(namespace_id)
+            .bind(memory_type_str(memory_ref.memory_type))
+            .bind(memory_ref.id)
+            .bind(source_sha256)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?
+            .0;
+            if already_queued {
+                continue;
+            }
+            query::<Postgres>(
+                "DELETE FROM embedding_backfill_queue
+             WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3
+               AND status = 'pending'",
+            )
+            .bind(namespace_id)
+            .bind(memory_type_str(memory_ref.memory_type))
+            .bind(memory_ref.id)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let next_sequence = query_as::<Postgres, (i64,)>(
+                "SELECT MAX(maximum) + 1 FROM (
+                 SELECT COALESCE(MAX(sequence), 0) AS maximum
+                   FROM embedding_backfill_queue WHERE namespace_id = $1
+                 UNION ALL
+                 SELECT barrier_sequence FROM namespace_embedding_state
+                  WHERE namespace_id = $1
+             ) AS bounds",
+            )
+            .bind(namespace_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?
+            .0;
+            query::<Postgres>(
+                "INSERT INTO embedding_backfill_queue
+             (namespace_id, memory_type, memory_id, source_sha256, sequence,
+              status, last_error)
+             VALUES ($1, $2, $3, $4, $5, 'pending', NULL)",
+            )
+            .bind(namespace_id)
+            .bind(memory_type_str(memory_ref.memory_type))
+            .bind(memory_ref.id)
+            .bind(source_sha256)
+            .bind(next_sequence)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+        }
+        after = page.last().map(|row| row.0);
+        let complete = page.len() < MEMORY_PAGE_SIZE;
+        drop(page);
+        if complete {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Serialize embedding coverage changes in one namespace.
+///
+/// Every caller must take this durable row first, then lifecycle state, then
+/// source/embedding/queue rows. Unlike a possibly absent lifecycle row, the
+/// namespace row exists before any source or migration transition can begin.
+async fn lock_namespace_embedding_serialization_pg_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    namespace_id: Uuid,
+) -> StorageResult<()> {
+    let namespace =
+        query_as::<Postgres, (Uuid,)>("SELECT id FROM namespaces WHERE id = $1 FOR UPDATE")
+            .bind(namespace_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+    if namespace.is_none() {
+        return Err(StorageError::NotFound(format!("namespace {namespace_id}")));
+    }
+    Ok(())
+}
+
+async fn validate_active_embedding_write_pg_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    memory: &Memory,
+    embeddings: &[EmbeddingRecord],
+) -> StorageResult<()> {
+    let namespace_id = memory_namespace_id(memory);
+    let memory_ref = MemoryRef::from_memory(memory);
+    let state = query_as::<Postgres, (String, Option<String>)>(
+        "SELECT state, active_read_space_id FROM namespace_embedding_state
+         WHERE namespace_id = $1 FOR UPDATE",
+    )
+    .bind(namespace_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?;
+    let Some((phase, active_space)) = state else {
+        let Some(record) = embeddings.first() else {
+            return Ok(());
+        };
+        let has_other_live_sources = query_as::<Postgres, (bool,)>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM (
+                     SELECT 'episodic'::text AS memory_type, id FROM episodic_memories
+                      WHERE namespace_id = $1 AND superseded_by IS NULL AND invalid_at IS NULL
+                     UNION ALL
+                     SELECT 'semantic', id FROM semantic_memories
+                      WHERE namespace_id = $1 AND superseded_by IS NULL AND invalid_at IS NULL
+                     UNION ALL
+                     SELECT 'procedural', id FROM procedural_memories
+                      WHERE namespace_id = $1 AND superseded_by IS NULL AND invalid_at IS NULL
+                     UNION ALL
+                     SELECT 'observation', id FROM observation_memories
+                      WHERE namespace_id = $1 AND superseded_by IS NULL AND invalid_at IS NULL
+                 ) AS sources WHERE memory_type != $2 OR id != $3
+             )",
+        )
+        .bind(namespace_id)
+        .bind(memory_type_str(memory_ref.memory_type))
+        .bind(memory_ref.id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(sqlx_to_io)?
+        .0;
+        if !has_other_live_sources {
+            query::<Postgres>(
+                "INSERT INTO namespace_embedding_state
+                 (namespace_id, active_read_space_id, target_space_id, state,
+                  barrier_sequence, updated_at)
+                 VALUES ($1, $2, NULL, 'active', 0, NOW())",
+            )
+            .bind(namespace_id)
+            .bind(&record.embedding_space_id.0)
+            .execute(&mut **transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+        }
+        return Ok(());
+    };
+    if phase != "active" {
+        return Ok(());
+    }
+    let Some(active_space) = active_space else {
+        return Err(StorageError::Context(
+            "active embedding lifecycle has no active space".into(),
+        ));
+    };
+    if embeddings
+        .iter()
+        .any(|record| record.embedding_space_id.0 == active_space)
+    {
+        return Ok(());
+    }
+    let preserves_active_coverage = query_as::<Postgres, (bool,)>(
+        "SELECT EXISTS(
+             SELECT 1 FROM memory_embeddings
+              WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3
+                AND embedding_space_id = $4 AND source_sha256 = $5
+         )",
+    )
+    .bind(namespace_id)
+    .bind(memory_type_str(memory_ref.memory_type))
+    .bind(memory_ref.id)
+    .bind(&active_space)
+    .bind(canonical_embedding_source_sha256(memory))
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?
+    .0;
+    if preserves_active_coverage {
+        return Ok(());
+    }
+    Err(StorageError::Context(format!(
+        "active embedding space {active_space} requires an atomic embedding for source {}",
+        memory.id()
+    )))
+}
+
+async fn validate_restore_embedding_lifecycle_pg_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    page: &[CapturedMemory],
+) -> StorageResult<()> {
+    let Some(first) = page.first() else {
+        return Ok(());
+    };
+    let namespace_id = memory_namespace_id(&first.memory);
+    let state = query_as::<Postgres, (String, Option<String>)>(
+        "SELECT state, active_read_space_id FROM namespace_embedding_state
+         WHERE namespace_id = $1 FOR UPDATE",
+    )
+    .bind(namespace_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(sqlx_to_io)?;
+    let Some((phase, active_space)) = state else {
+        return Ok(());
+    };
+    if phase != "active" {
+        return Ok(());
+    }
+    let Some(active_space) = active_space else {
+        return Err(StorageError::Context(
+            "active embedding lifecycle has no active space".into(),
+        ));
+    };
+    for captured in page
+        .iter()
+        .filter(|captured| memory_is_live(&captured.memory))
+    {
+        if !captured
+            .embeddings
+            .iter()
+            .any(|record| record.embedding_space_id.0 == active_space)
+        {
+            return Err(StorageError::Context(format!(
+                "active embedding space {active_space} requires explicit restore provenance for source {}",
+                captured.memory.id()
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn memory_page_from_pg_ids(
+    conn: &mut PgConnection,
+    namespace_id: Uuid,
+    rows: Vec<(String, Uuid)>,
+    limit: usize,
+) -> StorageResult<MemoryPage> {
+    let has_more = rows.len() > limit;
+    let refs = rows
+        .into_iter()
+        .take(limit)
+        .map(|(memory_type, id)| {
+            Ok(MemoryRef {
+                memory_type: memory_type_from_str(&memory_type)?,
+                id,
+            })
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    let next_cursor = has_more.then(|| {
+        let memory_ref = refs
+            .last()
+            .copied()
+            .expect("a page with more rows is non-empty");
+        PageCursor {
+            memory_type: memory_ref.memory_type,
+            id: memory_ref.id,
+        }
+    });
+    let mut memories = Vec::with_capacity(refs.len());
+    for memory_ref in refs {
+        if let Some(memory) =
+            load_memory_without_embedding_pg(conn, namespace_id, memory_ref).await?
+        {
+            memories.push(memory);
+        }
+    }
+    Ok(MemoryPage {
+        memories,
+        next_cursor,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // StorageTrait implementation
 // ---------------------------------------------------------------------------
 
 impl StorageTrait for PostgresBackend {
+    fn consolidation_workspace(&self) -> Option<&dyn ConsolidationWorkspace> {
+        Some(self)
+    }
+
+    fn page_namespaces(
+        &self,
+        after: Option<NamespacePageCursor>,
+        limit: usize,
+    ) -> StorageResult<NamespacePage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "namespace page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        let after = after.map_or(Uuid::nil(), |cursor| cursor.id);
+        self.block_on(async {
+            // `namespaces` is deliberately unpolicied: this bounded discovery
+            // query obtains the ids used to scope every subsequent operation.
+            let mut conn = self.conn_with_namespace(UNSCOPED_NAMESPACE).await?;
+            let ids: Vec<Uuid> = query_as::<Postgres, (Uuid,)>(
+                "SELECT id FROM namespaces WHERE id > $1 ORDER BY id LIMIT $2",
+            )
+            .bind(after)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?
+            .into_iter()
+            .map(|(id,)| id)
+            .collect();
+            let next_cursor = (ids.len() == limit)
+                .then(|| ids.last().copied())
+                .flatten()
+                .map(|id| NamespacePageCursor { id });
+            Ok(NamespacePage {
+                namespace_ids: ids,
+                next_cursor,
+            })
+        })
+    }
+
+    fn get_namespace_embedding_state(
+        &self,
+        namespace_id: Uuid,
+    ) -> StorageResult<Option<NamespaceEmbeddingState>> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let row = query_as::<
+                Postgres,
+                (
+                    Uuid,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    i64,
+                    DateTime<Utc>,
+                ),
+            >(
+                "SELECT state.namespace_id, state.active_read_space_id,
+                        state.target_space_id,
+                        active.canonical_identity_json,
+                        target.canonical_identity_json,
+                        state.state, state.barrier_sequence, state.updated_at
+                 FROM namespace_embedding_state AS state
+                 LEFT JOIN embedding_spaces AS active
+                   ON active.id = state.active_read_space_id
+                 LEFT JOIN embedding_spaces AS target
+                   ON target.id = state.target_space_id
+                 WHERE state.namespace_id = $1",
+            )
+            .bind(namespace_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let Some((
+                stored_namespace,
+                active_id,
+                target_id,
+                active,
+                target,
+                phase,
+                barrier_sequence,
+                updated_at,
+            )) = row
+            else {
+                return Ok(None);
+            };
+            let parse_space = |json: Option<String>| -> StorageResult<Option<EmbeddingSpace>> {
+                json.map(|value| serde_json::from_str(&value).map_err(StorageError::from))
+                    .transpose()
+            };
+            let state = NamespaceEmbeddingState {
+                namespace_id: stored_namespace,
+                active_read_space_id: active_id.map(EmbeddingSpaceId),
+                target_space_id: target_id.map(EmbeddingSpaceId),
+                active_read_space: parse_space(active)?,
+                target_space: parse_space(target)?,
+                phase: NamespaceEmbeddingPhase::parse(&phase)?,
+                barrier_sequence,
+                updated_at,
+            };
+            state.validate_joined_space_identities()?;
+            Ok(Some(state))
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "space registration, snapshot queueing, and lifecycle transition share one transaction"
+    )]
+    fn begin_embedding_migration(
+        &self,
+        namespace_id: Uuid,
+        target_space: &EmbeddingSpace,
+    ) -> Result<NamespaceEmbeddingState, MigrationError> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
+            let target_id = target_space.id();
+            let canonical_json = target_space.canonical_json();
+            let class = match target_space.class {
+                crate::embedding_space::EmbeddingClass::Real => "real",
+                crate::embedding_space::EmbeddingClass::Mock => "mock",
+                crate::embedding_space::EmbeddingClass::LegacyUnknown => "legacy_unknown",
+            };
+            query::<Postgres>(
+                "INSERT INTO embedding_spaces
+                 (id, canonical_identity_json, class, dimension, created_at)
+                 VALUES ($1, $2, $3, $4, NOW()) ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(&target_id.0)
+            .bind(&canonical_json)
+            .bind(class)
+            .bind(i32::try_from(target_space.dimensions).map_err(|error| {
+                StorageError::Context(format!(
+                    "embedding dimension {} is not representable: {error}",
+                    target_space.dimensions
+                ))
+            })?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            let registered = query_as::<Postgres, (String,)>(
+                "SELECT canonical_identity_json FROM embedding_spaces WHERE id = $1",
+            )
+            .bind(&target_id.0)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?
+            .0;
+            if registered != canonical_json {
+                return Err(StorageError::Context(format!(
+                    "embedding space {} conflicts with registered canonical provenance",
+                    target_id.0
+                ))
+                .into());
+            }
+            let existing = query_as::<Postgres, (String, Option<String>, Option<String>)>(
+                "SELECT state, active_read_space_id, target_space_id
+                 FROM namespace_embedding_state WHERE namespace_id = $1 FOR UPDATE",
+            )
+            .bind(namespace_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            if let Some((phase, _, target)) = &existing
+                && phase == "backfilling"
+                && target.as_deref() == Some(target_id.0.as_str())
+            {
+                transaction.commit().await.map_err(sqlx_to_io)?;
+                return self
+                    .get_namespace_embedding_state(namespace_id)?
+                    .ok_or_else(|| {
+                        StorageError::Context("migration state disappeared".into()).into()
+                    });
+            }
+            let phase =
+                existing
+                    .as_ref()
+                    .map_or(NamespaceEmbeddingPhase::LexicalOnly, |(phase, _, _)| {
+                        NamespaceEmbeddingPhase::parse(phase)
+                            .unwrap_or(NamespaceEmbeddingPhase::LexicalOnly)
+                    });
+            let previous_active = match (&existing, phase) {
+                (None | Some((_, None, None)), NamespaceEmbeddingPhase::LexicalOnly) => None,
+                (Some((_, Some(active), _)), NamespaceEmbeddingPhase::Active)
+                    if active != &target_id.0 =>
+                {
+                    Some(active.clone())
+                }
+                _ => {
+                    return Err(MigrationError::InvalidTransition {
+                        current: phase,
+                        requested: "start backfill",
+                    });
+                }
+            };
+            query::<Postgres>("DELETE FROM embedding_backfill_queue WHERE namespace_id = $1")
+                .bind(namespace_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
+            let mut sequence = 0_i64;
+            let mut after = None;
+            loop {
+                let page = pg_migration_source_page(
+                    &mut transaction,
+                    namespace_id,
+                    after,
+                    None,
+                    BulkPageKind::EmbeddingMigrationStart,
+                )
+                .await?;
+                if page.is_empty() {
+                    break;
+                }
+                for (memory_ref, source_sha256, _) in page.iter() {
+                    sequence = sequence.checked_add(1).ok_or_else(|| {
+                        StorageError::Context("backfill sequence overflow".into())
+                    })?;
+                    query::<Postgres>(
+                        "INSERT INTO embedding_backfill_queue
+                     (namespace_id, memory_type, memory_id, source_sha256, sequence,
+                      status, last_error)
+                     VALUES ($1, $2, $3, $4, $5, 'pending', NULL)",
+                    )
+                    .bind(namespace_id)
+                    .bind(memory_type_str(memory_ref.memory_type))
+                    .bind(memory_ref.id)
+                    .bind(source_sha256)
+                    .bind(sequence)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(sqlx_to_io)?;
+                }
+                after = page.last().map(|row| row.0);
+                let complete = page.len() < MEMORY_PAGE_SIZE;
+                drop(page);
+                if complete {
+                    break;
+                }
+            }
+            query::<Postgres>(
+                "INSERT INTO namespace_embedding_state
+                 (namespace_id, active_read_space_id, target_space_id, state,
+                  barrier_sequence, updated_at)
+                 VALUES ($1, $2, $3, 'backfilling', $4, NOW())
+                 ON CONFLICT(namespace_id) DO UPDATE SET
+                     active_read_space_id = EXCLUDED.active_read_space_id,
+                     target_space_id = EXCLUDED.target_space_id,
+                     state = 'backfilling',
+                     barrier_sequence = EXCLUDED.barrier_sequence,
+                     updated_at = EXCLUDED.updated_at",
+            )
+            .bind(namespace_id)
+            .bind(previous_active)
+            .bind(&target_id.0)
+            .bind(sequence)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            self.get_namespace_embedding_state(namespace_id)?
+                .ok_or_else(|| {
+                    StorageError::Context("migration state commit disappeared".into()).into()
+                })
+        })
+    }
+
+    fn page_embedding_backfill(
+        &self,
+        namespace_id: Uuid,
+        target_space_id: &EmbeddingSpaceId,
+        limit: usize,
+    ) -> Result<Vec<BackfillItem>, MigrationError> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "embedding backfill page size must be within 1..={MEMORY_PAGE_SIZE}"
+            ))
+            .into());
+        }
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let target = query_as::<Postgres, (Option<String>,)>(
+                "SELECT target_space_id FROM namespace_embedding_state
+                 WHERE namespace_id = $1 AND state = 'backfilling'",
+            )
+            .bind(namespace_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            if target.and_then(|row| row.0).as_deref() != Some(target_space_id.0.as_str()) {
+                return Err(MigrationError::InvalidTransition {
+                    current: NamespaceEmbeddingPhase::LexicalOnly,
+                    requested: "page backfill",
+                });
+            }
+            let rows = query_as::<Postgres, (String, Uuid, String, i64)>(
+                "SELECT memory_type, memory_id, source_sha256, sequence
+                 FROM embedding_backfill_queue
+                 WHERE namespace_id = $1 AND status = 'pending'
+                 ORDER BY sequence, memory_type, memory_id LIMIT $2",
+            )
+            .bind(namespace_id)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let mut page = Vec::with_capacity(rows.len());
+            for (memory_type, id, source_sha256, sequence) in rows {
+                let memory_ref = MemoryRef {
+                    memory_type: memory_type_from_str(&memory_type)?,
+                    id,
+                };
+                page.push(BackfillItem {
+                    namespace_id,
+                    memory: load_memory_without_embedding_pg(&mut conn, namespace_id, memory_ref)
+                        .await?,
+                    memory_ref,
+                    source_sha256,
+                    sequence,
+                });
+            }
+            Ok(page)
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "source lock, stale requeue, generation write, and queue drain share one transaction"
+    )]
+    fn commit_embedding_backfill_page(
+        &self,
+        namespace_id: Uuid,
+        target_space_id: &EmbeddingSpaceId,
+        commits: &[BackfillCommit],
+    ) -> Result<BackfillOutcome, MigrationError> {
+        if commits.len() > MEMORY_PAGE_SIZE {
+            return Err(StorageError::BudgetExceeded(format!(
+                "embedding backfill commit contains more than {MEMORY_PAGE_SIZE} items"
+            ))
+            .into());
+        }
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
+            let state = query_as::<Postgres, (String, Option<String>)>(
+                "SELECT state, target_space_id FROM namespace_embedding_state
+                 WHERE namespace_id = $1 FOR UPDATE",
+            )
+            .bind(namespace_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            if state
+                .as_ref()
+                .map(|value| (value.0.as_str(), value.1.as_deref()))
+                != Some(("backfilling", Some(target_space_id.0.as_str())))
+            {
+                return Err(MigrationError::InvalidTransition {
+                    current: NamespaceEmbeddingPhase::LexicalOnly,
+                    requested: "commit backfill page",
+                });
+            }
+            let mut outcome = BackfillOutcome::default();
+            for commit in commits {
+                if commit.item.namespace_id != namespace_id {
+                    return Err(StorageError::Context(
+                        "backfill commit contains an item from another namespace".into(),
+                    )
+                    .into());
+                }
+                outcome.attempted += 1;
+                let source_exists = lock_typed_source(
+                    &mut transaction,
+                    namespace_id,
+                    commit.item.memory_ref,
+                    SourceLockMode::Generation,
+                )
+                .await?;
+                let current = if source_exists {
+                    load_memory_without_embedding_pg(
+                        &mut transaction,
+                        namespace_id,
+                        commit.item.memory_ref,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+                let Some(memory) = current else {
+                    delete_pg_backfill_item(&mut transaction, namespace_id, &commit.item).await?;
+                    outcome.deleted += 1;
+                    continue;
+                };
+                let current_hash = canonical_embedding_source_sha256(&memory);
+                if current_hash != commit.item.source_sha256 {
+                    delete_pg_backfill_item(&mut transaction, namespace_id, &commit.item).await?;
+                    let next_sequence = query_as::<Postgres, (i64,)>(
+                        "SELECT MAX(maximum) + 1 FROM (
+                             SELECT COALESCE(MAX(sequence), 0) AS maximum
+                               FROM embedding_backfill_queue WHERE namespace_id = $1
+                             UNION ALL
+                             SELECT barrier_sequence FROM namespace_embedding_state
+                              WHERE namespace_id = $1
+                         ) AS bounds",
+                    )
+                    .bind(namespace_id)
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .map_err(sqlx_to_io)?
+                    .0;
+                    query::<Postgres>(
+                        "INSERT INTO embedding_backfill_queue
+                         (namespace_id, memory_type, memory_id, source_sha256, sequence,
+                          status, last_error)
+                         VALUES ($1, $2, $3, $4, $5, 'pending', NULL)",
+                    )
+                    .bind(namespace_id)
+                    .bind(memory_type_str(commit.item.memory_ref.memory_type))
+                    .bind(commit.item.memory_ref.id)
+                    .bind(current_hash)
+                    .bind(next_sequence)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(sqlx_to_io)?;
+                    outcome.requeued += 1;
+                    continue;
+                }
+                let record = commit.record.as_ref().ok_or_else(|| {
+                    StorageError::Context("live backfill source has no embedding record".into())
+                })?;
+                if record.embedding_space_id != *target_space_id {
+                    return Err(StorageError::Context(
+                        "backfill record belongs to a different embedding space".into(),
+                    )
+                    .into());
+                }
+                validate_record_matches_memory(record, &memory)?;
+                insert_embedding_in_pg_tx(&mut transaction, record).await?;
+                delete_pg_backfill_item(&mut transaction, namespace_id, &commit.item).await?;
+                outcome.committed += 1;
+            }
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            Ok(outcome)
+        })
+    }
+
+    fn record_embedding_backfill_failure(
+        &self,
+        namespace_id: Uuid,
+        item: &BackfillItem,
+        error: &str,
+    ) -> Result<(), MigrationError> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            query::<Postgres>(
+                "UPDATE embedding_backfill_queue SET last_error = $1
+                 WHERE namespace_id = $2 AND memory_type = $3 AND memory_id = $4
+                   AND sequence = $5 AND status = 'pending'",
+            )
+            .bind(error)
+            .bind(namespace_id)
+            .bind(memory_type_str(item.memory_ref.memory_type))
+            .bind(item.memory_ref.id)
+            .bind(item.sequence)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(())
+        })
+    }
+
+    fn inspect_embedding_migration_coverage(
+        &self,
+        namespace_id: Uuid,
+        target_space_id: &EmbeddingSpaceId,
+    ) -> Result<(MigrationCoverage, NamespaceEmbeddingState), MigrationError> {
+        let coverage = self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            pg_migration_coverage(
+                &mut conn,
+                namespace_id,
+                target_space_id,
+                BulkPageKind::EmbeddingMigrationVerify,
+            )
+            .await
+        })?;
+        let state = self
+            .get_namespace_embedding_state(namespace_id)?
+            .ok_or_else(|| StorageError::NotFound(format!("embedding state {namespace_id}")))?;
+        Ok((coverage, state))
+    }
+
+    fn verify_embedding_migration(
+        &self,
+        namespace_id: Uuid,
+        target_space_id: &EmbeddingSpaceId,
+    ) -> Result<(MigrationCoverage, NamespaceEmbeddingState), MigrationError> {
+        let coverage = self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
+            let phase = query_as::<Postgres, (String, Option<String>)>(
+                "SELECT state, target_space_id FROM namespace_embedding_state
+                 WHERE namespace_id = $1 FOR UPDATE",
+            )
+            .bind(namespace_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            let current = phase
+                .as_ref()
+                .map_or(NamespaceEmbeddingPhase::LexicalOnly, |value| {
+                    NamespaceEmbeddingPhase::parse(&value.0)
+                        .unwrap_or(NamespaceEmbeddingPhase::LexicalOnly)
+                });
+            if !matches!(
+                current,
+                NamespaceEmbeddingPhase::Backfilling | NamespaceEmbeddingPhase::Ready
+            ) || phase.as_ref().and_then(|value| value.1.as_deref())
+                != Some(target_space_id.0.as_str())
+            {
+                return Err(MigrationError::InvalidTransition {
+                    current,
+                    requested: "verify coverage",
+                });
+            }
+            let coverage = pg_migration_coverage(
+                &mut transaction,
+                namespace_id,
+                target_space_id,
+                BulkPageKind::EmbeddingMigrationVerify,
+            )
+            .await?;
+            if coverage.complete() {
+                query::<Postgres>(
+                    "UPDATE namespace_embedding_state SET state = 'ready', updated_at = NOW()
+                     WHERE namespace_id = $1 AND target_space_id = $2",
+                )
+                .bind(namespace_id)
+                .bind(&target_space_id.0)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
+            } else {
+                enqueue_uncovered_pg_sources(&mut transaction, namespace_id, target_space_id)
+                    .await?;
+                query::<Postgres>(
+                    "UPDATE namespace_embedding_state
+                     SET state = 'backfilling', updated_at = NOW()
+                     WHERE namespace_id = $1 AND target_space_id = $2",
+                )
+                .bind(namespace_id)
+                .bind(&target_space_id.0)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
+            }
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            Ok(coverage)
+        })?;
+        let state = self
+            .get_namespace_embedding_state(namespace_id)?
+            .ok_or_else(|| StorageError::Context("verified migration state disappeared".into()))?;
+        Ok((coverage, state))
+    }
+
+    fn activate_embedding_migration(
+        &self,
+        namespace_id: Uuid,
+        target_space_id: &EmbeddingSpaceId,
+        runtime_space_id: &EmbeddingSpaceId,
+    ) -> Result<NamespaceEmbeddingState, MigrationError> {
+        if runtime_space_id != target_space_id {
+            return Err(MigrationError::RuntimeSpaceMismatch {
+                runtime: runtime_space_id.0.clone(),
+                target: target_space_id.0.clone(),
+            });
+        }
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
+            let phase = query_as::<Postgres, (String, Option<String>, Option<String>)>(
+                "SELECT state, active_read_space_id, target_space_id FROM namespace_embedding_state
+                 WHERE namespace_id = $1 FOR UPDATE",
+            )
+            .bind(namespace_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            let current = phase
+                .as_ref()
+                .map_or(NamespaceEmbeddingPhase::LexicalOnly, |value| {
+                    NamespaceEmbeddingPhase::parse(&value.0)
+                        .unwrap_or(NamespaceEmbeddingPhase::LexicalOnly)
+                });
+            if current != NamespaceEmbeddingPhase::Ready
+                || phase.as_ref().and_then(|value| value.2.as_deref())
+                    != Some(target_space_id.0.as_str())
+            {
+                return Err(MigrationError::InvalidTransition {
+                    current,
+                    requested: "activate",
+                });
+            }
+            let coverage = pg_migration_coverage(
+                &mut transaction,
+                namespace_id,
+                target_space_id,
+                BulkPageKind::EmbeddingMigrationActivate,
+            )
+            .await?;
+            if !coverage.complete() {
+                return Err(coverage.into());
+            }
+            query::<Postgres>(
+                "UPDATE namespace_embedding_state
+                 SET target_space_id = COALESCE(active_read_space_id, $1),
+                     active_read_space_id = $1,
+                     state = 'active', updated_at = NOW()
+                 WHERE namespace_id = $2 AND state = 'ready' AND target_space_id = $1",
+            )
+            .bind(&target_space_id.0)
+            .bind(namespace_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            self.get_namespace_embedding_state(namespace_id)?
+                .ok_or_else(|| {
+                    StorageError::Context("activated migration state disappeared".into()).into()
+                })
+        })
+    }
+
+    fn rollback_embedding_migration_to_lexical(
+        &self,
+        namespace_id: Uuid,
+    ) -> Result<NamespaceEmbeddingState, MigrationError> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
+            let state = query_as::<Postgres, (String, Option<String>, Option<String>)>(
+                "SELECT state, active_read_space_id, target_space_id
+                 FROM namespace_embedding_state
+                 WHERE namespace_id = $1 FOR UPDATE",
+            )
+            .bind(namespace_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            let current = state
+                .as_ref()
+                .map_or(NamespaceEmbeddingPhase::LexicalOnly, |value| {
+                    NamespaceEmbeddingPhase::parse(&value.0)
+                        .unwrap_or(NamespaceEmbeddingPhase::LexicalOnly)
+                });
+            if current != NamespaceEmbeddingPhase::Active
+                || state
+                    .as_ref()
+                    .is_none_or(|(_, active, target)| active.is_none() || active != target)
+            {
+                return Err(MigrationError::InvalidTransition {
+                    current,
+                    requested: "rollback first migration",
+                });
+            }
+            query::<Postgres>(
+                "UPDATE namespace_embedding_state
+                 SET active_read_space_id = NULL, target_space_id = NULL,
+                     state = 'lexical_only', updated_at = NOW()
+                 WHERE namespace_id = $1",
+            )
+            .bind(namespace_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            query::<Postgres>("DELETE FROM embedding_backfill_queue WHERE namespace_id = $1")
+                .bind(namespace_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            self.get_namespace_embedding_state(namespace_id)?
+                .ok_or_else(|| {
+                    StorageError::Context("rolled back migration state disappeared".into()).into()
+                })
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transaction keeps deadline, validation, exact query, and fail-closed decoding inseparable"
+    )]
+    fn search_vector(
+        &self,
+        request: &VectorSearchRequest<'_>,
+    ) -> StorageResult<VectorSearchOutcome> {
+        self.search_vector_filtered(request, &MemoryFilter::legacy_first_stage())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transaction keeps deadline, validation, exact query, and fail-closed decoding inseparable"
+    )]
+    fn search_vector_filtered(
+        &self,
+        request: &VectorSearchRequest<'_>,
+        filter: &MemoryFilter,
+    ) -> StorageResult<VectorSearchOutcome> {
+        if !(1..=MAX_VECTOR_HITS).contains(&request.k) {
+            return Err(StorageError::Context(format!(
+                "vector search k must be within 1..={MAX_VECTOR_HITS}, got {}",
+                request.k
+            )));
+        }
+        let timeout_budget = StatementTimeoutBudget::new(request.deadline);
+        if timeout_budget.remaining_ms().is_none() {
+            return Ok(VectorSearchOutcome::Unavailable(
+                SearchUnavailable::DeadlineExceeded,
+            ));
+        }
+
+        self.block_on(async {
+            let mut conn = self.scoped_conn(request.scope.namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            let Some(timeout_ms) = timeout_budget.remaining_ms() else {
+                return Ok(VectorSearchOutcome::Unavailable(
+                    SearchUnavailable::DeadlineExceeded,
+                ));
+            };
+            if let Err(error) =
+                query::<Postgres>("SELECT set_config('statement_timeout', $1, true)")
+                    .bind(statement_timeout_value(timeout_ms))
+                    .execute(&mut *transaction)
+                    .await
+            {
+                if let Some(reason) = vector_error_reason(&error) {
+                    return Ok(VectorSearchOutcome::Unavailable(reason));
+                }
+                return Err(sqlx_to_io(error));
+            }
+
+            let lifecycle = match query_as::<Postgres, (String, Option<String>, Option<i32>)>(
+                "SELECT lifecycle.state, lifecycle.active_read_space_id, spaces.dimension
+                 FROM namespace_embedding_state AS lifecycle
+                 LEFT JOIN embedding_spaces AS spaces ON spaces.id = $2
+                 WHERE lifecycle.namespace_id = $1",
+            )
+            .bind(request.scope.namespace_id)
+            .bind(&request.embedding_space_id.0)
+            .fetch_optional(&mut *transaction)
+            .await
+            {
+                Ok(state) => state,
+                Err(error) => {
+                    if let Some(reason) = vector_error_reason(&error) {
+                        return Ok(VectorSearchOutcome::Unavailable(reason));
+                    }
+                    return Err(sqlx_to_io(error));
+                }
+            };
+            let expected_dimension = match lifecycle {
+                Some((phase, Some(active_space), dimension))
+                    if phase == "active" && active_space == request.embedding_space_id.0 =>
+                {
+                    let Some(dimension) = dimension else {
+                        return Ok(VectorSearchOutcome::Unavailable(
+                            SearchUnavailable::NoActiveEmbeddingSpace,
+                        ));
+                    };
+                    dimension
+                }
+                Some((phase, Some(_), _)) if phase == "active" => {
+                    return Ok(VectorSearchOutcome::Unavailable(
+                        SearchUnavailable::RuntimeSpaceMismatch,
+                    ));
+                }
+                _ => {
+                    return Ok(VectorSearchOutcome::Unavailable(
+                        SearchUnavailable::NoActiveEmbeddingSpace,
+                    ));
+                }
+            };
+            let Ok(expected_dimension) = usize::try_from(expected_dimension) else {
+                return Ok(VectorSearchOutcome::Unavailable(
+                    SearchUnavailable::InvalidStoredVector,
+                ));
+            };
+            if request.query_embedding.len() != expected_dimension
+                || request
+                    .query_embedding
+                    .iter()
+                    .any(|value| !value.is_finite())
+            {
+                return Err(StorageError::Context(format!(
+                    "query embedding must contain {expected_dimension} finite components"
+                )));
+            }
+            if request.query_embedding.iter().all(|value| *value == 0.0) {
+                if timeout_budget.remaining_ms().is_none() {
+                    return Ok(VectorSearchOutcome::Unavailable(
+                        SearchUnavailable::DeadlineExceeded,
+                    ));
+                }
+                let lifecycle = query_as::<Postgres, (String, Option<String>)>(
+                    "SELECT state, active_read_space_id FROM namespace_embedding_state
+                     WHERE namespace_id = $1",
+                )
+                .bind(request.scope.namespace_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
+                match lifecycle {
+                    Some((phase, Some(active_space)))
+                        if phase == "active" && active_space == request.embedding_space_id.0 => {}
+                    Some((phase, Some(_))) if phase == "active" => {
+                        return Ok(VectorSearchOutcome::Unavailable(
+                            SearchUnavailable::RuntimeSpaceMismatch,
+                        ));
+                    }
+                    _ => {
+                        return Ok(VectorSearchOutcome::Unavailable(
+                            SearchUnavailable::NoActiveEmbeddingSpace,
+                        ));
+                    }
+                }
+                transaction.commit().await.map_err(sqlx_to_io)?;
+                return Ok(VectorSearchOutcome::Complete(Vec::new()));
+            }
+
+            let query_embedding = embedding_to_pgtext(request.query_embedding)
+                .expect("a dimension-validated query embedding is non-empty");
+            let Some(timeout_ms) = timeout_budget.remaining_ms() else {
+                return Ok(VectorSearchOutcome::Unavailable(
+                    SearchUnavailable::DeadlineExceeded,
+                ));
+            };
+            if let Err(error) =
+                query::<Postgres>("SELECT set_config('statement_timeout', $1, true)")
+                    .bind(statement_timeout_value(timeout_ms))
+                    .execute(&mut *transaction)
+                    .await
+            {
+                if let Some(reason) = vector_error_reason(&error) {
+                    return Ok(VectorSearchOutcome::Unavailable(reason));
+                }
+                return Err(sqlx_to_io(error));
+            }
+            let (identity_mode, agent, user) = request.scope.identity_sql_parts();
+            let (entity_mode, entity) = request.scope.entity_sql_parts();
+            let (preferred_quota, broad_quota) = request.scope.entity_quotas(request.k);
+            let (episodic, semantic, procedural, _, min_confidence) = filter.sql_parts();
+            let rows: Vec<PgVectorSearchRow> =
+                match query_as::<Postgres, _>(POSTGRES_VECTOR_SEARCH_SQL)
+                    .bind(query_embedding)
+                    .bind(request.scope.namespace_id)
+                    .bind(&request.embedding_space_id.0)
+                    .bind(identity_mode)
+                    .bind(agent)
+                    .bind(user)
+                    .bind(entity_mode)
+                    .bind(entity)
+                    .bind(i64::try_from(preferred_quota).unwrap_or(i64::MAX))
+                    .bind(i64::try_from(broad_quota).unwrap_or(i64::MAX))
+                    .bind(i64::try_from(request.k).unwrap_or(i64::MAX))
+                    .bind(episodic)
+                    .bind(semantic)
+                    .bind(procedural)
+                    .bind(min_confidence)
+                    .fetch_all(&mut *transaction)
+                    .await
+                {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        if let Some(reason) = vector_error_reason(&error) {
+                            return Ok(VectorSearchOutcome::Unavailable(reason));
+                        }
+                        return Err(sqlx_to_io(error));
+                    }
+                };
+            let Some((_, _, _, _, phase, active_space)) = rows.first() else {
+                return Ok(VectorSearchOutcome::Unavailable(
+                    SearchUnavailable::NoActiveEmbeddingSpace,
+                ));
+            };
+            if phase == "active"
+                && active_space.as_deref() != Some(request.embedding_space_id.0.as_str())
+            {
+                return Ok(VectorSearchOutcome::Unavailable(
+                    SearchUnavailable::RuntimeSpaceMismatch,
+                ));
+            }
+            if phase != "active" {
+                return Ok(VectorSearchOutcome::Unavailable(
+                    SearchUnavailable::NoActiveEmbeddingSpace,
+                ));
+            }
+            if rows.len() > request.k || rows.iter().any(|row| row.3 == Some(true)) {
+                return Ok(VectorSearchOutcome::Unavailable(
+                    SearchUnavailable::InvalidStoredVector,
+                ));
+            }
+            let mut hits = Vec::with_capacity(rows.len());
+            for (memory_type, id, score, _invalid_stored_vector, _, _) in rows {
+                let (Some(memory_type), Some(id)) = (memory_type, id) else {
+                    continue;
+                };
+                let memory_type = match memory_type {
+                    0 => MemoryType::Episodic,
+                    1 => MemoryType::Semantic,
+                    2 => MemoryType::Procedural,
+                    _ => {
+                        return Ok(VectorSearchOutcome::Unavailable(
+                            SearchUnavailable::InvalidStoredVector,
+                        ));
+                    }
+                };
+                let Some(score) = score else {
+                    return Ok(VectorSearchOutcome::Unavailable(
+                        SearchUnavailable::InvalidStoredVector,
+                    ));
+                };
+                let score = score as f32;
+                if !score.is_finite() {
+                    return Ok(VectorSearchOutcome::Unavailable(
+                        SearchUnavailable::InvalidStoredVector,
+                    ));
+                }
+                hits.push(VectorHit {
+                    memory_ref: MemoryRef { memory_type, id },
+                    score,
+                });
+            }
+            if timeout_budget.remaining_ms().is_none() {
+                return Ok(VectorSearchOutcome::Unavailable(
+                    SearchUnavailable::DeadlineExceeded,
+                ));
+            }
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            if std::time::Instant::now() >= request.deadline {
+                return Ok(VectorSearchOutcome::Unavailable(
+                    SearchUnavailable::DeadlineExceeded,
+                ));
+            }
+            Ok(VectorSearchOutcome::Complete(hits))
+        })
+    }
+
+    fn search_lexical_hits(
+        &self,
+        query_str: &str,
+        scope: &SearchScope,
+        limit: usize,
+    ) -> StorageResult<Vec<LexicalHit>> {
+        self.search_lexical_hits_filtered(
+            query_str,
+            scope,
+            &MemoryFilter::legacy_first_stage(),
+            limit,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn search_lexical_hits_filtered(
+        &self,
+        query_str: &str,
+        scope: &SearchScope,
+        filter: &MemoryFilter,
+        limit: usize,
+    ) -> StorageResult<Vec<LexicalHit>> {
+        let tokens = lexical_query_tokens(query_str);
+        let limit = limit.min(MAX_LEXICAL_HITS);
+        if tokens.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let tsquery = or_tsquery_fragment(14, tokens.len());
+        let sql = format!(
+            "WITH candidates AS ( \
+                 SELECT 'episodic' AS memory_type, id, ts_rank(fts_content, {tsquery}) AS score, \
+                        $6::smallint = 2 AND COALESCE((about_entity = $7 \
+                            OR source_entity = $7), FALSE) \
+                            AS entity_preferred \
+                 FROM episodic_memories \
+                 WHERE namespace_id = $1 \
+                   AND ($3::smallint = 0 \
+                        OR ($3 = 1 AND agent_id IS NOT DISTINCT FROM $4 \
+                                   AND user_id IS NOT DISTINCT FROM $5) \
+                        OR ($3 = 2 AND agent_id = $4)) \
+                   AND ($6::smallint = 0 OR $6 = 2 OR ($6 = 1 \
+                        AND (about_entity = $7 OR source_entity = $7))) \
+                   AND $10 AND ($13::real IS NULL OR 1.0 >= $13) \
+                   AND superseded_by IS NULL AND invalid_at IS NULL \
+                   AND fts_content @@ {tsquery} \
+                 UNION ALL \
+                 SELECT 'semantic', id, ts_rank(fts_content, {tsquery}), \
+                        $6::smallint = 2 AND COALESCE((subject = $7 \
+                            OR object_entity = $7), FALSE) \
+                 FROM semantic_memories \
+                 WHERE namespace_id = $1 \
+                   AND ($3::smallint = 0 \
+                        OR ($3 = 1 AND agent_id IS NOT DISTINCT FROM $4 \
+                                   AND user_id IS NOT DISTINCT FROM $5) \
+                        OR ($3 = 2 AND agent_id = $4)) \
+                   AND ($6::smallint = 0 OR $6 = 2 OR ($6 = 1 \
+                        AND (subject = $7 OR object_entity = $7))) \
+                   AND $11 AND ($13::real IS NULL OR confidence >= $13) \
+                   AND superseded_by IS NULL AND invalid_at IS NULL \
+                   AND fts_content @@ {tsquery} \
+                 UNION ALL \
+                 SELECT 'procedural', id, ts_rank(fts_content, {tsquery}), false \
+                 FROM procedural_memories \
+                 WHERE namespace_id = $1 \
+                   AND ($3::smallint = 0 \
+                        OR ($3 = 1 AND agent_id IS NOT DISTINCT FROM $4 \
+                                   AND user_id IS NOT DISTINCT FROM $5) \
+                        OR ($3 = 2 AND agent_id = $4)) \
+                   AND ($6::smallint = 0 OR $6 = 2) \
+                   AND $12 AND ($13::real IS NULL OR reliability >= $13) \
+                   AND superseded_by IS NULL AND invalid_at IS NULL \
+                   AND fts_content @@ {tsquery} \
+             ), ranked AS ( \
+                 SELECT memory_type, id, score, entity_preferred, \
+                        row_number() OVER (PARTITION BY entity_preferred \
+                            ORDER BY score DESC, CASE memory_type \
+                                WHEN 'episodic' THEN 0 WHEN 'semantic' THEN 1 \
+                                WHEN 'procedural' THEN 2 ELSE 3 END, id) \
+                            AS entity_rank \
+                 FROM candidates \
+             ) \
+             SELECT memory_type, id, score FROM ranked \
+             WHERE $6::smallint <> 2 \
+                OR (entity_preferred AND entity_rank <= $8) \
+                OR (NOT entity_preferred AND entity_rank <= $9) \
+             ORDER BY score DESC, CASE memory_type \
+                 WHEN 'episodic' THEN 0 WHEN 'semantic' THEN 1 \
+                 WHEN 'procedural' THEN 2 ELSE 3 END, id \
+             LIMIT $2"
+        );
+        self.block_on(async {
+            let mut conn = self.scoped_conn(scope.namespace_id).await?;
+            let (identity_mode, agent, user) = scope.identity_sql_parts();
+            let (entity_mode, entity) = scope.entity_sql_parts();
+            let (preferred_quota, broad_quota) = scope.entity_quotas(limit);
+            let (episodic, semantic, procedural, _, min_confidence) = filter.sql_parts();
+            let mut query = query_as::<Postgres, (String, Uuid, f32)>(AssertSqlSafe(sql))
+                .bind(scope.namespace_id)
+                .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+                .bind(identity_mode)
+                .bind(agent)
+                .bind(user)
+                .bind(entity_mode)
+                .bind(entity)
+                .bind(i64::try_from(preferred_quota).unwrap_or(i64::MAX))
+                .bind(i64::try_from(broad_quota).unwrap_or(i64::MAX))
+                .bind(episodic)
+                .bind(semantic)
+                .bind(procedural)
+                .bind(min_confidence);
+            for token in &tokens {
+                query = query.bind(token);
+            }
+            let rows = query.fetch_all(&mut *conn).await.map_err(sqlx_to_io)?;
+            rows.into_iter()
+                .enumerate()
+                .map(|(index, (memory_type, id, _score))| {
+                    Ok(LexicalHit {
+                        memory_ref: MemoryRef {
+                            memory_type: memory_type_from_str(&memory_type)?,
+                            id,
+                        },
+                        rank: index + 1,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn hydrate_memories(
+        &self,
+        namespace_id: Uuid,
+        memory_refs: &[MemoryRef],
+        max_bytes: usize,
+    ) -> StorageResult<Vec<Memory>> {
+        if memory_refs.len() > MAX_FUSED_HITS {
+            return Err(StorageError::BudgetExceeded(format!(
+                "memory hydration accepts at most {MAX_FUSED_HITS} references"
+            )));
+        }
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut memories = Vec::with_capacity(memory_refs.len());
+            let max_bytes = max_bytes.min(MAX_HYDRATED_BYTES);
+            let mut total_bytes = 0_usize;
+            for memory_ref in memory_refs {
+                if let Some(memory) =
+                    load_memory_without_embedding_pg(&mut conn, namespace_id, *memory_ref).await?
+                {
+                    let memory_bytes = serde_json::to_vec(&memory)?.len();
+                    total_bytes = total_bytes.checked_add(memory_bytes).ok_or_else(|| {
+                        StorageError::BudgetExceeded(
+                            "hydrated payload byte count overflowed usize".into(),
+                        )
+                    })?;
+                    if total_bytes > max_bytes {
+                        return Err(StorageError::BudgetExceeded(format!(
+                            "hydrated payload exceeds {max_bytes} bytes"
+                        )));
+                    }
+                    memories.push(memory);
+                }
+            }
+            Ok(memories)
+        })
+    }
+
+    fn load_embedding_records(
+        &self,
+        namespace_id: Uuid,
+        embedding_space_id: &EmbeddingSpaceId,
+        memory_refs: &[MemoryRef],
+    ) -> StorageResult<Vec<EmbeddingRecord>> {
+        if memory_refs.len() > MAX_FUSED_HITS {
+            return Err(StorageError::BudgetExceeded(format!(
+                "embedding load accepts at most {MAX_FUSED_HITS} references"
+            )));
+        }
+        let unique_refs = memory_refs.iter().copied().collect::<BTreeSet<_>>();
+        if unique_refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let memory_types = unique_refs
+            .iter()
+            .map(|memory_ref| memory_type_str(memory_ref.memory_type).to_owned())
+            .collect::<Vec<_>>();
+        let memory_ids = unique_refs
+            .iter()
+            .map(|memory_ref| memory_ref.id)
+            .collect::<Vec<_>>();
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let rows: Vec<(String, Uuid, String, String, i32)> = query_as::<Postgres, _>(
+                r"SELECT e.memory_type, e.memory_id, e.source_sha256,
+                          e.embedding::text, s.dimension
+                   FROM unnest($3::text[], $4::uuid[]) AS requested(memory_type, memory_id)
+                   JOIN memory_embeddings e
+                     ON e.memory_type = requested.memory_type
+                    AND e.memory_id = requested.memory_id
+                   JOIN embedding_spaces s ON s.id = e.embedding_space_id
+                   WHERE e.namespace_id = $1 AND e.embedding_space_id = $2
+                   ORDER BY CASE e.memory_type
+                       WHEN 'episodic' THEN 0 WHEN 'semantic' THEN 1
+                       WHEN 'procedural' THEN 2 ELSE 3 END, e.memory_id",
+            )
+            .bind(namespace_id)
+            .bind(&embedding_space_id.0)
+            .bind(&memory_types)
+            .bind(&memory_ids)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let mut records = Vec::with_capacity(rows.len());
+            for (memory_type, id, source_sha256, encoded, dimension) in rows {
+                let memory_ref = MemoryRef {
+                    memory_type: memory_type_from_str(&memory_type)?,
+                    id,
+                };
+                if !unique_refs.contains(&memory_ref) {
+                    return Err(StorageError::Context(format!(
+                        "embedding load returned an unrequested key {memory_ref:?}"
+                    )));
+                }
+                let embedding = pgtext_to_embedding(Some(&encoded));
+                if usize::try_from(dimension).ok() != Some(embedding.len())
+                    || embedding.is_empty()
+                    || embedding.iter().any(|value| !value.is_finite())
+                {
+                    return Err(StorageError::Context(format!(
+                        "embedding for {id} does not match its registered finite dimension"
+                    )));
+                }
+                records.push(EmbeddingRecord {
+                    namespace_id,
+                    memory_ref,
+                    embedding_space_id: embedding_space_id.clone(),
+                    source_sha256,
+                    embedding,
+                });
+            }
+            Ok(records)
+        })
+    }
+
+    fn page_memories(&self, request: &MemoryPageRequest) -> StorageResult<MemoryPage> {
+        self.page_memories_filtered(request, None)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one typed union applies every scope mode before cursor order and the page limit"
+    )]
+    fn page_memories_filtered(
+        &self,
+        request: &MemoryPageRequest,
+        memory_type: Option<MemoryType>,
+    ) -> StorageResult<MemoryPage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&request.limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "memory page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        let after_type = request
+            .after
+            .as_ref()
+            .map_or(-1, |cursor| memory_type_order(cursor.memory_type));
+        let after_id = request
+            .after
+            .as_ref()
+            .map_or(Uuid::nil(), |cursor| cursor.id);
+        self.block_on(async {
+            let mut conn = self.scoped_conn(request.scope.namespace_id).await?;
+            let (identity_mode, agent, user) = request.scope.identity_sql_parts();
+            let (entity_mode, entity) = request.scope.entity_sql_parts();
+            let rows: Vec<(String, Uuid)> = query_as::<Postgres, _>(
+                r"SELECT memory_type, id FROM (
+                       SELECT 0 AS type_order, 'episodic'::text AS memory_type, id
+                       FROM episodic_memories
+                       WHERE namespace_id = $1
+                         AND ($2::smallint = 0 OR ($2 = 1
+                              AND agent_id IS NOT DISTINCT FROM $3
+                              AND user_id IS NOT DISTINCT FROM $4)
+                              OR ($2 = 2 AND agent_id = $3))
+                         AND ($5::smallint = 0 OR $5 = 2 OR ($5 = 1
+                              AND (about_entity = $6 OR source_entity = $6)))
+                         AND ($7 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                       UNION ALL
+                       SELECT 1, 'semantic', id FROM semantic_memories
+                       WHERE namespace_id = $1
+                         AND ($2::smallint = 0 OR ($2 = 1
+                              AND agent_id IS NOT DISTINCT FROM $3
+                              AND user_id IS NOT DISTINCT FROM $4)
+                              OR ($2 = 2 AND agent_id = $3))
+                         AND ($5::smallint = 0 OR $5 = 2 OR ($5 = 1
+                              AND (subject = $6 OR object_entity = $6)))
+                         AND ($7 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                       UNION ALL
+                       SELECT 2, 'procedural', id FROM procedural_memories
+                       WHERE namespace_id = $1
+                         AND ($2::smallint = 0 OR ($2 = 1
+                              AND agent_id IS NOT DISTINCT FROM $3
+                              AND user_id IS NOT DISTINCT FROM $4)
+                              OR ($2 = 2 AND agent_id = $3))
+                         AND ($5::smallint = 0 OR $5 = 2)
+                         AND ($7 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                       UNION ALL
+                       SELECT 3, 'observation', id FROM observation_memories
+                       WHERE namespace_id = $1
+                         AND ($2::smallint = 0 OR ($2 = 1
+                              AND agent_id IS NOT DISTINCT FROM $3
+                              AND user_id IS NOT DISTINCT FROM $4)
+                              OR ($2 = 2 AND agent_id = $3))
+                         AND ($5::smallint = 0 OR $5 = 2)
+                         AND ($7 OR (superseded_by IS NULL AND invalid_at IS NULL))
+                   ) AS memories
+                   WHERE ($10::smallint IS NULL OR type_order = $10)
+                     AND (type_order > $8 OR (type_order = $8 AND id > $9))
+                   ORDER BY type_order, id
+                   LIMIT $11",
+            )
+            .bind(request.scope.namespace_id)
+            .bind(identity_mode)
+            .bind(agent)
+            .bind(user)
+            .bind(entity_mode)
+            .bind(entity)
+            .bind(request.include_superseded)
+            .bind(after_type)
+            .bind(after_id)
+            .bind(memory_type.map(memory_type_order))
+            .bind(i64::try_from(request.limit + 1).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let has_more = rows.len() > request.limit;
+            let refs = rows
+                .into_iter()
+                .take(request.limit)
+                .map(|(memory_type, id)| {
+                    Ok(MemoryRef {
+                        memory_type: memory_type_from_str(&memory_type)?,
+                        id,
+                    })
+                })
+                .collect::<StorageResult<Vec<_>>>()?;
+            let next_cursor = has_more.then(|| {
+                let memory_ref = refs
+                    .last()
+                    .copied()
+                    .expect("a page with more rows is non-empty");
+                PageCursor {
+                    memory_type: memory_ref.memory_type,
+                    id: memory_ref.id,
+                }
+            });
+            let mut memories = Vec::with_capacity(refs.len());
+            for memory_ref in refs {
+                if let Some(memory) = load_memory_without_embedding_pg(
+                    &mut conn,
+                    request.scope.namespace_id,
+                    memory_ref,
+                )
+                .await?
+                {
+                    memories.push(memory);
+                }
+            }
+            Ok(MemoryPage {
+                memories,
+                next_cursor,
+            })
+        })
+    }
+
+    fn page_entity_memories(
+        &self,
+        namespace_id: Uuid,
+        entity_id: Uuid,
+        entity_instance: &str,
+        after: Option<PageCursor>,
+        limit: usize,
+        include_superseded: bool,
+    ) -> StorageResult<MemoryPage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "entity memory page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        let after_type = after
+            .as_ref()
+            .map_or(-1, |cursor| memory_type_order(cursor.memory_type));
+        let after_id = after.as_ref().map_or(Uuid::nil(), |cursor| cursor.id);
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let rows: Vec<(String, Uuid)> = query_as::<Postgres, _>(
+                r"SELECT memory_type, id FROM (
+                       SELECT 0 AS type_order, 'episodic'::text AS memory_type, id
+                       FROM episodic_memories
+                       WHERE namespace_id = $1
+                         AND about_entity = $2
+                         AND ($4 OR superseded_by IS NULL)
+                       UNION ALL
+                       SELECT 1, 'semantic', id FROM semantic_memories
+                       WHERE namespace_id = $1
+                         AND subject = $2
+                         AND ($4 OR superseded_by IS NULL)
+                       UNION ALL
+                       SELECT 3, 'observation', id FROM observation_memories
+                       WHERE namespace_id = $1 AND instance = $3
+                         AND ($4 OR superseded_by IS NULL)
+                   ) AS memories
+                   WHERE type_order > $5 OR (type_order = $5 AND id > $6)
+                   ORDER BY type_order, id
+                   LIMIT $7",
+            )
+            .bind(namespace_id)
+            .bind(entity_id)
+            .bind(entity_instance)
+            .bind(include_superseded)
+            .bind(after_type)
+            .bind(after_id)
+            .bind(i64::try_from(limit + 1).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            memory_page_from_pg_ids(&mut conn, namespace_id, rows, limit).await
+        })
+    }
+
+    fn page_gdpr_personal_data(
+        &self,
+        namespace_id: Uuid,
+        entity_id: Uuid,
+        after: Option<PageCursor>,
+        limit: usize,
+    ) -> StorageResult<MemoryPage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "GDPR memory page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        let after_type = after
+            .as_ref()
+            .map_or(-1, |cursor| memory_type_order(cursor.memory_type));
+        let after_id = after.as_ref().map_or(Uuid::nil(), |cursor| cursor.id);
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let rows: Vec<(String, Uuid)> = query_as::<Postgres, _>(
+                r"SELECT memory_type, id FROM (
+                       SELECT 0 AS type_order, 'episodic'::text AS memory_type, id
+                       FROM episodic_memories
+                       WHERE namespace_id = $1
+                         AND (about_entity = $2 OR source_entity = $2)
+                         AND superseded_by IS NULL
+                       UNION ALL
+                       SELECT 1, 'semantic', id FROM semantic_memories
+                       WHERE namespace_id = $1 AND subject = $2 AND superseded_by IS NULL
+                       UNION ALL
+                       SELECT 3, 'observation', o.id
+                       FROM observation_memories AS o
+                       WHERE o.namespace_id = $1 AND o.superseded_by IS NULL AND EXISTS (
+                           SELECT 1 FROM episodic_memories AS e
+                           WHERE e.namespace_id = $1 AND e.episode_id = o.episode_id
+                             AND (e.about_entity = $2 OR e.source_entity = $2)
+                             AND e.superseded_by IS NULL
+                       )
+                   ) AS memories
+                   WHERE type_order > $3 OR (type_order = $3 AND id > $4)
+                   ORDER BY type_order, id
+                   LIMIT $5",
+            )
+            .bind(namespace_id)
+            .bind(entity_id)
+            .bind(after_type)
+            .bind(after_id)
+            .bind(i64::try_from(limit + 1).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            memory_page_from_pg_ids(&mut conn, namespace_id, rows, limit).await
+        })
+    }
+
+    fn save_memory_with_embedding(
+        &self,
+        memory: &Memory,
+        embedding: Option<&EmbeddingRecord>,
+    ) -> StorageResult<()> {
+        if let Some(record) = embedding {
+            validate_record_matches_memory(record, memory)?;
+        }
+        let namespace_id = memory_namespace_id(memory);
+        self.block_on(async {
+            let mut conn = self.conn_with_namespace(UNSCOPED_NAMESPACE).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            query::<Postgres>("SELECT set_config('pensyve.namespace_id', $1, true)")
+                .bind(namespace_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
+            validate_active_embedding_write_pg_tx(
+                &mut transaction,
+                memory,
+                embedding.map_or(&[], std::slice::from_ref),
+            )
+            .await?;
+            save_memory_in_pg_tx(&mut transaction, memory).await?;
+            reconcile_embedding_source_in_pg_tx(&mut transaction, memory).await?;
+            if let Some(record) = embedding {
+                insert_embedding_in_pg_tx(&mut transaction, record).await?;
+            }
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            Ok(())
+        })
+    }
+
+    fn restore_memory_page(&self, page: &[CapturedMemory]) -> StorageResult<()> {
+        if page.len() > MEMORY_PAGE_SIZE {
+            return Err(StorageError::BudgetExceeded(format!(
+                "restore page contains {} rows; maximum is {MEMORY_PAGE_SIZE}",
+                page.len()
+            )));
+        }
+        for captured in page {
+            for record in &captured.embeddings {
+                validate_record_matches_memory(record, &captured.memory)?;
+            }
+        }
+        let Some(first) = page.first() else {
+            return Ok(());
+        };
+        let namespace_id = memory_namespace_id(&first.memory);
+        if page
+            .iter()
+            .any(|captured| memory_namespace_id(&captured.memory) != namespace_id)
+        {
+            return Err(StorageError::Context(
+                "restore page spans multiple namespaces".into(),
+            ));
+        }
+        self.block_on(async {
+            let mut conn = self.conn_with_namespace(UNSCOPED_NAMESPACE).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            query::<Postgres>("SELECT set_config('pensyve.namespace_id', $1, true)")
+                .bind(namespace_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
+            validate_restore_embedding_lifecycle_pg_tx(&mut transaction, page).await?;
+            for captured in page {
+                save_memory_in_pg_tx(&mut transaction, &captured.memory).await?;
+                reconcile_embedding_source_in_pg_tx(&mut transaction, &captured.memory).await?;
+                for record in &captured.embeddings {
+                    insert_embedding_in_pg_tx(&mut transaction, record).await?;
+                }
+            }
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            Ok(())
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Namespaces
     // -----------------------------------------------------------------------
@@ -1147,47 +4049,7 @@ impl StorageTrait for PostgresBackend {
     // -----------------------------------------------------------------------
 
     fn save_episodic(&self, mem: &EpisodicMemory) -> StorageResult<()> {
-        let embedding_text = embedding_to_pgtext(&mem.embedding);
-        self.block_on(async {
-            let mut conn = self.scoped_conn(mem.namespace_id).await?;
-            // Note: the `episodic_memories` table was provisioned without an
-            // `event_time` column in the original schema. Runs `ALTER TABLE
-            // … ADD COLUMN IF NOT EXISTS` inside `run_schema` to keep this
-            // INSERT compatible with both fresh and upgraded databases.
-            query::<Postgres>(
-                r"INSERT INTO episodic_memories
-                   (id, namespace_id, episode_id, source_entity, about_entity, content, summary,
-                    embedding, context_intent, timestamp, stability, retrievability,
-                    access_count, last_accessed, event_time, superseded_by, invalid_at)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-                   ON CONFLICT (id) DO UPDATE SET
-                       content = $6, summary = $7, embedding = $8::vector, context_intent = $9,
-                       stability = $11, retrievability = $12, access_count = $13,
-                       last_accessed = $14, event_time = $15, superseded_by = $16,
-                       invalid_at = $17",
-            )
-            .bind(mem.id)
-            .bind(mem.namespace_id)
-            .bind(mem.episode_id)
-            .bind(mem.source_entity)
-            .bind(mem.about_entity)
-            .bind(&mem.content)
-            .bind(&mem.summary)
-            .bind(&embedding_text)
-            .bind(&mem.context_intent)
-            .bind(mem.timestamp)
-            .bind(mem.stability)
-            .bind(mem.retrievability)
-            .bind(i32::try_from(mem.access_count).unwrap_or(i32::MAX))
-            .bind(mem.last_accessed)
-            .bind(mem.event_time)
-            .bind(mem.superseded_by)
-            .bind(mem.invalid_at)
-            .execute(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
-            Ok(())
-        })
+        self.save_memory_with_embedding(&Memory::Episodic(mem.clone()), None)
     }
 
     fn get_episodic_in_namespace(
@@ -1200,7 +4062,8 @@ impl StorageTrait for PostgresBackend {
             let row: Option<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed, event_time, superseded_by, invalid_at
+                          access_count, last_accessed, event_time, superseded_by, invalid_at,
+                          agent_id, user_id
                    FROM episodic_memories WHERE id = $1 AND namespace_id = $2",
             )
             .bind(id)
@@ -1225,7 +4088,8 @@ impl StorageTrait for PostgresBackend {
             let rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed, event_time, superseded_by, invalid_at
+                          access_count, last_accessed, event_time, superseded_by, invalid_at,
+                          agent_id, user_id
                    FROM episodic_memories
                    WHERE about_entity = $1 AND namespace_id = $2 AND superseded_by IS NULL
                    ORDER BY timestamp DESC LIMIT $3",
@@ -1254,7 +4118,8 @@ impl StorageTrait for PostgresBackend {
                 // chronological order across the episode.
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           summary, embedding::text AS embedding, context_intent, timestamp, stability, retrievability,
-                          access_count, last_accessed, event_time, superseded_by, invalid_at
+                          access_count, last_accessed, event_time, superseded_by, invalid_at,
+                          agent_id, user_id
                    FROM episodic_memories
                    WHERE namespace_id = $1 AND episode_id = $2 AND superseded_by IS NULL
                    ORDER BY COALESCE(event_time, timestamp) ASC",
@@ -1302,40 +4167,7 @@ impl StorageTrait for PostgresBackend {
     // -----------------------------------------------------------------------
 
     fn save_semantic(&self, mem: &SemanticMemory) -> StorageResult<()> {
-        let embedding_text = embedding_to_pgtext(&mem.embedding);
-        let source_episodes = serde_json::to_value(&mem.source_episodes)?;
-        self.block_on(async {
-            let mut conn = self.scoped_conn(mem.namespace_id).await?;
-            query::<Postgres>(
-                r"INSERT INTO semantic_memories
-                   (id, namespace_id, subject, predicate, object, object_entity, confidence,
-                    valid_at, invalid_at, source_episodes, embedding, stability, retrievability,
-                    superseded_by)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::vector, $12, $13, $14)
-                   ON CONFLICT (id) DO UPDATE SET
-                       predicate = $4, object = $5, object_entity = $6, confidence = $7,
-                       invalid_at = $9, source_episodes = $10, embedding = $11::vector,
-                       stability = $12, retrievability = $13, superseded_by = $14",
-            )
-            .bind(mem.id)
-            .bind(mem.namespace_id)
-            .bind(mem.subject)
-            .bind(&mem.predicate)
-            .bind(&mem.object)
-            .bind(mem.object_entity)
-            .bind(mem.confidence)
-            .bind(mem.valid_at)
-            .bind(mem.invalid_at)
-            .bind(&source_episodes)
-            .bind(&embedding_text)
-            .bind(mem.stability)
-            .bind(mem.retrievability)
-            .bind(mem.superseded_by)
-            .execute(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
-            Ok(())
-        })
+        self.save_memory_with_embedding(&Memory::Semantic(mem.clone()), None)
     }
 
     fn get_semantic_in_namespace(
@@ -1348,7 +4180,7 @@ impl StorageTrait for PostgresBackend {
             let row: Option<SemanticRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
                           valid_at, invalid_at, source_episodes, embedding::text, stability,
-                          retrievability, superseded_by
+                          retrievability, superseded_by, agent_id, user_id
                    FROM semantic_memories WHERE id = $1 AND namespace_id = $2",
             )
             .bind(id)
@@ -1373,7 +4205,7 @@ impl StorageTrait for PostgresBackend {
             let rows: Vec<SemanticRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
                           valid_at, invalid_at, source_episodes, embedding::text, stability,
-                          retrievability, superseded_by
+                          retrievability, superseded_by, agent_id, user_id
                    FROM semantic_memories
                    WHERE subject = $1 AND namespace_id = $2 AND superseded_by IS NULL
                    ORDER BY valid_at DESC LIMIT $3",
@@ -1394,44 +4226,7 @@ impl StorageTrait for PostgresBackend {
     // -----------------------------------------------------------------------
 
     fn save_procedural(&self, mem: &ProceduralMemory) -> StorageResult<()> {
-        let embedding_text = embedding_to_pgtext(&mem.embedding);
-        let outcome = outcome_to_str(&mem.outcome);
-        let context = serde_json::to_value(&mem.context)?;
-        let source_episodes = serde_json::to_value(&mem.source_episodes)?;
-        self.block_on(async {
-            let mut conn = self.scoped_conn(mem.namespace_id).await?;
-            query::<Postgres>(
-                r"INSERT INTO procedural_memories
-                   (id, namespace_id, trigger_text, action, outcome, context, reliability,
-                    trial_count, success_count, source_episodes, embedding, created_at, last_used,
-                    superseded_by, invalid_at)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::vector, $12, $13, $14, $15)
-                   ON CONFLICT (id) DO UPDATE SET
-                       trigger_text = $3, action = $4, outcome = $5, context = $6,
-                       reliability = $7, trial_count = $8, success_count = $9,
-                       source_episodes = $10, embedding = $11::vector, last_used = $13,
-                       superseded_by = $14, invalid_at = $15",
-            )
-            .bind(mem.id)
-            .bind(mem.namespace_id)
-            .bind(&mem.trigger)
-            .bind(&mem.action)
-            .bind(outcome)
-            .bind(&context)
-            .bind(mem.reliability)
-            .bind(i32::try_from(mem.trial_count).unwrap_or(i32::MAX))
-            .bind(i32::try_from(mem.success_count).unwrap_or(i32::MAX))
-            .bind(&source_episodes)
-            .bind(&embedding_text)
-            .bind(mem.created_at)
-            .bind(mem.last_used)
-            .bind(mem.superseded_by)
-            .bind(mem.invalid_at)
-            .execute(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
-            Ok(())
-        })
+        self.save_memory_with_embedding(&Memory::Procedural(mem.clone()), None)
     }
 
     fn get_procedural_in_namespace(
@@ -1444,7 +4239,7 @@ impl StorageTrait for PostgresBackend {
             let row: Option<ProceduralRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
                           trial_count, success_count, source_episodes, embedding::text, created_at,
-                          last_used, superseded_by, invalid_at
+                          last_used, superseded_by, invalid_at, agent_id, user_id
                    FROM procedural_memories WHERE id = $1 AND namespace_id = $2",
             )
             .bind(id)
@@ -1491,43 +4286,7 @@ impl StorageTrait for PostgresBackend {
     // -----------------------------------------------------------------------
 
     fn save_observation(&self, mem: &ObservationMemory) -> StorageResult<()> {
-        let embedding_text = embedding_to_pgtext(&mem.embedding);
-        self.block_on(async {
-            let mut conn = self.scoped_conn(mem.namespace_id).await?;
-            query::<Postgres>(
-                r"INSERT INTO observation_memories
-                   (id, namespace_id, episode_id, entity_type, instance, action, quantity, unit,
-                    content, embedding, confidence, event_time, created_at, stability, retrievability,
-                    superseded_by, invalid_at)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::vector, $11, $12, $13, $14, $15, $16, $17)
-                   ON CONFLICT (id) DO UPDATE SET
-                       entity_type = $4, instance = $5, action = $6, quantity = $7, unit = $8,
-                       content = $9, embedding = $10::vector, confidence = $11,
-                       event_time = $12, stability = $14, retrievability = $15,
-                       superseded_by = $16, invalid_at = $17",
-            )
-            .bind(mem.id)
-            .bind(mem.namespace_id)
-            .bind(mem.episode_id)
-            .bind(&mem.entity_type)
-            .bind(&mem.instance)
-            .bind(&mem.action)
-            .bind(mem.quantity)
-            .bind(&mem.unit)
-            .bind(&mem.content)
-            .bind(&embedding_text)
-            .bind(mem.confidence)
-            .bind(mem.event_time)
-            .bind(mem.created_at)
-            .bind(mem.stability)
-            .bind(mem.retrievability)
-            .bind(mem.superseded_by)
-            .bind(mem.invalid_at)
-            .execute(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
-            Ok(())
-        })
+        self.save_memory_with_embedding(&Memory::Observation(mem.clone()), None)
     }
 
     fn get_observation_in_namespace(
@@ -1540,7 +4299,7 @@ impl StorageTrait for PostgresBackend {
             let row: Option<ObservationRow> = query_as::<Postgres, _>(
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
                           unit, content, embedding::text AS embedding, confidence, event_time, created_at,
-                          stability, retrievability, superseded_by, invalid_at
+                          stability, retrievability, superseded_by, invalid_at, agent_id, user_id
                    FROM observation_memories WHERE id = $1 AND namespace_id = $2",
             )
             .bind(id)
@@ -1592,7 +4351,7 @@ impl StorageTrait for PostgresBackend {
             let rows: Vec<ObservationRow> = query_as::<Postgres, ObservationRow>(
                 r"SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
                           unit, content, embedding::text AS embedding, confidence, event_time, created_at,
-                          stability, retrievability, superseded_by, invalid_at
+                          stability, retrievability, superseded_by, invalid_at, agent_id, user_id
                    FROM observation_memories
                    WHERE episode_id = ANY($1) AND namespace_id = $2
                      AND superseded_by IS NULL
@@ -1609,6 +4368,58 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    fn list_observation_enrichments_by_episode_ids(
+        &self,
+        namespace_id: Uuid,
+        episode_ids: &[Uuid],
+        limit: usize,
+        max_bytes: usize,
+    ) -> StorageResult<Vec<ObservationMemory>> {
+        let limit = limit.min(MAX_FUSED_HITS);
+        let max_bytes = max_bytes.min(MAX_HYDRATED_BYTES);
+        if episode_ids.is_empty() || limit == 0 || max_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        let ids = episode_ids.to_vec();
+        self.block_on(async move {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let rows: Vec<ObservationRow> = query_as::<Postgres, ObservationRow>(
+                r"WITH projected AS (
+                     SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
+                            unit, content, NULL::text AS embedding, confidence, event_time,
+                            created_at, stability, retrievability, superseded_by, invalid_at,
+                            agent_id, user_id,
+                            1024 + 6 * (
+                                octet_length(entity_type) + octet_length(instance) +
+                                octet_length(action) + octet_length(COALESCE(unit, '')) +
+                                octet_length(content)
+                            ) AS budget_bytes
+                       FROM observation_memories
+                      WHERE episode_id = ANY($1) AND namespace_id = $2
+                        AND superseded_by IS NULL
+                      ORDER BY created_at ASC, id ASC
+                      LIMIT $3
+                 ), budgeted AS (
+                     SELECT *, SUM(budget_bytes) OVER (ORDER BY created_at ASC, id ASC) AS used_bytes
+                       FROM projected
+                 )
+                 SELECT id, namespace_id, episode_id, entity_type, instance, action, quantity,
+                        unit, content, embedding, confidence, event_time, created_at, stability,
+                        retrievability, superseded_by, invalid_at, agent_id, user_id
+                   FROM budgeted WHERE used_bytes <= $4
+                  ORDER BY created_at ASC, id ASC",
+            )
+            .bind(&ids)
+            .bind(namespace_id)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .bind(i64::try_from(max_bytes).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(rows.into_iter().map(row_to_observation).collect())
+        })
+    }
+
     fn delete_observations_by_episode(
         &self,
         namespace_id: Uuid,
@@ -1616,15 +4427,32 @@ impl StorageTrait for PostgresBackend {
     ) -> StorageResult<usize> {
         self.block_on(async move {
             let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
+            query::<Postgres>(
+                "DELETE FROM memory_embeddings
+                 WHERE namespace_id = $1 AND memory_type = 'observation'
+                   AND memory_id IN (
+                       SELECT id FROM observation_memories
+                       WHERE episode_id = $2 AND namespace_id = $1
+                   )",
+            )
+            .bind(namespace_id)
+            .bind(episode_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
             let result = query::<Postgres>(
                 "DELETE FROM observation_memories WHERE episode_id = $1 AND namespace_id = $2",
             )
             .bind(episode_id)
             .bind(namespace_id)
-            .execute(&mut *conn)
+            .execute(&mut *transaction)
             .await
             .map_err(sqlx_to_io)?;
-            Ok(usize::try_from(result.rows_affected()).unwrap_or(0))
+            let deleted = usize::try_from(result.rows_affected()).unwrap_or(0);
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            Ok(deleted)
         })
     }
 
@@ -1666,7 +4494,7 @@ impl StorageTrait for PostgresBackend {
                 "SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                         summary, embedding::text AS embedding, context_intent, timestamp,
                         stability, retrievability, access_count, last_accessed, event_time,
-                        superseded_by, invalid_at
+                        superseded_by, invalid_at, agent_id, user_id
                    FROM episodic_memories
                    WHERE namespace_id = $1 AND superseded_by IS NULL
                      AND fts_content @@ {tsquery}
@@ -1689,7 +4517,7 @@ impl StorageTrait for PostgresBackend {
             let sql = format!(
                 "SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
                         valid_at, invalid_at, source_episodes, embedding::text, stability,
-                        retrievability, superseded_by
+                        retrievability, superseded_by, agent_id, user_id
                    FROM semantic_memories
                    WHERE namespace_id = $1 AND superseded_by IS NULL
                      AND fts_content @@ {tsquery}
@@ -1712,7 +4540,7 @@ impl StorageTrait for PostgresBackend {
             let sql = format!(
                 "SELECT id, namespace_id, trigger_text, action, outcome, context, reliability,
                         trial_count, success_count, source_episodes, embedding::text, created_at,
-                        last_used, superseded_by, invalid_at
+                        last_used, superseded_by, invalid_at, agent_id, user_id
                    FROM procedural_memories
                    WHERE namespace_id = $1 AND superseded_by IS NULL
                      AND fts_content @@ {tsquery}
@@ -1762,7 +4590,7 @@ impl StorageTrait for PostgresBackend {
             let sql = format!(
                 "SELECT id, namespace_id, subject, predicate, object, object_entity, confidence,
                         valid_at, invalid_at, source_episodes, embedding::text, stability,
-                        retrievability, superseded_by
+                        retrievability, superseded_by, agent_id, user_id
                    FROM semantic_memories
                    WHERE namespace_id = $1 AND subject = $2
                      AND superseded_by IS NULL
@@ -1791,7 +4619,7 @@ impl StorageTrait for PostgresBackend {
                 "SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                         summary, embedding::text AS embedding, context_intent, timestamp,
                         stability, retrievability, access_count, last_accessed, event_time,
-                        superseded_by, invalid_at
+                        superseded_by, invalid_at, agent_id, user_id
                    FROM episodic_memories
                    WHERE namespace_id = $1
                      AND (about_entity = $2 OR source_entity = $2)
@@ -1852,7 +4680,7 @@ impl StorageTrait for PostgresBackend {
                 r"SELECT id, namespace_id, episode_id, source_entity, about_entity, content,
                           summary, embedding::text AS embedding, context_intent, timestamp,
                           stability, retrievability, access_count, last_accessed, event_time,
-                          superseded_by, invalid_at
+                          superseded_by, invalid_at, agent_id, user_id
                    FROM episodic_memories
                    WHERE (about_entity = $1 OR source_entity = $1) AND namespace_id = $2",
             )
@@ -1867,7 +4695,7 @@ impl StorageTrait for PostgresBackend {
                 r"SELECT id, namespace_id, subject, predicate, object, object_entity,
                           confidence, valid_at, invalid_at, source_episodes,
                           embedding::text AS embedding, stability, retrievability,
-                          superseded_by
+                          superseded_by, agent_id, user_id
                    FROM semantic_memories
                    WHERE (subject = $1 OR object_entity = $1) AND namespace_id = $2",
             )
@@ -1882,6 +4710,74 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    fn save_superseding_memory_with_embedding(
+        &self,
+        old: MemoryRef,
+        namespace_id: Uuid,
+        replacement: &Memory,
+        embedding: Option<&EmbeddingRecord>,
+        invalid_at: DateTime<Utc>,
+    ) -> StorageResult<bool> {
+        if memory_namespace_id(replacement) != namespace_id {
+            return Err(StorageError::Context(
+                "replacement memory namespace does not match supersession namespace".into(),
+            ));
+        }
+        if MemoryType::of(replacement) != old.memory_type {
+            return Err(StorageError::Context(
+                "replacement memory type does not match superseded memory type".into(),
+            ));
+        }
+        if replacement.id() == old.id {
+            return Err(StorageError::Context(
+                "replacement memory must have a distinct id".into(),
+            ));
+        }
+        if let Some(record) = embedding {
+            validate_record_matches_memory(record, replacement)?;
+        }
+
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
+            validate_active_embedding_write_pg_tx(
+                &mut transaction,
+                replacement,
+                embedding.map_or(&[], std::slice::from_ref),
+            )
+            .await?;
+            save_memory_in_pg_tx(&mut transaction, replacement).await?;
+            reconcile_embedding_source_in_pg_tx(&mut transaction, replacement).await?;
+            if let Some(record) = embedding {
+                insert_embedding_in_pg_tx(&mut transaction, record).await?;
+            }
+            let updated = query::<Postgres>(supersede_update_sql(old.memory_type))
+                .bind(replacement.id())
+                .bind(invalid_at)
+                .bind(old.id)
+                .bind(namespace_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
+            if updated.rows_affected() == 0 {
+                return Ok(false);
+            }
+            query::<Postgres>(
+                "DELETE FROM memory_embeddings
+                 WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3",
+            )
+            .bind(namespace_id)
+            .bind(memory_type_str(old.memory_type))
+            .bind(old.id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+            transaction.commit().await.map_err(sqlx_to_io)?;
+            Ok(true)
+        })
+    }
+
     fn supersede_memory_in_namespace(
         &self,
         id: Uuid,
@@ -1891,28 +4787,54 @@ impl StorageTrait for PostgresBackend {
     ) -> StorageResult<bool> {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
-            for sql in [
-                "UPDATE episodic_memories SET superseded_by = $1, invalid_at = $2 \
-                 WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
-                "UPDATE semantic_memories SET superseded_by = $1, invalid_at = $2 \
-                 WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
-                "UPDATE procedural_memories SET superseded_by = $1, invalid_at = $2 \
-                 WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
-                "UPDATE observation_memories SET superseded_by = $1, invalid_at = $2 \
-                 WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
+            for (sql, memory_type) in [
+                (
+                    "UPDATE episodic_memories SET superseded_by = $1, invalid_at = $2 \
+                     WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
+                    "episodic",
+                ),
+                (
+                    "UPDATE semantic_memories SET superseded_by = $1, invalid_at = $2 \
+                     WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
+                    "semantic",
+                ),
+                (
+                    "UPDATE procedural_memories SET superseded_by = $1, invalid_at = $2 \
+                     WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
+                    "procedural",
+                ),
+                (
+                    "UPDATE observation_memories SET superseded_by = $1, invalid_at = $2 \
+                     WHERE id = $3 AND namespace_id = $4 AND superseded_by IS NULL",
+                    "observation",
+                ),
             ] {
                 let result = query::<Postgres>(sql)
                     .bind(superseded_by)
                     .bind(invalid_at)
                     .bind(id)
                     .bind(namespace_id)
-                    .execute(&mut *conn)
+                    .execute(&mut *transaction)
                     .await
                     .map_err(sqlx_to_io)?;
                 if result.rows_affected() > 0 {
+                    query::<Postgres>(
+                        "DELETE FROM memory_embeddings
+                         WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3",
+                    )
+                    .bind(namespace_id)
+                    .bind(memory_type)
+                    .bind(id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(sqlx_to_io)?;
+                    transaction.commit().await.map_err(sqlx_to_io)?;
                     return Ok(true);
                 }
             }
+            transaction.commit().await.map_err(sqlx_to_io)?;
             Ok(false)
         })
     }
@@ -1943,6 +4865,32 @@ impl StorageTrait for PostgresBackend {
         namespace_id: Uuid,
         persist: &mut dyn FnMut(&[Memory]) -> StorageResult<()>,
     ) -> StorageResult<Vec<Memory>> {
+        let mut persist_sources = |captured: &[CapturedMemory]| {
+            let memories: Vec<Memory> = captured
+                .iter()
+                .map(|captured| captured.memory.clone())
+                .collect();
+            persist(&memories)
+        };
+        self.delete_memories_by_entity_capturing_with_embeddings(
+            entity_id,
+            namespace_id,
+            &mut persist_sources,
+        )
+        .map(|captured| {
+            captured
+                .into_iter()
+                .map(|captured| captured.memory)
+                .collect()
+        })
+    }
+
+    fn delete_memories_by_entity_capturing_with_embeddings(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+        persist: &mut dyn FnMut(&[CapturedMemory]) -> StorageResult<()>,
+    ) -> StorageResult<Vec<CapturedMemory>> {
         self.block_on(async {
             // Bound to the namespace being forgotten, not left unscoped: this
             // method knows its namespace, and an unscoped connection would
@@ -1952,6 +4900,7 @@ impl StorageTrait for PostgresBackend {
             // deployment today.
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut tx, namespace_id).await?;
             let mut memories = Vec::new();
 
             let rows: Vec<EpisodicRow> = query_as::<Postgres, _>(
@@ -1960,7 +4909,7 @@ impl StorageTrait for PostgresBackend {
                    RETURNING id, namespace_id, episode_id, source_entity, about_entity, content,
                              summary, embedding::text AS embedding, context_intent, timestamp,
                              stability, retrievability, access_count, last_accessed, event_time,
-                             superseded_by, invalid_at",
+                             superseded_by, invalid_at, agent_id, user_id",
             )
             .bind(entity_id)
             .bind(namespace_id)
@@ -1975,7 +4924,7 @@ impl StorageTrait for PostgresBackend {
                    RETURNING id, namespace_id, subject, predicate, object, object_entity,
                              confidence, valid_at, invalid_at, source_episodes,
                              embedding::text AS embedding, stability, retrievability,
-                             superseded_by",
+                             superseded_by, agent_id, user_id",
             )
             .bind(entity_id)
             .bind(namespace_id)
@@ -1984,13 +4933,225 @@ impl StorageTrait for PostgresBackend {
             .map_err(sqlx_to_io)?;
             memories.extend(rows.into_iter().map(row_to_semantic).map(Memory::Semantic));
 
+            let mut captured: Vec<CapturedMemory> = memories
+                .into_iter()
+                .map(|memory| CapturedMemory {
+                    memory,
+                    embeddings: Vec::new(),
+                })
+                .collect();
+
+            for unit in &mut captured {
+                let memory = &unit.memory;
+                let rows: Vec<(String, String, String)> = query_as::<Postgres, _>(
+                    "SELECT embedding_space_id, source_sha256, embedding::text
+                     FROM memory_embeddings
+                     WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3
+                     ORDER BY embedding_space_id",
+                )
+                .bind(memory_namespace_id(memory))
+                .bind(memory_type_str(MemoryType::of(memory)))
+                .bind(memory.id())
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+                unit.embeddings = rows
+                    .into_iter()
+                    .map(
+                        |(embedding_space_id, source_sha256, embedding)| EmbeddingRecord {
+                            namespace_id: memory_namespace_id(memory),
+                            memory_ref: crate::storage::bounded::MemoryRef::from_memory(memory),
+                            embedding_space_id: EmbeddingSpaceId(embedding_space_id),
+                            source_sha256,
+                            embedding: pgtext_to_embedding(Some(&embedding)),
+                        },
+                    )
+                    .collect();
+                query::<Postgres>(
+                    "DELETE FROM memory_embeddings
+                     WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3",
+                )
+                .bind(memory_namespace_id(memory))
+                .bind(memory_type_str(MemoryType::of(memory)))
+                .bind(memory.id())
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+            }
+
             // Persist inside the transaction. On `Err` the `?` drops `tx`,
             // which rolls back — nothing is deleted.
-            persist(&memories)?;
+            persist(&captured)?;
 
             tx.commit().await.map_err(sqlx_to_io)?;
 
-            Ok(memories)
+            Ok(captured)
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "paged capture, generation cleanup, callbacks, and commit form one transaction"
+    )]
+    fn delete_memories_by_entity_paged(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+        page_size: usize,
+        persist_page: &mut dyn FnMut(&[CapturedMemory]) -> StorageResult<()>,
+        finalize: &mut dyn FnMut(BulkMutationSummary) -> StorageResult<()>,
+    ) -> StorageResult<BulkMutationSummary> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&page_size) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "capture page size must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut tx, namespace_id).await?;
+            let mut summary = BulkMutationSummary::default();
+            loop {
+                let refs: Vec<(String, Uuid)> =
+                    query_as::<Postgres, _>(ENTITY_FORGET_PAGE_REFS_SQL)
+                        .bind(namespace_id)
+                        .bind(entity_id)
+                        .bind(i64::try_from(page_size).unwrap_or(i64::MAX))
+                        .fetch_all(&mut *tx)
+                        .await
+                        .map_err(sqlx_to_io)?;
+                if refs.is_empty() {
+                    break;
+                }
+                let mut refs = refs
+                    .into_iter()
+                    .map(|(memory_type, id)| {
+                        Ok((
+                            memory_type.clone(),
+                            MemoryRef {
+                                memory_type: memory_type_from_str(&memory_type)?,
+                                id,
+                            },
+                        ))
+                    })
+                    .collect::<StorageResult<Vec<_>>>()?;
+                // Close the page before the byte ceiling instead of rejecting
+                // it: the caller loops until an empty page, so rows left behind
+                // form the next page. Locks taken on rows past the cut simply
+                // release with the transaction.
+                let mut page_bytes = 0_usize;
+                let mut fitted = 0_usize;
+                for (_, memory_ref) in &refs {
+                    if !lock_typed_source_for_capture(&mut tx, namespace_id, *memory_ref).await? {
+                        return Err(StorageError::Context(format!(
+                            "selected memory {:?}/{} disappeared before capture lock",
+                            memory_ref.memory_type, memory_ref.id
+                        )));
+                    }
+                    let source_bytes =
+                        capture_payload_bytes_pg_tx(&mut tx, namespace_id, *memory_ref).await?;
+                    if source_bytes > SNAPSHOT_MAX_FRAME_BYTES {
+                        return Err(StorageError::BudgetExceeded(format!(
+                            "snapshot source {:?}/{} contains {source_bytes} payload bytes; maximum is {SNAPSHOT_MAX_FRAME_BYTES}",
+                            memory_ref.memory_type, memory_ref.id
+                        )));
+                    }
+                    let next_bytes = page_bytes.checked_add(source_bytes).ok_or_else(|| {
+                        StorageError::BudgetExceeded("snapshot page byte count overflow".into())
+                    })?;
+                    if fitted > 0 && next_bytes > SNAPSHOT_MAX_PAGE_BYTES {
+                        break;
+                    }
+                    page_bytes = next_bytes;
+                    fitted += 1;
+                }
+                refs.truncate(fitted);
+                let mut page = Vec::with_capacity(refs.len());
+                for (memory_type, memory_ref) in refs {
+                    let id = memory_ref.id;
+                    let memory = load_memory_without_embedding_pg(
+                        &mut tx,
+                        namespace_id,
+                        memory_ref,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        StorageError::Context(format!(
+                            "locked memory {memory_type}/{id} disappeared before final reread"
+                        ))
+                    })?;
+                    let rows: Vec<(String, String, String)> = query_as::<Postgres, _>(
+                        "SELECT embedding_space_id, source_sha256, embedding::text
+                         FROM memory_embeddings
+                         WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3
+                         ORDER BY embedding_space_id",
+                    )
+                    .bind(namespace_id)
+                    .bind(&memory_type)
+                    .bind(id)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(sqlx_to_io)?;
+                    let embeddings = rows
+                        .into_iter()
+                        .map(|(space, source_sha256, embedding)| EmbeddingRecord {
+                            namespace_id,
+                            memory_ref,
+                            embedding_space_id: EmbeddingSpaceId(space),
+                            source_sha256,
+                            embedding: pgtext_to_embedding(Some(&embedding)),
+                        })
+                        .collect::<Vec<_>>();
+                    #[cfg(test)]
+                    capture_lock_probe::after_capture(memory_ref);
+                    query::<Postgres>(
+                        "DELETE FROM memory_embeddings
+                         WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3",
+                    )
+                    .bind(namespace_id)
+                    .bind(&memory_type)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(sqlx_to_io)?;
+                    let table = match memory_ref.memory_type {
+                        MemoryType::Episodic => "episodic_memories",
+                        MemoryType::Semantic => "semantic_memories",
+                        MemoryType::Procedural | MemoryType::Observation => {
+                            return Err(StorageError::Context(
+                                "entity forget selected a non-entity memory type".into(),
+                            ));
+                        }
+                    };
+                    let sql = format!("DELETE FROM {table} WHERE id = $1 AND namespace_id = $2");
+                    let deleted = query::<Postgres>(AssertSqlSafe(sql))
+                        .bind(id)
+                        .bind(namespace_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(sqlx_to_io)?;
+                    if deleted.rows_affected() != 1 {
+                        return Err(StorageError::Context(format!(
+                            "captured memory {id} was not deleted exactly once"
+                        )));
+                    }
+                    page.push(CapturedMemory { memory, embeddings });
+                }
+                let page = super::BulkPageGuard::new(
+                    page,
+                    namespace_id,
+                    super::BulkPageKind::SnapshotCapture,
+                );
+                persist_page(&page)?;
+                summary.memories += page.len();
+                summary.embedding_records += page
+                    .iter()
+                    .map(|captured| captured.embeddings.len())
+                    .sum::<usize>();
+            }
+            finalize(summary)?;
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(summary)
         })
     }
 
@@ -2011,6 +5172,10 @@ impl StorageTrait for PostgresBackend {
     /// There is no full-text cleanup, unlike the `SQLite` backend: this schema
     /// indexes through a `fts_content` generated column on each table, so
     /// deleting the row deletes its index entry.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixed four-leg erase plus generation cleanup is intentionally one visible transaction"
+    )]
     fn erase_entity_capturing(
         &self,
         entity_id: Uuid,
@@ -2019,6 +5184,7 @@ impl StorageTrait for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut tx, namespace_id).await?;
             let mut erased = ErasedRows::default();
 
             // Leg 1 — observations. MUST precede the episodic delete: the only
@@ -2036,7 +5202,7 @@ impl StorageTrait for PostgresBackend {
                    RETURNING id, namespace_id, episode_id, entity_type, instance, action,
                              quantity, unit, content, embedding::text AS embedding, confidence,
                              event_time, created_at, stability, retrievability,
-                             superseded_by, invalid_at",
+                             superseded_by, invalid_at, agent_id, user_id",
             )
             .bind(entity_id)
             .bind(namespace_id)
@@ -2055,7 +5221,7 @@ impl StorageTrait for PostgresBackend {
                    RETURNING id, namespace_id, episode_id, source_entity, about_entity, content,
                              summary, embedding::text AS embedding, context_intent, timestamp,
                              stability, retrievability, access_count, last_accessed, event_time,
-                             superseded_by, invalid_at",
+                             superseded_by, invalid_at, agent_id, user_id",
             )
             .bind(entity_id)
             .bind(namespace_id)
@@ -2072,7 +5238,7 @@ impl StorageTrait for PostgresBackend {
                    RETURNING id, namespace_id, subject, predicate, object, object_entity,
                              confidence, valid_at, invalid_at, source_episodes,
                              embedding::text AS embedding, stability, retrievability,
-                             superseded_by",
+                             superseded_by, agent_id, user_id",
             )
             .bind(entity_id)
             .bind(namespace_id)
@@ -2082,6 +5248,30 @@ impl StorageTrait for PostgresBackend {
             erased
                 .memories
                 .extend(rows.into_iter().map(row_to_semantic).map(Memory::Semantic));
+
+            for observation in &erased.observations {
+                query::<Postgres>(
+                    "DELETE FROM memory_embeddings
+                     WHERE namespace_id = $1 AND memory_type = 'observation' AND memory_id = $2",
+                )
+                .bind(observation.namespace_id)
+                .bind(observation.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+            }
+            for memory in &erased.memories {
+                query::<Postgres>(
+                    "DELETE FROM memory_embeddings
+                     WHERE namespace_id = $1 AND memory_type = $2 AND memory_id = $3",
+                )
+                .bind(memory_namespace_id(memory))
+                .bind(memory_type_str(MemoryType::of(memory)))
+                .bind(memory.id())
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+            }
 
             // Leg 3 — graph edges. Same-namespace edges only, by construction:
             // an edge belongs to its source entity's namespace, so an edge from
@@ -2138,7 +5328,34 @@ impl StorageTrait for PostgresBackend {
     ) -> StorageResult<usize> {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
             let mut total = 0usize;
+
+            query::<Postgres>(
+                r"DELETE FROM memory_embeddings AS embedding
+                   WHERE embedding.namespace_id = $2
+                     AND (
+                       (embedding.memory_type = 'episodic' AND EXISTS (
+                         SELECT 1 FROM episodic_memories AS source
+                          WHERE source.id = embedding.memory_id
+                            AND (source.about_entity = $1 OR source.source_entity = $1)
+                            AND source.namespace_id = $2
+                       ))
+                       OR
+                       (embedding.memory_type = 'semantic' AND EXISTS (
+                         SELECT 1 FROM semantic_memories AS source
+                          WHERE source.id = embedding.memory_id
+                            AND (source.subject = $1 OR source.object_entity = $1)
+                            AND source.namespace_id = $2
+                       ))
+                     )",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
 
             // Delete episodic memories.
             let result = query::<Postgres>(
@@ -2147,7 +5364,7 @@ impl StorageTrait for PostgresBackend {
             )
             .bind(entity_id)
             .bind(namespace_id)
-            .execute(&mut *conn)
+            .execute(&mut *transaction)
             .await
             .map_err(sqlx_to_io)?;
             total += result.rows_affected() as usize;
@@ -2159,12 +5376,130 @@ impl StorageTrait for PostgresBackend {
             )
             .bind(entity_id)
             .bind(namespace_id)
-            .execute(&mut *conn)
+            .execute(&mut *transaction)
             .await
             .map_err(sqlx_to_io)?;
             total += result.rows_affected() as usize;
 
+            transaction.commit().await.map_err(sqlx_to_io)?;
             Ok(total)
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixed GDPR erase legs and generation cleanup form one visible transaction"
+    )]
+    fn erase_entity_bounded(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<ErasureSummary> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut tx, namespace_id).await?;
+            query::<Postgres>(
+                "DELETE FROM memory_embeddings
+                 WHERE namespace_id = $2 AND memory_type = 'observation'
+                   AND memory_id IN (
+                     SELECT o.id FROM observation_memories AS o
+                     WHERE o.namespace_id = $2 AND o.episode_id IN (
+                       SELECT DISTINCT e.episode_id FROM episodic_memories AS e
+                       WHERE e.namespace_id = $2
+                         AND (e.about_entity = $1 OR e.source_entity = $1)
+                     )
+                   )",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let observations = query::<Postgres>(
+                "DELETE FROM observation_memories AS o
+                 WHERE o.namespace_id = $2 AND o.episode_id IN (
+                   SELECT DISTINCT e.episode_id FROM episodic_memories AS e
+                   WHERE e.namespace_id = $2
+                     AND (e.about_entity = $1 OR e.source_entity = $1)
+                 )",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?
+            .rows_affected();
+            for (memory_type, table, predicate) in [
+                (
+                    "episodic",
+                    "episodic_memories",
+                    "about_entity = $1 OR source_entity = $1",
+                ),
+                (
+                    "semantic",
+                    "semantic_memories",
+                    "subject = $1 OR object_entity = $1",
+                ),
+            ] {
+                let sql = format!(
+                    "DELETE FROM memory_embeddings WHERE namespace_id = $2
+                     AND memory_type = '{memory_type}' AND memory_id IN (
+                       SELECT id FROM {table} WHERE namespace_id = $2 AND ({predicate})
+                     )"
+                );
+                query::<Postgres>(AssertSqlSafe(sql))
+                    .bind(entity_id)
+                    .bind(namespace_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(sqlx_to_io)?;
+            }
+            let episodic = query::<Postgres>(
+                "DELETE FROM episodic_memories
+                 WHERE namespace_id = $2 AND (about_entity = $1 OR source_entity = $1)",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?
+            .rows_affected();
+            let semantic = query::<Postgres>(
+                "DELETE FROM semantic_memories
+                 WHERE namespace_id = $2 AND (subject = $1 OR object_entity = $1)",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?
+            .rows_affected();
+            let edges = query::<Postgres>(
+                "DELETE FROM edges
+                 WHERE namespace_id = $2 AND (source = $1 OR target = $1)",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?
+            .rows_affected();
+            let entities =
+                query::<Postgres>("DELETE FROM entities WHERE id = $1 AND namespace_id = $2")
+                    .bind(entity_id)
+                    .bind(namespace_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(sqlx_to_io)?
+                    .rows_affected();
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(ErasureSummary {
+                memories: usize::try_from(episodic + semantic).unwrap_or(usize::MAX),
+                observations: usize::try_from(observations).unwrap_or(usize::MAX),
+                edges: usize::try_from(edges).unwrap_or(usize::MAX),
+                entities: usize::try_from(entities).unwrap_or(usize::MAX),
+            })
         })
     }
 
@@ -2176,6 +5511,7 @@ impl StorageTrait for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
             let mut deleted = false;
 
             let result = query::<Postgres>(
@@ -2226,6 +5562,15 @@ impl StorageTrait for PostgresBackend {
                 deleted = true;
             }
 
+            query::<Postgres>(
+                "DELETE FROM memory_embeddings WHERE memory_id = $1 AND namespace_id = $2",
+            )
+            .bind(id)
+            .bind(namespace_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(sqlx_to_io)?;
+
             transaction.commit().await.map_err(sqlx_to_io)?;
             Ok(deleted)
         })
@@ -2269,6 +5614,7 @@ impl StorageTrait for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
             let mut total = 0usize;
 
             for sql in [
@@ -2284,6 +5630,12 @@ impl StorageTrait for PostgresBackend {
                     .map_err(sqlx_to_io)?;
                 total += result.rows_affected() as usize;
             }
+
+            query::<Postgres>("DELETE FROM memory_embeddings WHERE namespace_id = $1")
+                .bind(namespace_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
 
             transaction.commit().await.map_err(sqlx_to_io)?;
             Ok(total)
@@ -2441,6 +5793,37 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    fn count_memories_by_entity_in_namespace(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+    ) -> StorageResult<(usize, usize)> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+
+            let (episodic,): (i64,) = query_as::<Postgres, _>(
+                "SELECT COUNT(*) FROM episodic_memories \
+                 WHERE about_entity = $1 AND namespace_id = $2 AND superseded_by IS NULL",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let (semantic,): (i64,) = query_as::<Postgres, _>(
+                "SELECT COUNT(*) FROM semantic_memories \
+                 WHERE subject = $1 AND namespace_id = $2 AND superseded_by IS NULL",
+            )
+            .bind(entity_id)
+            .bind(namespace_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+
+            Ok((episodic as usize, semantic as usize))
+        })
+    }
+
     fn count_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
@@ -2452,6 +5835,21 @@ impl StorageTrait for PostgresBackend {
                     .await
                     .map_err(sqlx_to_io)?;
 
+            Ok(count as usize)
+        })
+    }
+
+    fn count_observations_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let (count,): (i64,) = query_as::<Postgres, _>(
+                "SELECT COUNT(*) FROM observation_memories \
+                 WHERE namespace_id = $1 AND superseded_by IS NULL",
+            )
+            .bind(namespace_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
             Ok(count as usize)
         })
     }
@@ -2570,6 +5968,1341 @@ impl StorageTrait for PostgresBackend {
     }
 }
 
+const POSTGRES_COMPACT_DECAY_PAYLOAD_SQL: &str = r"SELECT type_order, id, reference_time, decay_value, trial_count, success_count
+      FROM (
+          SELECT 0 AS type_order, id,
+                 COALESCE(last_accessed, timestamp) AS reference_time,
+                 stability AS decay_value, NULL::integer AS trial_count,
+                 NULL::integer AS success_count
+          FROM episodic_memories
+          WHERE namespace_id = $1
+            AND superseded_by IS NULL AND invalid_at IS NULL
+          UNION ALL
+          SELECT 1, id, valid_at, stability, NULL::integer, NULL::integer
+          FROM semantic_memories
+          WHERE namespace_id = $1
+            AND superseded_by IS NULL AND invalid_at IS NULL
+          UNION ALL
+          SELECT 2, id, COALESCE(last_used, created_at), reliability,
+                 trial_count, success_count
+          FROM procedural_memories
+          WHERE namespace_id = $1
+            AND superseded_by IS NULL AND invalid_at IS NULL
+          UNION ALL
+          SELECT 3, id, NULL::timestamptz, NULL::real,
+                 NULL::integer, NULL::integer
+          FROM observation_memories
+          WHERE namespace_id = $1
+            AND superseded_by IS NULL AND invalid_at IS NULL
+      ) AS compact_decay
+      WHERE type_order > $2 OR (type_order = $2 AND id > $3)
+      ORDER BY type_order, id LIMIT $4";
+
+impl ConsolidationWorkspace for PostgresBackend {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one RLS-scoped transaction compares and refreshes the source snapshot atomically"
+    )]
+    fn begin_or_resume(
+        &self,
+        namespace_id: Uuid,
+        space: &EmbeddingSpaceId,
+    ) -> StorageResult<RunId> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut tx = conn.begin().await.map_err(sqlx_to_io)?;
+            let lifecycle = query_as::<Postgres, (String, Option<String>)>(
+                "SELECT state, active_read_space_id FROM namespace_embedding_state
+                 WHERE namespace_id = $1 FOR UPDATE",
+            )
+            .bind(namespace_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            if lifecycle.as_ref().is_none_or(|(phase, active)| {
+                phase != "active" || active.as_deref() != Some(space.0.as_str())
+            }) {
+                return Err(StorageError::Context(
+                    "consolidation requires an active matching embedding space".into(),
+                ));
+            }
+            let existing: Option<(Uuid,)> = query_as::<Postgres, _>(
+                "SELECT run_id FROM consolidation_runs
+                 WHERE namespace_id = $1 AND embedding_space_id = $2 FOR UPDATE",
+            )
+            .bind(namespace_id)
+            .bind(&space.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let run_id = existing.map_or_else(Uuid::new_v4, |(id,)| id);
+            if existing.is_none() {
+                query::<Postgres>(
+                    "INSERT INTO consolidation_runs
+                        (run_id, namespace_id, embedding_space_id, cursor_ordinal,
+                         completed, created_at, updated_at)
+                     VALUES ($1, $2, $3, 0, FALSE, NOW(), NOW())",
+                )
+                .bind(run_id)
+                .bind(namespace_id)
+                .bind(&space.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+            }
+            let changed: (bool,) = query_as::<Postgres, _>(
+                "SELECT EXISTS (
+                    SELECT 1 FROM consolidation_sources AS workspace
+                    WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                      AND NOT EXISTS (
+                        SELECT 1 FROM episodic_memories AS source
+                        JOIN memory_embeddings AS embedding
+                          ON embedding.namespace_id = source.namespace_id
+                         AND embedding.memory_type = 'episodic'
+                         AND embedding.memory_id = source.id
+                         AND embedding.embedding_space_id = $3
+                        WHERE source.namespace_id = $2
+                          AND source.superseded_by IS NULL AND source.invalid_at IS NULL
+                          AND source.id = workspace.memory_id
+                          AND source.about_entity = workspace.about_entity
+                          AND source.episode_id = workspace.episode_id
+                          AND source.timestamp = workspace.source_timestamp
+                          AND embedding.source_sha256 = workspace.source_sha256)
+                    UNION ALL
+                    SELECT 1 FROM episodic_memories AS source
+                    JOIN memory_embeddings AS embedding
+                      ON embedding.namespace_id = source.namespace_id
+                     AND embedding.memory_type = 'episodic'
+                     AND embedding.memory_id = source.id
+                     AND embedding.embedding_space_id = $3
+                    WHERE source.namespace_id = $2
+                      AND source.superseded_by IS NULL AND source.invalid_at IS NULL
+                      AND NOT EXISTS (
+                        SELECT 1 FROM consolidation_sources AS workspace
+                        WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                          AND workspace.memory_id = source.id
+                          AND workspace.about_entity = source.about_entity
+                          AND workspace.episode_id = source.episode_id
+                          AND workspace.source_timestamp = source.timestamp
+                          AND workspace.source_sha256 = embedding.source_sha256))",
+            )
+            .bind(run_id)
+            .bind(namespace_id)
+            .bind(&space.0)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let source_count: (i64,) = query_as::<Postgres, _>(
+                "SELECT COUNT(*) FROM consolidation_sources
+                 WHERE run_id = $1 AND namespace_id = $2",
+            )
+            .bind(run_id)
+            .bind(namespace_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            if changed.0 || source_count.0 == 0 {
+                query::<Postgres>(
+                    "DELETE FROM consolidation_sources
+                     WHERE run_id = $1 AND namespace_id = $2",
+                )
+                .bind(run_id)
+                .bind(namespace_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+                query::<Postgres>(
+                    "INSERT INTO consolidation_sources
+                        (run_id, namespace_id, memory_id, source_ordinal, about_entity,
+                         episode_id, source_timestamp, source_sha256, assignment_anchor,
+                         assignment_state, promotion_complete)
+                     SELECT $1, $2, source.id,
+                            ROW_NUMBER() OVER (
+                                ORDER BY source.about_entity, source.timestamp, source.id),
+                            source.about_entity, source.episode_id, source.timestamp,
+                            embedding.source_sha256, NULL, 'unassigned', FALSE
+                     FROM episodic_memories AS source
+                     JOIN memory_embeddings AS embedding
+                       ON embedding.namespace_id = source.namespace_id
+                      AND embedding.memory_type = 'episodic'
+                      AND embedding.memory_id = source.id
+                      AND embedding.embedding_space_id = $3
+                     WHERE source.namespace_id = $2
+                       AND source.superseded_by IS NULL AND source.invalid_at IS NULL
+                     ORDER BY source.about_entity, source.timestamp, source.id",
+                )
+                .bind(run_id)
+                .bind(namespace_id)
+                .bind(&space.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+                query::<Postgres>(
+                    "UPDATE consolidation_runs
+                     SET cursor_ordinal = 0, completed = FALSE, updated_at = NOW()
+                     WHERE run_id = $1 AND namespace_id = $2",
+                )
+                .bind(run_id)
+                .bind(namespace_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+            }
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(RunId {
+                id: run_id,
+                namespace_id,
+            })
+        })
+    }
+
+    fn next_sources(
+        &self,
+        run: RunId,
+        after: Option<WorkspaceCursor>,
+        limit: usize,
+        max_application_bytes: usize,
+    ) -> StorageResult<WorkspaceSourcePage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "consolidation source page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            let cursor = if let Some(cursor) = after {
+                cursor.source_ordinal
+            } else {
+                query_as::<Postgres, (i64,)>(
+                    "SELECT cursor_ordinal FROM consolidation_runs
+                     WHERE run_id = $1 AND namespace_id = $2",
+                )
+                .bind(run.id)
+                .bind(run.namespace_id)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(sqlx_to_io)?
+                .0
+            };
+            let rows: Vec<PgWorkspaceSourceRow> = query_as::<Postgres, _>(
+                "SELECT workspace.memory_id, workspace.about_entity,
+                            workspace.source_ordinal
+                     FROM consolidation_sources AS workspace
+                     WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                       AND workspace.source_ordinal > $3
+                       AND workspace.assignment_state NOT IN ('discarded', 'promoted')
+                       AND (workspace.assignment_anchor IS NULL
+                            OR workspace.assignment_anchor = workspace.memory_id)
+                     ORDER BY workspace.source_ordinal LIMIT $4",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(cursor)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            let records = rows
+                .into_iter()
+                .map(|(id, about_entity, ordinal)| WorkspaceSource {
+                    memory_ref: MemoryRef {
+                        memory_type: MemoryType::Episodic,
+                        id,
+                    },
+                    about_entity,
+                    ordinal,
+                })
+                .collect::<Vec<_>>();
+            ensure_application_budget(
+                std::mem::size_of::<WorkspaceSourcePage>().saturating_add(
+                    records
+                        .len()
+                        .saturating_mul(std::mem::size_of::<WorkspaceSource>()),
+                ),
+                max_application_bytes,
+                "consolidation source page",
+            )?;
+            let next_cursor = (records.len() == limit)
+                .then(|| {
+                    records.last().map(|source| WorkspaceCursor {
+                        source_ordinal: source.ordinal,
+                    })
+                })
+                .flatten();
+            Ok(WorkspaceSourcePage {
+                records,
+                next_cursor,
+            })
+        })
+    }
+
+    fn load_source(
+        &self,
+        run: RunId,
+        source: MemoryRef,
+        max_application_bytes: usize,
+    ) -> StorageResult<WorkspaceEmbeddingSource> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            let source = pg_workspace_embedding_source(
+                &mut tx,
+                run,
+                source.id,
+                max_application_bytes,
+                || {
+                    #[cfg(test)]
+                    self.pause_workspace_race(WorkspaceRacePoint::Vector);
+                },
+            )
+            .await?;
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(source)
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "candidate metadata preflight and payload fetch stay adjacent to prove allocation ordering"
+    )]
+    fn page_later_unassigned(
+        &self,
+        run: RunId,
+        anchor: MemoryRef,
+        after: Option<WorkspaceCursor>,
+        limit: usize,
+        max_application_bytes: usize,
+    ) -> StorageResult<WorkspaceCandidatePage> {
+        if !(1..=crate::storage::bounded::CONSOLIDATION_COMPARISON_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "consolidation candidate page limit must be within 1..={} ",
+                crate::storage::bounded::CONSOLIDATION_COMPARISON_PAGE_SIZE
+            )));
+        }
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            let (entity, ordinal): (Uuid, i64) = query_as::<Postgres, _>(
+                "SELECT about_entity, source_ordinal FROM consolidation_sources
+                 WHERE run_id = $1 AND namespace_id = $2 AND memory_id = $3
+                 FOR SHARE",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let cursor = after.map_or(ordinal, |cursor| cursor.source_ordinal);
+            let preflight: Vec<PgWorkspaceEmbeddingPreflightRow> = query_as::<Postgres, _>(
+                "SELECT workspace.memory_id, workspace.source_ordinal,
+                        octet_length(embedding.embedding::text)::BIGINT,
+                        vector_dims(embedding.embedding), spaces.dimension
+                 FROM consolidation_sources AS workspace
+                 JOIN consolidation_runs AS runs
+                   ON runs.run_id = workspace.run_id
+                  AND runs.namespace_id = workspace.namespace_id
+                 JOIN memory_embeddings AS embedding
+                   ON embedding.namespace_id = workspace.namespace_id
+                  AND embedding.memory_type = 'episodic'
+                  AND embedding.memory_id = workspace.memory_id
+                  AND embedding.embedding_space_id = runs.embedding_space_id
+                 JOIN consolidation_sources AS source_snapshot
+                   ON source_snapshot.run_id = runs.run_id
+                  AND source_snapshot.namespace_id = runs.namespace_id
+                  AND source_snapshot.memory_id = workspace.memory_id
+                  AND embedding.source_sha256 = source_snapshot.source_sha256
+                 JOIN embedding_spaces AS spaces ON spaces.id = runs.embedding_space_id
+                 WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                   AND workspace.about_entity = $3 AND workspace.source_ordinal > $4
+                   AND workspace.assignment_state = 'unassigned'
+                 ORDER BY workspace.source_ordinal LIMIT $5
+                 FOR SHARE OF workspace, runs, embedding, source_snapshot, spaces",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(entity)
+            .bind(cursor)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let row_count = preflight.len();
+            let mut encoded_bytes = 0_usize;
+            let mut decoded_bytes = 0_usize;
+            for (_, _, encoded, actual_dimension, registered_dimension) in &preflight {
+                if actual_dimension <= &0 || actual_dimension != registered_dimension {
+                    return Err(StorageError::Context(
+                        "workspace candidate embedding does not match its registered dimension"
+                            .into(),
+                    ));
+                }
+                encoded_bytes =
+                    encoded_bytes.saturating_add(usize::try_from(*encoded).map_err(|_| {
+                        StorageError::Context("negative candidate payload bytes".into())
+                    })?);
+                decoded_bytes = decoded_bytes.saturating_add(
+                    usize::try_from(*actual_dimension)
+                        .map_err(|_| StorageError::Context("negative candidate dimension".into()))?
+                        .saturating_mul(std::mem::size_of::<f32>()),
+                );
+            }
+            drop(preflight);
+            ensure_application_budget(
+                std::mem::size_of::<WorkspaceCandidatePage>()
+                    .saturating_add(
+                        row_count.saturating_mul(std::mem::size_of::<WorkspaceEmbeddingSource>()),
+                    )
+                    .saturating_add(
+                        row_count.saturating_mul(std::mem::size_of::<PgWorkspaceEmbeddingRow>()),
+                    )
+                    .saturating_add(encoded_bytes)
+                    .saturating_add(decoded_bytes),
+                max_application_bytes,
+                "consolidation candidate page",
+            )?;
+            let rows: Vec<PgWorkspaceEmbeddingRow> = query_as::<Postgres, _>(
+                "SELECT workspace.memory_id, workspace.source_ordinal,
+                        embedding.embedding::text, vector_dims(embedding.embedding)
+                 FROM consolidation_sources AS workspace
+                 JOIN consolidation_runs AS runs
+                   ON runs.run_id = workspace.run_id
+                  AND runs.namespace_id = workspace.namespace_id
+                 JOIN memory_embeddings AS embedding
+                   ON embedding.namespace_id = workspace.namespace_id
+                  AND embedding.memory_type = 'episodic'
+                  AND embedding.memory_id = workspace.memory_id
+                  AND embedding.embedding_space_id = runs.embedding_space_id
+                  AND embedding.source_sha256 = workspace.source_sha256
+                 JOIN embedding_spaces AS spaces ON spaces.id = runs.embedding_space_id
+                 WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                   AND workspace.about_entity = $3 AND workspace.source_ordinal > $4
+                   AND workspace.assignment_state = 'unassigned'
+                 ORDER BY workspace.source_ordinal LIMIT $5",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(entity)
+            .bind(cursor)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let records = rows
+                .into_iter()
+                .map(|row| pg_workspace_embedding_from_row(run.namespace_id, row))
+                .collect::<StorageResult<Vec<_>>>()?;
+            let next_cursor = (records.len() == limit)
+                .then(|| {
+                    records.last().map(|source| WorkspaceCursor {
+                        source_ordinal: source.ordinal,
+                    })
+                })
+                .flatten();
+            let page = WorkspaceCandidatePage {
+                records,
+                next_cursor,
+            };
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(page)
+        })
+    }
+
+    fn record_tentative_match(
+        &self,
+        run: RunId,
+        anchor: MemoryRef,
+        member: MemoryRef,
+    ) -> StorageResult<usize> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            // Durable cluster-mutation lock order: run row first, then workspace rows,
+            // then source/embedding/admission rows. Finalization and promotion use the
+            // same order, so separate processes serialize without a lock inversion.
+            let _: (Uuid,) = query_as::<Postgres, _>(
+                "SELECT run_id FROM consolidation_runs
+                 WHERE run_id = $1 AND namespace_id = $2
+                 FOR UPDATE",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let changed = query::<Postgres>(
+                "UPDATE consolidation_sources AS member
+                 SET assignment_anchor = $3, assignment_state = 'tentative'
+                 WHERE member.run_id = $1 AND member.namespace_id = $2
+                   AND member.memory_id = $4
+                   AND (member.assignment_state = 'unassigned'
+                        OR (member.assignment_anchor = $3
+                            AND member.assignment_state = 'tentative'))
+                   AND EXISTS (
+                       SELECT 1 FROM consolidation_sources AS anchor_row
+                       WHERE anchor_row.run_id = member.run_id
+                         AND anchor_row.namespace_id = member.namespace_id
+                         AND anchor_row.memory_id = $3
+                         AND anchor_row.assignment_state IN ('unassigned', 'tentative')
+                         AND (anchor_row.assignment_anchor IS NULL
+                              OR anchor_row.assignment_anchor = $3))",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .bind(member.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?
+            .rows_affected();
+            if changed == 0 {
+                tx.commit().await.map_err(sqlx_to_io)?;
+                return Ok(0);
+            }
+            let count: (i64,) = query_as::<Postgres, _>(
+                "SELECT COUNT(*) FROM consolidation_sources
+                 WHERE run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let count = usize::try_from(count.0)
+                .map_err(|_| StorageError::Context("negative workspace member count".into()))?;
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(count)
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "member/content preflight and finalization stay adjacent in one namespace-scoped operation"
+    )]
+    fn finalize_or_discard_cluster(
+        &self,
+        run: RunId,
+        anchor: MemoryRef,
+        max_application_bytes: usize,
+    ) -> StorageResult<ClusterDecision> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            let _: (Uuid,) = query_as::<Postgres, _>(
+                "SELECT run_id FROM consolidation_runs
+                 WHERE run_id = $1 AND namespace_id = $2
+                 FOR UPDATE",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let assigned: Vec<(Uuid,)> = query_as::<Postgres, _>(
+                "SELECT workspace.memory_id FROM consolidation_sources AS workspace
+                 WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                   AND workspace.assignment_anchor = $3
+                 ORDER BY workspace.source_ordinal
+                 LIMIT $4
+                 FOR SHARE OF workspace",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .bind(
+                i64::try_from(
+                    crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS.saturating_add(1),
+                )
+                .unwrap_or(i64::MAX),
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let count = assigned.len();
+            drop(assigned);
+            if count <= 1 {
+                query::<Postgres>(
+                    "UPDATE consolidation_sources
+                     SET assignment_anchor = NULL, assignment_state = 'discarded'
+                     WHERE run_id = $1 AND namespace_id = $2 AND memory_id = $3",
+                )
+                .bind(run.id)
+                .bind(run.namespace_id)
+                .bind(anchor.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+                tx.commit().await.map_err(sqlx_to_io)?;
+                return Ok(ClusterDecision::SingletonDiscarded);
+            }
+            if count > crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS {
+                return Ok(ClusterDecision::MemberBudgetExceeded {
+                    member_count: count,
+                });
+            }
+            #[cfg(test)]
+            self.pause_workspace_race(WorkspaceRacePoint::FinalMembership);
+            let latest_content_bytes: (i64,) = query_as::<Postgres, _>(
+                "SELECT octet_length(source.content)::BIGINT
+                 FROM consolidation_sources AS workspace
+                 JOIN episodic_memories AS source
+                   ON source.id = workspace.memory_id
+                  AND source.namespace_id = workspace.namespace_id
+                 WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                   AND workspace.assignment_anchor = $3
+                 ORDER BY workspace.source_timestamp DESC, workspace.memory_id DESC
+                 LIMIT 1
+                 FOR SHARE OF workspace, source",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let latest_content_bytes = usize::try_from(latest_content_bytes.0)
+                .map_err(|_| StorageError::Context("negative final content bytes".into()))?;
+            ensure_application_budget(
+                std::mem::size_of::<PromotionAggregate>()
+                    .saturating_add(latest_content_bytes)
+                    .saturating_add(count.saturating_mul(std::mem::size_of::<ClusterProvenance>()))
+                    .saturating_add(
+                        count.saturating_mul(std::mem::size_of::<(Uuid, DateTime<Utc>)>()),
+                    )
+                    .saturating_add(std::mem::size_of::<(Uuid, DateTime<Utc>, String)>()),
+                max_application_bytes,
+                "consolidation finalized cluster",
+            )?;
+            #[cfg(test)]
+            self.pause_workspace_race(WorkspaceRacePoint::FinalContent);
+            query::<Postgres>(
+                "UPDATE consolidation_sources SET assignment_state = 'finalized'
+                 WHERE run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let latest: (Uuid, DateTime<Utc>, String) = query_as::<Postgres, _>(
+                "SELECT workspace.episode_id, workspace.source_timestamp, source.content
+                 FROM consolidation_sources AS workspace
+                 JOIN episodic_memories AS source
+                   ON source.id = workspace.memory_id
+                  AND source.namespace_id = workspace.namespace_id
+                 WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                   AND workspace.assignment_anchor = $3
+                 ORDER BY workspace.source_timestamp DESC, workspace.memory_id DESC
+                 LIMIT 1",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let rows: Vec<(Uuid, DateTime<Utc>)> = query_as::<Postgres, _>(
+                "SELECT workspace.episode_id, workspace.source_timestamp
+                 FROM consolidation_sources AS workspace
+                 WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                   AND workspace.assignment_anchor = $3
+                 ORDER BY workspace.source_ordinal",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let decision = ClusterDecision::Finalized {
+                promotion: PromotionAggregate {
+                    member_count: count,
+                    latest: LatestClusterMember {
+                        episode_id: latest.0,
+                        timestamp: latest.1,
+                        content: latest.2,
+                    },
+                    provenance: rows
+                        .into_iter()
+                        .map(|(episode_id, timestamp)| ClusterProvenance {
+                            episode_id,
+                            timestamp,
+                        })
+                        .collect(),
+                },
+            };
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(decision)
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "validation locks, invalidation, admission, write, and workspace completion share one PostgreSQL transaction"
+    )]
+    fn commit_promotion(
+        &self,
+        run: RunId,
+        anchor: MemoryRef,
+        memory: &Memory,
+        embedding: &EmbeddingRecord,
+    ) -> StorageResult<PromotionCommit> {
+        validate_record_matches_memory(embedding, memory)?;
+        let Memory::Semantic(semantic) = memory else {
+            return Err(StorageError::Context(
+                "consolidation promotion must be semantic".into(),
+            ));
+        };
+        if semantic.namespace_id != run.namespace_id || anchor.memory_type != MemoryType::Episodic {
+            return Err(StorageError::Context(
+                "consolidation promotion identity does not match its run".into(),
+            ));
+        }
+
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut tx, run.namespace_id).await?;
+            let space: (String,) = query_as::<Postgres, _>(
+                "SELECT embedding_space_id FROM consolidation_runs
+                 WHERE run_id = $1 AND namespace_id = $2
+                 FOR UPDATE",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            if embedding.embedding_space_id.0 != space.0 {
+                return Err(StorageError::Context(
+                    "promotion embedding does not use the workspace generation".into(),
+                ));
+            }
+            let assigned: Vec<(Uuid, String)> = query_as::<Postgres, _>(
+                "SELECT memory_id, assignment_state FROM consolidation_sources
+                 WHERE run_id = $1 AND namespace_id = $2
+                   AND assignment_anchor = $3
+                 ORDER BY source_ordinal
+                 LIMIT $4
+                 FOR UPDATE",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .bind(
+                i64::try_from(
+                    crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS.saturating_add(1),
+                )
+                .unwrap_or(i64::MAX),
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let assigned_count = assigned.len();
+            if !(2..=crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS)
+                .contains(&assigned_count)
+            {
+                return Err(StorageError::Context(
+                    "finalized promotion member count is outside the bounded workspace membership"
+                        .into(),
+                ));
+            }
+            if assigned.iter().any(|row| row.1 != "finalized")
+                || !assigned.iter().any(|row| row.0 == anchor.id)
+            {
+                return Err(StorageError::Context(
+                    "finalized promotion membership is internally inconsistent".into(),
+                ));
+            }
+            let valid: Vec<(Uuid, Uuid, DateTime<Utc>)> = query_as::<Postgres, _>(
+                "SELECT workspace.memory_id, workspace.episode_id,
+                        workspace.source_timestamp
+                 FROM consolidation_sources AS workspace
+                 JOIN episodic_memories AS source
+                   ON source.id = workspace.memory_id
+                  AND source.namespace_id = workspace.namespace_id
+                  AND source.about_entity = workspace.about_entity
+                  AND source.episode_id = workspace.episode_id
+                  AND source.timestamp = workspace.source_timestamp
+                  AND source.superseded_by IS NULL AND source.invalid_at IS NULL
+                 JOIN memory_embeddings AS source_embedding
+                   ON source_embedding.namespace_id = workspace.namespace_id
+                  AND source_embedding.memory_type = 'episodic'
+                  AND source_embedding.memory_id = workspace.memory_id
+                  AND source_embedding.embedding_space_id = $4
+                  AND source_embedding.source_sha256 = workspace.source_sha256
+                 WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+                   AND workspace.assignment_anchor = $3
+                   AND workspace.assignment_state = 'finalized'
+                 ORDER BY workspace.source_ordinal
+                 LIMIT $5
+                 FOR SHARE OF source, source_embedding",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .bind(&space.0)
+            .bind(
+                i64::try_from(
+                    crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS.saturating_add(1),
+                )
+                .unwrap_or(i64::MAX),
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            if valid.len() != assigned_count
+                || valid.iter().map(|row| row.0).collect::<Vec<_>>()
+                != assigned.iter().map(|row| row.0).collect::<Vec<_>>()
+            {
+                query::<Postgres>(
+                    "DELETE FROM consolidation_sources
+                     WHERE run_id = $1 AND namespace_id = $2",
+                )
+                .bind(run.id)
+                .bind(run.namespace_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+                query::<Postgres>(
+                    "INSERT INTO consolidation_sources
+                        (run_id, namespace_id, memory_id, source_ordinal, about_entity,
+                         episode_id, source_timestamp, source_sha256, assignment_anchor,
+                         assignment_state, promotion_complete)
+                     SELECT $1, $2, source.id,
+                            ROW_NUMBER() OVER (
+                                ORDER BY source.about_entity, source.timestamp, source.id),
+                            source.about_entity, source.episode_id, source.timestamp,
+                            source_embedding.source_sha256, NULL, 'unassigned', FALSE
+                     FROM episodic_memories AS source
+                     JOIN memory_embeddings AS source_embedding
+                       ON source_embedding.namespace_id = source.namespace_id
+                      AND source_embedding.memory_type = 'episodic'
+                      AND source_embedding.memory_id = source.id
+                      AND source_embedding.embedding_space_id = $3
+                     WHERE source.namespace_id = $2
+                       AND source.superseded_by IS NULL AND source.invalid_at IS NULL
+                     ORDER BY source.about_entity, source.timestamp, source.id",
+                )
+                .bind(run.id)
+                .bind(run.namespace_id)
+                .bind(&space.0)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+                query::<Postgres>(
+                    "UPDATE consolidation_runs
+                     SET cursor_ordinal = 0, completed = FALSE, updated_at = NOW()
+                     WHERE run_id = $1 AND namespace_id = $2",
+                )
+                .bind(run.id)
+                .bind(run.namespace_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+                tx.commit().await.map_err(sqlx_to_io)?;
+                return Ok(PromotionCommit::Invalidated);
+            }
+            drop(assigned);
+            if semantic.source_episodes.len() != assigned_count
+                || semantic.source_episodes
+                    != valid.iter().map(|row| row.1).collect::<Vec<_>>()
+            {
+                return Err(StorageError::Context(
+                    "semantic promotion member count/provenance does not match locked workspace membership"
+                        .into(),
+                ));
+            }
+            let latest_episode_time = valid
+                .iter()
+                .map(|row| row.2)
+                .max()
+                .expect("a finalized promotion contains at least two members");
+
+            let rows: Vec<(Option<Uuid>, Option<DateTime<Utc>>)> = query_as::<Postgres, _>(
+                "SELECT superseded_by, invalid_at FROM semantic_memories
+                 WHERE namespace_id = $1 AND subject = $2 AND predicate = 'mentioned'
+                   AND object = $3
+                 FOR SHARE",
+            )
+            .bind(run.namespace_id)
+            .bind(semantic.subject)
+            .bind(&semantic.object)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let mut latest = None;
+            let mut admitted = rows.is_empty();
+            if !rows.is_empty() {
+                admitted = true;
+                for (superseded_by, invalid_at) in rows {
+                    let (Some(_), Some(invalid_at)) = (superseded_by, invalid_at) else {
+                        admitted = false;
+                        break;
+                    };
+                    latest =
+                        Some(latest.map_or(invalid_at, |at: DateTime<Utc>| at.max(invalid_at)));
+                }
+                if admitted {
+                    admitted = latest.is_none_or(|at| latest_episode_time > at);
+                }
+            }
+            if admitted {
+                validate_active_embedding_write_pg_tx(
+                    &mut tx,
+                    memory,
+                    std::slice::from_ref(embedding),
+                )
+                .await?;
+                save_memory_in_pg_tx(&mut tx, memory).await?;
+                reconcile_embedding_source_in_pg_tx(&mut tx, memory).await?;
+                insert_embedding_in_pg_tx(&mut tx, embedding).await?;
+            }
+            query::<Postgres>(
+                "UPDATE consolidation_sources
+                 SET assignment_state = 'promoted', promotion_complete = TRUE
+                 WHERE run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(anchor.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(if admitted {
+                PromotionCommit::Committed
+            } else {
+                PromotionCommit::NotAdmitted
+            })
+        })
+    }
+
+    fn cursor(&self, run: RunId) -> StorageResult<WorkspaceCursor> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            let (source_ordinal,): (i64,) = query_as::<Postgres, _>(
+                "SELECT cursor_ordinal FROM consolidation_runs
+                 WHERE run_id = $1 AND namespace_id = $2",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(WorkspaceCursor { source_ordinal })
+        })
+    }
+
+    fn checkpoint(&self, run: RunId, cursor: WorkspaceCursor) -> StorageResult<()> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            query::<Postgres>(
+                "UPDATE consolidation_runs SET cursor_ordinal = $3, updated_at = NOW()
+                 WHERE run_id = $1 AND namespace_id = $2",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(cursor.source_ordinal)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(())
+        })
+    }
+
+    fn complete(&self, run: RunId) -> StorageResult<()> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            query::<Postgres>(
+                "UPDATE consolidation_runs SET completed = TRUE, updated_at = NOW()
+                 WHERE run_id = $1 AND namespace_id = $2",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(())
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the compact preflight and matching fixed-size projection stay adjacent for allocation-order proof"
+    )]
+    fn page_decay(
+        &self,
+        namespace_id: Uuid,
+        after: Option<PageCursor>,
+        limit: usize,
+        max_application_bytes: usize,
+    ) -> StorageResult<DecayPage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "consolidation decay page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        let after_type = after
+            .as_ref()
+            .map_or(-1, |cursor| memory_type_order(cursor.memory_type));
+        let after_id = after.as_ref().map_or(Uuid::nil(), |cursor| cursor.id);
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            query::<Postgres>("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                .execute(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+            let row_count: (i64,) = query_as::<Postgres, _>(
+                "SELECT COUNT(*) FROM (
+                     SELECT type_order, id FROM (
+                         SELECT 0 AS type_order, id FROM episodic_memories
+                         WHERE namespace_id = $1
+                           AND superseded_by IS NULL AND invalid_at IS NULL
+                         UNION ALL
+                         SELECT 1, id FROM semantic_memories
+                         WHERE namespace_id = $1
+                           AND superseded_by IS NULL AND invalid_at IS NULL
+                         UNION ALL
+                         SELECT 2, id FROM procedural_memories
+                         WHERE namespace_id = $1
+                           AND superseded_by IS NULL AND invalid_at IS NULL
+                         UNION ALL
+                         SELECT 3, id FROM observation_memories
+                         WHERE namespace_id = $1
+                           AND superseded_by IS NULL AND invalid_at IS NULL
+                     ) AS compact_decay
+                     WHERE type_order > $2 OR (type_order = $2 AND id > $3)
+                     ORDER BY type_order, id LIMIT $4
+                 ) AS compact_decay_page",
+            )
+            .bind(namespace_id)
+            .bind(after_type)
+            .bind(after_id)
+            .bind(i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX))
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(sqlx_to_io)?;
+            let row_count = usize::try_from(row_count.0)
+                .map_err(|_| StorageError::Context("negative compact decay row count".into()))?;
+            ensure_application_budget(
+                std::mem::size_of::<DecayPage>()
+                    .saturating_add(row_count.saturating_mul(std::mem::size_of::<DecayRecord>()))
+                    .saturating_add(row_count.saturating_mul(std::mem::size_of::<PgDecayRow>())),
+                max_application_bytes,
+                "consolidation compact decay page",
+            )?;
+            #[cfg(test)]
+            self.pause_workspace_race(WorkspaceRacePoint::Decay);
+            let rows: Vec<PgDecayRow> = query_as::<Postgres, _>(POSTGRES_COMPACT_DECAY_PAYLOAD_SQL)
+                .bind(namespace_id)
+                .bind(after_type)
+                .bind(after_id)
+                .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(sqlx_to_io)?;
+            let has_more = row_count > limit;
+            let next_cursor = has_more
+                .then(|| rows.last().map(pg_decay_cursor))
+                .flatten()
+                .transpose()?;
+            let scanned_rows = rows.len();
+            let records = rows
+                .into_iter()
+                .filter_map(pg_decay_record)
+                .collect::<StorageResult<Vec<_>>>()?;
+            let page = DecayPage {
+                records,
+                scanned_rows,
+                next_cursor,
+            };
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(page)
+        })
+    }
+
+    fn commit_decay(&self, namespace_id: Uuid, updates: &[DecayUpdate]) -> StorageResult<()> {
+        if updates.len() > MEMORY_PAGE_SIZE {
+            return Err(StorageError::BudgetExceeded(format!(
+                "consolidation decay commit exceeds {MEMORY_PAGE_SIZE} updates"
+            )));
+        }
+        if updates.is_empty() {
+            return Ok(());
+        }
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            let now = Utc::now();
+            for update in updates {
+                match update {
+                    DecayUpdate::Episodic {
+                        id,
+                        stability,
+                        retrievability,
+                    } => {
+                        query::<Postgres>(
+                            "UPDATE episodic_memories
+                             SET stability = $1, retrievability = $2,
+                                 access_count = access_count + 1, last_accessed = $3
+                             WHERE id = $4 AND namespace_id = $5",
+                        )
+                        .bind(stability)
+                        .bind(retrievability)
+                        .bind(now)
+                        .bind(id)
+                        .bind(namespace_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(sqlx_to_io)?;
+                    }
+                    DecayUpdate::Procedural {
+                        id,
+                        reliability,
+                        trial_count,
+                        success_count,
+                    } => {
+                        query::<Postgres>(
+                            "UPDATE procedural_memories
+                             SET reliability = $1, trial_count = $2, success_count = $3,
+                                 last_used = $4
+                             WHERE id = $5 AND namespace_id = $6",
+                        )
+                        .bind(reliability)
+                        .bind(i32::try_from(*trial_count).unwrap_or(i32::MAX))
+                        .bind(i32::try_from(*success_count).unwrap_or(i32::MAX))
+                        .bind(now)
+                        .bind(id)
+                        .bind(namespace_id)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(sqlx_to_io)?;
+                    }
+                }
+            }
+            tx.commit().await.map_err(sqlx_to_io)?;
+            Ok(())
+        })
+    }
+
+    fn assignments(&self, run: RunId, limit: usize) -> StorageResult<Vec<WorkspaceAssignment>> {
+        if limit > crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS {
+            return Err(StorageError::BudgetExceeded(format!(
+                "workspace assignment diagnostic limit exceeds {}",
+                crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS
+            )));
+        }
+        self.block_on(async {
+            let mut conn = self.scoped_conn(run.namespace_id).await?;
+            let rows: Vec<(Uuid, Uuid)> = query_as::<Postgres, _>(
+                "SELECT assignment_anchor, memory_id FROM consolidation_sources
+                 WHERE run_id = $1 AND namespace_id = $2
+                   AND assignment_state IN ('finalized', 'promoted')
+                 ORDER BY assignment_anchor, source_ordinal LIMIT $3",
+            )
+            .bind(run.id)
+            .bind(run.namespace_id)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+            Ok(rows
+                .into_iter()
+                .map(|(anchor, member)| WorkspaceAssignment {
+                    anchor: MemoryRef {
+                        memory_type: MemoryType::Episodic,
+                        id: anchor,
+                    },
+                    member: MemoryRef {
+                        memory_type: MemoryType::Episodic,
+                        id: member,
+                    },
+                })
+                .collect())
+        })
+    }
+}
+
+type PgDecayRow = (
+    i32,
+    Uuid,
+    Option<DateTime<Utc>>,
+    Option<f32>,
+    Option<i32>,
+    Option<i32>,
+);
+
+fn pg_decay_cursor(row: &PgDecayRow) -> StorageResult<PageCursor> {
+    let memory_type = match row.0 {
+        0 => MemoryType::Episodic,
+        1 => MemoryType::Semantic,
+        2 => MemoryType::Procedural,
+        3 => MemoryType::Observation,
+        other => {
+            return Err(StorageError::Context(format!(
+                "invalid compact decay memory type order {other}"
+            )));
+        }
+    };
+    Ok(PageCursor {
+        memory_type,
+        id: row.1,
+    })
+}
+
+fn pg_decay_record(row: PgDecayRow) -> Option<StorageResult<DecayRecord>> {
+    let (type_order, id, reference_time, decay_value, trial_count, success_count) = row;
+    if type_order == 3 {
+        return None;
+    }
+    Some((|| {
+        let reference_time = reference_time
+            .ok_or_else(|| StorageError::Context("compact decay row has no timestamp".into()))?;
+        let decay_value = decay_value
+            .ok_or_else(|| StorageError::Context("compact decay row has no decay value".into()))?;
+        match type_order {
+            0 => Ok(DecayRecord::Episodic {
+                id,
+                reference_time,
+                stability: decay_value,
+            }),
+            1 => Ok(DecayRecord::Semantic {
+                valid_at: reference_time,
+                stability: decay_value,
+            }),
+            2 => Ok(DecayRecord::Procedural {
+                id,
+                reference_time,
+                reliability: decay_value,
+                trial_count: u32::try_from(trial_count.ok_or_else(|| {
+                    StorageError::Context("compact procedural decay row has no trial count".into())
+                })?)
+                .map_err(|_| StorageError::Context("invalid procedural trial count".into()))?,
+                success_count: u32::try_from(success_count.ok_or_else(|| {
+                    StorageError::Context(
+                        "compact procedural decay row has no success count".into(),
+                    )
+                })?)
+                .map_err(|_| StorageError::Context("invalid procedural success count".into()))?,
+            }),
+            other => Err(StorageError::Context(format!(
+                "invalid compact decay memory type order {other}"
+            ))),
+        }
+    })())
+}
+
+type PgWorkspaceSourceRow = (Uuid, Uuid, i64);
+
+type PgWorkspaceEmbeddingPreflightRow = (Uuid, i64, i64, i32, i32);
+
+type PgWorkspaceEmbeddingRow = (Uuid, i64, String, i32);
+
+fn pg_workspace_embedding_from_row(
+    _namespace_id: Uuid,
+    row: PgWorkspaceEmbeddingRow,
+) -> StorageResult<WorkspaceEmbeddingSource> {
+    let (id, ordinal, encoded, dim) = row;
+    let embedding = pgtext_to_embedding(Some(&encoded));
+    if usize::try_from(dim).ok() != Some(embedding.len())
+        || embedding.is_empty()
+        || embedding.iter().any(|value| !value.is_finite())
+    {
+        return Err(StorageError::Context(format!(
+            "workspace embedding for {id} does not match its finite dimension"
+        )));
+    }
+    let memory_ref = MemoryRef {
+        memory_type: MemoryType::Episodic,
+        id,
+    };
+    Ok(WorkspaceEmbeddingSource {
+        memory_ref,
+        ordinal,
+        embedding,
+    })
+}
+
+async fn pg_workspace_embedding_source<F>(
+    tx: &mut Transaction<'_, Postgres>,
+    run: RunId,
+    memory_id: Uuid,
+    max_application_bytes: usize,
+    before_payload: F,
+) -> StorageResult<WorkspaceEmbeddingSource>
+where
+    F: FnOnce(),
+{
+    let preflight: (i64, i32, i32) = query_as::<Postgres, _>(
+        "SELECT octet_length(embedding.embedding::text)::BIGINT,
+                vector_dims(embedding.embedding), spaces.dimension
+         FROM consolidation_sources AS workspace
+         JOIN consolidation_runs AS runs
+           ON runs.run_id = workspace.run_id AND runs.namespace_id = workspace.namespace_id
+         JOIN memory_embeddings AS embedding
+           ON embedding.namespace_id = workspace.namespace_id
+          AND embedding.memory_type = 'episodic'
+          AND embedding.memory_id = workspace.memory_id
+          AND embedding.embedding_space_id = runs.embedding_space_id
+          AND embedding.source_sha256 = workspace.source_sha256
+         JOIN embedding_spaces AS spaces ON spaces.id = runs.embedding_space_id
+         WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+           AND workspace.memory_id = $3
+         FOR SHARE OF workspace, runs, embedding, spaces",
+    )
+    .bind(run.id)
+    .bind(run.namespace_id)
+    .bind(memory_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(sqlx_to_io)?;
+    let encoded_bytes = usize::try_from(preflight.0)
+        .map_err(|_| StorageError::Context("negative anchor payload bytes".into()))?;
+    if preflight.1 <= 0 || preflight.1 != preflight.2 {
+        return Err(StorageError::Context(
+            "workspace anchor embedding does not match its registered dimension".into(),
+        ));
+    }
+    let dimension = usize::try_from(preflight.1)
+        .map_err(|_| StorageError::Context("negative anchor dimension".into()))?;
+    ensure_application_budget(
+        std::mem::size_of::<WorkspaceEmbeddingSource>()
+            .saturating_add(std::mem::size_of::<PgWorkspaceEmbeddingRow>())
+            .saturating_add(encoded_bytes)
+            .saturating_add(dimension.saturating_mul(std::mem::size_of::<f32>())),
+        max_application_bytes,
+        "consolidation anchor",
+    )?;
+    before_payload();
+    let row: PgWorkspaceEmbeddingRow = query_as::<Postgres, _>(
+        "SELECT workspace.memory_id, workspace.source_ordinal,
+                embedding.embedding::text, vector_dims(embedding.embedding)
+         FROM consolidation_sources AS workspace
+         JOIN consolidation_runs AS runs
+           ON runs.run_id = workspace.run_id AND runs.namespace_id = workspace.namespace_id
+         JOIN memory_embeddings AS embedding
+           ON embedding.namespace_id = workspace.namespace_id
+          AND embedding.memory_type = 'episodic'
+          AND embedding.memory_id = workspace.memory_id
+          AND embedding.embedding_space_id = runs.embedding_space_id
+          AND embedding.source_sha256 = workspace.source_sha256
+         JOIN embedding_spaces AS spaces ON spaces.id = runs.embedding_space_id
+         WHERE workspace.run_id = $1 AND workspace.namespace_id = $2
+           AND workspace.memory_id = $3",
+    )
+    .bind(run.id)
+    .bind(run.namespace_id)
+    .bind(memory_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(sqlx_to_io)?;
+    pg_workspace_embedding_from_row(run.namespace_id, row)
+}
+
 // ---------------------------------------------------------------------------
 // Row mapping helpers
 // ---------------------------------------------------------------------------
@@ -2593,6 +7326,8 @@ fn row_to_episodic(row: EpisodicRow) -> EpisodicMemory {
         event_time,
         superseded_by,
         invalid_at,
+        agent_id,
+        user_id,
     } = row;
     EpisodicMemory {
         id,
@@ -2615,17 +7350,13 @@ fn row_to_episodic(row: EpisodicRow) -> EpisodicMemory {
         event_time,
         superseded_by,
         invalid_at,
-        // G1: postgres backend does not yet carry the multi-tenant scope
-        // columns. The struct fields exist for trait/serde compatibility
-        // but are always None on this backend until the postgres schema
-        // adds matching columns in a follow-up.
-        agent_id: None,
-        user_id: None,
+        agent_id,
+        user_id,
     }
 }
 
 fn row_to_semantic(row: SemanticRow) -> SemanticMemory {
-    let (
+    let SemanticRow {
         id,
         namespace_id,
         subject,
@@ -2635,12 +7366,14 @@ fn row_to_semantic(row: SemanticRow) -> SemanticMemory {
         confidence,
         valid_at,
         invalid_at,
-        source_episodes_json,
+        source_episodes: source_episodes_json,
         embedding_text,
         stability,
         retrievability,
         superseded_by,
-    ) = row;
+        agent_id,
+        user_id,
+    } = row;
     let source_episodes: Vec<Uuid> =
         serde_json::from_value(source_episodes_json).unwrap_or_default();
     SemanticMemory {
@@ -2659,30 +7392,31 @@ fn row_to_semantic(row: SemanticRow) -> SemanticMemory {
         embedding: pgtext_to_embedding(embedding_text.as_deref()),
         stability,
         retrievability,
-        // G1: postgres backend does not yet carry the multi-tenant scope columns.
-        agent_id: None,
-        user_id: None,
+        agent_id,
+        user_id,
     }
 }
 
 fn row_to_procedural(row: ProceduralRow) -> ProceduralMemory {
-    let (
+    let ProceduralRow {
         id,
         namespace_id,
         trigger,
         action,
-        outcome_str,
-        context_json,
+        outcome: outcome_str,
+        context: context_json,
         reliability,
         trial_count,
         success_count,
-        source_episodes_json,
+        source_episodes: source_episodes_json,
         embedding_text,
         created_at,
         last_used,
         superseded_by,
         invalid_at,
-    ) = row;
+        agent_id,
+        user_id,
+    } = row;
     let context: HashMap<String, serde_json::Value> =
         serde_json::from_value(context_json).unwrap_or_default();
     let source_episodes: Vec<Uuid> =
@@ -2703,9 +7437,8 @@ fn row_to_procedural(row: ProceduralRow) -> ProceduralMemory {
         last_used,
         superseded_by,
         invalid_at,
-        // G1: postgres backend does not yet carry the multi-tenant scope columns.
-        agent_id: None,
-        user_id: None,
+        agent_id,
+        user_id,
     }
 }
 
@@ -2744,6 +7477,8 @@ fn row_to_observation(row: ObservationRow) -> ObservationMemory {
         retrievability,
         superseded_by,
         invalid_at,
+        agent_id,
+        user_id,
     } = row;
     ObservationMemory {
         id,
@@ -2763,9 +7498,8 @@ fn row_to_observation(row: ObservationRow) -> ObservationMemory {
         retrievability,
         superseded_by,
         invalid_at,
-        // G1: postgres backend does not yet carry the multi-tenant scope columns.
-        agent_id: None,
-        user_id: None,
+        agent_id,
+        user_id,
     }
 }
 
@@ -2777,6 +7511,190 @@ mod live_rls;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observation_count_uses_scoped_connection_and_explicit_active_namespace_predicate() {
+        let source = include_str!("postgres.rs");
+        let body = source
+            .split_once("fn count_observations_by_namespace(")
+            .expect("observation count method")
+            .1
+            .split_once("// -------------------------------------------------------------------")
+            .expect("observation count terminator")
+            .0;
+        assert!(body.contains("self.scoped_conn(namespace_id)"));
+        assert!(body.contains("FROM observation_memories"));
+        assert!(body.contains("namespace_id = $1"));
+        assert!(body.contains("superseded_by IS NULL"));
+        assert!(body.contains(".bind(namespace_id)"));
+    }
+
+    #[test]
+    fn namespace_page_type_filter_precedes_limit_and_preserves_cursor_order() {
+        let source = include_str!("postgres.rs");
+        let body = source
+            .split_once("fn page_memories_filtered(")
+            .expect("namespace page method")
+            .1
+            .split_once("fn page_entity_memories(")
+            .expect("namespace page terminator")
+            .0;
+        let filter = body
+            .find("type_order = $10")
+            .expect("type filter must be in the SQL relation");
+        let order = body
+            .find("ORDER BY type_order, id")
+            .expect("typed-key order must remain stable");
+        let limit = body
+            .find("LIMIT $11")
+            .expect("page limit must remain bound");
+        assert!(filter < order && order < limit);
+        assert!(body.contains(".bind(memory_type.map(memory_type_order))"));
+        assert!(body.contains(".bind(i64::try_from(request.limit + 1)"));
+    }
+
+    #[test]
+    fn exact_pgvector_sql_is_one_bounded_parameterized_union_with_stable_order() {
+        assert_eq!(POSTGRES_VECTOR_SEARCH_SQL.matches("UNION ALL").count(), 2);
+        assert_eq!(
+            POSTGRES_VECTOR_SEARCH_SQL
+                .matches("embeddings.namespace_id = $2")
+                .count(),
+            3
+        );
+        assert_eq!(
+            POSTGRES_VECTOR_SEARCH_SQL
+                .matches("embeddings.embedding_space_id = $3")
+                .count(),
+            3
+        );
+        for memory_type in ["episodic", "semantic", "procedural"] {
+            assert!(
+                POSTGRES_VECTOR_SEARCH_SQL
+                    .contains(&format!("embeddings.memory_type = '{memory_type}'"))
+            );
+        }
+        assert!(!POSTGRES_VECTOR_SEARCH_SQL.contains("observation_memories"));
+        assert!(
+            POSTGRES_VECTOR_SEARCH_SQL
+                .contains("ORDER BY distance ASC, memory_type ASC, memory_id ASC\n    LIMIT $11")
+        );
+        assert!(POSTGRES_VECTOR_SEARCH_SQL.contains(
+            "ORDER BY limited.distance ASC NULLS LAST,\n         limited.memory_type ASC NULLS LAST,\n         limited.memory_id ASC NULLS LAST"
+        ));
+        assert_eq!(POSTGRES_VECTOR_SEARCH_SQL.matches("LIMIT $11").count(), 1);
+        assert!(POSTGRES_VECTOR_SEARCH_SQL.contains("IS NOT DISTINCT FROM $5"));
+        assert!(POSTGRES_VECTOR_SEARCH_SQL.contains("IS NOT DISTINCT FROM $6"));
+        assert!(POSTGRES_VECTOR_SEARCH_SQL.contains("entity_rank <= $9"));
+        assert!(POSTGRES_VECTOR_SEARCH_SQL.contains("entity_rank <= $10"));
+        assert!(!POSTGRES_VECTOR_SEARCH_SQL.contains("get_all_memories"));
+    }
+
+    #[test]
+    fn exact_pgvector_stored_zero_norm_is_neutral_not_invalid() {
+        assert!(
+            POSTGRES_VECTOR_SEARCH_SQL.contains("WHEN vector_norm(embedding) = 0 THEN 1.0"),
+            "a stored zero vector must produce cosine distance 1.0 / score 0.0"
+        );
+        let invalid_flag = POSTGRES_VECTOR_SEARCH_SQL
+            .split_once("bool_or(")
+            .and_then(|(_, rest)| rest.split_once(") OVER ()"))
+            .map(|(flag, _)| flag)
+            .expect("query must expose one global invalid-vector flag");
+        assert!(invalid_flag.contains("vector_dims(embedding) <> vector_dims($1::vector)"));
+        assert!(
+            !invalid_flag.contains("vector_norm"),
+            "zero norm is valid and must not poison the whole result"
+        );
+    }
+
+    #[test]
+    fn bounded_lexical_sql_applies_explicit_modes_and_quotas_before_limit() {
+        let source = include_str!("postgres.rs");
+        let sql = source
+            .split_once("fn search_lexical_hits_filtered(")
+            .expect("bounded lexical method")
+            .1
+            .split_once("fn hydrate_memories(")
+            .expect("bounded lexical method terminator")
+            .0;
+
+        assert!(sql.contains("let tsquery = or_tsquery_fragment(14"));
+        assert!(sql.contains("IS NOT DISTINCT FROM $4"));
+        assert!(sql.contains("IS NOT DISTINCT FROM $5"));
+        assert!(sql.contains("$3 = 2 AND agent_id = $4"));
+        assert!(sql.contains("entity_rank <= $8"));
+        assert!(sql.contains("entity_rank <= $9"));
+        assert!(sql.find("entity_rank <= $9").unwrap() < sql.find("LIMIT $2").unwrap());
+        assert!(!sql.contains("observation_memories"));
+    }
+
+    #[test]
+    fn preferred_entity_flags_are_total_before_quota_partitioning() {
+        assert_eq!(
+            POSTGRES_VECTOR_SEARCH_SQL.matches("AND COALESCE((").count(),
+            2
+        );
+
+        let source = include_str!("postgres.rs");
+        let sql = source
+            .split_once("fn search_lexical_hits_filtered(")
+            .expect("bounded lexical method")
+            .1
+            .split_once("fn hydrate_memories(")
+            .expect("bounded lexical method terminator")
+            .0;
+        assert_eq!(sql.matches("AND COALESCE((").count(), 2);
+    }
+
+    #[test]
+    fn exact_pgvector_timeout_is_positive_bounded_and_query_cancel_maps_to_deadline() {
+        let expired = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(StatementTimeoutBudget::new(expired).remaining_ms(), None);
+
+        let one_second = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        assert!(
+            StatementTimeoutBudget::new(one_second)
+                .remaining_ms()
+                .is_some_and(|timeout_ms| (1..=1_000).contains(&timeout_ms))
+        );
+
+        assert!(
+            postgres_vector_error_reason(Some("57014"), "canceling statement")
+                .is_some_and(|reason| reason == SearchUnavailable::DeadlineExceeded)
+        );
+        assert!(
+            postgres_vector_error_reason(Some("22000"), "different vector dimensions")
+                .is_some_and(|reason| reason == SearchUnavailable::InvalidStoredVector)
+        );
+        assert_eq!(
+            postgres_vector_error_reason(Some("08006"), "connection failure"),
+            None
+        );
+    }
+
+    #[test]
+    fn exact_pgvector_timeout_budget_recomputes_after_registry_lookup_work() {
+        let start = std::time::Instant::now();
+        let deadline = start
+            .checked_add(std::time::Duration::from_millis(100))
+            .unwrap();
+        let budget = StatementTimeoutBudget::new(deadline);
+
+        assert_eq!(budget.remaining_ms_at(start), Some(100));
+        assert_eq!(
+            budget.remaining_ms_at(
+                start
+                    .checked_add(std::time::Duration::from_millis(40))
+                    .unwrap()
+            ),
+            Some(60),
+            "ranking must receive the post-lookup remainder, not the initial 100 ms"
+        );
+        assert_eq!(budget.remaining_ms_at(deadline), None);
+    }
 
     #[test]
     fn postgres_schema_has_idempotent_supersession_alters() {
@@ -2797,10 +7715,797 @@ mod tests {
     }
 
     #[test]
+    fn consolidation_workspace_schema_is_rls_forced_and_namespace_scoped() {
+        for table in ["consolidation_runs", "consolidation_sources"] {
+            assert!(SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")));
+            assert!(SCHEMA.contains(&format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;")));
+            assert!(SCHEMA.contains(&format!(
+                "CREATE POLICY namespace_isolation_{table} ON {table}"
+            )));
+            assert!(SCHEMA.contains(&format!("ALTER TABLE {table} FORCE ROW LEVEL SECURITY;")));
+            assert!(SCHEMA.contains(&format!(
+                "GRANT SELECT, INSERT, UPDATE, DELETE ON {table} TO pensyve_app;"
+            )));
+        }
+        assert!(
+            SCHEMA
+                .matches("namespace_id = current_setting('pensyve.namespace_id', true)::uuid")
+                .count()
+                >= 8
+        );
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exhaustive ordered table pins every workspace SQL statement in one proof"
+    )]
+    fn assert_consolidation_workspace_sql_contracts(source: &str) {
+        struct Contract {
+            label: &'static str,
+            binds: usize,
+            required: &'static [&'static str],
+        }
+
+        fn query_blocks(source: &str) -> Vec<&str> {
+            let mut blocks = Vec::new();
+            let mut offset = 0;
+            while offset < source.len() {
+                let tail = &source[offset..];
+                let query = tail.find("query::<Postgres>(");
+                let query_as = tail.find("query_as::<Postgres,");
+                let Some(relative_start) = (match (query, query_as) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    (Some(start), None) | (None, Some(start)) => Some(start),
+                    (None, None) => None,
+                }) else {
+                    break;
+                };
+                let start = offset + relative_start;
+                let relative_end = source[start..]
+                    .find(".await")
+                    .expect("workspace query must be awaited");
+                let end = start + relative_end + ".await".len();
+                blocks.push(&source[start..end]);
+                offset = end;
+            }
+            blocks
+        }
+
+        let start = source
+            .find("impl ConsolidationWorkspace for PostgresBackend")
+            .expect("workspace implementation");
+        let end = source[start..]
+            .find("type PgWorkspaceSourceRow")
+            .expect("workspace implementation end");
+        let workspace = &source[start..start + end];
+        assert!(!workspace.contains(&[".", "unbound()"].concat()));
+        let contracts = [
+            Contract {
+                label: "lock active lifecycle",
+                binds: 1,
+                required: &[
+                    "SELECT state, active_read_space_id FROM namespace_embedding_state",
+                    "namespace_id = $1 FOR UPDATE",
+                    "fetch_optional(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "resume run lock",
+                binds: 2,
+                required: &[
+                    "namespace_id = $1",
+                    "embedding_space_id = $2",
+                    "FOR UPDATE",
+                    "fetch_optional(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "insert run",
+                binds: 3,
+                required: &[
+                    "run_id, namespace_id, embedding_space_id",
+                    "VALUES ($1, $2, $3",
+                    "execute(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "detect changed snapshot",
+                binds: 3,
+                required: &[
+                    "workspace.run_id = $1 AND workspace.namespace_id = $2",
+                    "source.namespace_id = $2",
+                    "embedding.embedding_space_id = $3",
+                    "fetch_one(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "count snapshot",
+                binds: 2,
+                required: &["run_id = $1 AND namespace_id = $2", "fetch_one(&mut *tx)"],
+            },
+            Contract {
+                label: "delete stale snapshot",
+                binds: 2,
+                required: &["run_id = $1 AND namespace_id = $2", "execute(&mut *tx)"],
+            },
+            Contract {
+                label: "rebuild snapshot",
+                binds: 3,
+                required: &[
+                    "run_id, namespace_id, memory_id",
+                    "source.namespace_id = $2",
+                    "embedding.embedding_space_id = $3",
+                    "execute(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "reset run",
+                binds: 2,
+                required: &["run_id = $1 AND namespace_id = $2", "execute(&mut *tx)"],
+            },
+            Contract {
+                label: "read durable cursor",
+                binds: 2,
+                required: &["run_id = $1 AND namespace_id = $2", "fetch_one(&mut *conn)"],
+            },
+            Contract {
+                label: "page sources",
+                binds: 4,
+                required: &[
+                    "workspace.run_id = $1 AND workspace.namespace_id = $2",
+                    "workspace.source_ordinal > $3",
+                    "LIMIT $4",
+                    "fetch_all(&mut *conn)",
+                ],
+            },
+            Contract {
+                label: "read anchor ordinal",
+                binds: 3,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2 AND memory_id = $3",
+                    "FOR SHARE",
+                    "fetch_one(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "preflight candidate payload",
+                binds: 5,
+                required: &[
+                    "workspace.run_id = $1 AND workspace.namespace_id = $2",
+                    "workspace.about_entity = $3",
+                    "workspace.source_ordinal > $4",
+                    "LIMIT $5",
+                    "octet_length(embedding.embedding::text)::BIGINT",
+                    "vector_dims(embedding.embedding)",
+                    "FOR SHARE OF workspace, runs, embedding, source_snapshot, spaces",
+                    "fetch_all(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "page candidates",
+                binds: 5,
+                required: &[
+                    "workspace.run_id = $1 AND workspace.namespace_id = $2",
+                    "workspace.about_entity = $3",
+                    "workspace.source_ordinal > $4",
+                    "LIMIT $5",
+                    "vector_dims(embedding.embedding)",
+                    "fetch_all(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "lock run for tentative assignment",
+                binds: 2,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2",
+                    "FOR UPDATE",
+                    "fetch_one(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "record tentative",
+                binds: 4,
+                required: &[
+                    "member.run_id = $1 AND member.namespace_id = $2",
+                    "member.memory_id = $4",
+                    "anchor_row.assignment_state IN ('unassigned', 'tentative')",
+                    "anchor_row.assignment_anchor = $3",
+                    "execute(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "count tentative",
+                binds: 3,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
+                    "fetch_one(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "lock run for finalization",
+                binds: 2,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2",
+                    "FOR UPDATE",
+                    "fetch_one(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "lock finalized members",
+                binds: 4,
+                required: &[
+                    "workspace.run_id = $1 AND workspace.namespace_id = $2",
+                    "workspace.assignment_anchor = $3",
+                    "ORDER BY workspace.source_ordinal",
+                    "LIMIT $4",
+                    "FOR SHARE OF workspace",
+                    "fetch_all(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "discard singleton",
+                binds: 3,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2 AND memory_id = $3",
+                    "execute(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "preflight latest content",
+                binds: 3,
+                required: &[
+                    "workspace.run_id = $1 AND workspace.namespace_id = $2",
+                    "workspace.assignment_anchor = $3",
+                    "octet_length(source.content)::BIGINT",
+                    "LIMIT 1",
+                    "FOR SHARE OF workspace, source",
+                    "fetch_one(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "finalize cluster",
+                binds: 3,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
+                    "execute(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "load latest content",
+                binds: 3,
+                required: &[
+                    "workspace.run_id = $1 AND workspace.namespace_id = $2",
+                    "workspace.assignment_anchor = $3",
+                    "LIMIT 1",
+                    "fetch_one(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "load bounded provenance",
+                binds: 3,
+                required: &[
+                    "workspace.run_id = $1 AND workspace.namespace_id = $2",
+                    "workspace.assignment_anchor = $3",
+                    "fetch_all(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "lock run for promotion",
+                binds: 2,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2",
+                    "FOR UPDATE",
+                    "fetch_one(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "lock finalized assignments",
+                binds: 4,
+                required: &[
+                    "SELECT memory_id, assignment_state",
+                    "run_id = $1 AND namespace_id = $2",
+                    "assignment_anchor = $3",
+                    "ORDER BY source_ordinal",
+                    "LIMIT $4",
+                    "FOR UPDATE",
+                    "fetch_all(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "validate active sources",
+                binds: 5,
+                required: &[
+                    "workspace.run_id = $1 AND workspace.namespace_id = $2",
+                    "workspace.assignment_anchor = $3",
+                    "source_embedding.embedding_space_id = $4",
+                    "ORDER BY workspace.source_ordinal",
+                    "LIMIT $5",
+                    "FOR SHARE OF source, source_embedding",
+                    "fetch_all(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "delete invalid snapshot",
+                binds: 2,
+                required: &["run_id = $1 AND namespace_id = $2", "execute(&mut *tx)"],
+            },
+            Contract {
+                label: "requeue invalid snapshot",
+                binds: 3,
+                required: &[
+                    "run_id, namespace_id, memory_id",
+                    "source.namespace_id = $2",
+                    "source_embedding.embedding_space_id = $3",
+                    "execute(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "reset invalid run",
+                binds: 2,
+                required: &["run_id = $1 AND namespace_id = $2", "execute(&mut *tx)"],
+            },
+            Contract {
+                label: "lock admission rows",
+                binds: 3,
+                required: &[
+                    "namespace_id = $1 AND subject = $2",
+                    "object = $3",
+                    "FOR SHARE",
+                    "fetch_all(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "complete promotion",
+                binds: 3,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2 AND assignment_anchor = $3",
+                    "execute(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "read resume cursor",
+                binds: 2,
+                required: &[
+                    "SELECT cursor_ordinal FROM consolidation_runs",
+                    "run_id = $1 AND namespace_id = $2",
+                    "fetch_one(&mut *conn)",
+                ],
+            },
+            Contract {
+                label: "checkpoint",
+                binds: 3,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2",
+                    "cursor_ordinal = $3",
+                    "execute(&mut *conn)",
+                ],
+            },
+            Contract {
+                label: "complete run",
+                binds: 2,
+                required: &["run_id = $1 AND namespace_id = $2", "execute(&mut *conn)"],
+            },
+            Contract {
+                label: "start compact decay repeatable read",
+                binds: 0,
+                required: &[
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+                    "execute(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "preflight compact decay page",
+                binds: 4,
+                required: &[
+                    "namespace_id = $1",
+                    "type_order > $2 OR (type_order = $2 AND id > $3)",
+                    "LIMIT $4",
+                    "fetch_one(&mut *tx)",
+                ],
+            },
+            Contract {
+                label: "load compact decay page",
+                binds: 4,
+                required: &["POSTGRES_COMPACT_DECAY_PAYLOAD_SQL", "fetch_all(&mut *tx)"],
+            },
+            Contract {
+                label: "commit episodic decay",
+                binds: 5,
+                required: &["WHERE id = $4 AND namespace_id = $5", "execute(&mut *tx)"],
+            },
+            Contract {
+                label: "commit procedural decay",
+                binds: 6,
+                required: &["WHERE id = $5 AND namespace_id = $6", "execute(&mut *tx)"],
+            },
+            Contract {
+                label: "diagnostic assignments",
+                binds: 3,
+                required: &[
+                    "run_id = $1 AND namespace_id = $2",
+                    "LIMIT $3",
+                    "fetch_all(&mut *conn)",
+                ],
+            },
+        ];
+        let blocks = query_blocks(workspace);
+        assert_eq!(
+            blocks.len(),
+            contracts.len(),
+            "every workspace query must have an explicit static contract"
+        );
+        for (block, contract) in blocks.iter().zip(&contracts) {
+            assert_eq!(
+                block.matches(".bind(").count(),
+                contract.binds,
+                "{} bind arity changed:\n{block}",
+                contract.label
+            );
+            let sql = if block.contains("POSTGRES_COMPACT_DECAY_PAYLOAD_SQL") {
+                POSTGRES_COMPACT_DECAY_PAYLOAD_SQL
+            } else {
+                block
+            };
+            for placeholder in 1..=contract.binds {
+                assert!(
+                    sql.contains(&format!("${placeholder}")),
+                    "{} no longer uses placeholder ${placeholder}:\n{block}",
+                    contract.label
+                );
+            }
+            assert!(
+                !sql.contains(&format!("${}", contract.binds + 1)),
+                "{} uses an unbound placeholder:\n{block}",
+                contract.label
+            );
+            for required in contract.required {
+                assert!(
+                    block.contains(required),
+                    "{} lost required SQL/lock/executor marker {required:?}:\n{block}",
+                    contract.label
+                );
+            }
+        }
+
+        for decode_shape in [
+            "let existing: Option<(Uuid,)>",
+            "let changed: (bool,)",
+            "let source_count: (i64,)",
+            "let rows: Vec<PgWorkspaceSourceRow>",
+            "let (entity, ordinal): (Uuid, i64)",
+            "let preflight: Vec<PgWorkspaceEmbeddingPreflightRow>",
+            "let rows: Vec<PgWorkspaceEmbeddingRow>",
+            "let assigned: Vec<(Uuid,)>",
+            "let latest: (Uuid, DateTime<Utc>, String)",
+            "let rows: Vec<(Uuid, DateTime<Utc>)>",
+            "let space: (String,)",
+            "let assigned: Vec<(Uuid, String)>",
+            "let valid: Vec<(Uuid, Uuid, DateTime<Utc>)>",
+            "let rows: Vec<(Option<Uuid>, Option<DateTime<Utc>>)>",
+            "let rows: Vec<(Uuid, Uuid)>",
+        ] {
+            assert!(
+                workspace.contains(decode_shape),
+                "workspace result decoding shape changed: {decode_shape}"
+            );
+        }
+        let promotion = &workspace[workspace
+            .find("fn commit_promotion")
+            .expect("promotion implementation")..];
+        assert!(promotion.contains("let mut tx = (&mut *conn).begin()"));
+        assert!(promotion.matches("tx.commit().await").count() >= 2);
+
+        let helper_start = source
+            .find("async fn pg_workspace_embedding_source")
+            .expect("single-source workspace loader");
+        let helper_end = source[helper_start..]
+            .find("// ---------------------------------------------------------------------------")
+            .expect("single-source loader end");
+        let helper = &source[helper_start..helper_start + helper_end];
+        let helper_blocks = query_blocks(helper);
+        assert_eq!(helper_blocks.len(), 2);
+        let preflight_query = helper_blocks[0];
+        assert_eq!(preflight_query.matches(".bind(").count(), 3);
+        assert!(preflight_query.contains("octet_length(embedding.embedding::text)::BIGINT"));
+        let payload_query = helper_blocks[1];
+        assert_eq!(payload_query.matches(".bind(").count(), 3);
+        for required in [
+            "workspace.run_id = $1 AND workspace.namespace_id = $2",
+            "workspace.memory_id = $3",
+            "fetch_one(&mut **tx)",
+        ] {
+            assert!(preflight_query.contains(required));
+            assert!(payload_query.contains(required));
+        }
+        assert!(helper.contains("let row: PgWorkspaceEmbeddingRow"));
+        assert!(helper.contains("let preflight: (i64, i32, i32)"));
+        assert!(helper.contains("vector_dims(embedding.embedding)"));
+        assert!(helper.contains("FOR SHARE OF workspace, runs, embedding, spaces"));
+        assert!(helper.contains("pg_workspace_embedding_from_row(run.namespace_id, row)"));
+    }
+
+    #[test]
+    fn consolidation_workspace_statements_pin_scope_binds_locks_and_decoding() {
+        assert_consolidation_workspace_sql_contracts(include_str!("postgres.rs"));
+    }
+
+    #[test]
+    fn consolidation_payload_preflights_use_actual_dimensions_and_shared_transactions() {
+        let source = include_str!("postgres.rs");
+        let start = source
+            .find("impl ConsolidationWorkspace for PostgresBackend")
+            .expect("workspace implementation");
+        let end = source[start..]
+            .find("type PgWorkspaceSourceRow")
+            .expect("workspace implementation end");
+        let workspace = &source[start..start + end];
+        let candidate_start = workspace
+            .find("fn page_later_unassigned")
+            .expect("candidate paging");
+        let candidate_end = workspace[candidate_start..]
+            .find("fn record_tentative_match")
+            .expect("candidate paging end");
+        let candidate = &workspace[candidate_start..candidate_start + candidate_end];
+        for required in [
+            "vector_dims(embedding.embedding)",
+            "let mut tx = (&mut *conn).begin()",
+            "FOR SHARE",
+            "fetch_all(&mut *tx)",
+        ] {
+            assert!(
+                candidate.contains(required),
+                "candidate path lost {required}"
+            );
+        }
+        let final_start = workspace
+            .find("fn finalize_or_discard_cluster")
+            .expect("finalization");
+        let final_end = workspace[final_start..]
+            .find("fn commit_promotion")
+            .expect("finalization end");
+        let finalization = &workspace[final_start..final_start + final_end];
+        assert!(finalization.contains("let mut tx = (&mut *conn).begin()"));
+        assert!(finalization.contains("FOR SHARE OF workspace, source"));
+
+        let helper_start = source
+            .find("async fn pg_workspace_embedding_source")
+            .expect("anchor loader");
+        let helper_end = source[helper_start..]
+            .find("// ---------------------------------------------------------------------------")
+            .expect("anchor loader end");
+        let helper = &source[helper_start..helper_start + helper_end];
+        assert!(helper.contains("vector_dims(embedding.embedding)"));
+        assert!(helper.contains("FOR SHARE"));
+        assert!(helper.contains("&mut Transaction<'_, Postgres>"));
+    }
+
+    #[test]
+    fn consolidation_workspace_bounds_and_releases_postgres_lock_vectors() {
+        let source = include_str!("postgres.rs");
+        let workspace_start = source
+            .find("impl ConsolidationWorkspace for PostgresBackend")
+            .expect("workspace implementation");
+        let workspace_end = source[workspace_start..]
+            .find("type PgWorkspaceSourceRow")
+            .expect("workspace implementation end");
+        let workspace = &source[workspace_start..workspace_start + workspace_end];
+
+        let candidate_start = workspace
+            .find("fn page_later_unassigned")
+            .expect("candidate paging");
+        let candidate_end = workspace[candidate_start..]
+            .find("fn record_tentative_match")
+            .expect("candidate paging end");
+        let candidate = &workspace[candidate_start..candidate_start + candidate_end];
+        let drop_preflight = candidate
+            .find("drop(preflight);")
+            .expect("candidate preflight ownership must be released");
+        let payload_fetch = candidate
+            .find("let rows: Vec<PgWorkspaceEmbeddingRow>")
+            .expect("candidate payload fetch");
+        assert!(drop_preflight < payload_fetch);
+
+        let final_start = workspace
+            .find("fn finalize_or_discard_cluster")
+            .expect("finalization");
+        let final_end = workspace[final_start..]
+            .find("fn commit_promotion")
+            .expect("finalization end");
+        let finalization = &workspace[final_start..final_start + final_end];
+        for required in [
+            "ORDER BY workspace.source_ordinal\n                 LIMIT $4\n                 FOR SHARE OF workspace",
+            "MAX_PROMOTION_CLUSTER_MEMBERS.saturating_add(1)",
+            "let count = assigned.len();",
+            "drop(assigned);",
+            "if count > crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS",
+        ] {
+            assert!(
+                finalization.contains(required),
+                "bounded final lock path lost {required:?}"
+            );
+        }
+        let drop_assigned = finalization.find("drop(assigned);").unwrap();
+        let content_preflight = finalization
+            .find("let latest_content_bytes")
+            .expect("latest content preflight");
+        assert!(drop_assigned < content_preflight);
+    }
+
+    #[test]
+    fn consolidation_cluster_mutations_share_a_durable_lock_and_revalidate_promotion() {
+        fn operation<'a>(workspace: &'a str, start: &str, end: &str) -> &'a str {
+            let start = workspace.find(start).expect("operation start");
+            let end = workspace[start..].find(end).expect("operation end");
+            &workspace[start..start + end]
+        }
+
+        let source = include_str!("postgres.rs");
+        let workspace_start = source
+            .find("impl ConsolidationWorkspace for PostgresBackend")
+            .expect("workspace implementation");
+        let workspace_end = source[workspace_start..]
+            .find("type PgWorkspaceSourceRow")
+            .expect("workspace implementation end");
+        let workspace = &source[workspace_start..workspace_start + workspace_end];
+
+        let tentative = operation(
+            workspace,
+            "fn record_tentative_match",
+            "fn finalize_or_discard_cluster",
+        );
+        let finalization = operation(
+            workspace,
+            "fn finalize_or_discard_cluster",
+            "fn commit_promotion",
+        );
+        let promotion = operation(workspace, "fn commit_promotion", "fn checkpoint");
+
+        for operation in [tentative, finalization, promotion] {
+            assert!(operation.contains("let mut tx = (&mut *conn).begin()"));
+            let run_lock = operation
+                .find("FROM consolidation_runs")
+                .expect("durable run lock");
+            let exclusive = operation[run_lock..]
+                .find("FOR UPDATE")
+                .map(|offset| run_lock + offset)
+                .expect("exclusive durable run lock");
+            let source_access = operation
+                .find("consolidation_sources")
+                .expect("membership access");
+            assert!(
+                exclusive < source_access,
+                "durable run lock must precede every membership row lock/mutation"
+            );
+        }
+
+        for required in [
+            "anchor_row.assignment_state IN ('unassigned', 'tentative')",
+            "anchor_row.assignment_anchor IS NULL",
+            "anchor_row.assignment_anchor = $3",
+            "execute(&mut *tx)",
+            "fetch_one(&mut *tx)",
+            "tx.commit().await",
+        ] {
+            assert!(
+                tentative.contains(required),
+                "late-assignment rejection lost {required:?}"
+            );
+        }
+
+        let final_lock = finalization.find("FROM consolidation_runs").unwrap();
+        let final_members = finalization
+            .find("let assigned: Vec<(Uuid,)>")
+            .expect("bounded final membership");
+        assert!(final_lock < final_members);
+
+        let semantic_write = promotion
+            .find("save_memory_in_pg_tx")
+            .expect("semantic promotion write");
+        for required in [
+            "LIMIT $4",
+            "LIMIT $5",
+            "MAX_PROMOTION_CLUSTER_MEMBERS.saturating_add(1)",
+            "let assigned_count = assigned.len();",
+            "!(2..=crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS)\n                .contains(&assigned_count)",
+            "assigned.iter().any(|row| row.1 != \"finalized\")",
+            "!assigned.iter().any(|row| row.0 == anchor.id)",
+            "valid.len() != assigned_count",
+            "semantic.source_episodes.len() != assigned_count",
+            "!= valid.iter().map(|row| row.1).collect::<Vec<_>>()",
+        ] {
+            let position = promotion
+                .find(required)
+                .unwrap_or_else(|| panic!("promotion revalidation lost {required:?}"));
+            assert!(
+                position < semantic_write,
+                "promotion revalidation {required:?} must precede semantic writes"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_decay_postgres_projection_is_the_exact_fixed_field_whitelist() {
+        fn normalized(sql: &str) -> String {
+            sql.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+
+        let expected = r"SELECT type_order, id, reference_time, decay_value, trial_count, success_count
+                 FROM (
+                     SELECT 0 AS type_order, id,
+                            COALESCE(last_accessed, timestamp) AS reference_time,
+                            stability AS decay_value, NULL::integer AS trial_count,
+                            NULL::integer AS success_count
+                     FROM episodic_memories
+                     WHERE namespace_id = $1
+                       AND superseded_by IS NULL AND invalid_at IS NULL
+                     UNION ALL
+                     SELECT 1, id, valid_at, stability, NULL::integer, NULL::integer
+                     FROM semantic_memories
+                     WHERE namespace_id = $1
+                       AND superseded_by IS NULL AND invalid_at IS NULL
+                     UNION ALL
+                     SELECT 2, id, COALESCE(last_used, created_at), reliability,
+                            trial_count, success_count
+                     FROM procedural_memories
+                     WHERE namespace_id = $1
+                       AND superseded_by IS NULL AND invalid_at IS NULL
+                     UNION ALL
+                     SELECT 3, id, NULL::timestamptz, NULL::real,
+                            NULL::integer, NULL::integer
+                     FROM observation_memories
+                     WHERE namespace_id = $1
+                       AND superseded_by IS NULL AND invalid_at IS NULL
+                 ) AS compact_decay
+                 WHERE type_order > $2 OR (type_order = $2 AND id > $3)
+                 ORDER BY type_order, id LIMIT $4";
+        assert_eq!(
+            normalized(POSTGRES_COMPACT_DECAY_PAYLOAD_SQL),
+            normalized(expected),
+            "compact decay payload query must remain the exact fixed-field whitelist"
+        );
+    }
+
+    #[test]
+    fn compact_decay_postgres_preflight_and_payload_share_repeatable_read() {
+        let source = include_str!("postgres.rs");
+        let start = source
+            .find("fn page_decay(")
+            .expect("compact decay implementation");
+        let end = source[start..]
+            .find("fn commit_decay")
+            .expect("compact decay implementation end");
+        let decay = &source[start..start + end];
+        for required in [
+            "let mut tx = (&mut *conn).begin()",
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+            "fetch_one(&mut *tx)",
+            "query_as::<Postgres, _>(POSTGRES_COMPACT_DECAY_PAYLOAD_SQL)",
+            "fetch_all(&mut *tx)",
+            "tx.commit().await",
+        ] {
+            assert!(
+                decay.contains(required),
+                "compact decay snapshot path lost {required:?}"
+            );
+        }
+        for predicate in [
+            "namespace_id = $1",
+            "type_order > $2 OR (type_order = $2 AND id > $3)",
+            "ORDER BY type_order, id LIMIT $4",
+        ] {
+            assert!(decay.contains(predicate));
+            assert!(POSTGRES_COMPACT_DECAY_PAYLOAD_SQL.contains(predicate));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn postgres_row_mapping_round_trips_supersession_columns() {
         let now = Utc::now();
         let successor = Uuid::new_v4();
         let namespace_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
 
         let episodic = row_to_episodic(EpisodicRow {
             id: Uuid::new_v4(),
@@ -2820,46 +8525,52 @@ mod tests {
             event_time: None,
             superseded_by: Some(successor),
             invalid_at: Some(now),
+            agent_id: Some(agent_id),
+            user_id: Some(user_id),
         });
         assert_eq!(episodic.superseded_by, Some(successor));
         assert_eq!(episodic.invalid_at, Some(now));
 
-        let semantic = row_to_semantic((
-            Uuid::new_v4(),
+        let semantic = row_to_semantic(SemanticRow {
+            id: Uuid::new_v4(),
             namespace_id,
-            Uuid::new_v4(),
-            "predicate".to_string(),
-            "object".to_string(),
-            None,
-            0.9,
-            now,
-            Some(now),
-            serde_json::json!([]),
-            None,
-            1.0,
-            1.0,
-            Some(successor),
-        ));
+            subject: Uuid::new_v4(),
+            predicate: "predicate".to_string(),
+            object: "object".to_string(),
+            object_entity: None,
+            confidence: 0.9,
+            valid_at: now,
+            invalid_at: Some(now),
+            source_episodes: serde_json::json!([]),
+            embedding_text: None,
+            stability: 1.0,
+            retrievability: 1.0,
+            superseded_by: Some(successor),
+            agent_id: Some(agent_id),
+            user_id: Some(user_id),
+        });
         assert_eq!(semantic.superseded_by, Some(successor));
         assert_eq!(semantic.invalid_at, Some(now));
 
-        let procedural = row_to_procedural((
-            Uuid::new_v4(),
+        let procedural = row_to_procedural(ProceduralRow {
+            id: Uuid::new_v4(),
             namespace_id,
-            "trigger".to_string(),
-            "action".to_string(),
-            "Success".to_string(),
-            serde_json::json!({}),
-            0.9,
-            1,
-            1,
-            serde_json::json!([]),
-            None,
-            now,
-            None,
-            Some(successor),
-            Some(now),
-        ));
+            trigger: "trigger".to_string(),
+            action: "action".to_string(),
+            outcome: "Success".to_string(),
+            context: serde_json::json!({}),
+            reliability: 0.9,
+            trial_count: 1,
+            success_count: 1,
+            source_episodes: serde_json::json!([]),
+            embedding_text: None,
+            created_at: now,
+            last_used: None,
+            superseded_by: Some(successor),
+            invalid_at: Some(now),
+            agent_id: Some(agent_id),
+            user_id: Some(user_id),
+        });
         assert_eq!(procedural.superseded_by, Some(successor));
         assert_eq!(procedural.invalid_at, Some(now));
 
@@ -2881,9 +8592,20 @@ mod tests {
             retrievability: 1.0,
             superseded_by: Some(successor),
             invalid_at: Some(now),
+            agent_id: Some(agent_id),
+            user_id: Some(user_id),
         });
         assert_eq!(observation.superseded_by, Some(successor));
         assert_eq!(observation.invalid_at, Some(now));
+        for (actual_agent, actual_user) in [
+            (episodic.agent_id, episodic.user_id),
+            (semantic.agent_id, semantic.user_id),
+            (procedural.agent_id, procedural.user_id),
+            (observation.agent_id, observation.user_id),
+        ] {
+            assert_eq!(actual_agent, Some(agent_id));
+            assert_eq!(actual_user, Some(user_id));
+        }
     }
 
     use rusqlite::{Connection, params};
@@ -2944,5 +8666,155 @@ mod tests {
         );
         let instances = run_observation_instance_query(&["alice", "alice", "alice"], "alice", 2);
         assert_eq!(instances.len(), 2);
+    }
+
+    #[test]
+    fn atomic_supersession_queries_are_type_and_namespace_scoped() {
+        for (memory_type, table) in [
+            (MemoryType::Episodic, "episodic_memories"),
+            (MemoryType::Semantic, "semantic_memories"),
+            (MemoryType::Procedural, "procedural_memories"),
+            (MemoryType::Observation, "observation_memories"),
+        ] {
+            let sql = supersede_update_sql(memory_type);
+            assert!(sql.starts_with(&format!("UPDATE {table} SET superseded_by")));
+            assert!(sql.contains("id = $3 AND namespace_id = $4"));
+            assert!(sql.contains("superseded_by IS NULL"));
+        }
+    }
+
+    #[test]
+    fn paged_forget_uses_conflicting_namespace_scoped_locks_for_every_source_type() {
+        for (memory_type, table) in [
+            (MemoryType::Episodic, "episodic_memories"),
+            (MemoryType::Semantic, "semantic_memories"),
+            (MemoryType::Procedural, "procedural_memories"),
+            (MemoryType::Observation, "observation_memories"),
+        ] {
+            let capture = typed_source_lock_sql(memory_type, SourceLockMode::Capture);
+            assert!(capture.contains(&format!("FROM {table}")));
+            assert!(capture.contains("WHERE id = $1 AND namespace_id = $2"));
+            assert!(capture.ends_with("FOR UPDATE"));
+
+            let generation = typed_source_lock_sql(memory_type, SourceLockMode::Generation);
+            assert!(generation.contains(&format!("FROM {table}")));
+            assert!(generation.contains("WHERE id = $1 AND namespace_id = $2"));
+            assert!(generation.ends_with("FOR KEY SHARE"));
+        }
+
+        assert!(ENTITY_FORGET_PAGE_REFS_SQL.contains("ORDER BY type_order, id"));
+        let source = include_str!("postgres.rs");
+        let body = source
+            .split_once("fn delete_memories_by_entity_paged(")
+            .expect("paged forget")
+            .1
+            .split_once("/// One-transaction GDPR erase")
+            .expect("paged forget terminator")
+            .0;
+        let lock = body
+            .find("lock_typed_source_for_capture")
+            .expect("source lock");
+        let preflight = body[lock..]
+            .find("capture_payload_bytes_pg_tx")
+            .map(|offset| lock + offset)
+            .expect("bounded payload preflight");
+        let reread = body[lock..]
+            .find("load_memory_without_embedding_pg")
+            .map(|offset| lock + offset)
+            .expect("source reread");
+        let generations = body[reread..]
+            .find("FROM memory_embeddings")
+            .map(|offset| reread + offset)
+            .expect("generation capture");
+        let delete = body[generations..]
+            .find("DELETE FROM memory_embeddings")
+            .map(|offset| generations + offset)
+            .expect("generation delete");
+        assert!(lock < preflight && preflight < reread);
+        assert!(reread < generations && generations < delete);
+
+        let preflight_helper = source
+            .split_once("async fn capture_payload_bytes_pg_tx(")
+            .expect("payload preflight helper")
+            .1
+            .split_once("#[cfg(test)]")
+            .expect("payload preflight helper terminator")
+            .0;
+        assert!(preflight_helper.contains("octet_length(content)"));
+        assert!(preflight_helper.contains("SUM(octet_length(embedding::text)"));
+    }
+
+    #[test]
+    fn production_embedding_writes_and_capture_use_their_conflicting_locks_before_work() {
+        let source = include_str!("postgres.rs");
+        let production = source
+            .split_once("/// Live-Postgres coverage")
+            .expect("production PostgreSQL source terminator")
+            .0;
+
+        let capture_lock = production
+            .split_once("async fn lock_typed_source_for_capture(")
+            .expect("capture lock helper")
+            .1
+            .split_once("#[cfg(test)]")
+            .expect("capture lock helper terminator")
+            .0;
+        assert!(capture_lock.contains("lock_typed_source("));
+        assert!(capture_lock.contains("SourceLockMode::Capture"));
+        assert!(!capture_lock.contains("SourceLockMode::Generation"));
+
+        let insert = production
+            .split_once("async fn insert_embedding_in_pg_tx(")
+            .expect("central generation insert helper")
+            .1
+            .split_once("fn memory_type_from_str(")
+            .expect("central generation insert helper terminator")
+            .0;
+        let lock_call = insert
+            .find("lock_typed_source(")
+            .expect("generation source lock");
+        let lock_mode = insert
+            .find("SourceLockMode::Generation")
+            .expect("generation KEY SHARE mode");
+        let insert_statement = insert
+            .find("INSERT INTO memory_embeddings")
+            .expect("generation insert statement");
+        assert!(lock_call < lock_mode && lock_mode < insert_statement);
+        assert!(!insert[..insert_statement].contains("SourceLockMode::Capture"));
+        assert_eq!(insert.matches("INSERT INTO memory_embeddings").count(), 1);
+        assert_eq!(
+            production.matches("INSERT INTO memory_embeddings").count(),
+            1,
+            "every production generation insert must stay centralized behind the source lock"
+        );
+    }
+
+    #[test]
+    fn postgres_bulk_paths_keep_the_page_bound_and_real_page_guard_in_control_flow() {
+        let source = include_str!("postgres.rs");
+        let forget = source
+            .split_once("fn delete_memories_by_entity_paged(")
+            .expect("paged forget")
+            .1
+            .split_once("/// One-transaction GDPR erase")
+            .expect("paged forget terminator")
+            .0;
+        assert!(forget.contains("1..=MEMORY_PAGE_SIZE"));
+        let guard = forget.find("BulkPageGuard::new").expect("real page guard");
+        let callback = forget[guard..]
+            .find("persist_page(&page)")
+            .map(|offset| guard + offset)
+            .expect("guarded page callback");
+        assert!(guard < callback);
+
+        let gdpr = source
+            .split_once("fn page_gdpr_personal_data(")
+            .expect("GDPR page")
+            .1
+            .split_once("fn save_memory_with_embedding(")
+            .expect("GDPR page terminator")
+            .0;
+        assert!(gdpr.contains("1..=MEMORY_PAGE_SIZE"));
+        assert!(gdpr.contains("LIMIT $5"));
     }
 }

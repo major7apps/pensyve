@@ -15,8 +15,8 @@ use pensyve_core::config::{ConsolidationConfig, PensyveConfig};
 use pensyve_core::consolidation::ConsolidationEngine;
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::network_policy::NetworkPolicy;
-use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
+use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{Episode, EpisodicMemory, Memory, Namespace};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -51,6 +51,24 @@ fn run_once(storage: &SqliteBackend, embedder: &OnnxEmbedder, ns: Uuid) -> usize
     .promoted
 }
 
+fn initialize_generation(storage: &SqliteBackend, embedder: &OnnxEmbedder, ns: Uuid) {
+    storage
+        .initialize_local_runtime_space(ns, embedder.embedding_space().unwrap())
+        .unwrap();
+}
+
+fn save_episodic(storage: &SqliteBackend, embedder: &OnnxEmbedder, memory: &EpisodicMemory) {
+    let wrapped = Memory::Episodic(memory.clone());
+    let record = embedding_record_for_memory(
+        &wrapped,
+        embedder.embedding_space().unwrap(),
+        memory.embedding.clone(),
+    );
+    storage
+        .save_memory_with_embedding(&wrapped, Some(&record))
+        .unwrap();
+}
+
 /// Re-running the engine over an unchanged episodic set promotes on the first
 /// pass and is a no-op on every pass after it.
 #[test]
@@ -61,6 +79,7 @@ fn repeated_runs_do_not_duplicate_promotions() {
 
     let ns = Namespace::new("idempotent_promotion");
     storage.save_namespace(&ns).unwrap();
+    initialize_generation(&storage, &embedder, ns.id);
     let entity_id = Uuid::new_v4();
     let source_id = Uuid::new_v4();
     let episode = Episode::new(ns.id, vec![source_id, entity_id]);
@@ -73,7 +92,7 @@ fn repeated_runs_do_not_duplicate_promotions() {
             EpisodicMemory::new(ns.id, episode.id, source_id, entity_id, "prefers dark mode");
         mem.embedding = embedder.embed(&mem.content).unwrap();
         mem.timestamp = Utc::now() - chrono::Duration::seconds(i);
-        storage.save_episodic(&mem).unwrap();
+        save_episodic(&storage, &embedder, &mem);
     }
 
     let first = run_once(&storage, &embedder, ns.id);
@@ -109,6 +128,7 @@ fn guard_does_not_collapse_distinct_entities() {
 
     let ns = Namespace::new("idempotent_distinct_entities");
     storage.save_namespace(&ns).unwrap();
+    initialize_generation(&storage, &embedder, ns.id);
     let source_id = Uuid::new_v4();
     let episode = Episode::new(ns.id, vec![source_id]);
     storage.save_episode(&episode).unwrap();
@@ -121,7 +141,7 @@ fn guard_does_not_collapse_distinct_entities() {
                 EpisodicMemory::new(ns.id, episode.id, source_id, entity_id, "ships on Fridays");
             mem.embedding = embedder.embed(&mem.content).unwrap();
             mem.timestamp = Utc::now() - chrono::Duration::seconds(i);
-            storage.save_episodic(&mem).unwrap();
+            save_episodic(&storage, &embedder, &mem);
         }
     }
 
@@ -150,6 +170,7 @@ fn new_clusters_still_promote_after_prior_runs() {
 
     let ns = Namespace::new("idempotent_new_cluster");
     storage.save_namespace(&ns).unwrap();
+    initialize_generation(&storage, &embedder, ns.id);
     let source_id = Uuid::new_v4();
     let episode = Episode::new(ns.id, vec![source_id]);
     storage.save_episode(&episode).unwrap();
@@ -159,7 +180,7 @@ fn new_clusters_still_promote_after_prior_runs() {
         let mut mem = EpisodicMemory::new(ns.id, episode.id, source_id, entity_a, "uses zsh");
         mem.embedding = embedder.embed(&mem.content).unwrap();
         mem.timestamp = Utc::now() - chrono::Duration::seconds(i);
-        storage.save_episodic(&mem).unwrap();
+        save_episodic(&storage, &embedder, &mem);
     }
     assert_eq!(run_once(&storage, &embedder, ns.id), 1);
     assert_eq!(run_once(&storage, &embedder, ns.id), 0);
@@ -169,7 +190,7 @@ fn new_clusters_still_promote_after_prior_runs() {
         let mut mem = EpisodicMemory::new(ns.id, episode.id, source_id, entity_a, "uses fish");
         mem.embedding = embedder.embed(&mem.content).unwrap();
         mem.timestamp = Utc::now() - chrono::Duration::seconds(i);
-        storage.save_episodic(&mem).unwrap();
+        save_episodic(&storage, &embedder, &mem);
     }
 
     assert_eq!(

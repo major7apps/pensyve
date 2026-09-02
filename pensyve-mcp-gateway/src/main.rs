@@ -11,15 +11,20 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use pensyve_core::config::RetrievalConfig;
-use pensyve_core::embedding::OnnxEmbedder;
+use pensyve_core::embedding::{OnnxEmbedder, resolved_fastembed_cache_dir};
+use pensyve_core::embedding_migration::{BackfillCancellation, EmbeddingMigration, MigrationError};
+use pensyve_core::embedding_space::EmbeddingSpaceId;
+use pensyve_core::network_policy::NetworkPolicy;
+use pensyve_core::reranker::Reranker;
 use pensyve_core::storage::StorageTrait;
+use pensyve_core::storage::bounded::NamespaceEmbeddingPhase;
 use pensyve_core::storage::postgres::PostgresBackend;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::Namespace;
-use pensyve_core::vector::VectorIndex;
 
 use pensyve_mcp_tools::{PensyveMcpServer, PensyveState};
 
+use pensyve_mcp_gateway::admission::{MIB, RecallAdmission, enforce_recall_admission};
 use pensyve_mcp_gateway::auth::{self, AuthContext, AuthLayer};
 use pensyve_mcp_gateway::cache;
 use pensyve_mcp_gateway::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
@@ -37,12 +42,98 @@ struct InitResources {
     storage: Arc<dyn StorageTrait>,
     embedder: Arc<OnnxEmbedder>,
     namespace: Namespace,
-    vector_index: VectorIndex,
     retrieval_config: RetrievalConfig,
+    strict_reranker: Option<Arc<Reranker>>,
+}
+
+const EMBEDDING_MODEL: &str = "Alibaba-NLP/gte-base-en-v1.5";
+const MINILM_MODEL: &str = "all-MiniLM-L6-v2";
+const MINILM_REPOSITORY: &str = "Qdrant/all-MiniLM-L6-v2-onnx";
+const RERANKER_MODEL: &str = "BGERerankerBase";
+const RERANKER_REPOSITORY: &str = "BAAI/bge-reranker-base";
+const SHIPPING_EMBEDDING_POOL_SIZE: usize = 1;
+
+fn validate_model_runtime_configuration(
+    strict_local_models: bool,
+    allow_mock_embedder_value: Option<&std::ffi::OsStr>,
+    reranker_value: Option<&str>,
+) -> Result<()> {
+    if !strict_local_models {
+        return Ok(());
+    }
+    if allow_mock_embedder_value.is_some() {
+        anyhow::bail!(
+            "Invalid model runtime configuration: PENSYVE_REQUIRE_LOCAL_MODELS=1 conflicts with \
+             the presence of PENSYVE_ALLOW_MOCK_EMBEDDER"
+        );
+    }
+    if reranker_value != Some("1") {
+        anyhow::bail!(
+            "Invalid model runtime configuration: PENSYVE_REQUIRE_LOCAL_MODELS=1 requires \
+             PENSYVE_RERANKER=1"
+        );
+    }
+    Ok(())
+}
+
+fn cached_model_revision(cache_root: &std::path::Path, repository: &str) -> String {
+    let ref_path = cache_root
+        .join(format!("models--{}", repository.replace('/', "--")))
+        .join("refs/main");
+    std::fs::read_to_string(ref_path).unwrap_or_else(|_| "unresolved".to_string())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RerankerRuntimeMetadata {
+    state: &'static str,
+    model: &'static str,
+    revision: String,
+}
+
+fn reranker_runtime_metadata(
+    preinitialized: bool,
+    reranker_value: Option<&str>,
+    initialized_revision: Option<&str>,
+) -> RerankerRuntimeMetadata {
+    if preinitialized {
+        return RerankerRuntimeMetadata {
+            state: "initialized",
+            model: RERANKER_MODEL,
+            revision: initialized_revision.unwrap_or("unresolved").to_string(),
+        };
+    }
+    if reranker_value != Some("1") {
+        return RerankerRuntimeMetadata {
+            state: "disabled",
+            model: "none",
+            revision: "not-applicable".to_string(),
+        };
+    }
+    RerankerRuntimeMetadata {
+        state: "deferred",
+        model: RERANKER_MODEL,
+        revision: "resolved-on-first-use".to_string(),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
 fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
+    let strict_local_models = std::env::var("PENSYVE_REQUIRE_LOCAL_MODELS").as_deref() == Ok("1");
+    let allow_mock_embedder_value = std::env::var_os("PENSYVE_ALLOW_MOCK_EMBEDDER");
+    let allow_mock_embedder = allow_mock_embedder_value
+        .as_deref()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some();
+    let reranker_value = std::env::var("PENSYVE_RERANKER").ok();
+    validate_model_runtime_configuration(
+        strict_local_models,
+        allow_mock_embedder_value.as_deref(),
+        reranker_value.as_deref(),
+    )?;
+    let embedding_pool_size = SHIPPING_EMBEDDING_POOL_SIZE;
+    let cache_root = resolved_fastembed_cache_dir()
+        .map_err(|error| anyhow::anyhow!("Failed to resolve model cache root: {error}"))?;
+
     let storage: Arc<dyn StorageTrait> = if let Ok(database_url) = std::env::var("DATABASE_URL") {
         if database_url.starts_with("postgres") {
             tracing::info!("Using Postgres backend");
@@ -80,72 +171,93 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
         Err(e) => return Err(anyhow::anyhow!("Storage error: {e}")),
     };
 
-    let embedder = match OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5") {
-        Ok(e) => {
-            tracing::info!("Using ONNX embedder (Alibaba-NLP/gte-base-en-v1.5, 768 dims)");
-            e
-        }
-        Err(gte_err) => {
-            tracing::warn!("GTE model unavailable ({gte_err}), trying MiniLM fallback");
-            match OnnxEmbedder::new("all-MiniLM-L6-v2") {
-                Ok(e) => {
-                    tracing::info!("Using fallback ONNX embedder (all-MiniLM-L6-v2, 384 dims)");
-                    e
+    let (embedder, embedding_model, embedding_repository, strict_reranker) = if strict_local_models
+    {
+        let embedder = OnnxEmbedder::new_with_policy_and_pool_size(
+            EMBEDDING_MODEL,
+            &NetworkPolicy::Disabled,
+            embedding_pool_size,
+        )
+        .map_err(|error| anyhow::anyhow!("Strict local GTE initialization failed: {error}"))?;
+        let reranker = Reranker::new_cached_with_policy(RERANKER_MODEL, &NetworkPolicy::Disabled)
+            .map_err(|error| {
+            anyhow::anyhow!("Strict local BGE initialization failed: {error}")
+        })?;
+        (
+            embedder,
+            EMBEDDING_MODEL,
+            Some(EMBEDDING_MODEL),
+            Some(reranker),
+        )
+    } else {
+        let (embedder, embedding_model, embedding_repository) =
+            match OnnxEmbedder::new_with_policy_and_pool_size(
+                EMBEDDING_MODEL,
+                &NetworkPolicy::Permissive,
+                SHIPPING_EMBEDDING_POOL_SIZE,
+            ) {
+                Ok(embedder) => {
+                    tracing::info!("Using ONNX embedder (Alibaba-NLP/gte-base-en-v1.5, 768 dims)");
+                    (embedder, EMBEDDING_MODEL, Some(EMBEDDING_MODEL))
                 }
-                Err(mini_err) => {
-                    if std::env::var("PENSYVE_ALLOW_MOCK_EMBEDDER").is_ok() {
-                        // PENSYVE_ALLOW_MOCK_EMBEDDER is the explicit opt-in
-                        // for environments that intentionally ship without the
-                        // ONNX models (e.g. prod containers built without the
-                        // model artifacts). Surface as info, not warn.
-                        tracing::info!("Using mock embedder (768 dims) — {mini_err}");
-                        OnnxEmbedder::new_mock(768)
-                    } else {
-                        return Err(anyhow::anyhow!(
-                            "No ONNX model available. Set PENSYVE_ALLOW_MOCK_EMBEDDER=1 to use mock. Error: {mini_err}"
-                        ));
+                Err(gte_err) => {
+                    tracing::warn!("GTE model unavailable ({gte_err}), trying MiniLM fallback");
+                    match OnnxEmbedder::new_with_policy_and_pool_size(
+                        MINILM_MODEL,
+                        &NetworkPolicy::Permissive,
+                        SHIPPING_EMBEDDING_POOL_SIZE,
+                    ) {
+                        Ok(embedder) => {
+                            tracing::info!(
+                                "Using fallback ONNX embedder (all-MiniLM-L6-v2, 384 dims)"
+                            );
+                            (embedder, MINILM_MODEL, Some(MINILM_REPOSITORY))
+                        }
+                        Err(mini_err) => {
+                            if allow_mock_embedder {
+                                // PENSYVE_ALLOW_MOCK_EMBEDDER is the explicit opt-in
+                                // for environments that intentionally ship without the
+                                // ONNX models (e.g. prod containers built without the
+                                // model artifacts). Surface as info, not warn.
+                                tracing::info!("Using mock embedder (768 dims) — {mini_err}");
+                                (OnnxEmbedder::new_mock(768), "mock", None)
+                            } else {
+                                return Err(anyhow::anyhow!(
+                                    "No ONNX model available. Set PENSYVE_ALLOW_MOCK_EMBEDDER=1 to use mock. Error: {mini_err}"
+                                ));
+                            }
+                        }
                     }
                 }
-            }
-        }
+            };
+        (embedder, embedding_model, embedding_repository, None)
     };
 
+    let embedding_revision = embedding_repository.map_or_else(
+        || "not-applicable".to_string(),
+        |repository| cached_model_revision(&cache_root, repository),
+    );
+    let initialized_reranker_revision = strict_reranker
+        .as_ref()
+        .map(|_| cached_model_revision(&cache_root, RERANKER_REPOSITORY));
+    let reranker_metadata = reranker_runtime_metadata(
+        strict_reranker.is_some(),
+        reranker_value.as_deref(),
+        initialized_reranker_revision.as_deref(),
+    );
+    tracing::info!(
+        strict_local_models,
+        embedding_model,
+        embedding_revision,
+        reranker_state = reranker_metadata.state,
+        reranker_model = reranker_metadata.model,
+        reranker_revision = reranker_metadata.revision,
+        cache_root = %cache_root.display(),
+        embedding_pool_size,
+        "model runtime initialized"
+    );
+
     let embedder = Arc::new(embedder);
-    let dimensions = embedder.dimensions();
-
-    let mut index = VectorIndex::new(dimensions, 1024);
-    if let Ok(memories) = storage.get_all_memories_by_namespace(namespace.id) {
-        let mut loaded = 0usize;
-        for memory in &memories {
-            // Observations are recall-time enrichment — they attach to
-            // top-k session groups via `recall_grouped::attach_observations_to_groups`
-            // and MUST NOT enter the RRF candidate pool.
-            if matches!(memory, pensyve_core::types::Memory::Observation(_)) {
-                continue;
-            }
-            let embedding = memory.embedding();
-            if !embedding.is_empty() {
-                let result = match memory {
-                    pensyve_core::types::Memory::Semantic(s) => {
-                        index.add_with_entity(memory.id(), embedding, s.subject)
-                    }
-                    pensyve_core::types::Memory::Episodic(e) => {
-                        index.add_with_entity(memory.id(), embedding, e.about_entity)
-                    }
-                    pensyve_core::types::Memory::Procedural(_) => index.add(memory.id(), embedding),
-                    pensyve_core::types::Memory::Observation(_) => unreachable!(),
-                };
-                if result.is_ok() {
-                    loaded += 1;
-                }
-            }
-        }
-        tracing::info!(
-            "Loaded {loaded}/{} memories into vector index",
-            memories.len()
-        );
-    }
-
     let retrieval_config = RetrievalConfig {
         default_limit: 5,
         max_candidates: 100,
@@ -161,9 +273,131 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
         storage,
         embedder,
         namespace,
-        vector_index: index,
         retrieval_config,
+        strict_reranker,
     })
+}
+
+/// Operator mode: `pensyve-mcp-gateway backfill-embeddings` brings every
+/// namespace onto the embedding generation this process loaded, then exits.
+const BACKFILL_EMBEDDINGS_MODE: &str = "backfill-embeddings";
+
+/// Bounded per-namespace source page for the backfill loop.
+const BACKFILL_PAGE: usize = 256;
+
+/// Consecutive backfill rounds that attempt items without committing any
+/// before the namespace is reported as stalled instead of spinning.
+const BACKFILL_STALL_ROUNDS: usize = 3;
+
+enum BackfillResult {
+    AlreadyActive,
+    Activated { committed: usize },
+}
+
+/// Run the embedding migration lifecycle (begin, backfill, verify, activate)
+/// for every namespace the storage pages out, resuming namespaces already in
+/// flight on this generation and skipping ones already active on it. Each
+/// namespace is scoped through `StorageTrait`, so the serving role's
+/// row-level security applies exactly as it does when serving traffic.
+fn backfill_embeddings(storage: &dyn StorageTrait, embedder: &OnnxEmbedder) -> Result<()> {
+    let runtime_space = embedder
+        .embedding_space()
+        .map_err(|error| anyhow::anyhow!("runtime embedding space: {error}"))?
+        .id();
+    tracing::info!(space = %runtime_space.0, "embedding backfill starting");
+    let cancellation = BackfillCancellation::new();
+    let mut after = None;
+    let (mut activated, mut already_active, mut failed) = (0_usize, 0_usize, 0_usize);
+    loop {
+        let page = storage
+            .page_namespaces(after, BACKFILL_PAGE)
+            .map_err(|error| anyhow::anyhow!("page namespaces: {error}"))?;
+        for namespace_id in page.namespace_ids {
+            match backfill_namespace(
+                storage,
+                embedder,
+                namespace_id,
+                &runtime_space,
+                &cancellation,
+            ) {
+                Ok(BackfillResult::AlreadyActive) => already_active += 1,
+                Ok(BackfillResult::Activated { committed }) => {
+                    activated += 1;
+                    tracing::info!(%namespace_id, committed, "namespace activated");
+                }
+                Err(error) => {
+                    failed += 1;
+                    tracing::error!(%namespace_id, %error, "namespace backfill failed");
+                }
+            }
+        }
+        after = page.next_cursor;
+        if after.is_none() {
+            break;
+        }
+    }
+    tracing::info!(
+        activated,
+        already_active,
+        failed,
+        "embedding backfill finished"
+    );
+    if failed > 0 {
+        anyhow::bail!("{failed} namespace(s) failed to backfill; see log");
+    }
+    Ok(())
+}
+
+fn backfill_namespace(
+    storage: &dyn StorageTrait,
+    embedder: &OnnxEmbedder,
+    namespace_id: uuid::Uuid,
+    runtime_space: &EmbeddingSpaceId,
+    cancellation: &BackfillCancellation,
+) -> Result<BackfillResult, MigrationError> {
+    let state = storage.get_namespace_embedding_state(namespace_id)?;
+    let on_this_generation = |space: Option<&EmbeddingSpaceId>| space == Some(runtime_space);
+    if let Some(state) = &state
+        && state.phase == NamespaceEmbeddingPhase::Active
+        && on_this_generation(state.active_read_space_id.as_ref())
+    {
+        return Ok(BackfillResult::AlreadyActive);
+    }
+    let migration = EmbeddingMigration::new(storage, embedder, namespace_id);
+    let in_flight = state.as_ref().is_some_and(|state| {
+        matches!(
+            state.phase,
+            NamespaceEmbeddingPhase::Backfilling | NamespaceEmbeddingPhase::Ready
+        ) && on_this_generation(state.target_space_id.as_ref())
+    });
+    if !in_flight {
+        migration.start()?;
+    }
+    let mut committed = 0_usize;
+    let mut stalled_rounds = 0_usize;
+    loop {
+        let outcome = migration.backfill(BACKFILL_PAGE, cancellation)?;
+        committed += outcome.committed;
+        if outcome.attempted == 0 {
+            break;
+        }
+        if outcome.committed == 0 {
+            stalled_rounds += 1;
+            if stalled_rounds >= BACKFILL_STALL_ROUNDS {
+                tracing::warn!(
+                    %namespace_id,
+                    requeued = outcome.requeued,
+                    "backfill is not making progress; leaving namespace in flight"
+                );
+                break;
+            }
+        } else {
+            stalled_rounds = 0;
+        }
+    }
+    migration.verify()?;
+    migration.activate()?;
+    Ok(BackfillResult::Activated { committed })
 }
 
 fn main() -> Result<()> {
@@ -197,6 +431,9 @@ fn main() -> Result<()> {
     // Init resources BEFORE tokio runtime to avoid nested runtime panic
     // when PostgresBackend creates its own internal runtime.
     let res = init_resources(&config)?;
+    if std::env::args().nth(1).as_deref() == Some(BACKFILL_EMBEDDINGS_MODE) {
+        return backfill_embeddings(res.storage.as_ref(), res.embedder.as_ref());
+    }
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -205,22 +442,38 @@ fn main() -> Result<()> {
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::result_large_err,
+    reason = "public ConsolidationError::Partial compatibility requires unboxed committed stats"
+)]
 async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
-    let tenant_mgr = TenantStateManager::new(
-        res.storage,
-        res.embedder,
-        res.retrieval_config,
-        res.namespace,
-        res.vector_index,
-        // Derived from the gateway's own storage path, not a shared default:
-        // recovery artifacts belong inside the directory that backups and
-        // volume mounts already cover.
-        PensyveState::snapshot_root_for(&config.storage_path),
-        // Bounds what that directory accumulates: every non-empty forget
-        // writes a full copy of what it destroyed, so an unbounded snapshot
-        // volume is one `remember`/`forget` loop away from filling (#265).
-        PensyveState::snapshot_retention_from_env(),
-    );
+    // Recovery artifacts belong inside the directory that backups and volume
+    // mounts cover; the shared bound prevents any one tenant from growing it
+    // without limit through a `remember`/`forget` loop.
+    let snapshot_root = PensyveState::snapshot_root_for(&config.storage_path);
+    let snapshot_retention = PensyveState::snapshot_retention_from_env();
+    let consolidation_storage = res.storage.clone();
+    let consolidation_embedder = res.embedder.clone();
+    let tenant_mgr = if let Some(reranker) = res.strict_reranker {
+        TenantStateManager::new_storage_backed_with_preinitialized_reranker(
+            res.storage,
+            res.embedder,
+            res.retrieval_config,
+            res.namespace,
+            snapshot_root,
+            snapshot_retention,
+            reranker,
+        )?
+    } else {
+        TenantStateManager::new_storage_backed(
+            res.storage,
+            res.embedder,
+            res.retrieval_config,
+            res.namespace,
+            snapshot_root,
+            snapshot_retention,
+        )?
+    };
 
     let ct = CancellationToken::new();
 
@@ -292,6 +545,7 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
             }
         };
 
+    let recall_admission = Arc::new(RecallAdmission::new(8, 64 * MIB));
     let app_state = Arc::new(AppState {
         // Phase 23/C: AuthValidator wired with the auth circuit breaker so
         // validate_remote() trips on repeated upstream failures and falls back
@@ -312,6 +566,7 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         ),
         usage_counter,
         tenant_mgr,
+        recall_admission: Arc::clone(&recall_admission),
         auth_required,
         admin_key: config.admin_key.clone(),
         ct: ct.clone(),
@@ -323,6 +578,7 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
     // is created per request. The tenant ID is passed via tokio::task_local
     // (safe across .await thread migrations, unlike std::thread_local).
     let state_for_factory = app_state.clone();
+    let admission_for_factory = Arc::clone(&recall_admission);
     let mcp_service: StreamableHttpService<PensyveMcpServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || {
@@ -334,7 +590,11 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                     Some(id) => state_for_factory.tenant_mgr.get_tenant_state(&id)?,
                     None => state_for_factory.tenant_mgr.default_state(),
                 };
-                Ok(PensyveMcpServer::with_scope(pensyve_state, scope))
+                Ok(PensyveMcpServer::with_scope_and_admission(
+                    pensyve_state,
+                    scope,
+                    Arc::clone(&admission_for_factory),
+                ))
             },
             Arc::default(),
             {
@@ -382,6 +642,10 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                 .br(true),
         )
         .layer(axum::middleware::from_fn_with_state(
+            recall_admission,
+            enforce_recall_admission,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             tenant_and_usage_middleware,
         ))
@@ -402,17 +666,13 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
 
     // Background consolidation — runs every PENSYVE_CONSOLIDATION_INTERVAL_SECS (default 6h).
     //
-    // #226: this sweep used to hold a `Semaphore::new(1)` here. It never
-    // served its purpose. This task is the only acquirer — it walks namespaces
-    // sequentially and awaits each run before starting the next — so the
-    // permit was uncontended by construction, while the `episode_end` spawns
-    // it was meant to exclude never acquired it at all. The guarantee now
-    // lives inside `ConsolidationEngine::run`, keyed on the namespace, which
-    // is the granularity the hazard actually has and which no call site can
-    // skip.
+    // Namespace discovery comes from bounded storage pages, so eviction from
+    // the tenant metadata cache cannot hide durable work. The engine owns one
+    // fair process-global permit shared by every trigger path.
     let consolidation_cancel = ct.clone();
     tokio::spawn({
-        let state = app_state;
+        let sweep_storage = consolidation_storage;
+        let sweep_embedder = consolidation_embedder;
         async move {
             let interval_secs: u64 = std::env::var("PENSYVE_CONSOLIDATION_INTERVAL_SECS")
                 .ok()
@@ -426,14 +686,23 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                 if consolidation_cancel.is_cancelled() {
                     return;
                 }
-                for ns_id in state.tenant_mgr.active_namespace_ids() {
-                    if consolidation_cancel.is_cancelled() {
-                        return;
-                    }
-                    if let Some(ps) = state.tenant_mgr.get_state_by_namespace_id(ns_id) {
+                let mut namespace_cursor = None;
+                loop {
+                    let page = match sweep_storage.page_namespaces(namespace_cursor, 256) {
+                        Ok(page) => page,
+                        Err(error) => {
+                            tracing::warn!(reason = %error, "Background namespace enumeration failed");
+                            break;
+                        }
+                    };
+                    let next_namespace_cursor = page.next_cursor;
+                    for ns_id in page.namespace_ids {
+                        if consolidation_cancel.is_cancelled() {
+                            return;
+                        }
                         let config = pensyve_core::config::ConsolidationConfig::default();
-                        let storage = ps.storage.clone();
-                        let embedder = ps.embedder.clone();
+                        let storage = sweep_storage.clone();
+                        let embedder = sweep_embedder.clone();
                         let run_storage = storage.clone();
                         let run_embedder = embedder.clone();
                         let run_cancel = consolidation_cancel.clone();
@@ -442,7 +711,7 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                         // today; pass Disabled (fail-closed) and the shared
                         // shutdown token so blocking work can exit promptly.
                         let run = tokio::task::spawn_blocking(move || {
-                            pensyve_core::consolidation::ConsolidationEngine::run(
+                            pensyve_core::consolidation::ConsolidationEngine::run_bounded(
                                 run_storage.as_ref(),
                                 &run_embedder,
                                 &config,
@@ -453,10 +722,13 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                         })
                         .await;
                         match run {
-                            Ok(Ok(cs)) => {
+                            Ok(Ok(
+                                pensyve_core::consolidation::ConsolidationOutcome::Complete {
+                                    stats: cs,
+                                },
+                            )) => {
                                 if cs.promoted > 0 || cs.archived > 0 {
                                     tracing::info!(
-                                        namespace_id = %ns_id,
                                         promoted = cs.promoted,
                                         decayed = cs.decayed,
                                         archived = cs.archived,
@@ -471,6 +743,29 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                                         "decayed": cs.decayed,
                                         "archived": cs.archived,
                                     }),
+                                );
+                            }
+                            Ok(Ok(
+                                pensyve_core::consolidation::ConsolidationOutcome::Incomplete {
+                                    stats: cs,
+                                    reason,
+                                    ..
+                                },
+                            )) => {
+                                let reason_code = reason.reason_code();
+                                let _ = storage.log_activity(
+                                    ns_id,
+                                    "consolidate",
+                                    &serde_json::json!({
+                                        "promoted": cs.promoted,
+                                        "decayed": cs.decayed,
+                                        "archived": cs.archived,
+                                        "incomplete": reason_code,
+                                    }),
+                                );
+                                tracing::info!(
+                                    reason = reason_code,
+                                    "Background consolidation checkpointed incomplete"
                                 );
                             }
                             Ok(Err(e)) => {
@@ -490,20 +785,22 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                                     );
                                 }
                                 tracing::warn!(
-                                    namespace_id = %ns_id,
                                     error = %e,
                                     "Background consolidation failed"
                                 );
                             }
                             Err(e) => {
                                 tracing::warn!(
-                                    namespace_id = %ns_id,
                                     error = %e,
                                     "Background consolidation task failed"
                                 );
                             }
                         }
                     }
+                    let Some(next) = next_namespace_cursor else {
+                        break;
+                    };
+                    namespace_cursor = Some(next);
                 }
             }
         }
@@ -582,6 +879,87 @@ mod tests {
     use super::*;
 
     #[test]
+    fn strict_reranker_metadata_reports_initialized_exact_revision() {
+        let metadata =
+            reranker_runtime_metadata(true, None, Some("2cfc18c9415c912f9d8155881c133215df768a70"));
+
+        assert_eq!(metadata.state, "initialized");
+        assert_eq!(metadata.model, RERANKER_MODEL);
+        assert_eq!(
+            metadata.revision,
+            "2cfc18c9415c912f9d8155881c133215df768a70"
+        );
+    }
+
+    #[test]
+    fn permissive_disabled_reranker_metadata_reports_no_model() {
+        let metadata = reranker_runtime_metadata(false, Some("0"), Some("cached-but-unused"));
+
+        assert_eq!(metadata.state, "disabled");
+        assert_eq!(metadata.model, "none");
+        assert_eq!(metadata.revision, "not-applicable");
+    }
+
+    #[test]
+    fn permissive_default_reranker_metadata_reports_no_model() {
+        let metadata = reranker_runtime_metadata(false, None, Some("cached-but-unused"));
+
+        assert_eq!(metadata.state, "disabled");
+        assert_eq!(metadata.model, "none");
+        assert_eq!(metadata.revision, "not-applicable");
+    }
+
+    #[test]
+    fn permissive_explicit_reranker_metadata_reports_deferred_load() {
+        let metadata = reranker_runtime_metadata(false, Some("1"), Some("cached-but-not-loaded"));
+
+        assert_eq!(metadata.state, "deferred");
+        assert_eq!(metadata.model, RERANKER_MODEL);
+        assert_eq!(metadata.revision, "resolved-on-first-use");
+    }
+
+    #[test]
+    fn shipping_embedding_pool_is_one_session() {
+        assert_eq!(SHIPPING_EMBEDDING_POOL_SIZE, 1);
+    }
+
+    #[test]
+    fn strict_local_models_rejects_mock_embedder_marker_even_when_empty() {
+        let error =
+            validate_model_runtime_configuration(true, Some(std::ffi::OsStr::new("")), None)
+                .expect_err("strict mode must reject any mock-embedder marker");
+
+        assert!(
+            error.to_string().contains(
+                "PENSYVE_REQUIRE_LOCAL_MODELS=1 conflicts with the presence of \
+                 PENSYVE_ALLOW_MOCK_EMBEDDER"
+            ),
+            "startup error must identify the conflicting settings: {error}"
+        );
+    }
+
+    #[test]
+    fn strict_local_models_rejects_disabled_reranker() {
+        let error = validate_model_runtime_configuration(true, None, Some("0"))
+            .expect_err("strict mode must reject a disabled reranker");
+
+        assert!(
+            error
+                .to_string()
+                .contains("PENSYVE_REQUIRE_LOCAL_MODELS=1 requires PENSYVE_RERANKER=1"),
+            "startup error must identify the conflicting settings: {error}"
+        );
+    }
+
+    #[test]
+    fn permissive_model_runtime_keeps_existing_fallback_configuration() {
+        assert!(
+            validate_model_runtime_configuration(false, Some(std::ffi::OsStr::new("")), Some("0"))
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn positive_millis_env_falls_back_for_unset_or_zero() {
         let default = Duration::from_secs(1);
         assert_eq!(positive_millis_value(None, default), default);
@@ -616,6 +994,8 @@ async fn metrics_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     req: axum::http::Request<axum::body::Body>,
 ) -> axum::response::Response {
+    use std::fmt::Write as _;
+
     use axum::http::header;
 
     let not_found = || {
@@ -637,7 +1017,17 @@ async fn metrics_handler(
         return not_found();
     }
 
-    let body = pensyve_core::observability::metrics().prometheus_text();
+    let mut body = pensyve_core::observability::metrics().prometheus_text();
+    let _ = writeln!(
+        body,
+        "# HELP pensyve_recall_overload_total Recall requests rejected by bounded admission."
+    );
+    let _ = writeln!(body, "# TYPE pensyve_recall_overload_total counter");
+    let _ = writeln!(
+        body,
+        "pensyve_recall_overload_total {}",
+        pensyve_mcp_tools::recall_overload_count()
+    );
     axum::response::Response::builder()
         .header(
             header::CONTENT_TYPE,

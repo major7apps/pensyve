@@ -49,8 +49,11 @@ fn insert_legacy_edge(conn: &Connection, id: Uuid, source: Uuid, target: Uuid, r
 /// registry row so the next open re-runs the migration for real.
 fn revert_to_v4(dir: &Path) {
     let conn = open_raw(dir);
-    conn.execute("DELETE FROM schema_versions WHERE version = 5", [])
-        .expect("remove v5 registry row");
+    // The registry fires every migration above the highest applied version,
+    // so later rows have to go too or v5 never re-runs. The later migrations
+    // only create objects `IF NOT EXISTS`, so replaying them is harmless.
+    conn.execute("DELETE FROM schema_versions WHERE version >= 5", [])
+        .expect("remove v5 and later registry rows");
     // The index has to go first: `SQLite` refuses to drop a column an index
     // still references.
     conn.execute("DROP INDEX IF EXISTS idx_edges_namespace", [])

@@ -49,9 +49,9 @@
 //!
 //! ## Cache pre-condition
 //!
-//! `fastembed` resolves its cache dir via `FASTEMBED_CACHE_DIR` env var,
-//! defaulting to `.fastembed_cache` in the current working directory
-//! (verified against `fastembed-5.13.4/src/common.rs`). When `cargo test`
+//! `fastembed` 6.0.1 resolves its effective cache via `HF_HOME` when set,
+//! otherwise the `FASTEMBED_CACHE_DIR` option, which defaults to
+//! `.fastembed_cache` in the current working directory. When `cargo test`
 //! runs from `pensyve-core/`, the cwd is `pensyve-core/`, and the
 //! workspace ships a populated `pensyve-core/.fastembed_cache/` containing
 //! at least:
@@ -109,8 +109,9 @@ fn cache_env_lock() -> &'static Mutex<()> {
 fn real_cache_dir() -> &'static Path {
     static REAL: OnceLock<PathBuf> = OnceLock::new();
     REAL.get_or_init(|| {
-        let raw =
-            std::env::var("FASTEMBED_CACHE_DIR").unwrap_or_else(|_| ".fastembed_cache".into());
+        let raw = std::env::var("HF_HOME")
+            .or_else(|_| std::env::var("FASTEMBED_CACHE_DIR"))
+            .unwrap_or_else(|_| ".fastembed_cache".into());
         let p = PathBuf::from(raw);
         // Canonicalize if possible so the snapshot is robust against
         // later cwd changes; fall back to the lexical path otherwise.
@@ -126,71 +127,150 @@ fn real_cache_dir() -> &'static Path {
 /// down on disk (see `pensyve-core/.fastembed_cache/`).
 const BGE_RERANKER_CACHE_DIR: &str = "models--BAAI--bge-reranker-base";
 
+const BGE_RERANKER_REQUIRED_FILES: &[&str] = &[
+    "config.json",
+    "onnx/model.onnx",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+];
+
 /// `Qdrant/all-MiniLM-L6-v2-onnx` cache directory name (the fastembed
 /// canonical mapping for our exposed `"all-MiniLM-L6-v2"` model name).
 const MINILM_CACHE_DIR: &str = "models--Qdrant--all-MiniLM-L6-v2-onnx";
 
-/// Resolve the fastembed cache dir the same way `fastembed::common::get_cache_dir`
-/// does (env var with `.fastembed_cache` default in cwd) and check that
-/// the named subdir exists. If it doesn't, we skip the test rather than
+const MINILM_REQUIRED_FILES: &[&str] = &[
+    "config.json",
+    "model.onnx",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+];
+
+/// Resolve the effective cache dir the same way fastembed 6.0.1's
+/// `pull_from_hf` does (`HF_HOME`, then its `FASTEMBED_CACHE_DIR`-derived
+/// option, then `.fastembed_cache`) and check that the named subdir exists.
+/// If it doesn't, we skip the test rather than
 /// fail — the cache is a developer-environment precondition, not a
 /// production-code invariant.
 fn fastembed_cache_has(model_subdir: &str) -> bool {
-    let cache_dir =
-        std::env::var("FASTEMBED_CACHE_DIR").unwrap_or_else(|_| ".fastembed_cache".into());
+    let cache_dir = std::env::var("HF_HOME")
+        .or_else(|_| std::env::var("FASTEMBED_CACHE_DIR"))
+        .unwrap_or_else(|_| ".fastembed_cache".into());
     Path::new(&cache_dir).join(model_subdir).is_dir()
+}
+
+/// Seed an isolated BGE cache from a real local snapshot using symlinks.
+/// The source cache remains read-only; the returned snapshot can be mutated
+/// to exercise cache completeness without copying or modifying the ONNX blob.
+#[cfg(unix)]
+fn seed_bge_cache(source_root: &Path, destination_root: &Path) -> PathBuf {
+    let source_repository = source_root.join(BGE_RERANKER_CACHE_DIR);
+    let revision = std::fs::read_to_string(source_repository.join("refs/main"))
+        .expect("read seeded BGE main ref");
+    let destination_repository = destination_root.join(BGE_RERANKER_CACHE_DIR);
+    std::fs::create_dir_all(destination_repository.join("refs")).expect("create seeded BGE refs");
+    std::fs::write(destination_repository.join("refs/main"), &revision)
+        .expect("write seeded BGE main ref");
+
+    let source_snapshot = source_repository.join("snapshots").join(&revision);
+    let destination_snapshot = destination_repository.join("snapshots").join(&revision);
+    for required in BGE_RERANKER_REQUIRED_FILES {
+        let source = std::fs::canonicalize(source_snapshot.join(required))
+            .unwrap_or_else(|_| panic!("resolve real cached BGE file {required}"));
+        let destination = destination_snapshot.join(required);
+        std::fs::create_dir_all(destination.parent().expect("required file parent"))
+            .expect("create seeded BGE snapshot directory");
+        std::os::unix::fs::symlink(source, destination).expect("symlink real cached BGE file");
+    }
+    destination_snapshot
+}
+
+/// Seed an isolated MiniLM cache from a real local snapshot using symlinks.
+/// The source cache remains read-only; the returned snapshot can be mutated
+/// to prove cached construction revalidates the active cache.
+#[cfg(unix)]
+fn seed_minilm_cache(source_root: &Path, destination_root: &Path) -> PathBuf {
+    let source_repository = source_root.join(MINILM_CACHE_DIR);
+    let revision = std::fs::read_to_string(source_repository.join("refs/main"))
+        .expect("read seeded MiniLM main ref");
+    let destination_repository = destination_root.join(MINILM_CACHE_DIR);
+    std::fs::create_dir_all(destination_repository.join("refs"))
+        .expect("create seeded MiniLM refs");
+    std::fs::write(destination_repository.join("refs/main"), &revision)
+        .expect("write seeded MiniLM main ref");
+
+    let source_snapshot = source_repository.join("snapshots").join(&revision);
+    let destination_snapshot = destination_repository.join("snapshots").join(&revision);
+    for required in MINILM_REQUIRED_FILES {
+        let source = std::fs::canonicalize(source_snapshot.join(required))
+            .unwrap_or_else(|_| panic!("resolve real cached MiniLM file {required}"));
+        let destination = destination_snapshot.join(required);
+        std::fs::create_dir_all(destination.parent().expect("required file parent"))
+            .expect("create seeded MiniLM snapshot directory");
+        std::os::unix::fs::symlink(source, destination).expect("symlink real cached MiniLM file");
+    }
+    destination_snapshot
 }
 
 // -------------------------------------------------------------------------
 // Reranker
 // -------------------------------------------------------------------------
 
-/// **Invariant I4.Reranker**: `Reranker::new("BGERerankerBase")` followed
-/// by a `rerank()` call MUST NOT make any network request when the model
-/// is already cached locally. Per pre-reg §2 I4: "pure ONNX inference
+/// **Invariant I4.Reranker**:
+/// `Reranker::new_cached_with_policy("BGERerankerBase", &NetworkPolicy::Disabled)`
+/// followed by a `rerank()` call MUST NOT make any network request when
+/// the model is already cached locally. Per pre-reg §2 I4: "pure ONNX inference
 /// (`fastembed`); NO network calls today. G1 invariant: documented no-op;
 /// unit test asserts no network access regardless of policy state."
 ///
 /// Mechanical proof:
 ///   1. The fastembed cache contains `models--BAAI--bge-reranker-base/`
 ///      (skipped otherwise — developer environment precondition).
-///   2. `Reranker::new("BGERerankerBase")` succeeds. If load-time HF
-///      download were attempted, it would either succeed (no observable
-///      side-effect from this test) or fail with a network error; the
-///      cache hit means the download path is provably not entered.
+///   2. `Reranker::new_cached_with_policy(..., &NetworkPolicy::Disabled)`
+///      succeeds. The disabled policy makes any online fallback a test
+///      failure, so construction proves the real model loaded from cache.
 ///   3. `rerank(query, docs, top_k)` returns successfully — pure ONNX
 ///      inference path, zero network awareness in the call graph.
-///   4. This file imports zero HTTP-client crates (see import-hygiene
+///   4. Repointing the process cache to an empty tempdir makes a second
+///      cached construction fail, proving an Arc loaded under the first
+///      root cannot bypass policy checks under another root.
+///   5. This file imports zero HTTP-client crates (see import-hygiene
 ///      guard at the top). If a future change to `Reranker` introduces
 ///      a `reqwest::get(...)` call inside `rerank()`, that call would
 ///      need to be added to the production source AND the test would
 ///      need to be updated to acknowledge the new surface — at which
 ///      point the no-op invariant is broken and an addendum is required.
 #[test]
+#[cfg(unix)]
 fn reranker_does_not_make_network_calls() {
-    // Acquire the same env-var lock the `Disabled`-policy tests use below.
-    // `FASTEMBED_CACHE_DIR` is process-global; without this, cargo's
+    let real = real_cache_dir().to_path_buf();
+    // Acquire the same env-var lock the other cache-policy tests use below.
+    // The cache environment is process-global; without this, cargo's
     // parallel test runner could interleave this test with one of the
     // tests that temporarily points the var at an empty tempdir, causing
     // this cache-hit call to spuriously read the wrong directory and fail
     // with a `ModelLoad` error that looks like a real cache-resolution
-    // regression but is actually a test-harness race. This test itself
-    // never mutates the var — it only needs to not run *during* a window
-    // where another test has it pointed somewhere bogus.
+    // regression but is actually a test-harness race. This test pins the
+    // cache twice below, so the lock covers both environment guards.
     let _serial = cache_env_lock().lock().expect("env lock poisoned");
 
-    if !fastembed_cache_has(BGE_RERANKER_CACHE_DIR) {
+    if !real.join(BGE_RERANKER_CACHE_DIR).is_dir() {
         eprintln!(
             "skipping reranker_does_not_make_network_calls: \
-             {BGE_RERANKER_CACHE_DIR} not in fastembed cache. \
+             {BGE_RERANKER_CACHE_DIR} not in fastembed cache at {}. \
              Pre-cache it with `cargo test -p pensyve-core --release --test test_no_network_invariants -- --ignored` \
-             or run `Reranker::new(\"BGERerankerBase\")` once with network access."
+             or run `Reranker::new(\"BGERerankerBase\")` once with network access.",
+            real.display()
         );
         return;
     }
 
-    let reranker =
-        Reranker::new("BGERerankerBase").expect("BGE reranker should construct from cache");
+    let seeded_cache = TempDir::new().expect("isolated seeded BGE cache");
+    let seeded_snapshot = seed_bge_cache(&real, seeded_cache.path());
+    let real_cache_guard = FastembedCacheGuard::set(seeded_cache.path());
+    let reranker = Reranker::new_cached_with_policy("BGERerankerBase", &NetworkPolicy::Disabled)
+        .expect("BGE reranker should construct from cache under Disabled");
     let query = "What is the capital of France?";
     let docs = [
         "Paris is the capital of France.",
@@ -216,6 +296,36 @@ fn reranker_does_not_make_network_calls() {
         results.iter().all(|r| r.score.is_finite()),
         "all scores should be finite floats — sanity check that ONNX returned real numbers"
     );
+
+    // Even a same-root Arc hit must honor Disabled cache completeness after
+    // a runtime file disappears.
+    std::fs::remove_file(seeded_snapshot.join("tokenizer_config.json"))
+        .expect("remove required file from isolated cache");
+    match Reranker::new_cached_with_policy("BGERerankerBase", &NetworkPolicy::Disabled) {
+        Err(error) if error.is_cache_error() => assert!(
+            error.to_string().contains("tokenizer_config.json"),
+            "expected removed-file cache error, got: {error}"
+        ),
+        Err(other) => panic!("expected cache-specific error after file removal, got {other:?}"),
+        Ok(_) => panic!("same-root cached Arc bypassed Disabled cache preflight"),
+    }
+
+    // Nor may the Arc satisfy construction after the process cache is
+    // repointed at a distinct empty root. Drop the first environment guard
+    // before installing the second one; the Arc intentionally remains alive.
+    drop(real_cache_guard);
+    let empty_cache = TempDir::new().expect("empty fastembed cache");
+    let _empty_cache = FastembedCacheGuard::set(empty_cache.path());
+    match Reranker::new_cached_with_policy("BGERerankerBase", &NetworkPolicy::Disabled) {
+        Err(error) if error.is_cache_error() => assert!(
+            error.to_string().contains("refs/main"),
+            "expected missing-ref cache error, got: {error}"
+        ),
+        Err(other) => panic!("expected cache-specific error under empty cache, got {other:?}"),
+        Ok(_) => panic!(
+            "cached Arc from a different FASTEMBED_CACHE_DIR bypassed Disabled cache preflight"
+        ),
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -415,6 +525,63 @@ fn onnx_embedder_constructor_under_disabled_with_cached_model_succeeds() {
     );
 }
 
+/// A process-cached embedder must not bypass the active cache certification
+/// required by `NetworkPolicy::Disabled`. Both a required file disappearing
+/// from the original root and switching to a distinct empty root must fail
+/// before a cached `Arc<OnnxEmbedder>` is returned.
+#[test]
+#[cfg(unix)]
+fn onnx_embedder_cached_disabled_revalidates_active_cache() {
+    let real = real_cache_dir().to_path_buf();
+    if !real.join(MINILM_CACHE_DIR).is_dir() {
+        eprintln!(
+            "skipping onnx_embedder_cached_disabled_revalidates_active_cache: \
+             {MINILM_CACHE_DIR} not in fastembed cache at {}. \
+             Pre-cache by running `OnnxEmbedder::new(\"all-MiniLM-L6-v2\")` \
+             once with network access.",
+            real.display()
+        );
+        return;
+    }
+    let _serial = cache_env_lock().lock().expect("env lock poisoned");
+
+    let seeded_cache = TempDir::new().expect("isolated seeded MiniLM cache");
+    let seeded_snapshot = seed_minilm_cache(&real, seeded_cache.path());
+    let seeded_guard = FastembedCacheGuard::set(seeded_cache.path());
+    let cached = OnnxEmbedder::new_cached_with_policy("all-MiniLM-L6-v2", &NetworkPolicy::Disabled)
+        .expect("complete seeded cache should initialize under Disabled");
+    assert_eq!(cached.dimensions(), 384);
+
+    std::fs::remove_file(seeded_snapshot.join("tokenizer_config.json"))
+        .expect("remove required file from isolated MiniLM cache");
+    let same_root =
+        OnnxEmbedder::new_cached_with_policy("all-MiniLM-L6-v2", &NetworkPolicy::Disabled);
+
+    drop(seeded_guard);
+    let empty_cache = TempDir::new().expect("distinct empty MiniLM cache");
+    let _empty_guard = FastembedCacheGuard::set(empty_cache.path());
+    let distinct_root =
+        OnnxEmbedder::new_cached_with_policy("all-MiniLM-L6-v2", &NetworkPolicy::Disabled);
+
+    let mut failures = Vec::new();
+    match same_root {
+        Err(error)
+            if error.is_cache_error() && error.to_string().contains("tokenizer_config.json") => {}
+        Err(error) => failures.push(format!("same root returned the wrong error: {error}")),
+        Ok(_) => failures.push("same-root cached Arc bypassed required-file preflight".to_string()),
+    }
+    match distinct_root {
+        Err(error) if error.is_cache_error() && error.to_string().contains("refs/main") => {}
+        Err(error) => failures.push(format!("distinct root returned the wrong error: {error}")),
+        Ok(_) => failures.push("cached Arc from another cache root bypassed preflight".to_string()),
+    }
+    assert!(
+        failures.is_empty(),
+        "Disabled cached construction did not revalidate the active cache: {}",
+        failures.join("; ")
+    );
+}
+
 /// **Invariant I4.OnnxEmbedder.lazy-disabled-uncached**: a *lazy*
 /// embedder (`new_lazy_with_options`) constructed under
 /// `NetworkPolicy::Disabled` for an uncached model MUST succeed at
@@ -486,10 +653,12 @@ fn onnx_embedder_lazy_under_disabled_with_uncached_model_errors_at_first_use() {
 // FASTEMBED_CACHE_DIR env-var guard
 // -------------------------------------------------------------------------
 
-/// RAII guard that sets `FASTEMBED_CACHE_DIR` for the duration of a
-/// test and restores the previous value (or unsets it) on drop. Used by
-/// the `Disabled`-policy tests above to control whether the model
-/// appears cached.
+/// RAII guard that pins `FASTEMBED_CACHE_DIR`, clears the higher-precedence
+/// `HF_HOME`, and points `HF_ENDPOINT` at a closed loopback port for the
+/// duration of a test. It also pins the embedding pool to one session so real
+/// model fixtures stay bounded. All four previous values are restored on drop.
+/// Used by the `Disabled`-policy tests above to control whether the model
+/// appears cached while ensuring a regression cannot reach the public hub.
 ///
 /// `# Safety`: `std::env::set_var`/`remove_var` are flagged unsafe in
 /// modern Rust because env mutation is process-global and not
@@ -498,7 +667,10 @@ fn onnx_embedder_lazy_under_disabled_with_uncached_model_errors_at_first_use() {
 /// future tests are added that touch other env vars in parallel, they
 /// must coordinate via a shared mutex or `serial_test`.
 struct FastembedCacheGuard {
-    previous: Option<String>,
+    cache_dir: Option<String>,
+    hf_home: Option<String>,
+    hf_endpoint: Option<String>,
+    embedding_pool_size: Option<String>,
 }
 
 #[allow(
@@ -507,12 +679,23 @@ struct FastembedCacheGuard {
 )]
 impl FastembedCacheGuard {
     fn set(path: &std::path::Path) -> Self {
-        let previous = std::env::var("FASTEMBED_CACHE_DIR").ok();
+        let previous_cache_dir = std::env::var("FASTEMBED_CACHE_DIR").ok();
+        let previous_hf_home = std::env::var("HF_HOME").ok();
+        let previous_hf_endpoint = std::env::var("HF_ENDPOINT").ok();
+        let previous_embedding_pool_size = std::env::var("PENSYVE_EMBEDDING_POOL_SIZE").ok();
         // SAFETY: see struct doc — tests using this guard run sequentially.
         unsafe {
             std::env::set_var("FASTEMBED_CACHE_DIR", path);
+            std::env::remove_var("HF_HOME");
+            std::env::set_var("HF_ENDPOINT", "http://127.0.0.1:9");
+            std::env::set_var("PENSYVE_EMBEDDING_POOL_SIZE", "1");
         }
-        Self { previous }
+        Self {
+            cache_dir: previous_cache_dir,
+            hf_home: previous_hf_home,
+            hf_endpoint: previous_hf_endpoint,
+            embedding_pool_size: previous_embedding_pool_size,
+        }
     }
 }
 
@@ -524,9 +707,21 @@ impl Drop for FastembedCacheGuard {
     fn drop(&mut self) {
         // SAFETY: see struct doc.
         unsafe {
-            match self.previous.as_deref() {
+            match self.cache_dir.as_deref() {
                 Some(v) => std::env::set_var("FASTEMBED_CACHE_DIR", v),
                 None => std::env::remove_var("FASTEMBED_CACHE_DIR"),
+            }
+            match self.hf_home.as_deref() {
+                Some(v) => std::env::set_var("HF_HOME", v),
+                None => std::env::remove_var("HF_HOME"),
+            }
+            match self.hf_endpoint.as_deref() {
+                Some(v) => std::env::set_var("HF_ENDPOINT", v),
+                None => std::env::remove_var("HF_ENDPOINT"),
+            }
+            match self.embedding_pool_size.as_deref() {
+                Some(v) => std::env::set_var("PENSYVE_EMBEDDING_POOL_SIZE", v),
+                None => std::env::remove_var("PENSYVE_EMBEDDING_POOL_SIZE"),
             }
         }
     }

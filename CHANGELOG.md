@@ -5,6 +5,103 @@ All notable changes to Pensyve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [4.0.0] - 2026-09-02
+
+Bounded runtime and embedding provenance. Shipping runtimes no longer hold a
+resident vector corpus; retrieval is storage-backed and every stored vector
+carries the immutable identity of the embedding generation that produced it.
+Existing deployments upgrade in two steps (owner-connected schema startup, then
+a one-time `backfill-embeddings` run); until the backfill activates a namespace,
+that namespace serves lexical/graph retrieval only.
+
+### Breaking
+
+- **`ConsolidationWorkspace` gains a required `cursor(run)` method.** External
+  implementors must return the persisted resume cursor; both built-in backends do.
+- **`StorageTrait` grows bounded, storage-backed retrieval methods with
+  fail-closed defaults.** Custom backends compile unchanged but return an explicit
+  unsupported outcome for storage-backed search, paging, and the embedding
+  lifecycle until they implement them; the shipping runtimes require them.
+- **Schema v6/v7 on both backends** (versioned embedding spaces, embedding
+  records, namespace lifecycle state, backfill queue, durable consolidation
+  workspace). On PostgreSQL the serving role cannot apply it: start the new
+  build once on an owner connection, then serve as `pensyve_app` again.
+- **CLI embedding-space maintenance commands require `--storage-path`.**
+- **Python: observation extraction takes its own permit.** Recall, remember, and
+  consolidation no longer wait behind an extractor round trip.
+
+### Upgrade
+
+1. Deploy the new build; if the serving role cannot apply the schema, run the
+   owner-connected startup (`docs/SECURITY.md`).
+2. Run `pensyve-mcp-gateway backfill-embeddings` once against the same
+   database with the same model bundle; it activates every namespace on the
+   loaded embedding generation and is safe to re-run.
+
+### Changed
+
+- **Shipping Rust runtimes now use storage-backed exact retrieval exclusively.**
+  The CLI, MCP server, and hosted gateway no longer hydrate whole namespaces or
+  construct per-tenant resident vector corpora. SQLite streams exact cosine search;
+  Postgres ranks in storage. Both apply namespace, identity, entity, supersession,
+  and immutable active-generation filters before their bounded result limits.
+- **Embedding generations now have canonical immutable provenance and a one-session
+  namespace migration lifecycle.** Source/generation mutations are transactional;
+  incomplete, absent, rolled-back, or runtime-mismatched generations degrade to
+  lexical-only retrieval instead of mixing vector spaces or returning partial
+  vector rankings.
+- **Runtime bounds are explicit:** 100 vector hits, 100 lexical hits, 200 fused and
+  hydrated references, 4 MiB hydrated payload, a 50,000-row SQLite exact scan,
+  256-row pages, 64-row consolidation comparisons, 4,096-member promotion clusters,
+  hosted recall admission of 8 / 64 MiB, and 1,024 cached tenant metadata entries
+  with 30-minute idle expiry.
+- **Hosted gateway shape.** The production task now runs at 512 CPU / 2048 MiB
+  with the pinned GTE model bundle in the image and BGE reranking off unless
+  `PENSYVE_RERANKER=1`; the earlier 4 GiB strict-runtime sizing is superseded.
+
+### Added
+
+- **`pensyve-mcp-gateway backfill-embeddings` operator mode.** Runs the embedding
+  migration lifecycle (begin, backfill, verify, activate) for every namespace the
+  storage pages out, on the exact embedding generation the process loaded, then
+  exits. Namespaces already active on that generation are skipped and ones in
+  flight resume, so the command is idempotent. Run it once after upgrading a
+  hosted deployment so existing namespaces regain semantic recall; until then
+  they serve lexical/graph retrieval only. The container entrypoint now passes
+  its arguments through, so an ECS one-off task can invoke it with a command
+  override.
+
+### Fixed
+
+- **Entity-wide forget closes a snapshot page before the 4 MiB ceiling** instead
+  of rejecting the whole forget when a full 256-row page of individually valid
+  rows exceeds it in aggregate; the remaining rows form the next page.
+- **Consolidation resumes from its persisted cursor.** A cancellation or duration
+  budget that fires before the first page no longer checkpoints the origin over a
+  previously scanned run. `ConsolidationWorkspace` gains `cursor(run)`.
+- **`ConsolidationStats::archived` counts persisted decay updates only.** Semantic
+  memories decay but are never archived, and the bounded loop stopped reporting
+  them as if they were.
+- **`recall_grouped` honors `types` on the legacy in-memory vector source** as well
+  as on storage-backed engines.
+- **Python: observation extraction takes its own permit.** Recall, remember, and
+  consolidation no longer queue behind an extractor round trip; the episode's own
+  rows are durable before the local permit is released.
+- **CLI: a silent mock-embedder fallback stays lexical-only** and never activates a
+  mock generation that a later real model would mismatch.
+- **stdio MCP picks the embedding model from the namespace's active generation**
+  (its persisted dimensionality), so an existing namespace never starts against a
+  mismatched runtime space.
+- **`pensyve_inspect` rejects an unknown `memory_type`** with the same error as
+  `pensyve_recall` instead of answering with an empty page.
+- **Recall overload metrics count awaiting-path rejections** as well as immediate
+  ones.
+- Redundant indexes on `namespace_embedding_state(namespace_id)` and
+  `consolidation_runs(namespace_id, embedding_space_id)` are no longer created;
+  the primary key and unique constraint already index those columns.
+
 ## [3.2.0] - 2026-08-21
 
 ### Changed
@@ -430,7 +527,8 @@ Initial public release of Pensyve — the universal memory runtime for AI agents
 - ONNX embeddings via fastembed (all-MiniLM-L6-v2, 384 dimensions)
 - Brute-force vector index with cosine similarity
 - 8-signal fusion retrieval: vector, BM25, graph, intent, recency, access frequency, confidence, type boost
-- Cross-encoder reranking via BGE reranker
+- Cross-encoder reranking via BGE reranker (historical initial-release behavior;
+  the full-GTE-plus-BGE sizing guidance is superseded by the Unreleased entry above)
 - Graph-based retrieval via petgraph BFS traversal
 - FSRS memory decay with retrieval-induced reinforcement
 - Bayesian procedural tracking (beta-binomial posterior updates)

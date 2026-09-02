@@ -1,6 +1,6 @@
 [package]
 name = "pensyve-python"
-version = "3.2.0"
+version = "4.0.0"
 edition = "2024"
 rust-version = "1.88"
 readme = "README.md"
@@ -15,8 +15,11 @@ name = "pensyve_python"
 crate-type = ["cdylib"]
 
 [dependencies]
-pensyve-core = { path = "../pensyve-core", version = "3.2.0", features = ["observation-extraction"] }
-pyo3 = { version = "^0.29.0", features = ["extension-module"] }
+pensyve-core = { path = "../pensyve-core", version = "4.0.0", features = ["observation-extraction"] }
+# `extension-module` is deliberately not enabled here: maturin turns it on via
+# `[tool.maturin] features` in pyproject.toml when building the wheel, while
+# `cargo test -p pensyve-python` links the in-crate Rust tests against libpython.
+pyo3 = { version = "^0.29.0" }
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 serde_json = "1"

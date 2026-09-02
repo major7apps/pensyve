@@ -55,10 +55,13 @@ pub mod dmem;
 pub(crate) mod gate;
 pub mod typed_slots;
 
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::BTreeSet;
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -66,8 +69,16 @@ use crate::config::ConsolidationConfig;
 use crate::decay;
 use crate::embedding::{OnnxEmbedder, cosine_similarity};
 use crate::network_policy::{NetworkPolicy, NetworkRequiredError};
-use crate::storage::{StorageError, StorageTrait};
-use crate::types::{EpisodicMemory, Memory, SemanticMemory, SlotKind};
+use crate::storage::bounded::{
+    CONSOLIDATION_COMPARISON_PAGE_SIZE, EmbeddingRecord, MEMORY_PAGE_SIZE, MemoryRef,
+    embedding_source_text,
+};
+use crate::storage::consolidation_workspace::{
+    CONSOLIDATION_WORKING_STATE_BYTES, ClusterDecision, ConsolidationWorkspace, DecayRecord,
+    DecayUpdate, PromotionCommit, RunId, WorkspaceCursor,
+};
+use crate::storage::{StorageError, StorageResult, StorageTrait};
+use crate::types::{Memory, SemanticMemory, SlotKind};
 
 use self::typed_slots::{TypedSlotLlm, TypedSlots, extract_slots};
 
@@ -159,6 +170,52 @@ impl From<NetworkRequiredError> for ConsolidationError {
 }
 
 pub type ConsolidationResult = Result<ConsolidationStats, ConsolidationError>;
+pub type BoundedConsolidationResult = Result<ConsolidationOutcome, ConsolidationError>;
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ConsolidationIncomplete {
+    Cancelled,
+    DurationExceeded,
+    ClusterMemberBudgetExceeded { member_count: usize },
+    SourceChanged,
+    CoalescedPending,
+    WorkingStateBudgetExceeded,
+}
+
+impl ConsolidationIncomplete {
+    #[must_use]
+    pub const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::DurationExceeded => "duration_exceeded",
+            Self::ClusterMemberBudgetExceeded { .. } => "cluster_member_budget_exceeded",
+            Self::SourceChanged => "source_changed",
+            Self::CoalescedPending => "coalesced_pending",
+            Self::WorkingStateBudgetExceeded => "working_state_budget_exceeded",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ConsolidationOutcome {
+    Complete {
+        stats: ConsolidationStats,
+    },
+    Incomplete {
+        stats: ConsolidationStats,
+        cursor: WorkspaceCursor,
+        reason: ConsolidationIncomplete,
+    },
+}
+
+impl ConsolidationOutcome {
+    #[must_use]
+    pub fn stats(&self) -> &ConsolidationStats {
+        match self {
+            Self::Complete { stats } | Self::Incomplete { stats, .. } => stats,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ConsolidationStats
@@ -178,6 +235,31 @@ pub struct ConsolidationStats {
     /// for a run that found nothing to do, which is why the two situations
     /// need this flag to be told apart.
     pub coalesced: bool,
+    /// Typed incomplete state retained by the compatibility `run` surface.
+    pub incomplete: Option<ConsolidationIncomplete>,
+    /// Runtime observations, not restated constants.
+    pub metrics: ConsolidationMetrics,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ConsolidationMetrics {
+    pub max_source_page_request: usize,
+    pub max_source_page_rows: usize,
+    pub max_source_page_bytes: usize,
+    pub max_candidate_page_request: usize,
+    pub max_candidate_page_rows: usize,
+    pub max_candidate_page_bytes: usize,
+    pub peak_candidate_pages: usize,
+    pub candidate_pages: usize,
+    pub max_anchor_bytes: usize,
+    pub max_finalized_metadata_rows: usize,
+    pub max_finalized_metadata_bytes: usize,
+    pub peak_working_state_bytes: usize,
+    pub max_decay_page_request: usize,
+    pub max_decay_page_rows: usize,
+    pub max_decay_page_bytes: usize,
+    pub max_decay_commit_rows: usize,
+    pub decay_pages: usize,
 }
 
 impl ConsolidationStats {
@@ -185,6 +267,165 @@ impl ConsolidationStats {
     fn is_empty(&self) -> bool {
         self.promoted == 0 && self.decayed == 0 && self.archived == 0
     }
+
+    fn absorb(&mut self, other: &Self) {
+        self.promoted += other.promoted;
+        self.decayed += other.decayed;
+        self.archived += other.archived;
+        self.metrics.max_source_page_request = self
+            .metrics
+            .max_source_page_request
+            .max(other.metrics.max_source_page_request);
+        self.metrics.max_source_page_rows = self
+            .metrics
+            .max_source_page_rows
+            .max(other.metrics.max_source_page_rows);
+        self.metrics.max_source_page_bytes = self
+            .metrics
+            .max_source_page_bytes
+            .max(other.metrics.max_source_page_bytes);
+        self.metrics.max_candidate_page_request = self
+            .metrics
+            .max_candidate_page_request
+            .max(other.metrics.max_candidate_page_request);
+        self.metrics.max_candidate_page_rows = self
+            .metrics
+            .max_candidate_page_rows
+            .max(other.metrics.max_candidate_page_rows);
+        self.metrics.max_candidate_page_bytes = self
+            .metrics
+            .max_candidate_page_bytes
+            .max(other.metrics.max_candidate_page_bytes);
+        self.metrics.peak_candidate_pages = self
+            .metrics
+            .peak_candidate_pages
+            .max(other.metrics.peak_candidate_pages);
+        self.metrics.candidate_pages += other.metrics.candidate_pages;
+        self.metrics.max_anchor_bytes = self
+            .metrics
+            .max_anchor_bytes
+            .max(other.metrics.max_anchor_bytes);
+        self.metrics.max_finalized_metadata_rows = self
+            .metrics
+            .max_finalized_metadata_rows
+            .max(other.metrics.max_finalized_metadata_rows);
+        self.metrics.max_finalized_metadata_bytes = self
+            .metrics
+            .max_finalized_metadata_bytes
+            .max(other.metrics.max_finalized_metadata_bytes);
+        self.metrics.peak_working_state_bytes = self
+            .metrics
+            .peak_working_state_bytes
+            .max(other.metrics.peak_working_state_bytes);
+        self.metrics.max_decay_page_request = self
+            .metrics
+            .max_decay_page_request
+            .max(other.metrics.max_decay_page_request);
+        self.metrics.max_decay_page_rows = self
+            .metrics
+            .max_decay_page_rows
+            .max(other.metrics.max_decay_page_rows);
+        self.metrics.max_decay_page_bytes = self
+            .metrics
+            .max_decay_page_bytes
+            .max(other.metrics.max_decay_page_bytes);
+        self.metrics.max_decay_commit_rows = self
+            .metrics
+            .max_decay_commit_rows
+            .max(other.metrics.max_decay_commit_rows);
+        self.metrics.decay_pages += other.metrics.decay_pages;
+    }
+}
+
+#[derive(Default)]
+struct PermitState {
+    next_ticket: u64,
+    serving: u64,
+    abandoned: BTreeSet<u64>,
+}
+
+struct FairPermit {
+    state: Mutex<PermitState>,
+    ready: Condvar,
+}
+
+impl FairPermit {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(PermitState::default()),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn advance_abandoned(state: &mut PermitState) {
+        while state.abandoned.remove(&state.serving) {
+            state.serving = state.serving.wrapping_add(1);
+        }
+    }
+
+    fn abandon(&self, state: &mut PermitState, ticket: u64) {
+        state.abandoned.insert(ticket);
+        Self::advance_abandoned(state);
+        self.ready.notify_all();
+    }
+
+    fn acquire(
+        &self,
+        cancel: &CancellationToken,
+        start: Instant,
+        max_duration: Duration,
+    ) -> Result<FairPermitGuard<'_>, ConsolidationIncomplete> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ticket = state.next_ticket;
+        state.next_ticket = state.next_ticket.wrapping_add(1);
+        loop {
+            if cancel.is_cancelled() {
+                self.abandon(&mut state, ticket);
+                return Err(ConsolidationIncomplete::Cancelled);
+            }
+            let elapsed = start.elapsed();
+            if elapsed >= max_duration {
+                self.abandon(&mut state, ticket);
+                return Err(ConsolidationIncomplete::DurationExceeded);
+            }
+            if state.serving == ticket {
+                return Ok(FairPermitGuard { permit: self });
+            }
+            let wait = max_duration
+                .saturating_sub(elapsed)
+                .min(Duration::from_millis(50));
+            let (next, _) = self
+                .ready
+                .wait_timeout(state, wait)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+        }
+    }
+}
+
+struct FairPermitGuard<'a> {
+    permit: &'a FairPermit,
+}
+
+impl Drop for FairPermitGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .permit
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.serving = state.serving.wrapping_add(1);
+        FairPermit::advance_abandoned(&mut state);
+        self.permit.ready.notify_all();
+    }
+}
+
+fn global_consolidation_permit() -> &'static FairPermit {
+    static PERMIT: OnceLock<FairPermit> = OnceLock::new();
+    PERMIT.get_or_init(FairPermit::new)
 }
 
 // ---------------------------------------------------------------------------
@@ -193,53 +434,61 @@ impl ConsolidationStats {
 
 pub struct ConsolidationEngine;
 
+#[derive(Debug, Default)]
+struct CandidatePageTracker {
+    live: Cell<usize>,
+    peak: Cell<usize>,
+}
+
+impl CandidatePageTracker {
+    fn acquire<T>(
+        &self,
+        fetch: impl FnOnce() -> StorageResult<T>,
+    ) -> StorageResult<CandidatePageLease<'_, T>> {
+        if self.live() != 0 {
+            return Err(StorageError::BudgetExceeded(
+                "a consolidation candidate page is already live".into(),
+            ));
+        }
+        let value = fetch()?;
+        self.live.set(self.live() + 1);
+        self.peak.set(self.peak.get().max(self.live()));
+        Ok(CandidatePageLease {
+            value,
+            tracker: self,
+        })
+    }
+
+    fn live(&self) -> usize {
+        self.live.get()
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.get()
+    }
+}
+
+#[derive(Debug)]
+struct CandidatePageLease<'a, T> {
+    value: T,
+    tracker: &'a CandidatePageTracker,
+}
+
+impl<T> std::ops::Deref for CandidatePageLease<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<T> Drop for CandidatePageLease<'_, T> {
+    fn drop(&mut self) {
+        self.tracker.live.set(self.tracker.live() - 1);
+    }
+}
+
 const SIMILARITY_THRESHOLD: f32 = 0.8;
-
-/// Live episodic evidence eligible for clustering, grouped by `about_entity`.
-type EpisodicByEntity = HashMap<Uuid, Vec<EpisodicMemory>>;
-
-/// Guards keyed on the `(about_entity, content)` pair a promotion would write.
-type PromotionGuards = HashMap<(Uuid, String), PromotionGuard>;
-
-/// What an `(about_entity, content)` key the namespace already holds implies
-/// for a cluster that would re-derive it.
-///
-/// The promotion pass is a pure function of the episodic set, so a stable
-/// cluster yields the same key on every run. Whether re-deriving it is a
-/// duplicate or a legitimate re-assertion depends on the fate of the rows
-/// already holding that key.
-#[derive(Clone, Copy)]
-enum PromotionGuard {
-    /// A live row holds this key. Re-deriving it would duplicate a fact that
-    /// is already current, so the key is closed regardless of the evidence.
-    Active,
-    /// Every row holding this key is superseded; the moment carried here is
-    /// the most recent supersession. A correction speaks to the evidence that
-    /// existed when it was made: re-deriving the key from episodes that all
-    /// predate it would undo the correction, but episodes recorded after it
-    /// are new testimony and may re-assert the fact (issue #227).
-    SupersededAt(DateTime<Utc>),
-}
-
-impl PromotionGuard {
-    /// Fold another row's verdict for the same key into this one. A live row
-    /// closes the key outright; between two supersessions the later one wins,
-    /// since it is the correction still standing.
-    fn merge(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Active, _) | (_, Self::Active) => Self::Active,
-            (Self::SupersededAt(a), Self::SupersededAt(b)) => Self::SupersededAt(a.max(b)),
-        }
-    }
-
-    /// Whether a cluster with these episode timestamps may still promote.
-    fn admits(self, episode_times: impl IntoIterator<Item = DateTime<Utc>>) -> bool {
-        match self {
-            Self::Active => false,
-            Self::SupersededAt(at) => episode_times.into_iter().any(|t| t > at),
-        }
-    }
-}
 
 // Test seam state for `injected_run_failure`. Thread-local rather than
 // global, for the same reason as the `gate` module's release-window seam: the
@@ -302,6 +551,10 @@ fn injected_run_failure(_namespace_id: Uuid) -> Option<ConsolidationError> {
     None
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "public ConsolidationError::Partial compatibility requires unboxed committed stats"
+)]
 impl ConsolidationEngine {
     /// Run all consolidation jobs for a namespace.
     ///
@@ -325,21 +578,16 @@ impl ConsolidationEngine {
     /// would risk committing a partial state. Cancel response time target
     /// is ≤500 ms (pre-reg §2 I5).
     ///
-    /// At most one run per namespace is in flight at a time, enforced by
-    /// `gate::dispatch`: the promotion pass derives its idempotency guard
-    /// from a snapshot of the namespace and only then writes, so two
-    /// overlapping runs would each see an unpromoted namespace and mint the
-    /// same row twice (#226). Dispatch happens here rather than at the call
-    /// sites so no trigger path — the periodic sweep, either `episode_end`
-    /// spawn, or the on-demand `/consolidate` endpoint — can bypass it, and so
-    /// a future one inherits it by default. Runs on *different* namespaces are
-    /// unaffected and proceed in parallel.
+    /// One fair process-global permit covers every namespace and trigger path.
+    /// The existing namespace coalescer remains inside that admission boundary
+    /// so bursts do not lose work, but different namespaces no longer execute
+    /// consolidation concurrently.
     ///
     /// Triggers coalesce rather than queue. A call made while another run is
     /// in flight for the namespace does no work and returns zeroed stats with
-    /// [`ConsolidationStats::coalesced`] set; the run already going will run
-    /// once more and cover it, so nothing is dropped. See the `gate` module
-    /// docs for why queueing was rejected and why coalescing is lossless.
+    /// [`ConsolidationStats::coalesced`] set. A complete owner runs once more;
+    /// an incomplete owner leaves typed durable pending work for a later
+    /// trigger or sweep. See the `gate` module docs.
     ///
     /// A caller that does own the namespace may therefore perform several
     /// consecutive runs, and the returned stats are the total across them.
@@ -355,397 +603,672 @@ impl ConsolidationEngine {
         policy: &NetworkPolicy,
         cancel: &CancellationToken,
     ) -> ConsolidationResult {
-        let mut total = ConsolidationStats::default();
-        let outcome = gate::dispatch(
-            namespace_id,
-            || {
-                let result = match injected_run_failure(namespace_id) {
-                    Some(err) => Err(err),
-                    None => {
-                        Self::run_locked(storage, embedder, config, namespace_id, policy, cancel)
-                    }
-                };
-                if let Ok(stats) = &result {
-                    total.promoted += stats.promoted;
-                    total.decayed += stats.decayed;
-                    total.archived += stats.archived;
-                }
-                result
-            },
-            // Decline a re-run once the namespace has stopped making progress:
-            // a failed run would only fail again, and a cancelled caller must
-            // not be drafted into further work. Declining still releases the
-            // namespace, so the next trigger runs rather than coalescing into
-            // nothing.
-            |result| result.is_ok() && !cancel.is_cancelled(),
-        );
-
-        match outcome {
-            // Zeroed rather than the in-flight run's stats: this call did no
-            // work, and reporting another run's promotions here would
-            // double-count them in `log_activity`. The flag is what keeps that
-            // distinguishable from a run that found nothing to do.
-            gate::Dispatch::Coalesced => Ok(ConsolidationStats {
-                coalesced: true,
-                ..ConsolidationStats::default()
-            }),
-            gate::Dispatch::Ran(Ok(_)) => Ok(total),
-            // Whatever the failing run itself wrote is unknowable, but every
-            // run before it committed. Carry that total with the error rather
-            // than discard it — see [`ConsolidationError::Partial`].
-            gate::Dispatch::Ran(Err(err)) => Err(ConsolidationError::with_committed(total, err)),
+        match Self::run_bounded(storage, embedder, config, namespace_id, policy, cancel)? {
+            ConsolidationOutcome::Complete { stats } => Ok(stats),
+            ConsolidationOutcome::Incomplete {
+                mut stats, reason, ..
+            } => {
+                stats.incomplete = Some(reason);
+                Ok(stats)
+            }
         }
     }
 
-    /// The body of [`Self::run`], executed while this caller owns the
-    /// namespace.
-    fn run_locked(
+    #[tracing::instrument(skip_all, fields(namespace_id = %namespace_id))]
+    pub fn run_bounded(
         storage: &dyn StorageTrait,
         embedder: &OnnxEmbedder,
         config: &ConsolidationConfig,
         namespace_id: Uuid,
         policy: &NetworkPolicy,
         cancel: &CancellationToken,
-    ) -> ConsolidationResult {
-        let start = Instant::now();
-        let max_dur = Duration::from_secs(config.max_duration_secs);
+    ) -> BoundedConsolidationResult {
+        Self::run_bounded_internal(storage, embedder, config, namespace_id, policy, cancel)
+    }
 
-        // Cancel-check at engine entry — before the first storage read.
+    fn run_bounded_internal(
+        storage: &dyn StorageTrait,
+        embedder: &OnnxEmbedder,
+        config: &ConsolidationConfig,
+        namespace_id: Uuid,
+        policy: &NetworkPolicy,
+        cancel: &CancellationToken,
+    ) -> BoundedConsolidationResult {
+        let start = Instant::now();
+        let max_duration = Duration::from_secs(config.max_duration_secs);
+        let mut total = ConsolidationStats::default();
+        let outcome = gate::dispatch(
+            namespace_id,
+            || {
+                let _global =
+                    match global_consolidation_permit().acquire(cancel, start, max_duration) {
+                        Ok(guard) => guard,
+                        Err(reason) => {
+                            return Ok(ConsolidationOutcome::Incomplete {
+                                stats: ConsolidationStats::default(),
+                                cursor: WorkspaceCursor::default(),
+                                reason,
+                            });
+                        }
+                    };
+                let result = match injected_run_failure(namespace_id) {
+                    Some(err) => Err(err),
+                    None => Self::run_locked_bounded(
+                        storage,
+                        embedder,
+                        config,
+                        namespace_id,
+                        policy,
+                        cancel,
+                        start,
+                        max_duration,
+                    ),
+                };
+                if let Ok(outcome) = &result {
+                    total.absorb(outcome.stats());
+                }
+                result
+            },
+            |result| {
+                matches!(result, Ok(ConsolidationOutcome::Complete { .. }))
+                    && !cancel.is_cancelled()
+            },
+        );
+
+        match outcome {
+            gate::Dispatch::Coalesced => Ok(ConsolidationOutcome::Incomplete {
+                stats: ConsolidationStats {
+                    coalesced: true,
+                    ..ConsolidationStats::default()
+                },
+                cursor: WorkspaceCursor::default(),
+                reason: ConsolidationIncomplete::CoalescedPending,
+            }),
+            gate::Dispatch::Ran(Ok(ConsolidationOutcome::Complete { .. })) => {
+                Ok(ConsolidationOutcome::Complete { stats: total })
+            }
+            gate::Dispatch::Ran(Ok(ConsolidationOutcome::Incomplete {
+                cursor, reason, ..
+            })) => Ok(ConsolidationOutcome::Incomplete {
+                stats: total,
+                cursor,
+                reason,
+            }),
+            gate::Dispatch::Ran(Err(error)) => {
+                Err(ConsolidationError::with_committed(total, error))
+            }
+        }
+    }
+
+    fn run_locked_bounded(
+        storage: &dyn StorageTrait,
+        embedder: &OnnxEmbedder,
+        config: &ConsolidationConfig,
+        namespace_id: Uuid,
+        _policy: &NetworkPolicy,
+        cancel: &CancellationToken,
+        start: Instant,
+        max_dur: Duration,
+    ) -> BoundedConsolidationResult {
+        let mut stats = ConsolidationStats::default();
+        let lifecycle = storage
+            .get_namespace_embedding_state(namespace_id)?
+            .ok_or_else(|| StorageError::Context("namespace has no embedding lifecycle".into()))?;
+        let active_space = lifecycle.active_read_space_id.ok_or_else(|| {
+            StorageError::Context("namespace has no active embedding generation".into())
+        })?;
+        if embedder.embedding_space()?.id() != active_space {
+            return Err(StorageError::Context(
+                "consolidation runtime does not match the active embedding generation".into(),
+            )
+            .into());
+        }
+        let workspace = storage
+            .consolidation_workspace()
+            .ok_or_else(|| StorageError::Unsupported("durable consolidation workspace".into()))?;
+        let run = workspace.begin_or_resume(namespace_id, &active_space)?;
+        // Resume from the persisted cursor so an early checkpoint (cancellation
+        // or duration budget before the first page) never rewinds a
+        // previously scanned run to the origin.
+        let mut cursor = workspace.cursor(run)?;
+
         if cancel.is_cancelled() {
-            return Err(ConsolidationError::Cancelled(
-                "cancelled before promotion pass".into(),
-            ));
+            workspace.checkpoint(run, cursor)?;
+            return Ok(ConsolidationOutcome::Incomplete {
+                stats,
+                cursor,
+                reason: ConsolidationIncomplete::Cancelled,
+            });
         }
 
-        let mut stats = ConsolidationStats::default();
-        stats.promoted += Self::promote_episodic_to_semantic(
-            storage,
+        if let Some(incomplete) = Self::promote_bounded(
             embedder,
+            workspace,
+            run,
             namespace_id,
             start,
             max_dur,
-            policy,
             cancel,
-        )?;
-
-        if start.elapsed() > max_dur {
-            return Ok(stats);
+            &mut stats,
+            &mut cursor,
+        )? {
+            return Ok(ConsolidationOutcome::Incomplete {
+                stats,
+                cursor,
+                reason: incomplete,
+            });
         }
 
-        // Cancel-check between the two passes (each pass = a sequence of
-        // single-row SQLite transactions; this check sits between passes
-        // so neither pass observes a half-committed boundary).
-        if cancel.is_cancelled() {
-            return Err(ConsolidationError::Cancelled(
-                "cancelled before decay pass".into(),
-            ));
+        if let Some(incomplete) = Self::decay_bounded(
+            workspace,
+            config,
+            namespace_id,
+            start,
+            max_dur,
+            cancel,
+            &mut stats,
+        )? {
+            workspace.checkpoint(run, cursor)?;
+            return Ok(ConsolidationOutcome::Incomplete {
+                stats,
+                cursor,
+                reason: incomplete,
+            });
         }
 
-        let (decayed, archived) =
-            Self::decay_pass(storage, config, namespace_id, start, max_dur, cancel)?;
-        stats.decayed += decayed;
-        stats.archived += archived;
-        Ok(stats)
+        workspace.complete(run)?;
+        Ok(ConsolidationOutcome::Complete { stats })
     }
 
-    // -----------------------------------------------------------------------
-    // Job 1: Episodic → Semantic promotion
-    // -----------------------------------------------------------------------
-
-    /// Split a namespace's memories into the live episodic evidence the
-    /// promotion pass may cluster, grouped by `about_entity`, and the guards
-    /// its existing `mentioned` rows impose on re-derivation.
-    ///
-    /// Superseded episodes are retired evidence and must not seed new
-    /// clusters, so only live rows feed the clustering pass. Both live and
-    /// superseded promotions seed the guard map, but they bind differently —
-    /// see [`PromotionGuard`].
-    fn partition_for_promotion(all_memories: Vec<Memory>) -> (EpisodicByEntity, PromotionGuards) {
-        let mut episodic_by_entity = EpisodicByEntity::new();
-        let mut already_promoted = PromotionGuards::new();
-
-        for mem in all_memories {
-            match mem {
-                Memory::Episodic(em) if em.superseded_by.is_none() => {
-                    episodic_by_entity
-                        .entry(em.about_entity)
-                        .or_default()
-                        .push(em);
-                }
-                Memory::Semantic(sm) if sm.predicate == "mentioned" => {
-                    let guard = match (sm.superseded_by, sm.invalid_at) {
-                        // Superseded with a stamped moment: the key reopens
-                        // for evidence recorded after it. Everything else —
-                        // a live row, or a supersession with no moment to
-                        // date evidence against — closes the key outright.
-                        (Some(_), Some(at)) => PromotionGuard::SupersededAt(at),
-                        _ => PromotionGuard::Active,
-                    };
-                    already_promoted
-                        .entry((sm.subject, sm.object))
-                        .and_modify(|existing| *existing = existing.merge(guard))
-                        .or_insert(guard);
-                }
-                _ => {}
-            }
+    fn observe_working_state(
+        stats: &mut ConsolidationStats,
+        bytes: usize,
+    ) -> Option<ConsolidationIncomplete> {
+        stats.metrics.peak_working_state_bytes = stats.metrics.peak_working_state_bytes.max(bytes);
+        if bytes > CONSOLIDATION_WORKING_STATE_BYTES {
+            return Some(ConsolidationIncomplete::WorkingStateBudgetExceeded);
         }
-
-        (episodic_by_entity, already_promoted)
+        None
     }
 
-    /// Scan episodic memories for repeated facts about the same entity.
-    /// When 2+ episodic memories for the same `about_entity` have cosine similarity
-    /// > 0.8, promote them to a single `SemanticMemory`.
-    ///
-    /// `_policy` is accepted for forward compatibility (G3 will fire a
-    /// network-capable summarizer here, per pre-reg §1.2). Today the body
-    /// performs only local ONNX inference and `SQLite` writes, so the
-    /// policy is unused at the call sites.
-    fn promote_episodic_to_semantic(
-        storage: &dyn StorageTrait,
+    fn workspace_payload<T>(result: StorageResult<T>) -> Result<Option<T>, ConsolidationError> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(StorageError::BudgetExceeded(_)) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn remaining_working_state(retained: usize) -> usize {
+        CONSOLIDATION_WORKING_STATE_BYTES.saturating_sub(retained)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the bounded greedy loop keeps each checkpoint and ownership boundary visible"
+    )]
+    fn promote_bounded(
         embedder: &OnnxEmbedder,
+        workspace: &dyn ConsolidationWorkspace,
+        run: RunId,
         namespace_id: Uuid,
         start: Instant,
         max_duration: Duration,
-        _policy: &NetworkPolicy,
         cancel: &CancellationToken,
-    ) -> Result<usize, ConsolidationError> {
-        // Fetch all memories for this namespace, superseded history included.
-        // The guard below needs the history: a superseded promotion is a fact
-        // the operator corrected, and re-deriving it from the evidence that
-        // correction overrode would silently undo it.
-        let all_memories =
-            storage.get_all_memories_by_namespace_including_superseded(namespace_id)?;
-
-        let (episodic_by_entity, mut already_promoted) =
-            Self::partition_for_promotion(all_memories);
-
-        let mut promoted = 0usize;
-
-        for memories in episodic_by_entity.values() {
-            if start.elapsed() > max_duration {
-                break;
-            }
-            // Per-entity cancel check — sits between save_semantic
-            // transactions of the previous entity and the next entity's
-            // cluster work. SQLite rolls back any in-flight transaction
-            // when the future is dropped; this check guarantees we do not
-            // begin a new save_semantic after cancel was signalled.
+        stats: &mut ConsolidationStats,
+        cursor: &mut WorkspaceCursor,
+    ) -> Result<Option<ConsolidationIncomplete>, ConsolidationError> {
+        let mut page_cursor = None;
+        let candidate_pages = CandidatePageTracker::default();
+        loop {
             if cancel.is_cancelled() {
-                return Err(ConsolidationError::Cancelled(format!(
-                    "cancelled mid-promotion after {promoted} promotions"
-                )));
+                workspace.checkpoint(run, *cursor)?;
+                return Ok(Some(ConsolidationIncomplete::Cancelled));
             }
-
-            // Skip groups with only one memory — nothing to cluster.
-            if memories.len() < 2 {
-                continue;
+            if start.elapsed() > max_duration {
+                workspace.checkpoint(run, *cursor)?;
+                return Ok(Some(ConsolidationIncomplete::DurationExceeded));
             }
-
-            // Ensure all memories have embeddings. If any are empty, embed them on the fly.
-            let embeddings: Vec<Vec<f32>> = memories
-                .iter()
-                .map(|m| {
-                    if m.embedding.is_empty() {
-                        embedder.embed(&m.content)
-                    } else {
-                        Ok(m.embedding.clone())
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            // Find clusters of similar memories using a greedy O(n²) approach.
-            // Each memory can belong to at most one cluster (first-come assignment).
-            let n = memories.len();
-            let mut assigned = vec![false; n];
-            let mut clusters: Vec<Vec<usize>> = Vec::new();
-
-            for i in 0..n {
-                if assigned[i] {
+            let Some(page) = Self::workspace_payload(workspace.next_sources(
+                run,
+                page_cursor,
+                MEMORY_PAGE_SIZE,
+                CONSOLIDATION_WORKING_STATE_BYTES,
+            ))?
+            else {
+                workspace.checkpoint(run, *cursor)?;
+                return Ok(Some(ConsolidationIncomplete::WorkingStateBudgetExceeded));
+            };
+            let source_page_rows = page.records.len();
+            let source_page_bytes = page.application_bytes();
+            stats.metrics.max_source_page_request =
+                stats.metrics.max_source_page_request.max(MEMORY_PAGE_SIZE);
+            stats.metrics.max_source_page_rows =
+                stats.metrics.max_source_page_rows.max(source_page_rows);
+            stats.metrics.max_source_page_bytes =
+                stats.metrics.max_source_page_bytes.max(source_page_bytes);
+            if let Some(reason) = Self::observe_working_state(stats, source_page_bytes) {
+                workspace.checkpoint(run, *cursor)?;
+                return Ok(Some(reason));
+            }
+            if page.records.is_empty() {
+                return Ok(None);
+            }
+            let next_page = page.next_cursor;
+            for source in page.records {
+                if cancel.is_cancelled() {
+                    workspace.checkpoint(run, *cursor)?;
+                    return Ok(Some(ConsolidationIncomplete::Cancelled));
+                }
+                if start.elapsed() > max_duration {
+                    workspace.checkpoint(run, *cursor)?;
+                    return Ok(Some(ConsolidationIncomplete::DurationExceeded));
+                }
+                let anchor_ref = source.memory_ref;
+                let member_count = workspace.record_tentative_match(run, anchor_ref, anchor_ref)?;
+                if member_count == 0 {
+                    *cursor = WorkspaceCursor {
+                        source_ordinal: source.ordinal,
+                    };
+                    workspace.checkpoint(run, *cursor)?;
                     continue;
                 }
-                let mut cluster = vec![i];
-                for j in (i + 1)..n {
-                    if assigned[j] {
-                        continue;
+                let Some(anchor) = Self::workspace_payload(workspace.load_source(
+                    run,
+                    anchor_ref,
+                    Self::remaining_working_state(source_page_bytes),
+                ))?
+                else {
+                    workspace.checkpoint(run, *cursor)?;
+                    return Ok(Some(ConsolidationIncomplete::WorkingStateBudgetExceeded));
+                };
+                let anchor_bytes = anchor.application_bytes();
+                stats.metrics.max_anchor_bytes = stats.metrics.max_anchor_bytes.max(anchor_bytes);
+                if let Some(reason) = Self::observe_working_state(
+                    stats,
+                    source_page_bytes.saturating_add(anchor_bytes),
+                ) {
+                    workspace.checkpoint(run, *cursor)?;
+                    return Ok(Some(reason));
+                }
+                let mut candidate_cursor = None;
+                loop {
+                    if cancel.is_cancelled() {
+                        workspace.checkpoint(run, *cursor)?;
+                        return Ok(Some(ConsolidationIncomplete::Cancelled));
                     }
-                    let sim = cosine_similarity(&embeddings[i], &embeddings[j]);
-                    if sim > SIMILARITY_THRESHOLD {
-                        cluster.push(j);
+                    if start.elapsed() > max_duration {
+                        workspace.checkpoint(run, *cursor)?;
+                        return Ok(Some(ConsolidationIncomplete::DurationExceeded));
+                    }
+                    let candidate_result = candidate_pages.acquire(|| {
+                        workspace.page_later_unassigned(
+                            run,
+                            anchor_ref,
+                            candidate_cursor,
+                            CONSOLIDATION_COMPARISON_PAGE_SIZE,
+                            Self::remaining_working_state(
+                                source_page_bytes.saturating_add(anchor_bytes),
+                            ),
+                        )
+                    });
+                    let Some(candidates) = Self::workspace_payload(candidate_result)? else {
+                        workspace.checkpoint(run, *cursor)?;
+                        return Ok(Some(ConsolidationIncomplete::WorkingStateBudgetExceeded));
+                    };
+                    let candidate_page_rows = candidates.records.len();
+                    let candidate_page_bytes = candidates.application_bytes();
+                    stats.metrics.max_candidate_page_request = stats
+                        .metrics
+                        .max_candidate_page_request
+                        .max(CONSOLIDATION_COMPARISON_PAGE_SIZE);
+                    stats.metrics.max_candidate_page_rows = stats
+                        .metrics
+                        .max_candidate_page_rows
+                        .max(candidate_page_rows);
+                    stats.metrics.max_candidate_page_bytes = stats
+                        .metrics
+                        .max_candidate_page_bytes
+                        .max(candidate_page_bytes);
+                    stats.metrics.candidate_pages += 1;
+                    stats.metrics.peak_candidate_pages = candidate_pages.peak();
+                    if let Some(reason) = Self::observe_working_state(
+                        stats,
+                        source_page_bytes
+                            .saturating_add(anchor_bytes)
+                            .saturating_add(candidate_page_bytes),
+                    ) {
+                        workspace.checkpoint(run, *cursor)?;
+                        return Ok(Some(reason));
+                    }
+                    let next_candidates = candidates.next_cursor;
+                    for candidate in &candidates.records {
+                        if cosine_similarity(&anchor.embedding, &candidate.embedding)
+                            > SIMILARITY_THRESHOLD
+                        {
+                            let count = workspace.record_tentative_match(
+                                run,
+                                anchor_ref,
+                                candidate.memory_ref,
+                            )?;
+                            if count > crate::storage::bounded::MAX_PROMOTION_CLUSTER_MEMBERS {
+                                workspace.checkpoint(run, *cursor)?;
+                                return Ok(Some(
+                                    ConsolidationIncomplete::ClusterMemberBudgetExceeded {
+                                        member_count: count,
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    let Some(next) = next_candidates else {
+                        break;
+                    };
+                    candidate_cursor = Some(next);
+                }
+
+                let Some(decision) =
+                    Self::workspace_payload(workspace.finalize_or_discard_cluster(
+                        run,
+                        anchor_ref,
+                        Self::remaining_working_state(
+                            source_page_bytes.saturating_add(anchor_bytes),
+                        ),
+                    ))?
+                else {
+                    workspace.checkpoint(run, *cursor)?;
+                    return Ok(Some(ConsolidationIncomplete::WorkingStateBudgetExceeded));
+                };
+                match decision {
+                    ClusterDecision::SingletonDiscarded => {}
+                    ClusterDecision::MemberBudgetExceeded { member_count } => {
+                        workspace.checkpoint(run, *cursor)?;
+                        return Ok(Some(ConsolidationIncomplete::ClusterMemberBudgetExceeded {
+                            member_count,
+                        }));
+                    }
+                    ClusterDecision::Finalized { promotion } => {
+                        let promotion_bytes = promotion.application_bytes();
+                        stats.metrics.max_finalized_metadata_rows = stats
+                            .metrics
+                            .max_finalized_metadata_rows
+                            .max(promotion.provenance.len());
+                        stats.metrics.max_finalized_metadata_bytes = stats
+                            .metrics
+                            .max_finalized_metadata_bytes
+                            .max(promotion_bytes);
+                        if let Some(reason) = Self::observe_working_state(
+                            stats,
+                            source_page_bytes
+                                .saturating_add(anchor_bytes)
+                                .saturating_add(promotion_bytes),
+                        ) {
+                            workspace.checkpoint(run, *cursor)?;
+                            return Ok(Some(reason));
+                        }
+                        let confidence = (promotion.member_count as f32 * 0.3).min(1.0);
+                        let provenance = promotion.provenance;
+                        let provenance_bytes =
+                            provenance.capacity().saturating_mul(std::mem::size_of::<
+                                crate::storage::consolidation_workspace::ClusterProvenance,
+                            >());
+                        let mut semantic = SemanticMemory::new(
+                            namespace_id,
+                            source.about_entity,
+                            "mentioned",
+                            promotion.latest.content,
+                            confidence,
+                        );
+                        semantic.source_episodes =
+                            provenance.iter().map(|member| member.episode_id).collect();
+                        let wrapped = Memory::Semantic(semantic);
+                        let semantic_bytes = match &wrapped {
+                            Memory::Semantic(semantic) => {
+                                std::mem::size_of::<Memory>()
+                                    + semantic.predicate.capacity()
+                                    + semantic.object.capacity()
+                                    + semantic.source_episodes.capacity()
+                                        * std::mem::size_of::<Uuid>()
+                                    + semantic.embedding.capacity() * std::mem::size_of::<f32>()
+                            }
+                            _ => unreachable!("consolidation promotion is semantic"),
+                        };
+                        let canonical_bytes = match &wrapped {
+                            Memory::Semantic(semantic) => semantic
+                                .predicate
+                                .len()
+                                .saturating_add(1)
+                                .saturating_add(semantic.object.len()),
+                            _ => unreachable!("consolidation promotion is semantic"),
+                        };
+                        let predicted_embedding_bytes = embedder
+                            .dimensions()
+                            .saturating_mul(std::mem::size_of::<f32>());
+                        if let Some(reason) = Self::observe_working_state(
+                            stats,
+                            source_page_bytes
+                                .saturating_add(anchor_bytes)
+                                .saturating_add(semantic_bytes)
+                                .saturating_add(provenance_bytes)
+                                .saturating_add(canonical_bytes)
+                                .saturating_add(predicted_embedding_bytes),
+                        ) {
+                            workspace.checkpoint(run, *cursor)?;
+                            return Ok(Some(reason));
+                        }
+                        let canonical_source = embedding_source_text(&wrapped);
+                        let embedding = embedder.embed(&canonical_source)?;
+                        let record = EmbeddingRecord {
+                            namespace_id,
+                            memory_ref: MemoryRef::from_memory(&wrapped),
+                            embedding_space_id: embedder.embedding_space()?.id(),
+                            source_sha256: hex::encode(Sha256::digest(canonical_source.as_bytes())),
+                            embedding,
+                        };
+                        let record_bytes = std::mem::size_of::<
+                            crate::storage::bounded::EmbeddingRecord,
+                        >() + record.embedding_space_id.0.capacity()
+                            + record.source_sha256.capacity()
+                            + record.embedding.capacity() * std::mem::size_of::<f32>();
+                        if let Some(reason) = Self::observe_working_state(
+                            stats,
+                            source_page_bytes
+                                .saturating_add(anchor_bytes)
+                                .saturating_add(semantic_bytes)
+                                .saturating_add(provenance_bytes)
+                                .saturating_add(canonical_source.capacity())
+                                .saturating_add(record_bytes),
+                        ) {
+                            workspace.checkpoint(run, *cursor)?;
+                            return Ok(Some(reason));
+                        }
+                        match workspace.commit_promotion(run, anchor_ref, &wrapped, &record)? {
+                            PromotionCommit::Committed => stats.promoted += 1,
+                            PromotionCommit::NotAdmitted => {}
+                            PromotionCommit::Invalidated => {
+                                *cursor = WorkspaceCursor::default();
+                                return Ok(Some(ConsolidationIncomplete::SourceChanged));
+                            }
+                        }
                     }
                 }
-                if cluster.len() >= 2 {
-                    for &idx in &cluster {
-                        assigned[idx] = true;
-                    }
-                    clusters.push(cluster);
-                }
+                *cursor = WorkspaceCursor {
+                    source_ordinal: source.ordinal,
+                };
+                workspace.checkpoint(run, *cursor)?;
             }
-
-            // For each cluster of 2+, create a SemanticMemory.
-            for cluster in clusters {
-                // Find the most recent episode in the cluster.
-                let most_recent_idx = cluster
-                    .iter()
-                    .max_by_key(|&&idx| memories[idx].timestamp)
-                    .copied()
-                    .unwrap_or(cluster[0]);
-
-                let most_recent = &memories[most_recent_idx];
-                let cluster_size = cluster.len();
-                let about_entity = most_recent.about_entity;
-
-                // Idempotency guard: this job re-derives clusters from scratch
-                // on every run, and the (entity, content) pair it would write
-                // is fully determined by that cluster. Without this check a
-                // stable cluster is re-promoted once per run — an episode_end
-                // hook firing per session turns that into unbounded duplicate
-                // growth in semantic memory.
-                let key = (about_entity, most_recent.content.clone());
-                if let Some(guard) = already_promoted.get(&key)
-                    && !guard.admits(cluster.iter().map(|&idx| memories[idx].timestamp))
-                {
-                    continue;
-                }
-                already_promoted.insert(key, PromotionGuard::Active);
-
-                let confidence = (cluster_size as f32 * 0.3).min(1.0);
-                let source_episodes: Vec<Uuid> = cluster
-                    .iter()
-                    .map(|&idx| memories[idx].episode_id)
-                    .collect();
-
-                // Create the semantic memory.
-                let mut sem = SemanticMemory::new(
-                    namespace_id,
-                    about_entity,
-                    "mentioned",
-                    most_recent.content.clone(),
-                    confidence,
-                );
-                sem.source_episodes = source_episodes;
-
-                // Embed the semantic object content.
-                let embedding = embedder.embed(&most_recent.content)?;
-                sem.embedding = embedding;
-
-                storage.save_semantic(&sem)?;
-                promoted += 1;
-            }
+            let Some(next) = next_page else {
+                return Ok(None);
+            };
+            page_cursor = Some(next);
         }
-
-        Ok(promoted)
     }
 
-    // -----------------------------------------------------------------------
-    // Job 3: FSRS Decay pass
-    // -----------------------------------------------------------------------
-
-    /// Apply FSRS decay to all memories in the namespace.
-    ///
-    /// Returns `(decayed_count, archived_count)`.
-    fn decay_pass(
-        storage: &dyn StorageTrait,
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "compact decay paging, budget accounting, and typed updates remain one bounded control-flow proof"
+    )]
+    fn decay_bounded(
+        workspace: &dyn ConsolidationWorkspace,
         config: &ConsolidationConfig,
         namespace_id: Uuid,
         start: Instant,
         max_duration: Duration,
         cancel: &CancellationToken,
-    ) -> Result<(usize, usize), ConsolidationError> {
-        let all_memories = storage.get_all_memories_by_namespace(namespace_id)?;
+        stats: &mut ConsolidationStats,
+    ) -> Result<Option<ConsolidationIncomplete>, ConsolidationError> {
         let now = Utc::now();
         let threshold = config.fsrs_decay_threshold;
-
-        let mut decayed = 0usize;
-        let mut archived = 0usize;
-
-        for mem in all_memories {
-            if start.elapsed() > max_duration {
-                break;
-            }
-            // Per-row cancel check — sits between the previous row's
-            // `update_episodic_access_in_namespace` /
-            // `update_procedural_reliability_in_namespace`
-            // (each a single-statement SQLite transaction) and the next
-            // row. Per pre-reg §5.5 (I5), partial-write corruption is
-            // prevented by checking BETWEEN transactions, not within.
+        let mut after = None;
+        loop {
             if cancel.is_cancelled() {
-                return Err(ConsolidationError::Cancelled(format!(
-                    "cancelled mid-decay after {decayed} rows processed"
-                )));
+                return Ok(Some(ConsolidationIncomplete::Cancelled));
             }
-            match mem {
-                Memory::Episodic(em) => {
-                    let reference_time = em.last_accessed.unwrap_or(em.timestamp);
-                    let elapsed = decay::elapsed_days(reference_time, now);
-                    let retrievability = decay::retrievability(em.stability, elapsed);
-
-                    if retrievability < threshold {
-                        // Mark as archived by setting retrievability to near-zero and
-                        // generating a summary stub if none exists. We store the updated
-                        // stability/retrievability back via
-                        // `update_episodic_access_in_namespace`.
-                        storage.update_episodic_access_in_namespace(
-                            em.id,
-                            namespace_id,
-                            em.stability * 0.5,
-                            retrievability,
-                        )?;
-                        archived += 1;
-                    } else {
-                        // Just record updated retrievability.
-                        storage.update_episodic_access_in_namespace(
-                            em.id,
-                            namespace_id,
-                            em.stability,
-                            retrievability,
-                        )?;
-                    }
-                    decayed += 1;
-                }
-
-                Memory::Semantic(sm) => {
-                    let elapsed = decay::elapsed_days(sm.valid_at, now);
-                    let retrievability = decay::retrievability(sm.stability, elapsed);
-
-                    if retrievability < threshold {
-                        // Semantic memories: flag for review by invalidating (not deleting).
-                        // We don't archive semantic memories — just note the retrievability.
-                        // For now we track archived count but do not invalidate the
-                        // fact, as that would permanently mark it invalid. Instead we
-                        // simply note it in stats.
-                        archived += 1;
-                    }
-                    decayed += 1;
-                }
-
-                Memory::Procedural(pm) => {
-                    let reference_time = pm.last_used.unwrap_or(pm.created_at);
-                    let elapsed = decay::elapsed_days(reference_time, now);
-                    // Use reliability as a proxy for "stability" in FSRS retrievability.
-                    let retrievability = decay::retrievability(pm.reliability, elapsed);
-
-                    if retrievability < threshold && pm.reliability < 0.1 {
-                        // Archive: reduce reliability and increment archived count.
-                        let new_reliability = pm.reliability * 0.5;
-                        storage.update_procedural_reliability_in_namespace(
-                            pm.id,
-                            namespace_id,
-                            new_reliability,
-                            pm.trial_count,
-                            pm.success_count,
-                        )?;
-                        archived += 1;
-                    }
-                    decayed += 1;
-                }
-
-                // Observations decay with their source episode, not independently.
-                Memory::Observation(_) => {}
+            if start.elapsed() > max_duration {
+                return Ok(Some(ConsolidationIncomplete::DurationExceeded));
             }
+            stats.metrics.max_decay_page_request =
+                stats.metrics.max_decay_page_request.max(MEMORY_PAGE_SIZE);
+            let Some(page) = Self::workspace_payload(workspace.page_decay(
+                namespace_id,
+                after,
+                MEMORY_PAGE_SIZE,
+                CONSOLIDATION_WORKING_STATE_BYTES,
+            ))?
+            else {
+                return Ok(Some(ConsolidationIncomplete::WorkingStateBudgetExceeded));
+            };
+            if page.scanned_rows == 0 {
+                return Ok(None);
+            }
+            let page_bytes = page.application_bytes();
+            stats.metrics.max_decay_page_rows =
+                stats.metrics.max_decay_page_rows.max(page.scanned_rows);
+            stats.metrics.max_decay_page_bytes = stats.metrics.max_decay_page_bytes.max(page_bytes);
+            stats.metrics.decay_pages += 1;
+            let next = page.next_cursor;
+            let update_bytes = page
+                .records
+                .len()
+                .saturating_mul(std::mem::size_of::<DecayUpdate>());
+            if let Some(reason) =
+                Self::observe_working_state(stats, page_bytes.saturating_add(update_bytes))
+            {
+                return Ok(Some(reason));
+            }
+            let mut updates = Vec::with_capacity(page.records.len());
+            let mut page_decayed = 0;
+            let mut page_archived = 0;
+            for record in page.records {
+                if cancel.is_cancelled() {
+                    Self::commit_decay_page(
+                        workspace,
+                        namespace_id,
+                        &updates,
+                        page_decayed,
+                        page_archived,
+                        stats,
+                    )?;
+                    return Ok(Some(ConsolidationIncomplete::Cancelled));
+                }
+                if start.elapsed() > max_duration {
+                    Self::commit_decay_page(
+                        workspace,
+                        namespace_id,
+                        &updates,
+                        page_decayed,
+                        page_archived,
+                        stats,
+                    )?;
+                    return Ok(Some(ConsolidationIncomplete::DurationExceeded));
+                }
+                match record {
+                    DecayRecord::Episodic {
+                        id,
+                        reference_time,
+                        stability,
+                    } => {
+                        let elapsed = decay::elapsed_days(reference_time, now);
+                        let retrievability = decay::retrievability(stability, elapsed);
+
+                        if retrievability < threshold {
+                            updates.push(DecayUpdate::Episodic {
+                                id,
+                                stability: stability * 0.5,
+                                retrievability,
+                            });
+                            page_archived += 1;
+                        } else {
+                            updates.push(DecayUpdate::Episodic {
+                                id,
+                                stability,
+                                retrievability,
+                            });
+                        }
+                        page_decayed += 1;
+                    }
+
+                    DecayRecord::Semantic { .. } => {
+                        // Semantic memories are never archived by decay and
+                        // carry no persisted update, so they count as decayed
+                        // only; `archived` reports persisted changes alone.
+                        page_decayed += 1;
+                    }
+
+                    DecayRecord::Procedural {
+                        id,
+                        reference_time,
+                        reliability,
+                        trial_count,
+                        success_count,
+                    } => {
+                        let elapsed = decay::elapsed_days(reference_time, now);
+                        let retrievability = decay::retrievability(reliability, elapsed);
+
+                        if retrievability < threshold && reliability < 0.1 {
+                            updates.push(DecayUpdate::Procedural {
+                                id,
+                                reliability: reliability * 0.5,
+                                trial_count,
+                                success_count,
+                            });
+                            page_archived += 1;
+                        }
+                        page_decayed += 1;
+                    }
+                }
+            }
+            Self::commit_decay_page(
+                workspace,
+                namespace_id,
+                &updates,
+                page_decayed,
+                page_archived,
+                stats,
+            )?;
+            let Some(next) = next else {
+                return Ok(None);
+            };
+            after = Some(next);
         }
+    }
 
-        Ok((decayed, archived))
+    fn commit_decay_page(
+        workspace: &dyn ConsolidationWorkspace,
+        namespace_id: Uuid,
+        updates: &[DecayUpdate],
+        decayed: usize,
+        archived: usize,
+        stats: &mut ConsolidationStats,
+    ) -> Result<(), ConsolidationError> {
+        stats.metrics.max_decay_commit_rows =
+            stats.metrics.max_decay_commit_rows.max(updates.len());
+        workspace.commit_decay(namespace_id, updates)?;
+        stats.decayed += decayed;
+        stats.archived += archived;
+        Ok(())
     }
 }
 
@@ -873,6 +1396,10 @@ pub fn g3_typed_slots_enabled() -> bool {
 /// typed-slot enrichment for this observation. Distinguished from the
 /// cancel path which returns `Err(_)` so callers can route the two
 /// outcomes to different log streams.
+#[allow(
+    clippy::result_large_err,
+    reason = "public ConsolidationError::Partial compatibility requires unboxed committed stats"
+)]
 pub async fn run_typed_slots_hook<L: TypedSlotLlm + ?Sized>(
     observation_action: &str,
     observation_content: &str,
@@ -973,6 +1500,10 @@ pub async fn run_typed_slots_hook<L: TypedSlotLlm + ?Sized>(
 /// 5-slot prompt — the underlying HTTP shape is identical (single
 /// system-prompt + user-content pair), so reusing the trait avoids
 /// duplicating the OpenAI-compatible request plumbing.
+#[allow(
+    clippy::result_large_err,
+    reason = "public ConsolidationError::Partial compatibility requires unboxed committed stats"
+)]
 pub async fn run_supersession_summarizer_hook<L: TypedSlotLlm + ?Sized>(
     chain_text: &str,
     extractor: &L,
@@ -1424,14 +1955,70 @@ pub fn replay_priority(salience: f32, retrievability: f32, is_superseded: bool) 
 mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
+    use std::time::Duration as StdDuration;
 
     use chrono::Duration;
 
     use super::*;
     use crate::config::{ConsolidationConfig, PensyveConfig};
     use crate::embedding::OnnxEmbedder;
+    use crate::storage::embedding_record_for_memory;
     use crate::storage::sqlite::SqliteBackend;
     use crate::types::{Episode, EpisodicMemory, Namespace};
+
+    #[test]
+    fn candidate_page_lease_rejects_second_fetch_before_storage_access() {
+        let tracker = CandidatePageTracker::default();
+        let fetches = std::cell::Cell::new(0);
+        let first = tracker
+            .acquire(|| {
+                fetches.set(fetches.get() + 1);
+                Ok::<_, StorageError>(())
+            })
+            .unwrap();
+
+        let error = tracker
+            .acquire(|| {
+                fetches.set(fetches.get() + 1);
+                Ok::<_, StorageError>(())
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, StorageError::BudgetExceeded(_)));
+        assert_eq!(fetches.get(), 1, "second page must not be fetched");
+        assert_eq!(tracker.live(), 1);
+        assert_eq!(tracker.peak(), 1);
+        drop(first);
+        assert_eq!(tracker.live(), 0);
+    }
+
+    #[test]
+    fn incomplete_reason_codes_cover_every_shipping_outcome() {
+        let cases = [
+            (ConsolidationIncomplete::Cancelled, "cancelled"),
+            (
+                ConsolidationIncomplete::DurationExceeded,
+                "duration_exceeded",
+            ),
+            (
+                ConsolidationIncomplete::ClusterMemberBudgetExceeded { member_count: 4097 },
+                "cluster_member_budget_exceeded",
+            ),
+            (ConsolidationIncomplete::SourceChanged, "source_changed"),
+            (
+                ConsolidationIncomplete::CoalescedPending,
+                "coalesced_pending",
+            ),
+            (
+                ConsolidationIncomplete::WorkingStateBudgetExceeded,
+                "working_state_budget_exceeded",
+            ),
+        ];
+
+        for (reason, code) in cases {
+            assert_eq!(reason.reason_code(), code);
+        }
+    }
 
     fn make_storage(tmp: &str) -> SqliteBackend {
         SqliteBackend::open(&PathBuf::from(tmp)).expect("open storage")
@@ -1450,6 +2037,91 @@ mod tests {
         (ns, entity_id, source_entity)
     }
 
+    #[test]
+    fn queued_global_permit_cancellation_returns_within_500ms() {
+        let permit = FairPermit::new();
+        let holder = permit
+            .acquire(
+                &CancellationToken::new(),
+                Instant::now(),
+                StdDuration::from_secs(5),
+            )
+            .expect("first permit");
+        let cancel = CancellationToken::new();
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            let waiting_cancel = cancel.clone();
+            let permit = &permit;
+            let waiter = scope.spawn(move || {
+                permit
+                    .acquire(&waiting_cancel, started, StdDuration::from_secs(5))
+                    .map(drop)
+            });
+            std::thread::sleep(StdDuration::from_millis(50));
+            cancel.cancel();
+            let result = waiter.join().unwrap();
+            assert!(matches!(result, Err(ConsolidationIncomplete::Cancelled)));
+        });
+        assert!(started.elapsed() < StdDuration::from_millis(500));
+        drop(holder);
+    }
+
+    #[test]
+    fn queued_global_permit_duration_includes_admission_wait() {
+        let permit = FairPermit::new();
+        let holder = permit
+            .acquire(
+                &CancellationToken::new(),
+                Instant::now(),
+                StdDuration::from_secs(5),
+            )
+            .expect("first permit");
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                permit
+                    .acquire(
+                        &CancellationToken::new(),
+                        started,
+                        StdDuration::from_millis(75),
+                    )
+                    .map(drop)
+            });
+            let result = waiter.join().unwrap();
+            assert!(matches!(
+                result,
+                Err(ConsolidationIncomplete::DurationExceeded)
+            ));
+        });
+        assert!(started.elapsed() < StdDuration::from_millis(500));
+        drop(holder);
+    }
+
+    #[test]
+    fn fair_permit_serializes_inline_private_occupancy_proof() {
+        let permit = FairPermit::new();
+        let occupancy = std::sync::atomic::AtomicUsize::new(0);
+        let peak = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    let _guard = permit
+                        .acquire(
+                            &CancellationToken::new(),
+                            Instant::now(),
+                            StdDuration::from_secs(5),
+                        )
+                        .unwrap();
+                    let now = occupancy.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(StdDuration::from_millis(30));
+                    occupancy.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
     fn insert_episodic(
         storage: &SqliteBackend,
         embedder: &OnnxEmbedder,
@@ -1460,11 +2132,22 @@ mod tests {
         content: &str,
         timestamp_offset_days: i64,
     ) -> EpisodicMemory {
+        storage
+            .initialize_local_runtime_space(ns.id, embedder.embedding_space().unwrap())
+            .unwrap();
         let mut mem = EpisodicMemory::new(ns.id, episode_id, source, about, content);
         mem.embedding = embedder.embed(content).unwrap();
         // Adjust timestamp to simulate age.
         mem.timestamp = mem.timestamp - Duration::days(timestamp_offset_days);
-        storage.save_episodic(&mem).unwrap();
+        let wrapped = Memory::Episodic(mem.clone());
+        let record = embedding_record_for_memory(
+            &wrapped,
+            embedder.embedding_space().unwrap(),
+            mem.embedding.clone(),
+        );
+        storage
+            .save_memory_with_embedding(&wrapped, Some(&record))
+            .unwrap();
         mem
     }
 
@@ -1656,7 +2339,18 @@ mod tests {
         // Very low stability: 0.001 days. Timestamp from 365 days ago.
         mem.stability = 0.001;
         mem.timestamp = Utc::now() - Duration::days(365);
-        storage.save_episodic(&mem).unwrap();
+        storage
+            .initialize_local_runtime_space(ns.id, embedder.embedding_space().unwrap())
+            .unwrap();
+        let wrapped = Memory::Episodic(mem.clone());
+        let record = embedding_record_for_memory(
+            &wrapped,
+            embedder.embedding_space().unwrap(),
+            mem.embedding.clone(),
+        );
+        storage
+            .save_memory_with_embedding(&wrapped, Some(&record))
+            .unwrap();
 
         // Use a higher threshold so this memory definitely gets archived.
         let config = ConsolidationConfig {
@@ -1763,6 +2457,23 @@ mod tests {
     }
 
     #[test]
+    fn public_partial_error_field_remains_an_unboxed_stats_value() {
+        let expected = ConsolidationStats {
+            promoted: 1,
+            ..ConsolidationStats::default()
+        };
+        let error = ConsolidationError::Partial {
+            partial: expected.clone(),
+            source: Box::new(ConsolidationError::Cancelled("test".into())),
+        };
+        let ConsolidationError::Partial { partial, .. } = error else {
+            unreachable!();
+        };
+        let actual: ConsolidationStats = partial;
+        assert_eq!(actual.promoted, expected.promoted);
+    }
+
+    #[test]
     fn test_no_memories_no_op() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = make_storage(tmp.path().to_str().unwrap());
@@ -1770,6 +2481,9 @@ mod tests {
 
         let ns = Namespace::new("empty-namespace");
         storage.save_namespace(&ns).unwrap();
+        storage
+            .initialize_local_runtime_space(ns.id, embedder.embedding_space().unwrap())
+            .unwrap();
 
         let config = make_config();
         let stats = ConsolidationEngine::run(
@@ -1859,10 +2573,13 @@ mod tests {
         let embedder = OnnxEmbedder::new_mock(64);
         let ns = Namespace::new("nothing-committed");
         storage.save_namespace(&ns).unwrap();
+        storage
+            .initialize_local_runtime_space(ns.id, embedder.embedding_space().unwrap())
+            .unwrap();
 
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let err = ConsolidationEngine::run(
+        let stats = ConsolidationEngine::run(
             &storage,
             &embedder,
             &make_config(),
@@ -1870,11 +2587,11 @@ mod tests {
             &NetworkPolicy::Disabled,
             &cancel,
         )
-        .expect_err("a pre-cancelled token fails the first run");
+        .expect("a pre-cancelled token returns typed incomplete state");
 
         assert!(
-            matches!(err, ConsolidationError::Cancelled(_)),
-            "expected the bare cancellation, got {err:?}"
+            matches!(stats.incomplete, Some(ConsolidationIncomplete::Cancelled)),
+            "expected typed incomplete cancellation, got {stats:?}"
         );
     }
 

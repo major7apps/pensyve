@@ -7,6 +7,7 @@
 //! the crate is internal to the workspace and the version bumps in lockstep
 //! with the binary.
 
+pub mod admission;
 pub mod auth;
 pub mod cache;
 pub mod circuit_breaker;
@@ -23,6 +24,7 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::admission::RecallAdmission;
 use crate::auth::AuthValidator;
 use crate::rate_limit::RateLimiter;
 use crate::tenant::TenantStateManager;
@@ -36,6 +38,8 @@ pub struct AppState {
     pub usage_reporter: UsageReporter,
     pub usage_counter: UsageCounter,
     pub tenant_mgr: TenantStateManager,
+    /// One process-wide recall budget shared by HTTP, A2A, and gateway MCP.
+    pub recall_admission: Arc<RecallAdmission>,
     pub auth_required: bool,
     pub admin_key: Option<String>,
     pub ct: CancellationToken,

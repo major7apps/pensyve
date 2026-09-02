@@ -4,12 +4,20 @@ use clap::{Parser, Subcommand};
 use pensyve_core::{
     config::RetrievalConfig,
     embedding::OnnxEmbedder,
+    embedding_migration::{BackfillCancellation, EmbeddingMigration},
+    embedding_space::{EmbeddingClass, EmbeddingSpace, EmbeddingSpaceId},
+    network_policy::NetworkPolicy,
     reranker::Reranker,
     retrieval::RecallEngine,
-    storage::{StorageTrait, sqlite::SqliteBackend},
+    storage::bounded::{NamespaceEmbeddingPhase, embedding_source_text},
+    storage::{
+        StorageError, StorageResult, StorageTrait, embedding_record_for_memory,
+        sqlite::SqliteBackend,
+    },
     types::{Entity, EntityKind, Memory, Namespace, SemanticMemory},
-    vector::VectorIndex,
 };
+
+const SHIPPING_EMBEDDING_POOL_SIZE: usize = 1;
 
 /// Lazily resolve the cross-encoder reranker for `recall`. Only called from
 /// `cmd_recall`, so other subcommands never pay the model-load cost.
@@ -17,7 +25,7 @@ use pensyve_core::{
 /// logged once (to stderr) and recall proceeds unreranked rather than
 /// failing the command.
 fn resolve_reranker() -> Option<std::sync::Arc<Reranker>> {
-    if std::env::var("PENSYVE_RERANKER").as_deref() == Ok("0") {
+    if std::env::var("PENSYVE_RERANKER").as_deref() != Ok("1") {
         return None;
     }
     match Reranker::new_cached("BGERerankerBase") {
@@ -150,6 +158,48 @@ enum Command {
         #[arg(long, default_value = "default")]
         namespace: String,
     },
+
+    /// Inspect or advance a namespace's bounded embedding migration.
+    EmbeddingSpace {
+        /// Namespace storage directory containing memories.db
+        #[arg(long)]
+        storage_path: PathBuf,
+
+        #[command(subcommand)]
+        command: EmbeddingSpaceCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum EmbeddingSpaceCommand {
+    Inspect {
+        #[arg(long)]
+        namespace: uuid::Uuid,
+    },
+    Backfill {
+        #[arg(long)]
+        namespace: uuid::Uuid,
+        #[arg(long)]
+        space_manifest: PathBuf,
+        #[arg(long)]
+        max_items: usize,
+    },
+    Verify {
+        #[arg(long)]
+        namespace: uuid::Uuid,
+        #[arg(long)]
+        space_id: String,
+    },
+    Activate {
+        #[arg(long)]
+        namespace: uuid::Uuid,
+        #[arg(long)]
+        space_id: String,
+    },
+    RollbackLexical {
+        #[arg(long)]
+        namespace: uuid::Uuid,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -159,10 +209,13 @@ enum Command {
 /// Return the storage path for a given namespace.
 /// Defaults to ~/.pensyve/<namespace>.
 fn storage_path(namespace: &str) -> PathBuf {
+    storage_root().join(namespace)
+}
+
+fn storage_root() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".pensyve")
-        .join(namespace)
 }
 
 /// Open (or create) the `SqliteBackend` for `path`.
@@ -200,37 +253,57 @@ fn ensure_entity(
     Ok(entity)
 }
 
-/// Build a `VectorIndex` pre-loaded with all embeddings from `namespace_id`.
-fn build_vector_index(
+fn resolve_local_semantic_space(
     storage: &SqliteBackend,
+    embedder: &OnnxEmbedder,
     namespace_id: uuid::Uuid,
-    dimensions: usize,
-) -> Result<VectorIndex, Box<dyn std::error::Error>> {
-    let all_memories = storage.get_all_memories_by_namespace(namespace_id)?;
-    let mut index = VectorIndex::new(dimensions, all_memories.len().max(16));
-    for mem in &all_memories {
-        // Observations are recall-time enrichment — they attach to top-k
-        // session groups via `recall_grouped::attach_observations_to_groups`
-        // and MUST NOT enter the RRF candidate pool.
-        if matches!(mem, pensyve_core::types::Memory::Observation(_)) {
-            continue;
-        }
-        let emb = mem.embedding();
-        if emb.len() == dimensions && !emb.is_empty() {
-            // Best-effort: skip entries whose dimensions don't match.
-            let _ = match mem {
-                pensyve_core::types::Memory::Semantic(s) => {
-                    index.add_with_entity(mem.id(), emb, s.subject)
-                }
-                pensyve_core::types::Memory::Episodic(e) => {
-                    index.add_with_entity(mem.id(), emb, e.about_entity)
-                }
-                pensyve_core::types::Memory::Procedural(_) => index.add(mem.id(), emb),
-                pensyve_core::types::Memory::Observation(_) => unreachable!(),
-            };
-        }
+) -> StorageResult<Option<EmbeddingSpace>> {
+    let space = embedder
+        .embedding_space()
+        .map_err(|error| StorageError::Context(format!("runtime embedding space: {error}")))?
+        .clone();
+    let state = storage.initialize_local_runtime_space(namespace_id, &space)?;
+    if state.phase == NamespaceEmbeddingPhase::Active {
+        return Ok(Some(space));
     }
-    Ok(index)
+    Ok(None)
+}
+
+fn persist_local_memory(
+    storage: &SqliteBackend,
+    active_space: Option<&EmbeddingSpace>,
+    memory: &Memory,
+    embedding: Vec<f32>,
+) -> StorageResult<()> {
+    let record = active_space.map(|space| embedding_record_for_memory(memory, space, embedding));
+    storage.save_memory_with_embedding(memory, record.as_ref())
+}
+
+fn remember_local_memory(
+    storage: &SqliteBackend,
+    embedder: &OnnxEmbedder,
+    namespace_id: uuid::Uuid,
+    entity_id: uuid::Uuid,
+    fact: &str,
+    confidence: f32,
+) -> StorageResult<Memory> {
+    let (predicate, object) = fact
+        .split_once(' ')
+        .map_or(("is", fact), |(predicate, object)| (predicate, object));
+    let semantic = SemanticMemory::new(namespace_id, entity_id, predicate, object, confidence);
+    let mut memory = Memory::Semantic(semantic);
+    let active_space = resolve_local_semantic_space(storage, embedder, namespace_id)?;
+    let embedding = active_space
+        .as_ref()
+        .map(|_| embedder.embed(&embedding_source_text(&memory)))
+        .transpose()
+        .map_err(|error| StorageError::Context(format!("embedding failed: {error}")))?
+        .unwrap_or_default();
+    if let Memory::Semantic(semantic) = &mut memory {
+        semantic.embedding.clone_from(&embedding);
+    }
+    persist_local_memory(storage, active_space.as_ref(), &memory, embedding)?;
+    Ok(memory)
 }
 
 // ---------------------------------------------------------------------------
@@ -249,19 +322,8 @@ fn count_memories(
     storage: &SqliteBackend,
     namespace_id: uuid::Uuid,
 ) -> Result<MemoryCounts, Box<dyn std::error::Error>> {
-    let all_memories = storage.get_all_memories_by_namespace(namespace_id)?;
-    let mut episodic = 0usize;
-    let mut semantic = 0usize;
-    let mut procedural = 0usize;
-    let mut observation = 0usize;
-    for mem in &all_memories {
-        match mem {
-            Memory::Episodic(_) => episodic += 1,
-            Memory::Semantic(_) => semantic += 1,
-            Memory::Procedural(_) => procedural += 1,
-            Memory::Observation(_) => observation += 1,
-        }
-    }
+    let (episodic, semantic, procedural) = storage.count_memories_by_namespace(namespace_id)?;
+    let observation = storage.count_observations_by_namespace(namespace_id)?;
     Ok(MemoryCounts {
         episodic,
         semantic,
@@ -293,16 +355,37 @@ fn cmd_recall(
     let ns = ensure_namespace(&storage, namespace_name)?;
 
     // Try real ONNX embedder with fallback to mock.
-    let embedder = OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5")
-        .or_else(|_| OnnxEmbedder::new("all-MiniLM-L6-v2"))
-        .unwrap_or_else(|_| {
-            eprintln!(
-                "Warning: ONNX embedder unavailable, using mock (semantic search will be degraded)"
-            );
-            OnnxEmbedder::new_mock(768)
-        });
-    let dimensions = embedder.dimensions();
-    let vector_index = build_vector_index(&storage, ns.id, dimensions)?;
+    let embedder = OnnxEmbedder::new_with_policy_and_pool_size(
+        "Alibaba-NLP/gte-base-en-v1.5",
+        &NetworkPolicy::Permissive,
+        SHIPPING_EMBEDDING_POOL_SIZE,
+    )
+    .or_else(|_| {
+        OnnxEmbedder::new_with_policy_and_pool_size(
+            "all-MiniLM-L6-v2",
+            &NetworkPolicy::Permissive,
+            SHIPPING_EMBEDDING_POOL_SIZE,
+        )
+    })
+    .unwrap_or_else(|_| {
+        eprintln!(
+            "Warning: ONNX embedder unavailable, using mock (semantic search will be degraded)"
+        );
+        OnnxEmbedder::new_mock(768)
+    });
+    // A silent mock fallback must never become the namespace's active
+    // embedding generation: the next run with a real model would mismatch it
+    // and lose semantic search. Stay lexical-only without touching the
+    // lifecycle instead.
+    let runtime_class = embedder
+        .embedding_space()
+        .map_err(|error| format!("runtime embedding space: {error}"))?
+        .class;
+    let active_space = if runtime_class == EmbeddingClass::Mock {
+        None
+    } else {
+        resolve_local_semantic_space(&storage, &embedder, ns.id)?
+    };
 
     let config = RetrievalConfig {
         default_limit: limit,
@@ -315,7 +398,12 @@ fn cmd_recall(
         max_depth: 4,
     };
 
-    let mut engine = RecallEngine::new(&storage, &embedder, &vector_index, &config);
+    let mut engine = RecallEngine::new_storage_backed_with_vector_space(
+        &storage,
+        &embedder,
+        active_space.as_ref(),
+        &config,
+    );
     let reranker = resolve_reranker();
     if let Some(r) = reranker.as_deref() {
         engine = engine.with_reranker(r);
@@ -482,8 +570,8 @@ fn cmd_status(
     let counts = count_memories(&storage, ns.id)?;
 
     let entities = storage
-        .list_entities_by_namespace(ns.id)
-        .map_or(0, |v| v.len());
+        .count_entities_by_namespace(ns.id)
+        .unwrap_or_default();
 
     let storage_bytes = db_size(&path);
 
@@ -650,28 +738,33 @@ fn cmd_remember(
     let ns = ensure_namespace(&storage, namespace_name)?;
     let entity = ensure_entity(&storage, entity_name, ns.id)?;
 
-    // Parse "predicate object" from the fact string. Split on the first space;
-    // if there's no space, use "is" as the predicate and the full string as the object.
-    let (predicate, object) = if let Some(idx) = fact.find(' ') {
-        (&fact[..idx], &fact[idx + 1..])
-    } else {
-        ("is", fact)
-    };
-
-    let mut mem = SemanticMemory::new(ns.id, entity.id, predicate, object, confidence as f32);
-
     // Embed using real ONNX embedder with fallback to mock.
-    let embedder = OnnxEmbedder::new("Alibaba-NLP/gte-base-en-v1.5")
-        .or_else(|_| OnnxEmbedder::new("all-MiniLM-L6-v2"))
-        .unwrap_or_else(|_| {
-            eprintln!(
-                "Warning: ONNX embedder unavailable, using mock (semantic search will be degraded)"
-            );
-            OnnxEmbedder::new_mock(768)
-        });
-    mem.embedding = embedder.embed(fact)?;
-
-    storage.save_semantic(&mem)?;
+    let embedder = OnnxEmbedder::new_with_policy_and_pool_size(
+        "Alibaba-NLP/gte-base-en-v1.5",
+        &NetworkPolicy::Permissive,
+        SHIPPING_EMBEDDING_POOL_SIZE,
+    )
+    .or_else(|_| {
+        OnnxEmbedder::new_with_policy_and_pool_size(
+            "all-MiniLM-L6-v2",
+            &NetworkPolicy::Permissive,
+            SHIPPING_EMBEDDING_POOL_SIZE,
+        )
+    })
+    .unwrap_or_else(|_| {
+        eprintln!(
+            "Warning: ONNX embedder unavailable, using mock (semantic search will be degraded)"
+        );
+        OnnxEmbedder::new_mock(768)
+    });
+    remember_local_memory(
+        &storage,
+        &embedder,
+        ns.id,
+        entity.id,
+        fact,
+        confidence as f32,
+    )?;
 
     match format {
         OutputFormat::Json => {
@@ -744,6 +837,179 @@ fn cmd_forget(
     Ok(())
 }
 
+fn open_embedding_space_storage(
+    storage_path: &std::path::Path,
+    namespace_id: uuid::Uuid,
+) -> Result<SqliteBackend, Box<dyn std::error::Error>> {
+    if !storage_path.join("memories.db").is_file() {
+        return Err(StorageError::NotFound(format!(
+            "storage database {}",
+            storage_path.join("memories.db").display()
+        ))
+        .into());
+    }
+    let storage = open_storage(storage_path)?;
+    storage
+        .get_namespace(namespace_id)?
+        .ok_or_else(|| StorageError::NotFound(format!("namespace {namespace_id}")))?;
+    Ok(storage)
+}
+
+fn approved_manifest_embedder(
+    manifest: &EmbeddingSpace,
+) -> Result<OnnxEmbedder, Box<dyn std::error::Error>> {
+    if manifest.class != EmbeddingClass::Real {
+        return Err(StorageError::Context(
+            "maintenance CLI requires an approved real embedding-space manifest".into(),
+        )
+        .into());
+    }
+    let embedder = OnnxEmbedder::new_with_policy_and_pool_size(
+        &manifest.model_name,
+        &NetworkPolicy::Disabled,
+        SHIPPING_EMBEDDING_POOL_SIZE,
+    )?;
+    let runtime_id = embedder.embedding_space()?.id();
+    let manifest_id = manifest.id();
+    if runtime_id != manifest_id {
+        return Err(StorageError::Context(format!(
+            "local runtime space {} does not match approved manifest {}",
+            runtime_id.0, manifest_id.0
+        ))
+        .into());
+    }
+    Ok(embedder)
+}
+
+fn print_embedding_state(
+    state: &pensyve_core::storage::bounded::NamespaceEmbeddingState,
+    format: OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "namespace_id": state.namespace_id,
+                "state": state.phase.as_str(),
+                "active_space_id": state.active_read_space_id.as_ref().map(|id| &id.0),
+                "target_space_id": state.target_space_id.as_ref().map(|id| &id.0),
+                "barrier_sequence": state.barrier_sequence,
+                "updated_at": state.updated_at,
+            }))?
+        ),
+        OutputFormat::Text => println!(
+            "namespace={} state={} active={} target={} barrier={}",
+            state.namespace_id,
+            state.phase.as_str(),
+            state
+                .active_read_space_id
+                .as_ref()
+                .map_or("-", |id| id.0.as_str()),
+            state
+                .target_space_id
+                .as_ref()
+                .map_or("-", |id| id.0.as_str()),
+            state.barrier_sequence,
+        ),
+    }
+    Ok(())
+}
+
+fn cmd_embedding_space(
+    storage_path: &std::path::Path,
+    command: &EmbeddingSpaceCommand,
+    format: OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        EmbeddingSpaceCommand::Inspect { namespace } => {
+            let storage = open_embedding_space_storage(storage_path, *namespace)?;
+            let state = storage
+                .get_namespace_embedding_state(*namespace)?
+                .ok_or_else(|| StorageError::NotFound(format!("embedding state {namespace}")))?;
+            print_embedding_state(&state, format)
+        }
+        EmbeddingSpaceCommand::Backfill {
+            namespace,
+            space_manifest,
+            max_items,
+        } => {
+            let manifest: EmbeddingSpace =
+                serde_json::from_str(&std::fs::read_to_string(space_manifest)?)?;
+            let embedder = approved_manifest_embedder(&manifest)?;
+            let storage = open_embedding_space_storage(storage_path, *namespace)?;
+            let migration = EmbeddingMigration::new(&storage, &embedder, *namespace);
+            migration.start()?;
+            let outcome = migration.backfill(*max_items, &BackfillCancellation::new())?;
+            match format {
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "attempted": outcome.attempted,
+                        "committed": outcome.committed,
+                        "requeued": outcome.requeued,
+                        "deleted": outcome.deleted,
+                        "cancelled": outcome.cancelled,
+                    }))?
+                ),
+                OutputFormat::Text => println!(
+                    "attempted={} committed={} requeued={} deleted={} cancelled={}",
+                    outcome.attempted,
+                    outcome.committed,
+                    outcome.requeued,
+                    outcome.deleted,
+                    outcome.cancelled,
+                ),
+            }
+            Ok(())
+        }
+        EmbeddingSpaceCommand::Verify {
+            namespace,
+            space_id,
+        } => {
+            let storage = open_embedding_space_storage(storage_path, *namespace)?;
+            let (coverage, state) = storage
+                .verify_embedding_migration(*namespace, &EmbeddingSpaceId(space_id.clone()))?;
+            if !coverage.complete() {
+                return Err(
+                    pensyve_core::embedding_migration::MigrationError::from(coverage).into(),
+                );
+            }
+            print_embedding_state(&state, format)
+        }
+        EmbeddingSpaceCommand::Activate {
+            namespace,
+            space_id,
+        } => {
+            let storage = open_embedding_space_storage(storage_path, *namespace)?;
+            let state = storage
+                .get_namespace_embedding_state(*namespace)?
+                .ok_or_else(|| StorageError::NotFound(format!("embedding state {namespace}")))?;
+            let manifest = state.target_space.ok_or_else(|| {
+                StorageError::Context("namespace has no target embedding-space manifest".into())
+            })?;
+            if manifest.id().0 != *space_id {
+                return Err(StorageError::Context(
+                    "requested activation space does not match persisted target".into(),
+                )
+                .into());
+            }
+            let embedder = approved_manifest_embedder(&manifest)?;
+            let runtime_id = embedder.embedding_space()?.id();
+            let active = storage.activate_embedding_migration(
+                *namespace,
+                &EmbeddingSpaceId(space_id.clone()),
+                &runtime_id,
+            )?;
+            print_embedding_state(&active, format)
+        }
+        EmbeddingSpaceCommand::RollbackLexical { namespace } => {
+            let storage = open_embedding_space_storage(storage_path, *namespace)?;
+            let state = storage.rollback_embedding_migration_to_lexical(*namespace)?;
+            print_embedding_state(&state, format)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -795,10 +1061,201 @@ fn main() {
             hard,
             namespace,
         } => cmd_forget(entity, *hard, namespace, format),
+
+        Command::EmbeddingSpace {
+            storage_path,
+            command,
+        } => cmd_embedding_space(storage_path, command, format),
     };
 
     if let Err(e) = result {
         eprintln!("Error: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pensyve_core::retrieval::SemanticStatus;
+    use pensyve_core::storage::bounded::MemoryRef;
+
+    #[test]
+    fn shipping_model_defaults_are_opt_in_and_single_session() {
+        assert_eq!(SHIPPING_EMBEDDING_POOL_SIZE, 1);
+        assert!(include_str!("main.rs").contains("as_deref() != Ok(\"1\")"));
+    }
+
+    #[test]
+    fn embedding_space_commands_parse_without_a_model_selector() {
+        let commands = [
+            vec![
+                "pensyve",
+                "embedding-space",
+                "--storage-path",
+                "/namespace/storage",
+                "inspect",
+                "--namespace",
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            ],
+            vec![
+                "pensyve",
+                "embedding-space",
+                "--storage-path",
+                "/namespace/storage",
+                "backfill",
+                "--namespace",
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                "--space-manifest",
+                "/approved/space.json",
+                "--max-items",
+                "256",
+            ],
+            vec![
+                "pensyve",
+                "embedding-space",
+                "--storage-path",
+                "/namespace/storage",
+                "verify",
+                "--namespace",
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                "--space-id",
+                "abc123",
+            ],
+            vec![
+                "pensyve",
+                "embedding-space",
+                "--storage-path",
+                "/namespace/storage",
+                "activate",
+                "--namespace",
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                "--space-id",
+                "abc123",
+            ],
+            vec![
+                "pensyve",
+                "embedding-space",
+                "--storage-path",
+                "/namespace/storage",
+                "rollback-lexical",
+                "--namespace",
+                "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            ],
+        ];
+        for command in commands {
+            assert!(Cli::try_parse_from(command).is_ok());
+        }
+    }
+
+    #[test]
+    fn embedding_space_storage_resolver_never_enumerates_sibling_directories() {
+        let source = include_str!("main.rs");
+        let resolver = source
+            .split_once("fn open_embedding_space_storage(")
+            .expect("maintenance storage resolver")
+            .1
+            .split_once("fn approved_manifest_embedder(")
+            .expect("maintenance storage resolver terminator")
+            .0;
+
+        assert!(!resolver.contains("read_dir"));
+    }
+
+    #[test]
+    fn immediate_recall_uses_persisted_embedding() {
+        let dir = std::env::temp_dir().join(format!("pensyve-cli-test-{}", uuid::Uuid::new_v4()));
+        let storage = SqliteBackend::open(&dir).unwrap();
+        let namespace = Namespace::new("cli-persisted-recall");
+        storage.save_namespace(&namespace).unwrap();
+        let mut entity = Entity::new("alice", EntityKind::Agent);
+        entity.namespace_id = namespace.id;
+        storage.save_entity(&entity).unwrap();
+        let embedder = OnnxEmbedder::new_mock(2);
+        let memory =
+            remember_local_memory(&storage, &embedder, namespace.id, entity.id, "Rust", 0.9)
+                .unwrap();
+        let Memory::Semantic(semantic) = &memory else {
+            panic!("remember must create a semantic memory")
+        };
+        let active_space = embedder.embedding_space().unwrap();
+
+        let records = storage
+            .load_embedding_records(
+                namespace.id,
+                &active_space.id(),
+                &[MemoryRef::from_memory(&memory)],
+            )
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].source_sha256,
+            "ca9f6dc180a9be2b83ec0f43c539a37e9483eb4e03f907689b6856f185b773d6"
+        );
+        assert_eq!(records[0].embedding, embedder.embed("is Rust").unwrap());
+        let config = RetrievalConfig {
+            default_limit: 5,
+            max_candidates: 100,
+            weights: [0.30, 0.15, 0.20, 0.10, 0.10, 0.05, 0.05, 0.05],
+            recall_timeout_secs: 5,
+            rrf_k: 60,
+            rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.0],
+            beam_width: 10,
+            max_depth: 4,
+        };
+        let recalled = RecallEngine::new_storage_backed(&storage, &embedder, active_space, &config)
+            .recall_with_embedding(
+                "likes Rust",
+                Some(&semantic.embedding),
+                namespace.id,
+                5,
+                None,
+            )
+            .unwrap();
+        assert_eq!(recalled.semantic_status, SemanticStatus::Complete);
+        assert!(
+            recalled
+                .memories
+                .iter()
+                .any(|candidate| candidate.memory_id == semantic.id)
+        );
+        drop(storage);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn embedding_failure_leaves_neither_cli_source_nor_record() {
+        let dir = std::env::temp_dir().join(format!("pensyve-cli-test-{}", uuid::Uuid::new_v4()));
+        let storage = SqliteBackend::open(&dir).unwrap();
+        let namespace = Namespace::new("cli-atomic-write");
+        storage.save_namespace(&namespace).unwrap();
+        let embedder = OnnxEmbedder::new_mock(2);
+        let active_space = resolve_local_semantic_space(&storage, &embedder, namespace.id)
+            .unwrap()
+            .unwrap();
+        let memory = Memory::Semantic(SemanticMemory::new(
+            namespace.id,
+            uuid::Uuid::new_v4(),
+            "likes",
+            "Rust",
+            0.9,
+        ));
+        let memory_ref = MemoryRef::from_memory(&memory);
+
+        assert!(persist_local_memory(&storage, Some(&active_space), &memory, vec![1.0]).is_err());
+        assert!(
+            storage
+                .get_semantic_in_namespace(memory_ref.id, namespace.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .load_embedding_records(namespace.id, &active_space.id(), &[memory_ref])
+                .unwrap()
+                .is_empty()
+        );
+        drop(storage);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -4,15 +4,14 @@ use axum::Router;
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::reranker::Reranker;
-use pensyve_core::storage::StorageTrait;
+use pensyve_core::storage::bounded::embedding_source_text;
 use pensyve_core::storage::sqlite::SqliteBackend;
-use pensyve_core::types::{Namespace, ObservationMemory, Outcome, ProceduralMemory};
-use pensyve_core::vector::VectorIndex;
-use pensyve_mcp_tools::{PensyveMcpServer, PensyveState};
+use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
+use pensyve_core::types::{Memory, Namespace, ObservationMemory, Outcome, ProceduralMemory};
+use pensyve_mcp_tools::{PensyveMcpServer, PensyveState, VectorRuntime};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 /// Create a test server state, optionally with a reranker pre-attached
@@ -32,13 +31,16 @@ fn create_test_state_with_reranker(
     let namespace = Namespace::new("test");
     storage.save_namespace(&namespace).expect("save namespace");
     let embedder = OnnxEmbedder::new_mock(768);
-    let dimensions = embedder.dimensions();
-    let index = VectorIndex::new(dimensions, 1024);
+    let space = embedder.embedding_space().expect("embedding space").clone();
+    let lifecycle = storage
+        .initialize_local_runtime_space(namespace.id, &space)
+        .expect("initialize runtime space");
 
     Arc::new(PensyveState {
         storage: Arc::new(storage) as Arc<dyn StorageTrait>,
         embedder: Arc::new(embedder),
-        vector_index: RwLock::new(index),
+        vector_runtime: VectorRuntime::storage_backed(space, Some(&lifecycle))
+            .expect("storage-backed runtime"),
         namespace,
         retrieval_config: RetrievalConfig {
             default_limit: 5,
@@ -636,29 +638,49 @@ async fn test_mcp_forget_and_inspect() {
     let inspect_data: serde_json::Value = serde_json::from_str(content_text).unwrap();
     assert_eq!(inspect_data["memory_count"], 0);
 
-    let mut observation = ObservationMemory::new(
+    let observation = Memory::Observation(ObservationMemory::new(
         state.namespace.id,
         uuid::Uuid::new_v4(),
         "person",
         "bob",
         "mentioned",
         "Bob was mentioned",
-    );
-    observation.embedding = vec![0.1, 0.2];
+    ));
+    let mut observation = observation;
+    let embedding = state
+        .embedder
+        .embed(&embedding_source_text(&observation))
+        .expect("embed observation");
+    if let Memory::Observation(memory) = &mut observation {
+        memory.embedding = embedding;
+    }
+    let space = state.vector_runtime.space();
+    let observation_record =
+        embedding_record_for_memory(&observation, space, observation.embedding().to_vec());
     state
         .storage
-        .save_observation(&observation)
+        .save_memory_with_embedding(&observation, Some(&observation_record))
         .expect("save observation");
-    let procedural = ProceduralMemory::new(
+    let procedural = Memory::Procedural(ProceduralMemory::new(
         state.namespace.id,
         "on timeout",
         "retry",
         Outcome::Success,
         std::collections::HashMap::new(),
-    );
+    ));
+    let mut procedural = procedural;
+    let embedding = state
+        .embedder
+        .embed(&embedding_source_text(&procedural))
+        .expect("embed procedural");
+    if let Memory::Procedural(memory) = &mut procedural {
+        memory.embedding = embedding;
+    }
+    let procedural_record =
+        embedding_record_for_memory(&procedural, space, procedural.embedding().to_vec());
     state
         .storage
-        .save_procedural(&procedural)
+        .save_memory_with_embedding(&procedural, Some(&procedural_record))
         .expect("save procedural");
 
     // Entity mode includes instance-matched observations and excludes procedures.

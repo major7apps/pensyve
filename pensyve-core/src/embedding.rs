@@ -1,11 +1,18 @@
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{
+    EmbeddingModel, InitOptions, InitOptionsUserDefined, TextEmbedding, TokenizerFiles,
+    UserDefinedEmbeddingModel,
+};
 
+use crate::embedding_space::{
+    EmbeddingSpace, EmbeddingSpaceDescriptor, LocalArtifactFiles, MOCK_ALGORITHM_VERSION,
+};
 use crate::network_policy::{NetworkPolicy, NetworkRequiredError};
 
 // ---------------------------------------------------------------------------
@@ -19,10 +26,11 @@ use crate::network_policy::{NetworkPolicy, NetworkRequiredError};
 // monotonic ~250 MB-per-construction RSS leak in long-running eval harnesses
 // (see pensyve-docs/research/benchmark-sprint/_leak_diagnosis.md).
 //
-// The fix: a process-wide cache keyed by `(model_name, pool_size)`. Sessions
-// are immutable post-load; sharing across `Pensyve` instances is safe because
-// embedder calls already serialize through internal `Mutex<TextEmbedding>`s.
-type EmbedderCache = Mutex<HashMap<(String, usize), Arc<OnnxEmbedder>>>;
+// The fix: a process-wide cache keyed by `(model_name, pool_size, cache_root)`.
+// Sessions are immutable post-load; sharing across `Pensyve` instances is safe
+// because embedder calls already serialize through internal
+// `Mutex<TextEmbedding>`s.
+type EmbedderCache = Mutex<HashMap<(String, usize, PathBuf), Arc<OnnxEmbedder>>>;
 
 static EMBEDDER_CACHE: OnceLock<EmbedderCache> = OnceLock::new();
 
@@ -30,7 +38,11 @@ fn embedder_cache() -> &'static EmbedderCache {
     EMBEDDER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn resolve_pool_size() -> usize {
+/// Resolve the configured ONNX session-pool size.
+///
+/// Invalid, zero, or unset values preserve the historical CPU-derived default.
+#[must_use]
+pub fn resolved_embedding_pool_size() -> usize {
     std::env::var("PENSYVE_EMBEDDING_POOL_SIZE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -38,35 +50,108 @@ fn resolve_pool_size() -> usize {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get().min(4)))
 }
 
-/// Resolve the fastembed cache directory the same way
-/// `fastembed::common::get_cache_dir` does: `FASTEMBED_CACHE_DIR` env
-/// var, defaulting to `.fastembed_cache` under the current working
-/// directory. Used to detect whether a load-time HF download is needed.
-fn fastembed_cache_dir() -> std::path::PathBuf {
-    std::env::var("FASTEMBED_CACHE_DIR")
-        .map_or_else(|_| std::path::PathBuf::from(".fastembed_cache"), Into::into)
+/// Resolve the cache root fastembed 6.0.1 will actually use.
+///
+/// `HF_HOME` takes precedence over `FASTEMBED_CACHE_DIR`. Relative roots are
+/// anchored to the current directory so preflight, cache identity, and startup
+/// reporting keep one stable absolute path.
+pub fn resolved_fastembed_cache_dir() -> EmbeddingResult<PathBuf> {
+    let path = std::env::var("HF_HOME")
+        .or_else(|_| std::env::var("FASTEMBED_CACHE_DIR"))
+        .map_or_else(|_| PathBuf::from(".fastembed_cache"), PathBuf::from);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .map_err(|error| {
+            EmbeddingError::ModelLoad(format!("Failed to resolve cache root: {error}"))
+        })
 }
 
-/// Check whether a `HuggingFace` model is already present in the
-/// fastembed cache. fastembed lays models down at
-/// `<cache>/models--<org>--<name>/`. If this directory exists,
-/// fastembed's `pull_from_hf` will short-circuit without any network
-/// I/O. Used by [`OnnxEmbedder::new_with_policy`] to decide whether the
-/// `NetworkPolicy` gate must fire.
-///
-/// This directory-naming scheme (`models--<org>--<name>/refs/`,
-/// `/snapshots/<rev>/`, `/blobs/<sha>`) is the standard `hf-hub` cache
-/// layout, not something fastembed itself defines. Issue #191
-/// re-investigated the fastembed 5.17.2 -> 5.17.3 pin (see the
-/// `fastembed` dependency comment in `pensyve-core/Cargo.toml`) and
-/// found no cache-layout change to migrate: the two versions' `.rs`
-/// source is byte-identical, `hf-hub` stayed at the same locked version
-/// across the bump, and this function's logic was verified unchanged
-/// against a real seeded cache under 5.17.3. No dual-layout fallback was
-/// added here because there is no second layout to fall back to.
-fn is_model_cached(hf_model_code: &str) -> bool {
-    let cache_subdir = format!("models--{}", hf_model_code.replace('/', "--"));
-    fastembed_cache_dir().join(cache_subdir).is_dir()
+const REQUIRED_TOKENIZER_FILES: &[&str] = &[
+    "config.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+];
+
+const CACHE_ERROR_PREFIX: &str = "[embedding-cache] ";
+
+#[derive(Clone, Debug)]
+struct LocalEmbeddingFiles {
+    revision: String,
+    config: PathBuf,
+    onnx: PathBuf,
+    special_tokens_map: PathBuf,
+    tokenizer: PathBuf,
+    tokenizer_config: PathBuf,
+}
+
+fn model_cache_dir(cache_dir: &Path, hf_model_code: &str) -> PathBuf {
+    cache_dir.join(format!("models--{}", hf_model_code.replace('/', "--")))
+}
+
+/// Validate the exact hf-hub `main` ref and snapshot files consumed by
+/// fastembed 6.0.1 before any network-capable loader can run.
+fn preflight_model_cache(
+    cache_dir: &Path,
+    hf_model_code: &str,
+    model_file: &str,
+) -> Result<LocalEmbeddingFiles, String> {
+    let repository = model_cache_dir(cache_dir, hf_model_code);
+    let ref_path = repository.join("refs/main");
+    let revision = std::fs::read_to_string(&ref_path).map_err(|_| {
+        format!(
+            "required embedding cache ref is unavailable: {}",
+            ref_path.display()
+        )
+    })?;
+    if revision.is_empty() {
+        return Err(format!(
+            "required embedding cache ref is empty: {}",
+            ref_path.display()
+        ));
+    }
+    if revision != revision.trim() {
+        return Err(format!(
+            "required embedding cache ref contains noncanonical bytes: {}",
+            ref_path.display()
+        ));
+    }
+    let mut components = Path::new(&revision).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(format!(
+            "required embedding cache ref contains noncanonical path components: {}",
+            ref_path.display()
+        ));
+    }
+
+    let snapshot = repository.join("snapshots").join(&revision);
+    let onnx = snapshot.join(model_file);
+    if !onnx.is_file() {
+        return Err(format!(
+            "required embedding cache file is unavailable: {}",
+            onnx.display()
+        ));
+    }
+    for required in REQUIRED_TOKENIZER_FILES {
+        let path = snapshot.join(required);
+        if !path.is_file() {
+            return Err(format!(
+                "required embedding cache file is unavailable: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(LocalEmbeddingFiles {
+        revision,
+        config: snapshot.join("config.json"),
+        onnx,
+        special_tokens_map: snapshot.join("special_tokens_map.json"),
+        tokenizer: snapshot.join("tokenizer.json"),
+        tokenizer_config: snapshot.join("tokenizer_config.json"),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +180,19 @@ impl From<NetworkRequiredError> for EmbeddingError {
     }
 }
 
+impl EmbeddingError {
+    /// Return whether this failure identifies an incomplete or unreadable
+    /// local model cache under fail-closed construction.
+    #[must_use]
+    pub fn is_cache_error(&self) -> bool {
+        matches!(
+            self,
+            Self::ModelLoad(message) | Self::Network(message)
+                if message.starts_with(CACHE_ERROR_PREFIX)
+        )
+    }
+}
+
 pub type EmbeddingResult<T> = Result<T, EmbeddingError>;
 
 // ---------------------------------------------------------------------------
@@ -105,6 +203,7 @@ enum EmbedderInner {
     Mock,
     Real {
         pool: Vec<Mutex<TextEmbedding>>,
+        files: LocalEmbeddingFiles,
         next: AtomicUsize,
     },
     /// Deferred variant: the ONNX session pool (and any load-time HF
@@ -115,11 +214,17 @@ enum EmbedderInner {
     Lazy {
         model: EmbeddingModel,
         hf_model_code: &'static str,
+        model_file: &'static str,
         policy: NetworkPolicy,
         pool_size: usize,
-        pool: Mutex<Option<Arc<Vec<Mutex<TextEmbedding>>>>>,
+        pool: Mutex<Option<Arc<LazyEmbedderPool>>>,
         next: AtomicUsize,
     },
+}
+
+struct LazyEmbedderPool {
+    pool: Vec<Mutex<TextEmbedding>>,
+    files: LocalEmbeddingFiles,
 }
 
 // ---------------------------------------------------------------------------
@@ -148,21 +253,30 @@ pub fn model_dimensions(model_name: &str) -> Option<usize> {
 /// Useful for callers that want to pick a model without triggering a
 /// download (e.g. the MCP stdio server's lazy startup path).
 pub fn is_model_available_offline(model_name: &str) -> bool {
-    resolve_model(model_name).is_ok_and(|(_, _, hf_model_code)| is_model_cached(hf_model_code))
+    resolve_model(model_name).is_ok_and(|(_, _, hf_model_code, model_file)| {
+        resolved_fastembed_cache_dir().is_ok_and(|cache_dir| {
+            preflight_model_cache(&cache_dir, hf_model_code, model_file).is_ok()
+        })
+    })
 }
 
 /// Map a supported model name to its fastembed enum, dimensionality, and
 /// `HuggingFace` model code. Errors on unknown names. Dimensionality is
 /// looked up in [`SUPPORTED_MODELS`] so the registry stays the single
 /// source of truth.
-fn resolve_model(model_name: &str) -> EmbeddingResult<(EmbeddingModel, usize, &'static str)> {
-    let (model, hf_model_code) = match model_name {
-        "Alibaba-NLP/gte-base-en-v1.5" => {
-            (EmbeddingModel::GTEBaseENV15, "Alibaba-NLP/gte-base-en-v1.5")
-        }
+fn resolve_model(
+    model_name: &str,
+) -> EmbeddingResult<(EmbeddingModel, usize, &'static str, &'static str)> {
+    let (model, hf_model_code, model_file) = match model_name {
+        "Alibaba-NLP/gte-base-en-v1.5" => (
+            EmbeddingModel::GTEBaseENV15,
+            "Alibaba-NLP/gte-base-en-v1.5",
+            "onnx/model.onnx",
+        ),
         "all-MiniLM-L6-v2" | "sentence-transformers/all-MiniLM-L6-v2" => (
             EmbeddingModel::AllMiniLML6V2,
             "Qdrant/all-MiniLM-L6-v2-onnx",
+            "model.onnx",
         ),
         other => {
             let supported: Vec<&str> = SUPPORTED_MODELS.iter().map(|(name, _)| *name).collect();
@@ -177,26 +291,120 @@ fn resolve_model(model_name: &str) -> EmbeddingResult<(EmbeddingModel, usize, &'
             "BUG: model '{model_name}' resolves but is missing from SUPPORTED_MODELS"
         ))
     })?;
-    Ok((model, dims, hf_model_code))
+    Ok((model, dims, hf_model_code, model_file))
 }
 
 /// Build a pool of `pool_size` ONNX sessions for `model`. This is the
 /// expensive step (~hundreds of MB of session state per slot for
 /// GTE-base) shared by the eager and lazy construction paths.
-fn build_pool(
+fn build_hugging_face_pool(
     model: &EmbeddingModel,
     pool_size: usize,
+    cache_dir: &Path,
 ) -> EmbeddingResult<Vec<Mutex<TextEmbedding>>> {
     let mut pool = Vec::with_capacity(pool_size);
     for i in 0..pool_size {
         let show_progress = i == 0;
         let session = TextEmbedding::try_new(
-            InitOptions::new(model.clone()).with_show_download_progress(show_progress),
+            InitOptions::new(model.clone())
+                .with_cache_dir(cache_dir.to_path_buf())
+                .with_show_download_progress(show_progress),
         )
         .map_err(|e| EmbeddingError::ModelLoad(e.to_string()))?;
         pool.push(Mutex::new(session));
     }
     Ok(pool)
+}
+
+fn cache_model_load_error(detail: impl Into<String>) -> EmbeddingError {
+    EmbeddingError::ModelLoad(format!("{CACHE_ERROR_PREFIX}{}", detail.into()))
+}
+
+fn read_local_file(path: &Path) -> EmbeddingResult<Vec<u8>> {
+    std::fs::read(path).map_err(|error| {
+        cache_model_load_error(format!(
+            "certified local embedding file became unavailable: {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn load_local_embedding(
+    model: &EmbeddingModel,
+    files: &LocalEmbeddingFiles,
+) -> EmbeddingResult<TextEmbedding> {
+    let tokenizer_files = TokenizerFiles {
+        tokenizer_file: read_local_file(&files.tokenizer)?,
+        config_file: read_local_file(&files.config)?,
+        special_tokens_map_file: read_local_file(&files.special_tokens_map)?,
+        tokenizer_config_file: read_local_file(&files.tokenizer_config)?,
+    };
+    let mut user_model =
+        UserDefinedEmbeddingModel::new(read_local_file(&files.onnx)?, tokenizer_files);
+    if let Some(pooling) = TextEmbedding::get_default_pooling_method(model) {
+        user_model = user_model.with_pooling(pooling);
+    }
+    TextEmbedding::try_new_from_user_defined(user_model, InitOptionsUserDefined::default()).map_err(
+        |error| cache_model_load_error(format!("failed to load certified local embedder: {error}")),
+    )
+}
+
+fn build_local_pool(
+    model: &EmbeddingModel,
+    files: &LocalEmbeddingFiles,
+    pool_size: usize,
+) -> EmbeddingResult<Vec<Mutex<TextEmbedding>>> {
+    let mut pool = Vec::with_capacity(pool_size);
+    for _ in 0..pool_size {
+        pool.push(Mutex::new(load_local_embedding(model, files)?));
+    }
+    Ok(pool)
+}
+
+fn build_pool_with_policy_at_cache(
+    model: &EmbeddingModel,
+    hf_model_code: &str,
+    model_file: &str,
+    policy: &NetworkPolicy,
+    pool_size: usize,
+    cache_dir: &Path,
+) -> EmbeddingResult<(Vec<Mutex<TextEmbedding>>, LocalEmbeddingFiles)> {
+    match preflight_model_cache(cache_dir, hf_model_code, model_file) {
+        Ok(files) => Ok((build_local_pool(model, &files, pool_size)?, files)),
+        Err(detail) => {
+            let hf_url = format!("https://huggingface.co/{hf_model_code}");
+            policy.check(&hf_url).map_err(|policy_error| {
+                EmbeddingError::Network(format!("{CACHE_ERROR_PREFIX}{detail}; {policy_error}"))
+            })?;
+            // Fastembed owns the download path. Discard its sessions, then
+            // construct the returned pool from the one certified snapshot we
+            // retain as provenance; otherwise a later `refs/main` update
+            // could label vectors with a different artifact set.
+            drop(build_hugging_face_pool(model, 1, cache_dir)?);
+            let files = preflight_model_cache(cache_dir, hf_model_code, model_file)
+                .map_err(cache_model_load_error)?;
+            let pool = build_local_pool(model, &files, pool_size)?;
+            Ok((pool, files))
+        }
+    }
+}
+
+fn build_pool_with_policy(
+    model: &EmbeddingModel,
+    hf_model_code: &str,
+    model_file: &str,
+    policy: &NetworkPolicy,
+    pool_size: usize,
+) -> EmbeddingResult<(Vec<Mutex<TextEmbedding>>, LocalEmbeddingFiles)> {
+    let cache_dir = resolved_fastembed_cache_dir()?;
+    build_pool_with_policy_at_cache(
+        model,
+        hf_model_code,
+        model_file,
+        policy,
+        pool_size,
+        &cache_dir,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +413,10 @@ fn build_pool(
 
 pub struct OnnxEmbedder {
     dimensions: usize,
+    descriptor: Option<EmbeddingSpaceDescriptor>,
     inner: EmbedderInner,
+    space: OnceLock<EmbeddingSpace>,
+    space_init: Mutex<()>,
 }
 
 impl OnnxEmbedder {
@@ -229,40 +440,55 @@ impl OnnxEmbedder {
     ///
     /// Per pre-reg §2 invariant I4 + §3.0 item 10: under
     /// [`NetworkPolicy::Disabled`], constructing an embedder for a model
-    /// that is NOT already cached MUST surface
-    /// [`EmbeddingError::Network`]. If the model IS already cached
-    /// (resolved via the fastembed cache directory layout
-    /// `models--<org>--<name>` under `FASTEMBED_CACHE_DIR` or
-    /// `.fastembed_cache`), the policy check is a no-op because no
-    /// network request is needed.
+    /// whose exact ONNX/tokenizer/config snapshot is not cached surfaces a
+    /// cache-classified [`EmbeddingError::Network`] before any retrieval.
+    /// Complete caches use fastembed's user-defined constructor so the
+    /// disabled path has no HTTP-capable loader in its call graph.
     ///
     /// This is the fail-closed-friendly entry point. Callers that want
     /// the v2.1 always-permissive behavior keep using [`Self::new`].
     pub fn new_with_policy(model_name: &str, policy: &NetworkPolicy) -> EmbeddingResult<Self> {
-        let (model_enum, dims, hf_model_code) = resolve_model(model_name)?;
+        Self::new_with_policy_and_pool_size(model_name, policy, resolved_embedding_pool_size())
+    }
 
-        // Cache pre-check: if the model directory already exists in the
-        // fastembed cache, fastembed's `pull_from_hf` short-circuits and
-        // performs zero network I/O. In that case the policy check is a
-        // no-op (no network call is attempted) and we can proceed
-        // regardless of `Disabled`. If the cache is absent, we MUST gate
-        // the would-be download through the policy.
-        if !is_model_cached(hf_model_code) {
-            // Build the canonical HF URL for this model so the policy
-            // gets a real target string (used in the error message and
-            // any future `LocalOnly` URL-prefix checks).
-            let hf_url = format!("https://huggingface.co/{hf_model_code}");
-            policy.check(&hf_url)?;
-        }
+    /// Policy-aware eager constructor with an explicitly resolved session
+    /// pool size. Server callers use this to resolve process-global
+    /// configuration once and report the same value they initialize.
+    pub fn new_with_policy_and_pool_size(
+        model_name: &str,
+        policy: &NetworkPolicy,
+        pool_size: usize,
+    ) -> EmbeddingResult<Self> {
+        let cache_dir = resolved_fastembed_cache_dir()?;
+        Self::new_with_policy_pool_size_at_cache(model_name, policy, pool_size, &cache_dir)
+    }
 
-        let pool = build_pool(&model_enum, resolve_pool_size())?;
+    fn new_with_policy_pool_size_at_cache(
+        model_name: &str,
+        policy: &NetworkPolicy,
+        pool_size: usize,
+        cache_dir: &Path,
+    ) -> EmbeddingResult<Self> {
+        let (model_enum, dims, hf_model_code, model_file) = resolve_model(model_name)?;
+        let (pool, files) = build_pool_with_policy_at_cache(
+            &model_enum,
+            hf_model_code,
+            model_file,
+            policy,
+            pool_size.max(1),
+            cache_dir,
+        )?;
 
         Ok(Self {
             dimensions: dims,
+            descriptor: Some(embedding_space_descriptor(model_name, dims, &model_enum)),
             inner: EmbedderInner::Real {
                 pool,
+                files,
                 next: AtomicUsize::new(0),
             },
+            space: OnceLock::new(),
+            space_init: Mutex::new(()),
         })
     }
 
@@ -284,7 +510,11 @@ impl OnnxEmbedder {
     /// Equivalent to `new_lazy_with_options(model_name,
     /// &NetworkPolicy::Permissive, resolved pool size)`.
     pub fn new_lazy(model_name: &str) -> EmbeddingResult<Self> {
-        Self::new_lazy_with_options(model_name, &NetworkPolicy::Permissive, resolve_pool_size())
+        Self::new_lazy_with_options(
+            model_name,
+            &NetworkPolicy::Permissive,
+            resolved_embedding_pool_size(),
+        )
     }
 
     /// Lazy constructor with an explicit [`NetworkPolicy`] and pool size.
@@ -298,17 +528,21 @@ impl OnnxEmbedder {
         policy: &NetworkPolicy,
         pool_size: usize,
     ) -> EmbeddingResult<Self> {
-        let (model_enum, dims, hf_model_code) = resolve_model(model_name)?;
+        let (model_enum, dims, hf_model_code, model_file) = resolve_model(model_name)?;
         Ok(Self {
             dimensions: dims,
+            descriptor: Some(embedding_space_descriptor(model_name, dims, &model_enum)),
             inner: EmbedderInner::Lazy {
                 model: model_enum,
                 hf_model_code,
+                model_file,
                 policy: policy.clone(),
                 pool_size: pool_size.max(1),
                 pool: Mutex::new(None),
                 next: AtomicUsize::new(0),
             },
+            space: OnceLock::new(),
+            space_init: Mutex::new(()),
         })
     }
 
@@ -317,10 +551,11 @@ impl OnnxEmbedder {
     /// serialize instead of double-loading. Errors are returned without
     /// being cached so a transient failure (e.g. download denied/offline)
     /// is retried on the next call.
-    fn ensure_lazy_pool(&self) -> EmbeddingResult<Arc<Vec<Mutex<TextEmbedding>>>> {
+    fn ensure_lazy_pool(&self) -> EmbeddingResult<Arc<LazyEmbedderPool>> {
         let EmbedderInner::Lazy {
             model,
             hf_model_code,
+            model_file,
             policy,
             pool_size,
             pool,
@@ -339,21 +574,17 @@ impl OnnxEmbedder {
             return Ok(Arc::clone(existing));
         }
 
-        // Same load-time network gating as `new_with_policy`, deferred to
-        // first use.
-        if !is_model_cached(hf_model_code) {
-            let hf_url = format!("https://huggingface.co/{hf_model_code}");
-            policy.check(&hf_url)?;
-        }
-
         tracing::info!("Lazily loading ONNX embedder (pool_size={pool_size})");
-        let built = Arc::new(build_pool(model, *pool_size)?);
+        let (pool, files) =
+            build_pool_with_policy(model, hf_model_code, model_file, policy, *pool_size)?;
+        let built = Arc::new(LazyEmbedderPool { pool, files });
         *guard = Some(Arc::clone(&built));
         Ok(built)
     }
 
     /// Cached variant of [`Self::new`]. Returns an `Arc<OnnxEmbedder>` shared
-    /// across the process for the same `(model_name, pool_size)` pair.
+    /// across the process for the same `(model_name, pool_size, cache_root)`
+    /// tuple.
     ///
     /// Use this in long-running contexts (eval harnesses, servers) where
     /// repeated `Pensyve(...)` construction would otherwise leak ONNX session
@@ -370,23 +601,42 @@ impl OnnxEmbedder {
     /// Per pre-reg §2 invariant I4 + §3.0 item 10: this is the entry point
     /// the Pensyve handle constructor MUST use so that
     /// [`NetworkPolicy::Disabled`] propagates from the handle down to the
-    /// embedder. A cache hit on the process-shared `Arc` short-circuits
-    /// without re-checking the policy — by construction, an entry only
-    /// exists in the cache because a previous successful construction
-    /// (under whatever policy was active then) populated the on-disk
-    /// fastembed cache, and `new_with_policy` itself treats an already-cached
-    /// model as a no-op (no network request is needed).
+    /// embedder. Non-permissive cache hits revalidate the active on-disk cache
+    /// before returning the process-shared `Arc`.
     pub fn new_cached_with_policy(
         model_name: &str,
         policy: &NetworkPolicy,
     ) -> EmbeddingResult<Arc<Self>> {
-        let pool_size = resolve_pool_size();
-        let key = (model_name.to_string(), pool_size);
+        let pool_size = resolved_embedding_pool_size();
+        Self::new_cached_with_policy_and_pool_size(model_name, policy, pool_size)
+    }
+
+    /// Policy-aware cached constructor with an explicit session-pool size.
+    /// Shipping runtimes use this to pin one session independently of
+    /// process-global harness tuning.
+    pub fn new_cached_with_policy_and_pool_size(
+        model_name: &str,
+        policy: &NetworkPolicy,
+        pool_size: usize,
+    ) -> EmbeddingResult<Arc<Self>> {
+        let cache_dir = resolved_fastembed_cache_dir()?;
+        if !matches!(policy, NetworkPolicy::Permissive) {
+            let (_, _, hf_model_code, model_file) = resolve_model(model_name)?;
+            if let Err(detail) = preflight_model_cache(&cache_dir, hf_model_code, model_file) {
+                let hf_url = format!("https://huggingface.co/{hf_model_code}");
+                policy.check(&hf_url).map_err(|policy_error| {
+                    EmbeddingError::Network(format!("{CACHE_ERROR_PREFIX}{detail}; {policy_error}"))
+                })?;
+            }
+        }
+        let key = (model_name.to_string(), pool_size, cache_dir.clone());
         let mut guard = embedder_cache().lock().expect("embedder cache poisoned");
         if let Some(existing) = guard.get(&key) {
             return Ok(Arc::clone(existing));
         }
-        let fresh = Arc::new(Self::new_with_policy(model_name, policy)?);
+        let fresh = Arc::new(Self::new_with_policy_pool_size_at_cache(
+            model_name, policy, pool_size, &cache_dir,
+        )?);
         guard.insert(key, Arc::clone(&fresh));
         Ok(fresh)
     }
@@ -396,7 +646,10 @@ impl OnnxEmbedder {
     pub fn new_mock(dimensions: usize) -> Self {
         Self {
             dimensions,
+            descriptor: None,
             inner: EmbedderInner::Mock,
+            space: OnceLock::new(),
+            space_init: Mutex::new(()),
         }
     }
 
@@ -412,10 +665,10 @@ impl OnnxEmbedder {
     pub fn embed(&self, text: &str) -> EmbeddingResult<Vec<f32>> {
         match &self.inner {
             EmbedderInner::Mock => Ok(mock_embed(text, self.dimensions)),
-            EmbedderInner::Real { pool, next } => embed_one_in_pool(pool, next, text),
+            EmbedderInner::Real { pool, next, .. } => embed_one_in_pool(pool, next, text),
             EmbedderInner::Lazy { next, .. } => {
                 let pool = self.ensure_lazy_pool()?;
-                embed_one_in_pool(&pool, next, text)
+                embed_one_in_pool(&pool.pool, next, text)
             }
         }
     }
@@ -427,10 +680,10 @@ impl OnnxEmbedder {
                 .iter()
                 .map(|t| Ok(mock_embed(t, self.dimensions)))
                 .collect(),
-            EmbedderInner::Real { pool, next } => embed_batch_in_pool(pool, next, texts),
+            EmbedderInner::Real { pool, next, .. } => embed_batch_in_pool(pool, next, texts),
             EmbedderInner::Lazy { next, .. } => {
                 let pool = self.ensure_lazy_pool()?;
-                embed_batch_in_pool(&pool, next, texts)
+                embed_batch_in_pool(&pool.pool, next, texts)
             }
         }
     }
@@ -438,6 +691,83 @@ impl OnnxEmbedder {
     /// Return the embedding dimensionality.
     pub fn dimensions(&self) -> usize {
         self.dimensions
+    }
+
+    /// Return the exact immutable embedding space used by this embedder.
+    ///
+    /// Real spaces are only constructed from an on-disk certified cache: a
+    /// model name and dimension never stand in for artifact provenance.
+    pub fn embedding_space(&self) -> EmbeddingResult<&EmbeddingSpace> {
+        if let Some(space) = self.space.get() {
+            return Ok(space);
+        }
+        let _guard = self.space_init.lock().map_err(|error| {
+            EmbeddingError::Inference(format!("embedding-space lock poisoned: {error}"))
+        })?;
+        if let Some(space) = self.space.get() {
+            return Ok(space);
+        }
+        let resolved = match &self.inner {
+            EmbedderInner::Mock => Ok(EmbeddingSpace::mock(
+                self.dimensions,
+                MOCK_ALGORITHM_VERSION,
+            )),
+            EmbedderInner::Real { files, .. } => self.embedding_space_from_files(files),
+            EmbedderInner::Lazy { .. } => {
+                let loaded = self.ensure_lazy_pool()?;
+                self.embedding_space_from_files(&loaded.files)
+            }
+        }?;
+        self.space.set(resolved).map_err(|_| {
+            EmbeddingError::Inference("embedding space was concurrently initialized".into())
+        })?;
+        self.space.get().ok_or_else(|| {
+            EmbeddingError::Inference("embedding space initialization did not persist".into())
+        })
+    }
+
+    fn embedding_space_from_files(
+        &self,
+        files: &LocalEmbeddingFiles,
+    ) -> EmbeddingResult<EmbeddingSpace> {
+        let descriptor = self.descriptor.as_ref().ok_or_else(|| {
+            EmbeddingError::Inference("mock embedder has no local artifacts".into())
+        })?;
+        let files = LocalArtifactFiles {
+            revision: files.revision.clone(),
+            config: files.config.clone(),
+            onnx: files.onnx.clone(),
+            special_tokens_map: files.special_tokens_map.clone(),
+            tokenizer: files.tokenizer.clone(),
+            tokenizer_config: files.tokenizer_config.clone(),
+        };
+        EmbeddingSpace::from_hashed_files(descriptor, &files).map_err(|error| {
+            cache_model_load_error(format!(
+                "failed to hash certified local embedding artifacts: {error}"
+            ))
+        })
+    }
+}
+
+fn embedding_space_descriptor(
+    model_name: &str,
+    dimensions: usize,
+    model: &EmbeddingModel,
+) -> EmbeddingSpaceDescriptor {
+    let pooling = match model {
+        EmbeddingModel::GTEBaseENV15 => "cls",
+        EmbeddingModel::AllMiniLML6V2 => "mean",
+        _ => "fastembed-default",
+    };
+    EmbeddingSpaceDescriptor {
+        model_name: model_name.to_owned(),
+        dimensions,
+        pooling: pooling.to_owned(),
+        normalized: true,
+        query_prefix: String::new(),
+        document_prefix: String::new(),
+        truncation: 512,
+        runtime: FASTEMBED_RUNTIME.to_owned(),
     }
 }
 
@@ -536,6 +866,11 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Runtime component of every fastembed-backed embedding-space identity. A
+/// unit test pins it to the version resolved in `Cargo.lock`, so a dependency
+/// bump cannot leave vectors stamped with a stale runtime.
+const FASTEMBED_RUNTIME: &str = "fastembed-6.0.1/onnxruntime";
+
 #[cfg(test)]
 #[allow(
     clippy::ignore_without_reason,
@@ -545,6 +880,38 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 )]
 mod tests {
     use super::*;
+
+    const TEST_GTE_CACHE_DIR: &str = "models--Alibaba-NLP--gte-base-en-v1.5";
+    const TEST_GTE_REQUIRED_FILES: &[&str] = &[
+        "config.json",
+        "onnx/model.onnx",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ];
+
+    #[cfg(unix)]
+    fn seed_gte_cache(source_root: &std::path::Path, destination_root: &std::path::Path) {
+        let source_repository = source_root.join(TEST_GTE_CACHE_DIR);
+        let revision = std::fs::read_to_string(source_repository.join("refs/main"))
+            .expect("read real GTE main ref");
+        let destination_repository = destination_root.join(TEST_GTE_CACHE_DIR);
+        std::fs::create_dir_all(destination_repository.join("refs"))
+            .expect("create isolated GTE refs");
+        std::fs::write(destination_repository.join("refs/main"), &revision)
+            .expect("write isolated GTE main ref");
+
+        let source_snapshot = source_repository.join("snapshots").join(&revision);
+        let destination_snapshot = destination_repository.join("snapshots").join(&revision);
+        for required in TEST_GTE_REQUIRED_FILES {
+            let source = std::fs::canonicalize(source_snapshot.join(required))
+                .unwrap_or_else(|_| panic!("resolve real cached GTE file {required}"));
+            let destination = destination_snapshot.join(required);
+            std::fs::create_dir_all(destination.parent().expect("required file parent"))
+                .expect("create isolated GTE snapshot directory");
+            std::os::unix::fs::symlink(source, destination).expect("symlink real cached GTE file");
+        }
+    }
 
     #[test]
     fn test_embed_single_text() {
@@ -727,16 +1094,108 @@ mod tests {
 
     #[test]
     fn test_sentence_transformers_alias() {
-        // "sentence-transformers/all-MiniLM-L6-v2" should resolve to the same model.
-        let result = OnnxEmbedder::new("sentence-transformers/all-MiniLM-L6-v2");
-        // This would succeed if the model is downloaded, but we only check it doesn't
-        // return "Unknown model" error.
-        if let Err(e) = &result {
+        let (model, dimensions, hf_model_code, model_file) =
+            resolve_model("sentence-transformers/all-MiniLM-L6-v2")
+                .expect("sentence-transformers alias should resolve");
+
+        assert!(matches!(model, EmbeddingModel::AllMiniLML6V2));
+        assert_eq!(dimensions, 384);
+        assert_eq!(hf_model_code, "Qdrant/all-MiniLM-L6-v2-onnx");
+        assert_eq!(model_file, "model.onnx");
+    }
+
+    #[test]
+    fn disabled_gte_rejects_each_missing_required_cache_file() {
+        for missing in TEST_GTE_REQUIRED_FILES {
+            let cache = tempfile::TempDir::new().expect("temporary GTE cache");
+            let repository = cache.path().join(TEST_GTE_CACHE_DIR);
+            let snapshot = repository.join("snapshots/test-revision");
+            std::fs::create_dir_all(snapshot.join("onnx")).expect("create GTE snapshot");
+            std::fs::create_dir_all(repository.join("refs")).expect("create GTE refs");
+            std::fs::write(repository.join("refs/main"), "test-revision")
+                .expect("write GTE main ref");
+            for required in TEST_GTE_REQUIRED_FILES {
+                if required != missing {
+                    std::fs::write(snapshot.join(required), []).expect("seed required GTE file");
+                }
+            }
+            let result = OnnxEmbedder::new_with_policy_pool_size_at_cache(
+                "Alibaba-NLP/gte-base-en-v1.5",
+                &NetworkPolicy::Disabled,
+                1,
+                cache.path(),
+            );
+
+            let Err(error) = result else {
+                panic!("incomplete GTE cache without {missing} initialized under Disabled");
+            };
             assert!(
-                !e.to_string().contains("Unknown model"),
-                "sentence-transformers alias should be recognized"
+                error.is_cache_error(),
+                "missing {missing} did not return a cache-specific error: {error}"
+            );
+            assert!(
+                error.to_string().contains(missing),
+                "cache error did not identify missing {missing}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn local_only_policy_rejects_missing_public_hugging_face_cache() {
+        let cache = tempfile::TempDir::new().expect("empty GTE cache");
+        let policy = NetworkPolicy::LocalOnly {
+            url: "http://localhost:8888/v1".to_string(),
+        };
+
+        let result = OnnxEmbedder::new_with_policy_pool_size_at_cache(
+            "Alibaba-NLP/gte-base-en-v1.5",
+            &policy,
+            1,
+            cache.path(),
+        );
+
+        let Err(EmbeddingError::Network(message)) = result else {
+            panic!("LocalOnly policy did not reject a public model retrieval before loading");
+        };
+        assert!(message.contains("LocalOnly"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "requires a real GTE cache; Task 4 CI must seed and invoke this test explicitly"]
+    fn disabled_gte_constructs_from_complete_real_seeded_cache() {
+        let source_root = resolved_fastembed_cache_dir().expect("resolve real cache root");
+        let source_repository = source_root.join(TEST_GTE_CACHE_DIR);
+        assert!(
+            source_repository.is_dir(),
+            "real GTE cache fixture is required at {}; set HF_HOME or \
+             FASTEMBED_CACHE_DIR to the cache root containing it",
+            source_repository.display()
+        );
+        let cache = tempfile::TempDir::new().expect("isolated seeded GTE cache");
+        seed_gte_cache(&source_root, cache.path());
+
+        let embedder = OnnxEmbedder::new_with_policy_pool_size_at_cache(
+            "Alibaba-NLP/gte-base-en-v1.5",
+            &NetworkPolicy::Disabled,
+            1,
+            cache.path(),
+        )
+        .expect("complete real GTE cache should construct under Disabled");
+
+        let values = embedder
+            .embed("structurally offline GTE inference proof")
+            .expect("real cached GTE should run inference under Disabled");
+        assert_eq!(values.len(), 768);
+        assert!(
+            values.iter().all(|value| value.is_finite()),
+            "real cached GTE returned a non-finite embedding"
+        );
+        let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 0.01,
+            "real cached GTE embedding must be approximately unit-normalized, got {norm}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -767,6 +1226,25 @@ mod tests {
             "Similar sentences should have higher similarity: sim_ab={:.4}, sim_ac={:.4}",
             sim_ab,
             sim_ac
+        );
+    }
+
+    #[test]
+    fn runtime_descriptor_tracks_the_resolved_fastembed_version() {
+        let lock = include_str!("../../Cargo.lock");
+        let version = lock
+            .split("[[package]]")
+            .find(|package| package.contains("name = \"fastembed\""))
+            .and_then(|package| {
+                package
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix("version = \""))
+            })
+            .map(|rest| rest.trim_end_matches('"'))
+            .expect("fastembed is resolved in Cargo.lock");
+        assert_eq!(
+            FASTEMBED_RUNTIME,
+            format!("fastembed-{version}/onnxruntime")
         );
     }
 }

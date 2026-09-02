@@ -21,7 +21,6 @@ use pensyve_core::reranker::Reranker;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::Namespace;
-use pensyve_core::vector::VectorIndex;
 use pensyve_mcp_gateway::tenant::TenantStateManager;
 use pensyve_mcp_gateway::{AGENT_ID_HEADER, build_tenant_key, parse_agent_id_header};
 use pensyve_mcp_tools::PensyveMcpServer;
@@ -68,25 +67,26 @@ fn make_mgr(dir: &tempfile::TempDir) -> Arc<TenantStateManager> {
     let ns = Namespace::new("default");
     storage.save_namespace(&ns).expect("save default ns");
     let embedder = Arc::new(OnnxEmbedder::new_mock(768));
-    let idx = VectorIndex::new(768, 1024);
-    let mgr = Arc::new(TenantStateManager::new(
-        storage,
-        embedder,
-        RetrievalConfig {
-            default_limit: 5,
-            max_candidates: 100,
-            weights: [0.30, 0.15, 0.20, 0.10, 0.10, 0.05, 0.05, 0.05],
-            recall_timeout_secs: 5,
-            rrf_k: 60,
-            rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.0],
-            beam_width: 10,
-            max_depth: 4,
-        },
-        ns,
-        idx,
-        dir.path().join("snapshots"),
-        pensyve_core::snapshot::RetentionPolicy::UNBOUNDED,
-    ));
+    let mgr = Arc::new(
+        TenantStateManager::new_storage_backed(
+            storage,
+            embedder,
+            RetrievalConfig {
+                default_limit: 5,
+                max_candidates: 100,
+                weights: [0.30, 0.15, 0.20, 0.10, 0.10, 0.05, 0.05, 0.05],
+                recall_timeout_secs: 5,
+                rrf_k: 60,
+                rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.0],
+                beam_width: 10,
+                max_depth: 4,
+            },
+            ns,
+            dir.path().join("snapshots"),
+            pensyve_core::snapshot::RetentionPolicy::UNBOUNDED,
+        )
+        .expect("construct storage-backed tenant manager"),
+    );
 
     // Resolve the shared reranker cell up front with a mock, so nothing in
     // this binary can trigger the real ~280MB model download. Every tenant

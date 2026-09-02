@@ -52,20 +52,33 @@
 //! different answer — the two are intentionally separate.
 
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::storage::{StorageError, StorageResult, StorageTrait};
+use crate::embedding_space::EmbeddingSpaceId;
+use crate::storage::bounded::{
+    EmbeddingRecord, MEMORY_PAGE_SIZE, MemoryRef, MemoryType, SNAPSHOT_MAX_FRAME_BYTES,
+    SNAPSHOT_MAX_PAGE_BYTES,
+};
+use crate::storage::{
+    CapturedMemory, StorageError, StorageResult, StorageTrait, canonical_embedding_source_sha256,
+    validate_record_matches_memory,
+};
 use crate::types::Memory;
 
 /// On-disk format version. Bump on any breaking change to [`ForgetSnapshot`];
 /// [`read_file`] refuses versions it does not understand rather than silently
 /// restoring a misparsed snapshot.
 pub const FORMAT_VERSION: u32 = 1;
+
+/// Incrementally readable/writable snapshot format used by shipping forget/restore paths.
+pub const STREAM_FORMAT_VERSION: u32 = 2;
 
 /// Everything an entity-wide delete is about to destroy, captured before it runs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,9 +106,99 @@ pub struct ForgetSnapshot {
     /// rather than silently claiming protection it never had.
     #[serde(default)]
     pub owner_only: bool,
-    /// Full memory rows, embeddings included, so a restore is byte-faithful to
-    /// what the storage layer can read back.
+    /// Full source rows, including their legacy inline embeddings.
     pub memories: Vec<Memory>,
+    /// Immutable versioned embedding generations removed with `memories`.
+    /// Absent in original format-v1 archives, which decode as source-only.
+    #[serde(default, with = "embedding_records_serde")]
+    pub embedding_records: Vec<EmbeddingRecord>,
+}
+
+mod embedding_records_serde {
+    use super::{
+        Deserialize, Deserializer, EmbeddingRecord, EmbeddingSpaceId, MemoryRef, MemoryType,
+        Serialize, Serializer, Uuid,
+    };
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum SerializableMemoryType {
+        Episodic,
+        Semantic,
+        Procedural,
+        Observation,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct SerializableEmbeddingRecord {
+        namespace_id: Uuid,
+        memory_type: SerializableMemoryType,
+        memory_id: Uuid,
+        embedding_space_id: String,
+        source_sha256: String,
+        embedding: Vec<f32>,
+    }
+
+    impl From<MemoryType> for SerializableMemoryType {
+        fn from(value: MemoryType) -> Self {
+            match value {
+                MemoryType::Episodic => Self::Episodic,
+                MemoryType::Semantic => Self::Semantic,
+                MemoryType::Procedural => Self::Procedural,
+                MemoryType::Observation => Self::Observation,
+            }
+        }
+    }
+
+    impl From<SerializableMemoryType> for MemoryType {
+        fn from(value: SerializableMemoryType) -> Self {
+            match value {
+                SerializableMemoryType::Episodic => Self::Episodic,
+                SerializableMemoryType::Semantic => Self::Semantic,
+                SerializableMemoryType::Procedural => Self::Procedural,
+                SerializableMemoryType::Observation => Self::Observation,
+            }
+        }
+    }
+
+    pub fn serialize<S>(records: &[EmbeddingRecord], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        records
+            .iter()
+            .map(|record| SerializableEmbeddingRecord {
+                namespace_id: record.namespace_id,
+                memory_type: record.memory_ref.memory_type.into(),
+                memory_id: record.memory_ref.id,
+                embedding_space_id: record.embedding_space_id.0.clone(),
+                source_sha256: record.source_sha256.clone(),
+                embedding: record.embedding.clone(),
+            })
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<EmbeddingRecord>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<SerializableEmbeddingRecord>::deserialize(deserializer).map(|records| {
+            records
+                .into_iter()
+                .map(|record| EmbeddingRecord {
+                    namespace_id: record.namespace_id,
+                    memory_ref: MemoryRef {
+                        memory_type: record.memory_type.into(),
+                        id: record.memory_id,
+                    },
+                    embedding_space_id: EmbeddingSpaceId(record.embedding_space_id),
+                    source_sha256: record.source_sha256,
+                    embedding: record.embedding,
+                })
+                .collect()
+        })
+    }
 }
 
 /// Whether this platform can restrict a snapshot file to its owner.
@@ -114,6 +217,33 @@ pub struct SnapshotCounts {
     pub procedural: usize,
     pub observation: usize,
     pub total: usize,
+}
+
+/// Constant-size description of a streamed snapshot artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotManifest {
+    pub format_version: u32,
+    pub snapshot_id: Uuid,
+    pub entity_id: Uuid,
+    pub entity_name: Option<String>,
+    pub namespace_id: Uuid,
+    pub captured_at: DateTime<Utc>,
+    pub owner_only: bool,
+    pub counts: SnapshotCounts,
+    pub embedding_records: usize,
+    pub stream_sha256: String,
+}
+
+impl SnapshotManifest {
+    #[must_use]
+    pub const fn counts(&self) -> SnapshotCounts {
+        self.counts
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.counts.total == 0
+    }
 }
 
 impl ForgetSnapshot {
@@ -152,16 +282,40 @@ pub struct RestoreOutcome {
 /// Result of a [`forget_entity_bounded`] call.
 #[derive(Debug, Clone)]
 pub struct ForgetOutcome {
-    /// The rows the delete removed. Empty when the entity had no memories.
-    pub snapshot: ForgetSnapshot,
+    /// Constant-size manifest for exactly the rows the delete removed.
+    pub snapshot: SnapshotManifest,
     /// Where the snapshot was written. `None` when nothing was deleted — an
     /// empty snapshot has nothing to recover, and writing one per call would
     /// let a caller fill the disk by invoking `pensyve_forget` in a loop.
     pub path: Option<PathBuf>,
+    /// Already-open handle for streaming post-commit compatibility cleanup.
+    ///
+    /// Retention may remove `path` after this forget releases its namespace
+    /// lock. Keeping this handle alive pins the exact validated artifact until
+    /// the caller finishes cleanup, without retaining any memory IDs.
+    pub artifact: Option<SnapshotArtifact>,
     /// What retention evicted from this namespace's directory afterwards, and
     /// anything that went wrong doing it. Never affects whether the delete
     /// happened — see [`prune_namespace_dir`].
     pub pruned: PruneOutcome,
+}
+
+/// An already-open streamed snapshot, pinned independently of its directory entry.
+#[derive(Debug, Clone)]
+pub struct SnapshotArtifact {
+    path: PathBuf,
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+impl SnapshotArtifact {
+    /// Stream IDs from the validated artifact through the same open file handle.
+    pub fn for_each_memory_id(
+        &self,
+        visit: impl FnMut(Uuid) -> StorageResult<()>,
+    ) -> StorageResult<()> {
+        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+        for_each_memory_id_in_opened_file_with(&mut file, visit, || {})
+    }
 }
 
 /// How much snapshot history one namespace directory keeps.
@@ -208,6 +362,225 @@ pub struct PruneOutcome {
     /// from storage, so the only thing aborting could achieve is turning a
     /// successful delete into a reported failure.
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotStreamHeader {
+    kind: String,
+    format_version: u32,
+    snapshot_id: Uuid,
+    entity_id: Uuid,
+    entity_name: Option<String>,
+    namespace_id: Uuid,
+    captured_at: DateTime<Utc>,
+    owner_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotStreamEntry {
+    kind: String,
+    source_sha256: String,
+    memory: Memory,
+    #[serde(default, with = "embedding_records_serde")]
+    embedding_records: Vec<EmbeddingRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotStreamFooter {
+    kind: String,
+    counts: SnapshotCounts,
+    embedding_records: usize,
+    stream_sha256: String,
+}
+
+/// The v2 checksum covers the exact UTF-8 bytes of the header and every entry frame,
+/// including each trailing `\n`. The footer is excluded because it carries the digest.
+struct SnapshotStreamWriter {
+    header: SnapshotStreamHeader,
+    dir: PathBuf,
+    path: PathBuf,
+    temp_path: PathBuf,
+    file: Option<std::fs::File>,
+    digest: Sha256,
+    counts: SnapshotCounts,
+    embedding_records: usize,
+    last_ref: Option<MemoryRef>,
+    published: bool,
+}
+
+impl SnapshotStreamWriter {
+    fn new(dir: &Path, header: SnapshotStreamHeader) -> Self {
+        let path = dir.join(file_name_parts(
+            header.entity_id,
+            header.captured_at,
+            header.snapshot_id,
+        ));
+        let temp_path = path.with_extension("json.partial");
+        Self {
+            header,
+            dir: dir.to_path_buf(),
+            path,
+            temp_path,
+            file: None,
+            digest: Sha256::new(),
+            counts: SnapshotCounts::default(),
+            embedding_records: 0,
+            last_ref: None,
+            published: false,
+        }
+    }
+
+    fn write_hashed_frame(&mut self, bytes: &[u8]) -> StorageResult<()> {
+        if bytes.len() > SNAPSHOT_MAX_FRAME_BYTES {
+            return Err(StorageError::BudgetExceeded(format!(
+                "snapshot frame contains {} serialized bytes; maximum is {SNAPSHOT_MAX_FRAME_BYTES}",
+                bytes.len()
+            )));
+        }
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| StorageError::Context("snapshot writer already finalized".into()))?;
+        file.write_all(bytes)?;
+        file.write_all(b"\n")?;
+        self.digest.update(bytes);
+        self.digest.update(b"\n");
+        Ok(())
+    }
+
+    fn write_page(&mut self, page: &[CapturedMemory]) -> StorageResult<()> {
+        if page.len() > MEMORY_PAGE_SIZE {
+            return Err(StorageError::BudgetExceeded(format!(
+                "snapshot page contains {} rows; maximum is {}",
+                page.len(),
+                MEMORY_PAGE_SIZE
+            )));
+        }
+        if !page.is_empty() && self.file.is_none() {
+            #[cfg(not(unix))]
+            tracing::warn!(
+                directory = %self.dir.display(),
+                "Snapshot files cannot be restricted to owner-only access on this platform: \
+                 they inherit default ACLs and may be readable by other users, and the \
+                 directory entry is not fsynced so a crash may lose a snapshot that reported \
+                 success. Restrict the snapshot directory's permissions yourself, and treat \
+                 its contents as sensitive — they contain verbatim memory content."
+            );
+            create_snapshot_dir(&self.dir)?;
+            self.file = Some(create_owner_only_file(&self.temp_path)?);
+            let header = serde_json::to_vec(&self.header)?;
+            self.write_hashed_frame(&header)?;
+        }
+        let mut page_bytes = 0_usize;
+        for captured in page {
+            if memory_namespace(&captured.memory) != self.header.namespace_id {
+                return Err(StorageError::Context(format!(
+                    "refusing to snapshot memory {} outside namespace {}",
+                    captured.memory.id(),
+                    self.header.namespace_id
+                )));
+            }
+            let memory_ref = MemoryRef::from_memory(&captured.memory);
+            if self
+                .last_ref
+                .as_ref()
+                .is_some_and(|last| *last >= memory_ref)
+            {
+                return Err(StorageError::Context(
+                    "snapshot capture is not in stable typed-key order".into(),
+                ));
+            }
+            for record in &captured.embeddings {
+                validate_record_matches_memory(record, &captured.memory)?;
+            }
+            let entry = SnapshotStreamEntry {
+                kind: "entry".into(),
+                source_sha256: canonical_embedding_source_sha256(&captured.memory),
+                memory: captured.memory.clone(),
+                embedding_records: captured.embeddings.clone(),
+            };
+            let bytes = serde_json::to_vec(&entry)?;
+            page_bytes = page_bytes.checked_add(bytes.len()).ok_or_else(|| {
+                StorageError::BudgetExceeded("snapshot page byte count overflow".into())
+            })?;
+            if page_bytes > SNAPSHOT_MAX_PAGE_BYTES {
+                return Err(StorageError::BudgetExceeded(format!(
+                    "snapshot page contains {page_bytes} serialized bytes; maximum is {SNAPSHOT_MAX_PAGE_BYTES}"
+                )));
+            }
+            self.write_hashed_frame(&bytes)?;
+            self.last_ref = Some(memory_ref);
+            self.embedding_records += entry.embedding_records.len();
+            increment_counts(&mut self.counts, &entry.memory);
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> StorageResult<(SnapshotManifest, Option<SnapshotArtifact>)> {
+        let stream_sha256 = hex::encode(self.digest.clone().finalize());
+        let footer = SnapshotStreamFooter {
+            kind: "footer".into(),
+            counts: self.counts,
+            embedding_records: self.embedding_records,
+            stream_sha256: stream_sha256.clone(),
+        };
+        let artifact =
+            if self.counts.total == 0 {
+                drop(self.file.take());
+                None
+            } else {
+                let footer_bytes = serde_json::to_vec(&footer)?;
+                let file = self.file.as_mut().ok_or_else(|| {
+                    StorageError::Context("snapshot writer already finalized".into())
+                })?;
+                file.write_all(&footer_bytes)?;
+                file.write_all(b"\n")?;
+                file.sync_all()?;
+                let file = self.file.take().ok_or_else(|| {
+                    StorageError::Context("snapshot writer already finalized".into())
+                })?;
+                std::fs::rename(&self.temp_path, &self.path)?;
+                sync_dir(&self.dir)?;
+                self.published = true;
+                Some(SnapshotArtifact {
+                    path: self.path.clone(),
+                    file: Arc::new(Mutex::new(file)),
+                })
+            };
+        Ok((
+            SnapshotManifest {
+                format_version: STREAM_FORMAT_VERSION,
+                snapshot_id: self.header.snapshot_id,
+                entity_id: self.header.entity_id,
+                entity_name: self.header.entity_name.clone(),
+                namespace_id: self.header.namespace_id,
+                captured_at: self.header.captured_at,
+                owner_only: self.header.owner_only,
+                counts: self.counts,
+                embedding_records: self.embedding_records,
+                stream_sha256,
+            },
+            artifact,
+        ))
+    }
+}
+
+impl Drop for SnapshotStreamWriter {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_file(&self.temp_path);
+        }
+    }
+}
+
+fn increment_counts(counts: &mut SnapshotCounts, memory: &Memory) {
+    counts.total += 1;
+    match memory {
+        Memory::Episodic(_) => counts.episodic += 1,
+        Memory::Semantic(_) => counts.semantic += 1,
+        Memory::Procedural(_) => counts.procedural += 1,
+        Memory::Observation(_) => counts.observation += 1,
+    }
 }
 
 /// Delete every memory attached to `entity_id` and persist a snapshot of
@@ -285,6 +658,11 @@ fn forget_entity_bounded_with(
     remove_file: fn(&Path) -> std::io::Result<()>,
 ) -> StorageResult<ForgetOutcome> {
     let dir = namespace_dir(snapshot_root, namespace_id);
+    let page_size = crate::storage::bounded_bulk_page_size(
+        namespace_id,
+        crate::storage::BulkPageKind::SnapshotCapture,
+        crate::storage::bounded::MEMORY_PAGE_SIZE,
+    )?;
 
     // Held across the delete, the snapshot write, and the prune that follows —
     // see [`namespace_lock`]. Poisoning is ignored deliberately: the guarded
@@ -294,56 +672,52 @@ fn forget_entity_bounded_with(
     let lock = namespace_lock(namespace_id);
     let _serialized = lock.lock().unwrap_or_else(PoisonError::into_inner);
 
-    let mut captured: Option<ForgetSnapshot> = None;
-    let mut path: Option<PathBuf> = None;
-
-    let mut persist = |memories: &[Memory]| -> StorageResult<()> {
-        // The artifact is per-namespace, so a row from another namespace would
-        // be a cross-tenant leak into it. The backends' `namespace_id`
-        // predicates are what prevent that; this verifies it at the point the
-        // file is written rather than trusting the SQL, and returning `Err`
-        // rolls the delete back — so a scoping regression fails closed instead
-        // of quietly writing one tenant's memories into another's directory.
-        if let Some(foreign) = memories
-            .iter()
-            .find(|m| memory_namespace(m) != namespace_id)
+    let header = SnapshotStreamHeader {
+        kind: "header".into(),
+        format_version: STREAM_FORMAT_VERSION,
+        snapshot_id: Uuid::new_v4(),
+        entity_id,
+        entity_name: entity_name.map(str::to_string),
+        namespace_id,
+        captured_at: Utc::now(),
+        owner_only: OWNER_ONLY_SUPPORTED,
+    };
+    let writer = std::cell::RefCell::new(Some(SnapshotStreamWriter::new(&dir, header)));
+    let finalized = std::cell::RefCell::new(None);
+    let mut persist_page = |page: &[CapturedMemory]| -> StorageResult<()> {
+        writer
+            .borrow_mut()
+            .as_mut()
+            .ok_or_else(|| StorageError::Context("snapshot writer already finalized".into()))?
+            .write_page(page)
+    };
+    let mut finalize = |summary: crate::storage::BulkMutationSummary| -> StorageResult<()> {
+        let writer = writer
+            .borrow_mut()
+            .take()
+            .ok_or_else(|| StorageError::Context("snapshot writer finalized twice".into()))?;
+        let finished = writer.finish()?;
+        if summary.memories != finished.0.counts.total
+            || summary.embedding_records != finished.0.embedding_records
         {
-            return Err(StorageError::Context(format!(
-                "refusing to snapshot: memory {} belongs to namespace {}, not {namespace_id}",
-                foreign.id(),
-                memory_namespace(foreign)
-            )));
+            return Err(StorageError::Context(
+                "storage capture summary does not match finalized snapshot manifest".into(),
+            ));
         }
-
-        let snapshot = ForgetSnapshot {
-            format_version: FORMAT_VERSION,
-            snapshot_id: Uuid::new_v4(),
-            entity_id,
-            entity_name: entity_name.map(str::to_string),
-            namespace_id,
-            captured_at: Utc::now(),
-            owner_only: OWNER_ONLY_SUPPORTED,
-            memories: memories.to_vec(),
-        };
-
-        if !snapshot.is_empty() {
-            path = Some(write_to_dir(&dir, &snapshot)?);
-        }
-        captured = Some(snapshot);
-
+        *finalized.borrow_mut() = Some(finished);
         Ok(())
     };
-
-    storage.delete_memories_by_entity_capturing(entity_id, namespace_id, &mut persist)?;
-
-    // Enforces the trait contract that `persist` runs exactly once. A backend
-    // that deleted without calling it would have destroyed data uncaptured, so
-    // this is an error rather than a defaulted empty snapshot.
-    let snapshot = captured.ok_or_else(|| {
-        StorageError::Context(
-            "storage backend deleted without invoking the snapshot callback".to_string(),
-        )
+    storage.delete_memories_by_entity_paged(
+        entity_id,
+        namespace_id,
+        page_size,
+        &mut persist_page,
+        &mut finalize,
+    )?;
+    let (snapshot, artifact) = finalized.into_inner().ok_or_else(|| {
+        StorageError::Context("storage backend committed without finalizing snapshot".into())
     })?;
+    let path = artifact.as_ref().map(|artifact| artifact.path.clone());
 
     // Only after the delete committed, and only when it actually left a new
     // file behind: pruning a directory this call did not add to would be
@@ -371,6 +745,7 @@ fn forget_entity_bounded_with(
     Ok(ForgetOutcome {
         snapshot,
         path,
+        artifact,
         pruned,
     })
 }
@@ -553,16 +928,36 @@ fn prune_namespace_dir_with(
 /// per namespace) instead. Nothing ships that shape today, so nothing here
 /// builds one.
 ///
-/// The registry keeps one small entry per namespace that has ever run a forget
-/// and never drops one: that is bounded by the tenant count, and dropping
-/// entries would need reference counting to avoid handing out a lock another
-/// thread is about to acquire.
+/// The registry holds weak references, so tenant churn cannot retain historical
+/// namespace metadata after the final forget lease is dropped. Upgrade or
+/// replacement happens while the registry lock is held, preserving one live
+/// mutex per namespace.
 fn namespace_lock(namespace_id: Uuid) -> Arc<Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = namespace_lock_registry()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&namespace_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(namespace_id, Arc::downgrade(&lock));
+    lock
+}
 
-    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks.lock().unwrap_or_else(PoisonError::into_inner);
-    Arc::clone(locks.entry(namespace_id).or_default())
+fn namespace_lock_registry() -> &'static Mutex<HashMap<Uuid, Weak<Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<Uuid, Weak<Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn namespace_lock_registry_ids() -> Vec<Uuid> {
+    namespace_lock_registry()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .keys()
+        .copied()
+        .collect()
 }
 
 /// Per-namespace snapshot directory. Keeps one gateway tenant's memory dumps
@@ -680,6 +1075,7 @@ fn create_owner_only_file(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let file = std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
         .mode(0o600)
@@ -694,6 +1090,7 @@ fn create_owner_only_file(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(not(unix))]
 fn create_owner_only_file(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
         .open(path)
@@ -742,16 +1139,297 @@ pub fn restore(
     let mut outcome = RestoreOutcome::default();
 
     for memory in &snapshot.memories {
-        match memory {
-            Memory::Episodic(m) => storage.save_episodic(m)?,
-            Memory::Semantic(m) => storage.save_semantic(m)?,
-            Memory::Procedural(m) => storage.save_procedural(m)?,
-            Memory::Observation(m) => storage.save_observation(m)?,
+        let records: Vec<&EmbeddingRecord> = snapshot
+            .embedding_records
+            .iter()
+            .filter(|record| record.memory_ref == MemoryRef::from_memory(memory))
+            .collect();
+        if records.is_empty() {
+            storage.save_memory_with_embedding(memory, None)?;
+        } else {
+            for record in records {
+                storage.save_memory_with_embedding(memory, Some(record))?;
+            }
         }
         outcome.restored += 1;
     }
 
     Ok(outcome)
+}
+
+/// Restore a streamed v2 artifact with bounded memory.
+///
+/// Pass one validates every frame, canonical source hash, embedding record, count, and the
+/// complete-stream checksum without mutating storage. Pass two rewinds that same opened artifact
+/// and commits source/embedding units in atomic pages of at most 256. If a later storage page fails, the
+/// returned error never claims completion and an idempotent retry converges.
+pub fn restore_file(storage: &dyn StorageTrait, path: &Path) -> StorageResult<RestoreOutcome> {
+    let mut file = std::fs::File::open(path)?;
+    restore_opened_file_with(storage, &mut file, || {})
+}
+
+fn restore_opened_file_with(
+    storage: &dyn StorageTrait,
+    file: &mut std::fs::File,
+    after_validation: impl FnOnce(),
+) -> StorageResult<RestoreOutcome> {
+    let manifest = validate_stream_reader(file)?;
+    after_validation();
+    file.rewind()?;
+    let mut page = Vec::with_capacity(MEMORY_PAGE_SIZE);
+    let mut page_bytes = 0_usize;
+    let mut outcome = RestoreOutcome::default();
+    let mut reader = BufReader::new(file);
+    let mut bytes = Vec::new();
+    while read_bounded_snapshot_frame(&mut reader, &mut bytes)? {
+        let frame_bytes = &bytes[..bytes.len() - 1];
+        let value: serde_json::Value = serde_json::from_slice(frame_bytes)?;
+        match value.get("kind").and_then(serde_json::Value::as_str) {
+            Some("header" | "footer") => {}
+            Some("entry") => {
+                page_bytes = page_bytes.checked_add(frame_bytes.len()).ok_or_else(|| {
+                    StorageError::BudgetExceeded("snapshot restore page byte count overflow".into())
+                })?;
+                if page_bytes > SNAPSHOT_MAX_PAGE_BYTES {
+                    return Err(StorageError::BudgetExceeded(format!(
+                        "snapshot restore page contains {page_bytes} serialized bytes; maximum is {SNAPSHOT_MAX_PAGE_BYTES}"
+                    )));
+                }
+                let entry: SnapshotStreamEntry = serde_json::from_value(value)?;
+                page.push(CapturedMemory {
+                    memory: entry.memory,
+                    embeddings: entry.embedding_records,
+                });
+                if page.len() == MEMORY_PAGE_SIZE {
+                    storage.restore_memory_page(&page)?;
+                    outcome.restored += page.len();
+                    page.clear();
+                    page_bytes = 0;
+                }
+            }
+            _ => {
+                return Err(StorageError::Context(
+                    "unknown streamed snapshot frame".into(),
+                ));
+            }
+        }
+    }
+    if !page.is_empty() {
+        storage.restore_memory_page(&page)?;
+        outcome.restored += page.len();
+    }
+    if outcome.restored != manifest.counts.total {
+        return Err(StorageError::Context(format!(
+            "restored {} rows but validated manifest contains {}",
+            outcome.restored, manifest.counts.total
+        )));
+    }
+    Ok(outcome)
+}
+
+/// Stream memory ids from a validated v2 artifact without retaining the corpus.
+pub fn for_each_memory_id(
+    path: &Path,
+    visit: impl FnMut(Uuid) -> StorageResult<()>,
+) -> StorageResult<()> {
+    let mut file = std::fs::File::open(path)?;
+    for_each_memory_id_in_opened_file_with(&mut file, visit, || {})
+}
+
+fn for_each_memory_id_in_opened_file_with(
+    file: &mut std::fs::File,
+    mut visit: impl FnMut(Uuid) -> StorageResult<()>,
+    after_validation: impl FnOnce(),
+) -> StorageResult<()> {
+    validate_stream_reader(file)?;
+    after_validation();
+    file.rewind()?;
+    let mut reader = BufReader::new(file);
+    let mut bytes = Vec::new();
+    while read_bounded_snapshot_frame(&mut reader, &mut bytes)? {
+        let value: serde_json::Value = serde_json::from_slice(&bytes[..bytes.len() - 1])?;
+        if value.get("kind").and_then(serde_json::Value::as_str) == Some("entry") {
+            let entry: SnapshotStreamEntry = serde_json::from_value(value)?;
+            visit(entry.memory.id())?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn validate_stream_file(path: &Path) -> StorageResult<SnapshotManifest> {
+    let mut file = std::fs::File::open(path)?;
+    validate_stream_reader(&mut file)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "framing, order, provenance, count, and checksum validation stay in one linear pass"
+)]
+fn validate_stream_reader(file: &mut std::fs::File) -> StorageResult<SnapshotManifest> {
+    file.rewind()?;
+    let mut reader = BufReader::new(file);
+    let mut bytes = Vec::new();
+    let mut header: Option<SnapshotStreamHeader> = None;
+    let mut footer: Option<SnapshotStreamFooter> = None;
+    let mut digest = Sha256::new();
+    let mut counts = SnapshotCounts::default();
+    let mut embedding_records = 0_usize;
+    let mut last_ref: Option<MemoryRef> = None;
+    let mut page_rows = 0_usize;
+    let mut page_bytes = 0_usize;
+    while read_bounded_snapshot_frame(&mut reader, &mut bytes)? {
+        let frame_bytes = &bytes[..bytes.len() - 1];
+        let value: serde_json::Value = serde_json::from_slice(frame_bytes)?;
+        let kind = value
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| StorageError::Context("snapshot frame has no kind".into()))?;
+        match kind {
+            "header" => {
+                if header.is_some() || counts.total != 0 || footer.is_some() {
+                    return Err(StorageError::Context(
+                        "streamed snapshot header is not the first frame".into(),
+                    ));
+                }
+                let decoded: SnapshotStreamHeader = serde_json::from_value(value)?;
+                if decoded.format_version != STREAM_FORMAT_VERSION {
+                    return Err(StorageError::Context(format!(
+                        "unsupported streamed snapshot format version {}",
+                        decoded.format_version
+                    )));
+                }
+                digest.update(&bytes);
+                header = Some(decoded);
+            }
+            "entry" => {
+                let header = header.as_ref().ok_or_else(|| {
+                    StorageError::Context("snapshot entry precedes header".into())
+                })?;
+                if footer.is_some() {
+                    return Err(StorageError::Context(
+                        "snapshot entry follows footer".into(),
+                    ));
+                }
+                page_bytes = page_bytes.checked_add(frame_bytes.len()).ok_or_else(|| {
+                    StorageError::BudgetExceeded(
+                        "snapshot validation page byte count overflow".into(),
+                    )
+                })?;
+                if page_bytes > SNAPSHOT_MAX_PAGE_BYTES {
+                    return Err(StorageError::BudgetExceeded(format!(
+                        "snapshot validation page contains {page_bytes} serialized bytes; maximum is {SNAPSHOT_MAX_PAGE_BYTES}"
+                    )));
+                }
+                let entry: SnapshotStreamEntry = serde_json::from_value(value)?;
+                if memory_namespace(&entry.memory) != header.namespace_id {
+                    return Err(StorageError::Context(
+                        "snapshot entry belongs to another namespace".into(),
+                    ));
+                }
+                if entry.source_sha256 != canonical_embedding_source_sha256(&entry.memory) {
+                    return Err(StorageError::Context(format!(
+                        "snapshot source hash mismatch for memory {}",
+                        entry.memory.id()
+                    )));
+                }
+                let memory_ref = MemoryRef::from_memory(&entry.memory);
+                if last_ref.as_ref().is_some_and(|last| *last >= memory_ref) {
+                    return Err(StorageError::Context(
+                        "snapshot entries are not in stable typed-key order".into(),
+                    ));
+                }
+                for record in &entry.embedding_records {
+                    validate_record_matches_memory(record, &entry.memory)?;
+                }
+                embedding_records += entry.embedding_records.len();
+                increment_counts(&mut counts, &entry.memory);
+                last_ref = Some(memory_ref);
+                digest.update(&bytes);
+                page_rows += 1;
+                if page_rows == MEMORY_PAGE_SIZE {
+                    page_rows = 0;
+                    page_bytes = 0;
+                }
+            }
+            "footer" => {
+                if header.is_none() || footer.is_some() {
+                    return Err(StorageError::Context(
+                        "streamed snapshot has invalid footer placement".into(),
+                    ));
+                }
+                footer = Some(serde_json::from_value(value)?);
+            }
+            _ => {
+                return Err(StorageError::Context(format!(
+                    "unknown snapshot frame kind {kind:?}"
+                )));
+            }
+        }
+    }
+    let header = header.ok_or_else(|| StorageError::Context("snapshot header missing".into()))?;
+    let footer = footer.ok_or_else(|| StorageError::Context("snapshot footer missing".into()))?;
+    let actual_sha256 = hex::encode(digest.finalize());
+    if footer.counts != counts
+        || footer.embedding_records != embedding_records
+        || footer.stream_sha256 != actual_sha256
+    {
+        return Err(StorageError::Context(
+            "streamed snapshot checksum or manifest mismatch".into(),
+        ));
+    }
+    Ok(SnapshotManifest {
+        format_version: header.format_version,
+        snapshot_id: header.snapshot_id,
+        entity_id: header.entity_id,
+        entity_name: header.entity_name,
+        namespace_id: header.namespace_id,
+        captured_at: header.captured_at,
+        owner_only: header.owner_only,
+        counts,
+        embedding_records,
+        stream_sha256: actual_sha256,
+    })
+}
+
+fn read_bounded_snapshot_frame(
+    reader: &mut impl BufRead,
+    bytes: &mut Vec<u8>,
+) -> StorageResult<bool> {
+    bytes.clear();
+    loop {
+        let (take, complete) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                if bytes.is_empty() {
+                    return Ok(false);
+                }
+                return Err(StorageError::Context(
+                    "truncated streamed snapshot frame".into(),
+                ));
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let take = newline.map_or(available.len(), |index| index + 1);
+            let serialized_bytes = bytes
+                .len()
+                .checked_add(take)
+                .and_then(|total| total.checked_sub(usize::from(newline.is_some())))
+                .ok_or_else(|| {
+                    StorageError::BudgetExceeded("snapshot frame byte count overflow".into())
+                })?;
+            if serialized_bytes > SNAPSHOT_MAX_FRAME_BYTES {
+                return Err(StorageError::BudgetExceeded(format!(
+                    "snapshot frame exceeds {SNAPSHOT_MAX_FRAME_BYTES} serialized bytes"
+                )));
+            }
+            bytes.extend_from_slice(&available[..take]);
+            (take, newline.is_some())
+        };
+        reader.consume(take);
+        if complete {
+            return Ok(true);
+        }
+    }
 }
 
 /// Timestamp format inside a snapshot file name: safe on every filesystem (no
@@ -764,11 +1442,19 @@ const UUID_LEN: usize = 36;
 
 /// `forget-<entity>-<captured_at>-<snapshot>.json`.
 fn file_name(snapshot: &ForgetSnapshot) -> String {
+    file_name_parts(
+        snapshot.entity_id,
+        snapshot.captured_at,
+        snapshot.snapshot_id,
+    )
+}
+
+fn file_name_parts(entity_id: Uuid, captured_at: DateTime<Utc>, snapshot_id: Uuid) -> String {
     format!(
         "forget-{}-{}-{}.json",
-        snapshot.entity_id,
-        snapshot.captured_at.format(FILE_NAME_TIMESTAMP),
-        snapshot.snapshot_id
+        entity_id,
+        captured_at.format(FILE_NAME_TIMESTAMP),
+        snapshot_id
     )
 }
 
@@ -815,6 +1501,7 @@ mod tests {
     use super::*;
     use crate::storage::sqlite::SqliteBackend;
     use crate::types::{Entity, EntityKind, Episode, EpisodicMemory, Namespace, SemanticMemory};
+    use crate::vector::VectorIndex;
     use chrono::{Duration, TimeZone};
 
     struct Fixture {
@@ -855,7 +1542,57 @@ mod tests {
             captured_at: Utc::now(),
             owner_only: OWNER_ONLY_SUPPORTED,
             memories,
+            embedding_records: Vec::new(),
         }
+    }
+
+    fn write_stream_archive(f: &Fixture, mut memories: Vec<Memory>, name: &str) -> PathBuf {
+        memories.sort_by_key(MemoryRef::from_memory);
+        let header = SnapshotStreamHeader {
+            kind: "header".into(),
+            format_version: STREAM_FORMAT_VERSION,
+            snapshot_id: Uuid::new_v4(),
+            entity_id: f.entity.id,
+            entity_name: Some(f.entity.name.clone()),
+            namespace_id: f.namespace.id,
+            captured_at: Utc::now(),
+            owner_only: OWNER_ONLY_SUPPORTED,
+        };
+        let mut frames = vec![serde_json::to_vec(&header).unwrap()];
+        let mut counts = SnapshotCounts::default();
+        for memory in memories {
+            increment_counts(&mut counts, &memory);
+            frames.push(
+                serde_json::to_vec(&SnapshotStreamEntry {
+                    kind: "entry".into(),
+                    source_sha256: canonical_embedding_source_sha256(&memory),
+                    memory,
+                    embedding_records: Vec::new(),
+                })
+                .unwrap(),
+            );
+        }
+        let mut digest = Sha256::new();
+        for frame in &frames {
+            digest.update(frame);
+            digest.update(b"\n");
+        }
+        frames.push(
+            serde_json::to_vec(&SnapshotStreamFooter {
+                kind: "footer".into(),
+                counts,
+                embedding_records: 0,
+                stream_sha256: hex::encode(digest.finalize()),
+            })
+            .unwrap(),
+        );
+        let path = f.dir.path().join(name);
+        let mut file = std::fs::File::create(&path).unwrap();
+        for frame in frames {
+            file.write_all(&frame).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        path
     }
 
     fn seed_one_of_each(f: &Fixture) {
@@ -970,12 +1707,18 @@ mod tests {
         .unwrap();
 
         let path = outcome.path.expect("a non-empty snapshot must be written");
-        let reloaded = read_file(&path).unwrap();
+        let reloaded = validate_stream_file(&path).unwrap();
+        let mut ids = Vec::new();
+        for_each_memory_id(&path, |id| {
+            ids.push(id);
+            Ok(())
+        })
+        .unwrap();
 
         assert_eq!(reloaded.snapshot_id, outcome.snapshot.snapshot_id);
         assert_eq!(reloaded.entity_name.as_deref(), Some("subject"));
         assert_eq!(reloaded.namespace_id, f.namespace.id);
-        assert_eq!(reloaded.memory_ids(), outcome.snapshot.memory_ids());
+        assert_eq!(ids.len(), outcome.snapshot.counts.total);
         // Only the finished file is left behind — no `.partial` staging file.
         assert!(!path.with_extension("json.partial").exists());
     }
@@ -1351,6 +2094,26 @@ mod tests {
         });
     }
 
+    #[test]
+    fn namespace_lock_registry_drops_historical_tenants() {
+        let historical = (0..2_048)
+            .map(|_| {
+                let namespace_id = Uuid::new_v4();
+                drop(namespace_lock(namespace_id));
+                namespace_id
+            })
+            .collect::<Vec<_>>();
+        let live_namespace = Uuid::new_v4();
+        let _live = namespace_lock(live_namespace);
+
+        let retained = namespace_lock_registry_ids();
+        assert!(retained.contains(&live_namespace));
+        assert!(
+            historical.iter().all(|id| !retained.contains(id)),
+            "dropped namespace leases must not remain in the process registry"
+        );
+    }
+
     /// Concurrent forgets in one namespace all succeed, evict only what the cap
     /// requires, and leave every artifact they wrote behind.
     ///
@@ -1666,30 +2429,27 @@ mod tests {
         assert!(reloaded.owner_only);
     }
 
-    /// `owner_only` was added after the first snapshots were written. It is
-    /// `#[serde(default)]` rather than a `FORMAT_VERSION` bump, because bumping
-    /// would make `read_file` reject those snapshots outright — refusing to
-    /// restore recoverable data over a field that does not affect the rows.
+    /// `owner_only` and `embedding_records` were added after the first
+    /// snapshots were written. They use `#[serde(default)]` rather than a
+    /// `FORMAT_VERSION` bump, because old source rows remain recoverable.
     #[test]
     fn a_snapshot_written_before_owner_only_existed_still_restores() {
         let f = fixture();
         seed_one_of_each(&f);
-        let outcome = forget_entity_bounded(
-            &f.storage,
-            f.entity.id,
-            None,
-            f.namespace.id,
-            &f.dir.path().join("snapshots"),
-            RetentionPolicy::UNBOUNDED,
-        )
-        .unwrap();
-        let path = outcome.path.expect("a non-empty snapshot must be written");
+        let memories = f
+            .storage
+            .get_all_memories_by_namespace(f.namespace.id)
+            .unwrap();
+        let legacy = snapshot_of(&f, memories);
+        let expected_ids = legacy.memory_ids();
+        let path = write_to_dir(&f.dir.path().join("snapshots"), &legacy).unwrap();
 
         // Strip the field, exactly as a snapshot written by the previous build
         // would have been.
         let mut raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         raw.as_object_mut().unwrap().remove("owner_only");
+        raw.as_object_mut().unwrap().remove("embedding_records");
         assert_eq!(raw["format_version"], FORMAT_VERSION);
         std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
 
@@ -1699,9 +2459,10 @@ mod tests {
             !reloaded.owner_only,
             "an absent field must read as unprotected, never as protected"
         );
-        assert_eq!(reloaded.memory_ids(), outcome.snapshot.memory_ids());
+        assert!(reloaded.embedding_records.is_empty());
+        assert_eq!(reloaded.memory_ids(), expected_ids);
         let restored = restore(&f.storage, &reloaded).unwrap();
-        assert_eq!(restored.restored, outcome.snapshot.memories.len());
+        assert_eq!(restored.restored, legacy.memories.len());
     }
 
     /// Pins the real `sync_dir` that `write_to_dir` injects: it succeeds on a
@@ -1714,5 +2475,567 @@ mod tests {
 
         assert!(sync_dir(f.dir.path()).is_ok());
         assert!(sync_dir(&f.dir.path().join("does-not-exist")).is_err());
+    }
+
+    #[test]
+    fn snapshot_is_page_streamed() {
+        let f = fixture();
+        let episode = Episode::new(f.namespace.id, vec![f.entity.id]);
+        f.storage.save_episode(&episode).unwrap();
+        for index in 0..257 {
+            f.storage
+                .save_episodic(&EpisodicMemory::new(
+                    f.namespace.id,
+                    episode.id,
+                    f.entity.id,
+                    f.entity.id,
+                    format!("streamed snapshot row {index}"),
+                ))
+                .unwrap();
+        }
+
+        let outcome = forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            Some("subject"),
+            f.namespace.id,
+            &f.dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap();
+        assert_eq!(outcome.snapshot.counts.total, 257);
+        assert_eq!(outcome.snapshot.format_version, STREAM_FORMAT_VERSION);
+
+        let path = outcome.path.as_ref().expect("non-empty snapshot");
+        let restored = restore_file(&f.storage, path).unwrap();
+        assert_eq!(restored.restored, 257);
+    }
+
+    #[test]
+    fn snapshot_page_guard_owns_at_most_one_real_callback_page() {
+        let f = fixture();
+        let episode = Episode::new(f.namespace.id, vec![f.entity.id]);
+        f.storage.save_episode(&episode).unwrap();
+        for index in 0..257 {
+            f.storage
+                .save_episodic(&EpisodicMemory::new(
+                    f.namespace.id,
+                    episode.id,
+                    f.entity.id,
+                    f.entity.id,
+                    format!("ownership row {index}"),
+                ))
+                .unwrap();
+        }
+        let probe = crate::storage::bulk_page_probe::start(
+            f.namespace.id,
+            crate::storage::BulkPageKind::SnapshotCapture,
+        );
+
+        forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            None,
+            f.namespace.id,
+            &f.dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap();
+
+        let observed = probe.observed();
+        assert_eq!(observed.max_requested, 256);
+        assert_eq!(observed.peak_live_pages, 1);
+        assert_eq!(observed.live_pages, 0);
+        assert_eq!(observed.created_pages, 2);
+    }
+
+    #[test]
+    fn snapshot_caller_rejects_an_oversized_page_request() {
+        let error = crate::storage::bounded_bulk_page_size(
+            Uuid::new_v4(),
+            crate::storage::BulkPageKind::SnapshotCapture,
+            257,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, StorageError::BudgetExceeded(_)));
+    }
+
+    #[test]
+    fn restore_rejects_noncanonical_source_hash_with_valid_stream_checksum() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let outcome = forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            Some("subject"),
+            f.namespace.id,
+            &f.dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap();
+        let path = outcome.path.as_ref().unwrap();
+        let mut lines: Vec<Vec<u8>> = std::fs::read(path)
+            .unwrap()
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect();
+        let mut entry: SnapshotStreamEntry = serde_json::from_slice(&lines[1]).unwrap();
+        entry.source_sha256 = "00".repeat(32);
+        lines[1] = serde_json::to_vec(&entry).unwrap();
+
+        let mut digest = Sha256::new();
+        for line in &lines[..lines.len() - 1] {
+            digest.update(line);
+            digest.update(b"\n");
+        }
+        let last = lines.len() - 1;
+        let mut footer: SnapshotStreamFooter = serde_json::from_slice(&lines[last]).unwrap();
+        footer.stream_sha256 = hex::encode(digest.finalize());
+        lines[last] = serde_json::to_vec(&footer).unwrap();
+        let mut archive = lines.concat();
+        for offset in (1..lines.len()).rev() {
+            let insert_at = lines[..offset].iter().map(Vec::len).sum::<usize>();
+            archive.insert(insert_at, b'\n');
+        }
+        archive.push(b'\n');
+        std::fs::write(path, archive).unwrap();
+
+        let error = restore_file(&f.storage, path).unwrap_err();
+        assert!(error.to_string().contains("source hash mismatch"));
+        assert!(
+            f.storage
+                .get_all_memories_by_namespace(f.namespace.id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn malformed_late_snapshot_frame_never_claims_a_complete_restore() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let outcome = forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            Some("subject"),
+            f.namespace.id,
+            &f.dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap();
+        let path = outcome.path.as_ref().unwrap();
+        let mut bytes = std::fs::read(path).unwrap();
+        let corrupt_at = bytes.len() - 2;
+        bytes[corrupt_at] ^= 1;
+        std::fs::write(path, bytes).unwrap();
+
+        let _error = restore_file(&f.storage, path).unwrap_err();
+        assert!(
+            f.storage
+                .get_all_memories_by_namespace(f.namespace.id)
+                .unwrap()
+                .is_empty(),
+            "validation must finish before the first restore-page commit"
+        );
+    }
+
+    #[test]
+    fn snapshot_writer_rejects_an_oversized_serialized_frame() {
+        let f = fixture();
+        let memory = Memory::Semantic(SemanticMemory::new(
+            f.namespace.id,
+            f.entity.id,
+            "predicate",
+            "x".repeat(crate::storage::bounded::MAX_HYDRATED_BYTES),
+            1.0,
+        ));
+        let header = SnapshotStreamHeader {
+            kind: "header".into(),
+            format_version: STREAM_FORMAT_VERSION,
+            snapshot_id: Uuid::new_v4(),
+            entity_id: f.entity.id,
+            entity_name: None,
+            namespace_id: f.namespace.id,
+            captured_at: Utc::now(),
+            owner_only: OWNER_ONLY_SUPPORTED,
+        };
+        let mut writer = SnapshotStreamWriter::new(f.dir.path(), header);
+
+        let error = writer
+            .write_page(&[CapturedMemory {
+                memory,
+                embeddings: Vec::new(),
+            }])
+            .unwrap_err();
+
+        assert!(matches!(error, StorageError::BudgetExceeded(_)));
+    }
+
+    #[test]
+    fn restore_rejects_an_oversized_valid_frame_without_mutation() {
+        let f = fixture();
+        let memory = Memory::Semantic(SemanticMemory::new(
+            f.namespace.id,
+            f.entity.id,
+            "predicate",
+            "x".repeat(crate::storage::bounded::MAX_HYDRATED_BYTES),
+            1.0,
+        ));
+        let path = write_stream_archive(&f, vec![memory], "oversized-valid.json");
+
+        let error = restore_file(&f.storage, &path).unwrap_err();
+
+        assert!(matches!(error, StorageError::BudgetExceeded(_)));
+        assert!(
+            f.storage
+                .get_all_memories_by_namespace(f.namespace.id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn restore_rejects_a_page_over_the_serialized_byte_budget_without_mutation() {
+        let f = fixture();
+        let content = "x".repeat(crate::storage::bounded::MAX_HYDRATED_BYTES / 2);
+        let memories = vec![
+            Memory::Semantic(SemanticMemory::new(
+                f.namespace.id,
+                f.entity.id,
+                "predicate-a",
+                &content,
+                1.0,
+            )),
+            Memory::Semantic(SemanticMemory::new(
+                f.namespace.id,
+                f.entity.id,
+                "predicate-b",
+                &content,
+                1.0,
+            )),
+        ];
+        let path = write_stream_archive(&f, memories, "oversized-page.json");
+
+        let error = restore_file(&f.storage, &path).unwrap_err();
+
+        assert!(matches!(error, StorageError::BudgetExceeded(_)));
+        assert!(
+            f.storage
+                .get_all_memories_by_namespace(f.namespace.id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn restore_stops_reading_an_oversized_malformed_frame_without_mutation() {
+        let f = fixture();
+        let path = f.dir.path().join("oversized-malformed.json");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(&vec![b'['; crate::storage::bounded::MAX_HYDRATED_BYTES + 1])
+            .unwrap();
+        file.write_all(b"\n").unwrap();
+
+        let error = restore_file(&f.storage, &path).unwrap_err();
+
+        assert!(matches!(error, StorageError::BudgetExceeded(_)));
+        assert!(
+            f.storage
+                .get_all_memories_by_namespace(f.namespace.id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_second_pass_uses_the_validated_open_file_after_path_retarget() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let outcome = forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            Some("subject"),
+            f.namespace.id,
+            &f.dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap();
+        let path = outcome.path.as_ref().unwrap();
+        let moved = path.with_extension("validated");
+        let mut file = std::fs::File::open(path).unwrap();
+
+        let restored = restore_opened_file_with(&f.storage, &mut file, || {
+            std::fs::rename(path, &moved).unwrap();
+            std::fs::write(path, b"retargeted after validation\n").unwrap();
+        })
+        .unwrap();
+
+        assert_eq!(restored.restored, outcome.snapshot.counts.total);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn id_second_pass_uses_the_validated_open_file_after_path_retarget() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let outcome = forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            Some("subject"),
+            f.namespace.id,
+            &f.dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap();
+        let path = outcome.path.as_ref().unwrap();
+        let moved = path.with_extension("validated");
+        let mut file = std::fs::File::open(path).unwrap();
+        let mut ids = Vec::new();
+
+        for_each_memory_id_in_opened_file_with(
+            &mut file,
+            |id| {
+                ids.push(id);
+                Ok(())
+            },
+            || {
+                std::fs::rename(path, &moved).unwrap();
+                std::fs::write(path, b"retargeted after validation\n").unwrap();
+            },
+        )
+        .unwrap();
+
+        assert_eq!(ids.len(), outcome.snapshot.counts.total);
+    }
+
+    #[test]
+    fn pinned_artifact_survives_a_second_forget_until_both_index_cleanups_finish() {
+        let f = fixture();
+        let mut other = Entity::new("other", EntityKind::User);
+        other.namespace_id = f.namespace.id;
+        f.storage.save_entity(&other).unwrap();
+        let first = SemanticMemory::new(f.namespace.id, f.entity.id, "likes", "rust", 0.9);
+        let second = SemanticMemory::new(f.namespace.id, other.id, "likes", "sqlite", 0.9);
+        f.storage.save_semantic(&first).unwrap();
+        f.storage.save_semantic(&second).unwrap();
+
+        let index = std::sync::Mutex::new(VectorIndex::new(2, 2));
+        index.lock().unwrap().add(first.id, &[1.0, 0.0]).unwrap();
+        index.lock().unwrap().add(second.id, &[0.0, 1.0]).unwrap();
+        let root = f.dir.path().join("snapshots");
+        let policy = RetentionPolicy {
+            max_age_days: None,
+            max_count: Some(1),
+        };
+        let (first_ready_tx, first_ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let storage = &f.storage;
+            let namespace_id = f.namespace.id;
+            let first_entity_id = f.entity.id;
+            let snapshot_root = &root;
+            let compatibility_index = &index;
+            let first_cleanup = scope.spawn(move || {
+                let mut outcome = forget_entity_bounded(
+                    storage,
+                    first_entity_id,
+                    None,
+                    namespace_id,
+                    snapshot_root,
+                    policy,
+                )
+                .unwrap();
+                first_ready_tx.send(outcome.path.clone().unwrap()).unwrap();
+                resume_rx.recv().unwrap();
+                outcome
+                    .artifact
+                    .as_mut()
+                    .expect("non-empty forget returns a pinned artifact")
+                    .for_each_memory_id(|id| {
+                        let _ = compatibility_index.lock().unwrap().remove(id);
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+
+            let first_path = first_ready_rx.recv().unwrap();
+            let mut second_outcome =
+                forget_entity_bounded(&f.storage, other.id, None, f.namespace.id, &root, policy)
+                    .unwrap();
+            #[cfg(unix)]
+            let first_was_pruned = !first_path.exists();
+            let second_cleanup = second_outcome
+                .artifact
+                .as_mut()
+                .expect("non-empty forget returns a pinned artifact")
+                .for_each_memory_id(|id| {
+                    let _ = index.lock().unwrap().remove(id);
+                    Ok(())
+                });
+            resume_tx.send(()).unwrap();
+            first_cleanup.join().unwrap();
+            second_cleanup.unwrap();
+            #[cfg(unix)]
+            assert!(
+                first_was_pruned,
+                "the second forget must prune the first artifact's directory entry"
+            );
+        });
+
+        assert!(index.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn forget_outcome_and_pinned_artifact_remain_clone_compatible() {
+        fn assert_clone<T: Clone>() {}
+
+        assert_clone::<ForgetOutcome>();
+        assert_clone::<SnapshotArtifact>();
+
+        let f = fixture();
+        seed_one_of_each(&f);
+        let outcome = forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            Some("subject"),
+            f.namespace.id,
+            &f.dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap();
+        let cloned = outcome.clone();
+
+        assert_eq!(cloned.snapshot.snapshot_id, outcome.snapshot.snapshot_id);
+        assert_eq!(cloned.path, outcome.path);
+        assert!(cloned.artifact.is_some());
+    }
+
+    #[test]
+    fn cloned_artifact_leases_serialize_complete_cursor_passes() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let outcome = forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            Some("subject"),
+            f.namespace.id,
+            &f.dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap();
+        let path = outcome.path.clone().unwrap();
+        let first = outcome.artifact.unwrap();
+        let second = first.clone();
+        #[cfg(unix)]
+        std::fs::remove_file(path).unwrap();
+        let start = std::sync::Barrier::new(2);
+
+        let (first_ids, second_ids) = std::thread::scope(|scope| {
+            let first_pass = scope.spawn(|| {
+                start.wait();
+                let mut ids = Vec::new();
+                first
+                    .for_each_memory_id(|id| {
+                        ids.push(id);
+                        Ok(())
+                    })
+                    .unwrap();
+                ids
+            });
+            let second_pass = scope.spawn(|| {
+                start.wait();
+                let mut ids = Vec::new();
+                second
+                    .for_each_memory_id(|id| {
+                        ids.push(id);
+                        Ok(())
+                    })
+                    .unwrap();
+                ids
+            });
+            (first_pass.join().unwrap(), second_pass.join().unwrap())
+        });
+
+        assert_eq!(first_ids, second_ids);
+        assert_eq!(first_ids.len(), outcome.snapshot.counts.total);
+    }
+
+    #[test]
+    fn cloned_artifact_lease_recovers_after_a_visitor_panic() {
+        let f = fixture();
+        seed_one_of_each(&f);
+        let outcome = forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            Some("subject"),
+            f.namespace.id,
+            &f.dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap();
+        let first = outcome.artifact.unwrap();
+        let second = first.clone();
+        let mut visited_before_panic = 0;
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            first
+                .for_each_memory_id(|_| {
+                    visited_before_panic += 1;
+                    panic!("visitor panic after an id");
+                })
+                .unwrap();
+        }));
+
+        assert!(panic.is_err());
+        assert_eq!(visited_before_panic, 1);
+        let mut recovered_ids = Vec::new();
+        second
+            .for_each_memory_id(|id| {
+                recovered_ids.push(id);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(recovered_ids.len(), outcome.snapshot.counts.total);
+    }
+
+    #[test]
+    fn streamed_snapshot_shipping_paths_avoid_legacy_bulk_readers() {
+        let source = include_str!("snapshot.rs");
+        let forget = source
+            .split_once("fn forget_entity_bounded_with(")
+            .expect("streamed forget implementation")
+            .1
+            .split_once("pub fn prune_namespace_dir(")
+            .expect("streamed forget implementation terminator")
+            .0;
+        let restore = source
+            .split_once("pub fn restore_file(")
+            .expect("streamed restore implementation")
+            .1
+            .split_once("pub fn for_each_memory_id(")
+            .expect("streamed restore implementation terminator")
+            .0;
+        let ids = source
+            .split_once("/// Stream memory ids from a validated v2 artifact")
+            .expect("streamed id implementation")
+            .1
+            .split_once("fn validate_stream_file(")
+            .expect("streamed id implementation terminator")
+            .0;
+
+        for shipping_path in [forget, restore] {
+            assert!(!shipping_path.contains("get_all_memories_by_namespace"));
+            assert!(!shipping_path.contains("including_superseded"));
+        }
+        assert_eq!(restore.matches("File::open").count(), 1);
+        assert!(!restore.contains("validate_stream_file"));
+        assert!(restore.contains("restore_opened_file_with"));
+        assert_eq!(ids.matches("File::open").count(), 1);
+        assert!(!ids.contains("validate_stream_file"));
+        assert!(ids.contains("for_each_memory_id_in_opened_file_with"));
     }
 }

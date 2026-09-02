@@ -2,18 +2,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
-use rmcp::ServiceExt;
-use tokio::sync::RwLock;
-
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::{OnnxEmbedder, is_model_available_offline};
 use pensyve_core::network_policy::NetworkPolicy;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::Namespace;
-use pensyve_core::vector::VectorIndex;
-
-use pensyve_mcp_tools::{PensyveMcpServer, PensyveState};
+use pensyve_mcp_tools::{PensyveMcpServer, PensyveState, VectorRuntime};
+use rmcp::ServiceExt;
 
 fn resolve_storage_path() -> PathBuf {
     if let Ok(path) = std::env::var("PENSYVE_PATH") {
@@ -33,14 +29,9 @@ fn resolve_namespace() -> String {
 /// Pool size for the stdio server's embedder. This server has exactly one
 /// client and serves tool calls serially, so one ONNX session is enough;
 /// the CPU-derived default in pensyve-core (up to 4 sessions ≈ 4× the
-/// resident memory) is meant for multi-threaded harnesses.
-/// `PENSYVE_EMBEDDING_POOL_SIZE` still overrides.
+/// resident memory) is reserved for non-shipping harnesses.
 fn resolve_stdio_pool_size() -> usize {
-    std::env::var("PENSYVE_EMBEDDING_POOL_SIZE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(1)
+    1
 }
 
 /// Build the embedder for the stdio server.
@@ -162,7 +153,11 @@ fn eager_model_order(stored_dims: Option<usize>) -> [&'static str; 2] {
 /// existing embeddings' dimensionality — see `eager_model_order`.
 fn build_eager_embedder(stored_dims: Option<usize>) -> anyhow::Result<OnnxEmbedder> {
     let [first, second] = eager_model_order(stored_dims);
-    match OnnxEmbedder::new(first) {
+    match OnnxEmbedder::new_with_policy_and_pool_size(
+        first,
+        &NetworkPolicy::Permissive,
+        resolve_stdio_pool_size(),
+    ) {
         Ok(e) => {
             tracing::info!(
                 "Using real ONNX embedder ({first}, {} dims)",
@@ -172,7 +167,11 @@ fn build_eager_embedder(stored_dims: Option<usize>) -> anyhow::Result<OnnxEmbedd
         }
         Err(first_err) => {
             tracing::warn!("{first} unavailable ({first_err}), trying {second} fallback");
-            match OnnxEmbedder::new(second) {
+            match OnnxEmbedder::new_with_policy_and_pool_size(
+                second,
+                &NetworkPolicy::Permissive,
+                resolve_stdio_pool_size(),
+            ) {
                 Ok(e) => {
                     tracing::info!(
                         "Using fallback ONNX embedder ({second}, {} dims)",
@@ -202,50 +201,13 @@ fn build_eager_embedder(stored_dims: Option<usize>) -> anyhow::Result<OnnxEmbedd
 /// non-observation memory with a non-empty embedding. `None` for a fresh
 /// namespace. Drives model choice in `build_embedder` so we never pick a
 /// model that orphans the stored vectors.
+#[cfg(test)]
 fn stored_embedding_dims(memories: &[pensyve_core::types::Memory]) -> Option<usize> {
     memories
         .iter()
         .filter(|m| !matches!(m, pensyve_core::types::Memory::Observation(_)))
         .map(|m| m.embedding().len())
         .find(|&len| len > 0)
-}
-
-fn build_vector_index(memories: &[pensyve_core::types::Memory], dimensions: usize) -> VectorIndex {
-    let mut index = VectorIndex::new(dimensions, 1024);
-
-    let mut loaded = 0usize;
-    for memory in memories {
-        // Observations are recall-time enrichment — they attach to
-        // top-k session groups via `recall_grouped::attach_observations_to_groups`
-        // and MUST NOT enter the RRF candidate pool.
-        if matches!(memory, pensyve_core::types::Memory::Observation(_)) {
-            continue;
-        }
-        let embedding = memory.embedding();
-        if !embedding.is_empty() {
-            let result = match memory {
-                pensyve_core::types::Memory::Semantic(s) => {
-                    index.add_with_entity(memory.id(), embedding, s.subject)
-                }
-                pensyve_core::types::Memory::Episodic(e) => {
-                    index.add_with_entity(memory.id(), embedding, e.about_entity)
-                }
-                pensyve_core::types::Memory::Procedural(_) => index.add(memory.id(), embedding),
-                pensyve_core::types::Memory::Observation(_) => unreachable!(),
-            };
-            if let Err(e) = result {
-                tracing::warn!("Skipping memory in index load: {e}");
-            } else {
-                loaded += 1;
-            }
-        }
-    }
-    tracing::info!(
-        "Loaded {loaded}/{} memories into vector index",
-        memories.len()
-    );
-
-    index
 }
 
 #[tokio::main]
@@ -279,22 +241,26 @@ async fn main() -> Result<()> {
         Err(e) => return Err(anyhow::anyhow!("Storage error: {e}")),
     };
 
-    // Fetch memories once: they drive both the embedder's model choice
-    // (existing embedding dimensionality wins) and the vector index build.
-    let memories = storage
-        .get_all_memories_by_namespace(namespace.id)
-        .unwrap_or_else(|e| {
-            tracing::warn!("Failed to load memories for vector index: {e}");
-            Vec::new()
-        });
-
-    // Initialize embedder — lazy by default (see `build_embedder`).
-    let embedder = build_embedder(stored_embedding_dims(&memories))?;
-
-    let dimensions = embedder.dimensions();
-
-    // Load existing embeddings into the vector index.
-    let vector_index = build_vector_index(&memories, dimensions);
+    // Initialize the configured runtime without hydrating the namespace corpus.
+    // The persisted namespace embedding state is the read-side activation gate,
+    // and its active generation's dimensionality picks the model so an
+    // existing namespace never starts against a mismatched runtime space.
+    let stored_dims = storage
+        .get_namespace_embedding_state(namespace.id)
+        .map_err(|error| anyhow::anyhow!("Failed to read namespace embedding state: {error}"))?
+        .and_then(|state| state.active_read_space.map(|space| space.dimensions));
+    let embedder = build_embedder(stored_dims)?;
+    let runtime_space = embedder
+        .embedding_space()
+        .map_err(|error| anyhow::anyhow!("Failed to resolve runtime embedding space: {error}"))?
+        .clone();
+    storage
+        .initialize_local_runtime_space(namespace.id, &runtime_space)
+        .map_err(|error| anyhow::anyhow!("Failed to initialize local runtime space: {error}"))?;
+    let storage = Arc::new(storage) as Arc<dyn StorageTrait>;
+    let vector_runtime =
+        VectorRuntime::resolve_storage_backed(storage.as_ref(), &embedder, namespace.id)
+            .map_err(anyhow::Error::msg)?;
 
     let retrieval_config = RetrievalConfig {
         default_limit: 5,
@@ -308,9 +274,9 @@ async fn main() -> Result<()> {
     };
 
     let state = Arc::new(PensyveState {
-        storage: Arc::new(storage) as Arc<dyn StorageTrait>,
+        storage,
         embedder: Arc::new(embedder),
-        vector_index: RwLock::new(vector_index),
+        vector_runtime,
         namespace,
         retrieval_config,
         is_remote: false,
@@ -344,6 +310,37 @@ mod tests {
     use super::*;
     use pensyve_core::types::{Memory, SemanticMemory};
     use uuid::Uuid;
+
+    #[test]
+    fn shipping_stdio_pool_is_one_session() {
+        assert_eq!(resolve_stdio_pool_size(), 1);
+    }
+
+    #[test]
+    fn lazy_and_eager_stdio_embedders_use_the_single_session_policy() {
+        let source = include_str!("main.rs");
+        let lazy = source
+            .split_once("fn build_embedder(")
+            .expect("stdio embedder builder")
+            .1
+            .split_once("const GTE:")
+            .expect("stdio embedder builder terminator")
+            .0;
+        assert!(lazy.contains("new_lazy_with_options"));
+        assert!(lazy.contains("resolve_stdio_pool_size()"));
+
+        let eager = source
+            .split_once("fn build_eager_embedder(")
+            .expect("eager stdio embedder builder")
+            .1
+            .split_once("#[cfg(test)]\nfn stored_embedding_dims")
+            .expect("eager stdio embedder builder terminator")
+            .0;
+        assert_eq!(eager.matches("new_with_policy_and_pool_size").count(), 2);
+        assert_eq!(eager.matches("NetworkPolicy::Permissive").count(), 2);
+        assert_eq!(eager.matches("resolve_stdio_pool_size()").count(), 2);
+        assert!(!eager.contains("OnnxEmbedder::new("));
+    }
 
     #[test]
     fn stored_dims_win_over_cache_state() {

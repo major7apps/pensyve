@@ -21,8 +21,8 @@ use pensyve_core::config::{ConsolidationConfig, PensyveConfig};
 use pensyve_core::consolidation::ConsolidationEngine;
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::network_policy::NetworkPolicy;
-use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
+use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{Episode, EpisodicMemory, Memory, Namespace, SemanticMemory};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -71,6 +71,29 @@ fn run_once(storage: &SqliteBackend, embedder: &OnnxEmbedder, ns: Uuid) -> usize
     .promoted
 }
 
+fn initialize_generation(storage: &SqliteBackend, embedder: &OnnxEmbedder, ns: Uuid) {
+    storage
+        .initialize_local_runtime_space(ns, embedder.embedding_space().unwrap())
+        .unwrap();
+}
+
+fn save_active_semantic(
+    storage: &SqliteBackend,
+    embedder: &OnnxEmbedder,
+    semantic: &SemanticMemory,
+) {
+    let memory = Memory::Semantic(semantic.clone());
+    let source = pensyve_core::storage::bounded::embedding_source_text(&memory);
+    let record = embedding_record_for_memory(
+        &memory,
+        embedder.embedding_space().unwrap(),
+        embedder.embed(&source).unwrap(),
+    );
+    storage
+        .save_memory_with_embedding(&memory, Some(&record))
+        .unwrap();
+}
+
 /// The single `mentioned` row currently live in `ns`. Panics unless the
 /// namespace holds exactly one, so an unexpected extra row fails loudly here
 /// rather than silently steering a supersession onto the wrong row.
@@ -106,7 +129,15 @@ fn save_episode_at(
     let mut mem = EpisodicMemory::new(ns, episode_id, source_id, entity_id, content);
     mem.embedding = embedder.embed(&mem.content).unwrap();
     mem.timestamp = at;
-    storage.save_episodic(&mem).unwrap();
+    let wrapped = Memory::Episodic(mem.clone());
+    let record = embedding_record_for_memory(
+        &wrapped,
+        embedder.embedding_space().unwrap(),
+        mem.embedding.clone(),
+    );
+    storage
+        .save_memory_with_embedding(&wrapped, Some(&record))
+        .unwrap();
     mem.id
 }
 
@@ -146,6 +177,7 @@ fn superseded_promotion_is_not_reminted_from_unchanged_evidence() {
 
     let ns = Namespace::new("supersession_guard");
     storage.save_namespace(&ns).unwrap();
+    initialize_generation(&storage, &embedder, ns.id);
     let entity_id = Uuid::new_v4();
     let source_id = Uuid::new_v4();
     let episode = Episode::new(ns.id, vec![source_id, entity_id]);
@@ -176,7 +208,7 @@ fn superseded_promotion_is_not_reminted_from_unchanged_evidence() {
     // Correct the fact: a new semantic row supersedes the promoted one.
     let promoted_id = active_mentioned_id(&storage, ns.id);
     let correction = SemanticMemory::new(ns.id, entity_id, "mentioned", "prefers light mode", 0.9);
-    storage.save_semantic(&correction).unwrap();
+    save_active_semantic(&storage, &embedder, &correction);
     assert!(
         storage
             .supersede_memory_in_namespace(promoted_id, ns.id, correction.id, corrected_at)
@@ -218,6 +250,7 @@ fn new_evidence_still_promotes_after_supersession() {
 
     let ns = Namespace::new("supersession_reassertion");
     storage.save_namespace(&ns).unwrap();
+    initialize_generation(&storage, &embedder, ns.id);
     let entity_id = Uuid::new_v4();
     let source_id = Uuid::new_v4();
     let episode = Episode::new(ns.id, vec![source_id, entity_id]);
@@ -240,7 +273,7 @@ fn new_evidence_still_promotes_after_supersession() {
 
     let promoted_id = active_mentioned_id(&storage, ns.id);
     let correction = SemanticMemory::new(ns.id, entity_id, "mentioned", "uses bash", 0.9);
-    storage.save_semantic(&correction).unwrap();
+    save_active_semantic(&storage, &embedder, &correction);
     assert!(
         storage
             .supersede_memory_in_namespace(promoted_id, ns.id, correction.id, corrected_at)
@@ -292,6 +325,7 @@ fn new_evidence_reasserting_same_content_promotes_after_supersession() {
 
     let ns = Namespace::new("supersession_reassert_same_content");
     storage.save_namespace(&ns).unwrap();
+    initialize_generation(&storage, &embedder, ns.id);
     let entity_id = Uuid::new_v4();
     let source_id = Uuid::new_v4();
     let episode = Episode::new(ns.id, vec![source_id, entity_id]);
@@ -314,7 +348,7 @@ fn new_evidence_reasserting_same_content_promotes_after_supersession() {
 
     let promoted_id = active_mentioned_id(&storage, ns.id);
     let correction = SemanticMemory::new(ns.id, entity_id, "mentioned", "prefers light mode", 0.9);
-    storage.save_semantic(&correction).unwrap();
+    save_active_semantic(&storage, &embedder, &correction);
     assert!(
         storage
             .supersede_memory_in_namespace(promoted_id, ns.id, correction.id, corrected_at)
@@ -377,6 +411,7 @@ fn superseded_episodic_evidence_cannot_support_a_cluster() {
 
     let ns = Namespace::new("supersession_retired_episodes");
     storage.save_namespace(&ns).unwrap();
+    initialize_generation(&storage, &embedder, ns.id);
     let entity_id = Uuid::new_v4();
     let source_id = Uuid::new_v4();
     let episode = Episode::new(ns.id, vec![source_id, entity_id]);

@@ -16,16 +16,18 @@
 //! zeroed stats, and the run already in flight runs once more so the coalesced
 //! trigger's evidence is still consolidated.
 
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use pensyve_core::config::{ConsolidationConfig, PensyveConfig};
-use pensyve_core::consolidation::ConsolidationEngine;
+use pensyve_core::consolidation::{
+    ConsolidationEngine, ConsolidationIncomplete, ConsolidationOutcome,
+};
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::network_policy::NetworkPolicy;
-use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
+use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{Episode, EpisodicMemory, Memory, Namespace};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -33,6 +35,15 @@ use uuid::Uuid;
 
 /// Distinct promotable clusters seeded per namespace.
 const CLUSTERS: usize = 48;
+
+/// `ConsolidationEngine::run*` waits on one process-global permit. Tests in
+/// this binary run on parallel threads, so without serialization one test's
+/// owner run can queue behind another test's until it reports
+/// `DurationExceeded` instead of the race it was written to observe.
+fn permit_serial() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 fn make_config() -> ConsolidationConfig {
     PensyveConfig::default().consolidation
@@ -72,7 +83,7 @@ fn seed_clusters(
                 EpisodicMemory::new(ns, episode.id, source_id, entity_id, content.as_str());
             mem.embedding = embedder.embed(&mem.content).unwrap();
             mem.timestamp = Utc::now() - chrono::Duration::seconds(i);
-            storage.save_episodic(&mem).unwrap();
+            save_episodic(storage, embedder, &mem);
         }
     }
 }
@@ -81,8 +92,23 @@ fn seed_clusters(
 fn seed_namespace(storage: &SqliteBackend, embedder: &OnnxEmbedder, name: &str) -> Uuid {
     let ns = Namespace::new(name);
     storage.save_namespace(&ns).unwrap();
+    storage
+        .initialize_local_runtime_space(ns.id, embedder.embedding_space().unwrap())
+        .unwrap();
     seed_clusters(storage, embedder, ns.id, 0..CLUSTERS);
     ns.id
+}
+
+fn save_episodic(storage: &SqliteBackend, embedder: &OnnxEmbedder, memory: &EpisodicMemory) {
+    let wrapped = Memory::Episodic(memory.clone());
+    let record = embedding_record_for_memory(
+        &wrapped,
+        embedder.embedding_space().unwrap(),
+        memory.embedding.clone(),
+    );
+    storage
+        .save_memory_with_embedding(&wrapped, Some(&record))
+        .unwrap();
 }
 
 fn run(storage: &SqliteBackend, embedder: &OnnxEmbedder, ns: Uuid) -> usize {
@@ -125,6 +151,7 @@ fn race_window_stays_wide_enough_to_detect() {
     const MIN_MARGIN: f64 = 200.0;
     const SKEW_TRIALS: usize = 9;
 
+    let _serial = permit_serial();
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(SqliteBackend::open(tmp.path()).expect("open storage"));
     let embedder = Arc::new(OnnxEmbedder::new_mock(64));
@@ -173,6 +200,7 @@ fn race_window_stays_wide_enough_to_detect() {
 /// cluster exactly once between them.
 #[test]
 fn concurrent_runs_on_one_namespace_do_not_double_promote() {
+    let _serial = permit_serial();
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(SqliteBackend::open(tmp.path()).expect("open storage"));
     let embedder = Arc::new(OnnxEmbedder::new_mock(64));
@@ -235,12 +263,16 @@ fn evidence_arriving_mid_run_is_not_dropped_by_coalescing() {
     const SEEDED: usize = CLUSTERS * 4;
     const LATE_CONTENT: &str = "late evidence the in-flight run cannot see";
 
+    let _serial = permit_serial();
     let tmp = TempDir::new().unwrap();
     let storage = Arc::new(SqliteBackend::open(tmp.path()).expect("open storage"));
     let embedder = Arc::new(OnnxEmbedder::new_mock(64));
     let namespace = Namespace::new("coalesced_coverage");
     storage.save_namespace(&namespace).unwrap();
     let ns = namespace.id;
+    storage
+        .initialize_local_runtime_space(ns, embedder.embedding_space().unwrap())
+        .unwrap();
     seed_clusters(&storage, &embedder, ns, 0..SEEDED);
 
     // Build the late cluster up front, everything except its two `save_episodic`
@@ -281,7 +313,7 @@ fn evidence_arriving_mid_run_is_not_dropped_by_coalescing() {
     // Evidence the in-flight run cannot possibly have snapshotted, plus the
     // trigger that announces it. That trigger coalesces.
     for mem in &late_memories {
-        storage.save_episodic(mem).unwrap();
+        save_episodic(&storage, &embedder, mem);
     }
     let coalesced_promoted = run(&storage, &embedder, ns);
     let owner_promoted = owner.join().unwrap();
@@ -302,4 +334,70 @@ fn evidence_arriving_mid_run_is_not_dropped_by_coalescing() {
         SEEDED + 1,
         "the owner's reported total should span both of its runs"
     );
+}
+
+#[test]
+fn coalesced_trigger_is_typed_pending_when_owner_becomes_incomplete() {
+    const SEEDED: usize = CLUSTERS * 4;
+
+    let _serial = permit_serial();
+    let tmp = TempDir::new().unwrap();
+    let storage = Arc::new(SqliteBackend::open(tmp.path()).expect("open storage"));
+    let embedder = Arc::new(OnnxEmbedder::new_mock(64));
+    let namespace = Namespace::new("coalesced-incomplete");
+    storage.save_namespace(&namespace).unwrap();
+    let ns = namespace.id;
+    storage
+        .initialize_local_runtime_space(ns, embedder.embedding_space().unwrap())
+        .unwrap();
+    seed_clusters(&storage, &embedder, ns, 0..SEEDED);
+
+    let owner_cancel = CancellationToken::new();
+    let owner = {
+        let storage = storage.clone();
+        let embedder = embedder.clone();
+        let cancel = owner_cancel.clone();
+        std::thread::spawn(move || {
+            ConsolidationEngine::run_bounded(
+                storage.as_ref(),
+                &embedder,
+                &make_config(),
+                ns,
+                &NetworkPolicy::Disabled,
+                &cancel,
+            )
+            .unwrap()
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while mentioned_rows(&storage, ns).is_empty() {
+        assert!(Instant::now() < deadline, "owner never began promoting");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let coalesced = ConsolidationEngine::run_bounded(
+        storage.as_ref(),
+        &embedder,
+        &make_config(),
+        ns,
+        &NetworkPolicy::Disabled,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    owner_cancel.cancel();
+
+    assert!(matches!(
+        coalesced,
+        ConsolidationOutcome::Incomplete {
+            reason: ConsolidationIncomplete::CoalescedPending,
+            ..
+        }
+    ));
+    assert!(matches!(
+        owner.join().unwrap(),
+        ConsolidationOutcome::Incomplete {
+            reason: ConsolidationIncomplete::Cancelled,
+            ..
+        }
+    ));
 }

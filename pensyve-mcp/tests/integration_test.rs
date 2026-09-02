@@ -3,19 +3,21 @@
 //! Because `pensyve-mcp` is a binary crate, we cannot import its internal
 //! `PensyveState` or the generated tool-router types.  Instead we replicate
 //! the exact same pensyve-core operations that each tool handler performs,
-//! exercising the full storage / embedding / vector-index stack with a
+//! exercising the full storage / embedding / persisted-index stack with a
 //! temporary `SQLite` database.
 
 use std::sync::Arc;
 
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
+use pensyve_core::embedding_space::EmbeddingSpace;
 use pensyve_core::retrieval::RecallEngine;
-use pensyve_core::storage::StorageTrait;
+use pensyve_core::storage::bounded::{MemoryRef, embedding_source_text};
 use pensyve_core::storage::sqlite::SqliteBackend;
-use pensyve_core::types::{Entity, EntityKind, Episode, Namespace, Outcome, SemanticMemory};
-use pensyve_core::vector::VectorIndex;
-use tokio::sync::RwLock;
+use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
+use pensyve_core::types::{
+    Entity, EntityKind, Episode, Memory, Namespace, Outcome, SemanticMemory,
+};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -27,7 +29,7 @@ use uuid::Uuid;
 struct TestState {
     storage: Arc<SqliteBackend>,
     embedder: OnnxEmbedder,
-    vector_index: RwLock<VectorIndex>,
+    runtime_space: EmbeddingSpace,
     namespace: Namespace,
     retrieval_config: RetrievalConfig,
     _tmpdir: tempfile::TempDir,
@@ -41,12 +43,15 @@ impl TestState {
 
         // Use the mock embedder (no ONNX model needed).
         let embedder = OnnxEmbedder::new_mock(768);
-        let dimensions = embedder.dimensions();
-
         let namespace = Namespace::new("test");
         storage.save_namespace(&namespace).expect("save namespace");
-
-        let vector_index = VectorIndex::new(dimensions, 1024);
+        let runtime_space = embedder
+            .embedding_space()
+            .expect("mock runtime space")
+            .clone();
+        storage
+            .initialize_local_runtime_space(namespace.id, &runtime_space)
+            .expect("activate empty local runtime space");
 
         let retrieval_config = RetrievalConfig {
             default_limit: 5,
@@ -62,7 +67,7 @@ impl TestState {
         Self {
             storage,
             embedder,
-            vector_index: RwLock::new(vector_index),
+            runtime_space,
             namespace,
             retrieval_config,
             _tmpdir: tmpdir,
@@ -83,6 +88,23 @@ impl TestState {
             self.storage.save_entity(&e).expect("save entity");
             e
         }
+    }
+
+    /// Embeds the memory's canonical source text so the stored vector and the
+    /// record's provenance hash describe the same document.
+    fn save_semantic_with_embedding(&self, semantic: SemanticMemory) {
+        let mut memory = Memory::Semantic(semantic);
+        let embedding = self
+            .embedder
+            .embed(&embedding_source_text(&memory))
+            .expect("mock embed");
+        if let Memory::Semantic(semantic) = &mut memory {
+            semantic.embedding.clone_from(&embedding);
+        }
+        let record = embedding_record_for_memory(&memory, &self.runtime_space, embedding);
+        self.storage
+            .save_memory_with_embedding(&memory, Some(&record))
+            .expect("save source and embedding");
     }
 }
 
@@ -115,15 +137,15 @@ async fn test_remember_creates_semantic_memory() {
         confidence,
     );
 
-    // Generate embedding and add to vector index.
+    // Generate and transactionally persist the source plus embedding record.
     let embedding = state.embedder.embed(fact).expect("mock embed");
-    {
-        let mut index = state.vector_index.write().await;
-        index.add(mem.id, &embedding).expect("add to vector index");
-    }
-    mem.embedding = embedding;
-
-    state.storage.save_semantic(&mem).expect("save semantic");
+    mem.embedding.clone_from(&embedding);
+    let memory = Memory::Semantic(mem.clone());
+    let record = embedding_record_for_memory(&memory, &state.runtime_space, embedding);
+    state
+        .storage
+        .save_memory_with_embedding(&memory, Some(&record))
+        .expect("save source and embedding");
 
     // Verify retrieval.
     let stored = state
@@ -217,19 +239,14 @@ async fn test_forget_removes_all_memories_for_entity() {
 
     // Store two semantic memories for this entity.
     for i in 0..2_u32 {
-        let mut mem = SemanticMemory::new(
+        let mem = SemanticMemory::new(
             state.namespace.id,
             entity.id,
             "knows",
             format!("fact {i}"),
             1.0,
         );
-        let embedding = state
-            .embedder
-            .embed(&format!("fact {i}"))
-            .expect("mock embed");
-        mem.embedding = embedding;
-        state.storage.save_semantic(&mem).expect("save semantic");
+        state.save_semantic_with_embedding(mem);
     }
 
     // Confirm they're there.
@@ -238,6 +255,18 @@ async fn test_forget_removes_all_memories_for_entity() {
         .list_semantic_by_entity_in_namespace(entity.id, state.namespace.id, 10)
         .expect("list semantic");
     assert_eq!(before.len(), 2);
+    let refs: Vec<_> = before
+        .iter()
+        .map(|memory| MemoryRef::from_memory(&Memory::Semantic(memory.clone())))
+        .collect();
+    assert_eq!(
+        state
+            .storage
+            .load_embedding_records(state.namespace.id, &state.runtime_space.id(), &refs)
+            .expect("load embedding records")
+            .len(),
+        2
+    );
 
     // forget: delete memories.
     let forgotten = state
@@ -252,6 +281,14 @@ async fn test_forget_removes_all_memories_for_entity() {
         .list_semantic_by_entity_in_namespace(entity.id, state.namespace.id, 10)
         .expect("list semantic after delete");
     assert!(after.is_empty(), "no memories should remain after forget");
+    assert!(
+        state
+            .storage
+            .load_embedding_records(state.namespace.id, &state.runtime_space.id(), &refs)
+            .expect("load embedding records after delete")
+            .is_empty(),
+        "storage-backed embedding rows should cascade with their sources"
+    );
 }
 
 #[tokio::test]
@@ -279,17 +316,14 @@ async fn test_inspect_lists_semantic_memories_for_entity() {
 
     // Store two semantic memories.
     for i in 0..2_u32 {
-        let fact = format!("knows thing {i}");
-        let mut mem = SemanticMemory::new(
+        let mem = SemanticMemory::new(
             state.namespace.id,
             entity.id,
             "knows",
             format!("thing {i}"),
             0.8,
         );
-        let embedding = state.embedder.embed(&fact).expect("embed");
-        mem.embedding = embedding;
-        state.storage.save_semantic(&mem).expect("save");
+        state.save_semantic_with_embedding(mem);
     }
 
     let limit = 20_usize;
@@ -335,19 +369,19 @@ async fn test_recall_returns_stored_semantic_memory() {
         1.0,
     );
     let embedding = state.embedder.embed(fact).expect("embed");
-    {
-        let mut index = state.vector_index.write().await;
-        index.add(mem.id, &embedding).expect("add to index");
-    }
-    mem.embedding = embedding;
-    state.storage.save_semantic(&mem).expect("save");
+    mem.embedding.clone_from(&embedding);
+    let memory = Memory::Semantic(mem.clone());
+    let record = embedding_record_for_memory(&memory, &state.runtime_space, embedding);
+    state
+        .storage
+        .save_memory_with_embedding(&memory, Some(&record))
+        .expect("save source and embedding");
 
     // Run the recall engine (same as the recall tool handler).
-    let index = state.vector_index.read().await;
-    let engine = RecallEngine::new(
+    let engine = RecallEngine::new_storage_backed(
         &*state.storage,
         &state.embedder,
-        &index,
+        &state.runtime_space,
         &state.retrieval_config,
     );
 
@@ -355,13 +389,12 @@ async fn test_recall_returns_stored_semantic_memory() {
         .recall("hiking mountains", state.namespace.id, 5)
         .expect("recall");
 
-    // With the mock embedder the semantic similarity between "hiking mountains"
-    // and "likes hiking in the mountains" may not score highest, but the FTS
-    // engine should still surface it.
     assert!(
-        !result.memories.is_empty() || result.memories.is_empty(),
-        "recall should not panic; result count: {}",
-        result.memories.len()
+        result
+            .memories
+            .iter()
+            .any(|candidate| candidate.memory_id == mem.id),
+        "recall must return the stored semantic memory"
     );
 }
 
@@ -369,11 +402,10 @@ async fn test_recall_returns_stored_semantic_memory() {
 async fn test_recall_empty_namespace_returns_no_results() {
     let state = TestState::new();
 
-    let index = state.vector_index.read().await;
-    let engine = RecallEngine::new(
+    let engine = RecallEngine::new_storage_backed(
         &*state.storage,
         &state.embedder,
-        &index,
+        &state.runtime_space,
         &state.retrieval_config,
     );
 

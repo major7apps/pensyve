@@ -416,6 +416,14 @@ hand-apply, or one on a pre-marker database), or `database schema is not at this
 build's version; applying it` if the deployment had been stamped by an earlier
 build. The remedy is the same either way.
 
+**Existing namespaces serve lexical-only after upgrading to schema v6.** Versioned
+embedding generations start with no active generation per namespace. After the
+owner-connected startup, run `pensyve-mcp-gateway backfill-embeddings` once with
+the serving role's `DATABASE_URL` (for ECS, a one-off task from the production
+task definition with the container command overridden to `backfill-embeddings`).
+It pages every namespace, embeds each source on the loaded generation, verifies
+coverage, and activates; running tasks observe activation on their next request.
+
 **Startup fails with `permission denied for table pensyve_schema_state`.** The
 serving role cannot read the applied-schema marker, so it cannot establish that
 the DDL is safe to skip. Grant it `SELECT` — the
@@ -444,14 +452,34 @@ model runs entirely on-device; no data leaves the machine.
 
 ## Execution Bounds
 
-Hard limits prevent runaway operations:
+Hard limits prevent runaway operations and cross-tenant corpus retention:
 
 | Operation | Bound |
 |---|---|
 | Recall query | 5 second timeout |
+| Hosted recall admission | 8 concurrent reservations; 64 MiB reserved working set |
+| Vector / lexical candidates | 100 each |
+| Fused references / hydrated payload | 200 references; 4 MiB |
+| SQLite exact-vector scan | 50,000 eligible active-generation rows |
+| Memory page | 256 rows |
 | Consolidation cycle | 60 second maximum |
+| Consolidation comparison / promotion | 64 candidates; 4,096 members |
+| Tenant metadata cache | 1,024 entries; 30-minute idle expiry |
 | Episode TTL | 30 minutes (REST API) |
-| Embedding batch | Bounded by available memory; uses streaming |
+| Embedding migration page | 256 rows; one target session per namespace |
+
+Shipping runtimes hold no resident namespace vector corpus. Exact search applies
+namespace and immutable active-generation identity in storage before ranking;
+hydration is a separate bounded step. Missing or mismatched embedding provenance
+degrades to lexical-only retrieval, never a mixed or partial vector ranking. Source
+and embedding-generation mutations commit transactionally across remember, update,
+supersede, forget, erase, restore, and backfill paths.
+
+These contracts are common to local SQLite and hosted Postgres. They do not approve
+a deployment: no production model has been selected or downloaded, no production
+data has been backfilled, and no cutover has been authorized. Earlier full-GTE-plus-
+BGE and 4 GiB deployment guidance is superseded; sizing requires separate certified
+model evidence and an approved rollout plan.
 
 ## Rate Limiting
 

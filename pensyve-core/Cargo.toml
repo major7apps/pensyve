@@ -1,6 +1,6 @@
 [package]
 name = "pensyve-core"
-version = "3.2.0"
+version = "4.0.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -20,6 +20,8 @@ rusqlite = { version = "0.40", features = ["bundled", "vtab"] }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.11"
+hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 dirs = "6"
@@ -42,11 +44,11 @@ regex = "1"
 # the latent test race documented in
 # `tests/test_no_network_invariants.rs`) rather than a real fastembed
 # regression -- PR #190's own body already concluded no transitive
-# dependency change could explain it. Unpinned back to a normal caret
-# requirement now that CI runs `test_no_network_invariants` against a
-# seeded cache on every PR (see `.github/workflows/ci.yml`) and will fail
-# the build if cached-model resolution ever regresses again.
-fastembed = "5.17.3"
+# dependency change could explain it. Pinned to exact 6.0.1 for this reviewed
+# migration because a normal caret requirement now admits unreviewed 6.0.2.
+# Revisit the pin separately; CI runs `test_no_network_invariants` against a
+# seeded cache on every PR (see `.github/workflows/ci.yml`).
+fastembed = "=6.0.1"
 petgraph = "0.8"
 # Phase 2B: compile-time predicate-verb lexicon for the shallow dependency
 # parser (`extraction::dep_parse`). `phf::Map` keys are interned at build
