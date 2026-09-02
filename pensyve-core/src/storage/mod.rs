@@ -707,6 +707,21 @@ pub trait StorageTrait: Send + Sync {
 
     fn update_episode(&self, episode: &Episode) -> StorageResult<()>;
 
+    /// Walk one namespace's episodes in stable bounded pages ordered by id.
+    ///
+    /// The namespace predicate is mandatory for the same reason
+    /// [`StorageTrait::get_episode_in_namespace`] carries one: a shared backend
+    /// serves every tenant, so an unscoped walk is a cross-tenant read. Backends
+    /// that cannot page fail closed rather than falling back to a full scan.
+    fn page_episodes(
+        &self,
+        _namespace_id: Uuid,
+        _after: Option<bounded::EpisodePageCursor>,
+        _limit: usize,
+    ) -> StorageResult<bounded::EpisodePage> {
+        Err(StorageError::Unsupported("bounded episode paging".into()))
+    }
+
     // Episodic Memory
     fn save_episodic(&self, mem: &EpisodicMemory) -> StorageResult<()>;
 

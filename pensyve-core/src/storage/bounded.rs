@@ -555,6 +555,25 @@ pub struct PageCursor {
     pub id: Uuid,
 }
 
+/// Cursor into a namespace's episodes, ordered by id.
+///
+/// Episodes are the one durable row class with no bounded enumerator of their
+/// own: `get_episode_in_namespace` fetches one by id and nothing walks the
+/// table. A namespace copy that recovered episode ids from
+/// `episodic_memories.episode_id` would silently drop every episode whose
+/// memories had been erased or superseded away, so the walk is its own paged
+/// read rather than a join.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EpisodePageCursor {
+    pub id: Uuid,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct EpisodePage {
+    pub episodes: Vec<crate::types::Episode>,
+    pub next_cursor: Option<EpisodePageCursor>,
+}
+
 pub struct VectorSearchRequest<'a> {
     pub scope: SearchScope,
     pub embedding_space_id: EmbeddingSpaceId,

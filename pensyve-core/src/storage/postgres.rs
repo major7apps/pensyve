@@ -36,11 +36,12 @@ use super::{
 };
 use crate::graph::EdgeType;
 use crate::storage::bounded::{
-    EmbeddingRecord, LexicalHit, MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS,
-    MAX_VECTOR_HITS, MEMORY_PAGE_SIZE, MemoryFilter, MemoryPage, MemoryPageRequest, MemoryRef,
-    MemoryType, NamespaceEmbeddingPhase, NamespaceEmbeddingState, PageCursor,
-    SNAPSHOT_MAX_FRAME_BYTES, SNAPSHOT_MAX_PAGE_BYTES, SearchScope, SearchUnavailable, VectorHit,
-    VectorSearchOutcome, VectorSearchRequest, lexical_query_tokens,
+    EmbeddingRecord, EpisodePage, EpisodePageCursor, LexicalHit, MAX_FUSED_HITS,
+    MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS, MAX_VECTOR_HITS, MEMORY_PAGE_SIZE, MemoryFilter,
+    MemoryPage, MemoryPageRequest, MemoryRef, MemoryType, NamespaceEmbeddingPhase,
+    NamespaceEmbeddingState, PageCursor, SNAPSHOT_MAX_FRAME_BYTES, SNAPSHOT_MAX_PAGE_BYTES,
+    SearchScope, SearchUnavailable, VectorHit, VectorSearchOutcome, VectorSearchRequest,
+    lexical_query_tokens,
 };
 use crate::storage::consolidation_workspace::{
     ClusterDecision, ClusterProvenance, ConsolidationWorkspace, DecayPage, DecayRecord,
@@ -4042,6 +4043,70 @@ impl StorageTrait for PostgresBackend {
 
     fn update_episode(&self, episode: &Episode) -> StorageResult<()> {
         self.save_episode(episode)
+    }
+
+    fn page_episodes(
+        &self,
+        namespace_id: Uuid,
+        after: Option<EpisodePageCursor>,
+        limit: usize,
+    ) -> StorageResult<EpisodePage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "episode page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        let after = after.map_or_else(Uuid::nil, |cursor| cursor.id);
+        self.block_on(async move {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            #[allow(clippy::type_complexity)]
+            let rows: Vec<(
+                Uuid,
+                Uuid,
+                serde_json::Value,
+                DateTime<Utc>,
+                Option<DateTime<Utc>>,
+                Option<String>,
+                serde_json::Value,
+            )> = query_as::<Postgres, _>(
+                "SELECT id, namespace_id, participants, started_at, ended_at, outcome, metadata \
+                 FROM episodes WHERE namespace_id = $1 AND id > $2 ORDER BY id LIMIT $3",
+            )
+            .bind(namespace_id)
+            .bind(after)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+
+            let episodes: Vec<Episode> = rows
+                .into_iter()
+                .map(
+                    |(id, namespace_id, participants, started_at, ended_at, outcome, metadata)| {
+                        Episode {
+                            id,
+                            namespace_id,
+                            participants: serde_json::from_value(participants).unwrap_or_default(),
+                            started_at,
+                            ended_at,
+                            outcome: outcome.as_deref().map(str_to_outcome),
+                            metadata: serde_json::from_value(metadata).unwrap_or_default(),
+                        }
+                    },
+                )
+                .collect();
+            let next_cursor = (episodes.len() == limit)
+                .then(|| {
+                    episodes
+                        .last()
+                        .map(|episode| EpisodePageCursor { id: episode.id })
+                })
+                .flatten();
+            Ok(EpisodePage {
+                episodes,
+                next_cursor,
+            })
+        })
     }
 
     // -----------------------------------------------------------------------
