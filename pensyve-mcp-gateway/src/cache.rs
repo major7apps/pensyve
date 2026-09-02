@@ -1,16 +1,13 @@
-//! Optional Redis caching layer for the gateway.
-//!
-//! When `REDIS_URL` is set, recall responses are cached to reduce latency on
-//! repeated queries. Write operations (remember, observe, forget) invalidate
-//! relevant cache entries. Gracefully falls back to no-op when Redis is
-//! unavailable.
+//! Optional Redis connection for the gateway's distributed controls.
 
-use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 
+fn redis_connection_success_message(_url: &str) -> &'static str {
+    "Redis connection established"
+}
+
 /// Initialize a Redis connection manager from the `REDIS_URL` env var.
-/// Returns `None` if the variable is unset or the connection fails —
-/// the gateway operates normally without caching.
+/// Returns `None` if the variable is unset or the connection fails.
 pub async fn init() -> Option<ConnectionManager> {
     let url = std::env::var("REDIS_URL").ok()?;
     match redis::Client::open(url.as_str()) {
@@ -23,7 +20,7 @@ pub async fn init() -> Option<ConnectionManager> {
             .await
             {
                 Ok(Ok(mgr)) => {
-                    tracing::info!("Redis cache connected at {url}");
+                    tracing::info!("{}", redis_connection_success_message(&url));
                     Some(mgr)
                 }
                 Ok(Err(e)) => {
@@ -43,79 +40,18 @@ pub async fn init() -> Option<ConnectionManager> {
     }
 }
 
-/// Get a cached value by key.
-pub async fn get(conn: &mut ConnectionManager, key: &str) -> Option<String> {
-    match conn.get::<_, Option<String>>(key).await {
-        Ok(val) => val,
-        Err(e) => {
-            tracing::debug!("Cache GET error for {key}: {e}");
-            None
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn successful_connection_message_never_renders_redis_credentials() {
+        let url = "redis://sensitive-user:sensitive-password@cache.internal:6379/0";
+
+        let message = redis_connection_success_message(url);
+
+        assert!(!message.contains("sensitive-user"));
+        assert!(!message.contains("sensitive-password"));
+        assert!(!message.contains(url));
     }
-}
-
-/// Set a cached value with TTL (fire-and-forget).
-pub async fn set(conn: &mut ConnectionManager, key: &str, value: &str, ttl_secs: u64) {
-    if let Err(e) = conn.set_ex::<_, _, ()>(key, value, ttl_secs).await {
-        tracing::debug!("Cache SET error for {key}: {e}");
-    }
-}
-
-/// Delete all keys matching a prefix pattern (e.g., "pensyve:recall:ns-*").
-/// Uses SCAN to avoid blocking Redis on large key sets.
-pub async fn invalidate_prefix(conn: &mut ConnectionManager, prefix: &str) {
-    let pattern = format!("{prefix}*");
-    let mut cursor: u64 = 0;
-    loop {
-        let result: Result<(u64, Vec<String>), _> = redis::cmd("SCAN")
-            .arg(cursor)
-            .arg("MATCH")
-            .arg(&pattern)
-            .arg("COUNT")
-            .arg(100)
-            .query_async(&mut conn.clone())
-            .await;
-
-        match result {
-            Ok((next_cursor, keys)) => {
-                for key in &keys {
-                    let _ = conn.del::<_, ()>(key).await;
-                }
-                cursor = next_cursor;
-                if cursor == 0 {
-                    break;
-                }
-            }
-            Err(e) => {
-                tracing::debug!("Cache SCAN error for pattern {pattern}: {e}");
-                break;
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Key builders
-// ---------------------------------------------------------------------------
-
-/// Cache key for recall queries.
-pub fn recall_key(namespace_id: &str, query_hash: &str) -> String {
-    format!("pensyve:recall:{namespace_id}:{query_hash}")
-}
-
-/// Cache key for stats.
-#[allow(dead_code)]
-pub fn stats_key(namespace_id: &str) -> String {
-    format!("pensyve:stats:{namespace_id}")
-}
-
-/// Cache key for inspect.
-#[allow(dead_code)]
-pub fn inspect_key(namespace_id: &str, entity: &str) -> String {
-    format!("pensyve:inspect:{namespace_id}:{entity}")
-}
-
-/// Namespace prefix for invalidation.
-pub fn namespace_prefix(namespace_id: &str) -> String {
-    format!("pensyve:recall:{namespace_id}:")
 }

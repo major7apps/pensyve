@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::types::{
@@ -7,6 +8,8 @@ use crate::types::{
     SemanticMemory,
 };
 
+pub mod bounded;
+pub mod consolidation_workspace;
 pub mod sqlite;
 
 #[cfg(feature = "postgres")]
@@ -30,11 +33,99 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("Storage context: {0}")]
     Context(String),
+    #[error("Unsupported storage capability: {0}")]
+    Unsupported(String),
+    #[error("Storage budget exceeded: {0}")]
+    BudgetExceeded(String),
     #[error("Mutex lock poisoned: {0}")]
     LockPoisoned(String),
 }
 
 pub type StorageResult<T> = Result<T, StorageError>;
+
+pub(crate) fn memory_namespace_id(memory: &Memory) -> Uuid {
+    match memory {
+        Memory::Episodic(memory) => memory.namespace_id,
+        Memory::Semantic(memory) => memory.namespace_id,
+        Memory::Procedural(memory) => memory.namespace_id,
+        Memory::Observation(memory) => memory.namespace_id,
+    }
+}
+
+pub(crate) fn memory_is_live(memory: &Memory) -> bool {
+    match memory {
+        Memory::Episodic(memory) => memory.superseded_by.is_none() && memory.invalid_at.is_none(),
+        Memory::Semantic(memory) => memory.superseded_by.is_none() && memory.invalid_at.is_none(),
+        Memory::Procedural(memory) => memory.superseded_by.is_none() && memory.invalid_at.is_none(),
+        Memory::Observation(memory) => {
+            memory.superseded_by.is_none() && memory.invalid_at.is_none()
+        }
+    }
+}
+
+/// SHA-256 of the canonical UTF-8 source document used for embedding.
+///
+/// Shipping runtimes and backfill must share this exact path so provenance is
+/// independent of serialization and mutable memory metadata.
+#[must_use]
+pub fn canonical_embedding_source_sha256(memory: &Memory) -> String {
+    canonical_embedding_source_text_sha256(&bounded::embedding_source_text(memory))
+}
+
+pub(crate) fn canonical_embedding_source_text_sha256(source: &str) -> String {
+    hex::encode(Sha256::digest(source.as_bytes()))
+}
+
+/// Construct one versioned embedding record from the exact runtime space and
+/// the shared canonical source document.
+#[must_use]
+pub fn embedding_record_for_memory(
+    memory: &Memory,
+    space: &crate::embedding_space::EmbeddingSpace,
+    embedding: Vec<f32>,
+) -> bounded::EmbeddingRecord {
+    bounded::EmbeddingRecord {
+        namespace_id: memory_namespace_id(memory),
+        memory_ref: bounded::MemoryRef::from_memory(memory),
+        embedding_space_id: space.id(),
+        source_sha256: canonical_embedding_source_sha256(memory),
+        embedding,
+    }
+}
+
+pub(crate) fn validate_record_matches_memory(
+    record: &bounded::EmbeddingRecord,
+    memory: &Memory,
+) -> StorageResult<()> {
+    let namespace_id = memory_namespace_id(memory);
+    if record.namespace_id != namespace_id {
+        return Err(StorageError::Context(format!(
+            "embedding namespace {} does not match source namespace {namespace_id}",
+            record.namespace_id
+        )));
+    }
+    let expected_ref = bounded::MemoryRef::from_memory(memory);
+    if record.memory_ref != expected_ref {
+        return Err(StorageError::Context(format!(
+            "embedding memory reference {:?} does not match source {:?}",
+            record.memory_ref, expected_ref
+        )));
+    }
+    let expected_hash = canonical_embedding_source_sha256(memory);
+    if record.source_sha256 != expected_hash {
+        return Err(StorageError::Context(format!(
+            "embedding source hash does not match canonical source for {}",
+            memory.id()
+        )));
+    }
+    if record.embedding.is_empty() || record.embedding.iter().any(|value| !value.is_finite()) {
+        return Err(StorageError::Context(format!(
+            "embedding for {} must contain finite components",
+            memory.id()
+        )));
+    }
+    Ok(())
+}
 
 /// Rejection returned by `save_edge` when the supplied edge id already exists
 /// in a different namespace.
@@ -73,6 +164,174 @@ pub struct ErasedRows {
     pub entity_deleted: bool,
 }
 
+/// One recoverable source-memory unit and every immutable embedding generation
+/// deleted with it.
+#[derive(Debug, Clone)]
+pub struct CapturedMemory {
+    pub memory: Memory,
+    pub embeddings: Vec<bounded::EmbeddingRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum BulkPageKind {
+    SnapshotCapture,
+    GdprExport,
+    EmbeddingMigrationStart,
+    EmbeddingMigrationVerify,
+    EmbeddingMigrationActivate,
+}
+
+pub(crate) fn bounded_bulk_page_size(
+    namespace_id: Uuid,
+    kind: BulkPageKind,
+    requested: usize,
+) -> StorageResult<usize> {
+    #[cfg(test)]
+    bulk_page_probe::record_request(namespace_id, kind, requested);
+    #[cfg(not(test))]
+    let _ = (namespace_id, kind);
+    if !(1..=bounded::MEMORY_PAGE_SIZE).contains(&requested) {
+        return Err(StorageError::BudgetExceeded(format!(
+            "bulk page size must be within 1..={}, got {requested}",
+            bounded::MEMORY_PAGE_SIZE
+        )));
+    }
+    Ok(requested)
+}
+
+pub(crate) struct BulkPageGuard<T> {
+    value: T,
+    #[cfg(test)]
+    _ownership: bulk_page_probe::PageOwnership,
+}
+
+impl<T> BulkPageGuard<T> {
+    pub(crate) fn new(value: T, namespace_id: Uuid, kind: BulkPageKind) -> Self {
+        #[cfg(not(test))]
+        let _ = (namespace_id, kind);
+        Self {
+            value,
+            #[cfg(test)]
+            _ownership: bulk_page_probe::PageOwnership::new(namespace_id, kind),
+        }
+    }
+}
+
+impl<T> std::ops::Deref for BulkPageGuard<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod bulk_page_probe {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    use uuid::Uuid;
+
+    use super::BulkPageKind;
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub(crate) struct Observed {
+        pub(crate) max_requested: usize,
+        pub(crate) live_pages: usize,
+        pub(crate) peak_live_pages: usize,
+        pub(crate) created_pages: usize,
+    }
+
+    type Key = (Uuid, BulkPageKind);
+
+    fn probes() -> &'static Mutex<HashMap<Key, Observed>> {
+        static PROBES: OnceLock<Mutex<HashMap<Key, Observed>>> = OnceLock::new();
+        PROBES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(crate) struct Probe {
+        key: Key,
+    }
+
+    pub(crate) fn start(namespace_id: Uuid, kind: BulkPageKind) -> Probe {
+        let key = (namespace_id, kind);
+        let old = probes().lock().unwrap().insert(key, Observed::default());
+        assert!(old.is_none(), "bulk page probe already active for {key:?}");
+        Probe { key }
+    }
+
+    impl Probe {
+        pub(crate) fn observed(&self) -> Observed {
+            *probes()
+                .lock()
+                .unwrap()
+                .get(&self.key)
+                .expect("bulk page probe is active")
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let observed = probes()
+                .lock()
+                .unwrap()
+                .remove(&self.key)
+                .expect("bulk page probe is active");
+            assert_eq!(observed.live_pages, 0, "a bulk page guard leaked");
+        }
+    }
+
+    pub(crate) fn record_request(namespace_id: Uuid, kind: BulkPageKind, requested: usize) {
+        if let Some(observed) = probes().lock().unwrap().get_mut(&(namespace_id, kind)) {
+            observed.max_requested = observed.max_requested.max(requested);
+        }
+    }
+
+    pub(crate) struct PageOwnership {
+        key: Option<Key>,
+    }
+
+    impl PageOwnership {
+        pub(crate) fn new(namespace_id: Uuid, kind: BulkPageKind) -> Self {
+            let key = (namespace_id, kind);
+            let mut probes = probes().lock().unwrap();
+            let Some(observed) = probes.get_mut(&key) else {
+                return Self { key: None };
+            };
+            observed.live_pages += 1;
+            observed.created_pages += 1;
+            observed.peak_live_pages = observed.peak_live_pages.max(observed.live_pages);
+            Self { key: Some(key) }
+        }
+    }
+
+    impl Drop for PageOwnership {
+        fn drop(&mut self) {
+            if let Some(key) = self.key {
+                let mut probes = probes().lock().unwrap();
+                let observed = probes.get_mut(&key).expect("bulk page probe is active");
+                observed.live_pages -= 1;
+            }
+        }
+    }
+}
+
+/// Constant-size result of a streamed bulk mutation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BulkMutationSummary {
+    pub memories: usize,
+    pub embedding_records: usize,
+}
+
+/// Constant-size result of a storage-backed GDPR entity erase.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ErasureSummary {
+    pub memories: usize,
+    pub observations: usize,
+    pub edges: usize,
+    pub entities: usize,
+}
+
 /// Maximum whitespace-delimited tokens an FTS query contributes to the search
 /// expression; both backends truncate identically so their candidate sets stay
 /// comparable (#225).
@@ -89,6 +348,264 @@ pub(crate) const MAX_FTS_QUERY_TOKENS: usize = 256;
 // ---------------------------------------------------------------------------
 
 pub trait StorageTrait: Send + Sync {
+    /// Durable bounded consolidation workspace when supported by the backend.
+    fn consolidation_workspace(
+        &self,
+    ) -> Option<&dyn consolidation_workspace::ConsolidationWorkspace> {
+        None
+    }
+
+    /// Enumerate persisted namespaces in stable bounded pages. Shipping
+    /// periodic consolidation must use this rather than a process cache.
+    fn page_namespaces(
+        &self,
+        _after: Option<consolidation_workspace::NamespacePageCursor>,
+        _limit: usize,
+    ) -> StorageResult<consolidation_workspace::NamespacePage> {
+        Err(StorageError::Unsupported("bounded namespace paging".into()))
+    }
+
+    /// Read one namespace's embedding lifecycle row and joined immutable
+    /// spaces. The namespace predicate is mandatory even when backend RLS is
+    /// enabled. External backends without versioned generations remain
+    /// lexical-only through the compatibility default.
+    fn get_namespace_embedding_state(
+        &self,
+        _namespace_id: Uuid,
+    ) -> StorageResult<Option<bounded::NamespaceEmbeddingState>> {
+        Ok(None)
+    }
+
+    /// Register one immutable local runtime space and initialize its namespace
+    /// lifecycle without inventing coverage.
+    ///
+    /// Built-in local storage may activate the space only for a namespace with
+    /// no live source memories, or return an already-active exact match.
+    /// Existing non-empty or in-progress namespaces remain semantic-unavailable
+    /// until the explicit migration protocol proves coverage.
+    fn initialize_local_runtime_space(
+        &self,
+        _namespace_id: Uuid,
+        _space: &crate::embedding_space::EmbeddingSpace,
+    ) -> StorageResult<bounded::NamespaceEmbeddingState> {
+        Err(StorageError::Unsupported(
+            "local embedding-space initialization".into(),
+        ))
+    }
+
+    fn begin_embedding_migration(
+        &self,
+        _namespace_id: Uuid,
+        _target_space: &crate::embedding_space::EmbeddingSpace,
+    ) -> Result<bounded::NamespaceEmbeddingState, crate::embedding_migration::MigrationError> {
+        Err(StorageError::Unsupported("embedding migration start".into()).into())
+    }
+
+    fn page_embedding_backfill(
+        &self,
+        _namespace_id: Uuid,
+        _target_space_id: &crate::embedding_space::EmbeddingSpaceId,
+        _limit: usize,
+    ) -> Result<
+        Vec<crate::embedding_migration::BackfillItem>,
+        crate::embedding_migration::MigrationError,
+    > {
+        Err(StorageError::Unsupported("embedding migration paging".into()).into())
+    }
+
+    fn commit_embedding_backfill_page(
+        &self,
+        _namespace_id: Uuid,
+        _target_space_id: &crate::embedding_space::EmbeddingSpaceId,
+        _commits: &[crate::embedding_migration::BackfillCommit],
+    ) -> Result<
+        crate::embedding_migration::BackfillOutcome,
+        crate::embedding_migration::MigrationError,
+    > {
+        Err(StorageError::Unsupported("embedding migration commit".into()).into())
+    }
+
+    fn record_embedding_backfill_failure(
+        &self,
+        _namespace_id: Uuid,
+        _item: &crate::embedding_migration::BackfillItem,
+        _error: &str,
+    ) -> Result<(), crate::embedding_migration::MigrationError> {
+        Err(StorageError::Unsupported("embedding migration retry".into()).into())
+    }
+
+    fn inspect_embedding_migration_coverage(
+        &self,
+        _namespace_id: Uuid,
+        _target_space_id: &crate::embedding_space::EmbeddingSpaceId,
+    ) -> Result<
+        (
+            crate::embedding_migration::MigrationCoverage,
+            bounded::NamespaceEmbeddingState,
+        ),
+        crate::embedding_migration::MigrationError,
+    > {
+        Err(StorageError::Unsupported("embedding migration coverage".into()).into())
+    }
+
+    fn verify_embedding_migration(
+        &self,
+        _namespace_id: Uuid,
+        _target_space_id: &crate::embedding_space::EmbeddingSpaceId,
+    ) -> Result<
+        (
+            crate::embedding_migration::MigrationCoverage,
+            bounded::NamespaceEmbeddingState,
+        ),
+        crate::embedding_migration::MigrationError,
+    > {
+        Err(StorageError::Unsupported("embedding migration verify".into()).into())
+    }
+
+    fn activate_embedding_migration(
+        &self,
+        _namespace_id: Uuid,
+        _target_space_id: &crate::embedding_space::EmbeddingSpaceId,
+        _runtime_space_id: &crate::embedding_space::EmbeddingSpaceId,
+    ) -> Result<bounded::NamespaceEmbeddingState, crate::embedding_migration::MigrationError> {
+        Err(StorageError::Unsupported("embedding migration activation".into()).into())
+    }
+
+    fn rollback_embedding_migration_to_lexical(
+        &self,
+        _namespace_id: Uuid,
+    ) -> Result<bounded::NamespaceEmbeddingState, crate::embedding_migration::MigrationError> {
+        Err(StorageError::Unsupported("embedding migration rollback".into()).into())
+    }
+
+    /// Bounded vector retrieval. Backends must opt in explicitly; the
+    /// fail-closed default never falls back to a namespace-wide bulk load.
+    fn search_vector(
+        &self,
+        _request: &bounded::VectorSearchRequest<'_>,
+    ) -> StorageResult<bounded::VectorSearchOutcome> {
+        Ok(bounded::VectorSearchOutcome::Unavailable(
+            bounded::SearchUnavailable::UnsupportedBackend,
+        ))
+    }
+
+    /// Bounded vector retrieval with storage-side type/confidence predicates.
+    /// Compatibility backends opt in explicitly; filtering never falls back
+    /// to post-limit selection.
+    fn search_vector_filtered(
+        &self,
+        _request: &bounded::VectorSearchRequest<'_>,
+        _filter: &bounded::MemoryFilter,
+    ) -> StorageResult<bounded::VectorSearchOutcome> {
+        Ok(bounded::VectorSearchOutcome::Unavailable(
+            bounded::SearchUnavailable::UnsupportedBackend,
+        ))
+    }
+
+    /// Bounded lexical candidate retrieval. Unlike legacy FTS hydration, this
+    /// default is an explicit unsupported error rather than an unbounded path.
+    fn search_lexical_hits(
+        &self,
+        _query: &str,
+        _scope: &bounded::SearchScope,
+        _limit: usize,
+    ) -> StorageResult<Vec<bounded::LexicalHit>> {
+        Err(StorageError::Unsupported("bounded lexical search".into()))
+    }
+
+    /// Bounded lexical retrieval with storage-side type/confidence predicates.
+    fn search_lexical_hits_filtered(
+        &self,
+        _query: &str,
+        _scope: &bounded::SearchScope,
+        _filter: &bounded::MemoryFilter,
+        _limit: usize,
+    ) -> StorageResult<Vec<bounded::LexicalHit>> {
+        Err(StorageError::Unsupported(
+            "bounded filtered lexical search".into(),
+        ))
+    }
+
+    /// Hydrate at most one bounded batch of typed memory references.
+    /// Backends must never fall back to namespace-wide bulk loading.
+    fn hydrate_memories(
+        &self,
+        _namespace_id: Uuid,
+        _memory_refs: &[bounded::MemoryRef],
+        _max_bytes: usize,
+    ) -> StorageResult<Vec<Memory>> {
+        Err(StorageError::Unsupported("bounded memory hydration".into()))
+    }
+
+    /// Load one immutable embedding generation for a bounded reference batch.
+    /// Backends must never consult compatibility inline embedding columns.
+    fn load_embedding_records(
+        &self,
+        _namespace_id: Uuid,
+        _embedding_space_id: &crate::embedding_space::EmbeddingSpaceId,
+        _memory_refs: &[bounded::MemoryRef],
+    ) -> StorageResult<Vec<bounded::EmbeddingRecord>> {
+        Err(StorageError::Unsupported(
+            "bounded embedding-generation load".into(),
+        ))
+    }
+
+    /// Page source memories in deterministic typed-key order.
+    /// Backends must never implement this through a namespace-wide bulk load.
+    fn page_memories(
+        &self,
+        _request: &bounded::MemoryPageRequest,
+    ) -> StorageResult<bounded::MemoryPage> {
+        Err(StorageError::Unsupported("bounded memory paging".into()))
+    }
+
+    /// Page source memories with an optional memory-type predicate applied
+    /// before the backend page limit.
+    fn page_memories_filtered(
+        &self,
+        request: &bounded::MemoryPageRequest,
+        memory_type: Option<bounded::MemoryType>,
+    ) -> StorageResult<bounded::MemoryPage> {
+        match memory_type {
+            None => self.page_memories(request),
+            Some(_) => Err(StorageError::Unsupported(
+                "bounded filtered memory paging".into(),
+            )),
+        }
+    }
+
+    /// Page the existing entity-oriented inspect relation in stable typed-key order:
+    /// episodic `about_entity`, semantic `subject`, and observation `instance`.
+    /// This preserves the public inspect contract without post-filtering a
+    /// namespace-wide page.
+    fn page_entity_memories(
+        &self,
+        _namespace_id: Uuid,
+        _entity_id: Uuid,
+        _entity_instance: &str,
+        _after: Option<bounded::PageCursor>,
+        _limit: usize,
+        _include_superseded: bool,
+    ) -> StorageResult<bounded::MemoryPage> {
+        Err(StorageError::Unsupported(
+            "bounded entity inspect paging".into(),
+        ))
+    }
+
+    /// Page the GDPR personal-data relation in stable typed-key order, including
+    /// observations derived from episodes in which the entity participated.
+    fn page_gdpr_personal_data(
+        &self,
+        _namespace_id: Uuid,
+        _entity_id: Uuid,
+        _after: Option<bounded::PageCursor>,
+        _limit: usize,
+    ) -> StorageResult<bounded::MemoryPage> {
+        Err(StorageError::Unsupported(
+            "bounded GDPR personal-data paging".into(),
+        ))
+    }
+
     /// Filesystem path of the underlying `SQLite` file, when the backend is
     /// disk-backed. Returns `None` for in-memory backends, the (future)
     /// Postgres backend, or any backend that has no single-file location.
@@ -102,6 +619,41 @@ pub trait StorageTrait: Send + Sync {
     /// with.
     fn db_path(&self) -> Option<&std::path::Path> {
         None
+    }
+
+    /// Atomically persist one source memory and, when supplied, its immutable
+    /// embedding-generation record. Built-in backends also reconcile stale
+    /// generations whose source hash no longer matches this source.
+    ///
+    /// The default preserves source-only compatibility for external backends.
+    /// It rejects an embedding before writing anything because a backend that
+    /// cannot provide one transaction must fail closed rather than expose a
+    /// partially persisted logical mutation.
+    fn save_memory_with_embedding(
+        &self,
+        memory: &Memory,
+        embedding: Option<&bounded::EmbeddingRecord>,
+    ) -> StorageResult<()> {
+        if embedding.is_some() {
+            return Err(StorageError::Unsupported(
+                "transactional source and embedding save".into(),
+            ));
+        }
+        match memory {
+            Memory::Episodic(memory) => self.save_episodic(memory),
+            Memory::Semantic(memory) => self.save_semantic(memory),
+            Memory::Procedural(memory) => self.save_procedural(memory),
+            Memory::Observation(memory) => self.save_observation(memory),
+        }
+    }
+
+    /// Atomically restore one validated page of source memories and every captured
+    /// versioned embedding record. Implementations must reject pages over 256 before
+    /// writing anything and must not activate or register embedding spaces.
+    fn restore_memory_page(&self, _page: &[CapturedMemory]) -> StorageResult<()> {
+        Err(StorageError::Unsupported(
+            "transactional bounded restore page".into(),
+        ))
     }
 
     // Namespaces
@@ -339,6 +891,21 @@ pub trait StorageTrait: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Fetch observation rows for grouped-recall enrichment without inline
+    /// embeddings, bounded before hydration by row count and serialized-size
+    /// budget.
+    fn list_observation_enrichments_by_episode_ids(
+        &self,
+        _namespace_id: Uuid,
+        _episode_ids: &[Uuid],
+        _limit: usize,
+        _max_bytes: usize,
+    ) -> StorageResult<Vec<ObservationMemory>> {
+        Err(StorageError::Unsupported(
+            "bounded observation enrichment".into(),
+        ))
+    }
+
     /// Delete every observation tied to the given episode *within
     /// `namespace_id`*. Returns the row count. Called as part of episode
     /// cascade-delete paths, whose `episode_id` is caller-supplied.
@@ -438,10 +1005,11 @@ pub trait StorageTrait: Send + Sync {
         limit: usize,
     ) -> StorageResult<Vec<Memory>>;
 
-    // Bulk
+    // Bulk compatibility/research helpers. Shipping callers must use bounded pages.
     fn get_all_memories_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Memory>>;
 
-    /// Fetch all memories, including superseded history, for audit/inspect paths.
+    /// Fetch all memories, including superseded history, for compatibility and
+    /// synthetic research fixtures. Shipping inspect/export paths must page instead.
     fn get_all_memories_by_namespace_including_superseded(
         &self,
         namespace_id: Uuid,
@@ -503,9 +1071,10 @@ pub trait StorageTrait: Send + Sync {
             .collect())
     }
 
-    /// Mark a live memory as superseded, but only when it belongs to
-    /// `namespace_id`. Returns `false` when no live row in that namespace
-    /// matched.
+    /// Atomically insert a replacement source and optional embedding, mark a
+    /// live old source as superseded, and delete the old source's embeddings.
+    /// Returns `false` when the old source compare-and-set loses; in that case
+    /// the replacement source and embedding must not remain visible.
     ///
     /// There is deliberately no unscoped `supersede_memory`. Memory ids are not
     /// globally unique in this schema, so an id-only `UPDATE` stamps whichever
@@ -516,6 +1085,22 @@ pub trait StorageTrait: Send + Sync {
     /// Backends must put both predicates in the SQL rather than leave the
     /// namespace to row-level security, which is defence in depth and inert in
     /// every deployment shipping today.
+    fn save_superseding_memory_with_embedding(
+        &self,
+        _old: bounded::MemoryRef,
+        _namespace_id: Uuid,
+        _replacement: &Memory,
+        _embedding: Option<&bounded::EmbeddingRecord>,
+        _invalid_at: DateTime<Utc>,
+    ) -> StorageResult<bool> {
+        Err(StorageError::Unsupported(
+            "transactional memory supersession".into(),
+        ))
+    }
+
+    /// Mark a live memory as superseded, but only when it belongs to
+    /// `namespace_id`. Returns `false` when no live row in that namespace
+    /// matched.
     fn supersede_memory_in_namespace(
         &self,
         id: Uuid,
@@ -588,6 +1173,50 @@ pub trait StorageTrait: Send + Sync {
         persist: &mut dyn FnMut(&[Memory]) -> StorageResult<()>,
     ) -> StorageResult<Vec<Memory>>;
 
+    /// Generation-aware counterpart to
+    /// [`StorageTrait::delete_memories_by_entity_capturing`]. Backends that
+    /// store immutable embedding generations override this so each source and
+    /// all of its generations are captured and persisted in the same delete
+    /// transaction. The default preserves compatibility for backends that only
+    /// store source rows.
+    fn delete_memories_by_entity_capturing_with_embeddings(
+        &self,
+        entity_id: Uuid,
+        namespace_id: Uuid,
+        persist: &mut dyn FnMut(&[CapturedMemory]) -> StorageResult<()>,
+    ) -> StorageResult<Vec<CapturedMemory>> {
+        let mut captured = Vec::new();
+        let mut persist_sources = |memories: &[Memory]| {
+            captured = memories
+                .iter()
+                .cloned()
+                .map(|memory| CapturedMemory {
+                    memory,
+                    embeddings: Vec::new(),
+                })
+                .collect();
+            persist(&captured)
+        };
+        self.delete_memories_by_entity_capturing(entity_id, namespace_id, &mut persist_sources)?;
+        Ok(captured)
+    }
+
+    /// Delete one entity's attached memories while handing the exact removed rows to
+    /// `persist_page` in stable pages. Page persistence and count-bearing `finalize`
+    /// execute inside the delete transaction; any callback error rolls the delete back.
+    fn delete_memories_by_entity_paged(
+        &self,
+        _entity_id: Uuid,
+        _namespace_id: Uuid,
+        _page_size: usize,
+        _persist_page: &mut dyn FnMut(&[CapturedMemory]) -> StorageResult<()>,
+        _finalize: &mut dyn FnMut(BulkMutationSummary) -> StorageResult<()>,
+    ) -> StorageResult<BulkMutationSummary> {
+        Err(StorageError::Unsupported(
+            "transactional paged entity capture".into(),
+        ))
+    }
+
     /// Erase everything belonging to `entity_id` within `namespace_id` in ONE
     /// transaction, and hand back the rows it removed.
     ///
@@ -626,6 +1255,17 @@ pub trait StorageTrait: Send + Sync {
         entity_id: Uuid,
         namespace_id: Uuid,
     ) -> StorageResult<ErasedRows>;
+
+    /// Storage-backed GDPR erase that returns counts rather than captured corpus rows.
+    fn erase_entity_bounded(
+        &self,
+        _entity_id: Uuid,
+        _namespace_id: Uuid,
+    ) -> StorageResult<ErasureSummary> {
+        Err(StorageError::Unsupported(
+            "bounded GDPR entity erase".into(),
+        ))
+    }
 
     /// Delete a single memory (episodic, semantic, procedural or observation)
     /// only when it belongs to `namespace_id`.
@@ -700,6 +1340,25 @@ pub trait StorageTrait: Send + Sync {
         &self,
         namespace_id: Uuid,
     ) -> StorageResult<(usize, usize, usize)>; // (episodic, semantic, procedural)
+
+    /// Count live episodic memories about `entity_id` and live semantic
+    /// memories whose subject is `entity_id`, scoped to one namespace.
+    fn count_memories_by_entity_in_namespace(
+        &self,
+        _entity_id: Uuid,
+        _namespace_id: Uuid,
+    ) -> StorageResult<(usize, usize)> {
+        Err(StorageError::Unsupported(
+            "entity-scoped memory counts".into(),
+        ))
+    }
+
+    /// Count active observations in a namespace without loading memory content.
+    fn count_observations_by_namespace(&self, _namespace_id: Uuid) -> StorageResult<usize> {
+        Err(StorageError::Unsupported(
+            "observation count by namespace".into(),
+        ))
+    }
 
     /// Count entities in a namespace.
     fn count_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize>;

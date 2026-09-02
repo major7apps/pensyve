@@ -5,6 +5,60 @@ All notable changes to Pensyve will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Shipping Rust runtimes now use storage-backed exact retrieval exclusively.**
+  The CLI, MCP server, and hosted gateway no longer hydrate whole namespaces or
+  construct per-tenant resident vector corpora. SQLite streams exact cosine search;
+  Postgres ranks in storage. Both apply namespace, identity, entity, supersession,
+  and immutable active-generation filters before their bounded result limits.
+- **Embedding generations now have canonical immutable provenance and a one-session
+  namespace migration lifecycle.** Source/generation mutations are transactional;
+  incomplete, absent, rolled-back, or runtime-mismatched generations degrade to
+  lexical-only retrieval instead of mixing vector spaces or returning partial
+  vector rankings.
+- **Runtime bounds are explicit:** 100 vector hits, 100 lexical hits, 200 fused and
+  hydrated references, 4 MiB hydrated payload, a 50,000-row SQLite exact scan,
+  256-row pages, 64-row consolidation comparisons, 4,096-member promotion clusters,
+  hosted recall admission of 8 / 64 MiB, and 1,024 cached tenant metadata entries
+  with 30-minute idle expiry.
+- **Deployment guidance corrected.** Earlier full-GTE-plus-BGE and 4 GiB sizing is
+  superseded. This candidate does not select or download a production model and
+  does not authorize a production backfill, cutover, infrastructure change, or
+  release; certified real-model evidence and a separately approved rollout remain
+  required.
+
+### Fixed
+
+- **Entity-wide forget closes a snapshot page before the 4 MiB ceiling** instead
+  of rejecting the whole forget when a full 256-row page of individually valid
+  rows exceeds it in aggregate; the remaining rows form the next page.
+- **Consolidation resumes from its persisted cursor.** A cancellation or duration
+  budget that fires before the first page no longer checkpoints the origin over a
+  previously scanned run. `ConsolidationWorkspace` gains `cursor(run)`.
+- **`ConsolidationStats::archived` counts persisted decay updates only.** Semantic
+  memories decay but are never archived, and the bounded loop stopped reporting
+  them as if they were.
+- **`recall_grouped` honors `types` on the legacy in-memory vector source** as well
+  as on storage-backed engines.
+- **Python: observation extraction takes its own permit.** Recall, remember, and
+  consolidation no longer queue behind an extractor round trip; the episode's own
+  rows are durable before the local permit is released.
+- **CLI: a silent mock-embedder fallback stays lexical-only** and never activates a
+  mock generation that a later real model would mismatch.
+- **stdio MCP picks the embedding model from the namespace's active generation**
+  (its persisted dimensionality), so an existing namespace never starts against a
+  mismatched runtime space.
+- **`pensyve_inspect` rejects an unknown `memory_type`** with the same error as
+  `pensyve_recall` instead of answering with an empty page.
+- **Recall overload metrics count awaiting-path rejections** as well as immediate
+  ones.
+- Redundant indexes on `namespace_embedding_state(namespace_id)` and
+  `consolidation_runs(namespace_id, embedding_space_id)` are no longer created;
+  the primary key and unique constraint already index those columns.
+
 ## [3.2.0] - 2026-08-21
 
 ### Changed
@@ -430,7 +484,8 @@ Initial public release of Pensyve — the universal memory runtime for AI agents
 - ONNX embeddings via fastembed (all-MiniLM-L6-v2, 384 dimensions)
 - Brute-force vector index with cosine similarity
 - 8-signal fusion retrieval: vector, BM25, graph, intent, recency, access frequency, confidence, type boost
-- Cross-encoder reranking via BGE reranker
+- Cross-encoder reranking via BGE reranker (historical initial-release behavior;
+  the full-GTE-plus-BGE sizing guidance is superseded by the Unreleased entry above)
 - Graph-based retrieval via petgraph BFS traversal
 - FSRS memory decay with retrieval-induced reinforcement
 - Bayesian procedural tracking (beta-binomial posterior updates)

@@ -1,17 +1,13 @@
-//! Entity-wide deletion through the gateway must strip the vector index of
-//! *every* row it deletes (#261).
+//! Entity-wide deletion through the gateway must strip exact embedding
+//! generations for *every* row it deletes (#261).
 //!
 //! The delete matches episodic rows on `about_entity OR source_entity` and
 //! semantic rows on `subject OR object_entity`, superseded rows included.
-//! Index cleanup that collects ids from `list_episodic_by_entity` /
-//! `list_semantic_by_entity` sees only the about-side, the subject-side and
-//! live rows, so source-side, object-side and superseded entries survive their
-//! base rows: they hydrate to nothing on recall, but they bloat the index and
-//! burn candidate slots on every query.
+//! Generation cleanup must cover source-side and object-side rows, while a
+//! superseded row's generation must already be gone before entity deletion.
 //!
 //! The REST `remember` route only ever creates subject-side semantic rows, so
-//! the fixture seeds storage directly and inserts the ids into the tenant's
-//! index the way `TenantStateManager` does when it warms one from storage.
+//! the fixture seeds exact source-plus-generation records directly.
 //!
 //! One REST test covers the `forget_entity` handler; the A2A `memory.forget`
 //! capability runs the identical cleanup code in `a2a_forget`, so it is not
@@ -23,10 +19,10 @@ use std::sync::Arc;
 use axum::Extension;
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
-use pensyve_core::storage::StorageTrait;
+use pensyve_core::storage::bounded::MemoryRef;
 use pensyve_core::storage::sqlite::SqliteBackend;
-use pensyve_core::types::{Entity, EntityKind, EpisodicMemory, Namespace, SemanticMemory};
-use pensyve_core::vector::VectorIndex;
+use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
+use pensyve_core::types::{Entity, EntityKind, EpisodicMemory, Memory, Namespace, SemanticMemory};
 use pensyve_mcp_gateway::AppState;
 use pensyve_mcp_gateway::auth::{AuthContext, AuthValidator};
 use pensyve_mcp_gateway::config::GatewayConfig;
@@ -72,22 +68,32 @@ fn gateway_config(dir: &TempDir) -> GatewayConfig {
 }
 
 fn app_state(dir: &TempDir, snapshot_root: PathBuf) -> Arc<AppState> {
-    let storage =
-        Arc::new(SqliteBackend::open(dir.path()).expect("open storage")) as Arc<dyn StorageTrait>;
+    let storage = Arc::new(SqliteBackend::open(dir.path()).expect("open storage"));
     let namespace = Namespace::new("default");
     storage
         .save_namespace(&namespace)
         .expect("save default namespace");
+    let tenant_namespace = Namespace::new(format!("tenant:{TEST_TENANT}"));
+    storage
+        .save_namespace(&tenant_namespace)
+        .expect("save tenant namespace");
+    let embedder = Arc::new(OnnxEmbedder::new_mock(DIMENSIONS));
+    storage
+        .initialize_local_runtime_space(
+            tenant_namespace.id,
+            embedder.embedding_space().expect("mock embedding space"),
+        )
+        .expect("initialize tenant embedding space");
 
-    let tenant_mgr = TenantStateManager::new(
-        storage,
-        Arc::new(OnnxEmbedder::new_mock(DIMENSIONS)),
+    let tenant_mgr = TenantStateManager::new_storage_backed(
+        storage as Arc<dyn StorageTrait>,
+        embedder,
         retrieval_config(),
         namespace,
-        VectorIndex::new(DIMENSIONS, 1024),
         snapshot_root,
         pensyve_core::snapshot::RetentionPolicy::UNBOUNDED,
-    );
+    )
+    .expect("construct storage-backed tenant manager");
     let config = gateway_config(dir);
 
     Arc::new(AppState {
@@ -96,6 +102,10 @@ fn app_state(dir: &TempDir, snapshot_root: PathBuf) -> Arc<AppState> {
         usage_reporter: UsageReporter::new(None),
         usage_counter: UsageCounter::new(),
         tenant_mgr,
+        recall_admission: Arc::new(pensyve_mcp_gateway::admission::RecallAdmission::new(
+            8,
+            64 * pensyve_mcp_gateway::admission::MIB,
+        )),
         auth_required: false,
         admin_key: None,
         ct: CancellationToken::new(),
@@ -146,14 +156,25 @@ fn embedding(seed: f32) -> Vec<f32> {
 /// row shape instead of a bare UUID.
 struct Seeded {
     target: Entity,
-    deletable: Vec<(&'static str, Uuid)>,
-    /// A row about a different entity — must survive in storage and in the index.
-    survivor: Uuid,
+    deletable: Vec<(&'static str, MemoryRef)>,
+    superseded: MemoryRef,
+    /// A row about a different entity — its source and generation must survive.
+    survivor: MemoryRef,
 }
 
-/// Seed one row of every shape the entity-wide delete removes, plus a control,
-/// and index them all the way `TenantStateManager` does when warming a tenant.
-async fn seed(state: &AppState) -> Seeded {
+fn save_with_generation(ps: &pensyve_mcp_tools::PensyveState, memory: &Memory) {
+    let record = embedding_record_for_memory(
+        memory,
+        ps.vector_runtime.space(),
+        memory.embedding().to_vec(),
+    );
+    ps.storage
+        .save_memory_with_embedding(memory, Some(&record))
+        .expect("save source and exact generation");
+}
+
+/// Seed one row of every shape the entity-wide delete removes, plus a control.
+fn seed(state: &AppState) -> Seeded {
     let ps = state
         .tenant_mgr
         .get_tenant_state(TEST_TENANT)
@@ -177,27 +198,27 @@ async fn seed(state: &AppState) -> Seeded {
         "the target talking about bob",
     );
     source_side.embedding = embedding(0.1);
-    ps.storage
-        .save_episodic(&source_side)
-        .expect("save source-side episodic");
+    let source_side = Memory::Episodic(source_side);
+    save_with_generation(&ps, &source_side);
+    let source_side_ref = MemoryRef::from_memory(&source_side);
 
     // Object-side semantic: the target is the object of someone else's fact.
     let mut object_side = SemanticMemory::new(namespace_id, other.id, "manages", "alice", 0.9);
     object_side.object_entity = Some(target.id);
     object_side.embedding = embedding(0.2);
-    ps.storage
-        .save_semantic(&object_side)
-        .expect("save object-side semantic");
+    let object_side = Memory::Semantic(object_side);
+    save_with_generation(&ps, &object_side);
+    let object_side_ref = MemoryRef::from_memory(&object_side);
 
     // Superseded semantic: the delete ignores `superseded_by`, so cleanup must.
     let mut superseded = SemanticMemory::new(namespace_id, target.id, "lived_in", "berlin", 0.5);
     superseded.embedding = embedding(0.3);
-    ps.storage
-        .save_semantic(&superseded)
-        .expect("save superseded semantic");
+    let superseded = Memory::Semantic(superseded);
+    save_with_generation(&ps, &superseded);
+    let superseded_ref = MemoryRef::from_memory(&superseded);
     ps.storage
         .supersede_memory_in_namespace(
-            superseded.id,
+            superseded.id(),
             namespace_id,
             Uuid::new_v4(),
             chrono::Utc::now(),
@@ -207,81 +228,95 @@ async fn seed(state: &AppState) -> Seeded {
     // Control: nothing to do with the target.
     let mut survivor = SemanticMemory::new(namespace_id, other.id, "likes", "go", 0.9);
     survivor.embedding = embedding(0.4);
-    ps.storage
-        .save_semantic(&survivor)
-        .expect("save unrelated semantic");
-
-    {
-        let mut index = ps.vector_index.write().await;
-        index
-            .add_with_entity(
-                source_side.id,
-                &source_side.embedding,
-                source_side.about_entity,
-            )
-            .expect("index source-side episodic");
-        index
-            .add_with_entity(object_side.id, &object_side.embedding, object_side.subject)
-            .expect("index object-side semantic");
-        index
-            .add_with_entity(superseded.id, &superseded.embedding, superseded.subject)
-            .expect("index superseded semantic");
-        index
-            .add_with_entity(survivor.id, &survivor.embedding, survivor.subject)
-            .expect("index unrelated semantic");
-    }
+    let survivor = Memory::Semantic(survivor);
+    save_with_generation(&ps, &survivor);
+    let survivor_ref = MemoryRef::from_memory(&survivor);
 
     Seeded {
         target,
         deletable: vec![
-            ("source-side episodic", source_side.id),
-            ("object-side semantic", object_side.id),
-            ("superseded semantic", superseded.id),
+            ("source-side episodic", source_side_ref),
+            ("object-side semantic", object_side_ref),
+            ("superseded semantic", superseded_ref),
         ],
-        survivor: survivor.id,
+        superseded: superseded_ref,
+        survivor: survivor_ref,
     }
 }
 
-async fn assert_all_indexed(state: &AppState, seeded: &Seeded) {
+fn assert_generation_state_before_forget(state: &AppState, seeded: &Seeded) {
     let ps = state
         .tenant_mgr
         .get_tenant_state(TEST_TENANT)
         .expect("tenant state");
-    let index = ps.vector_index.read().await;
-    for (label, id) in &seeded.deletable {
+    let refs: Vec<_> = seeded
+        .deletable
+        .iter()
+        .map(|(_, memory_ref)| *memory_ref)
+        .chain(std::iter::once(seeded.survivor))
+        .collect();
+    let records = ps
+        .storage
+        .load_embedding_records(ps.namespace.id, &ps.vector_runtime.space().id(), &refs)
+        .expect("load seeded generations");
+    for (label, memory_ref) in &seeded.deletable[..2] {
         assert!(
-            index.get(*id).is_some(),
-            "{label} ({id}) must be indexed before the forget, or its absence \
+            records
+                .iter()
+                .any(|record| record.memory_ref == *memory_ref),
+            "{label} ({memory_ref:?}) must have a generation before the forget, or its absence \
              afterwards proves nothing"
         );
     }
-    assert!(index.get(seeded.survivor).is_some());
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.memory_ref == seeded.superseded)
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record.memory_ref == seeded.survivor)
+    );
 }
 
-async fn assert_deletable_gone_from_index(state: &AppState, seeded: &Seeded) {
+fn assert_deletable_generations_gone(state: &AppState, seeded: &Seeded) {
     let ps = state
         .tenant_mgr
         .get_tenant_state(TEST_TENANT)
         .expect("tenant state");
-    let index = ps.vector_index.read().await;
-    for (label, id) in &seeded.deletable {
+    let refs: Vec<_> = seeded
+        .deletable
+        .iter()
+        .map(|(_, memory_ref)| *memory_ref)
+        .chain(std::iter::once(seeded.survivor))
+        .collect();
+    let records = ps
+        .storage
+        .load_embedding_records(ps.namespace.id, &ps.vector_runtime.space().id(), &refs)
+        .expect("load post-forget generations");
+    for (label, memory_ref) in &seeded.deletable {
         assert!(
-            index.get(*id).is_none(),
-            "{label} ({id}) was deleted from storage but its vector-index entry survived"
+            !records
+                .iter()
+                .any(|record| record.memory_ref == *memory_ref),
+            "{label} ({memory_ref:?}) was deleted from storage but its generation survived"
         );
     }
     assert!(
-        index.get(seeded.survivor).is_some(),
-        "the unrelated row's index entry must survive the forget"
+        records
+            .iter()
+            .any(|record| record.memory_ref == seeded.survivor),
+        "the unrelated row's generation must survive the forget"
     );
 }
 
 #[tokio::test]
-async fn rest_forget_strips_the_index_of_every_deleted_row_shape() {
+async fn rest_forget_strips_generations_for_every_deleted_row_shape() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = app_state(&dir, dir.path().join("snapshots"));
-    let seeded = seed(&state).await;
-    assert_all_indexed(&state, &seeded).await;
+    let seeded = seed(&state);
+    assert_generation_state_before_forget(&state, &seeded);
 
     let (url, cancellation) = start_test_server(state.clone()).await;
     let client = reqwest::Client::new();
@@ -298,16 +333,16 @@ async fn rest_forget_strips_the_index_of_every_deleted_row_shape() {
         "the forget must report every row it deleted"
     );
 
-    assert_deletable_gone_from_index(&state, &seeded).await;
+    assert_deletable_generations_gone(&state, &seeded);
     cancellation.cancel();
 }
 
 #[tokio::test]
-async fn gdpr_erase_strips_the_index_of_every_deleted_row_shape() {
+async fn gdpr_erase_strips_generations_for_every_deleted_row_shape() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = app_state(&dir, dir.path().join("snapshots"));
-    let seeded = seed(&state).await;
-    assert_all_indexed(&state, &seeded).await;
+    let seeded = seed(&state);
+    assert_generation_state_before_forget(&state, &seeded);
 
     let (url, cancellation) = start_test_server(state.clone()).await;
     let client = reqwest::Client::new();
@@ -324,6 +359,6 @@ async fn gdpr_erase_strips_the_index_of_every_deleted_row_shape() {
         "the erasure must report every row it deleted"
     );
 
-    assert_deletable_gone_from_index(&state, &seeded).await;
+    assert_deletable_generations_gone(&state, &seeded);
     cancellation.cancel();
 }

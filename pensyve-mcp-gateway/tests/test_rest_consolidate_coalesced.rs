@@ -12,13 +12,12 @@ use std::time::{Duration, Instant};
 use axum::Extension;
 use chrono::Utc;
 use pensyve_core::config::{ConsolidationConfig, RetrievalConfig};
-use pensyve_core::consolidation::ConsolidationEngine;
+use pensyve_core::consolidation::{ConsolidationEngine, ConsolidationOutcome};
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::network_policy::NetworkPolicy;
-use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
+use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{Episode, EpisodicMemory, Memory, Namespace};
-use pensyve_core::vector::VectorIndex;
 use pensyve_mcp_gateway::AppState;
 use pensyve_mcp_gateway::auth::{AuthContext, AuthValidator};
 use pensyve_mcp_gateway::config::GatewayConfig;
@@ -76,16 +75,17 @@ fn app_state(dir: &TempDir) -> Arc<AppState> {
     storage
         .save_namespace(&namespace)
         .expect("save default namespace");
+    let embedder = Arc::new(OnnxEmbedder::new_mock(EMBEDDING_DIMS));
 
-    let tenant_mgr = TenantStateManager::new(
+    let tenant_mgr = TenantStateManager::new_storage_backed(
         storage,
-        Arc::new(OnnxEmbedder::new_mock(EMBEDDING_DIMS)),
+        embedder,
         retrieval_config(),
         namespace,
-        VectorIndex::new(EMBEDDING_DIMS, 1024),
         dir.path().join("snapshots"),
         pensyve_core::snapshot::RetentionPolicy::UNBOUNDED,
-    );
+    )
+    .expect("construct storage-backed tenant manager");
     let config = gateway_config(dir);
 
     Arc::new(AppState {
@@ -94,6 +94,10 @@ fn app_state(dir: &TempDir) -> Arc<AppState> {
         usage_reporter: UsageReporter::new(None),
         usage_counter: UsageCounter::new(),
         tenant_mgr,
+        recall_admission: Arc::new(pensyve_mcp_gateway::admission::RecallAdmission::new(
+            8,
+            64 * pensyve_mcp_gateway::admission::MIB,
+        )),
         auth_required: false,
         admin_key: None,
         ct: CancellationToken::new(),
@@ -166,7 +170,15 @@ fn seed_clusters(storage: &dyn StorageTrait, embedder: &OnnxEmbedder, ns: Uuid) 
                 EpisodicMemory::new(ns, episode.id, source_id, entity_id, content.as_str());
             mem.embedding = embedder.embed(&mem.content).unwrap();
             mem.timestamp = Utc::now() - chrono::Duration::seconds(i);
-            storage.save_episodic(&mem).unwrap();
+            let wrapped = Memory::Episodic(mem.clone());
+            let record = embedding_record_for_memory(
+                &wrapped,
+                embedder.embedding_space().unwrap(),
+                mem.embedding.clone(),
+            );
+            storage
+                .save_memory_with_embedding(&wrapped, Some(&record))
+                .unwrap();
         }
     }
 }
@@ -185,6 +197,9 @@ async fn consolidate_reports_whether_the_request_coalesced() {
         .get_tenant_state(TEST_TENANT)
         .expect("tenant state");
     let ns_id = ps.namespace.id;
+    ps.storage
+        .initialize_local_runtime_space(ns_id, ps.embedder.embedding_space().unwrap())
+        .expect("initialize active embedding space");
     seed_clusters(ps.storage.as_ref(), ps.embedder.as_ref(), ns_id);
 
     // The run this request has to coalesce into. Started off the runtime, as
@@ -193,7 +208,7 @@ async fn consolidate_reports_whether_the_request_coalesced() {
         let storage = ps.storage.clone();
         let embedder = ps.embedder.clone();
         std::thread::spawn(move || {
-            ConsolidationEngine::run(
+            ConsolidationEngine::run_bounded(
                 storage.as_ref(),
                 &embedder,
                 &ConsolidationConfig::default(),
@@ -230,8 +245,13 @@ async fn consolidate_reports_whether_the_request_coalesced() {
         coalesced["promoted"], 0,
         "a coalesced request does no work of its own"
     );
+    assert_eq!(coalesced["status"], "incomplete");
+    assert_eq!(coalesced["incomplete_reason"], "coalesced_pending");
 
-    let owner_stats = owner.join().expect("owner thread");
+    let ConsolidationOutcome::Complete { stats: owner_stats } = owner.join().expect("owner thread")
+    else {
+        panic!("uncancelled owner must complete");
+    };
     assert_eq!(
         owner_stats.promoted, CLUSTERS,
         "the owner's total should span both of its runs"
@@ -246,4 +266,6 @@ async fn consolidate_reports_whether_the_request_coalesced() {
         "a request that ran must not report itself as coalesced"
     );
     assert_eq!(ran["promoted"], 0, "everything was already promoted");
+    assert_eq!(ran["status"], "complete");
+    assert!(ran["incomplete_reason"].is_null());
 }

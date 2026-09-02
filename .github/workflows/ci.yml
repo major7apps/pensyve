@@ -46,6 +46,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      # `pensyve-python` carries in-crate Rust tests that link against
+      # libpython; the toolcache interpreter ships the shared library and
+      # setup-python exports its lib directory on LD_LIBRARY_PATH.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Check bounded shipping runtime callers
+        run: bash scripts/check-bounded-runtime-callers.sh
       - name: Run tests
         run: cargo test --workspace
 

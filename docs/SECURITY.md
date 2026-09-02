@@ -444,14 +444,34 @@ model runs entirely on-device; no data leaves the machine.
 
 ## Execution Bounds
 
-Hard limits prevent runaway operations:
+Hard limits prevent runaway operations and cross-tenant corpus retention:
 
 | Operation | Bound |
 |---|---|
 | Recall query | 5 second timeout |
+| Hosted recall admission | 8 concurrent reservations; 64 MiB reserved working set |
+| Vector / lexical candidates | 100 each |
+| Fused references / hydrated payload | 200 references; 4 MiB |
+| SQLite exact-vector scan | 50,000 eligible active-generation rows |
+| Memory page | 256 rows |
 | Consolidation cycle | 60 second maximum |
+| Consolidation comparison / promotion | 64 candidates; 4,096 members |
+| Tenant metadata cache | 1,024 entries; 30-minute idle expiry |
 | Episode TTL | 30 minutes (REST API) |
-| Embedding batch | Bounded by available memory; uses streaming |
+| Embedding migration page | 256 rows; one target session per namespace |
+
+Shipping runtimes hold no resident namespace vector corpus. Exact search applies
+namespace and immutable active-generation identity in storage before ranking;
+hydration is a separate bounded step. Missing or mismatched embedding provenance
+degrades to lexical-only retrieval, never a mixed or partial vector ranking. Source
+and embedding-generation mutations commit transactionally across remember, update,
+supersede, forget, erase, restore, and backfill paths.
+
+These contracts are common to local SQLite and hosted Postgres. They do not approve
+a deployment: no production model has been selected or downloaded, no production
+data has been backfilled, and no cutover has been authorized. Earlier full-GTE-plus-
+BGE and 4 GiB deployment guidance is superseded; sizing requires separate certified
+model evidence and an approved rollout plan.
 
 ## Rate Limiting
 

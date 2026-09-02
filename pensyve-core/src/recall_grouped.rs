@@ -319,21 +319,22 @@ pub fn attach_observations_to_groups(
         return groups;
     }
 
-    // `limit` is set generously; at our expected 50-top-k workload the
-    // per-group observation count is typically 2-5, so a few hundred is
-    // well above ceiling. Future phase: configurable cap.
-    let observations =
-        match storage.list_observations_by_episode_ids(namespace_id, &episode_ids, 1024) {
-            Ok(obs) => obs,
-            Err(e) => {
-                tracing::warn!(
-                    target: "pensyve::observation",
-                    error = %e,
-                    "failed to load observations for session groups — returning groups unchanged"
-                );
-                return groups;
-            }
-        };
+    let observations = match storage.list_observation_enrichments_by_episode_ids(
+        namespace_id,
+        &episode_ids,
+        crate::storage::bounded::MAX_FUSED_HITS,
+        crate::storage::bounded::MAX_HYDRATED_BYTES,
+    ) {
+        Ok(obs) => obs,
+        Err(e) => {
+            tracing::warn!(
+                target: "pensyve::observation",
+                error = %e,
+                "failed to load observations for session groups — returning groups unchanged"
+            );
+            return groups;
+        }
+    };
 
     if observations.is_empty() {
         return groups;
@@ -341,7 +342,18 @@ pub fn attach_observations_to_groups(
 
     // Bucket observations by episode id.
     let mut by_episode: HashMap<Uuid, Vec<crate::types::ObservationMemory>> = HashMap::new();
+    let mut serialized_bytes = 0usize;
     for obs in observations {
+        let Ok(bytes) = serde_json::to_vec(&obs) else {
+            continue;
+        };
+        let Some(next_bytes) = serialized_bytes.checked_add(bytes.len()) else {
+            break;
+        };
+        if next_bytes > crate::storage::bounded::MAX_HYDRATED_BYTES {
+            break;
+        }
+        serialized_bytes = next_bytes;
         by_episode.entry(obs.episode_id).or_default().push(obs);
     }
 
@@ -845,6 +857,55 @@ mod tests {
 
         assert_eq!(attached.len(), 1);
         assert_eq!(attached[0].memories.len(), 1);
+    }
+
+    #[test]
+    fn attach_excludes_legacy_vectors_and_bounds_serialized_enrichment() {
+        let (_dir, db, ns) = setup_storage_with_namespace();
+        let episode_id = Uuid::new_v4();
+        for number in 0..8 {
+            let mut observation = ObservationMemory::new(
+                ns.id,
+                episode_id,
+                "large-observation",
+                format!("instance-{number}"),
+                "observed",
+                format!("{number}:{}", "x".repeat(400_000)),
+            );
+            observation.embedding = vec![1.0; 50_000];
+            db.save_observation(&observation).unwrap();
+        }
+
+        let groups = group_by_session(
+            vec![scored(ep_at(episode_id, t(2026, 1, 1), "source turn"), 0.5)],
+            OrderBy::Chronological,
+            None,
+        );
+        let attached = attach_observations_to_groups(&db, ns.id, groups);
+        let observations = attached[0]
+            .memories
+            .iter()
+            .filter_map(|scored| match &scored.memory {
+                Memory::Observation(observation) => Some(observation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!observations.is_empty());
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.embedding.is_empty()),
+            "grouped enrichment must not hydrate legacy inline vectors"
+        );
+        let serialized_bytes = observations
+            .iter()
+            .map(|observation| serde_json::to_vec(observation).unwrap().len())
+            .sum::<usize>();
+        assert!(
+            serialized_bytes <= crate::storage::bounded::MAX_HYDRATED_BYTES,
+            "serialized observation enrichment used {serialized_bytes} bytes"
+        );
     }
 
     #[test]

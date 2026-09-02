@@ -10,6 +10,9 @@ use fastembed::{
     UserDefinedEmbeddingModel,
 };
 
+use crate::embedding_space::{
+    EmbeddingSpace, EmbeddingSpaceDescriptor, LocalArtifactFiles, MOCK_ALGORITHM_VERSION,
+};
 use crate::network_policy::{NetworkPolicy, NetworkRequiredError};
 
 // ---------------------------------------------------------------------------
@@ -77,6 +80,7 @@ const CACHE_ERROR_PREFIX: &str = "[embedding-cache] ";
 
 #[derive(Clone, Debug)]
 struct LocalEmbeddingFiles {
+    revision: String,
     config: PathBuf,
     onnx: PathBuf,
     special_tokens_map: PathBuf,
@@ -141,6 +145,7 @@ fn preflight_model_cache(
         }
     }
     Ok(LocalEmbeddingFiles {
+        revision,
         config: snapshot.join("config.json"),
         onnx,
         special_tokens_map: snapshot.join("special_tokens_map.json"),
@@ -198,6 +203,7 @@ enum EmbedderInner {
     Mock,
     Real {
         pool: Vec<Mutex<TextEmbedding>>,
+        files: LocalEmbeddingFiles,
         next: AtomicUsize,
     },
     /// Deferred variant: the ONNX session pool (and any load-time HF
@@ -211,9 +217,14 @@ enum EmbedderInner {
         model_file: &'static str,
         policy: NetworkPolicy,
         pool_size: usize,
-        pool: Mutex<Option<Arc<Vec<Mutex<TextEmbedding>>>>>,
+        pool: Mutex<Option<Arc<LazyEmbedderPool>>>,
         next: AtomicUsize,
     },
+}
+
+struct LazyEmbedderPool {
+    pool: Vec<Mutex<TextEmbedding>>,
+    files: LocalEmbeddingFiles,
 }
 
 // ---------------------------------------------------------------------------
@@ -357,18 +368,23 @@ fn build_pool_with_policy_at_cache(
     policy: &NetworkPolicy,
     pool_size: usize,
     cache_dir: &Path,
-) -> EmbeddingResult<Vec<Mutex<TextEmbedding>>> {
+) -> EmbeddingResult<(Vec<Mutex<TextEmbedding>>, LocalEmbeddingFiles)> {
     match preflight_model_cache(cache_dir, hf_model_code, model_file) {
-        Ok(files) if !matches!(policy, NetworkPolicy::Permissive) => {
-            build_local_pool(model, &files, pool_size)
-        }
-        Ok(_) => build_hugging_face_pool(model, pool_size, cache_dir),
+        Ok(files) => Ok((build_local_pool(model, &files, pool_size)?, files)),
         Err(detail) => {
             let hf_url = format!("https://huggingface.co/{hf_model_code}");
             policy.check(&hf_url).map_err(|policy_error| {
                 EmbeddingError::Network(format!("{CACHE_ERROR_PREFIX}{detail}; {policy_error}"))
             })?;
-            build_hugging_face_pool(model, pool_size, cache_dir)
+            // Fastembed owns the download path. Discard its sessions, then
+            // construct the returned pool from the one certified snapshot we
+            // retain as provenance; otherwise a later `refs/main` update
+            // could label vectors with a different artifact set.
+            drop(build_hugging_face_pool(model, 1, cache_dir)?);
+            let files = preflight_model_cache(cache_dir, hf_model_code, model_file)
+                .map_err(cache_model_load_error)?;
+            let pool = build_local_pool(model, &files, pool_size)?;
+            Ok((pool, files))
         }
     }
 }
@@ -379,7 +395,7 @@ fn build_pool_with_policy(
     model_file: &str,
     policy: &NetworkPolicy,
     pool_size: usize,
-) -> EmbeddingResult<Vec<Mutex<TextEmbedding>>> {
+) -> EmbeddingResult<(Vec<Mutex<TextEmbedding>>, LocalEmbeddingFiles)> {
     let cache_dir = resolved_fastembed_cache_dir()?;
     build_pool_with_policy_at_cache(
         model,
@@ -397,7 +413,10 @@ fn build_pool_with_policy(
 
 pub struct OnnxEmbedder {
     dimensions: usize,
+    descriptor: Option<EmbeddingSpaceDescriptor>,
     inner: EmbedderInner,
+    space: OnceLock<EmbeddingSpace>,
+    space_init: Mutex<()>,
 }
 
 impl OnnxEmbedder {
@@ -451,7 +470,7 @@ impl OnnxEmbedder {
         cache_dir: &Path,
     ) -> EmbeddingResult<Self> {
         let (model_enum, dims, hf_model_code, model_file) = resolve_model(model_name)?;
-        let pool = build_pool_with_policy_at_cache(
+        let (pool, files) = build_pool_with_policy_at_cache(
             &model_enum,
             hf_model_code,
             model_file,
@@ -462,10 +481,14 @@ impl OnnxEmbedder {
 
         Ok(Self {
             dimensions: dims,
+            descriptor: Some(embedding_space_descriptor(model_name, dims, &model_enum)),
             inner: EmbedderInner::Real {
                 pool,
+                files,
                 next: AtomicUsize::new(0),
             },
+            space: OnceLock::new(),
+            space_init: Mutex::new(()),
         })
     }
 
@@ -508,6 +531,7 @@ impl OnnxEmbedder {
         let (model_enum, dims, hf_model_code, model_file) = resolve_model(model_name)?;
         Ok(Self {
             dimensions: dims,
+            descriptor: Some(embedding_space_descriptor(model_name, dims, &model_enum)),
             inner: EmbedderInner::Lazy {
                 model: model_enum,
                 hf_model_code,
@@ -517,6 +541,8 @@ impl OnnxEmbedder {
                 pool: Mutex::new(None),
                 next: AtomicUsize::new(0),
             },
+            space: OnceLock::new(),
+            space_init: Mutex::new(()),
         })
     }
 
@@ -525,7 +551,7 @@ impl OnnxEmbedder {
     /// serialize instead of double-loading. Errors are returned without
     /// being cached so a transient failure (e.g. download denied/offline)
     /// is retried on the next call.
-    fn ensure_lazy_pool(&self) -> EmbeddingResult<Arc<Vec<Mutex<TextEmbedding>>>> {
+    fn ensure_lazy_pool(&self) -> EmbeddingResult<Arc<LazyEmbedderPool>> {
         let EmbedderInner::Lazy {
             model,
             hf_model_code,
@@ -549,13 +575,9 @@ impl OnnxEmbedder {
         }
 
         tracing::info!("Lazily loading ONNX embedder (pool_size={pool_size})");
-        let built = Arc::new(build_pool_with_policy(
-            model,
-            hf_model_code,
-            model_file,
-            policy,
-            *pool_size,
-        )?);
+        let (pool, files) =
+            build_pool_with_policy(model, hf_model_code, model_file, policy, *pool_size)?;
+        let built = Arc::new(LazyEmbedderPool { pool, files });
         *guard = Some(Arc::clone(&built));
         Ok(built)
     }
@@ -586,6 +608,17 @@ impl OnnxEmbedder {
         policy: &NetworkPolicy,
     ) -> EmbeddingResult<Arc<Self>> {
         let pool_size = resolved_embedding_pool_size();
+        Self::new_cached_with_policy_and_pool_size(model_name, policy, pool_size)
+    }
+
+    /// Policy-aware cached constructor with an explicit session-pool size.
+    /// Shipping runtimes use this to pin one session independently of
+    /// process-global harness tuning.
+    pub fn new_cached_with_policy_and_pool_size(
+        model_name: &str,
+        policy: &NetworkPolicy,
+        pool_size: usize,
+    ) -> EmbeddingResult<Arc<Self>> {
         let cache_dir = resolved_fastembed_cache_dir()?;
         if !matches!(policy, NetworkPolicy::Permissive) {
             let (_, _, hf_model_code, model_file) = resolve_model(model_name)?;
@@ -613,7 +646,10 @@ impl OnnxEmbedder {
     pub fn new_mock(dimensions: usize) -> Self {
         Self {
             dimensions,
+            descriptor: None,
             inner: EmbedderInner::Mock,
+            space: OnceLock::new(),
+            space_init: Mutex::new(()),
         }
     }
 
@@ -629,10 +665,10 @@ impl OnnxEmbedder {
     pub fn embed(&self, text: &str) -> EmbeddingResult<Vec<f32>> {
         match &self.inner {
             EmbedderInner::Mock => Ok(mock_embed(text, self.dimensions)),
-            EmbedderInner::Real { pool, next } => embed_one_in_pool(pool, next, text),
+            EmbedderInner::Real { pool, next, .. } => embed_one_in_pool(pool, next, text),
             EmbedderInner::Lazy { next, .. } => {
                 let pool = self.ensure_lazy_pool()?;
-                embed_one_in_pool(&pool, next, text)
+                embed_one_in_pool(&pool.pool, next, text)
             }
         }
     }
@@ -644,10 +680,10 @@ impl OnnxEmbedder {
                 .iter()
                 .map(|t| Ok(mock_embed(t, self.dimensions)))
                 .collect(),
-            EmbedderInner::Real { pool, next } => embed_batch_in_pool(pool, next, texts),
+            EmbedderInner::Real { pool, next, .. } => embed_batch_in_pool(pool, next, texts),
             EmbedderInner::Lazy { next, .. } => {
                 let pool = self.ensure_lazy_pool()?;
-                embed_batch_in_pool(&pool, next, texts)
+                embed_batch_in_pool(&pool.pool, next, texts)
             }
         }
     }
@@ -655,6 +691,83 @@ impl OnnxEmbedder {
     /// Return the embedding dimensionality.
     pub fn dimensions(&self) -> usize {
         self.dimensions
+    }
+
+    /// Return the exact immutable embedding space used by this embedder.
+    ///
+    /// Real spaces are only constructed from an on-disk certified cache: a
+    /// model name and dimension never stand in for artifact provenance.
+    pub fn embedding_space(&self) -> EmbeddingResult<&EmbeddingSpace> {
+        if let Some(space) = self.space.get() {
+            return Ok(space);
+        }
+        let _guard = self.space_init.lock().map_err(|error| {
+            EmbeddingError::Inference(format!("embedding-space lock poisoned: {error}"))
+        })?;
+        if let Some(space) = self.space.get() {
+            return Ok(space);
+        }
+        let resolved = match &self.inner {
+            EmbedderInner::Mock => Ok(EmbeddingSpace::mock(
+                self.dimensions,
+                MOCK_ALGORITHM_VERSION,
+            )),
+            EmbedderInner::Real { files, .. } => self.embedding_space_from_files(files),
+            EmbedderInner::Lazy { .. } => {
+                let loaded = self.ensure_lazy_pool()?;
+                self.embedding_space_from_files(&loaded.files)
+            }
+        }?;
+        self.space.set(resolved).map_err(|_| {
+            EmbeddingError::Inference("embedding space was concurrently initialized".into())
+        })?;
+        self.space.get().ok_or_else(|| {
+            EmbeddingError::Inference("embedding space initialization did not persist".into())
+        })
+    }
+
+    fn embedding_space_from_files(
+        &self,
+        files: &LocalEmbeddingFiles,
+    ) -> EmbeddingResult<EmbeddingSpace> {
+        let descriptor = self.descriptor.as_ref().ok_or_else(|| {
+            EmbeddingError::Inference("mock embedder has no local artifacts".into())
+        })?;
+        let files = LocalArtifactFiles {
+            revision: files.revision.clone(),
+            config: files.config.clone(),
+            onnx: files.onnx.clone(),
+            special_tokens_map: files.special_tokens_map.clone(),
+            tokenizer: files.tokenizer.clone(),
+            tokenizer_config: files.tokenizer_config.clone(),
+        };
+        EmbeddingSpace::from_hashed_files(descriptor, &files).map_err(|error| {
+            cache_model_load_error(format!(
+                "failed to hash certified local embedding artifacts: {error}"
+            ))
+        })
+    }
+}
+
+fn embedding_space_descriptor(
+    model_name: &str,
+    dimensions: usize,
+    model: &EmbeddingModel,
+) -> EmbeddingSpaceDescriptor {
+    let pooling = match model {
+        EmbeddingModel::GTEBaseENV15 => "cls",
+        EmbeddingModel::AllMiniLML6V2 => "mean",
+        _ => "fastembed-default",
+    };
+    EmbeddingSpaceDescriptor {
+        model_name: model_name.to_owned(),
+        dimensions,
+        pooling: pooling.to_owned(),
+        normalized: true,
+        query_prefix: String::new(),
+        document_prefix: String::new(),
+        truncation: 512,
+        runtime: FASTEMBED_RUNTIME.to_owned(),
     }
 }
 
@@ -752,6 +865,11 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Runtime component of every fastembed-backed embedding-space identity. A
+/// unit test pins it to the version resolved in `Cargo.lock`, so a dependency
+/// bump cannot leave vectors stamped with a stale runtime.
+const FASTEMBED_RUNTIME: &str = "fastembed-6.0.1/onnxruntime";
 
 #[cfg(test)]
 #[allow(
@@ -1108,6 +1226,25 @@ mod tests {
             "Similar sentences should have higher similarity: sim_ab={:.4}, sim_ac={:.4}",
             sim_ab,
             sim_ac
+        );
+    }
+
+    #[test]
+    fn runtime_descriptor_tracks_the_resolved_fastembed_version() {
+        let lock = include_str!("../../Cargo.lock");
+        let version = lock
+            .split("[[package]]")
+            .find(|package| package.contains("name = \"fastembed\""))
+            .and_then(|package| {
+                package
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix("version = \""))
+            })
+            .map(|rest| rest.trim_end_matches('"'))
+            .expect("fastembed is resolved in Cargo.lock");
+        assert_eq!(
+            FASTEMBED_RUNTIME,
+            format!("fastembed-{version}/onnxruntime")
         );
     }
 }

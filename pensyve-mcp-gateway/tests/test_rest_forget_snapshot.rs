@@ -7,6 +7,7 @@
 //! written aborts the delete rather than losing rows silently.
 
 use std::future::Future;
+use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -15,9 +16,9 @@ use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::snapshot::RetentionPolicy;
 use pensyve_core::storage::StorageTrait;
+use pensyve_core::storage::bounded::{MemoryRef, MemoryType};
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::Namespace;
-use pensyve_core::vector::VectorIndex;
 use pensyve_mcp_gateway::AppState;
 use pensyve_mcp_gateway::auth::{AuthContext, AuthValidator};
 use pensyve_mcp_gateway::config::GatewayConfig;
@@ -76,22 +77,32 @@ fn app_state_with_retention(
     snapshot_root: PathBuf,
     snapshot_retention: RetentionPolicy,
 ) -> Arc<AppState> {
-    let storage =
-        Arc::new(SqliteBackend::open(dir.path()).expect("open storage")) as Arc<dyn StorageTrait>;
+    let storage = Arc::new(SqliteBackend::open(dir.path()).expect("open storage"));
     let namespace = Namespace::new("default");
     storage
         .save_namespace(&namespace)
         .expect("save default namespace");
+    let tenant_namespace = Namespace::new(format!("tenant:{TEST_TENANT}"));
+    storage
+        .save_namespace(&tenant_namespace)
+        .expect("save tenant namespace");
+    let embedder = Arc::new(OnnxEmbedder::new_mock(768));
+    storage
+        .initialize_local_runtime_space(
+            tenant_namespace.id,
+            embedder.embedding_space().expect("mock embedding space"),
+        )
+        .expect("initialize tenant embedding space");
 
-    let tenant_mgr = TenantStateManager::new(
-        storage,
-        Arc::new(OnnxEmbedder::new_mock(768)),
+    let tenant_mgr = TenantStateManager::new_storage_backed(
+        storage as Arc<dyn StorageTrait>,
+        embedder,
         retrieval_config(),
         namespace,
-        VectorIndex::new(768, 1024),
         snapshot_root,
         snapshot_retention,
-    );
+    )
+    .expect("construct storage-backed tenant manager");
     let config = gateway_config(dir);
 
     Arc::new(AppState {
@@ -100,6 +111,10 @@ fn app_state_with_retention(
         usage_reporter: UsageReporter::new(None),
         usage_counter: UsageCounter::new(),
         tenant_mgr,
+        recall_admission: Arc::new(pensyve_mcp_gateway::admission::RecallAdmission::new(
+            8,
+            64 * pensyve_mcp_gateway::admission::MIB,
+        )),
         auth_required: false,
         admin_key: None,
         ct: CancellationToken::new(),
@@ -201,30 +216,34 @@ async fn a2a_forget(client: &reqwest::Client, url: &str, entity: &str) -> Value 
     response.json().await.expect("a2a forget response JSON")
 }
 
-/// Asserts every id is present in the vector index. Run before a forget so the
-/// absence checks afterward prove removal rather than never-indexed ids.
-async fn assert_indexed(state: &AppState, ids: &[Uuid]) {
+/// Assert every semantic source has its exact active embedding generation.
+fn assert_generations_present(state: &AppState, ids: &[Uuid]) {
     let ps = state
         .tenant_mgr
         .get_tenant_state(TEST_TENANT)
         .expect("tenant state");
-    let vector_index = ps.vector_index.read().await;
-    for id in ids {
-        assert!(
-            vector_index.get(*id).is_some(),
-            "memory {id} must be indexed before the forget"
-        );
-    }
+    let refs: Vec<_> = ids
+        .iter()
+        .map(|id| MemoryRef {
+            memory_type: MemoryType::Semantic,
+            id: *id,
+        })
+        .collect();
+    let records = ps
+        .storage
+        .load_embedding_records(ps.namespace.id, &ps.vector_runtime.space().id(), &refs)
+        .expect("load semantic generations");
+    assert_eq!(records.len(), ids.len());
 }
 
 /// Asserts the reference points at a real snapshot holding exactly `expected`
-/// and returns the parsed artifact.
+/// and returns the artifact path.
 fn assert_reference_matches_file(
     reference: &Value,
     snapshot_root: &std::path::Path,
     namespace_id: Uuid,
     expected: &[Uuid],
-) -> pensyve_core::snapshot::ForgetSnapshot {
+) -> PathBuf {
     // The reference is by id only: remote callers cannot use a server-local
     // filesystem path, so exposing one would only leak the snapshot layout.
     assert!(
@@ -242,16 +261,41 @@ fn assert_reference_matches_file(
         panic!("expected exactly one snapshot artifact, found {entries:?}");
     };
 
-    let snapshot = pensyve_core::snapshot::read_file(path).expect("snapshot round-trips");
-    let mut got = snapshot.memory_ids();
+    let mut got = Vec::new();
+    pensyve_core::snapshot::for_each_memory_id(path, |id| {
+        got.push(id);
+        Ok(())
+    })
+    .expect("snapshot round-trips");
     got.sort();
     let mut want = expected.to_vec();
     want.sort();
     assert_eq!(got, want, "snapshot must hold exactly the deleted rows");
 
-    assert_eq!(reference["snapshot_id"], snapshot.snapshot_id.to_string());
-    assert_eq!(reference["format_version"], snapshot.format_version);
-    assert_eq!(reference["captured_at"], snapshot.captured_at.to_rfc3339());
+    let mut lines =
+        std::io::BufReader::new(std::fs::File::open(path).expect("open snapshot")).lines();
+    let header: Value = serde_json::from_str(
+        &lines
+            .next()
+            .expect("snapshot header line")
+            .expect("read snapshot header"),
+    )
+    .expect("parse snapshot header");
+    assert_eq!(reference["snapshot_id"], header["snapshot_id"]);
+    assert_eq!(reference["format_version"], header["format_version"]);
+    let reference_captured_at = chrono::DateTime::parse_from_rfc3339(
+        reference["captured_at"]
+            .as_str()
+            .expect("reference captured_at string"),
+    )
+    .expect("reference captured_at timestamp");
+    let header_captured_at = chrono::DateTime::parse_from_rfc3339(
+        header["captured_at"]
+            .as_str()
+            .expect("header captured_at string"),
+    )
+    .expect("header captured_at timestamp");
+    assert_eq!(reference_captured_at, header_captured_at);
     assert_eq!(reference["memory_count"], expected.len());
     assert_eq!(reference["semantic_count"], expected.len());
     assert_eq!(reference["episodic_count"], 0);
@@ -261,7 +305,7 @@ fn assert_reference_matches_file(
         "the response must state whether the artifact is owner-only"
     );
 
-    snapshot
+    path.clone()
 }
 
 #[tokio::test]
@@ -274,14 +318,14 @@ async fn rest_forget_writes_a_snapshot_and_returns_its_reference() {
     let client = reqwest::Client::new();
     let tea = remember(&client, &url, "alice", "likes tea").await;
     let rust = remember(&client, &url, "alice", "uses rust").await;
-    assert_indexed(&state, &[tea, rust]).await;
+    assert_generations_present(&state, &[tea, rust]);
 
     let response = forget(&client, &url, "alice").await;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let body: Value = response.json().await.expect("forget response JSON");
     assert_eq!(body["forgotten_count"], 2);
 
-    let snapshot = assert_reference_matches_file(
+    let snapshot_path = assert_reference_matches_file(
         &body["snapshot"],
         &snapshot_root,
         namespace_id,
@@ -294,13 +338,10 @@ async fn rest_forget_writes_a_snapshot_and_returns_its_reference() {
         .tenant_mgr
         .get_tenant_state(TEST_TENANT)
         .expect("tenant state");
-    pensyve_core::snapshot::restore(ps.storage.as_ref(), &snapshot).expect("restore");
+    pensyve_core::snapshot::restore_file(ps.storage.as_ref(), &snapshot_path).expect("restore");
     assert_eq!(stored_memory_count(&state), 2);
 
-    let vector_index = ps.vector_index.read().await;
-    assert!(vector_index.get(tea).is_none());
-    assert!(vector_index.get(rust).is_none());
-    drop(vector_index);
+    assert_generations_present(&state, &[tea, rust]);
     cancellation.cancel();
 }
 
@@ -353,13 +394,13 @@ async fn a2a_forget_writes_a_snapshot_and_returns_its_reference() {
     let client = reqwest::Client::new();
     let tea = remember(&client, &url, "alice", "likes tea").await;
     let rust = remember(&client, &url, "alice", "uses rust").await;
-    assert_indexed(&state, &[tea, rust]).await;
+    assert_generations_present(&state, &[tea, rust]);
 
     let body = a2a_forget(&client, &url, "alice").await;
     assert_eq!(body["status"], "completed");
     assert_eq!(body["output"]["forgotten_count"], 2);
 
-    let snapshot = assert_reference_matches_file(
+    let snapshot_path = assert_reference_matches_file(
         &body["output"]["snapshot"],
         &snapshot_root,
         namespace_id,
@@ -371,13 +412,10 @@ async fn a2a_forget_writes_a_snapshot_and_returns_its_reference() {
         .tenant_mgr
         .get_tenant_state(TEST_TENANT)
         .expect("tenant state");
-    pensyve_core::snapshot::restore(ps.storage.as_ref(), &snapshot).expect("restore");
+    pensyve_core::snapshot::restore_file(ps.storage.as_ref(), &snapshot_path).expect("restore");
     assert_eq!(stored_memory_count(&state), 2);
 
-    let vector_index = ps.vector_index.read().await;
-    assert!(vector_index.get(tea).is_none());
-    assert!(vector_index.get(rust).is_none());
-    drop(vector_index);
+    assert_generations_present(&state, &[tea, rust]);
     cancellation.cancel();
 }
 
@@ -539,10 +577,19 @@ async fn rest_forget_evicts_snapshots_beyond_the_per_namespace_quota() {
     let mut captured: Vec<String> = remaining
         .iter()
         .map(|path| {
-            pensyve_core::snapshot::read_file(path)
-                .expect("surviving snapshots stay readable")
-                .captured_at
-                .to_rfc3339()
+            let mut lines =
+                std::io::BufReader::new(std::fs::File::open(path).expect("open snapshot")).lines();
+            let header: Value = serde_json::from_str(
+                &lines
+                    .next()
+                    .expect("snapshot header line")
+                    .expect("read snapshot header"),
+            )
+            .expect("surviving snapshots stay readable");
+            header["captured_at"]
+                .as_str()
+                .expect("captured_at string")
+                .to_owned()
         })
         .collect();
     captured.sort();

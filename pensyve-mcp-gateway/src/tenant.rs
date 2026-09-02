@@ -1,9 +1,8 @@
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use dashmap::mapref::entry::Entry;
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use pensyve_core::config::RetrievalConfig;
@@ -12,23 +11,40 @@ use pensyve_core::reranker::Reranker;
 use pensyve_core::snapshot::RetentionPolicy;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::types::Namespace;
-use pensyve_core::vector::VectorIndex;
+use pensyve_mcp_tools::{PensyveState, VectorRuntime};
 
-use pensyve_mcp_tools::PensyveState;
+const MAX_CACHED_TENANTS: usize = 1_024;
+const TENANT_TIME_TO_IDLE: Duration = Duration::from_secs(30 * 60);
+type TenantClock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+#[derive(Clone)]
+struct TenantMetadata {
+    // Owned values only: no request-state Arc and no back-reference from a
+    // resolved PensyveState can retain this cache entry after eviction.
+    namespace: Namespace,
+    last_accessed: Instant,
+}
 
 /// Manages per-tenant `PensyveState` instances.
 ///
 /// Each API key (tenant) gets an isolated namespace so tenants cannot
 /// read, modify, or delete each other's memories. The storage backend,
-/// embedder, and retrieval config are shared; only the namespace and
-/// vector index differ per tenant.
+/// embedder, and retrieval config are shared; the bounded cache owns only
+/// namespace metadata and access timestamps. In storage-backed shipping mode,
+/// every returned state is an ephemeral view containing the owned namespace
+/// value plus shared process-resource `Arc`s; it has no link back to its cache
+/// entry, owns no corpus, and does not copy a model session. Consequently an
+/// eviction leaves zero live evicted metadata contexts even if a request still
+/// holds its view. Recall work is separately bounded by process admission; the
+/// number of lightweight request views is not claimed to be admission-bounded.
 pub struct TenantStateManager {
     storage: Arc<dyn StorageTrait>,
     embedder: Arc<OnnxEmbedder>,
     retrieval_config: RetrievalConfig,
     default_state: Arc<PensyveState>,
-    dimensions: usize,
-    tenants: DashMap<String, Arc<PensyveState>>,
+    tenants: DashMap<String, TenantMetadata>,
+    cache_gate: Mutex<()>,
+    clock: TenantClock,
     /// Shared across every tenant's `PensyveState` so the reranker model
     /// resolves (or fails, with a single warning) at most once per gateway
     /// process rather than once per tenant.
@@ -47,25 +63,24 @@ pub struct TenantStateManager {
 }
 
 impl TenantStateManager {
-    pub fn new(
+    pub fn new_storage_backed(
         storage: Arc<dyn StorageTrait>,
         embedder: Arc<OnnxEmbedder>,
         retrieval_config: RetrievalConfig,
         default_namespace: Namespace,
-        default_vector_index: VectorIndex,
         snapshot_root: PathBuf,
         snapshot_retention: RetentionPolicy,
-    ) -> Self {
+    ) -> Result<Self, std::io::Error> {
         let reranker_cell = Arc::new(OnceLock::new());
         Self::new_with_reranker_cell(
             storage,
             embedder,
             retrieval_config,
             default_namespace,
-            default_vector_index,
             snapshot_root,
             snapshot_retention,
             reranker_cell,
+            Arc::new(Instant::now),
         )
     }
 
@@ -76,26 +91,48 @@ impl TenantStateManager {
         clippy::too_many_arguments,
         reason = "mirrors the compatibility constructor plus the required preinitialized model"
     )]
-    pub fn new_with_preinitialized_reranker(
+    pub fn new_storage_backed_with_preinitialized_reranker(
         storage: Arc<dyn StorageTrait>,
         embedder: Arc<OnnxEmbedder>,
         retrieval_config: RetrievalConfig,
         default_namespace: Namespace,
-        default_vector_index: VectorIndex,
         snapshot_root: PathBuf,
         snapshot_retention: RetentionPolicy,
         reranker: Arc<Reranker>,
-    ) -> Self {
+    ) -> Result<Self, std::io::Error> {
         let reranker_cell = PensyveState::preinitialized_reranker_cell(reranker);
         Self::new_with_reranker_cell(
             storage,
             embedder,
             retrieval_config,
             default_namespace,
-            default_vector_index,
             snapshot_root,
             snapshot_retention,
             reranker_cell,
+            Arc::new(Instant::now),
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_clock(
+        storage: Arc<dyn StorageTrait>,
+        embedder: Arc<OnnxEmbedder>,
+        retrieval_config: RetrievalConfig,
+        default_namespace: Namespace,
+        snapshot_root: PathBuf,
+        snapshot_retention: RetentionPolicy,
+        clock: TenantClock,
+    ) -> Result<Self, std::io::Error> {
+        Self::new_with_reranker_cell(
+            storage,
+            embedder,
+            retrieval_config,
+            default_namespace,
+            snapshot_root,
+            snapshot_retention,
+            Arc::new(OnceLock::new()),
+            clock,
         )
     }
 
@@ -108,16 +145,21 @@ impl TenantStateManager {
         embedder: Arc<OnnxEmbedder>,
         retrieval_config: RetrievalConfig,
         default_namespace: Namespace,
-        default_vector_index: VectorIndex,
         snapshot_root: PathBuf,
         snapshot_retention: RetentionPolicy,
         reranker_cell: Arc<OnceLock<Option<Arc<Reranker>>>>,
-    ) -> Self {
-        let dimensions = default_vector_index.dimensions();
+        clock: TenantClock,
+    ) -> Result<Self, std::io::Error> {
+        let vector_runtime = VectorRuntime::resolve_storage_backed(
+            storage.as_ref(),
+            &embedder,
+            default_namespace.id,
+        )
+        .map_err(std::io::Error::other)?;
         let default_state = Arc::new(PensyveState {
             storage: storage.clone(),
             embedder: embedder.clone(),
-            vector_index: RwLock::new(default_vector_index),
+            vector_runtime,
             namespace: default_namespace,
             retrieval_config: retrieval_config.clone(),
             is_remote: true,
@@ -126,17 +168,18 @@ impl TenantStateManager {
             snapshot_retention,
         });
 
-        Self {
+        Ok(Self {
             storage,
             embedder,
             retrieval_config,
             default_state,
-            dimensions,
             tenants: DashMap::new(),
+            cache_gate: Mutex::new(()),
+            clock,
             reranker_cell,
             snapshot_root,
             snapshot_retention,
-        }
+        })
     }
 
     /// Get the default (dev/unauthenticated) state.
@@ -150,17 +193,49 @@ impl TenantStateManager {
     /// creation fails — falling back to the default namespace would break
     /// tenant isolation.
     pub fn get_tenant_state(&self, tenant_id: &str) -> Result<Arc<PensyveState>, std::io::Error> {
-        // Use DashMap::entry to atomically check-and-insert, avoiding the
-        // race where two concurrent requests for the same new tenant both
-        // create a namespace and one silently overwrites the other.
-        match self.tenants.entry(tenant_id.to_string()) {
-            Entry::Occupied(e) => Ok(e.get().clone()),
-            Entry::Vacant(e) => {
-                let state = self.create_tenant_state(tenant_id)?;
-                e.insert(state.clone());
-                Ok(state)
+        let namespace = {
+            let _gate = self
+                .cache_gate
+                .lock()
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let now = (self.clock)();
+            self.tenants.retain(|_, metadata| {
+                now.saturating_duration_since(metadata.last_accessed) < TENANT_TIME_TO_IDLE
+            });
+            if let Some(mut metadata) = self.tenants.get_mut(tenant_id) {
+                metadata.last_accessed = now;
+                metadata.namespace.clone()
+            } else {
+                let namespace = self.resolve_tenant_namespace(tenant_id)?;
+                while self.tenants.len() >= MAX_CACHED_TENANTS {
+                    let oldest = self
+                        .tenants
+                        .iter()
+                        .min_by(|left, right| {
+                            left.last_accessed
+                                .cmp(&right.last_accessed)
+                                .then_with(|| left.key().cmp(right.key()))
+                        })
+                        .map(|entry| entry.key().clone());
+                    let Some(oldest) = oldest else { break };
+                    self.tenants.remove(&oldest);
+                }
+                self.tenants.insert(
+                    tenant_id.to_string(),
+                    TenantMetadata {
+                        namespace: namespace.clone(),
+                        last_accessed: now,
+                    },
+                );
+                namespace
             }
-        }
+        };
+        self.state_for_namespace(namespace)
+    }
+
+    #[must_use]
+    pub fn cached_tenant_count(&self) -> usize {
+        self.tenants.len()
     }
 
     /// Returns namespace UUIDs for all tenants accessed since boot.
@@ -184,10 +259,13 @@ impl TenantStateManager {
         self.tenants
             .iter()
             .find(|entry| entry.value().namespace.id == ns_id)
-            .map(|entry| entry.value().clone())
+            .and_then(|entry| {
+                self.state_for_namespace(entry.value().namespace.clone())
+                    .ok()
+            })
     }
 
-    fn create_tenant_state(&self, tenant_id: &str) -> Result<Arc<PensyveState>, std::io::Error> {
+    fn resolve_tenant_namespace(&self, tenant_id: &str) -> Result<Namespace, std::io::Error> {
         let ns_name = format!("tenant:{tenant_id}");
         let namespace = match self.storage.get_namespace_by_name(&ns_name) {
             Ok(Some(ns)) => ns,
@@ -208,35 +286,23 @@ impl TenantStateManager {
             }
         };
 
-        let mut index = VectorIndex::new(self.dimensions, 1024);
-        if let Ok(memories) = self.storage.get_all_memories_by_namespace(namespace.id) {
-            for mem in &memories {
-                // Observations are recall-time enrichment — they attach to
-                // top-k session groups via `recall_grouped::attach_observations_to_groups`
-                // and MUST NOT enter the RRF candidate pool.
-                if matches!(mem, pensyve_core::types::Memory::Observation(_)) {
-                    continue;
-                }
-                let emb = mem.embedding();
-                if !emb.is_empty() {
-                    let _ = match mem {
-                        pensyve_core::types::Memory::Semantic(s) => {
-                            index.add_with_entity(mem.id(), emb, s.subject)
-                        }
-                        pensyve_core::types::Memory::Episodic(e) => {
-                            index.add_with_entity(mem.id(), emb, e.about_entity)
-                        }
-                        pensyve_core::types::Memory::Procedural(_) => index.add(mem.id(), emb),
-                        pensyve_core::types::Memory::Observation(_) => unreachable!(),
-                    };
-                }
-            }
-        }
+        Ok(namespace)
+    }
 
+    fn state_for_namespace(
+        &self,
+        namespace: Namespace,
+    ) -> Result<Arc<PensyveState>, std::io::Error> {
+        let vector_runtime = VectorRuntime::resolve_storage_backed(
+            self.storage.as_ref(),
+            &self.embedder,
+            namespace.id,
+        )
+        .map_err(std::io::Error::other)?;
         Ok(Arc::new(PensyveState {
             storage: self.storage.clone(),
             embedder: self.embedder.clone(),
-            vector_index: RwLock::new(index),
+            vector_runtime,
             namespace,
             retrieval_config: self.retrieval_config.clone(),
             is_remote: true,
@@ -257,7 +323,6 @@ mod tests {
         let ns = Namespace::new("default");
         storage.save_namespace(&ns).unwrap();
         let embedder = Arc::new(OnnxEmbedder::new_mock(768));
-        let index = VectorIndex::new(768, 1024);
         let config = RetrievalConfig {
             default_limit: 5,
             max_candidates: 100,
@@ -268,15 +333,15 @@ mod tests {
             beam_width: 10,
             max_depth: 4,
         };
-        TenantStateManager::new(
+        TenantStateManager::new_storage_backed(
             storage,
             embedder,
             config,
             ns,
-            index,
             dir.path().join("snapshots"),
             RetentionPolicy::UNBOUNDED,
         )
+        .unwrap()
     }
 
     fn test_manager_with_reranker(
@@ -286,7 +351,7 @@ mod tests {
         let storage = Arc::new(SqliteBackend::open(dir.path()).unwrap()) as Arc<dyn StorageTrait>;
         let ns = Namespace::new("default");
         storage.save_namespace(&ns).unwrap();
-        TenantStateManager::new_with_preinitialized_reranker(
+        TenantStateManager::new_storage_backed_with_preinitialized_reranker(
             storage,
             Arc::new(OnnxEmbedder::new_mock(768)),
             RetrievalConfig {
@@ -300,11 +365,11 @@ mod tests {
                 max_depth: 4,
             },
             ns,
-            VectorIndex::new(768, 1024),
             dir.path().join("snapshots"),
             RetentionPolicy::UNBOUNDED,
             reranker,
         )
+        .unwrap()
     }
 
     #[test]
@@ -322,6 +387,34 @@ mod tests {
     }
 
     #[test]
+    fn default_state_observes_activation_and_rollback_after_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(&dir);
+        let state = mgr.default_state.clone();
+        let runtime_space = mgr.embedder.embedding_space().unwrap().clone();
+
+        assert!(state.semantic_space().unwrap().is_none());
+        mgr.storage
+            .begin_embedding_migration(state.namespace.id, &runtime_space)
+            .unwrap();
+        mgr.storage
+            .verify_embedding_migration(state.namespace.id, &runtime_space.id())
+            .unwrap();
+        mgr.storage
+            .activate_embedding_migration(
+                state.namespace.id,
+                &runtime_space.id(),
+                &runtime_space.id(),
+            )
+            .unwrap();
+        assert!(state.semantic_space().unwrap().is_some());
+        mgr.storage
+            .rollback_embedding_migration_to_lexical(state.namespace.id)
+            .unwrap();
+        assert!(state.semantic_space().unwrap().is_none());
+    }
+
+    #[test]
     fn test_concurrent_same_tenant_returns_same_state() {
         let dir = tempfile::tempdir().unwrap();
         let mgr = test_manager(&dir);
@@ -330,6 +423,98 @@ mod tests {
         let s1 = mgr.get_tenant_state("key_carol").unwrap();
         let s2 = mgr.get_tenant_state("key_carol").unwrap();
         assert_eq!(s1.namespace.id, s2.namespace.id);
+    }
+
+    #[test]
+    fn tenant_metadata_expires_after_exactly_thirty_minutes_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(SqliteBackend::open(dir.path()).unwrap()) as Arc<dyn StorageTrait>;
+        let ns = Namespace::new("default");
+        storage.save_namespace(&ns).unwrap();
+        let now = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+        let clock_now = Arc::clone(&now);
+        let manager = TenantStateManager::new_with_clock(
+            storage,
+            Arc::new(OnnxEmbedder::new_mock(8)),
+            RetrievalConfig {
+                default_limit: 5,
+                max_candidates: 100,
+                weights: [0.30, 0.15, 0.20, 0.10, 0.10, 0.05, 0.05, 0.05],
+                recall_timeout_secs: 5,
+                rrf_k: 60,
+                rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.0],
+                beam_width: 10,
+                max_depth: 4,
+            },
+            ns,
+            dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
+            Arc::new(move || *clock_now.lock().unwrap()),
+        )
+        .unwrap();
+        manager.get_tenant_state("idle").unwrap();
+        assert_eq!(manager.cached_tenant_count(), 1);
+
+        *now.lock().unwrap() += std::time::Duration::from_secs(30 * 60);
+        manager.get_tenant_state("fresh").unwrap();
+
+        assert!(
+            manager
+                .get_state_by_namespace_id(Namespace::new("unrelated-id-only").id)
+                .is_none()
+        );
+        assert_eq!(manager.cached_tenant_count(), 1);
+    }
+
+    #[test]
+    fn held_request_view_cannot_retain_evicted_metadata_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(SqliteBackend::open(dir.path()).unwrap()) as Arc<dyn StorageTrait>;
+        let ns = Namespace::new("default");
+        storage.save_namespace(&ns).unwrap();
+        let fixed_now = std::time::Instant::now();
+        let manager = TenantStateManager::new_with_clock(
+            storage,
+            Arc::new(OnnxEmbedder::new_mock(8)),
+            RetrievalConfig {
+                default_limit: 5,
+                max_candidates: 100,
+                weights: [0.30, 0.15, 0.20, 0.10, 0.10, 0.05, 0.05, 0.05],
+                recall_timeout_secs: 5,
+                rrf_k: 60,
+                rrf_weights: [1.0, 0.8, 1.0, 0.8, 0.5, 0.5, 1.2, 1.0],
+                beam_width: 10,
+                max_depth: 4,
+            },
+            ns,
+            dir.path().join("snapshots"),
+            RetentionPolicy::UNBOUNDED,
+            Arc::new(move || fixed_now),
+        )
+        .unwrap();
+
+        let held = manager.get_tenant_state("tenant-0000").unwrap();
+        for tenant in 1..MAX_CACHED_TENANTS {
+            manager
+                .get_tenant_state(&format!("tenant-{tenant:04}"))
+                .unwrap();
+        }
+        assert_eq!(manager.cached_tenant_count(), MAX_CACHED_TENANTS);
+
+        manager.get_tenant_state("tenant-new").unwrap();
+
+        assert_eq!(manager.cached_tenant_count(), MAX_CACHED_TENANTS);
+        assert!(!manager.tenants.contains_key("tenant-0000"));
+        assert!(matches!(
+            &held.vector_runtime,
+            VectorRuntime::StorageBacked { .. }
+        ));
+        assert!(Arc::ptr_eq(&held.storage, &manager.default_state.storage));
+        assert!(Arc::ptr_eq(&held.embedder, &manager.default_state.embedder));
+        assert!(Arc::ptr_eq(
+            &held.reranker_cell,
+            &manager.default_state.reranker_cell
+        ));
     }
 
     #[test]

@@ -7,7 +7,6 @@ use pensyve_core::reranker::Reranker;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::{Entity, EntityKind, Namespace, SemanticMemory};
-use pensyve_core::vector::VectorIndex;
 use pensyve_mcp_gateway::AppState;
 use pensyve_mcp_gateway::auth::{AuthContext, AuthValidator};
 use pensyve_mcp_gateway::config::GatewayConfig;
@@ -59,15 +58,15 @@ fn app_state(dir: &TempDir) -> Arc<AppState> {
         .save_namespace(&namespace)
         .expect("save default namespace");
 
-    let tenant_mgr = TenantStateManager::new(
+    let tenant_mgr = TenantStateManager::new_storage_backed(
         storage,
         Arc::new(OnnxEmbedder::new_mock(768)),
         retrieval_config(),
         namespace,
-        VectorIndex::new(768, 1024),
         dir.path().join("snapshots"),
         pensyve_core::snapshot::RetentionPolicy::UNBOUNDED,
-    );
+    )
+    .expect("construct storage-backed tenant manager");
 
     // Resolve the shared reranker cell up front with a mock, so nothing in
     // this binary can trigger the real ~280MB model download. Every tenant
@@ -94,6 +93,10 @@ fn app_state(dir: &TempDir) -> Arc<AppState> {
         usage_reporter: UsageReporter::new(None),
         usage_counter: UsageCounter::new(),
         tenant_mgr,
+        recall_admission: Arc::new(pensyve_mcp_gateway::admission::RecallAdmission::new(
+            8,
+            64 * pensyve_mcp_gateway::admission::MIB,
+        )),
         auth_required: false,
         admin_key: None,
         ct: CancellationToken::new(),

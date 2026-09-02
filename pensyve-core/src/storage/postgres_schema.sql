@@ -84,6 +84,8 @@ CREATE TABLE IF NOT EXISTS episodic_memories (
     access_count    INTEGER NOT NULL DEFAULT 0,
     last_accessed   TIMESTAMPTZ,
     event_time      TIMESTAMPTZ,
+    agent_id        UUID,
+    user_id         UUID,
     fts_content     tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
 );
 
@@ -94,11 +96,15 @@ CREATE TABLE IF NOT EXISTS episodic_memories (
 ALTER TABLE episodic_memories ADD COLUMN IF NOT EXISTS event_time TIMESTAMPTZ;
 ALTER TABLE episodic_memories ADD COLUMN IF NOT EXISTS superseded_by UUID;
 ALTER TABLE episodic_memories ADD COLUMN IF NOT EXISTS invalid_at TIMESTAMPTZ;
+ALTER TABLE episodic_memories ADD COLUMN IF NOT EXISTS agent_id UUID;
+ALTER TABLE episodic_memories ADD COLUMN IF NOT EXISTS user_id UUID;
 
 CREATE INDEX IF NOT EXISTS idx_episodic_about_entity ON episodic_memories(about_entity);
 CREATE INDEX IF NOT EXISTS idx_episodic_namespace ON episodic_memories(namespace_id);
 CREATE INDEX IF NOT EXISTS idx_episodic_episode
     ON episodic_memories(namespace_id, episode_id);
+CREATE INDEX IF NOT EXISTS idx_episodic_namespace_agent_user
+    ON episodic_memories(namespace_id, agent_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_episodic_fts ON episodic_memories USING GIN(fts_content);
 
 -- ---------------------------------------------------------------------------
@@ -119,13 +125,19 @@ CREATE TABLE IF NOT EXISTS semantic_memories (
     embedding       vector,
     stability       REAL NOT NULL DEFAULT 1.0,
     retrievability  REAL NOT NULL DEFAULT 1.0,
+    agent_id        UUID,
+    user_id         UUID,
     fts_content     tsvector GENERATED ALWAYS AS (to_tsvector('english', predicate || ' ' || object)) STORED
 );
 
 ALTER TABLE semantic_memories ADD COLUMN IF NOT EXISTS superseded_by UUID;
+ALTER TABLE semantic_memories ADD COLUMN IF NOT EXISTS agent_id UUID;
+ALTER TABLE semantic_memories ADD COLUMN IF NOT EXISTS user_id UUID;
 
 CREATE INDEX IF NOT EXISTS idx_semantic_subject ON semantic_memories(subject);
 CREATE INDEX IF NOT EXISTS idx_semantic_namespace ON semantic_memories(namespace_id);
+CREATE INDEX IF NOT EXISTS idx_semantic_namespace_agent_user
+    ON semantic_memories(namespace_id, agent_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_semantic_fts ON semantic_memories USING GIN(fts_content);
 
 -- ---------------------------------------------------------------------------
@@ -146,13 +158,19 @@ CREATE TABLE IF NOT EXISTS procedural_memories (
     embedding       vector,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_used       TIMESTAMPTZ,
+    agent_id        UUID,
+    user_id         UUID,
     fts_content     tsvector GENERATED ALWAYS AS (to_tsvector('english', trigger_text || ' ' || action)) STORED
 );
 
 ALTER TABLE procedural_memories ADD COLUMN IF NOT EXISTS superseded_by UUID;
 ALTER TABLE procedural_memories ADD COLUMN IF NOT EXISTS invalid_at TIMESTAMPTZ;
+ALTER TABLE procedural_memories ADD COLUMN IF NOT EXISTS agent_id UUID;
+ALTER TABLE procedural_memories ADD COLUMN IF NOT EXISTS user_id UUID;
 
 CREATE INDEX IF NOT EXISTS idx_procedural_namespace ON procedural_memories(namespace_id);
+CREATE INDEX IF NOT EXISTS idx_procedural_namespace_agent_user
+    ON procedural_memories(namespace_id, agent_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_procedural_fts ON procedural_memories USING GIN(fts_content);
 
 -- ---------------------------------------------------------------------------
@@ -177,14 +195,20 @@ CREATE TABLE IF NOT EXISTS observation_memories (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     stability       REAL NOT NULL DEFAULT 1.0,
     retrievability  REAL NOT NULL DEFAULT 1.0,
+    agent_id        UUID,
+    user_id         UUID,
     fts_content     tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
 );
 
 ALTER TABLE observation_memories ADD COLUMN IF NOT EXISTS superseded_by UUID;
 ALTER TABLE observation_memories ADD COLUMN IF NOT EXISTS invalid_at TIMESTAMPTZ;
+ALTER TABLE observation_memories ADD COLUMN IF NOT EXISTS agent_id UUID;
+ALTER TABLE observation_memories ADD COLUMN IF NOT EXISTS user_id UUID;
 
 CREATE INDEX IF NOT EXISTS idx_observation_episode ON observation_memories(episode_id);
 CREATE INDEX IF NOT EXISTS idx_observation_namespace ON observation_memories(namespace_id);
+CREATE INDEX IF NOT EXISTS idx_observation_namespace_agent_user
+    ON observation_memories(namespace_id, agent_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_observation_entity_type
     ON observation_memories(namespace_id, entity_type);
 
@@ -327,6 +351,103 @@ CREATE TABLE IF NOT EXISTS activity_events (
 CREATE INDEX IF NOT EXISTS idx_activity_ns_date ON activity_events(namespace_id, created_at);
 
 -- ---------------------------------------------------------------------------
+-- Versioned Embedding Generations
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS embedding_spaces (
+    id                      TEXT PRIMARY KEY,
+    canonical_identity_json TEXT NOT NULL,
+    class                   TEXT NOT NULL CHECK (class IN ('real', 'mock', 'legacy_unknown')),
+    dimension               INTEGER NOT NULL CHECK (dimension > 0),
+    created_at              TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    namespace_id        UUID NOT NULL REFERENCES namespaces(id),
+    memory_type         TEXT NOT NULL CHECK (memory_type IN ('episodic', 'semantic', 'procedural', 'observation')),
+    memory_id           UUID NOT NULL,
+    embedding_space_id  TEXT NOT NULL REFERENCES embedding_spaces(id),
+    source_sha256       TEXT NOT NULL,
+    embedding           vector NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (memory_type, memory_id, embedding_space_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_embeddings_lookup
+    ON memory_embeddings(namespace_id, embedding_space_id, memory_type, memory_id);
+
+CREATE TABLE IF NOT EXISTS namespace_embedding_state (
+    namespace_id          UUID PRIMARY KEY REFERENCES namespaces(id),
+    active_read_space_id  TEXT REFERENCES embedding_spaces(id),
+    target_space_id       TEXT REFERENCES embedding_spaces(id),
+    state                 TEXT NOT NULL CHECK (state IN ('lexical_only', 'backfilling', 'ready', 'active')),
+    barrier_sequence      BIGINT NOT NULL,
+    updated_at            TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS embedding_backfill_queue (
+    namespace_id  UUID NOT NULL REFERENCES namespaces(id),
+    memory_type   TEXT NOT NULL CHECK (memory_type IN ('episodic', 'semantic', 'procedural', 'observation')),
+    memory_id     UUID NOT NULL,
+    source_sha256 TEXT NOT NULL,
+    sequence      BIGINT NOT NULL,
+    status        TEXT NOT NULL,
+    last_error    TEXT,
+    PRIMARY KEY (namespace_id, memory_type, memory_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_embedding_backfill_queue_namespace_status_sequence
+    ON embedding_backfill_queue(namespace_id, status, sequence);
+
+CREATE TABLE IF NOT EXISTS consolidation_runs (
+    run_id              UUID PRIMARY KEY,
+    namespace_id        UUID NOT NULL REFERENCES namespaces(id),
+    embedding_space_id  TEXT NOT NULL REFERENCES embedding_spaces(id),
+    cursor_ordinal      BIGINT NOT NULL DEFAULT 0,
+    completed           BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at          TIMESTAMPTZ NOT NULL,
+    updated_at          TIMESTAMPTZ NOT NULL,
+    UNIQUE(namespace_id, embedding_space_id)
+);
+
+CREATE TABLE IF NOT EXISTS consolidation_sources (
+    run_id              UUID NOT NULL REFERENCES consolidation_runs(run_id) ON DELETE CASCADE,
+    namespace_id        UUID NOT NULL REFERENCES namespaces(id),
+    memory_id           UUID NOT NULL,
+    source_ordinal      BIGINT NOT NULL,
+    about_entity        UUID NOT NULL,
+    episode_id          UUID NOT NULL,
+    source_timestamp    TIMESTAMPTZ NOT NULL,
+    source_sha256       TEXT NOT NULL,
+    assignment_anchor   UUID,
+    assignment_state    TEXT NOT NULL DEFAULT 'unassigned'
+        CHECK (assignment_state IN
+            ('unassigned', 'tentative', 'finalized', 'discarded', 'promoted')),
+    promotion_complete  BOOLEAN NOT NULL DEFAULT FALSE,
+    PRIMARY KEY(run_id, memory_id),
+    UNIQUE(run_id, source_ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_consolidation_sources_scan
+    ON consolidation_sources(run_id, about_entity, source_ordinal, assignment_state);
+
+-- A production deployment may use the dedicated serving role described in
+-- docs/SECURITY.md. Development and test databases need not create it, so the
+-- per-table grants are conditional while the schema remains self-applicable.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pensyve_app') THEN
+        -- Provenance rows are append-only: an update would silently redefine an
+        -- id that other namespaces already reference.
+        GRANT SELECT, INSERT ON embedding_spaces TO pensyve_app;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON memory_embeddings TO pensyve_app;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON namespace_embedding_state TO pensyve_app;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON embedding_backfill_queue TO pensyve_app;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON consolidation_runs TO pensyve_app;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON consolidation_sources TO pensyve_app;
+    END IF;
+END $$;
+
+-- ---------------------------------------------------------------------------
 -- Row-Level Security (Postgres only)
 --
 -- Namespace isolation.  Each connection binds its namespace via
@@ -355,6 +476,11 @@ ALTER TABLE semantic_memories    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE procedural_memories  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE observation_memories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE edges                ENABLE ROW LEVEL SECURITY;
+ALTER TABLE memory_embeddings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE namespace_embedding_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE embedding_backfill_queue ENABLE ROW LEVEL SECURITY;
+ALTER TABLE consolidation_runs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE consolidation_sources ENABLE ROW LEVEL SECURITY;
 
 -- DROP + CREATE rather than "create if absent": this file is re-applied on
 -- every startup, so an existing database has to pick up a corrected policy.
@@ -402,6 +528,31 @@ DROP POLICY IF EXISTS namespace_isolation_edges ON edges;
 CREATE POLICY namespace_isolation_edges ON edges
   USING (namespace_id::text = current_setting('pensyve.namespace_id', true))
   WITH CHECK (namespace_id::text = current_setting('pensyve.namespace_id', true));
+
+DROP POLICY IF EXISTS namespace_isolation_memory_embeddings ON memory_embeddings;
+CREATE POLICY namespace_isolation_memory_embeddings ON memory_embeddings
+  USING (namespace_id = current_setting('pensyve.namespace_id', true)::uuid)
+  WITH CHECK (namespace_id = current_setting('pensyve.namespace_id', true)::uuid);
+
+DROP POLICY IF EXISTS namespace_isolation_embedding_state ON namespace_embedding_state;
+CREATE POLICY namespace_isolation_embedding_state ON namespace_embedding_state
+  USING (namespace_id = current_setting('pensyve.namespace_id', true)::uuid)
+  WITH CHECK (namespace_id = current_setting('pensyve.namespace_id', true)::uuid);
+
+DROP POLICY IF EXISTS namespace_isolation_embedding_backfill_queue ON embedding_backfill_queue;
+CREATE POLICY namespace_isolation_embedding_backfill_queue ON embedding_backfill_queue
+  USING (namespace_id = current_setting('pensyve.namespace_id', true)::uuid)
+  WITH CHECK (namespace_id = current_setting('pensyve.namespace_id', true)::uuid);
+
+DROP POLICY IF EXISTS namespace_isolation_consolidation_runs ON consolidation_runs;
+CREATE POLICY namespace_isolation_consolidation_runs ON consolidation_runs
+  USING (namespace_id = current_setting('pensyve.namespace_id', true)::uuid)
+  WITH CHECK (namespace_id = current_setting('pensyve.namespace_id', true)::uuid);
+
+DROP POLICY IF EXISTS namespace_isolation_consolidation_sources ON consolidation_sources;
+CREATE POLICY namespace_isolation_consolidation_sources ON consolidation_sources
+  USING (namespace_id = current_setting('pensyve.namespace_id', true)::uuid)
+  WITH CHECK (namespace_id = current_setting('pensyve.namespace_id', true)::uuid);
 
 -- ---------------------------------------------------------------------------
 -- Enforcement
@@ -454,3 +605,8 @@ ALTER TABLE semantic_memories    FORCE ROW LEVEL SECURITY;
 ALTER TABLE procedural_memories  FORCE ROW LEVEL SECURITY;
 ALTER TABLE observation_memories FORCE ROW LEVEL SECURITY;
 ALTER TABLE edges                FORCE ROW LEVEL SECURITY;
+ALTER TABLE memory_embeddings FORCE ROW LEVEL SECURITY;
+ALTER TABLE namespace_embedding_state FORCE ROW LEVEL SECURITY;
+ALTER TABLE embedding_backfill_queue FORCE ROW LEVEL SECURITY;
+ALTER TABLE consolidation_runs FORCE ROW LEVEL SECURITY;
+ALTER TABLE consolidation_sources FORCE ROW LEVEL SECURITY;

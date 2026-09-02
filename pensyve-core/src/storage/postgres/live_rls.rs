@@ -99,8 +99,11 @@
 //! so out loud). Those tests name the reason in their own docs.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
+use sha2::{Digest, Sha256};
+use sqlx_core::acquire::Acquire;
 use sqlx_core::query::query;
 use sqlx_core::query_as::query_as;
 use sqlx_core::raw_sql::raw_sql;
@@ -109,8 +112,18 @@ use sqlx_postgres::{PgConnectOptions, PgPool, PgPoolOptions, Postgres};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
-use super::PostgresBackend;
-use crate::storage::StorageTrait;
+use super::{POSTGRES_VECTOR_SEARCH_SQL, PostgresBackend, WorkspaceRacePoint};
+use crate::embedding_space::{EmbeddingSpace, EmbeddingSpaceId};
+use crate::storage::bounded::{
+    EmbeddingRecord, EntityScope as BoundedEntityScope, IdentityScope, MAX_HYDRATED_BYTES,
+    MAX_PROMOTION_CLUSTER_MEMBERS, MemoryPageRequest, MemoryRef, MemoryType, SearchScope,
+    SearchUnavailable, VectorHit, VectorSearchOutcome, VectorSearchRequest, embedding_source_text,
+};
+use crate::storage::consolidation_workspace::{
+    CONSOLIDATION_WORKING_STATE_BYTES, ClusterDecision, ConsolidationWorkspace, DecayPage,
+    DecayRecord, PromotionCommit, RunId, WorkspaceCursor,
+};
+use crate::storage::{StorageError, StorageTrait};
 use crate::types::{
     Edge, Entity, EntityKind, EpisodicMemory, Memory, Namespace, ObservationMemory, Outcome,
     ProceduralMemory, SemanticMemory,
@@ -140,6 +153,23 @@ const RLS_POLICIES: &[(&str, &str)] = &[
     ("procedural_memories", "namespace_isolation_procedural"),
     ("observation_memories", "namespace_isolation_observation"),
     ("edges", "namespace_isolation_edges"),
+    ("memory_embeddings", "namespace_isolation_memory_embeddings"),
+    (
+        "namespace_embedding_state",
+        "namespace_isolation_embedding_state",
+    ),
+    (
+        "embedding_backfill_queue",
+        "namespace_isolation_embedding_backfill_queue",
+    ),
+    (
+        "consolidation_runs",
+        "namespace_isolation_consolidation_runs",
+    ),
+    (
+        "consolidation_sources",
+        "namespace_isolation_consolidation_sources",
+    ),
 ];
 
 /// How Postgres renders the expected `USING` clause back out of `pg_policies`.
@@ -151,6 +181,23 @@ const RLS_POLICIES: &[(&str, &str)] = &[
 /// GUC, or switched to a different column.
 const EXPECTED_POLICY_QUAL: &str =
     "((namespace_id)::text = current_setting('pensyve.namespace_id'::text, true))";
+
+/// `embedding_*` tables compare native UUID values. Their policies are not
+/// interchangeable with the legacy text comparison because a migration must
+/// preserve the exact namespace type at the new storage boundary.
+const EXPECTED_EMBEDDING_POLICY_QUAL: &str =
+    "(namespace_id = (current_setting('pensyve.namespace_id'::text, true))::uuid)";
+
+fn expected_policy_qual(table: &str) -> &'static str {
+    match table {
+        "memory_embeddings"
+        | "namespace_embedding_state"
+        | "embedding_backfill_queue"
+        | "consolidation_runs"
+        | "consolidation_sources" => EXPECTED_EMBEDDING_POLICY_QUAL,
+        _ => EXPECTED_POLICY_QUAL,
+    }
+}
 
 /// One `pg_policies` row: `(tablename, policyname, permissive, cmd, qual,
 /// with_check)`.
@@ -480,6 +527,1431 @@ fn memory_ids(memories: &[Memory]) -> Vec<Uuid> {
             Memory::Observation(x) => x.id,
         })
         .collect()
+}
+
+fn register_embedding_space(fixture: &Fixture, id: &str, class: &str, dimension: i32) {
+    fixture.rt.block_on(async {
+        query::<Postgres>(
+            "INSERT INTO embedding_spaces
+             (id, canonical_identity_json, class, dimension, created_at)
+             VALUES ($1, '{}', $2, $3, NOW())",
+        )
+        .bind(id)
+        .bind(class)
+        .bind(dimension)
+        .execute(fixture.backend.pool())
+        .await
+        .expect("register embedding space");
+    });
+}
+
+/// Marks `space` as the namespace's active read space, mirroring what the first
+/// embedded API save does for an empty namespace. Fixtures that seed rows with
+/// raw SQL never pass through that path, so they activate here.
+fn activate_namespace_space(fixture: &Fixture, namespace_id: Uuid, space: &str) {
+    fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace_id).await.unwrap();
+        query::<Postgres>(
+            "INSERT INTO namespace_embedding_state
+             (namespace_id, active_read_space_id, target_space_id, state,
+              barrier_sequence, updated_at)
+             VALUES ($1, $2, NULL, 'active', 0, NOW())",
+        )
+        .bind(namespace_id)
+        .bind(space)
+        .execute(&mut *conn)
+        .await
+        .expect("activate namespace embedding space");
+    });
+}
+
+/// Moves one memory's only embedding to `space` behind the API on both
+/// backends. An active namespace refuses to write a memory whose sole vector
+/// belongs to another generation, so the "other generation" fixture row is
+/// produced by relocating a valid active-space embedding after the fact.
+fn move_embedding_to_space(
+    fixture: &Fixture,
+    sqlite_path: &std::path::Path,
+    memory: &Memory,
+    space: &str,
+) {
+    let memory_ref = MemoryRef::from_memory(memory);
+    let memory_type = match memory_ref.memory_type {
+        MemoryType::Episodic => "episodic",
+        MemoryType::Semantic => "semantic",
+        MemoryType::Procedural => "procedural",
+        MemoryType::Observation => "observation",
+    };
+    fixture.rt.block_on(async {
+        let namespace_id = match memory {
+            Memory::Episodic(memory) => memory.namespace_id,
+            Memory::Semantic(memory) => memory.namespace_id,
+            Memory::Procedural(memory) => memory.namespace_id,
+            Memory::Observation(memory) => memory.namespace_id,
+        };
+        let mut conn = fixture.backend.scoped_conn(namespace_id).await.unwrap();
+        let moved = query::<Postgres>(
+            "UPDATE memory_embeddings SET embedding_space_id = $1
+             WHERE namespace_id = $2 AND memory_type = $3 AND memory_id = $4",
+        )
+        .bind(space)
+        .bind(namespace_id)
+        .bind(memory_type)
+        .bind(memory_ref.id)
+        .execute(&mut *conn)
+        .await
+        .expect("move Postgres embedding to another space")
+        .rows_affected();
+        assert_eq!(moved, 1);
+    });
+    let connection = rusqlite::Connection::open(sqlite_path.join("memories.db"))
+        .expect("open sqlite generation fixture");
+    let moved = connection
+        .execute(
+            "UPDATE memory_embeddings SET embedding_space_id = ?1
+             WHERE memory_type = ?2 AND memory_id = ?3",
+            rusqlite::params![space, memory_type, memory_ref.id.to_string()],
+        )
+        .expect("move sqlite embedding to another space");
+    assert_eq!(moved, 1);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one live fixture proves the scoped join and both provenance-corruption branches"
+)]
+fn namespace_embedding_state_read_is_scoped_by_explicit_postgres_predicate() {
+    let Some(admin_opts) =
+        skip_notice("namespace_embedding_state_read_is_scoped_by_explicit_postgres_predicate")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    fixture.relax_rls();
+    let requested = Namespace::new("embedding-state-requested");
+    let foreign = Namespace::new("embedding-state-foreign");
+    fixture
+        .backend
+        .save_namespace(&requested)
+        .expect("save requested namespace");
+    fixture
+        .backend
+        .save_namespace(&foreign)
+        .expect("save foreign namespace");
+
+    let active = EmbeddingSpace::mock(2, "postgres-active-v1");
+    let target = EmbeddingSpace::mock(3, "postgres-target-v2");
+    fixture.rt.block_on(async {
+        for space in [&active, &target] {
+            query::<Postgres>(
+                "INSERT INTO embedding_spaces
+                 (id, canonical_identity_json, class, dimension, created_at)
+                 VALUES ($1, $2, 'mock', $3, NOW())",
+            )
+            .bind(space.id().0)
+            .bind(space.canonical_json())
+            .bind(i32::try_from(space.dimensions).expect("test dimension fits i32"))
+            .execute(fixture.backend.pool())
+            .await
+            .expect("register canonical embedding space");
+        }
+        for (namespace_id, phase, barrier) in [
+            (requested.id, "backfilling", 17_i64),
+            (foreign.id, "active", 99_i64),
+        ] {
+            query::<Postgres>(
+                "INSERT INTO namespace_embedding_state
+                 (namespace_id, active_read_space_id, target_space_id, state,
+                  barrier_sequence, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, NOW())",
+            )
+            .bind(namespace_id)
+            .bind(active.id().0)
+            .bind(target.id().0)
+            .bind(phase)
+            .bind(barrier)
+            .execute(fixture.backend.pool())
+            .await
+            .expect("insert namespace embedding state");
+        }
+    });
+
+    let state = fixture
+        .backend
+        .get_namespace_embedding_state(requested.id)
+        .expect("read requested namespace state")
+        .expect("requested state row");
+
+    assert_eq!(state.namespace_id, requested.id);
+    assert_eq!(state.active_read_space_id, Some(active.id()));
+    assert_eq!(state.target_space_id, Some(target.id()));
+    assert_eq!(state.active_read_space, Some(active.clone()));
+    assert_eq!(state.target_space, Some(target.clone()));
+    assert_eq!(state.phase.as_str(), "backfilling");
+    assert_eq!(state.barrier_sequence, 17);
+
+    let corrupt_active_id = format!("tampered-active-{}", Uuid::new_v4());
+    let corrupt_target_id = format!("tampered-target-{}", Uuid::new_v4());
+    fixture.rt.block_on(async {
+        for (stored_id, canonical) in [
+            (&corrupt_active_id, active.canonical_json()),
+            (&corrupt_target_id, target.canonical_json()),
+        ] {
+            query::<Postgres>(
+                "INSERT INTO embedding_spaces
+                 (id, canonical_identity_json, class, dimension, created_at)
+                 VALUES ($1, $2, 'mock', 2, NOW())",
+            )
+            .bind(stored_id)
+            .bind(canonical)
+            .execute(fixture.backend.pool())
+            .await
+            .expect("register corrupt canonical embedding space");
+        }
+        query::<Postgres>(
+            "UPDATE namespace_embedding_state SET active_read_space_id = $1 WHERE namespace_id = $2",
+        )
+        .bind(&corrupt_active_id)
+        .bind(requested.id)
+        .execute(fixture.backend.pool())
+        .await
+        .expect("point active read at corrupt provenance");
+    });
+    let active_error = fixture
+        .backend
+        .get_namespace_embedding_state(requested.id)
+        .expect_err("corrupt active provenance must fail closed");
+    assert!(
+        active_error
+            .to_string()
+            .contains("active embedding space identity")
+    );
+
+    fixture.rt.block_on(async {
+        query::<Postgres>(
+            "UPDATE namespace_embedding_state
+             SET active_read_space_id = $1, target_space_id = $2
+             WHERE namespace_id = $3",
+        )
+        .bind(active.id().0)
+        .bind(&corrupt_target_id)
+        .bind(requested.id)
+        .execute(fixture.backend.pool())
+        .await
+        .expect("point target at corrupt provenance");
+    });
+    let target_error = fixture
+        .backend
+        .get_namespace_embedding_state(requested.id)
+        .expect_err("corrupt target provenance must fail closed");
+    assert!(
+        target_error
+            .to_string()
+            .contains("target embedding space identity")
+    );
+}
+
+fn canonical_source_sha256(memory: &Memory) -> String {
+    hex::encode(Sha256::digest(embedding_source_text(memory).as_bytes()))
+}
+
+fn embedding_record(memory: &Memory, space: &str, embedding: Vec<f32>) -> EmbeddingRecord {
+    let namespace_id = match memory {
+        Memory::Episodic(memory) => memory.namespace_id,
+        Memory::Semantic(memory) => memory.namespace_id,
+        Memory::Procedural(memory) => memory.namespace_id,
+        Memory::Observation(memory) => memory.namespace_id,
+    };
+    EmbeddingRecord {
+        namespace_id,
+        memory_ref: MemoryRef::from_memory(memory),
+        embedding_space_id: EmbeddingSpaceId(space.to_string()),
+        source_sha256: canonical_source_sha256(memory),
+        embedding,
+    }
+}
+
+fn embedding_count(fixture: &Fixture, namespace_id: Uuid) -> i64 {
+    fixture.rt.block_on(async {
+        let mut conn = fixture
+            .backend
+            .scoped_conn(namespace_id)
+            .await
+            .expect("scope embedding count");
+        query_as::<Postgres, (i64,)>(
+            "SELECT COUNT(*) FROM memory_embeddings WHERE namespace_id = $1",
+        )
+        .bind(namespace_id)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("count embeddings")
+        .0
+    })
+}
+
+fn embedding_write_fixture(fixture: &Fixture) -> (Namespace, Memory) {
+    let namespace = Namespace::new("embedding-write");
+    fixture
+        .backend
+        .save_namespace(&namespace)
+        .expect("save embedding namespace");
+    let memory = Memory::Episodic(EpisodicMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "transactional postgres source",
+    ));
+    (namespace, memory)
+}
+
+fn save_workspace_episode(
+    fixture: &Fixture,
+    namespace_id: Uuid,
+    about_entity: Uuid,
+    content: &str,
+    timestamp: DateTime<Utc>,
+    space: &str,
+) -> Memory {
+    let mut episodic = EpisodicMemory::new(
+        namespace_id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        about_entity,
+        content,
+    );
+    episodic.timestamp = timestamp;
+    let memory = Memory::Episodic(episodic);
+    let record = embedding_record(&memory, space, vec![1.0, 0.0]);
+    fixture
+        .backend
+        .save_memory_with_embedding(&memory, Some(&record))
+        .expect("save workspace source and active-generation embedding");
+    memory
+}
+
+fn semantic_promotion(
+    namespace_id: Uuid,
+    subject: Uuid,
+    content: &str,
+    source_episodes: Vec<Uuid>,
+    space: &str,
+) -> (Memory, EmbeddingRecord) {
+    let mut semantic = SemanticMemory::new(namespace_id, subject, "mentioned", content, 1.0);
+    semantic.source_episodes = source_episodes;
+    let memory = Memory::Semantic(semantic);
+    let record = embedding_record(&memory, space, vec![1.0, 0.0]);
+    (memory, record)
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one disposable database proves the complete workspace lifecycle and RLS isolation"
+)]
+fn consolidation_workspace_lifecycle_is_transactional_resumable_and_rls_scoped() {
+    let Some(admin_opts) =
+        skip_notice("consolidation_workspace_lifecycle_is_transactional_resumable_and_rls_scoped")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let workspace: &dyn ConsolidationWorkspace = &fixture.backend;
+    let namespace = Namespace::new("workspace-owner");
+    let foreign = Namespace::new("workspace-foreign");
+    fixture.backend.save_namespace(&namespace).unwrap();
+    fixture.backend.save_namespace(&foreign).unwrap();
+    register_embedding_space(&fixture, "workspace-space", "mock", 2);
+    let space = EmbeddingSpaceId("workspace-space".to_string());
+    let about = Uuid::new_v4();
+    let base = Utc::now();
+    let mut sources = Vec::new();
+    for index in 0..4_i64 {
+        sources.push(save_workspace_episode(
+            &fixture,
+            namespace.id,
+            about,
+            &format!("owner source {index}"),
+            base + chrono::Duration::seconds(index),
+            &space.0,
+        ));
+    }
+    for index in 0..2_i64 {
+        save_workspace_episode(
+            &fixture,
+            foreign.id,
+            Uuid::new_v4(),
+            &format!("foreign source {index}"),
+            base + chrono::Duration::seconds(index),
+            &space.0,
+        );
+    }
+
+    let run = workspace.begin_or_resume(namespace.id, &space).unwrap();
+    assert_eq!(
+        workspace.begin_or_resume(namespace.id, &space).unwrap(),
+        run
+    );
+    let first_page = workspace
+        .next_sources(run, None, 2, CONSOLIDATION_WORKING_STATE_BYTES)
+        .unwrap();
+    assert_eq!(first_page.records.len(), 2);
+    let page_cursor = first_page
+        .next_cursor
+        .expect("two of four has another page");
+    workspace.checkpoint(run, page_cursor).unwrap();
+    assert_eq!(
+        workspace
+            .next_sources(run, None, 8, CONSOLIDATION_WORKING_STATE_BYTES)
+            .unwrap()
+            .records
+            .len(),
+        2
+    );
+    workspace
+        .checkpoint(run, WorkspaceCursor::default())
+        .unwrap();
+    assert_eq!(
+        workspace
+            .next_sources(run, None, 8, CONSOLIDATION_WORKING_STATE_BYTES)
+            .unwrap()
+            .records
+            .len(),
+        4
+    );
+
+    let foreign_run_id = RunId {
+        id: run.id,
+        namespace_id: foreign.id,
+    };
+    assert!(
+        workspace
+            .next_sources(foreign_run_id, None, 8, CONSOLIDATION_WORKING_STATE_BYTES,)
+            .is_err()
+    );
+    let foreign_run = workspace.begin_or_resume(foreign.id, &space).unwrap();
+    assert_ne!(foreign_run.id, run.id);
+    assert_eq!(
+        workspace
+            .next_sources(foreign_run, None, 8, CONSOLIDATION_WORKING_STATE_BYTES)
+            .unwrap()
+            .records
+            .len(),
+        2
+    );
+
+    let records = workspace
+        .next_sources(
+            run,
+            Some(WorkspaceCursor::default()),
+            8,
+            CONSOLIDATION_WORKING_STATE_BYTES,
+        )
+        .unwrap()
+        .records;
+    let anchor = records[0].memory_ref;
+    assert_eq!(
+        workspace
+            .record_tentative_match(run, anchor, anchor)
+            .unwrap(),
+        1
+    );
+    let candidates = workspace
+        .page_later_unassigned(run, anchor, None, 8, CONSOLIDATION_WORKING_STATE_BYTES)
+        .unwrap();
+    assert_eq!(candidates.records.len(), 3);
+    for candidate in candidates.records {
+        workspace
+            .record_tentative_match(run, anchor, candidate.memory_ref)
+            .unwrap();
+    }
+    let ClusterDecision::Finalized { promotion } = workspace
+        .finalize_or_discard_cluster(run, anchor, CONSOLIDATION_WORKING_STATE_BYTES)
+        .unwrap()
+    else {
+        panic!("four matching rows must finalize");
+    };
+    assert_eq!(promotion.member_count, 4);
+    assert_eq!(promotion.provenance.len(), 4);
+    let (semantic, semantic_record) = semantic_promotion(
+        namespace.id,
+        about,
+        &promotion.latest.content,
+        promotion
+            .provenance
+            .iter()
+            .map(|source| source.episode_id)
+            .collect(),
+        &space.0,
+    );
+    assert_eq!(
+        workspace
+            .commit_promotion(run, anchor, &semantic, &semantic_record)
+            .unwrap(),
+        PromotionCommit::Committed
+    );
+    assert!(
+        fixture
+            .backend
+            .get_semantic_in_namespace(semantic.id(), namespace.id)
+            .unwrap()
+            .is_some()
+    );
+
+    let replacement_anchor = save_workspace_episode(
+        &fixture,
+        namespace.id,
+        about,
+        "replacement anchor",
+        base + chrono::Duration::seconds(10),
+        &space.0,
+    );
+    let replacement_member = save_workspace_episode(
+        &fixture,
+        namespace.id,
+        about,
+        "replacement member",
+        base + chrono::Duration::seconds(11),
+        &space.0,
+    );
+    assert_eq!(
+        workspace.begin_or_resume(namespace.id, &space).unwrap(),
+        run
+    );
+    let replacement_anchor_ref = MemoryRef::from_memory(&replacement_anchor);
+    workspace
+        .record_tentative_match(run, replacement_anchor_ref, replacement_anchor_ref)
+        .unwrap();
+    workspace
+        .record_tentative_match(
+            run,
+            replacement_anchor_ref,
+            MemoryRef::from_memory(&replacement_member),
+        )
+        .unwrap();
+    let ClusterDecision::Finalized {
+        promotion: replacement,
+    } = workspace
+        .finalize_or_discard_cluster(
+            run,
+            replacement_anchor_ref,
+            CONSOLIDATION_WORKING_STATE_BYTES,
+        )
+        .unwrap()
+    else {
+        panic!("replacement pair must finalize");
+    };
+    let (stale_semantic, stale_record) = semantic_promotion(
+        namespace.id,
+        about,
+        &replacement.latest.content,
+        replacement
+            .provenance
+            .iter()
+            .map(|source| source.episode_id)
+            .collect(),
+        &space.0,
+    );
+    let Memory::Episodic(mut changed_member) = replacement_member else {
+        unreachable!();
+    };
+    changed_member.content = "changed after tentative assignment".to_string();
+    let changed_memory = Memory::Episodic(changed_member);
+    let changed_record = embedding_record(&changed_memory, &space.0, vec![0.0, 1.0]);
+    fixture
+        .backend
+        .save_memory_with_embedding(&changed_memory, Some(&changed_record))
+        .unwrap();
+    assert_eq!(
+        workspace
+            .commit_promotion(run, replacement_anchor_ref, &stale_semantic, &stale_record)
+            .unwrap(),
+        PromotionCommit::Invalidated
+    );
+    assert!(
+        fixture
+            .backend
+            .get_semantic_in_namespace(stale_semantic.id(), namespace.id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        workspace
+            .next_sources(run, None, 16, CONSOLIDATION_WORKING_STATE_BYTES)
+            .unwrap()
+            .records
+            .len(),
+        6
+    );
+}
+
+#[test]
+fn consolidation_rejects_a_live_postgres_vector_dimension_mismatch() {
+    let Some(admin_opts) =
+        skip_notice("consolidation_rejects_a_live_postgres_vector_dimension_mismatch")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let namespace = Namespace::new("workspace-vector-dimension");
+    fixture.backend.save_namespace(&namespace).unwrap();
+    register_embedding_space(&fixture, "workspace-dimension-space", "mock", 2);
+    let space = EmbeddingSpaceId("workspace-dimension-space".to_string());
+    let source = save_workspace_episode(
+        &fixture,
+        namespace.id,
+        Uuid::new_v4(),
+        "dimension mismatch",
+        Utc::now(),
+        &space.0,
+    );
+    let workspace: &dyn ConsolidationWorkspace = &fixture.backend;
+    let run = workspace.begin_or_resume(namespace.id, &space).unwrap();
+    let source_ref = MemoryRef::from_memory(&source);
+    fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace.id).await.unwrap();
+        query::<Postgres>(
+            "UPDATE memory_embeddings SET embedding = '[1.0,0.0,0.0]'::vector
+             WHERE namespace_id = $1 AND memory_type = 'episodic'
+               AND memory_id = $2 AND embedding_space_id = $3",
+        )
+        .bind(namespace.id)
+        .bind(source_ref.id)
+        .bind(&space.0)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    });
+
+    let error = workspace
+        .load_source(run, source_ref, CONSOLIDATION_WORKING_STATE_BYTES)
+        .expect_err("actual pgvector dimension must match the immutable registry dimension");
+    assert!(
+        matches!(error, StorageError::Context(message) if message.contains("registered dimension"))
+    );
+}
+
+#[test]
+fn consolidation_vector_preflight_blocks_a_two_connection_postgres_race() {
+    let Some(admin_opts) =
+        skip_notice("consolidation_vector_preflight_blocks_a_two_connection_postgres_race")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let writer = fixture.backend_as(&admin_opts, &fixture.role);
+    let namespace = Namespace::new("workspace-vector-race");
+    fixture.backend.save_namespace(&namespace).unwrap();
+    register_embedding_space(&fixture, "workspace-race-space", "mock", 2);
+    let space = EmbeddingSpaceId("workspace-race-space".to_string());
+    let source = save_workspace_episode(
+        &fixture,
+        namespace.id,
+        Uuid::new_v4(),
+        "stable vector",
+        Utc::now(),
+        &space.0,
+    );
+    let workspace: &dyn ConsolidationWorkspace = &fixture.backend;
+    let run = workspace.begin_or_resume(namespace.id, &space).unwrap();
+    let source_ref = MemoryRef::from_memory(&source);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    fixture
+        .backend
+        .set_workspace_race_barrier(WorkspaceRacePoint::Vector, barrier.clone());
+
+    let loaded = std::thread::scope(|scope| {
+        let reader = scope
+            .spawn(|| workspace.load_source(run, source_ref, CONSOLIDATION_WORKING_STATE_BYTES));
+        barrier.wait();
+        let update_error = writer
+            .block_on(async {
+                let mut conn = writer.scoped_conn(namespace.id).await.unwrap();
+                let mut tx = (&mut *conn).begin().await.unwrap();
+                query::<Postgres>("SET LOCAL lock_timeout = '250ms'")
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                let result = query::<Postgres>(
+                    "UPDATE memory_embeddings SET embedding = '[0.0,1.0]'::vector
+                     WHERE namespace_id = $1 AND memory_type = 'episodic'
+                       AND memory_id = $2 AND embedding_space_id = $3",
+                )
+                .bind(namespace.id)
+                .bind(source_ref.id)
+                .bind(&space.0)
+                .execute(&mut *tx)
+                .await;
+                let _ = tx.rollback().await;
+                result
+            })
+            .expect_err("the reader's FOR SHARE lock must reject the racing vector update");
+        assert_eq!(
+            update_error
+                .as_database_error()
+                .and_then(sqlx_core::error::DatabaseError::code)
+                .as_deref(),
+            Some("55P03")
+        );
+        barrier.wait();
+        reader.join().expect("workspace reader thread")
+    })
+    .expect("stable PostgreSQL vector snapshot");
+    assert_eq!(loaded.embedding, vec![1.0, 0.0]);
+}
+
+#[test]
+fn consolidation_content_preflight_blocks_a_two_connection_postgres_race() {
+    let Some(admin_opts) =
+        skip_notice("consolidation_content_preflight_blocks_a_two_connection_postgres_race")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let writer = fixture.backend_as(&admin_opts, &fixture.role);
+    let namespace = Namespace::new("workspace-content-race");
+    fixture.backend.save_namespace(&namespace).unwrap();
+    register_embedding_space(&fixture, "workspace-content-race-space", "mock", 2);
+    let space = EmbeddingSpaceId("workspace-content-race-space".to_string());
+    let about = Uuid::new_v4();
+    let base = Utc::now();
+    let first = save_workspace_episode(
+        &fixture,
+        namespace.id,
+        about,
+        "stable final content",
+        base,
+        &space.0,
+    );
+    let latest = save_workspace_episode(
+        &fixture,
+        namespace.id,
+        about,
+        "stable final content",
+        base + chrono::Duration::seconds(1),
+        &space.0,
+    );
+    let workspace: &dyn ConsolidationWorkspace = &fixture.backend;
+    let run = workspace.begin_or_resume(namespace.id, &space).unwrap();
+    let anchor = MemoryRef::from_memory(&first);
+    let latest_ref = MemoryRef::from_memory(&latest);
+    workspace
+        .record_tentative_match(run, anchor, anchor)
+        .unwrap();
+    workspace
+        .record_tentative_match(run, anchor, latest_ref)
+        .unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    fixture
+        .backend
+        .set_workspace_race_barrier(WorkspaceRacePoint::FinalContent, barrier.clone());
+
+    let decision = std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            workspace.finalize_or_discard_cluster(run, anchor, CONSOLIDATION_WORKING_STATE_BYTES)
+        });
+        barrier.wait();
+        let update_error = writer
+            .block_on(async {
+                let mut conn = writer.scoped_conn(namespace.id).await.unwrap();
+                let mut tx = (&mut *conn).begin().await.unwrap();
+                query::<Postgres>("SET LOCAL lock_timeout = '250ms'")
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                let result = query::<Postgres>(
+                    "UPDATE episodic_memories SET content = repeat('x', $1)
+                     WHERE namespace_id = $2 AND id = $3",
+                )
+                .bind(i32::try_from(CONSOLIDATION_WORKING_STATE_BYTES + 1).unwrap())
+                .bind(namespace.id)
+                .bind(latest_ref.id)
+                .execute(&mut *tx)
+                .await;
+                let _ = tx.rollback().await;
+                result
+            })
+            .expect_err("the reader's FOR SHARE lock must reject the racing content update");
+        assert_eq!(
+            update_error
+                .as_database_error()
+                .and_then(sqlx_core::error::DatabaseError::code)
+                .as_deref(),
+            Some("55P03")
+        );
+        barrier.wait();
+        reader.join().expect("workspace reader thread")
+    })
+    .expect("stable PostgreSQL content snapshot");
+    let ClusterDecision::Finalized { promotion } = decision else {
+        panic!("pair must finalize after the racing write is rejected");
+    };
+    assert_eq!(promotion.latest.content, "stable final content");
+}
+
+#[test]
+fn compact_decay_timestamp_preflight_and_fetch_share_one_postgres_snapshot() {
+    let Some(admin_opts) =
+        skip_notice("compact_decay_timestamp_preflight_and_fetch_share_one_postgres_snapshot")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let writer = fixture.backend_as(&admin_opts, &fixture.role);
+    let namespace = Namespace::new("compact-decay-timestamp-race");
+    fixture.backend.save_namespace(&namespace).unwrap();
+    let mut memory = EpisodicMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "stable compact timestamp",
+    );
+    // `timestamptz` is microsecond-precise; the round trip must compare like with like.
+    memory.timestamp = memory.timestamp.trunc_subsecs(6);
+    let expected_reference_time = memory.timestamp;
+    let memory_id = memory.id;
+    fixture.backend.save_episodic(&memory).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    fixture
+        .backend
+        .set_workspace_race_barrier(WorkspaceRacePoint::Decay, barrier.clone());
+    let workspace: &dyn ConsolidationWorkspace = &fixture.backend;
+
+    let page = std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            workspace.page_decay(namespace.id, None, 256, CONSOLIDATION_WORKING_STATE_BYTES)
+        });
+        barrier.wait();
+        writer.block_on(async {
+            let mut conn = writer.scoped_conn(namespace.id).await.unwrap();
+            query::<Postgres>(
+                "UPDATE episodic_memories SET timestamp = $1
+                 WHERE namespace_id = $2 AND id = $3",
+            )
+            .bind(expected_reference_time + chrono::Duration::days(7))
+            .bind(namespace.id)
+            .bind(memory_id)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        });
+        barrier.wait();
+        reader.join().expect("compact decay reader thread")
+    })
+    .expect("stable PostgreSQL compact decay snapshot");
+    let [DecayRecord::Episodic { reference_time, .. }] = page.records.as_slice() else {
+        panic!("one episodic compact decay record expected");
+    };
+    assert_eq!(*reference_time, expected_reference_time);
+}
+
+#[test]
+fn compact_decay_row_insertion_cannot_exceed_the_postgres_preflight_budget() {
+    let Some(admin_opts) =
+        skip_notice("compact_decay_row_insertion_cannot_exceed_the_postgres_preflight_budget")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let writer = fixture.backend_as(&admin_opts, &fixture.role);
+    let namespace = Namespace::new("compact-decay-insertion-race");
+    fixture.backend.save_namespace(&namespace).unwrap();
+    fixture
+        .backend
+        .save_episodic(&EpisodicMemory::new(
+            namespace.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "stable compact insertion",
+        ))
+        .unwrap();
+    let one_row_budget = std::mem::size_of::<DecayPage>()
+        + std::mem::size_of::<DecayRecord>()
+        + std::mem::size_of::<super::PgDecayRow>();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    fixture
+        .backend
+        .set_workspace_race_barrier(WorkspaceRacePoint::Decay, barrier.clone());
+    let workspace: &dyn ConsolidationWorkspace = &fixture.backend;
+
+    let page = std::thread::scope(|scope| {
+        let reader = scope.spawn(|| workspace.page_decay(namespace.id, None, 256, one_row_budget));
+        barrier.wait();
+        writer.block_on(async {
+            let mut conn = writer.scoped_conn(namespace.id).await.unwrap();
+            query::<Postgres>(
+                "INSERT INTO episodic_memories
+                    (id, namespace_id, episode_id, source_entity, about_entity, content, timestamp)
+                 VALUES ($1, $2, $3, $4, $5, 'racing insert', $6)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(namespace.id)
+            .bind(Uuid::new_v4())
+            .bind(Uuid::new_v4())
+            .bind(Uuid::new_v4())
+            .bind(Utc::now())
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        });
+        barrier.wait();
+        reader.join().expect("compact decay reader thread")
+    })
+    .expect("stable PostgreSQL compact decay snapshot");
+    assert_eq!(page.scanned_rows, 1);
+    assert_eq!(page.records.len(), 1);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one disposable two-connection fixture proves boundary serialization through promotion"
+)]
+fn consolidation_finalization_excludes_a_late_postgres_assignment() {
+    let Some(admin_opts) =
+        skip_notice("consolidation_finalization_excludes_a_late_postgres_assignment")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let writer = fixture.backend_as(&admin_opts, &fixture.role);
+    let namespace = Namespace::new("workspace-late-assignment-race");
+    fixture.backend.save_namespace(&namespace).unwrap();
+    register_embedding_space(&fixture, "workspace-late-assignment-space", "mock", 2);
+    activate_namespace_space(&fixture, namespace.id, "workspace-late-assignment-space");
+    let space = EmbeddingSpaceId("workspace-late-assignment-space".to_string());
+    let about = Uuid::new_v4();
+    fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace.id).await.unwrap();
+        let mut tx = (&mut *conn).begin().await.unwrap();
+        query::<Postgres>(
+            "INSERT INTO episodic_memories
+                (id, namespace_id, episode_id, source_entity, about_entity, content, timestamp)
+             SELECT md5('late-assignment-memory-' || ordinal)::uuid, $1,
+                    md5('late-assignment-episode-' || ordinal)::uuid, $2, $2,
+                    'late assignment source ' || ordinal,
+                    NOW() + ordinal * INTERVAL '1 second'
+             FROM generate_series(1, 4097) AS ordinal",
+        )
+        .bind(namespace.id)
+        .bind(about)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        query::<Postgres>(
+            "INSERT INTO memory_embeddings
+                (namespace_id, memory_type, memory_id, embedding_space_id,
+                 source_sha256, embedding, created_at)
+             SELECT $1, 'episodic', id, $2, repeat('a', 64), '[1,0]'::vector, NOW()
+             FROM episodic_memories WHERE namespace_id = $1",
+        )
+        .bind(namespace.id)
+        .bind(&space.0)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    });
+    let workspace: &dyn ConsolidationWorkspace = &fixture.backend;
+    let run = workspace.begin_or_resume(namespace.id, &space).unwrap();
+    let (anchor_id, late_id) = fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace.id).await.unwrap();
+        let rows: Vec<(Uuid, i64)> = query_as::<Postgres, _>(
+            "SELECT memory_id, source_ordinal FROM consolidation_sources
+             WHERE run_id = $1 AND namespace_id = $2
+               AND source_ordinal IN (1, 4097)
+             ORDER BY source_ordinal",
+        )
+        .bind(run.id)
+        .bind(namespace.id)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        let [(anchor_id, 1), (late_id, 4097)] = rows.as_slice() else {
+            panic!("boundary workspace rows");
+        };
+        query::<Postgres>(
+            "UPDATE consolidation_sources
+             SET assignment_anchor = $3, assignment_state = 'tentative'
+             WHERE run_id = $1 AND namespace_id = $2 AND source_ordinal <= $4",
+        )
+        .bind(run.id)
+        .bind(namespace.id)
+        .bind(*anchor_id)
+        .bind(i64::try_from(MAX_PROMOTION_CLUSTER_MEMBERS).unwrap())
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        (*anchor_id, *late_id)
+    });
+    let anchor = MemoryRef {
+        memory_type: MemoryType::Episodic,
+        id: anchor_id,
+    };
+    let late = MemoryRef {
+        memory_type: MemoryType::Episodic,
+        id: late_id,
+    };
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    fixture
+        .backend
+        .set_workspace_race_barrier(WorkspaceRacePoint::FinalMembership, barrier.clone());
+
+    let (decision, late_count) = std::thread::scope(|scope| {
+        let finalizer = scope.spawn(|| {
+            workspace.finalize_or_discard_cluster(run, anchor, CONSOLIDATION_WORKING_STATE_BYTES)
+        });
+        barrier.wait();
+        let (attempting, attempted) = std::sync::mpsc::sync_channel(0);
+        let late_assignment = scope.spawn(move || {
+            let writer_workspace: &dyn ConsolidationWorkspace = &writer;
+            attempting.send(()).unwrap();
+            writer_workspace.record_tentative_match(run, anchor, late)
+        });
+        attempted.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !late_assignment.is_finished(),
+            "late assignment must wait for the finalizer's durable lock"
+        );
+        barrier.wait();
+        let decision = finalizer
+            .join()
+            .expect("finalization thread")
+            .expect("bounded finalization");
+        let late_count = late_assignment
+            .join()
+            .expect("late assignment thread")
+            .expect("late assignment result");
+        (decision, late_count)
+    });
+    assert_eq!(late_count, 0);
+    let ClusterDecision::Finalized { promotion } = decision else {
+        panic!("the original 4,096 members must finalize");
+    };
+    assert_eq!(promotion.member_count, MAX_PROMOTION_CLUSTER_MEMBERS);
+    assert_eq!(promotion.provenance.len(), MAX_PROMOTION_CLUSTER_MEMBERS);
+
+    let durable: (i64, i64) = fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace.id).await.unwrap();
+        query_as::<Postgres, _>(
+            "SELECT
+                 COUNT(*) FILTER (
+                     WHERE assignment_anchor = $3 AND assignment_state = 'finalized'),
+                 COUNT(*) FILTER (
+                     WHERE memory_id = $4 AND assignment_anchor IS NULL
+                       AND assignment_state = 'unassigned')
+             FROM consolidation_sources WHERE run_id = $1 AND namespace_id = $2",
+        )
+        .bind(run.id)
+        .bind(namespace.id)
+        .bind(anchor.id)
+        .bind(late.id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+    });
+    assert_eq!(durable, (4096, 1));
+
+    let episodes = promotion
+        .provenance
+        .iter()
+        .map(|member| member.episode_id)
+        .collect::<Vec<_>>();
+    let (malformed, malformed_record) = semantic_promotion(
+        namespace.id,
+        about,
+        &promotion.latest.content,
+        episodes[..episodes.len() - 1].to_vec(),
+        &space.0,
+    );
+    let error = workspace
+        .commit_promotion(run, anchor, &malformed, &malformed_record)
+        .expect_err("promotion must reject a supplied member/provenance count mismatch");
+    assert!(error.to_string().contains("provenance"));
+
+    let (semantic, semantic_record) = semantic_promotion(
+        namespace.id,
+        about,
+        &promotion.latest.content,
+        episodes,
+        &space.0,
+    );
+    assert_eq!(
+        workspace
+            .commit_promotion(run, anchor, &semantic, &semantic_record)
+            .unwrap(),
+        PromotionCommit::Committed
+    );
+    let durable: (i64, i64) = fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace.id).await.unwrap();
+        query_as::<Postgres, _>(
+            "SELECT
+                 COUNT(*) FILTER (
+                     WHERE assignment_anchor = $3 AND assignment_state = 'promoted'),
+                 COUNT(*) FILTER (
+                     WHERE memory_id = $4 AND assignment_anchor IS NULL
+                       AND assignment_state = 'unassigned')
+             FROM consolidation_sources WHERE run_id = $1 AND namespace_id = $2",
+        )
+        .bind(run.id)
+        .bind(namespace.id)
+        .bind(anchor.id)
+        .bind(late.id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+    });
+    assert_eq!(durable, (4096, 1));
+    assert!(
+        fixture
+            .backend
+            .get_semantic_in_namespace(semantic.id(), namespace.id)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn consolidation_workspace_rejects_a_4097_member_promotion() {
+    let Some(admin_opts) = skip_notice("consolidation_workspace_rejects_a_4097_member_promotion")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let namespace = Namespace::new("workspace-boundary");
+    fixture.backend.save_namespace(&namespace).unwrap();
+    register_embedding_space(&fixture, "workspace-boundary-space", "mock", 2);
+    activate_namespace_space(&fixture, namespace.id, "workspace-boundary-space");
+    fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace.id).await.unwrap();
+        let mut tx = (&mut *conn).begin().await.unwrap();
+        query::<Postgres>(
+            "INSERT INTO episodic_memories
+                (id, namespace_id, episode_id, source_entity, about_entity, content, timestamp)
+             SELECT md5('workspace-memory-' || ordinal)::uuid, $1,
+                    md5('workspace-episode-' || ordinal)::uuid, $2, $2,
+                    'boundary source ' || ordinal, NOW() + ordinal * INTERVAL '1 second'
+             FROM generate_series(1, 4097) AS ordinal",
+        )
+        .bind(namespace.id)
+        .bind(Uuid::new_v4())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        query::<Postgres>(
+            "INSERT INTO memory_embeddings
+                (namespace_id, memory_type, memory_id, embedding_space_id,
+                 source_sha256, embedding, created_at)
+             SELECT $1, 'episodic', id, 'workspace-boundary-space', repeat('a', 64),
+                    '[1,0]'::vector, NOW()
+             FROM episodic_memories WHERE namespace_id = $1",
+        )
+        .bind(namespace.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    });
+    let workspace: &dyn ConsolidationWorkspace = &fixture.backend;
+    let run = workspace
+        .begin_or_resume(
+            namespace.id,
+            &EmbeddingSpaceId("workspace-boundary-space".to_string()),
+        )
+        .unwrap();
+    let anchor_id = fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace.id).await.unwrap();
+        let anchor: (Uuid,) = query_as::<Postgres, _>(
+            "SELECT memory_id FROM consolidation_sources
+             WHERE run_id = $1 AND namespace_id = $2 ORDER BY source_ordinal LIMIT 1",
+        )
+        .bind(run.id)
+        .bind(namespace.id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        query::<Postgres>(
+            "UPDATE consolidation_sources
+             SET assignment_anchor = $3, assignment_state = 'tentative'
+             WHERE run_id = $1 AND namespace_id = $2",
+        )
+        .bind(run.id)
+        .bind(namespace.id)
+        .bind(anchor.0)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        anchor.0
+    });
+    for _ in 0..2 {
+        assert!(matches!(
+            workspace
+                .finalize_or_discard_cluster(
+                    run,
+                    MemoryRef {
+                        memory_type: MemoryType::Episodic,
+                        id: anchor_id,
+                    },
+                    CONSOLIDATION_WORKING_STATE_BYTES,
+                )
+                .unwrap(),
+            ClusterDecision::MemberBudgetExceeded { member_count: 4097 }
+        ));
+    }
+    let promoted: (i64,) = fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace.id).await.unwrap();
+        query_as::<Postgres, _>(
+            "SELECT COUNT(*) FROM consolidation_sources
+             WHERE run_id = $1 AND namespace_id = $2 AND promotion_complete = TRUE",
+        )
+        .bind(run.id)
+        .bind(namespace.id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+    });
+    assert_eq!(promoted.0, 0);
+}
+
+#[test]
+fn embedding_write_commits_mock_and_real_generations_for_the_same_source() {
+    let Some(admin_opts) =
+        skip_notice("embedding_write_commits_mock_and_real_generations_for_the_same_source")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let (namespace, memory) = embedding_write_fixture(&fixture);
+    register_embedding_space(&fixture, "mock-space", "mock", 4);
+    register_embedding_space(&fixture, "real-space", "real", 4);
+
+    for space in ["mock-space", "real-space"] {
+        let record = embedding_record(&memory, space, vec![1.0; 4]);
+        fixture
+            .backend
+            .save_memory_with_embedding(&memory, Some(&record))
+            .expect("save source and embedding generation");
+    }
+
+    assert_eq!(embedding_count(&fixture, namespace.id), 2);
+    assert!(
+        fixture
+            .backend
+            .get_episodic_in_namespace(memory.id(), namespace.id)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn embedding_write_missing_space_and_stale_hash_roll_back_source() {
+    let Some(admin_opts) =
+        skip_notice("embedding_write_missing_space_and_stale_hash_roll_back_source")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let (namespace, missing_memory) = embedding_write_fixture(&fixture);
+    let missing = embedding_record(&missing_memory, "missing-space", vec![1.0; 4]);
+    assert!(
+        fixture
+            .backend
+            .save_memory_with_embedding(&missing_memory, Some(&missing))
+            .is_err()
+    );
+    assert!(
+        fixture
+            .backend
+            .get_episodic_in_namespace(missing_memory.id(), namespace.id)
+            .unwrap()
+            .is_none()
+    );
+
+    register_embedding_space(&fixture, "test-space", "mock", 4);
+    let stale_memory = Memory::Episodic(EpisodicMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "stale source",
+    ));
+    let mut stale = embedding_record(&stale_memory, "test-space", vec![1.0; 4]);
+    stale.source_sha256 = "00".repeat(32);
+    assert!(matches!(
+        fixture
+            .backend
+            .save_memory_with_embedding(&stale_memory, Some(&stale)),
+        Err(StorageError::Context(_))
+    ));
+    assert!(
+        fixture
+            .backend
+            .get_episodic_in_namespace(stale_memory.id(), namespace.id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(embedding_count(&fixture, namespace.id), 0);
+}
+
+fn assert_embedding_write_rejects_cross_namespace_replacement(fixture: &Fixture, relax_rls: bool) {
+    if relax_rls {
+        fixture.relax_rls();
+    }
+    let (owner, memory) = embedding_write_fixture(fixture);
+    register_embedding_space(fixture, "test-space", "mock", 4);
+    let owner_record = embedding_record(&memory, "test-space", vec![1.0; 4]);
+    fixture
+        .backend
+        .save_memory_with_embedding(&memory, Some(&owner_record))
+        .unwrap();
+
+    let foreign = Namespace::new("embedding-foreign");
+    fixture.backend.save_namespace(&foreign).unwrap();
+    let mut replacement = memory.clone();
+    let Memory::Episodic(replacement) = &mut replacement else {
+        unreachable!()
+    };
+    replacement.namespace_id = foreign.id;
+    replacement.content = "cross-namespace replacement".to_string();
+    let foreign_record = embedding_record(
+        &Memory::Episodic(replacement.clone()),
+        "test-space",
+        vec![2.0; 4],
+    );
+
+    let error = fixture
+        .backend
+        .save_memory_with_embedding(
+            &Memory::Episodic(replacement.clone()),
+            Some(&foreign_record),
+        )
+        .expect_err("cross-namespace replacement must be rejected");
+    if relax_rls {
+        assert!(
+            matches!(
+                error,
+                StorageError::Context(ref message)
+                    if message == &format!(
+                        "source write for {} was rejected by its namespace predicate",
+                        replacement.id
+                    )
+            ),
+            "relaxed RLS must reach the explicit upsert predicate rejection, got: {error}"
+        );
+    }
+    assert!(
+        fixture
+            .backend
+            .get_episodic_in_namespace(memory.id(), owner.id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        fixture
+            .backend
+            .get_episodic_in_namespace(memory.id(), foreign.id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(embedding_count(fixture, owner.id), 1);
+    assert_eq!(embedding_count(fixture, foreign.id), 0);
+}
+
+#[test]
+fn embedding_write_cross_namespace_replacement_is_blocked_by_explicit_predicates() {
+    let Some(admin_opts) = skip_notice(
+        "embedding_write_cross_namespace_replacement_is_blocked_by_explicit_predicates",
+    ) else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    assert_embedding_write_rejects_cross_namespace_replacement(&fixture, true);
+}
+
+#[test]
+fn embedding_write_cross_namespace_replacement_is_blocked_under_forced_rls() {
+    let Some(admin_opts) =
+        skip_notice("embedding_write_cross_namespace_replacement_is_blocked_under_forced_rls")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    assert_embedding_write_rejects_cross_namespace_replacement(&fixture, false);
+}
+
+#[test]
+fn embedding_write_rows_are_removed_by_supersede_delete_and_erase() {
+    let Some(admin_opts) =
+        skip_notice("embedding_write_rows_are_removed_by_supersede_delete_and_erase")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let (namespace, superseded) = embedding_write_fixture(&fixture);
+    register_embedding_space(&fixture, "test-space", "mock", 4);
+    let Memory::Episodic(superseded_source) = &superseded else {
+        unreachable!()
+    };
+    let deleted = Memory::Procedural(ProceduralMemory::new(
+        namespace.id,
+        "delete",
+        "generation",
+        Outcome::Success,
+        HashMap::new(),
+    ));
+    let observation = Memory::Observation(ObservationMemory::new(
+        namespace.id,
+        superseded_source.episode_id,
+        "erase",
+        "observation",
+        "remove",
+        "erase generation",
+    ));
+    let mut entity = Entity::new("erase target", EntityKind::User);
+    entity.id = superseded_source.about_entity;
+    entity.namespace_id = namespace.id;
+    fixture.backend.save_entity(&entity).unwrap();
+
+    for memory in [&superseded, &deleted, &observation] {
+        let record = embedding_record(memory, "test-space", vec![1.0; 4]);
+        fixture
+            .backend
+            .save_memory_with_embedding(memory, Some(&record))
+            .unwrap();
+    }
+    assert_eq!(embedding_count(&fixture, namespace.id), 3);
+
+    assert!(
+        fixture
+            .backend
+            .supersede_memory_in_namespace(
+                superseded.id(),
+                namespace.id,
+                Uuid::new_v4(),
+                Utc::now(),
+            )
+            .unwrap()
+    );
+    assert_eq!(embedding_count(&fixture, namespace.id), 2);
+    assert!(
+        fixture
+            .backend
+            .delete_memory_by_id_in_namespace(deleted.id(), namespace.id)
+            .unwrap()
+    );
+    assert_eq!(embedding_count(&fixture, namespace.id), 1);
+
+    let erased = fixture
+        .backend
+        .erase_entity_capturing(entity.id, namespace.id)
+        .unwrap();
+    assert_eq!(erased.memories.len(), 1);
+    assert_eq!(erased.observations.len(), 1);
+    assert_eq!(embedding_count(&fixture, namespace.id), 0);
 }
 
 /// Seed one episodic memory in `ns_a` and register both namespaces.
@@ -1024,8 +2496,14 @@ fn capturing_delete_still_works_under_enforced_rls() {
     )
     .expect("forget in namespace A must still succeed under enforced RLS");
 
+    let mut captured = Vec::new();
+    crate::snapshot::for_each_memory_id(outcome.path.as_deref().expect("snapshot path"), |id| {
+        captured.push(id);
+        Ok(())
+    })
+    .expect("stream snapshot ids");
     assert_eq!(
-        outcome.snapshot.memory_ids(),
+        captured,
         vec![mine.id],
         "the capturing delete must still capture its own namespace's row under enforced RLS"
     );
@@ -2909,13 +4387,13 @@ fn every_rls_table_has_exactly_one_namespace_policy() {
         );
         assert_eq!(
             qual.as_deref(),
-            Some(EXPECTED_POLICY_QUAL),
+            Some(expected_policy_qual(table)),
             "{policy} on {table} no longer isolates reads by namespace_id via the \
              pensyve.namespace_id GUC"
         );
         assert_eq!(
             with_check.as_deref(),
-            Some(EXPECTED_POLICY_QUAL),
+            Some(expected_policy_qual(table)),
             "{policy} on {table} no longer constrains writes: without WITH CHECK a \
              connection scoped to one namespace could INSERT or UPDATE a row into another"
         );
@@ -2960,8 +4438,8 @@ fn schema_declares_rls_for_every_expected_table() {
     // would otherwise satisfy these assertions without the schema declaring
     // anything.
     let normalized = sql_statements_only(super::SCHEMA);
-    let predicate = "namespace_id::text = current_setting('pensyve.namespace_id', true)";
     for (table, policy) in RLS_POLICIES {
+        let predicate = expected_policy_predicate(table);
         assert!(
             normalized.contains(&format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;")),
             "postgres_schema.sql no longer enables RLS on {table}"
@@ -2981,6 +4459,32 @@ fn schema_declares_rls_for_every_expected_table() {
             "postgres_schema.sql no longer declares {policy} on {table} with the expected \
              namespace_id predicate on both the read (USING) and write (WITH CHECK) halves"
         );
+    }
+}
+
+fn expected_policy_predicate(table: &str) -> &'static str {
+    match table {
+        "memory_embeddings"
+        | "namespace_embedding_state"
+        | "embedding_backfill_queue"
+        | "consolidation_runs"
+        | "consolidation_sources" => {
+            "namespace_id = current_setting('pensyve.namespace_id', true)::uuid"
+        }
+        _ => "namespace_id::text = current_setting('pensyve.namespace_id', true)",
+    }
+}
+
+#[test]
+fn schema_forces_rls_on_every_embedding_namespace_table() {
+    let sql = include_str!("../postgres_schema.sql");
+    for table in [
+        "memory_embeddings",
+        "namespace_embedding_state",
+        "embedding_backfill_queue",
+    ] {
+        assert!(sql.contains(&format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")));
+        assert!(sql.contains(&format!("ALTER TABLE {table} FORCE ROW LEVEL SECURITY")));
     }
 }
 
@@ -3070,7 +4574,12 @@ fn capturing_delete_is_confined_to_its_namespace() {
     );
 
     // 2. And they never entered the artifact.
-    let captured = outcome.snapshot.memory_ids();
+    let mut captured = Vec::new();
+    crate::snapshot::for_each_memory_id(outcome.path.as_deref().expect("snapshot path"), |id| {
+        captured.push(id);
+        Ok(())
+    })
+    .expect("stream snapshot ids");
     assert!(
         !captured.contains(&theirs.id) && !captured.contains(&their_fact.id),
         "namespace B's rows leaked into namespace A's snapshot: {captured:?}"
@@ -3096,11 +4605,259 @@ fn capturing_delete_is_confined_to_its_namespace() {
         path.parent().expect("snapshot parent"),
         crate::snapshot::namespace_dir(snapshot_root.path(), ns_a.id)
     );
-    let reloaded = crate::snapshot::read_file(&path).expect("reload snapshot");
     assert!(
-        !reloaded.memory_ids().contains(&theirs.id),
+        !captured.contains(&theirs.id),
         "namespace B's row leaked into the snapshot file on disk"
     );
+}
+
+#[test]
+fn capturing_delete_live_body_reads_the_streamed_v2_artifact() {
+    let source = include_str!("live_rls.rs");
+    let body = source
+        .split_once("fn capturing_delete_is_confined_to_its_namespace()")
+        .expect("capturing delete live body")
+        .1
+        .split_once("fn capturing_delete_live_body_reads_the_streamed_v2_artifact()")
+        .expect("capturing delete body terminator")
+        .0;
+
+    assert!(!body.contains("snapshot::read_file"));
+    assert!(body.contains("snapshot::for_each_memory_id"));
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one coordinated live fixture proves both conflicting writer classes and exact outcome"
+)]
+fn paged_forget_locks_final_source_and_generation_capture_against_concurrent_writers() {
+    let Some(admin_opts) = skip_notice(
+        "paged_forget_locks_final_source_and_generation_capture_against_concurrent_writers",
+    ) else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    fixture.relax_rls();
+    let backend = &fixture.backend;
+    let namespace = Namespace::new(format!("forget-lock-{}", Uuid::new_v4().simple()));
+    backend
+        .save_namespace(&namespace)
+        .expect("save lock-test namespace");
+    let entity_id = Uuid::new_v4();
+    let source = Memory::Semantic(SemanticMemory::new(
+        namespace.id,
+        entity_id,
+        "status",
+        "captured-before-concurrent-update",
+        0.9,
+    ));
+    register_embedding_space(&fixture, "forget-lock-space", "real", 2);
+    let original_record = embedding_record(&source, "forget-lock-space", vec![1.0, 0.0]);
+    backend
+        .save_memory_with_embedding(&source, Some(&original_record))
+        .expect("save source and original generation");
+    let memory_ref = MemoryRef::from_memory(&source);
+    let pause = super::capture_lock_probe::install(memory_ref);
+    let snapshot_root = tempfile::tempdir().expect("snapshot root");
+    let writer_options = admin_opts
+        .clone()
+        .username(&fixture.role)
+        .password(APP_ROLE_PASSWORD)
+        .database(&fixture.database);
+
+    let (update_done_tx, update_done_rx) = std::sync::mpsc::channel();
+    let (generation_done_tx, generation_done_rx) = std::sync::mpsc::channel();
+    let (outcome, update_rows, generation_result, update_early, generation_early) =
+        std::thread::scope(|scope| {
+            let forget = scope.spawn(|| {
+                crate::snapshot::forget_entity_bounded(
+                    backend,
+                    entity_id,
+                    Some("lock subject"),
+                    namespace.id,
+                    snapshot_root.path(),
+                    crate::snapshot::RetentionPolicy::UNBOUNDED,
+                )
+            });
+            let reached = pause.wait_until_reached(Duration::from_secs(10));
+            if !reached {
+                pause.release();
+                let _ = forget.join();
+                panic!("paged forget never reached the post-capture lock probe");
+            }
+
+            let update_options = writer_options.clone();
+            let update = scope.spawn(move || {
+                let runtime = Runtime::new().expect("update runtime");
+                let rows = runtime.block_on(async {
+                    let pool = PgPoolOptions::new()
+                        .max_connections(1)
+                        .connect_with(update_options)
+                        .await
+                        .expect("connect concurrent updater");
+                    query::<Postgres>(
+                        "UPDATE semantic_memories SET object = $1
+                         WHERE id = $2 AND namespace_id = $3",
+                    )
+                    .bind("concurrent-update")
+                    .bind(memory_ref.id)
+                    .bind(namespace.id)
+                    .execute(&pool)
+                    .await
+                    .expect("run concurrent source update")
+                    .rows_affected()
+                });
+                update_done_tx.send(()).expect("report update completion");
+                rows
+            });
+
+            let generation_options = writer_options.clone();
+            let concurrent_record = embedding_record(&source, "forget-lock-space", vec![0.0, 1.0]);
+            let generation = scope.spawn(move || {
+                let runtime = Runtime::new().expect("generation runtime");
+                let result = runtime.block_on(async {
+                    let pool = PgPoolOptions::new()
+                        .max_connections(1)
+                        .connect_with(generation_options)
+                        .await
+                        .expect("connect concurrent generation writer");
+                    let mut connection = pool.acquire().await.expect("acquire generation writer");
+                    let mut transaction = (&mut *connection)
+                        .begin()
+                        .await
+                        .expect("begin generation write");
+                    let result =
+                        super::insert_embedding_in_pg_tx(&mut transaction, &concurrent_record)
+                            .await
+                            .map_err(|error| error.to_string());
+                    if result.is_ok() {
+                        transaction.commit().await.expect("commit generation write");
+                    }
+                    result
+                });
+                generation_done_tx
+                    .send(())
+                    .expect("report generation completion");
+                result
+            });
+
+            let update_early = update_done_rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_ok();
+            let generation_early = generation_done_rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_ok();
+            pause.release();
+
+            (
+                forget
+                    .join()
+                    .expect("forget thread")
+                    .expect("forget result"),
+                update.join().expect("update thread"),
+                generation.join().expect("generation thread"),
+                update_early,
+                generation_early,
+            )
+        });
+
+    assert!(
+        !update_early,
+        "source update committed while capture was paused"
+    );
+    assert!(
+        !generation_early,
+        "generation insert committed while capture was paused"
+    );
+    assert_eq!(
+        update_rows, 0,
+        "the post-delete update must touch no source"
+    );
+    assert!(
+        generation_result
+            .expect_err("the post-delete generation must fail")
+            .contains("does not exist")
+    );
+    assert_eq!(outcome.snapshot.counts.total, 1);
+    assert_eq!(outcome.snapshot.embedding_records, 1);
+    let mut captured = Vec::new();
+    outcome
+        .artifact
+        .expect("pinned streamed artifact")
+        .for_each_memory_id(|id| {
+            captured.push(id);
+            Ok(())
+        })
+        .expect("stream captured ids");
+    assert_eq!(captured, [memory_ref.id]);
+    assert!(
+        backend
+            .get_semantic_in_namespace(memory_ref.id, namespace.id)
+            .expect("read deleted source")
+            .is_none()
+    );
+    assert_eq!(embedding_count(&fixture, namespace.id), 0);
+}
+
+#[test]
+fn postgres_snapshot_and_gdpr_pages_keep_one_real_page_live() {
+    let Some(admin_opts) = skip_notice("postgres_snapshot_and_gdpr_pages_keep_one_real_page_live")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+    let namespace = Namespace::new(format!("page-guard-{}", Uuid::new_v4().simple()));
+    backend
+        .save_namespace(&namespace)
+        .expect("save page-guard namespace");
+    let entity_id = Uuid::new_v4();
+    for index in 0..257 {
+        backend
+            .save_semantic(&SemanticMemory::new(
+                namespace.id,
+                entity_id,
+                "page",
+                format!("row {index}"),
+                0.9,
+            ))
+            .expect("save page-guard source");
+    }
+
+    let gdpr_probe = crate::storage::bulk_page_probe::start(
+        namespace.id,
+        crate::storage::BulkPageKind::GdprExport,
+    );
+    crate::gdpr::export_entity_data_to_writer(backend, entity_id, namespace.id, &mut Vec::new())
+        .expect("stream GDPR pages");
+    let gdpr = gdpr_probe.observed();
+    assert_eq!(gdpr.max_requested, 256);
+    assert_eq!(gdpr.peak_live_pages, 1);
+    assert_eq!(gdpr.live_pages, 0);
+    assert_eq!(gdpr.created_pages, 2);
+    drop(gdpr_probe);
+
+    let snapshot_probe = crate::storage::bulk_page_probe::start(
+        namespace.id,
+        crate::storage::BulkPageKind::SnapshotCapture,
+    );
+    let snapshot_root = tempfile::tempdir().expect("snapshot root");
+    let outcome = crate::snapshot::forget_entity_bounded(
+        backend,
+        entity_id,
+        Some("page subject"),
+        namespace.id,
+        snapshot_root.path(),
+        crate::snapshot::RetentionPolicy::UNBOUNDED,
+    )
+    .expect("stream snapshot pages");
+    let snapshot = snapshot_probe.observed();
+    assert_eq!(snapshot.max_requested, 256);
+    assert_eq!(snapshot.peak_live_pages, 1);
+    assert_eq!(snapshot.live_pages, 0);
+    assert_eq!(snapshot.created_pages, 2);
+    assert_eq!(outcome.snapshot.counts.total, 257);
 }
 
 /// Only known-safe call sites may take a connection that carries no namespace.
@@ -3155,6 +4912,33 @@ fn only_bound_connections_reach_policied_tables() {
              allowlisted `unbound()` call."
         );
     }
+}
+
+/// Transactional upserts reject a colliding id through their namespace-qualified
+/// `ON CONFLICT ... WHERE` clauses. An ownership probe without the requested
+/// namespace predicate bypasses that defense when RLS is relaxed and can also
+/// disclose that another tenant owns the id.
+#[test]
+fn transactional_writes_have_no_unscoped_ownership_probes() {
+    let source = rust_code_only(include_str!("../postgres.rs"));
+    for table in [
+        "episodic_memories",
+        "semantic_memories",
+        "procedural_memories",
+        "observation_memories",
+    ] {
+        let forbidden = format!("SELECT namespace_id FROM {table} WHERE id = $1");
+        assert!(
+            !source.contains(&forbidden),
+            "postgres.rs probes {table} ownership without the requested namespace; rely on the \
+             qualified upsert and its affected-row rejection instead"
+        );
+    }
+    assert!(
+        !source.contains("SELECT namespace_id FROM memory_embeddings"),
+        "postgres.rs probes generation ownership without the requested namespace; rely on the \
+         qualified upsert and its affected-row rejection instead"
+    );
 }
 
 /// The other half of the `unbound()` rule: what the SQL it executes may do.
@@ -3461,5 +5245,1460 @@ fn fts_candidates_match_sqlite_for_multi_token_queries() {
     assert!(
         pg_stopwords.is_empty(),
         "a stop-word-only query normalises to the empty tsquery on Postgres"
+    );
+}
+
+fn bounded_memory_keys(memories: &[Memory]) -> Vec<(MemoryType, Uuid)> {
+    memories
+        .iter()
+        .map(MemoryRef::from_memory)
+        .map(|memory_ref| (memory_ref.memory_type, memory_ref.id))
+        .collect()
+}
+
+fn register_sqlite_embedding_space(path: &std::path::Path, id: &str, dimension: usize) {
+    let connection = rusqlite::Connection::open(path.join("memories.db"))
+        .expect("open sqlite generation fixture");
+    connection
+        .execute(
+            "INSERT INTO embedding_spaces
+             (id, canonical_identity_json, class, dimension, created_at)
+             VALUES (?1, '{}', 'real', ?2, '2026-08-31T00:00:00Z')",
+            rusqlite::params![id, i64::try_from(dimension).unwrap()],
+        )
+        .expect("register sqlite embedding space");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn bounded_reads_match_sqlite_and_isolate_forced_rls() {
+    let Some(admin_opts) = skip_notice("bounded_reads_match_sqlite_and_isolate_forced_rls") else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let postgres = &fixture.backend;
+    let sqlite_dir = tempfile::tempdir().expect("sqlite tempdir");
+    let sqlite = crate::storage::sqlite::SqliteBackend::open(sqlite_dir.path())
+        .expect("open sqlite parity backend");
+    let backends: [&dyn StorageTrait; 2] = [postgres, &sqlite];
+
+    let namespace = Namespace::new(format!("bounded-own-{}", Uuid::new_v4().simple()));
+    let foreign = Namespace::new(format!("bounded-foreign-{}", Uuid::new_v4().simple()));
+    let agent = Uuid::new_v4();
+    let user = Uuid::new_v4();
+    let entity = Uuid::new_v4();
+    let shared_id = Uuid::from_u128(71);
+    for backend in backends {
+        backend
+            .save_namespace(&namespace)
+            .expect("save own namespace");
+        backend
+            .save_namespace(&foreign)
+            .expect("save foreign namespace");
+
+        let mut own = EpisodicMemory::new(
+            namespace.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "boundedtoken own",
+        );
+        own.id = shared_id;
+        own.about_entity = entity;
+        own.agent_id = Some(agent);
+        own.user_id = Some(user);
+        own.embedding = vec![99.0, 98.0];
+        backend.save_episodic(&own).expect("save scoped own row");
+
+        let mut wrong_scope = SemanticMemory::new(
+            namespace.id,
+            Uuid::new_v4(),
+            "boundedtoken",
+            "wrong scope",
+            1.0,
+        );
+        wrong_scope.id = Uuid::from_u128(72);
+        wrong_scope.agent_id = Some(agent);
+        wrong_scope.user_id = Some(user);
+        backend
+            .save_semantic(&wrong_scope)
+            .expect("save wrong-scope row");
+
+        let mut foreign_same_id = ProceduralMemory::new(
+            foreign.id,
+            "boundedtoken",
+            "foreign row",
+            Outcome::Success,
+            HashMap::new(),
+        );
+        foreign_same_id.id = shared_id;
+        foreign_same_id.agent_id = Some(agent);
+        foreign_same_id.user_id = Some(user);
+        backend
+            .save_procedural(&foreign_same_id)
+            .expect("save foreign same-id row");
+    }
+
+    let scope = SearchScope {
+        namespace_id: namespace.id,
+        identity: IdentityScope::ExactPair {
+            agent_id: Some(agent),
+            user_id: Some(user),
+        },
+        entity: BoundedEntityScope::Exact(entity),
+    };
+    let sqlite_hits = sqlite
+        .search_lexical_hits("boundedtoken", &scope, 100)
+        .expect("sqlite lexical hits");
+    let postgres_hits = postgres
+        .search_lexical_hits("boundedtoken", &scope, 100)
+        .expect("postgres lexical hits");
+    assert_eq!(postgres_hits, sqlite_hits);
+    assert_eq!(
+        postgres_hits
+            .iter()
+            .map(|hit| hit.memory_ref)
+            .collect::<Vec<_>>(),
+        vec![MemoryRef {
+            memory_type: MemoryType::Episodic,
+            id: shared_id,
+        }]
+    );
+
+    let refs = [
+        MemoryRef {
+            memory_type: MemoryType::Episodic,
+            id: shared_id,
+        },
+        MemoryRef {
+            memory_type: MemoryType::Procedural,
+            id: shared_id,
+        },
+    ];
+    let sqlite_hydrated = sqlite
+        .hydrate_memories(namespace.id, &refs, MAX_HYDRATED_BYTES)
+        .expect("sqlite hydrate");
+    let postgres_hydrated = postgres
+        .hydrate_memories(namespace.id, &refs, MAX_HYDRATED_BYTES)
+        .expect("postgres hydrate");
+    assert_eq!(
+        bounded_memory_keys(&postgres_hydrated),
+        bounded_memory_keys(&sqlite_hydrated)
+    );
+    assert!(postgres_hydrated.iter().all(|memory| match memory {
+        Memory::Episodic(memory) => memory.embedding.is_empty(),
+        Memory::Semantic(memory) => memory.embedding.is_empty(),
+        Memory::Procedural(memory) => memory.embedding.is_empty(),
+        Memory::Observation(memory) => memory.embedding.is_empty(),
+    }));
+
+    let request = MemoryPageRequest::new(scope, None, 1, false).expect("page request");
+    let sqlite_page = sqlite.page_memories(&request).expect("sqlite page");
+    let postgres_page = postgres.page_memories(&request).expect("postgres page");
+    assert_eq!(
+        bounded_memory_keys(&postgres_page.memories),
+        bounded_memory_keys(&sqlite_page.memories)
+    );
+    assert_eq!(postgres_page.next_cursor, sqlite_page.next_cursor);
+
+    let sqlite_filtered = sqlite
+        .page_memories_filtered(&request, Some(MemoryType::Episodic))
+        .expect("sqlite filtered page");
+    let postgres_filtered = postgres
+        .page_memories_filtered(&request, Some(MemoryType::Episodic))
+        .expect("postgres filtered page");
+    assert_eq!(
+        bounded_memory_keys(&postgres_filtered.memories),
+        bounded_memory_keys(&sqlite_filtered.memories)
+    );
+    assert!(
+        postgres_filtered
+            .memories
+            .iter()
+            .all(|memory| MemoryType::of(memory) == MemoryType::Episodic)
+    );
+
+    register_embedding_space(&fixture, "bounded-space", "real", 2);
+    register_sqlite_embedding_space(sqlite_dir.path(), "bounded-space", 2);
+    let source = Memory::Episodic(EpisodicMemory {
+        embedding: Vec::new(),
+        ..match &postgres_hydrated[0] {
+            Memory::Episodic(memory) => memory.clone(),
+            _ => panic!("expected episodic source"),
+        }
+    });
+    let record = embedding_record(&source, "bounded-space", vec![1.0, 2.0]);
+    postgres
+        .save_memory_with_embedding(&source, Some(&record))
+        .expect("save postgres generation");
+    sqlite
+        .save_memory_with_embedding(&source, Some(&record))
+        .expect("save sqlite generation");
+    let space = EmbeddingSpaceId("bounded-space".into());
+    assert_eq!(
+        postgres
+            .load_embedding_records(namespace.id, &space, &refs[..1])
+            .expect("load postgres generation"),
+        sqlite
+            .load_embedding_records(namespace.id, &space, &refs[..1])
+            .expect("load sqlite generation")
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one cross-backend fixture proves all bounded mode parity in a single isolated database"
+)]
+fn bounded_explicit_scope_entity_preference_and_observation_exclusion_match_sqlite() {
+    let Some(admin_opts) = skip_notice(
+        "bounded_explicit_scope_entity_preference_and_observation_exclusion_match_sqlite",
+    ) else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let postgres = &fixture.backend;
+    let sqlite_dir = tempfile::tempdir().expect("sqlite bounded-scope tempdir");
+    let sqlite = crate::storage::sqlite::SqliteBackend::open(sqlite_dir.path())
+        .expect("open sqlite bounded-scope oracle");
+    let namespace = Namespace::new(format!("bounded-modes-{}", Uuid::new_v4().simple()));
+    for backend in [postgres as &dyn StorageTrait, &sqlite] {
+        backend.save_namespace(&namespace).expect("save namespace");
+    }
+    let agent = Uuid::new_v4();
+    let other_agent = Uuid::new_v4();
+    let user = Uuid::new_v4();
+    let entity = Uuid::new_v4();
+
+    let mut exact_null = EpisodicMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "halfscopetoken",
+    );
+    exact_null.id = Uuid::from_u128(10_001);
+    exact_null.agent_id = Some(agent);
+    let mut wrong_user = exact_null.clone();
+    wrong_user.id = Uuid::from_u128(10_002);
+    wrong_user.user_id = Some(user);
+
+    let mut across_null = exact_null.clone();
+    across_null.id = Uuid::from_u128(11_001);
+    across_null.content = "acrossuserstoken".into();
+    let mut across_user = across_null.clone();
+    across_user.id = Uuid::from_u128(11_002);
+    across_user.user_id = Some(user);
+    let mut wrong_agent = across_null.clone();
+    wrong_agent.id = Uuid::from_u128(11_003);
+    wrong_agent.agent_id = Some(other_agent);
+
+    let mut preferred = Vec::new();
+    for id in 12_001..=12_010 {
+        let mut memory = EpisodicMemory::new(
+            namespace.id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            entity,
+            "entitypreferencetoken",
+        );
+        memory.id = Uuid::from_u128(id);
+        memory.about_entity = entity;
+        preferred.push(memory);
+    }
+    let mut broad = EpisodicMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "entitypreferencetoken",
+    );
+    broad.id = Uuid::from_u128(13_001);
+    let mut nullable_semantic_broad = SemanticMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        "entitypreferencetoken",
+        "nullable broad context",
+        1.0,
+    );
+    nullable_semantic_broad.id = Uuid::from_u128(13_002);
+    nullable_semantic_broad.object_entity = None;
+    let mut valid_source = exact_null.clone();
+    valid_source.id = Uuid::from_u128(14_001);
+    valid_source.content = "observationcrowdtoken".into();
+    let mut observation = ObservationMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        "kind",
+        "instance",
+        "action",
+        "observationcrowdtoken observationcrowdtoken",
+    );
+    observation.id = Uuid::from_u128(14_002);
+
+    for backend in [postgres as &dyn StorageTrait, &sqlite] {
+        for memory in [
+            &exact_null,
+            &wrong_user,
+            &across_null,
+            &across_user,
+            &wrong_agent,
+            &valid_source,
+        ] {
+            backend.save_episodic(memory).expect("save scoped memory");
+        }
+        for memory in &preferred {
+            backend.save_episodic(memory).expect("save entity memory");
+        }
+        backend.save_episodic(&broad).expect("save broad memory");
+        backend
+            .save_semantic(&nullable_semantic_broad)
+            .expect("save nullable semantic broad context");
+        backend
+            .save_observation(&observation)
+            .expect("save observation");
+    }
+
+    let cases = [
+        (
+            "halfscopetoken",
+            SearchScope {
+                namespace_id: namespace.id,
+                identity: IdentityScope::ExactPair {
+                    agent_id: Some(agent),
+                    user_id: None,
+                },
+                entity: BoundedEntityScope::Any,
+            },
+            100,
+        ),
+        (
+            "acrossuserstoken",
+            SearchScope {
+                namespace_id: namespace.id,
+                identity: IdentityScope::AgentAcrossUsers(agent),
+                entity: BoundedEntityScope::Any,
+            },
+            100,
+        ),
+        (
+            "entitypreferencetoken",
+            SearchScope {
+                namespace_id: namespace.id,
+                identity: IdentityScope::Unscoped,
+                entity: BoundedEntityScope::PreferWithBroad(entity),
+            },
+            10,
+        ),
+        (
+            "observationcrowdtoken",
+            SearchScope::namespace(namespace.id),
+            100,
+        ),
+    ];
+    for (query, scope, limit) in cases {
+        let sqlite_hits = sqlite
+            .search_lexical_hits(query, &scope, limit)
+            .expect("sqlite bounded lexical");
+        let postgres_hits = postgres
+            .search_lexical_hits(query, &scope, limit)
+            .expect("Postgres bounded lexical");
+        assert_eq!(postgres_hits, sqlite_hits, "parity for {query}");
+    }
+
+    let preferred_hits = postgres
+        .search_lexical_hits(
+            "entitypreferencetoken",
+            &SearchScope {
+                namespace_id: namespace.id,
+                identity: IdentityScope::Unscoped,
+                entity: BoundedEntityScope::PreferWithBroad(entity),
+            },
+            10,
+        )
+        .expect("Postgres entity-preferred lexical");
+    assert_eq!(preferred_hits.len(), 10);
+    assert_eq!(
+        preferred_hits
+            .iter()
+            .filter(|hit| hit.memory_ref.id.as_u128() < 13_000)
+            .count(),
+        8
+    );
+    assert!(preferred_hits.iter().any(|hit| {
+        hit.memory_ref.memory_type == MemoryType::Semantic
+            && hit.memory_ref.id == nullable_semantic_broad.id
+    }));
+    assert!(
+        preferred_hits
+            .iter()
+            .all(|hit| { hit.memory_ref.memory_type != MemoryType::Observation })
+    );
+}
+
+#[test]
+fn bounded_lexical_stop_words_and_ranking_match_sqlite() {
+    let Some(admin_opts) = skip_notice("bounded_lexical_stop_words_and_ranking_match_sqlite")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let postgres = &fixture.backend;
+    let sqlite_dir = tempfile::tempdir().expect("sqlite tempdir");
+    let sqlite = crate::storage::sqlite::SqliteBackend::open(sqlite_dir.path())
+        .expect("open sqlite parity backend");
+    let namespace = Namespace::new(format!("lexical-parity-{}", Uuid::new_v4().simple()));
+
+    for backend in [postgres as &dyn StorageTrait, &sqlite] {
+        backend.save_namespace(&namespace).expect("save namespace");
+        for (id, content) in [
+            (81_u128, "the alpha"),
+            (82, "alpha alpha"),
+            (83, "re"),
+            (84, "late"),
+        ] {
+            let mut memory = EpisodicMemory::new(
+                namespace.id,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                content,
+            );
+            memory.id = Uuid::from_u128(id);
+            backend.save_episodic(&memory).expect("save lexical row");
+        }
+    }
+    let scope = SearchScope::namespace(namespace.id);
+
+    let postgres_meaningful = postgres
+        .search_lexical_hits("alpha", &scope, 100)
+        .expect("postgres meaningful query");
+    let sqlite_meaningful = sqlite
+        .search_lexical_hits("alpha", &scope, 100)
+        .expect("sqlite meaningful query");
+    let postgres_with_stop = postgres
+        .search_lexical_hits("the alpha and", &scope, 100)
+        .expect("postgres stop-word query");
+    let sqlite_with_stop = sqlite
+        .search_lexical_hits("the alpha and", &scope, 100)
+        .expect("sqlite stop-word query");
+
+    assert_eq!(postgres_meaningful, sqlite_meaningful);
+    assert_eq!(postgres_with_stop, postgres_meaningful);
+    assert_eq!(sqlite_with_stop, sqlite_meaningful);
+    for punctuated_query in ["the.alpha", "the—alpha"] {
+        assert_eq!(
+            postgres
+                .search_lexical_hits(punctuated_query, &scope, 100)
+                .expect("postgres punctuated query"),
+            postgres_meaningful
+        );
+        assert_eq!(
+            sqlite
+                .search_lexical_hits(punctuated_query, &scope, 100)
+                .expect("sqlite punctuated query"),
+            sqlite_meaningful
+        );
+    }
+    for contraction in ["you're", "you’re"] {
+        assert!(
+            postgres
+                .search_lexical_hits(contraction, &scope, 100)
+                .expect("postgres contraction query")
+                .is_empty()
+        );
+        assert!(
+            sqlite
+                .search_lexical_hits(contraction, &scope, 100)
+                .expect("sqlite contraction query")
+                .is_empty()
+        );
+    }
+    let candidate_capped_query = format!("{}late", "the ".repeat(256));
+    assert!(
+        postgres
+            .search_lexical_hits(&candidate_capped_query, &scope, 100)
+            .expect("postgres candidate-capped query")
+            .is_empty()
+    );
+    assert!(
+        sqlite
+            .search_lexical_hits(&candidate_capped_query, &scope, 100)
+            .expect("sqlite candidate-capped query")
+            .is_empty()
+    );
+    assert!(
+        postgres
+            .search_lexical_hits("the and of", &scope, 100)
+            .expect("postgres stop-only query")
+            .is_empty()
+    );
+    assert!(
+        sqlite
+            .search_lexical_hits("the and of", &scope, 100)
+            .expect("sqlite stop-only query")
+            .is_empty()
+    );
+}
+
+fn assert_memory_scope(memory: &Memory, agent_id: Uuid, user_id: Uuid) {
+    let (actual_agent, actual_user) = match memory {
+        Memory::Episodic(memory) => (memory.agent_id, memory.user_id),
+        Memory::Semantic(memory) => (memory.agent_id, memory.user_id),
+        Memory::Procedural(memory) => (memory.agent_id, memory.user_id),
+        Memory::Observation(memory) => (memory.agent_id, memory.user_id),
+    };
+    assert_eq!(actual_agent, Some(agent_id));
+    assert_eq!(actual_user, Some(user_id));
+}
+
+#[test]
+fn postgres_source_projections_round_trip_persisted_scope() {
+    let Some(admin_opts) = skip_notice("postgres_source_projections_round_trip_persisted_scope")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+    let namespace = Namespace::new(format!("scope-roundtrip-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&namespace).expect("save namespace");
+    let agent_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+
+    let mut episodic = EpisodicMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "scope episodic",
+    );
+    episodic.agent_id = Some(agent_id);
+    episodic.user_id = Some(user_id);
+    backend.save_episodic(&episodic).expect("save episodic");
+
+    let mut semantic = SemanticMemory::new(namespace.id, Uuid::new_v4(), "scope", "semantic", 1.0);
+    semantic.agent_id = Some(agent_id);
+    semantic.user_id = Some(user_id);
+    backend.save_semantic(&semantic).expect("save semantic");
+
+    let mut procedural = ProceduralMemory::new(
+        namespace.id,
+        "scope",
+        "procedural",
+        Outcome::Success,
+        HashMap::new(),
+    );
+    procedural.agent_id = Some(agent_id);
+    procedural.user_id = Some(user_id);
+    backend
+        .save_procedural(&procedural)
+        .expect("save procedural");
+
+    let mut observation = ObservationMemory::new(
+        namespace.id,
+        episodic.episode_id,
+        "scope",
+        "observation",
+        "round trip",
+        "scope observation",
+    );
+    observation.agent_id = Some(agent_id);
+    observation.user_id = Some(user_id);
+    backend
+        .save_observation(&observation)
+        .expect("save observation");
+
+    for memory in [
+        Memory::Episodic(
+            backend
+                .get_episodic_in_namespace(episodic.id, namespace.id)
+                .expect("get episodic")
+                .expect("episodic row"),
+        ),
+        Memory::Semantic(
+            backend
+                .get_semantic_in_namespace(semantic.id, namespace.id)
+                .expect("get semantic")
+                .expect("semantic row"),
+        ),
+        Memory::Procedural(
+            backend
+                .get_procedural_in_namespace(procedural.id, namespace.id)
+                .expect("get procedural")
+                .expect("procedural row"),
+        ),
+        Memory::Observation(
+            backend
+                .get_observation_in_namespace(observation.id, namespace.id)
+                .expect("get observation")
+                .expect("observation row"),
+        ),
+    ] {
+        assert_memory_scope(&memory, agent_id, user_id);
+    }
+    let bulk = backend
+        .get_all_memories_by_namespace(namespace.id)
+        .expect("bulk source projections");
+    assert_eq!(bulk.len(), 4);
+    for memory in &bulk {
+        assert_memory_scope(memory, agent_id, user_id);
+    }
+}
+
+fn save_exact_vector(
+    postgres: &PostgresBackend,
+    sqlite: &crate::storage::sqlite::SqliteBackend,
+    memory: &Memory,
+    space: &str,
+    embedding: Vec<f32>,
+) {
+    let record = embedding_record(memory, space, embedding);
+    postgres
+        .save_memory_with_embedding(memory, Some(&record))
+        .expect("save Postgres exact-search fixture");
+    sqlite
+        .save_memory_with_embedding(memory, Some(&record))
+        .expect("save SQLite exact-search fixture");
+}
+
+fn complete_vector_hits(outcome: VectorSearchOutcome) -> Vec<VectorHit> {
+    match outcome {
+        VectorSearchOutcome::Complete(hits) => hits,
+        VectorSearchOutcome::Unavailable(reason) => {
+            panic!("expected complete vector search, got {reason:?}")
+        }
+    }
+}
+
+fn vector_refs(hits: &[VectorHit]) -> Vec<MemoryRef> {
+    hits.iter().map(|hit| hit.memory_ref).collect()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn exact_pgvector_matches_sqlite_oracle_with_scope_ties_and_cross_type_ids() {
+    let Some(admin_opts) =
+        skip_notice("exact_pgvector_matches_sqlite_oracle_with_scope_ties_and_cross_type_ids")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let postgres = &fixture.backend;
+    let sqlite_dir = tempfile::tempdir().expect("sqlite exact-search tempdir");
+    let sqlite = crate::storage::sqlite::SqliteBackend::open(sqlite_dir.path())
+        .expect("open sqlite exact-search oracle");
+    let namespace = Namespace::new(format!("exact-own-{}", Uuid::new_v4().simple()));
+    let foreign = Namespace::new(format!("exact-foreign-{}", Uuid::new_v4().simple()));
+    for backend in [postgres as &dyn StorageTrait, &sqlite] {
+        backend
+            .save_namespace(&namespace)
+            .expect("save own namespace");
+        backend
+            .save_namespace(&foreign)
+            .expect("save foreign namespace");
+    }
+    for space in ["exact-space", "other-space"] {
+        register_embedding_space(&fixture, space, "real", 2);
+        register_sqlite_embedding_space(sqlite_dir.path(), space, 2);
+    }
+
+    let agent = Uuid::new_v4();
+    let user = Uuid::new_v4();
+    let entity = Uuid::new_v4();
+    let collision_id = Uuid::from_u128(7_001);
+
+    let mut episodic = EpisodicMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        entity,
+        "exact episodic",
+    );
+    episodic.id = collision_id;
+    episodic.agent_id = Some(agent);
+    episodic.user_id = Some(user);
+    let mut semantic = SemanticMemory::new(namespace.id, entity, "exact", "semantic", 1.0);
+    semantic.id = collision_id;
+    semantic.agent_id = Some(agent);
+    semantic.user_id = Some(user);
+    let mut procedural = ProceduralMemory::new(
+        namespace.id,
+        "exact",
+        "procedural",
+        Outcome::Success,
+        HashMap::new(),
+    );
+    procedural.id = collision_id;
+    procedural.agent_id = Some(agent);
+    procedural.user_id = Some(user);
+    let mut observation = ObservationMemory::new(
+        namespace.id,
+        episodic.episode_id,
+        "exact",
+        "observation",
+        "exclude",
+        "exact observation",
+    );
+    observation.id = collision_id;
+    observation.agent_id = Some(agent);
+    observation.user_id = Some(user);
+    for memory in [
+        Memory::Episodic(episodic),
+        Memory::Semantic(semantic),
+        Memory::Procedural(procedural),
+        Memory::Observation(observation),
+    ] {
+        save_exact_vector(postgres, &sqlite, &memory, "exact-space", vec![1.0, 0.0]);
+    }
+
+    let mut lower = EpisodicMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        entity,
+        "lower ranked",
+    );
+    lower.id = Uuid::from_u128(7_002);
+    lower.agent_id = Some(agent);
+    lower.user_id = Some(user);
+    save_exact_vector(
+        postgres,
+        &sqlite,
+        &Memory::Episodic(lower.clone()),
+        "exact-space",
+        vec![0.0, 1.0],
+    );
+
+    let mut wrong_agent = lower.clone();
+    wrong_agent.id = Uuid::from_u128(7_003);
+    wrong_agent.agent_id = Some(Uuid::new_v4());
+    save_exact_vector(
+        postgres,
+        &sqlite,
+        &Memory::Episodic(wrong_agent),
+        "exact-space",
+        vec![1.0, 0.0],
+    );
+    let mut wrong_user = lower.clone();
+    wrong_user.id = Uuid::from_u128(7_004);
+    wrong_user.user_id = Some(Uuid::new_v4());
+    save_exact_vector(
+        postgres,
+        &sqlite,
+        &Memory::Episodic(wrong_user),
+        "exact-space",
+        vec![1.0, 0.0],
+    );
+    let mut superseded = lower.clone();
+    superseded.id = Uuid::from_u128(7_005);
+    superseded.superseded_by = Some(Uuid::new_v4());
+    save_exact_vector(
+        postgres,
+        &sqlite,
+        &Memory::Episodic(superseded),
+        "exact-space",
+        vec![1.0, 0.0],
+    );
+    let mut invalid = lower.clone();
+    invalid.id = Uuid::from_u128(7_006);
+    invalid.invalid_at = Some(Utc::now());
+    save_exact_vector(
+        postgres,
+        &sqlite,
+        &Memory::Episodic(invalid),
+        "exact-space",
+        vec![1.0, 0.0],
+    );
+    let mut other_generation = lower.clone();
+    other_generation.id = Uuid::from_u128(7_007);
+    let other_generation = Memory::Episodic(other_generation);
+    save_exact_vector(
+        postgres,
+        &sqlite,
+        &other_generation,
+        "exact-space",
+        vec![1.0, 0.0],
+    );
+    move_embedding_to_space(
+        &fixture,
+        sqlite_dir.path(),
+        &other_generation,
+        "other-space",
+    );
+    let mut foreign_memory = lower;
+    foreign_memory.id = Uuid::from_u128(7_008);
+    foreign_memory.namespace_id = foreign.id;
+    save_exact_vector(
+        postgres,
+        &sqlite,
+        &Memory::Episodic(foreign_memory),
+        "exact-space",
+        vec![1.0, 0.0],
+    );
+
+    let query_embedding = [1.0, 0.0];
+    let scope = SearchScope {
+        namespace_id: namespace.id,
+        identity: IdentityScope::ExactPair {
+            agent_id: Some(agent),
+            user_id: Some(user),
+        },
+        entity: BoundedEntityScope::Any,
+    };
+    let request = VectorSearchRequest::new(
+        scope.clone(),
+        "exact-space",
+        &query_embedding,
+        100,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .expect("exact request");
+    let postgres_hits = complete_vector_hits(postgres.search_vector(&request).unwrap());
+    let sqlite_hits = complete_vector_hits(sqlite.search_vector(&request).unwrap());
+    assert_eq!(vector_refs(&postgres_hits), vector_refs(&sqlite_hits));
+    assert_eq!(
+        vector_refs(&postgres_hits),
+        vec![
+            MemoryRef {
+                memory_type: MemoryType::Episodic,
+                id: collision_id,
+            },
+            MemoryRef {
+                memory_type: MemoryType::Semantic,
+                id: collision_id,
+            },
+            MemoryRef {
+                memory_type: MemoryType::Procedural,
+                id: collision_id,
+            },
+            MemoryRef {
+                memory_type: MemoryType::Episodic,
+                id: Uuid::from_u128(7_002),
+            },
+        ]
+    );
+
+    let entity_request = VectorSearchRequest::new(
+        scope.for_entity(entity),
+        "exact-space",
+        &query_embedding,
+        100,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .expect("entity request");
+    let postgres_entity = complete_vector_hits(postgres.search_vector(&entity_request).unwrap());
+    let sqlite_entity = complete_vector_hits(sqlite.search_vector(&entity_request).unwrap());
+    assert_eq!(vector_refs(&postgres_entity), vector_refs(&sqlite_entity));
+    assert_eq!(postgres_entity.len(), 3);
+
+    let top_two_request = VectorSearchRequest::new(
+        request.scope.clone(),
+        "exact-space",
+        &query_embedding,
+        2,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .expect("top-two request");
+    assert_eq!(
+        vector_refs(&complete_vector_hits(
+            postgres.search_vector(&top_two_request).unwrap()
+        )),
+        vector_refs(&complete_vector_hits(
+            sqlite.search_vector(&top_two_request).unwrap()
+        ))
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one live fixture compares zero-vector parity before checking every query-validation exit"
+)]
+fn exact_pgvector_validates_query_space_deadline_and_stored_zero_norm() {
+    let Some(admin_opts) =
+        skip_notice("exact_pgvector_validates_query_space_deadline_and_stored_zero_norm")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+    let sqlite_dir = tempfile::tempdir().expect("sqlite zero-vector parity tempdir");
+    let sqlite = crate::storage::sqlite::SqliteBackend::open(sqlite_dir.path())
+        .expect("open sqlite zero-vector parity oracle");
+    let namespace = Namespace::new(format!("exact-validation-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&namespace).unwrap();
+    sqlite.save_namespace(&namespace).unwrap();
+    register_embedding_space(&fixture, "validation-space", "real", 2);
+    register_sqlite_embedding_space(sqlite_dir.path(), "validation-space", 2);
+    let memory = Memory::Episodic(EpisodicMemory::new(
+        namespace.id,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "valid stored zero vector",
+    ));
+    save_exact_vector(
+        backend,
+        &sqlite,
+        &memory,
+        "validation-space",
+        vec![0.0, 0.0],
+    );
+    let scope = SearchScope::namespace(namespace.id);
+    let finite = [1.0, 0.0];
+    let request = VectorSearchRequest::new(
+        scope.clone(),
+        "validation-space",
+        &finite,
+        10,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    let postgres_zero_stored = backend.search_vector(&request).unwrap();
+    let sqlite_zero_stored = sqlite.search_vector(&request).unwrap();
+    assert_eq!(postgres_zero_stored, sqlite_zero_stored);
+    assert!(matches!(
+        postgres_zero_stored,
+        VectorSearchOutcome::Complete(ref hits)
+            if hits.len() == 1 && hits[0].score == 0.0
+    ));
+
+    let zero = [0.0, 0.0];
+    let zero_request = VectorSearchRequest::new(
+        scope.clone(),
+        "validation-space",
+        &zero,
+        10,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert_eq!(
+        backend.search_vector(&zero_request).unwrap(),
+        sqlite.search_vector(&zero_request).unwrap()
+    );
+
+    let missing_request = VectorSearchRequest::new(
+        scope.clone(),
+        "missing-space",
+        &finite,
+        10,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    // The namespace became active in "validation-space" on its first embedded
+    // save, so an unknown space is a runtime mismatch rather than a missing
+    // lifecycle; SQLite is the oracle for that ordering.
+    let postgres_missing = backend.search_vector(&missing_request).unwrap();
+    assert_eq!(
+        postgres_missing,
+        sqlite.search_vector(&missing_request).unwrap()
+    );
+    assert_eq!(
+        postgres_missing,
+        VectorSearchOutcome::Unavailable(SearchUnavailable::RuntimeSpaceMismatch)
+    );
+
+    let wrong_dimension = [1.0];
+    let dimension_request = VectorSearchRequest::new(
+        scope.clone(),
+        "validation-space",
+        &wrong_dimension,
+        10,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(matches!(
+        backend.search_vector(&dimension_request),
+        Err(StorageError::Context(_))
+    ));
+
+    let non_finite = [f32::NAN, 0.0];
+    let non_finite_request = VectorSearchRequest::new(
+        scope.clone(),
+        "validation-space",
+        &non_finite,
+        10,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(matches!(
+        backend.search_vector(&non_finite_request),
+        Err(StorageError::Context(_))
+    ));
+
+    let expired_request =
+        VectorSearchRequest::new(scope, "validation-space", &finite, 10, Instant::now()).unwrap();
+    assert_eq!(
+        backend.search_vector(&expired_request).unwrap(),
+        VectorSearchOutcome::Unavailable(SearchUnavailable::DeadlineExceeded)
+    );
+}
+
+#[test]
+fn exact_pgvector_forced_rls_blocks_foreign_row_after_test_removes_namespace_predicates() {
+    let Some(admin_opts) = skip_notice(
+        "exact_pgvector_forced_rls_blocks_foreign_row_after_test_removes_namespace_predicates",
+    ) else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+    let own = Namespace::new(format!("exact-rls-own-{}", Uuid::new_v4().simple()));
+    let foreign = Namespace::new(format!("exact-rls-foreign-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&own).unwrap();
+    backend.save_namespace(&foreign).unwrap();
+    register_embedding_space(&fixture, "rls-space", "real", 2);
+    for (namespace_id, id) in [(own.id, 7_101_u128), (foreign.id, 7_102)] {
+        let mut memory = EpisodicMemory::new(
+            namespace_id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "forced RLS exact vector",
+        );
+        memory.id = Uuid::from_u128(id);
+        let memory = Memory::Episodic(memory);
+        backend
+            .save_memory_with_embedding(
+                &memory,
+                Some(&embedding_record(&memory, "rls-space", vec![1.0, 0.0])),
+            )
+            .unwrap();
+    }
+
+    let sql_without_explicit_namespace =
+        POSTGRES_VECTOR_SEARCH_SQL.replace("embeddings.namespace_id = $2", "$2::uuid IS NOT NULL");
+    assert_eq!(
+        POSTGRES_VECTOR_SEARCH_SQL
+            .matches("embeddings.namespace_id = $2")
+            .count(),
+        3
+    );
+    assert!(!sql_without_explicit_namespace.contains("embeddings.namespace_id = $2"));
+    let rows: Vec<super::PgVectorSearchRow> = fixture.rt.block_on(async {
+        let mut conn = backend.scoped_conn(own.id).await.unwrap();
+        bind_exact_search_params(
+            query_as::<Postgres, _>(AssertSqlSafe(sql_without_explicit_namespace)),
+            own.id,
+            "rls-space",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap()
+    });
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, Some(Uuid::from_u128(7_101)));
+}
+
+fn sum_plan_metric(value: &serde_json::Value, key: &str) -> u64 {
+    match value {
+        serde_json::Value::Object(fields) => fields
+            .iter()
+            .map(|(name, value)| {
+                if name == key {
+                    value.as_u64().unwrap_or(0)
+                } else {
+                    sum_plan_metric(value, key)
+                }
+            })
+            .sum(),
+        serde_json::Value::Array(values) => {
+            values.iter().map(|value| sum_plan_metric(value, key)).sum()
+        }
+        _ => 0,
+    }
+}
+
+fn plan_has_exact_vector_result_order(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => {
+            if let Some(plan) = fields.get("Plan") {
+                return plan_has_exact_vector_result_order(plan);
+            }
+            let is_sort = matches!(
+                fields.get("Node Type").and_then(serde_json::Value::as_str),
+                Some("Sort" | "Incremental Sort")
+            );
+            let has_keys = fields
+                .get("Sort Key")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|keys| {
+                    let expected = ["distance", "memory_type", "memory_id"];
+                    keys.len() == expected.len()
+                        && keys.iter().zip(expected).all(|(key, expected)| {
+                            key.as_str().is_some_and(|key| {
+                                let key = key.to_ascii_lowercase();
+                                key.contains(expected) && !key.contains("desc")
+                            })
+                        })
+                });
+            if is_sort {
+                return has_keys;
+            }
+            fields
+                .get("Plans")
+                .and_then(serde_json::Value::as_array)
+                .filter(|plans| plans.len() == 1)
+                .is_some_and(|plans| plan_has_exact_vector_result_order(&plans[0]))
+        }
+        serde_json::Value::Array(values) if values.len() == 1 => {
+            plan_has_exact_vector_result_order(&values[0])
+        }
+        _ => false,
+    }
+}
+
+fn plan_has_explicit_vector_scope(
+    value: &serde_json::Value,
+    rls_bypassed: bool,
+    namespace_id: &str,
+    embedding_space_id: &str,
+) -> bool {
+    fn matching_embedding_scans(
+        value: &serde_json::Value,
+        namespace_id: &str,
+        embedding_space_id: &str,
+    ) -> usize {
+        match value {
+            serde_json::Value::Object(fields) => {
+                let this_scan = usize::from(
+                    fields
+                        .get("Relation Name")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("memory_embeddings")
+                        && {
+                            let rendered = value.to_string();
+                            rendered.contains("namespace_id")
+                                && rendered.contains(namespace_id)
+                                && rendered.contains("embedding_space_id")
+                                && rendered.contains(embedding_space_id)
+                        },
+                );
+                this_scan
+                    + fields
+                        .values()
+                        .map(|value| {
+                            matching_embedding_scans(value, namespace_id, embedding_space_id)
+                        })
+                        .sum::<usize>()
+            }
+            serde_json::Value::Array(values) => values
+                .iter()
+                .map(|value| matching_embedding_scans(value, namespace_id, embedding_space_id))
+                .sum(),
+            _ => 0,
+        }
+    }
+
+    rls_bypassed && matching_embedding_scans(value, namespace_id, embedding_space_id) == 3
+}
+
+#[test]
+fn exact_pgvector_representative_plan_rejects_a_missing_or_wrong_global_sort() {
+    let plan_without_sort = serde_json::json!({
+        "Node Type": "Limit",
+        "Plans": [{ "Node Type": "WindowAgg" }]
+    });
+    let plan_with_wrong_order = serde_json::json!({
+        "Node Type": "Limit",
+        "Plans": [{
+            "Node Type": "Sort",
+            "Sort Key": ["memory_type", "distance", "memory_id"]
+        }]
+    });
+    let plan_with_exact_order = serde_json::json!({
+        "Node Type": "Limit",
+        "Plans": [{
+            "Node Type": "Sort",
+            "Sort Key": ["distance", "memory_type", "memory_id"]
+        }]
+    });
+    let plan_with_only_a_branch_sort = serde_json::json!({
+        "Node Type": "Limit",
+        "Plans": [{
+            "Node Type": "WindowAgg",
+            "Plans": [{
+                "Node Type": "Append",
+                "Plans": [
+                    {
+                        "Node Type": "Sort",
+                        "Sort Key": ["distance", "memory_type", "memory_id"]
+                    },
+                    { "Node Type": "Seq Scan" },
+                    { "Node Type": "Seq Scan" }
+                ]
+            }]
+        }]
+    });
+
+    assert!(
+        !plan_has_exact_vector_result_order(&plan_without_sort),
+        "a bounded plan without the final distance/type/id sort is not representative proof"
+    );
+    assert!(
+        !plan_has_exact_vector_result_order(&plan_with_wrong_order),
+        "a Sort node with the wrong key order is not representative proof"
+    );
+    assert!(
+        !plan_has_exact_vector_result_order(&plan_with_only_a_branch_sort),
+        "a correctly keyed sort inside only one UNION branch is not a global result sort"
+    );
+    assert!(
+        plan_has_exact_vector_result_order(&plan_with_exact_order),
+        "the exact ascending distance/type/id sort must be accepted"
+    );
+}
+
+#[test]
+fn exact_pgvector_representative_plan_rejects_scope_filters_without_rls_bypass_proof() {
+    const NAMESPACE: &str = "00000000-0000-0000-0000-000000000001";
+    let policy_indistinguishable_plan = serde_json::json!({
+        "Node Type": "Append",
+        "Plans": [
+            {
+                "Node Type": "Seq Scan",
+                "Relation Name": "memory_embeddings",
+                "Filter": format!("namespace_id = '{NAMESPACE}'::uuid AND embedding_space_id = 'plan-space'::text")
+            },
+            {
+                "Node Type": "Seq Scan",
+                "Relation Name": "memory_embeddings",
+                "Filter": format!("namespace_id = '{NAMESPACE}'::uuid AND embedding_space_id = 'plan-space'::text")
+            },
+            {
+                "Node Type": "Seq Scan",
+                "Relation Name": "memory_embeddings",
+                "Filter": format!("namespace_id = '{NAMESPACE}'::uuid AND embedding_space_id = 'plan-space'::text")
+            }
+        ]
+    });
+
+    assert!(
+        !plan_has_explicit_vector_scope(
+            &policy_indistinguishable_plan,
+            false,
+            NAMESPACE,
+            "plan-space",
+        ),
+        "filters from an RLS-enforced plan cannot prove the query predicates exist"
+    );
+    assert!(
+        plan_has_explicit_vector_scope(
+            &policy_indistinguishable_plan,
+            true,
+            NAMESPACE,
+            "plan-space",
+        ),
+        "the same three branch filters are explicit evidence once RLS is demonstrably bypassed"
+    );
+}
+
+const REPRESENTATIVE_EXACT_PLAN_CANDIDATES: i64 = 18_076;
+
+fn seed_representative_exact_plan(fixture: &Fixture, namespace_id: Uuid, embedding_space_id: &str) {
+    fixture.rt.block_on(async {
+        let mut conn = fixture.backend.scoped_conn(namespace_id).await.unwrap();
+        let mut transaction = (&mut *conn).begin().await.unwrap();
+        query::<Postgres>(
+            r"INSERT INTO episodic_memories
+               (id, namespace_id, episode_id, source_entity, about_entity, content)
+               SELECT md5('plan-episodic-' || candidate)::uuid, $1,
+                      md5('plan-episode-' || candidate)::uuid,
+                      md5('plan-source-' || candidate)::uuid,
+                      md5('plan-about-' || candidate)::uuid,
+                      'representative episodic ' || candidate
+               FROM generate_series(1, $2::integer) AS candidate",
+        )
+        .bind(namespace_id)
+        .bind(6_026_i32)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        query::<Postgres>(
+            r"INSERT INTO semantic_memories
+               (id, namespace_id, subject, predicate, object, confidence)
+               SELECT md5('plan-semantic-' || candidate)::uuid, $1,
+                      md5('plan-subject-' || candidate)::uuid,
+                      'representative', 'semantic ' || candidate, 1.0
+               FROM generate_series(1, $2::integer) AS candidate",
+        )
+        .bind(namespace_id)
+        .bind(6_025_i32)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        query::<Postgres>(
+            r"INSERT INTO procedural_memories
+               (id, namespace_id, trigger_text, action, outcome)
+               SELECT md5('plan-procedural-' || candidate)::uuid, $1,
+                      'representative ' || candidate, 'procedural action', 'Success'
+               FROM generate_series(1, $2::integer) AS candidate",
+        )
+        .bind(namespace_id)
+        .bind(6_025_i32)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        query::<Postgres>(
+            r"INSERT INTO memory_embeddings
+               (namespace_id, memory_type, memory_id, embedding_space_id,
+                source_sha256, embedding, created_at)
+               SELECT $1, source.memory_type, source.memory_id, $2,
+                      repeat('a', 64), '[1,0]'::vector, NOW()
+               FROM (
+                   SELECT 'episodic'::text AS memory_type, id AS memory_id
+                   FROM episodic_memories WHERE namespace_id = $1
+                   UNION ALL
+                   SELECT 'semantic', id FROM semantic_memories WHERE namespace_id = $1
+                   UNION ALL
+                   SELECT 'procedural', id FROM procedural_memories WHERE namespace_id = $1
+               ) AS source",
+        )
+        .bind(namespace_id)
+        .bind(embedding_space_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+    });
+}
+
+/// Binds the production `POSTGRES_VECTOR_SEARCH_SQL` contract for a `[1,0]`
+/// query: unscoped identity, any entity, top-100, every first-stage type,
+/// no confidence floor. Keep in step with `PostgresBackend::search_vector`.
+fn bind_exact_search_params<'q, O>(
+    query: sqlx_core::query_as::QueryAs<'q, Postgres, O, sqlx_postgres::PgArguments>,
+    namespace_id: Uuid,
+    embedding_space_id: &'q str,
+) -> sqlx_core::query_as::QueryAs<'q, Postgres, O, sqlx_postgres::PgArguments> {
+    query
+        .bind("[1,0]")
+        .bind(namespace_id)
+        .bind(embedding_space_id)
+        .bind(0_i16)
+        .bind(None::<Uuid>)
+        .bind(None::<Uuid>)
+        .bind(0_i16)
+        .bind(None::<Uuid>)
+        .bind(100_i64)
+        .bind(100_i64)
+        .bind(100_i64)
+        .bind(true)
+        .bind(true)
+        .bind(true)
+        .bind(None::<f32>)
+}
+
+fn explain_representative_exact_plan(
+    fixture: &Fixture,
+    admin_opts: &PgConnectOptions,
+    namespace_id: Uuid,
+    embedding_space_id: &str,
+) -> (serde_json::Value, String, bool) {
+    let explain_sql =
+        format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {POSTGRES_VECTOR_SEARCH_SQL}");
+    with_admin_pool(&fixture.rt, admin_opts, &fixture.database, |rt, pool| {
+        rt.block_on(async {
+            let (role, superuser, bypassrls): (String, bool, bool) = query_as::<Postgres, _>(
+                "SELECT current_user, rolsuper, rolbypassrls
+                 FROM pg_roles WHERE rolname = current_user",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("inspect the representative EXPLAIN role's RLS exemptions");
+            let rls_bypassed = superuser || bypassrls;
+            assert!(
+                rls_bypassed,
+                "representative EXPLAIN role {role:?} is neither superuser nor BYPASSRLS; \
+                 its plan cannot distinguish explicit namespace predicates from policy injection"
+            );
+            let plan = bind_exact_search_params(
+                query_as::<Postgres, (serde_json::Value,)>(AssertSqlSafe(explain_sql)),
+                namespace_id,
+                embedding_space_id,
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            .0;
+            (plan, role, rls_bypassed)
+        })
+    })
+}
+
+#[test]
+fn exact_pgvector_explain_is_bounded_scoped_and_does_not_spill() {
+    let Some(admin_opts) =
+        skip_notice("exact_pgvector_explain_is_bounded_scoped_and_does_not_spill")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+    let namespace = Namespace::new(format!("exact-plan-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&namespace).unwrap();
+    register_embedding_space(&fixture, "plan-space", "real", 2);
+    activate_namespace_space(&fixture, namespace.id, "plan-space");
+    seed_representative_exact_plan(&fixture, namespace.id, "plan-space");
+    let candidate_count: i64 = fixture.rt.block_on(async {
+        let mut conn = backend.scoped_conn(namespace.id).await.unwrap();
+        query_as::<Postgres, (i64,)>(
+            "SELECT COUNT(*) FROM memory_embeddings
+             WHERE namespace_id = $1 AND embedding_space_id = $2",
+        )
+        .bind(namespace.id)
+        .bind("plan-space")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap()
+        .0
+    });
+    assert_eq!(candidate_count, REPRESENTATIVE_EXACT_PLAN_CANDIDATES);
+
+    let (plan, explain_role, rls_bypassed) =
+        explain_representative_exact_plan(&fixture, &admin_opts, namespace.id, "plan-space");
+    assert!(
+        rls_bypassed,
+        "EXPLAIN role {explain_role:?} lost RLS bypass"
+    );
+    assert!(
+        plan_has_explicit_vector_scope(
+            &plan,
+            rls_bypassed,
+            &namespace.id.to_string(),
+            "plan-space",
+        ),
+        "the RLS-bypassed plan must retain explicit namespace and embedding-space predicates \
+         in all three memory_embeddings branches"
+    );
+    assert!(
+        plan_has_exact_vector_result_order(&plan),
+        "the plan must globally sort by distance ASC, memory_type ASC, memory_id ASC"
+    );
+    let rendered = plan.to_string();
+    for relation in [
+        "episodic_memories",
+        "semantic_memories",
+        "procedural_memories",
+    ] {
+        assert!(rendered.contains(relation), "plan omitted {relation}");
+    }
+    assert!(
+        rendered.contains("Append"),
+        "UNION ALL branches were not preserved"
+    );
+    assert!(
+        rendered.contains("WindowAgg"),
+        "global validation window was not planned"
+    );
+    assert!(plan[0]["Plan"]["Actual Rows"].as_u64().unwrap_or(101) <= 100);
+    assert_eq!(sum_plan_metric(&plan, "Temp Read Blocks"), 0);
+    assert_eq!(sum_plan_metric(&plan, "Temp Written Blocks"), 0);
+    let rendered_lowercase = rendered.to_ascii_lowercase();
+    assert!(!rendered_lowercase.contains("\"sort space type\":\"disk\""));
+    assert!(!rendered_lowercase.contains("\"sort method\":\"external"));
+    eprintln!(
+        "exact pgvector representative execution time: {:?} ms",
+        plan[0]["Execution Time"]
     );
 }
