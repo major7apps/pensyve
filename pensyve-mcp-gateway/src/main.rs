@@ -332,11 +332,19 @@ fn export_namespace_command(
     embedder: &OnnxEmbedder,
     args: &ExportArgs,
 ) -> Result<()> {
-    if args.sqlite.exists() {
-        anyhow::bail!(
-            "{} already exists; refusing to overwrite an existing export",
-            args.sqlite.display()
-        );
+    // Both outputs are checked up front rather than each at its own write. The
+    // sidecar is written well into the run, so discovering it there would mean
+    // failing after the expensive copy had already finished.
+    for existing in [Some(&args.sqlite), args.json.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if existing.exists() {
+            anyhow::bail!(
+                "{} already exists; refusing to overwrite an existing export",
+                existing.display()
+            );
+        }
     }
     let parent = args
         .sqlite
