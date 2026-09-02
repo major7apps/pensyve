@@ -111,9 +111,17 @@ jobs:
         run: |
           set -euo pipefail
           aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
-          aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
-            --query 'services[0].deployments[*].{status:status,td:taskDefinition,rollout:rolloutState,reason:rolloutStateReason}' \
-            --output json | tee "$RUNNER_TEMP/deployments.json"
+          # services-stable returns on task counts; the deployment's rollout state can
+          # still read IN_PROGRESS for a few seconds after that. Wait for a terminal state.
+          for _ in $(seq 1 60); do
+            aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+              --query 'services[0].deployments[*].{status:status,td:taskDefinition,rollout:rolloutState,reason:rolloutStateReason}' \
+              --output json > "$RUNNER_TEMP/deployments.json"
+            if jq -e '[.[] | select(.status=="PRIMARY")] | all(.rollout != "IN_PROGRESS")' \
+              "$RUNNER_TEMP/deployments.json" >/dev/null; then break; fi
+            sleep 10
+          done
+          cat "$RUNNER_TEMP/deployments.json"
           # A completed rollback is "stable" too; fail if the primary is not the revision we registered.
           jq -e '[.[] | select(.status=="PRIMARY")] | length == 1 and all(.rollout == "COMPLETED" and (.reason | test("rolling back") | not))' \
             "$RUNNER_TEMP/deployments.json" >/dev/null
