@@ -339,6 +339,31 @@ fn parse_export_args(args: &[String]) -> Result<ExportArgs> {
     })
 }
 
+/// Move a staged artifact to its final path.
+///
+/// A rename is atomic but cannot cross a filesystem boundary. Staging sits
+/// beside `--sqlite`, so the database always renames within one filesystem —
+/// but `--json` may be given on a different mount, where a bare rename fails
+/// with `EXDEV` after the database has already been published. Falling back to
+/// copy-then-remove keeps that split-output case working; it is not atomic, so
+/// it is only the fallback.
+fn publish(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc_exdev()) => {
+            std::fs::copy(from, to)?;
+            std::fs::remove_file(from)?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// `EXDEV`, the "cross-device link" errno a rename across mounts returns.
+const fn libc_exdev() -> i32 {
+    18
+}
+
 /// Build both export artifacts inside `staging`, and hand back the tallies.
 ///
 /// Split out from the publish step so every failure path has one place to be
@@ -440,9 +465,9 @@ fn export_namespace_command(
         }
     };
 
-    std::fs::rename(staging.join("memories.db"), &args.sqlite)?;
+    publish(&staging.join("memories.db"), &args.sqlite)?;
     if let Some(json) = &args.json {
-        std::fs::rename(staging.join("sidecar.json"), json)?;
+        publish(&staging.join("sidecar.json"), json)?;
     }
     std::fs::remove_dir_all(&staging)?;
 
