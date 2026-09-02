@@ -278,6 +278,155 @@ fn init_resources(config: &GatewayConfig) -> Result<InitResources> {
     })
 }
 
+/// Operator mode: `pensyve-mcp-gateway export-namespace` copies one namespace
+/// out of the configured store into a standalone `SQLite` store the customer can
+/// serve from, then exits.
+const EXPORT_NAMESPACE_MODE: &str = "export-namespace";
+
+struct ExportArgs {
+    namespace: uuid::Uuid,
+    sqlite: std::path::PathBuf,
+    json: Option<std::path::PathBuf>,
+}
+
+fn parse_export_args(args: &[String]) -> Result<ExportArgs> {
+    let mut namespace = None;
+    let mut sqlite = None;
+    let mut json = None;
+    let mut rest = args.iter();
+    while let Some(flag) = rest.next() {
+        let mut value = || {
+            rest.next()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("{flag} requires a value"))
+        };
+        match flag.as_str() {
+            "--namespace" => namespace = Some(value()?),
+            "--sqlite" => sqlite = Some(value()?),
+            "--json" => json = Some(value()?),
+            other => anyhow::bail!(
+                "unknown argument {other}; usage: {EXPORT_NAMESPACE_MODE} \
+                 --namespace <uuid> --sqlite <out.db> [--json <out.json>]"
+            ),
+        }
+    }
+    let namespace = namespace.ok_or_else(|| anyhow::anyhow!("--namespace is required"))?;
+    let sqlite = sqlite.ok_or_else(|| anyhow::anyhow!("--sqlite is required"))?;
+    Ok(ExportArgs {
+        namespace: uuid::Uuid::parse_str(&namespace)
+            .map_err(|error| anyhow::anyhow!("--namespace {namespace} is not a UUID: {error}"))?,
+        sqlite: std::path::PathBuf::from(sqlite),
+        json: json.map(std::path::PathBuf::from),
+    })
+}
+
+/// Copy one namespace into a fresh `SQLite` store, plus an optional JSON sidecar.
+///
+/// The source store is only read. `SqliteBackend::open` takes a *directory* and
+/// creates `memories.db` inside it, so the copy is staged in a sibling
+/// directory of the requested file and the finished database is moved into
+/// place — a rename within the same parent, so a half-written store never
+/// appears under the name the operator is going to hand to a customer.
+fn export_namespace_command(
+    storage: &dyn StorageTrait,
+    embedder: &OnnxEmbedder,
+    args: &ExportArgs,
+) -> Result<()> {
+    if args.sqlite.exists() {
+        anyhow::bail!(
+            "{} already exists; refusing to overwrite an existing export",
+            args.sqlite.display()
+        );
+    }
+    let parent = args
+        .sqlite
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let staging = parent.join(format!(".pensyve-export-{}", uuid::Uuid::new_v4()));
+
+    let counts = {
+        let destination = SqliteBackend::open(&staging)?;
+        let counts =
+            pensyve_core::namespace_export::export_namespace(storage, &destination, args.namespace)
+                .map_err(|error| anyhow::anyhow!("export namespace: {error}"))?;
+
+        if let Some(json) = &args.json {
+            let mut file = std::fs::File::create(json)?;
+            let manifest = pensyve_core::gdpr::export_namespace_data_to_writer(
+                storage,
+                args.namespace,
+                &mut file,
+            )
+            .map_err(|error| anyhow::anyhow!("json sidecar: {error}"))?;
+            tracing::info!(
+                path = %json.display(),
+                memory_records = manifest.memory_records,
+                total_records = manifest.total_records,
+                stream_sha256 = %manifest.stream_sha256,
+                "json sidecar written"
+            );
+        }
+        counts
+        // `destination` is dropped here, closing the last connection so SQLite
+        // checkpoints and removes the WAL. Moving the file before that would
+        // hand over a database whose most recent writes live in a sidecar file
+        // left behind.
+    };
+
+    let staged_db = staging.join("memories.db");
+    let wal = staging.join("memories.db-wal");
+    if wal.exists() {
+        anyhow::bail!(
+            "{} still has a write-ahead log after close; refusing to publish a \
+             partial store",
+            wal.display()
+        );
+    }
+    std::fs::rename(&staged_db, &args.sqlite)?;
+    std::fs::remove_dir_all(&staging)?;
+
+    // Whether the copied vectors are usable as-is on a self-hosted instance is
+    // decided by whether this build's embedder reproduces the space the vectors
+    // were written under. Report it rather than leaving the operator to guess:
+    // a mismatch means the customer runs an embedding migration on first start.
+    let runtime_space = embedder
+        .embedding_space()
+        .map_err(|error| anyhow::anyhow!("runtime embedding space: {error}"))?
+        .id();
+    let exported_space = storage
+        .get_namespace_embedding_state(args.namespace)
+        .map_err(|error| anyhow::anyhow!("read embedding state: {error}"))?
+        .and_then(|state| state.active_read_space_id);
+    let vectors_reusable = exported_space.as_ref() == Some(&runtime_space);
+
+    tracing::info!(
+        namespace = %args.namespace,
+        path = %args.sqlite.display(),
+        episodes = counts.episodes,
+        episodic = counts.episodic,
+        semantic = counts.semantic,
+        procedural = counts.procedural,
+        observations = counts.observations,
+        memories = counts.memories(),
+        entities = counts.entities,
+        edges = counts.edges,
+        embeddings = counts.embeddings,
+        runtime_space = %runtime_space.0,
+        exported_space = exported_space.as_ref().map_or("none", |space| space.0.as_str()),
+        vectors_reusable,
+        "namespace export complete"
+    );
+    if !vectors_reusable {
+        tracing::warn!(
+            "this build's embedder does not reproduce the exported embedding space; \
+             the recipient must run an embedding migration before semantic recall works"
+        );
+    }
+    Ok(())
+}
+
 /// Operator mode: `pensyve-mcp-gateway backfill-embeddings` brings every
 /// namespace onto the embedding generation this process loaded, then exits.
 const BACKFILL_EMBEDDINGS_MODE: &str = "backfill-embeddings";
@@ -431,8 +580,16 @@ fn main() -> Result<()> {
     // Init resources BEFORE tokio runtime to avoid nested runtime panic
     // when PostgresBackend creates its own internal runtime.
     let res = init_resources(&config)?;
-    if std::env::args().nth(1).as_deref() == Some(BACKFILL_EMBEDDINGS_MODE) {
-        return backfill_embeddings(res.storage.as_ref(), res.embedder.as_ref());
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    match argv.first().map(String::as_str) {
+        Some(BACKFILL_EMBEDDINGS_MODE) => {
+            return backfill_embeddings(res.storage.as_ref(), res.embedder.as_ref());
+        }
+        Some(EXPORT_NAMESPACE_MODE) => {
+            let parsed = parse_export_args(&argv[1..])?;
+            return export_namespace_command(res.storage.as_ref(), res.embedder.as_ref(), &parsed);
+        }
+        _ => {}
     }
 
     tokio::runtime::Builder::new_multi_thread()

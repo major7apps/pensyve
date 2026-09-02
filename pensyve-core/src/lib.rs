@@ -13,6 +13,7 @@ pub mod gdpr;
 pub mod graph;
 pub mod mesh;
 pub mod multimodal;
+pub mod namespace_export;
 pub mod network_policy;
 pub mod observability;
 pub mod observation;

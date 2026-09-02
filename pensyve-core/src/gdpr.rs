@@ -314,6 +314,112 @@ fn personal_memory_value(memory: &Memory) -> Result<serde_json::Value, StorageEr
     })
 }
 
+/// Stream a namespace-wide sidecar in the same frame shape as
+/// [`export_entity_data_to_writer`].
+///
+/// The native store copy is the lossless artifact; this is the plain-text
+/// companion that stays readable when no Pensyve build is at hand, so it
+/// deliberately carries the same per-memory record shape a DSAR export uses
+/// rather than inventing a second one.
+///
+/// Two differences from the entity export, both forced by the wider scope:
+/// it walks the namespace rather than one entity's personal data, and it
+/// includes procedural memories. `personal_memory_value` rejects those on
+/// purpose — a procedure is not personal data attached to a data subject — but
+/// a namespace sidecar that silently dropped a whole memory class would
+/// misrepresent what the customer has, so they get their own record arm here
+/// instead of a relaxed GDPR contract.
+pub fn export_namespace_data_to_writer(
+    storage: &dyn StorageTrait,
+    namespace_id: Uuid,
+    writer: &mut dyn Write,
+) -> Result<ExportManifest, StorageError> {
+    use crate::storage::bounded::{MEMORY_PAGE_SIZE, MemoryPageRequest, SearchScope};
+
+    let mut digest = Sha256::new();
+    write_export_frame(
+        writer,
+        &mut digest,
+        &serde_json::json!({
+            "kind": "header",
+            "format_version": 1,
+            "namespace_id": namespace_id.to_string(),
+        }),
+    )?;
+
+    let scope = SearchScope::namespace(namespace_id);
+    let mut memory_records = 0_usize;
+    let mut cursor = None;
+    loop {
+        let request = MemoryPageRequest::new(scope.clone(), cursor, MEMORY_PAGE_SIZE, true)?;
+        let page = storage.page_memories(&request)?;
+        for memory in &page.memories {
+            write_export_frame(
+                writer,
+                &mut digest,
+                &serde_json::json!({
+                    "kind": "memory",
+                    "record": sidecar_memory_value(memory)?,
+                }),
+            )?;
+            memory_records += 1;
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    let mut entity_records = 0_usize;
+    for entity in storage.list_entities_by_namespace(namespace_id)? {
+        write_export_frame(
+            writer,
+            &mut digest,
+            &serde_json::json!({
+                "kind": "entity",
+                "id": entity.id.to_string(),
+                "name": entity.name,
+            }),
+        )?;
+        entity_records += 1;
+    }
+
+    let stream_sha256 = hex::encode(digest.finalize());
+    let total_records = memory_records + entity_records;
+    let footer = serde_json::to_vec(&serde_json::json!({
+        "kind": "footer",
+        "memory_records": memory_records,
+        "entity_records": entity_records,
+        "total_records": total_records,
+        "stream_sha256": stream_sha256,
+    }))?;
+    writer.write_all(&footer)?;
+    writer.write_all(b"\n")?;
+
+    Ok(ExportManifest {
+        memory_records,
+        total_records,
+        stream_sha256,
+    })
+}
+
+/// [`personal_memory_value`] widened to the one class it refuses.
+fn sidecar_memory_value(memory: &Memory) -> Result<serde_json::Value, StorageError> {
+    match memory {
+        Memory::Procedural(memory) => Ok(serde_json::json!({
+            "type": "procedural",
+            "id": memory.id.to_string(),
+            "trigger": memory.trigger,
+            "action": memory.action,
+            "reliability": memory.reliability,
+            "trial_count": memory.trial_count,
+            "success_count": memory.success_count,
+            "created_at": memory.created_at.to_rfc3339(),
+        })),
+        other => personal_memory_value(other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

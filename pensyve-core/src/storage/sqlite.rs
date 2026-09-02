@@ -29,12 +29,12 @@ use super::{
 };
 use crate::graph::EdgeType;
 use crate::storage::bounded::{
-    EmbeddingRecord, LexicalHit, MAX_FUSED_HITS, MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS,
-    MAX_VECTOR_HITS, MEMORY_PAGE_SIZE, MemoryFilter, MemoryPage, MemoryPageRequest, MemoryRef,
-    MemoryType, NamespaceEmbeddingPhase, NamespaceEmbeddingState, PageCursor,
-    SNAPSHOT_MAX_FRAME_BYTES, SNAPSHOT_MAX_PAGE_BYTES, SQLITE_MAX_SCANNED_VECTORS, SearchScope,
-    SearchUnavailable, VectorHit, VectorSearchOutcome, VectorSearchRequest, lexical_query_tokens,
-    sort_vector_hits,
+    EmbeddingRecord, EpisodePage, EpisodePageCursor, LexicalHit, MAX_FUSED_HITS,
+    MAX_HYDRATED_BYTES, MAX_LEXICAL_HITS, MAX_VECTOR_HITS, MEMORY_PAGE_SIZE, MemoryFilter,
+    MemoryPage, MemoryPageRequest, MemoryRef, MemoryType, NamespaceEmbeddingPhase,
+    NamespaceEmbeddingState, PageCursor, SNAPSHOT_MAX_FRAME_BYTES, SNAPSHOT_MAX_PAGE_BYTES,
+    SQLITE_MAX_SCANNED_VECTORS, SearchScope, SearchUnavailable, VectorHit, VectorSearchOutcome,
+    VectorSearchRequest, lexical_query_tokens, sort_vector_hits,
 };
 use crate::storage::consolidation_workspace::{
     ClusterDecision, ClusterProvenance, ConsolidationWorkspace, DecayPage, DecayRecord,
@@ -4164,6 +4164,70 @@ impl StorageTrait for SqliteBackend {
     fn update_episode(&self, episode: &Episode) -> StorageResult<()> {
         // Reuse save (INSERT OR REPLACE handles update).
         self.save_episode(episode)
+    }
+
+    fn page_episodes(
+        &self,
+        namespace_id: Uuid,
+        after: Option<EpisodePageCursor>,
+        limit: usize,
+    ) -> StorageResult<EpisodePage> {
+        if !(1..=MEMORY_PAGE_SIZE).contains(&limit) {
+            return Err(StorageError::BudgetExceeded(format!(
+                "episode page limit must be within 1..={MEMORY_PAGE_SIZE}"
+            )));
+        }
+        let after = after.map_or_else(String::new, |cursor| cursor.id.to_string());
+        let conn = lock_conn!(self);
+        let mut stmt = conn.prepare(
+            "SELECT id, namespace_id, participants, started_at, ended_at, outcome, metadata \
+             FROM episodes WHERE namespace_id = ?1 AND id > ?2 ORDER BY id LIMIT ?3",
+        )?;
+        let episodes = stmt
+            .query_map(
+                params![
+                    namespace_id.to_string(),
+                    after,
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )?
+            .map(|row| {
+                let (id, ns, participants, started_at, ended_at, outcome, metadata) = row?;
+                Ok(Episode {
+                    id: Uuid::parse_str(&id)
+                        .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?,
+                    namespace_id: Uuid::parse_str(&ns)
+                        .map_err(|e| StorageError::Context(format!("corrupt UUID: {e}")))?,
+                    participants: json_to_uuids(&participants),
+                    started_at: str_to_dt(&started_at),
+                    ended_at: str_to_opt_dt(ended_at.as_deref()),
+                    outcome: outcome.as_deref().map(str_to_outcome),
+                    metadata: serde_json::from_str(&metadata)?,
+                })
+            })
+            .collect::<StorageResult<Vec<_>>>()?;
+        let next_cursor = (episodes.len() == limit)
+            .then(|| {
+                episodes
+                    .last()
+                    .map(|episode| EpisodePageCursor { id: episode.id })
+            })
+            .flatten();
+        Ok(EpisodePage {
+            episodes,
+            next_cursor,
+        })
     }
 
     // -----------------------------------------------------------------------
