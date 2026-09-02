@@ -416,6 +416,14 @@ hand-apply, or one on a pre-marker database), or `database schema is not at this
 build's version; applying it` if the deployment had been stamped by an earlier
 build. The remedy is the same either way.
 
+**Existing namespaces serve lexical-only after upgrading to schema v6.** Versioned
+embedding generations start with no active generation per namespace. After the
+owner-connected startup, run `pensyve-mcp-gateway backfill-embeddings` once with
+the serving role's `DATABASE_URL` (for ECS, a one-off task from the production
+task definition with the container command overridden to `backfill-embeddings`).
+It pages every namespace, embeds each source on the loaded generation, verifies
+coverage, and activates; running tasks observe activation on their next request.
+
 **Startup fails with `permission denied for table pensyve_schema_state`.** The
 serving role cannot read the applied-schema marker, so it cannot establish that
 the DDL is safe to skip. Grant it `SELECT` — the

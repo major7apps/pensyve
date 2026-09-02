@@ -23,4 +23,4 @@ if [ -n "$DATABASE_URL" ] && echo "$DATABASE_URL" | grep -q "^postgres"; then
   pg_isready -h "$DB_HOST" -p "$DB_PORT" -t 10 2>&1 || echo "pg_isready failed"
 fi
 
-exec pensyve-mcp-gateway
+exec pensyve-mcp-gateway "$@"

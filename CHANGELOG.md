@@ -30,6 +30,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release; certified real-model evidence and a separately approved rollout remain
   required.
 
+### Added
+
+- **`pensyve-mcp-gateway backfill-embeddings` operator mode.** Runs the embedding
+  migration lifecycle (begin, backfill, verify, activate) for every namespace the
+  storage pages out, on the exact embedding generation the process loaded, then
+  exits. Namespaces already active on that generation are skipped and ones in
+  flight resume, so the command is idempotent. Run it once after upgrading a
+  hosted deployment so existing namespaces regain semantic recall; until then
+  they serve lexical/graph retrieval only. The container entrypoint now passes
+  its arguments through, so an ECS one-off task can invoke it with a command
+  override.
+
 ### Fixed
 
 - **Entity-wide forget closes a snapshot page before the 4 MiB ceiling** instead
