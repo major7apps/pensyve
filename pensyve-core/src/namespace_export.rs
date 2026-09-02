@@ -49,7 +49,7 @@
 use uuid::Uuid;
 
 use crate::storage::bounded::{
-    EpisodePageCursor, MEMORY_PAGE_SIZE, MemoryPageRequest, MemoryRef, SearchScope,
+    EpisodePageCursor, MAX_FUSED_HITS, MEMORY_PAGE_SIZE, MemoryPageRequest, MemoryRef, SearchScope,
 };
 use crate::storage::{CapturedMemory, StorageError, StorageResult, StorageTrait};
 use crate::types::Memory;
@@ -199,8 +199,11 @@ pub fn export_namespace(
 
 /// Pair one page of memories with their embedding records.
 ///
-/// Embeddings are loaded per page rather than per memory so the round trip
-/// count stays proportional to pages, not rows.
+/// Embeddings are loaded in batches rather than per memory so the round-trip
+/// count stays proportional to pages, not rows. The batch is capped by
+/// [`MAX_FUSED_HITS`] rather than by the memory page size: a memory page holds
+/// [`MEMORY_PAGE_SIZE`] rows, which is larger, and handing the backend the
+/// whole page at once is refused as a budget violation.
 fn capture_page(
     source: &dyn StorageTrait,
     namespace_id: Uuid,
@@ -218,7 +221,10 @@ fn capture_page(
     };
 
     let refs: Vec<MemoryRef> = memories.iter().map(MemoryRef::from_memory).collect();
-    let records = source.load_embedding_records(namespace_id, space_id, &refs)?;
+    let mut records = Vec::with_capacity(refs.len());
+    for batch in refs.chunks(MAX_FUSED_HITS) {
+        records.extend(source.load_embedding_records(namespace_id, space_id, batch)?);
+    }
 
     Ok(memories
         .iter()
@@ -453,6 +459,57 @@ mod tests {
         );
         assert_eq!(dest_db.count_entities_by_namespace(other.id).unwrap(), 0);
         assert!(dest_db.get_namespace(other.id).unwrap().is_none());
+    }
+
+    /// A namespace bigger than one memory page, which is also bigger than the
+    /// embedding-load batch cap.
+    ///
+    /// These two limits are not the same number — a memory page holds
+    /// `MEMORY_PAGE_SIZE` (256) rows while an embedding load accepts at most
+    /// `MAX_FUSED_HITS` (200) references — so a copy that fed each page
+    /// straight into the embedding load worked on every small fixture and then
+    /// failed on the first real namespace with a budget error.
+    #[test]
+    fn a_namespace_larger_than_one_page_copies_with_every_vector() {
+        use crate::storage::bounded::{MAX_FUSED_HITS, MEMORY_PAGE_SIZE};
+
+        let embedder = OnnxEmbedder::new_mock(DIMS);
+        let space = embedder.embedding_space().expect("mock space").clone();
+        let (_source_dir, source_db) = store();
+
+        let namespace = Namespace::new("tenant:bulk");
+        source_db.save_namespace(&namespace).unwrap();
+        source_db
+            .initialize_local_runtime_space(namespace.id, &space)
+            .unwrap();
+        let episode = Episode::new(namespace.id, vec![Uuid::new_v4()]);
+        source_db.save_episode(&episode).unwrap();
+
+        let total = MEMORY_PAGE_SIZE + MAX_FUSED_HITS + 7;
+        for index in 0..total {
+            let memory = Memory::Episodic(EpisodicMemory::new(
+                namespace.id,
+                episode.id,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                format!("bulk memory {index}"),
+            ));
+            save(&source_db, &space, &memory, index);
+        }
+
+        let (_dest_dir, dest_db) = store();
+        let counts =
+            export_namespace(&source_db, &dest_db, namespace.id).expect("export namespace");
+
+        assert_eq!(counts.episodic, total);
+        assert_eq!(
+            counts.embeddings, total,
+            "every memory must arrive with its vector, not just the first page"
+        );
+        assert_eq!(
+            dest_db.count_memories_by_namespace(namespace.id).unwrap(),
+            (total, 0, 0)
+        );
     }
 
     #[test]
