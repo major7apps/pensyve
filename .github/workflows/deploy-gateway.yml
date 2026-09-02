@@ -1,276 +1,125 @@
-name: Deploy Gateway
+name: Build & Deploy Gateway
+
+# Rolls the hosted MCP gateway to the exact commit that triggered the run:
+# build the ARM64 binary and image, push it to ECR under the commit SHA,
+# register a task-definition revision derived from the live service (so the
+# tofu-owned shape, roles, secrets, and environment carry over unchanged),
+# update the one service, and wait for ECS to report it stable. The service's
+# deployment circuit breaker rolls back automatically if the new tasks fail.
+#
+# A build whose schema is newer than the stamped production schema will not
+# start as the serving role; run the owner-connected startup from
+# docs/SECURITY.md first, then re-dispatch.
 
 on:
   workflow_dispatch:
-    inputs:
-      operation:
-        description: Trusted-main gateway operation
-        required: true
-        type: choice
-        options:
-          - task8-create
-          - task8-rollback
-          - task9-promote
-          - task9-rollback
-      custody_json:
-        description: Canonical local custody JSON (small record only)
-        required: true
-        type: string
+  push:
+    branches: [main]
+    paths:
+      - "pensyve-core/**"
+      - "pensyve-mcp-tools/**"
+      - "pensyve-mcp-gateway/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/deploy-gateway.yml"
 
 permissions:
+  id-token: write
   contents: read
 
 concurrency:
   group: pensyve-production-gateway
   cancel-in-progress: false
 
+env:
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY: pensyve-gateway
+  ECS_CLUSTER: pensyve-prod
+  ECS_SERVICE: pensyve-prod-gateway
+
 jobs:
-  preflight:
-    name: Validate trusted-main custody without production authority
+  test:
+    name: Test Gateway
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      custody_sha256: ${{ steps.custody.outputs.custody_sha256 }}
-      source_sha: ${{ steps.custody.outputs.source_sha }}
-      source_tree: ${{ steps.custody.outputs.source_tree }}
-      manifest_digest: ${{ steps.custody.outputs.manifest_digest }}
-      account: ${{ steps.custody.outputs.account }}
     steps:
-      - name: Canonicalize and bind custody to exact current main
-        id: custody
-        env:
-          CUSTODY_JSON: ${{ inputs.custody_json }}
-          GH_TOKEN: ${{ github.token }}
-          EXPECTED_SHA: ${{ github.sha }}
-          EXPECTED_REF: ${{ github.ref }}
-        run: |
-          set -euo pipefail
-          [[ "$EXPECTED_REF" == refs/heads/main ]]
-          python3 - "$RUNNER_TEMP/custody.json" <<'PY'
-          import hashlib
-          import json
-          import os
-          import re
-          import sys
-          from pathlib import Path
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test -p pensyve-mcp-gateway -p pensyve-mcp-tools
 
-          output = Path(sys.argv[1])
-          raw = os.environ["CUSTODY_JSON"]
-          if len(raw.encode()) > 8192:
-              raise SystemExit("custody input exceeds the small-record limit")
-          data = json.loads(raw)
-          if set(data) != {"source", "image", "evidence", "publisher"}:
-              raise SystemExit("custody top-level objects must be source/image/evidence/publisher")
-          source, image = data.get("source"), data.get("image")
-          evidence, publisher = data.get("evidence"), data.get("publisher")
-          if not all(isinstance(value, dict) for value in (source, image, evidence, publisher)):
-              raise SystemExit("custody top-level values must be objects")
-          hex40 = re.compile(r"[0-9a-f]{40}")
-          hex64 = re.compile(r"[0-9a-f]{64}")
-          if (set(source) != {"schema_version", "repository", "sha", "tree"} or
-                  type(source.get("schema_version")) is not int or source.get("schema_version") != 1 or
-                  source.get("repository") != "major7apps/pensyve" or
-                  not hex40.fullmatch(str(source.get("sha", ""))) or
-                  not hex40.fullmatch(str(source.get("tree", "")))):
-              raise SystemExit("source schema/repository/SHA/tree mismatch")
-          image_keys = {"account", "registry", "repository", "manifest_digest", "config_digest",
-                        "platform", "raw_manifest_media_type", "raw_manifest_sha256"}
-          if set(image) != image_keys:
-              raise SystemExit("image custody shape mismatch")
-          account = str(image.get("account", ""))
-          if (not re.fullmatch(r"[0-9]{12}", account) or
-                  image.get("registry") != f"{account}.dkr.ecr.us-east-2.amazonaws.com" or
-                  image.get("repository") != "pensyve-gateway" or
-                  image.get("platform") != "linux/arm64" or
-                  image.get("raw_manifest_media_type") !=
-                  "application/vnd.docker.distribution.manifest.v2+json" or
-                  not re.fullmatch(r"sha256:[0-9a-f]{64}", str(image.get("manifest_digest", ""))) or
-                  not re.fullmatch(r"sha256:[0-9a-f]{64}", str(image.get("config_digest", ""))) or
-                  not hex64.fullmatch(str(image.get("raw_manifest_sha256", "")))):
-              raise SystemExit("image registry/digest/config/platform/raw-manifest mismatch")
-          evidence_keys = {"archive_sha256", "evidence_tree_sha256", "scan_report_sha256",
-                           "scan_policy_sha256", "gate_summary_sha256"}
-          if set(evidence) != evidence_keys or not all(
-              hex64.fullmatch(str(value)) for value in evidence.values()
-          ):
-              raise SystemExit("evidence hash shape mismatch")
-          expected_publisher = (
-              f"arn:aws:sts::{account}:federated-user/pensyve-gateway-{source['sha']}"
-          )
-          if (set(publisher) != {"arn", "inline_session_policy_sha256"} or
-                  publisher.get("arn") != expected_publisher or
-                  not hex64.fullmatch(str(publisher.get("inline_session_policy_sha256", "")))):
-              raise SystemExit("publisher ARN/policy hash mismatch")
-          if source["sha"] != os.environ["EXPECTED_SHA"]:
-              raise SystemExit("github.sha != source.sha")
-          canonical = json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
-          output.write_text(canonical, encoding="utf-8")
-          digest = hashlib.sha256(canonical.encode()).hexdigest()
-          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
-              stream.write(f"custody_sha256={digest}\n")
-              stream.write(f"source_sha={source['sha']}\n")
-              stream.write(f"source_tree={source['tree']}\n")
-              stream.write(f"manifest_digest={image['manifest_digest']}\n")
-              stream.write(f"account={account}\n")
-          PY
-          source_tree=$(awk -F= '$1 == "source_tree" {print $2}' "$GITHUB_OUTPUT")
-          custody_sha=$(awk -F= '$1 == "custody_sha256" {print $2}' "$GITHUB_OUTPUT")
-          manifest_digest=$(awk -F= '$1 == "manifest_digest" {print $2}' "$GITHUB_OUTPUT")
-          gh api "repos/${GITHUB_REPOSITORY}/commits/main" > "$RUNNER_TEMP/current-main.json"
-          jq -e --arg sha "${{ github.sha }}" \
-            --arg tree "$source_tree" \
-            '.sha == $sha and .commit.tree.sha == $tree' "$RUNNER_TEMP/current-main.json" >/dev/null
-          {
-            echo "### Gateway custody preflight"
-            echo "- source: \`${{ github.sha }}\`"
-            echo "- manifest: \`$manifest_digest\`"
-            echo "- custody SHA-256: \`$custody_sha\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  production:
-    name: Execute one reviewed gateway control-plane operation
-    needs: preflight
-    runs-on: ubuntu-latest
+  build-and-deploy:
+    name: Build & Deploy
+    needs: [test]
+    runs-on: ubuntu-24.04-arm
     environment: production
-    permissions:
-      contents: read
-      id-token: write
     steps:
-      - name: Recheck canonical custody, reviewed hash, and current main before OIDC
-        env:
-          CUSTODY_JSON: ${{ inputs.custody_json }}
-          EXPECTED_SHA: ${{ needs.preflight.outputs.source_sha }}
-          EXPECTED_TREE: ${{ needs.preflight.outputs.source_tree }}
-          EXPECTED_HASH: ${{ needs.preflight.outputs.custody_sha256 }}
-          EXPECTED_ACCOUNT: ${{ needs.preflight.outputs.account }}
-          PENSYVE_REVIEWED_CUSTODY_SHA256: ${{ vars.PENSYVE_REVIEWED_CUSTODY_SHA256 }}
-          PENSYVE_TASK8_BASELINE_ARN: ${{ vars.PENSYVE_TASK8_BASELINE_ARN }}
-          OPERATION: ${{ inputs.operation }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          [[ "$GITHUB_REF" == refs/heads/main && "$GITHUB_SHA" == "$EXPECTED_SHA" ]]
-          python3 - "$RUNNER_TEMP/custody.json" <<'PY'
-          import hashlib
-          import json
-          import os
-          import re
-          import sys
-          from pathlib import Path
-
-          data = json.loads(os.environ["CUSTODY_JSON"])
-          canonical = json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
-          digest = hashlib.sha256(canonical.encode()).hexdigest()
-          if digest != os.environ["EXPECTED_HASH"]:
-              raise SystemExit("custody hash differs from preflight output")
-          if digest != os.environ["PENSYVE_REVIEWED_CUSTODY_SHA256"]:
-              raise SystemExit("custody hash lacks environment-scoped human review")
-          source = data.get("source", {})
-          if source.get("repository") != "major7apps/pensyve" or source.get("sha") != os.environ["EXPECTED_SHA"]:
-              raise SystemExit("source.sha/repository differs from preflight")
-          if source.get("tree") != os.environ["EXPECTED_TREE"]:
-              raise SystemExit("source.tree differs from preflight")
-          if data.get("image", {}).get("account") != os.environ["EXPECTED_ACCOUNT"]:
-              raise SystemExit("image account differs from preflight")
-          if os.environ["OPERATION"].startswith("task9-") and not re.fullmatch(
-              r"arn:aws:ecs:us-east-2:[0-9]{12}:task-definition/pensyve-prod-gateway:(?!157$)[0-9]+",
-              os.environ["PENSYVE_TASK8_BASELINE_ARN"],
-          ):
-              raise SystemExit("Task 9 requires canonical environment-scoped PENSYVE_TASK8_BASELINE_ARN")
-          Path(sys.argv[1]).write_text(canonical, encoding="utf-8")
-          PY
-          gh api "repos/${GITHUB_REPOSITORY}/commits/main" > "$RUNNER_TEMP/current-main.json"
-          jq -e --arg sha "$EXPECTED_SHA" --arg tree "$EXPECTED_TREE" \
-            '.sha == $sha and .commit.tree.sha == $tree' "$RUNNER_TEMP/current-main.json" >/dev/null
-
-      - name: Check out exact trusted main source without persisted credentials
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-
-      - name: Configure narrow production control-plane session
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: us-east-2
-          allowed-account-ids: ${{ needs.preflight.outputs.account }}
-          role-session-name: pensyve-gateway-${{ github.run_id }}-${{ github.run_attempt }}
-          inline-session-policy: >-
-            {"Version":"2012-10-17","Statement":[{"Sid":"ReadCandidateImage","Effect":"Allow","Action":["ecr:DescribeImages","ecr:BatchGetImage","ecr:GetDownloadUrlForLayer"],"Resource":"arn:aws:ecr:us-east-2:${{ needs.preflight.outputs.account }}:repository/pensyve-gateway"},{"Sid":"ReadTaskDefinitionsAndRegisterDerivedTask","Effect":"Allow","Action":["ecs:DescribeTaskDefinition","ecs:RegisterTaskDefinition"],"Resource":"*"},{"Sid":"ReadAndUpdateExactGatewayService","Effect":"Allow","Action":["ecs:DescribeServices","ecs:UpdateService"],"Resource":"arn:aws:ecs:us-east-2:${{ needs.preflight.outputs.account }}:service/pensyve-prod/pensyve-prod-gateway"},{"Sid":"ReadExactGatewayTargetHealth","Effect":"Allow","Action":"elasticloadbalancing:DescribeTargetHealth","Resource":"arn:aws:elasticloadbalancing:us-east-2:${{ needs.preflight.outputs.account }}:targetgroup/pensyve-prod-gw-tg/*"},{"Sid":"PassExactProjectRoles","Effect":"Allow","Action":"iam:PassRole","Resource":["arn:aws:iam::${{ needs.preflight.outputs.account }}:role/pensyve-prod-task","arn:aws:iam::${{ needs.preflight.outputs.account }}:role/pensyve-prod-task-execution"]}]}
-
-      - name: Verify immutable ECR raw manifest, config blob, platform, and source
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build release binary
+        run: cargo build --release -p pensyve-mcp-gateway
+      - name: Build and push image
+        id: image
         env:
-          SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
-          EXPECTED_ACCOUNT: ${{ needs.preflight.outputs.account }}
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
           set -euo pipefail
-          registry=$(jq -r '.image.registry' "$RUNNER_TEMP/custody.json")
-          repository=$(jq -r '.image.repository' "$RUNNER_TEMP/custody.json")
-          digest=$(jq -r '.image.manifest_digest' "$RUNNER_TEMP/custody.json")
-          config=$(jq -r '.image.config_digest' "$RUNNER_TEMP/custody.json")
-          platform=$(jq -r '.image.platform' "$RUNNER_TEMP/custody.json")
-          media=$(jq -r '.image.raw_manifest_media_type' "$RUNNER_TEMP/custody.json")
-          raw_sha=$(jq -r '.image.raw_manifest_sha256' "$RUNNER_TEMP/custody.json")
-          account=$(jq -r '.image.account' "$RUNNER_TEMP/custody.json")
-          [[ "$platform" == linux/arm64 && "${registry}/${repository}@${digest}" != *:latest ]]
-          [[ "$account" == "$EXPECTED_ACCOUNT" ]]
-          assumed_account=$(aws sts get-caller-identity --query Account --output text)
-          [[ "$assumed_account" == "$account" ]]
-          aws ecr describe-images --region us-east-2 --registry-id "$account" \
-            --repository-name "$repository" \
-            --image-ids "imageDigest=$digest" --output json > "$RUNNER_TEMP/describe.json"
-          aws ecr batch-get-image --region us-east-2 --registry-id "$account" \
-            --repository-name "$repository" \
-            --image-ids "imageDigest=$digest" --accepted-media-types "$media" \
-            --output json > "$RUNNER_TEMP/batch.json"
-          python3 - "$RUNNER_TEMP/custody.json" "$RUNNER_TEMP/describe.json" \
-            "$RUNNER_TEMP/batch.json" "$RUNNER_TEMP/raw-manifest.json" <<'PY'
-          import hashlib
-          import json
-          import sys
-          from pathlib import Path
-
-          custody, describe, batch = [json.loads(Path(path).read_text()) for path in sys.argv[1:4]]
-          image = custody["image"]
-          details = describe.get("imageDetails")
-          images = batch.get("images")
-          if not isinstance(details, list) or len(details) != 1 or details[0].get("imageDigest") != image["manifest_digest"]:
-              raise SystemExit("wrong ECR describe-images digest")
-          if not isinstance(images, list) or len(images) != 1 or batch.get("failures") not in (None, []):
-              raise SystemExit("wrong ECR batch-get-image cardinality")
-          record = images[0]
-          raw = record.get("imageManifest")
-          if (record.get("imageId", {}).get("imageDigest") != image["manifest_digest"] or
-                  record.get("imageManifestMediaType") != image["raw_manifest_media_type"] or
-                  not isinstance(raw, str)):
-              raise SystemExit("wrong ECR raw manifest identity/media")
-          raw_bytes = raw.encode("utf-8")
-          raw_digest = hashlib.sha256(raw_bytes).hexdigest()
-          manifest = json.loads(raw)
-          if (raw_digest != image["raw_manifest_sha256"] or "sha256:" + raw_digest != image["manifest_digest"] or
-                  manifest.get("mediaType") != image["raw_manifest_media_type"] or
-                  manifest.get("config", {}).get("digest") != image["config_digest"]):
-              raise SystemExit("wrong ECR raw manifest bytes/hash/config")
-          Path(sys.argv[4]).write_bytes(raw_bytes)
-          PY
-          url=$(aws ecr get-download-url-for-layer --region us-east-2 \
-            --registry-id "$account" \
-            --repository-name "$repository" --layer-digest "$config" \
-            --query downloadUrl --output text)
-          curl --fail --silent --show-error --location --max-time 60 \
-            --output "$RUNNER_TEMP/config.json" "$url"
-          [[ "sha256:$(sha256sum "$RUNNER_TEMP/config.json" | cut -d' ' -f1)" == "$config" ]]
-          jq -e --arg source "$SOURCE_SHA" \
-            '.os == "linux" and .architecture == "arm64" and .config.Labels["org.opencontainers.image.revision"] == $source' \
-            "$RUNNER_TEMP/config.json" >/dev/null
-
-      - name: Invoke only the selected trusted-main promoter mode
+          docker build --build-arg SOURCE_SHA="$IMAGE_TAG" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            -f pensyve-mcp-gateway/Dockerfile .
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          digest=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$IMAGE_TAG" \
+            --query 'imageDetails[0].imageDigest' --output text)
+          [[ "$digest" == sha256:* ]]
+          echo "ref=$ECR_REGISTRY/$ECR_REPOSITORY@$digest" >> "$GITHUB_OUTPUT"
+      - name: Register revision derived from the live service and roll it
         env:
-          OPERATION: ${{ inputs.operation }}
-          PENSYVE_TASK8_BASELINE_ARN: ${{ vars.PENSYVE_TASK8_BASELINE_ARN }}
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
         run: |
           set -euo pipefail
-          pensyve-mcp-gateway/scripts/promote-gateway-image.sh "$OPERATION" \
-            --custody "$RUNNER_TEMP/custody.json"
+          current=$(aws ecs describe-services --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" --query 'services[0].taskDefinition' --output text)
+          echo "deriving from $current"
+          aws ecs describe-task-definition --task-definition "$current" \
+            --query taskDefinition --output json \
+            | jq --arg IMAGE "$IMAGE_REF" \
+              'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy, .enableFaultInjection)
+               | .containerDefinitions[0].image = $IMAGE' \
+            > "$RUNNER_TEMP/task-def.json"
+          new=$(aws ecs register-task-definition \
+            --cli-input-json "file://$RUNNER_TEMP/task-def.json" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "registered $new"
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+            --task-definition "$new" --query 'service.taskDefinition' --output text
+          {
+            echo "### Gateway rollout"
+            echo "- image: \`$IMAGE_REF\`"
+            echo "- previous: \`$current\`"
+            echo "- new: \`$new\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Wait for stability
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+          aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].deployments[*].{status:status,td:taskDefinition,rollout:rolloutState,reason:rolloutStateReason}' \
+            --output json | tee "$RUNNER_TEMP/deployments.json"
+          # A completed rollback is "stable" too; fail if the primary is not the revision we registered.
+          jq -e '[.[] | select(.status=="PRIMARY")] | length == 1 and all(.rollout == "COMPLETED" and (.reason | test("rolling back") | not))' \
+            "$RUNNER_TEMP/deployments.json" >/dev/null
+      - name: Verify health
+        run: |
+          set -euo pipefail
+          sleep 10
+          curl -sf --max-time 10 https://mcp.pensyve.com/health
+          curl -sf --max-time 10 https://mcp.pensyve.com/ready
