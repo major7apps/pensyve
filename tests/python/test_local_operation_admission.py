@@ -23,7 +23,7 @@ def test_blocked_extraction_releases_gil_and_local_permit(tmp_path: Path) -> Non
     release_request = threading.Event()
 
     class BlockingExtractorHandler(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:  # noqa: N802 - stdlib callback name
+        def do_POST(self) -> None:
             content_length = int(self.headers.get("Content-Length", "0"))
             self.rfile.read(content_length)
             request_entered.set()
