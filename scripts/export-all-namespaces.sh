@@ -20,11 +20,22 @@
 #   PENSYVE_EXPORT_PASSPHRASE=... \
 #     scripts/export-all-namespaces.sh <export-dir> s3://bucket/prefix
 #
+# Canonical destination for the 2026-10-01 run (MAJ-374):
+#
+#   s3://pensyve-prod-exports-use2/namespaces/2026-10-01/
+#
+# It is still passed as an argument rather than defaulted, so a mistyped or
+# not-yet-created bucket fails loudly instead of silently uploading a customer
+# data set somewhere unintended.
+#
 # Prerequisites:
 #   - The export directory has already been produced by the gateway's
 #     `--all` mode, with the gateway scaled to zero so nothing is writing.
-#   - The destination bucket is private (all four public-access blocks on)
-#     and carries the 90-day lifecycle rule from the sunset decision.
+#   - The destination bucket exists in us-east-2, with all four public-access
+#     blocks on, default encryption enabled, and a 90-day expiry lifecycle rule
+#     (the sunset decision promises 90-day retention). It is NOT one of the
+#     buckets the teardown keeps — it is created for this run and deleted with
+#     the rest of the 12-18 cleanup.
 #   - `aws` is configured for the profile that can write to that bucket.
 
 set -euo pipefail
