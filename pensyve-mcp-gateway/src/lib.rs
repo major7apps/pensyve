@@ -9,6 +9,7 @@
 
 pub mod admission;
 pub mod auth;
+pub mod bulk_export;
 pub mod cache;
 pub mod circuit_breaker;
 pub mod config;

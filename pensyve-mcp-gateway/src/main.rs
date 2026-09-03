@@ -302,16 +302,35 @@ fn init_resources_with(
 /// serve from, then exits.
 const EXPORT_NAMESPACE_MODE: &str = "export-namespace";
 
+#[derive(Debug)]
 struct ExportArgs {
     namespace: uuid::Uuid,
     sqlite: std::path::PathBuf,
     json: Option<std::path::PathBuf>,
 }
 
-fn parse_export_args(args: &[String]) -> Result<ExportArgs> {
+/// The two shapes of `export-namespace`.
+///
+/// One customer taking their data (`--namespace`), or the 2026-10-01 operator
+/// run copying everything before the store is destroyed (`--all`). They are
+/// separate variants rather than optional fields so that a half-specified
+/// invocation is a parse error instead of a surprising default — the bulk run
+/// happens once and cannot be repeated afterwards.
+#[derive(Debug)]
+enum ExportMode {
+    Single(ExportArgs),
+    All { out_dir: std::path::PathBuf },
+}
+
+const EXPORT_USAGE: &str = "usage: export-namespace --namespace <uuid> --sqlite <out.db> \
+     [--json <out.json>] | export-namespace --all --out-dir <dir>";
+
+fn parse_export_args(args: &[String]) -> Result<ExportMode> {
     let mut namespace = None;
     let mut sqlite = None;
     let mut json = None;
+    let mut out_dir = None;
+    let mut all = false;
     let mut rest = args.iter();
     while let Some(flag) = rest.next() {
         let mut value = || {
@@ -323,20 +342,39 @@ fn parse_export_args(args: &[String]) -> Result<ExportArgs> {
             "--namespace" => namespace = Some(value()?),
             "--sqlite" => sqlite = Some(value()?),
             "--json" => json = Some(value()?),
-            other => anyhow::bail!(
-                "unknown argument {other}; usage: {EXPORT_NAMESPACE_MODE} \
-                 --namespace <uuid> --sqlite <out.db> [--json <out.json>]"
-            ),
+            "--out-dir" => out_dir = Some(value()?),
+            "--all" => all = true,
+            other => anyhow::bail!("unknown argument {other}; {EXPORT_USAGE}"),
         }
+    }
+
+    if all {
+        // Rejected rather than resolved: exporting something other than what
+        // the operator asked for is worse than refusing, on a run that has no
+        // second chance.
+        if namespace.is_some() || sqlite.is_some() || json.is_some() {
+            anyhow::bail!(
+                "--all exports every namespace and cannot be combined with \
+                 --namespace/--sqlite/--json; {EXPORT_USAGE}"
+            );
+        }
+        let out_dir = out_dir.ok_or_else(|| anyhow::anyhow!("--out-dir is required with --all"))?;
+        return Ok(ExportMode::All {
+            out_dir: std::path::PathBuf::from(out_dir),
+        });
+    }
+
+    if out_dir.is_some() {
+        anyhow::bail!("--out-dir is only meaningful with --all; {EXPORT_USAGE}");
     }
     let namespace = namespace.ok_or_else(|| anyhow::anyhow!("--namespace is required"))?;
     let sqlite = sqlite.ok_or_else(|| anyhow::anyhow!("--sqlite is required"))?;
-    Ok(ExportArgs {
+    Ok(ExportMode::Single(ExportArgs {
         namespace: uuid::Uuid::parse_str(&namespace)
             .map_err(|error| anyhow::anyhow!("--namespace {namespace} is not a UUID: {error}"))?,
         sqlite: std::path::PathBuf::from(sqlite),
         json: json.map(std::path::PathBuf::from),
-    })
+    }))
 }
 
 /// Move a staged artifact to its final path.
@@ -515,6 +553,50 @@ fn export_namespace_command(
     Ok(())
 }
 
+/// Operator mode: `export-namespace --all` copies every namespace out of the
+/// hosted store, for the 2026-10-01 shutdown (MAJ-374).
+///
+/// A run that could not copy every namespace exits non-zero. The store is
+/// deleted after this, so a partial run that looked like a success is the one
+/// outcome there is no recovering from.
+fn export_all_namespaces_command(
+    storage: &dyn StorageTrait,
+    embedder: &OnnxEmbedder,
+    out_dir: &std::path::Path,
+) -> Result<()> {
+    let runtime_space = embedder
+        .embedding_space()
+        .map_err(|error| anyhow::anyhow!("runtime embedding space: {error}"))?
+        .id();
+
+    let summary =
+        pensyve_mcp_gateway::bulk_export::export_all_namespaces(storage, out_dir, &runtime_space)
+            .map_err(|error| anyhow::anyhow!("bulk export: {error}"))?;
+
+    if !summary.complete() {
+        for failure in &summary.failed {
+            tracing::error!(
+                namespace = %failure.namespace_id,
+                error = %failure.error,
+                "namespace was not exported"
+            );
+        }
+        anyhow::bail!(
+            "{} of {} namespaces failed to export; see {} — do not proceed with teardown",
+            summary.failed.len(),
+            summary.exported.len() + summary.failed.len(),
+            pensyve_mcp_gateway::bulk_export::manifest_path(out_dir).display()
+        );
+    }
+
+    tracing::info!(
+        exported = summary.exported.len(),
+        path = %out_dir.display(),
+        "every namespace exported"
+    );
+    Ok(())
+}
+
 /// Operator mode: `pensyve-mcp-gateway backfill-embeddings` brings every
 /// namespace onto the embedding generation this process loaded, then exits.
 const BACKFILL_EMBEDDINGS_MODE: &str = "backfill-embeddings";
@@ -686,7 +768,14 @@ fn main() -> Result<()> {
     // when PostgresBackend creates its own internal runtime.
     let res = init_resources_with(&config, namespace_policy)?;
     if let Some(parsed) = export {
-        return export_namespace_command(res.storage.as_ref(), res.embedder.as_ref(), &parsed);
+        return match parsed {
+            ExportMode::Single(single) => {
+                export_namespace_command(res.storage.as_ref(), res.embedder.as_ref(), &single)
+            }
+            ExportMode::All { out_dir } => {
+                export_all_namespaces_command(res.storage.as_ref(), res.embedder.as_ref(), &out_dir)
+            }
+        };
     }
     if mode == Some(BACKFILL_EMBEDDINGS_MODE) {
         return backfill_embeddings(res.storage.as_ref(), res.embedder.as_ref());
@@ -1134,6 +1223,84 @@ async fn health_handler() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- export-namespace argument parsing (MAJ-374 pre-req) -------------
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn parses_a_single_namespace_export() {
+        let parsed = parse_export_args(&args(&[
+            "--namespace",
+            "00000000-0000-0000-0000-000000000001",
+            "--sqlite",
+            "/tmp/out.db",
+        ]))
+        .expect("single-namespace form should parse");
+
+        match parsed {
+            ExportMode::Single(single) => {
+                assert_eq!(single.sqlite, std::path::PathBuf::from("/tmp/out.db"));
+            }
+            ExportMode::All { .. } => panic!("expected the single-namespace form"),
+        }
+    }
+
+    #[test]
+    fn parses_the_all_namespaces_export() {
+        let parsed = parse_export_args(&args(&["--all", "--out-dir", "/tmp/exports"]))
+            .expect("--all form should parse");
+
+        match parsed {
+            ExportMode::All { out_dir } => {
+                assert_eq!(out_dir, std::path::PathBuf::from("/tmp/exports"));
+            }
+            ExportMode::Single(_) => panic!("expected the --all form"),
+        }
+    }
+
+    #[test]
+    fn all_requires_an_output_directory() {
+        let error = parse_export_args(&args(&["--all"]))
+            .expect_err("--all without --out-dir must not be accepted");
+
+        assert!(
+            error.to_string().contains("--out-dir"),
+            "error should name the missing flag: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_mixing_all_with_a_single_namespace() {
+        // Silently preferring one over the other would export something other
+        // than what the operator asked for, on a run that cannot be repeated.
+        let error = parse_export_args(&args(&[
+            "--all",
+            "--out-dir",
+            "/tmp/exports",
+            "--namespace",
+            "00000000-0000-0000-0000-000000000001",
+        ]))
+        .expect_err("mixing the two forms must be rejected");
+
+        assert!(
+            error.to_string().contains("--all"),
+            "error should explain the conflict: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_single_export_with_no_destination() {
+        let error = parse_export_args(&args(&[
+            "--namespace",
+            "00000000-0000-0000-0000-000000000001",
+        ]))
+        .expect_err("--sqlite is required for a single namespace");
+
+        assert!(error.to_string().contains("--sqlite"), "{error}");
+    }
 
     #[test]
     fn strict_reranker_metadata_reports_initialized_exact_revision() {
