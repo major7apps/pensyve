@@ -107,7 +107,12 @@ encrypt() {
   # mechanisms are unavailable — which would put the passphrase on disk. A
   # pipe never does. `printf` is a shell builtin, so the value is not exec'd
   # into an argv either.
+  # --pinentry-mode loopback is required for GnuPG 2.1+ to honour
+  # --passphrase-fd at all; without it the agent can try to prompt and the
+  # non-interactive path fails on a machine whose gpg-agent is configured
+  # differently from the one this was written on.
   printf '%s' "$passphrase" | gpg --batch --yes --quiet \
+      --pinentry-mode loopback \
       --symmetric --cipher-algo AES256 \
       --passphrase-fd 0 \
       --output "$2" "$1"
@@ -140,15 +145,16 @@ aws s3 cp "$manifest.gpg" "$destination/manifest.json.gpg" \
 echo "uploaded $uploaded namespace export(s) + manifest to $destination"
 echo
 echo "Verify before teardown:"
-echo "  aws s3 ls \"$destination/\" --recursive --summarize | tail -3"
+printf '  aws s3 ls %q --recursive --summarize | tail -3\n' "$destination/"
 echo "Then compare the object count against \"namespaces\" in the manifest."
 echo
 echo "IMPORTANT: $export_dir still holds PLAINTEXT customer memories."
 echo "The gateway writes them unencrypted and this script encrypts on the way"
 echo "out, so every namespace sits in the clear on this box until you remove"
 echo "them. Deliberately not deleted here — verify the upload first, then:"
-# Quoted: this line is meant to be pasted, and it is destructive. With an
-# unquoted path containing a space, `rm -rf /tmp/my exports` deletes /tmp/my.
-echo "  shred -u \"$export_dir\"/*.db && rm -rf \"$export_dir\""
+# %q, not just quotes: this line is meant to be pasted and it is destructive.
+# Quoting survives a space, but a path holding a double quote or `$(...)` would
+# break out of it. `--` stops a leading-dash path being read as an option.
+printf '  shred -u -- %q/*.db && rm -rf -- %q\n' "$export_dir" "$export_dir"
 echo
 echo "Keep the passphrase in the password manager; it is not recorded anywhere here."
