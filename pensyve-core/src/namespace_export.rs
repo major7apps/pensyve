@@ -671,7 +671,25 @@ mod tests {
         assert_eq!(
             all,
             counts.memories(),
-            "the admission count must equal the rows the export copies"
+            "the admission count must equal the memory rows the export copies"
+        );
+
+        // Memories are not the only thing copied: every entity is loaded into
+        // one Vec and every episode is paged, so a namespace can be cheap in
+        // memories and expensive in the rest. Admission has to see those too.
+        let entities = source_db
+            .count_entities_by_namespace(namespace.id)
+            .expect("entity count");
+        let episodes = source_db
+            .count_episodes_by_namespace(namespace.id)
+            .expect("episode count");
+        assert_eq!(
+            entities, counts.entities,
+            "entity count must match the copy"
+        );
+        assert_eq!(
+            episodes, counts.episodes,
+            "episode count must match the copy"
         );
         assert!(
             all > live_total,

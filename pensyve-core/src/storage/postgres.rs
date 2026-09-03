@@ -5889,6 +5889,19 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    fn count_episodes_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            let (count,): (i64,) =
+                query_as::<Postgres, _>("SELECT COUNT(*) FROM episodes WHERE namespace_id = $1")
+                    .bind(namespace_id)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(sqlx_to_io)?;
+            Ok(count as usize)
+        })
+    }
+
     fn count_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;

@@ -6001,6 +6001,16 @@ impl StorageTrait for SqliteBackend {
         Ok((episodic as usize, semantic as usize))
     }
 
+    fn count_episodes_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
+        let conn = lock_conn!(self);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM episodes WHERE namespace_id = ?1",
+            params![namespace_id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     fn count_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
         let conn = lock_conn!(self);
         let count: i64 = conn.query_row(

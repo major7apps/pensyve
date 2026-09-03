@@ -351,6 +351,70 @@ async fn export_of_an_empty_namespace_is_an_openable_store() {
     cancellation.cancel();
 }
 
+/// An MCP client that scoped its writes with `X-Pensyve-Agent-Id` must get
+/// *that* namespace back, not the credential's unscoped one.
+///
+/// `tenant_and_usage_middleware` folds the header into the tenant key for the
+/// MCP transport, but `get_pensyve_state` rebuilds the key from `AuthContext`
+/// alone. Without this, such a caller receives a valid 200 and a SQLite file
+/// containing the wrong — usually empty — dataset, which is the worst way for
+/// an export to fail: silently.
+#[tokio::test]
+async fn an_agent_scoped_caller_exports_the_agent_scoped_namespace() {
+    let dir = TempDir::new().expect("temp dir");
+    let (url, state, cancellation) = start_test_server(&dir).await;
+    let client = reqwest::Client::new();
+
+    let agent_id = uuid::Uuid::new_v4();
+    let scoped_key = pensyve_mcp_gateway::build_tenant_key(
+        TENANT_OWNER,
+        Some(&pensyve_core::types::AgentId::from(agent_id)),
+    );
+    let scoped_namespace = state
+        .tenant_mgr
+        .get_tenant_state(&scoped_key)
+        .expect("agent-scoped tenant state")
+        .namespace
+        .id;
+    let unscoped_namespace = state
+        .tenant_mgr
+        .get_tenant_state(TENANT_OWNER)
+        .expect("unscoped tenant state")
+        .namespace
+        .id;
+    assert_ne!(
+        scoped_namespace, unscoped_namespace,
+        "fixture must actually produce two namespaces"
+    );
+
+    let response = client
+        .post(format!("{url}/v1/export"))
+        .header(TENANT_HEADER, TENANT_OWNER)
+        .header("x-pensyve-agent-id", agent_id.to_string())
+        .send()
+        .await
+        .expect("export request");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let disposition = response
+        .headers()
+        .get("content-disposition")
+        .expect("disposition")
+        .to_str()
+        .expect("ASCII")
+        .to_string();
+    assert!(
+        disposition.contains(&scoped_namespace.to_string()),
+        "expected the agent-scoped namespace, got {disposition}"
+    );
+    assert!(
+        !disposition.contains(&unscoped_namespace.to_string()),
+        "exported the credential's unscoped namespace instead: {disposition}"
+    );
+
+    cancellation.cancel();
+}
+
 /// The cap keeps a pathological namespace from holding an ALB connection past
 /// its 120s idle timeout and returning nothing at all. Boundary is exercised
 /// directly rather than by writing hundreds of thousands of rows.

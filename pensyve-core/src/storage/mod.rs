@@ -1392,6 +1392,14 @@ pub trait StorageTrait: Send + Sync {
     }
 
     /// Count entities in a namespace.
+    /// Count the episodes [`crate::namespace_export::export_namespace`] will
+    /// page. Memories are not the only cost of an export: every entity is
+    /// loaded into one `Vec` and every episode is paged, so a namespace can be
+    /// cheap in memories and expensive in the rest.
+    fn count_episodes_by_namespace(&self, _namespace_id: Uuid) -> StorageResult<usize> {
+        Err(StorageError::Unsupported("episode count".into()))
+    }
+
     fn count_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize>;
 
     // Activity logging

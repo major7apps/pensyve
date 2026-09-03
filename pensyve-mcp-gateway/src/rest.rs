@@ -929,21 +929,42 @@ fn export_namespace_staged(
 async fn export_namespace_download(
     State(state): State<Arc<AppState>>,
     axum::Extension(auth_ctx): axum::Extension<AuthContext>,
+    headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, RestError> {
-    let ps = get_pensyve_state(&state, &auth_ctx)?;
+    // Resolved with the same key the MCP transport builds, so a client that
+    // scoped its writes with `X-Pensyve-Agent-Id` gets that namespace back.
+    // `get_pensyve_state` rebuilds the key from `AuthContext` alone, which
+    // would hand such a caller a valid 200 containing the wrong — usually
+    // empty — dataset. Silently exporting the wrong data is the worst way for
+    // this endpoint to fail.
+    //
+    // A caller that omits the header still gets the unscoped namespace, which
+    // is what the dashboard does; the dashboard cannot know a customer's agent
+    // ids, so an agent-scoped namespace is reachable only by a client that
+    // sends the header it wrote under.
+    let agent_id = crate::parse_agent_id_header(&headers);
+    let tenant_key = crate::build_tenant_key(
+        auth_ctx.user_id.as_deref().unwrap_or(&auth_ctx.key_id),
+        agent_id.as_ref(),
+    );
+    let ps = state
+        .tenant_mgr
+        .get_tenant_state(&tenant_key)
+        .map_err(|e| {
+            RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to resolve tenant state: {e}"),
+            )
+        })?;
     let namespace_id = ps.namespace.id;
 
     // Every failure here is fail-closed. A count that silently degrades to
     // zero would admit exactly the namespace the cap exists to turn away.
-    let admitted = ps
-        .storage
-        .count_all_memories_by_namespace(namespace_id)
-        .map_err(|error| {
-            RestError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Could not size the namespace: {error}"),
-            )
-        })?;
+    //
+    // Memories are not the whole cost: `export_namespace` loads every entity
+    // into one `Vec`, walks each entity's edges, and pages every episode, so a
+    // namespace can be cheap in memories and still unbounded work.
+    let admitted = export_workload(ps.storage.as_ref(), namespace_id)?;
 
     if export_exceeds_cap(admitted) {
         return Err(oversized_export(admitted));
@@ -968,7 +989,7 @@ async fn export_namespace_download(
     // before the copy began, and the namespace stays writable throughout —
     // `remember` calls landing in that gap would otherwise let an admitted
     // export return more than the cap allows. `ExportCounts` is exact.
-    let copied = staged.counts.memories();
+    let copied = staged.counts.memories() + staged.counts.entities + staged.counts.episodes;
     if export_exceeds_cap(copied) {
         tracing::warn!(
             namespace = %namespace_id,
@@ -1003,12 +1024,41 @@ async fn export_namespace_download(
     ))
 }
 
+/// Total rows an export of this namespace will copy.
+///
+/// Sums every row class `export_namespace` walks — memories (including
+/// superseded and invalidated ones), entities, and episodes — so admission
+/// bounds the actual work rather than one part of it.
+fn export_workload(storage: &dyn StorageTrait, namespace_id: Uuid) -> Result<usize, RestError> {
+    let size = |what: &str, result: pensyve_core::storage::StorageResult<usize>| {
+        result.map_err(|error| {
+            RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Could not size the namespace ({what}): {error}"),
+            )
+        })
+    };
+    let memories = size(
+        "memories",
+        storage.count_all_memories_by_namespace(namespace_id),
+    )?;
+    let entities = size(
+        "entities",
+        storage.count_entities_by_namespace(namespace_id),
+    )?;
+    let episodes = size(
+        "episodes",
+        storage.count_episodes_by_namespace(namespace_id),
+    )?;
+    Ok(memories + entities + episodes)
+}
+
 /// The 413 an over-cap namespace gets, with the route out of it.
 fn oversized_export(memories: usize) -> RestError {
     RestError(
         StatusCode::PAYLOAD_TOO_LARGE,
         format!(
-            "This namespace holds {memories} memories, above the \
+            "This namespace holds {memories} rows, above the \
              {MAX_SELF_SERVE_EXPORT_MEMORIES} the self-serve export can copy in one request. \
              Email support@major7apps.com and we will run the full export for you."
         ),
