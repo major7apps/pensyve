@@ -883,6 +883,11 @@ CREATE TABLE IF NOT EXISTS episodes (
     outcome      TEXT,
     metadata     TEXT NOT NULL DEFAULT '{}'
 );
+-- Namespace-scoped episode reads (the export's admission count, and paging)
+-- would otherwise scan the table. In the base batch rather than a migration:
+-- this runs with IF NOT EXISTS on every open, so existing stores gain it
+-- without a schema-version bump.
+CREATE INDEX IF NOT EXISTS idx_episodes_namespace ON episodes(namespace_id);
 
 CREATE TABLE IF NOT EXISTS episodic_memories (
     id              TEXT PRIMARY KEY,
@@ -5999,6 +6004,16 @@ impl StorageTrait for SqliteBackend {
         )?;
 
         Ok((episodic as usize, semantic as usize))
+    }
+
+    fn count_edges_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
+        let conn = lock_conn!(self);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM edges WHERE namespace_id = ?1",
+            params![namespace_id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
     }
 
     fn count_episodes_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {

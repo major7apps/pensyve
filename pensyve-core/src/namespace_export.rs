@@ -691,6 +691,12 @@ mod tests {
             episodes, counts.episodes,
             "episode count must match the copy"
         );
+        // `save_edge` adds rows without moving any of the other counts, so an
+        // edge-heavy namespace is invisible to a cap that ignores them.
+        let edges = source_db
+            .count_edges_by_namespace(namespace.id)
+            .expect("edge count");
+        assert_eq!(edges, counts.edges, "edge count must match the copy");
         assert!(
             all > live_total,
             "fixture must actually exercise the gap (live {live_total}, all {all})"

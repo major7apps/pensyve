@@ -964,7 +964,20 @@ async fn export_namespace_download(
     // Memories are not the whole cost: `export_namespace` loads every entity
     // into one `Vec`, walks each entity's edges, and pages every episode, so a
     // namespace can be cheap in memories and still unbounded work.
-    let admitted = export_workload(ps.storage.as_ref(), namespace_id)?;
+    // On the blocking pool: these are synchronous storage reads on a
+    // multi-thread executor, and a slow count would otherwise stall unrelated
+    // requests scheduled on the same worker thread.
+    let counting_storage = Arc::clone(&ps.storage);
+    let admitted = tokio::task::spawn_blocking(move || {
+        export_workload(counting_storage.as_ref(), namespace_id)
+    })
+    .await
+    .map_err(|error| {
+        RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Sizing task failed: {error}"),
+        )
+    })??;
 
     if export_exceeds_cap(admitted) {
         return Err(oversized_export(admitted));
@@ -989,7 +1002,10 @@ async fn export_namespace_download(
     // before the copy began, and the namespace stays writable throughout —
     // `remember` calls landing in that gap would otherwise let an admitted
     // export return more than the cap allows. `ExportCounts` is exact.
-    let copied = staged.counts.memories() + staged.counts.entities + staged.counts.episodes;
+    let copied = staged.counts.memories()
+        + staged.counts.entities
+        + staged.counts.episodes
+        + staged.counts.edges;
     if export_exceeds_cap(copied) {
         tracing::warn!(
             namespace = %namespace_id,
@@ -1027,8 +1043,11 @@ async fn export_namespace_download(
 /// Total rows an export of this namespace will copy.
 ///
 /// Sums every row class `export_namespace` walks — memories (including
-/// superseded and invalidated ones), entities, and episodes — so admission
-/// bounds the actual work rather than one part of it.
+/// superseded and invalidated ones), entities, episodes and graph edges — so
+/// admission bounds the actual work rather than one part of it. `save_edge` in
+/// particular adds rows without moving any other count.
+///
+/// Synchronous storage work: callers run it on the blocking pool.
 fn export_workload(storage: &dyn StorageTrait, namespace_id: Uuid) -> Result<usize, RestError> {
     let size = |what: &str, result: pensyve_core::storage::StorageResult<usize>| {
         result.map_err(|error| {
@@ -1050,7 +1069,8 @@ fn export_workload(storage: &dyn StorageTrait, namespace_id: Uuid) -> Result<usi
         "episodes",
         storage.count_episodes_by_namespace(namespace_id),
     )?;
-    Ok(memories + entities + episodes)
+    let edges = size("edges", storage.count_edges_by_namespace(namespace_id))?;
+    Ok(memories + entities + episodes + edges)
 }
 
 /// The 413 an over-cap namespace gets, with the route out of it.

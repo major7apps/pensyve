@@ -1392,6 +1392,14 @@ pub trait StorageTrait: Send + Sync {
     }
 
     /// Count entities in a namespace.
+    /// Count the graph edges [`crate::namespace_export::export_namespace`] will
+    /// copy. `save_edge` adds rows without moving the memory, entity or
+    /// episode counts, so an edge-heavy namespace is invisible to any bound
+    /// that ignores them.
+    fn count_edges_by_namespace(&self, _namespace_id: Uuid) -> StorageResult<usize> {
+        Err(StorageError::Unsupported("edge count".into()))
+    }
+
     /// Count the episodes [`crate::namespace_export::export_namespace`] will
     /// page. Memories are not the only cost of an export: every entity is
     /// loaded into one `Vec` and every episode is paged, so a namespace can be
