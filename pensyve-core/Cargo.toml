@@ -48,7 +48,7 @@ regex = "1"
 # migration because a normal caret requirement now admits unreviewed 6.0.2.
 # Revisit the pin separately; CI runs `test_no_network_invariants` against a
 # seeded cache on every PR (see `.github/workflows/ci.yml`).
-fastembed = "=6.0.1"
+fastembed = "=6.0.2"
 petgraph = "0.8"
 # Phase 2B: compile-time predicate-verb lexicon for the shallow dependency
 # parser (`extraction::dep_parse`). `phf::Map` keys are interned at build
