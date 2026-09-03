@@ -21,7 +21,7 @@ use pensyve_core::embedding_space::EmbeddingSpaceId;
 use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::types::{EntityKind, Namespace, SemanticMemory};
-use pensyve_mcp_gateway::bulk_export::{export_all_namespaces, read_manifest};
+use pensyve_mcp_gateway::bulk_export::{ensure_publishable, export_all_namespaces, read_manifest};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -217,4 +217,43 @@ fn records_whether_each_namespace_can_reuse_its_vectors() {
     // These namespaces were written without an embedding generation, so there
     // is nothing to reuse and nothing to migrate.
     assert!(!manifest.namespaces[0].vectors_reusable);
+}
+
+/// A run that exported nothing must not read as success.
+///
+/// `init_resources_with` falls back to a local SQLite store when
+/// `DATABASE_URL` is unset or is not a Postgres URL, and will happily create
+/// an empty one. The bulk export then finds zero namespaces, reports no
+/// failures, and exits 0 — after which the upload script accepts an empty
+/// manifest and the operator tears down production believing every namespace
+/// was saved. On a one-shot, irreversible runbook step that is the single
+/// worst outcome available, so an empty run is an error.
+#[test]
+fn an_export_that_saved_nothing_is_not_publishable() {
+    let source_dir = TempDir::new().expect("source dir");
+    let storage = Arc::new(SqliteBackend::open(source_dir.path()).expect("open storage"))
+        as Arc<dyn StorageTrait>;
+    let out = TempDir::new().expect("out dir");
+
+    let summary = export_all_namespaces(storage.as_ref(), out.path(), &runtime_space())
+        .expect("bulk export of an empty store still writes a manifest");
+
+    let refused = ensure_publishable(&summary).expect_err("an empty run must not be publishable");
+    assert!(
+        refused.contains("no namespaces"),
+        "the error should say what is wrong: {refused}"
+    );
+}
+
+/// A run that copied at least one namespace and lost none is publishable.
+#[test]
+fn a_complete_export_is_publishable() {
+    let source_dir = TempDir::new().expect("source dir");
+    let (storage, _) = store_with_namespaces(&source_dir, 2);
+    let out = TempDir::new().expect("out dir");
+
+    let summary =
+        export_all_namespaces(storage.as_ref(), out.path(), &runtime_space()).expect("bulk export");
+
+    ensure_publishable(&summary).expect("a complete run should be publishable");
 }

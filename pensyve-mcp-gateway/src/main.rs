@@ -573,18 +573,19 @@ fn export_all_namespaces_command(
         pensyve_mcp_gateway::bulk_export::export_all_namespaces(storage, out_dir, &runtime_space)
             .map_err(|error| anyhow::anyhow!("bulk export: {error}"))?;
 
-    if !summary.complete() {
-        for failure in &summary.failed {
-            tracing::error!(
-                namespace = %failure.namespace_id,
-                error = %failure.error,
-                "namespace was not exported"
-            );
-        }
+    for failure in &summary.failed {
+        tracing::error!(
+            namespace = %failure.namespace_id,
+            error = %failure.error,
+            "namespace was not exported"
+        );
+    }
+    // Covers both "some namespaces failed" and "nothing was exported at all" —
+    // the second being the quiet one, since a local-SQLite fallback produces a
+    // clean, complete-looking run over an empty store.
+    if let Err(reason) = pensyve_mcp_gateway::bulk_export::ensure_publishable(&summary) {
         anyhow::bail!(
-            "{} of {} namespaces failed to export; see {} — do not proceed with teardown",
-            summary.failed.len(),
-            summary.exported.len() + summary.failed.len(),
+            "{reason}; see {}",
             pensyve_mcp_gateway::bulk_export::manifest_path(out_dir).display()
         );
     }

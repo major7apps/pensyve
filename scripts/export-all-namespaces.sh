@@ -13,8 +13,17 @@
 #
 # The passphrase is read from PENSYVE_EXPORT_PASSPHRASE and is never echoed,
 # never written to disk, and never passed as an argv value (which would expose
-# it in `ps`). It goes to gpg on a file descriptor. Store it in a password
-# manager and hand it over out of band — never in git, Linear, or the vault.
+# it in `ps`). It reaches gpg on a file descriptor.
+#
+# It is also copied into a shell-local variable and removed from the
+# environment before anything is spawned. Invoked the documented way the
+# variable carries the export attribute, so without this every child —
+# `python3`, `gpg`, `aws` — inherits the secret in its own environment, where a
+# same-user observer reads it straight out of /proc/<pid>/environ. The fd
+# handoff alone does not prevent that.
+#
+# Store it in a password manager and hand it over out of band — never in git,
+# Linear, or the vault.
 #
 # Usage:
 #   PENSYVE_EXPORT_PASSPHRASE=... \
@@ -53,6 +62,11 @@ if [[ -z "${PENSYVE_EXPORT_PASSPHRASE:-}" ]]; then
   exit 2
 fi
 
+# Take a shell-local copy and drop the exported variable, so no child process
+# inherits the secret in its environment. Done before the first subprocess.
+passphrase="$PENSYVE_EXPORT_PASSPHRASE"
+unset PENSYVE_EXPORT_PASSPHRASE
+
 if [[ "$destination" != s3://* ]]; then
   echo "destination must be an s3:// URI, got: $destination" >&2
   exit 2
@@ -64,15 +78,23 @@ if [[ ! -f "$manifest" ]]; then
   exit 1
 fi
 
-# Refuse a manifest that records failures. The store is deleted after this
-# runbook step, so uploading a knowingly partial export is unrecoverable.
-failed_count="$(python3 -c '
+# Refuse a manifest that records failures, or one that records nothing at all.
+# The store is deleted after this runbook step, so uploading a knowingly
+# partial export is unrecoverable — and an empty one usually means the gateway
+# fell back to local SQLite rather than reaching production.
+read -r failed_count exported_count <<<"$(python3 -c '
 import json, sys
 with open(sys.argv[1]) as handle:
-    print(len(json.load(handle).get("failed", [])))
+    m = json.load(handle)
+print(len(m.get("failed", [])), len(m.get("namespaces", [])))
 ' "$manifest")"
 if [[ "$failed_count" != "0" ]]; then
   echo "manifest records $failed_count failed namespace(s); fix and re-run before uploading" >&2
+  exit 1
+fi
+if [[ "$exported_count" == "0" ]]; then
+  echo "manifest records no exported namespaces; refusing to upload an empty export" >&2
+  echo "(a store with nothing in it usually means DATABASE_URL was unset or not a Postgres URL)" >&2
   exit 1
 fi
 
@@ -82,7 +104,7 @@ encrypt() {
   gpg --batch --yes --quiet \
       --symmetric --cipher-algo AES256 \
       --passphrase-fd 3 \
-      --output "$2" "$1" 3<<<"$PENSYVE_EXPORT_PASSPHRASE"
+      --output "$2" "$1" 3<<<"$passphrase"
 }
 
 shopt -s nullglob

@@ -99,6 +99,39 @@ impl BulkExportSummary {
     }
 }
 
+/// Whether a finished run may be uploaded and used to justify teardown.
+///
+/// Two ways a run can look successful and not be:
+///
+/// - **It saved nothing.** `init_resources_with` falls back to a local SQLite
+///   store when `DATABASE_URL` is unset or is not a Postgres URL, and will
+///   create an empty one. The export then finds zero namespaces and reports no
+///   failures. Exiting 0 there would have an operator tear down production
+///   believing every namespace was saved.
+/// - **It lost namespaces.** Any failure means the artifact set is incomplete,
+///   and the store is deleted after this step.
+///
+/// # Errors
+/// If the run exported no namespaces, or any namespace failed.
+pub fn ensure_publishable(summary: &BulkExportSummary) -> Result<(), String> {
+    if !summary.failed.is_empty() {
+        return Err(format!(
+            "{} of {} namespaces failed to export; do not proceed with teardown",
+            summary.failed.len(),
+            summary.exported.len() + summary.failed.len()
+        ));
+    }
+    if summary.exported.is_empty() {
+        return Err(
+            "exported no namespaces — refusing to report success. A store with nothing in it \
+             usually means the gateway fell back to local SQLite because DATABASE_URL was unset \
+             or was not a Postgres URL. Check the connection before treating this as done."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Hex-encoded SHA-256 of `bytes`.
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
