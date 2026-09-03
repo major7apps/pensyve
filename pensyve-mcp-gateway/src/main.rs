@@ -908,11 +908,17 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         ))
         .layer(RateLimitLayer::new(app_state.clone()))
         .layer(AuthLayer::new(app_state.clone()))
-        // Tracing layer is added LAST so it sits outermost: it observes
-        // every request before auth/rate-limit, so the trace context is
-        // already in request extensions when auth.rs's `validate_remote`
-        // and the tenant_and_usage middleware run.
+        // Tracing layer observes every request before auth/rate-limit, so the
+        // trace context is already in request extensions when auth.rs's
+        // `validate_remote` and the tenant_and_usage middleware run.
         .layer(TracingLayer::new())
+        // Sunset/Deprecation is added LAST so it sits outermost of all: the
+        // shutdown warning has to ride on the responses inner layers reject
+        // outright (expired key, rate limit, unmatched path), because a client
+        // still pointed here late in September is precisely the one seeing them.
+        .layer(axum::middleware::from_fn(
+            pensyve_mcp_gateway::middleware::sunset::announce_sunset,
+        ))
         .with_state(app_state.clone());
 
     // Phase 23 Track B: the periodic `evict_stale()` task is gone — Redis

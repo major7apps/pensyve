@@ -1369,6 +1369,22 @@ pub trait StorageTrait: Send + Sync {
     }
 
     /// Count active observations in a namespace without loading memory content.
+    /// Count every memory row [`crate::namespace_export::export_namespace`]
+    /// will copy, across all four memory tables, **including superseded and
+    /// invalidated rows**.
+    ///
+    /// [`Self::count_memories_by_namespace`] answers a different question: how
+    /// much a namespace currently *holds*. The export deliberately carries
+    /// superseded and invalidated memories — they are still the customer's
+    /// data — so anything sizing work against the export (an admission cap, a
+    /// progress estimate) has to count this set instead. On an edit-heavy
+    /// namespace the two disagree by an unbounded factor.
+    fn count_all_memories_by_namespace(&self, _namespace_id: Uuid) -> StorageResult<usize> {
+        Err(StorageError::Unsupported(
+            "superseded-inclusive memory count".into(),
+        ))
+    }
+
     fn count_observations_by_namespace(&self, _namespace_id: Uuid) -> StorageResult<usize> {
         Err(StorageError::Unsupported(
             "observation count by namespace".into(),
@@ -1376,6 +1392,22 @@ pub trait StorageTrait: Send + Sync {
     }
 
     /// Count entities in a namespace.
+    /// Count the graph edges [`crate::namespace_export::export_namespace`] will
+    /// copy. `save_edge` adds rows without moving the memory, entity or
+    /// episode counts, so an edge-heavy namespace is invisible to any bound
+    /// that ignores them.
+    fn count_edges_by_namespace(&self, _namespace_id: Uuid) -> StorageResult<usize> {
+        Err(StorageError::Unsupported("edge count".into()))
+    }
+
+    /// Count the episodes [`crate::namespace_export::export_namespace`] will
+    /// page. Memories are not the only cost of an export: every entity is
+    /// loaded into one `Vec` and every episode is paged, so a namespace can be
+    /// cheap in memories and expensive in the rest.
+    fn count_episodes_by_namespace(&self, _namespace_id: Uuid) -> StorageResult<usize> {
+        Err(StorageError::Unsupported("episode count".into()))
+    }
+
     fn count_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize>;
 
     // Activity logging
