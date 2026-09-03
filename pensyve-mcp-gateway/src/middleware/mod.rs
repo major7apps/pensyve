@@ -6,4 +6,5 @@
 //! pre-date this module and continue to live at the crate root for
 //! historical reasons; new middleware should land here.
 
+pub mod sunset;
 pub mod tracing;
