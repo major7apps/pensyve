@@ -9,7 +9,7 @@
 # Encryption and AWS deliberately live here rather than in the gateway binary:
 # Pensyve is entering maintenance mode as an OSS single binary, and neither an
 # AWS SDK nor a crypto stack belongs in what customers self-host. This is the
-# same shape the MAJ-369 delivery used for Jeremy Chu's export.
+# same shape the earlier single-namespace delivery used.
 #
 # The passphrase is read from PENSYVE_EXPORT_PASSPHRASE and is never echoed,
 # never written to disk, and never passed as an argv value (which would expose
