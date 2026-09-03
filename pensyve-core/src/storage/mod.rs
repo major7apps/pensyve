@@ -1369,6 +1369,22 @@ pub trait StorageTrait: Send + Sync {
     }
 
     /// Count active observations in a namespace without loading memory content.
+    /// Count every memory row [`crate::namespace_export::export_namespace`]
+    /// will copy, across all four memory tables, **including superseded and
+    /// invalidated rows**.
+    ///
+    /// [`Self::count_memories_by_namespace`] answers a different question: how
+    /// much a namespace currently *holds*. The export deliberately carries
+    /// superseded and invalidated memories — they are still the customer's
+    /// data — so anything sizing work against the export (an admission cap, a
+    /// progress estimate) has to count this set instead. On an edit-heavy
+    /// namespace the two disagree by an unbounded factor.
+    fn count_all_memories_by_namespace(&self, _namespace_id: Uuid) -> StorageResult<usize> {
+        Err(StorageError::Unsupported(
+            "superseded-inclusive memory count".into(),
+        ))
+    }
+
     fn count_observations_by_namespace(&self, _namespace_id: Uuid) -> StorageResult<usize> {
         Err(StorageError::Unsupported(
             "observation count by namespace".into(),

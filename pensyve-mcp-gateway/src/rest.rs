@@ -844,8 +844,10 @@ async fn perform_supersession(
 /// it, an operator runs the `export-namespace` CLI mode instead, which has no
 /// such deadline.
 ///
-/// The value clears the largest namespace on the hosted store at sunset
-/// (19,789 memories) with room to spare, so no real customer meets it.
+/// Counted against
+/// [`StorageTrait::count_all_memories_by_namespace`], not the live count: the
+/// export carries superseded and invalidated rows too, so an edit-heavy
+/// namespace copies far more than it currently holds.
 pub const MAX_SELF_SERVE_EXPORT_MEMORIES: usize = 50_000;
 
 /// Whether a namespace of this size is too large for the inline path.
@@ -854,16 +856,26 @@ pub fn export_exceeds_cap(memory_count: usize) -> bool {
     memory_count > MAX_SELF_SERVE_EXPORT_MEMORIES
 }
 
-/// Copy one namespace into a fresh `SQLite` store and return its bytes.
+/// A finished export, held open as a file handle with no path.
 ///
-/// Blocking, storage-bound work: callers run it on the blocking pool. The
-/// staging directory is removed when `staging` drops, on the error paths as
-/// well as the success one — the reason this takes a `TempDir` rather than
-/// assembling a path by hand.
-fn export_namespace_to_bytes(
+/// The staging directory is deleted before this returns. On Unix the open
+/// descriptor keeps the inode alive, so the response can stream from it while
+/// nothing on disk refers to it any more — the artifact cannot outlive the
+/// request even if the response is dropped mid-flight, and there is no
+/// cleanup to tie to the response body's lifetime.
+struct StagedExport {
+    file: std::fs::File,
+    bytes: u64,
+    counts: pensyve_core::namespace_export::ExportCounts,
+}
+
+/// Copy one namespace into a fresh `SQLite` store and hand back an open handle.
+///
+/// Blocking, storage-bound work: callers run it on the blocking pool.
+fn export_namespace_staged(
     storage: &dyn StorageTrait,
     namespace_id: Uuid,
-) -> Result<Vec<u8>, String> {
+) -> Result<StagedExport, String> {
     let staging =
         tempfile::TempDir::new().map_err(|error| format!("staging directory: {error}"))?;
 
@@ -873,15 +885,23 @@ fn export_namespace_to_bytes(
         pensyve_core::namespace_export::export_namespace(storage, &destination, namespace_id)
             .map_err(|error| format!("export namespace: {error}"))?
         // `destination` drops here, checkpointing and removing the WAL before
-        // the file is read. Reading it while the backend was still open would
+        // the file is opened. Reading it while the backend was still open would
         // hand the customer a store missing its most recent pages.
     };
 
-    let database = staging.path().join("memories.db");
     if staging.path().join("memories.db-wal").exists() {
         return Err("export store still has a write-ahead log after close".to_string());
     }
-    let bytes = std::fs::read(&database).map_err(|error| format!("read export store: {error}"))?;
+    let file = std::fs::File::open(staging.path().join("memories.db"))
+        .map_err(|error| format!("open export store: {error}"))?;
+    let bytes = file
+        .metadata()
+        .map_err(|error| format!("size export store: {error}"))?
+        .len();
+
+    // `staging` drops here: the directory and the file name go away, the
+    // descriptor above does not.
+    drop(staging);
 
     tracing::info!(
         namespace = %namespace_id,
@@ -890,10 +910,14 @@ fn export_namespace_to_bytes(
         entities = counts.entities,
         edges = counts.edges,
         embeddings = counts.embeddings,
-        bytes = bytes.len(),
+        bytes,
         "self-serve namespace export complete"
     );
-    Ok(bytes)
+    Ok(StagedExport {
+        file,
+        bytes,
+        counts,
+    })
 }
 
 /// `POST /v1/export` — hand the caller their own namespace as a `SQLite` store.
@@ -909,37 +933,27 @@ async fn export_namespace_download(
     let ps = get_pensyve_state(&state, &auth_ctx)?;
     let namespace_id = ps.namespace.id;
 
-    let (episodic, semantic, procedural) = ps
+    // Every failure here is fail-closed. A count that silently degrades to
+    // zero would admit exactly the namespace the cap exists to turn away.
+    let admitted = ps
         .storage
-        .count_memories_by_namespace(namespace_id)
+        .count_all_memories_by_namespace(namespace_id)
         .map_err(|error| {
             RestError(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Could not size the namespace: {error}"),
             )
         })?;
-    let observations = ps
-        .storage
-        .count_observations_by_namespace(namespace_id)
-        .unwrap_or_default();
-    let total = episodic + semantic + procedural + observations;
 
-    if export_exceeds_cap(total) {
-        return Err(RestError(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!(
-                "This namespace holds {total} memories, above the {MAX_SELF_SERVE_EXPORT_MEMORIES} \
-                 the self-serve export can copy in one request. Email support@major7apps.com and \
-                 we will run the full export for you."
-            ),
-        ));
+    if export_exceeds_cap(admitted) {
+        return Err(oversized_export(admitted));
     }
 
     // The copy is synchronous storage work; off the async pool it would stall
     // every other request sharing this worker thread.
     let storage = Arc::clone(&ps.storage);
-    let bytes = tokio::task::spawn_blocking(move || {
-        export_namespace_to_bytes(storage.as_ref(), namespace_id)
+    let staged = tokio::task::spawn_blocking(move || {
+        export_namespace_staged(storage.as_ref(), namespace_id)
     })
     .await
     .map_err(|error| {
@@ -950,6 +964,28 @@ async fn export_namespace_download(
     })?
     .map_err(|error| RestError(StatusCode::INTERNAL_SERVER_ERROR, error))?;
 
+    // Re-check against what was actually copied. Admission read the store
+    // before the copy began, and the namespace stays writable throughout —
+    // `remember` calls landing in that gap would otherwise let an admitted
+    // export return more than the cap allows. `ExportCounts` is exact.
+    let copied = staged.counts.memories();
+    if export_exceeds_cap(copied) {
+        tracing::warn!(
+            namespace = %namespace_id,
+            admitted,
+            copied,
+            "namespace grew past the export cap during the copy; discarding"
+        );
+        return Err(oversized_export(copied));
+    }
+
+    // Streamed, not buffered: a namespace near the cap can hold hundreds of
+    // megabytes of 768-dimensional vectors, and several concurrent exports
+    // each holding a full copy in memory would exhaust the gateway.
+    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(
+        tokio::fs::File::from_std(staged.file),
+    ));
+
     Ok((
         StatusCode::OK,
         [
@@ -957,13 +993,26 @@ async fn export_namespace_download(
                 axum::http::header::CONTENT_TYPE,
                 "application/vnd.sqlite3".to_string(),
             ),
+            (axum::http::header::CONTENT_LENGTH, staged.bytes.to_string()),
             (
                 axum::http::header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"pensyve-{namespace_id}.db\""),
             ),
         ],
-        bytes,
+        body,
     ))
+}
+
+/// The 413 an over-cap namespace gets, with the route out of it.
+fn oversized_export(memories: usize) -> RestError {
+    RestError(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!(
+            "This namespace holds {memories} memories, above the \
+             {MAX_SELF_SERVE_EXPORT_MEMORIES} the self-serve export can copy in one request. \
+             Email support@major7apps.com and we will run the full export for you."
+        ),
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -6011,6 +6011,29 @@ impl StorageTrait for SqliteBackend {
         Ok(count as usize)
     }
 
+    fn count_all_memories_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
+        let conn = lock_conn!(self);
+        let ns = namespace_id.to_string();
+        // Namespace is the only predicate: the export's page request sets
+        // `include_superseded = true` and applies no validity filter, so every
+        // row in these four tables crosses.
+        let mut total: i64 = 0;
+        for table in [
+            "episodic_memories",
+            "semantic_memories",
+            "procedural_memories",
+            "observation_memories",
+        ] {
+            let count: i64 = conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE namespace_id = ?1"),
+                params![ns],
+                |row| row.get(0),
+            )?;
+            total += count;
+        }
+        Ok(total as usize)
+    }
+
     fn count_observations_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
         let conn = lock_conn!(self);
         let count: i64 = conn.query_row(

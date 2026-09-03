@@ -608,6 +608,77 @@ mod tests {
         );
     }
 
+    /// The number a caller admits an export on must be the number of rows the
+    /// export actually copies.
+    ///
+    /// `count_memories_by_namespace` filters `superseded_by IS NULL` (and
+    /// `invalid_at IS NULL` for semantic rows), but the export deliberately
+    /// carries superseded and invalidated memories — they are still the
+    /// customer's data. Sizing an admission cap off the live count therefore
+    /// undercounts an edit-heavy namespace by an unbounded factor, which is
+    /// exactly the case such a cap exists to catch.
+    #[test]
+    fn the_admission_count_matches_the_rows_the_export_copies() {
+        let embedder = OnnxEmbedder::new_mock(DIMS);
+        let space = embedder.embedding_space().expect("mock space").clone();
+
+        let (_source_dir, source_db) = store();
+        let (namespace, _) = seed(&source_db, &space, "edited");
+
+        // Supersede one row and invalidate another, so the live count and the
+        // full row count genuinely disagree.
+        let stale = Memory::Semantic(SemanticMemory::new(
+            namespace.id,
+            Uuid::new_v4(),
+            "runs",
+            "an older claim",
+            0.5,
+        ));
+        save(&source_db, &space, &stale, 11);
+        let replacement = Memory::Semantic(SemanticMemory::new(
+            namespace.id,
+            Uuid::new_v4(),
+            "runs",
+            "a newer claim",
+            0.9,
+        ));
+        save(&source_db, &space, &replacement, 12);
+        source_db
+            .supersede_memory_in_namespace(
+                stale.id(),
+                namespace.id,
+                replacement.id(),
+                chrono::Utc::now(),
+            )
+            .expect("supersede");
+
+        let (live_e, live_s, live_p) = source_db
+            .count_memories_by_namespace(namespace.id)
+            .expect("live count");
+        let live_observations = source_db
+            .count_observations_by_namespace(namespace.id)
+            .expect("live observation count");
+        let live_total = live_e + live_s + live_p + live_observations;
+
+        let all = source_db
+            .count_all_memories_by_namespace(namespace.id)
+            .expect("superseded-inclusive count");
+
+        let (_dest_dir, dest_db) = store();
+        let counts =
+            export_namespace(&source_db, &dest_db, namespace.id).expect("export namespace");
+
+        assert_eq!(
+            all,
+            counts.memories(),
+            "the admission count must equal the rows the export copies"
+        );
+        assert!(
+            all > live_total,
+            "fixture must actually exercise the gap (live {live_total}, all {all})"
+        );
+    }
+
     #[test]
     fn superseded_memories_cross_with_their_supersession_intact() {
         let embedder = OnnxEmbedder::new_mock(DIMS);

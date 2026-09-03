@@ -38,7 +38,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 dashmap = "6"
 redis = { version = "1.2", features = ["tokio-comp", "connection-manager", "tokio-native-tls-comp"] }
 jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
 dirs = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sqlx-core = { version = "0.9.0", features = ["_rt-tokio", "_tls-rustls-aws-lc-rs"] }

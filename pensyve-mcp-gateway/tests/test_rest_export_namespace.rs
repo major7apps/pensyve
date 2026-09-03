@@ -162,7 +162,13 @@ async fn start_test_server(dir: &TempDir) -> (String, Arc<AppState>, Cancellatio
     (format!("http://{addr}"), state, cancellation)
 }
 
-async fn remember(client: &reqwest::Client, url: &str, tenant: &str, entity: &str, fact: &str) {
+async fn remember(
+    client: &reqwest::Client,
+    url: &str,
+    tenant: &str,
+    entity: &str,
+    fact: &str,
+) -> uuid::Uuid {
     let response = client
         .post(format!("{url}/v1/remember"))
         .header(TENANT_HEADER, tenant)
@@ -171,6 +177,9 @@ async fn remember(client: &reqwest::Client, url: &str, tenant: &str, entity: &st
         .await
         .expect("remember request");
     assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let body: serde_json::Value = response.json().await.expect("remember response JSON");
+    uuid::Uuid::parse_str(body["id"].as_str().expect("remembered memory id"))
+        .expect("valid memory id")
 }
 
 /// Download an export and hand back the status plus the response bytes.
@@ -353,13 +362,131 @@ fn the_export_cap_admits_the_boundary_and_rejects_past_it() {
     assert!(export_exceeds_cap(MAX_SELF_SERVE_EXPORT_MEMORIES + 1));
 }
 
-/// The largest namespace on the hosted store at sunset is Jeremy Chu's, at
-/// 19,789 memories (vault: `people/jeremy-chu.md`). A cap that would turn the
-/// one paying customer away from the self-serve button is the wrong cap.
+/// A cap that turns real namespaces away from the self-serve button is the
+/// wrong cap: the whole point is that owners do not have to email support.
+///
+/// This repository is public, so the sizing evidence stays out of it — the
+/// figure the cap was chosen against lives with the operator, not here. What
+/// belongs in the test is the property: an ordinary namespace, an order of
+/// magnitude below the limit, is admitted.
 #[test]
-fn the_export_cap_clears_the_largest_hosted_namespace() {
+fn the_export_cap_admits_an_ordinary_namespace() {
+    assert!(!export_exceeds_cap(MAX_SELF_SERVE_EXPORT_MEMORIES / 10));
+}
+
+/// Superseded and invalidated rows cross with the export, so they have to be
+/// counted before it. The endpoint sizes admission on
+/// `count_all_memories_by_namespace`; the live count would let an edit-heavy
+/// namespace through and then copy a multiple of what was admitted.
+#[tokio::test]
+async fn superseded_memories_are_exported_and_counted() {
+    let dir = TempDir::new().expect("temp dir");
+    let (url, state, cancellation) = start_test_server(&dir).await;
+    let client = reqwest::Client::new();
+
+    let original = remember(&client, &url, TENANT_OWNER, "rust", "An older claim").await;
+
+    // Supersede it, so the live count and the full count genuinely diverge.
+    let superseded = client
+        .post(format!("{url}/v1/memories/{original}/supersede"))
+        .header(TENANT_HEADER, TENANT_OWNER)
+        .json(&json!({ "content": "A newer claim", "confidence": 0.95 }))
+        .send()
+        .await
+        .expect("supersede request");
+    assert_eq!(superseded.status(), reqwest::StatusCode::CREATED);
+
+    let ps = state
+        .tenant_mgr
+        .get_tenant_state(TENANT_OWNER)
+        .expect("owner tenant state");
+    let namespace_id = ps.namespace.id;
+
+    let (episodic, semantic, procedural) = ps
+        .storage
+        .count_memories_by_namespace(namespace_id)
+        .expect("live count");
+    let live = episodic + semantic + procedural;
+    let all = ps
+        .storage
+        .count_all_memories_by_namespace(namespace_id)
+        .expect("full count");
     assert!(
-        !export_exceeds_cap(19_789),
-        "cap must admit the largest known hosted namespace"
+        all > live,
+        "fixture must exercise the gap the cap cares about (live {live}, all {all})"
     );
+
+    let (status, _, body) = export(&client, &url, TENANT_OWNER).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    let (_guard, exported) = open_export(&body);
+    let (e, s, p) = exported
+        .count_memories_by_namespace(namespace_id)
+        .expect("count memories in the export");
+    let exported_all = exported
+        .count_all_memories_by_namespace(namespace_id)
+        .expect("full count in the export");
+    assert_eq!(
+        exported_all, all,
+        "the export copies the superseded row the admission count included"
+    );
+    assert_eq!(e + s + p, live, "the live view of the copy still matches");
+
+    cancellation.cancel();
+}
+
+/// The staging directory is deleted before the response starts streaming, so
+/// the artifact is reachable only through the open descriptor. If that trick
+/// ever stops holding, the download becomes empty rather than merely slower —
+/// this asserts the bytes really are a populated store.
+#[tokio::test]
+async fn the_streamed_body_survives_deletion_of_its_staging_directory() {
+    let dir = TempDir::new().expect("temp dir");
+    let (url, state, cancellation) = start_test_server(&dir).await;
+    let client = reqwest::Client::new();
+
+    remember(
+        &client,
+        &url,
+        TENANT_OWNER,
+        "rust",
+        "Borrowck is not a linter",
+    )
+    .await;
+
+    let response = client
+        .post(format!("{url}/v1/export"))
+        .header(TENANT_HEADER, TENANT_OWNER)
+        .send()
+        .await
+        .expect("export request");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    // Declared up front from the file's own metadata, so a client can show
+    // progress instead of an unbounded chunked download.
+    let declared: u64 = response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .expect("export must declare its length")
+        .to_str()
+        .expect("ASCII length")
+        .parse()
+        .expect("numeric length");
+
+    let body = response.bytes().await.expect("export body").to_vec();
+    assert_eq!(body.len() as u64, declared, "streamed body was truncated");
+
+    let namespace_id = state
+        .tenant_mgr
+        .get_tenant_state(TENANT_OWNER)
+        .expect("owner tenant state")
+        .namespace
+        .id;
+    let (_guard, exported) = open_export(&body);
+    let (e, s, p) = exported
+        .count_memories_by_namespace(namespace_id)
+        .expect("count memories in the streamed export");
+    assert_eq!(e + s + p, 1);
+
+    cancellation.cancel();
 }

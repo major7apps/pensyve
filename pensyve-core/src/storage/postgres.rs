@@ -5904,6 +5904,27 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
+    fn count_all_memories_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
+        self.block_on(async {
+            let mut conn = self.scoped_conn(namespace_id).await?;
+            // Namespace is the only predicate: the export's page request sets
+            // `include_superseded = true` and applies no validity filter, so
+            // every row in these four tables crosses.
+            let (total,): (i64,) = query_as::<Postgres, _>(
+                "SELECT (SELECT COUNT(*) FROM episodic_memories WHERE namespace_id = $1) \
+                      + (SELECT COUNT(*) FROM semantic_memories WHERE namespace_id = $1) \
+                      + (SELECT COUNT(*) FROM procedural_memories WHERE namespace_id = $1) \
+                      + (SELECT COUNT(*) FROM observation_memories WHERE namespace_id = $1)",
+            )
+            .bind(namespace_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(sqlx_to_io)?;
+
+            Ok(total as usize)
+        })
+    }
+
     fn count_observations_by_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
