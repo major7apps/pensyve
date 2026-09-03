@@ -25,6 +25,7 @@ use pensyve_core::storage::bounded::{
     MemoryFilter, MemoryPageRequest, MemoryRef, MemoryType, PageCursor, SearchScope,
     embedding_source_text,
 };
+use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
 use pensyve_core::types::{
     ContentType, Entity, EntityKind, Episode, EpisodicMemory, Memory, Outcome, SemanticMemory,
@@ -831,6 +832,141 @@ async fn perform_supersession(
 }
 
 // ---------------------------------------------------------------------------
+// Self-serve namespace export (MAJ-371)
+// ---------------------------------------------------------------------------
+
+/// Largest namespace `/v1/export` will copy inline.
+///
+/// The export runs synchronously inside one request, and the production ALB
+/// closes an idle connection after 120s (`pensyve-infra`,
+/// `infra/modules/compute/main.tf`). The cap is what keeps a pathological
+/// namespace from spending that budget and handing the caller nothing; above
+/// it, an operator runs the `export-namespace` CLI mode instead, which has no
+/// such deadline.
+///
+/// The value clears the largest namespace on the hosted store at sunset
+/// (19,789 memories) with room to spare, so no real customer meets it.
+pub const MAX_SELF_SERVE_EXPORT_MEMORIES: usize = 50_000;
+
+/// Whether a namespace of this size is too large for the inline path.
+#[must_use]
+pub fn export_exceeds_cap(memory_count: usize) -> bool {
+    memory_count > MAX_SELF_SERVE_EXPORT_MEMORIES
+}
+
+/// Copy one namespace into a fresh `SQLite` store and return its bytes.
+///
+/// Blocking, storage-bound work: callers run it on the blocking pool. The
+/// staging directory is removed when `staging` drops, on the error paths as
+/// well as the success one — the reason this takes a `TempDir` rather than
+/// assembling a path by hand.
+fn export_namespace_to_bytes(
+    storage: &dyn StorageTrait,
+    namespace_id: Uuid,
+) -> Result<Vec<u8>, String> {
+    let staging =
+        tempfile::TempDir::new().map_err(|error| format!("staging directory: {error}"))?;
+
+    let counts = {
+        let destination = SqliteBackend::open(staging.path())
+            .map_err(|error| format!("create export store: {error}"))?;
+        pensyve_core::namespace_export::export_namespace(storage, &destination, namespace_id)
+            .map_err(|error| format!("export namespace: {error}"))?
+        // `destination` drops here, checkpointing and removing the WAL before
+        // the file is read. Reading it while the backend was still open would
+        // hand the customer a store missing its most recent pages.
+    };
+
+    let database = staging.path().join("memories.db");
+    if staging.path().join("memories.db-wal").exists() {
+        return Err("export store still has a write-ahead log after close".to_string());
+    }
+    let bytes = std::fs::read(&database).map_err(|error| format!("read export store: {error}"))?;
+
+    tracing::info!(
+        namespace = %namespace_id,
+        episodes = counts.episodes,
+        memories = counts.memories(),
+        entities = counts.entities,
+        edges = counts.edges,
+        embeddings = counts.embeddings,
+        bytes = bytes.len(),
+        "self-serve namespace export complete"
+    );
+    Ok(bytes)
+}
+
+/// `POST /v1/export` — hand the caller their own namespace as a `SQLite` store.
+///
+/// There is deliberately no namespace parameter. The namespace comes from the
+/// tenant state the auth context resolves to, exactly as every other handler
+/// resolves it, so "owner-only" is a property of the shape rather than of a
+/// check that a later edit could drop.
+async fn export_namespace_download(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(auth_ctx): axum::Extension<AuthContext>,
+) -> Result<impl IntoResponse, RestError> {
+    let ps = get_pensyve_state(&state, &auth_ctx)?;
+    let namespace_id = ps.namespace.id;
+
+    let (episodic, semantic, procedural) = ps
+        .storage
+        .count_memories_by_namespace(namespace_id)
+        .map_err(|error| {
+            RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Could not size the namespace: {error}"),
+            )
+        })?;
+    let observations = ps
+        .storage
+        .count_observations_by_namespace(namespace_id)
+        .unwrap_or_default();
+    let total = episodic + semantic + procedural + observations;
+
+    if export_exceeds_cap(total) {
+        return Err(RestError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "This namespace holds {total} memories, above the {MAX_SELF_SERVE_EXPORT_MEMORIES} \
+                 the self-serve export can copy in one request. Email support@major7apps.com and \
+                 we will run the full export for you."
+            ),
+        ));
+    }
+
+    // The copy is synchronous storage work; off the async pool it would stall
+    // every other request sharing this worker thread.
+    let storage = Arc::clone(&ps.storage);
+    let bytes = tokio::task::spawn_blocking(move || {
+        export_namespace_to_bytes(storage.as_ref(), namespace_id)
+    })
+    .await
+    .map_err(|error| {
+        RestError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Export task failed: {error}"),
+        )
+    })?
+    .map_err(|error| RestError(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+
+    Ok((
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/vnd.sqlite3".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"pensyve-{namespace_id}.db\""),
+            ),
+        ],
+        bytes,
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -863,6 +999,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/v1/consolidate", routing::post(consolidate))
         .route("/v1/feedback", routing::post(feedback))
         .route("/v1/gdpr/erase/{name}", routing::delete(gdpr_erase))
+        .route("/v1/export", routing::post(export_namespace_download))
         .route("/v1/a2a/agent-card", routing::get(a2a_agent_card))
         .route("/v1/a2a/task", routing::post(a2a_task))
 }

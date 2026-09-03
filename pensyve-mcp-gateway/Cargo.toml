@@ -43,6 +43,8 @@ dirs = "6"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sqlx-core = { version = "0.9.0", features = ["_rt-tokio", "_tls-rustls-aws-lc-rs"] }
 sqlx-postgres = { version = "0.9.0" }
+# Staging directory for /v1/export, removed by RAII on every path including errors.
+tempfile = "3"
 
 [dev-dependencies]
 tempfile = "3"
