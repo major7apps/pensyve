@@ -19,7 +19,7 @@ pensyve-mcp-tools = { path = "../pensyve-mcp-tools", version = "4.0.0" }
 rmcp = { version = "3.1", features = ["server", "transport-io", "macros"] }
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
-dirs = "6"
+dirs = "7"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
