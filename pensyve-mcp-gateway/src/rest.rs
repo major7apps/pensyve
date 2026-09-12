@@ -314,6 +314,11 @@ struct RestError(StatusCode, String);
 
 impl IntoResponse for RestError {
     fn into_response(self) -> axum::response::Response {
+        // A 5xx that only reaches the caller is invisible to the operator:
+        // four production exports failed for two days before anyone knew.
+        if self.0.is_server_error() {
+            tracing::error!(status = %self.0.as_u16(), error = %self.1, "REST handler failed");
+        }
         (self.0, Json(json!({ "error": self.1 }))).into_response()
     }
 }
@@ -869,15 +874,48 @@ struct StagedExport {
     counts: pensyve_core::namespace_export::ExportCounts,
 }
 
+/// Create the staging root if it does not exist, owner-only when we create it.
+///
+/// A directory the operator provided keeps its own mode, mirroring the
+/// snapshot module: pointing `PENSYVE_SNAPSHOT_DIR` at an existing location is
+/// a deliberate choice.
+#[cfg(unix)]
+fn create_staging_root(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let already_existed = dir.is_dir();
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    if !already_existed {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_staging_root(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
 /// Copy one namespace into a fresh `SQLite` store and hand back an open handle.
 ///
 /// Blocking, storage-bound work: callers run it on the blocking pool.
 fn export_namespace_staged(
     storage: &dyn StorageTrait,
     namespace_id: Uuid,
+    staging_root: &std::path::Path,
 ) -> Result<StagedExport, String> {
-    let staging =
-        tempfile::TempDir::new().map_err(|error| format!("staging directory: {error}"))?;
+    // Under the snapshot root, never the system temp dir. In production the
+    // gateway runs as a non-root user on a read-only root filesystem, and
+    // `/tmp` is a Fargate bind mount that arrives owned by root: `TempDir::new()`
+    // there fails with EACCES and every self-serve export 500s. The snapshot
+    // root is the one directory the deployment guarantees writable (an EFS
+    // access point owned by the gateway's uid), and it is already the place
+    // the forget path writes recovery artifacts. Owner-only like that path.
+    create_staging_root(staging_root).map_err(|error| format!("staging directory: {error}"))?;
+    let staging = tempfile::TempDir::new_in(staging_root)
+        .map_err(|error| format!("staging directory: {error}"))?;
 
     let counts = {
         let destination = SqliteBackend::open(staging.path())
@@ -986,8 +1024,9 @@ async fn export_namespace_download(
     // The copy is synchronous storage work; off the async pool it would stall
     // every other request sharing this worker thread.
     let storage = Arc::clone(&ps.storage);
+    let staging_root = ps.snapshot_root.clone();
     let staged = tokio::task::spawn_blocking(move || {
-        export_namespace_staged(storage.as_ref(), namespace_id)
+        export_namespace_staged(storage.as_ref(), namespace_id, &staging_root)
     })
     .await
     .map_err(|error| {
@@ -3662,5 +3701,71 @@ mod tests {
     #[test]
     fn parse_order_kind_rejects_unknown_value() {
         assert!(parse_recall_grouped_order(Some("bogus")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod rest_error_logging_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn logged_while(f: impl FnOnce()) -> String {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = capture.0.lock().expect("capture lock").clone();
+        String::from_utf8(bytes).expect("utf8 log")
+    }
+
+    /// A 5xx that only reaches the caller is invisible to the operator: four
+    /// production exports failed before anyone knew. The error text has to
+    /// reach the log, not only the response body.
+    #[test]
+    fn server_errors_are_logged_with_their_message() {
+        let logged = logged_while(|| {
+            let _ = RestError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "staging directory: Permission denied (os error 13)".to_string(),
+            )
+            .into_response();
+        });
+        assert!(logged.contains("500"), "status missing from log: {logged}");
+        assert!(
+            logged.contains("staging directory: Permission denied"),
+            "message missing from log: {logged}"
+        );
+    }
+
+    /// Client errors are the caller's problem and stay out of the error log.
+    #[test]
+    fn client_errors_are_not_logged_as_errors() {
+        let logged = logged_while(|| {
+            let _ = RestError(StatusCode::BAD_REQUEST, "missing field".to_string()).into_response();
+        });
+        assert!(!logged.contains("ERROR"), "unexpected error log: {logged}");
     }
 }

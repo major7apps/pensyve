@@ -554,3 +554,78 @@ async fn the_streamed_body_survives_deletion_of_its_staging_directory() {
 
     cancellation.cancel();
 }
+
+/// The staging copy has to land under the configured snapshot root, not the
+/// system temp dir. In production the gateway runs as a non-root user on a
+/// read-only root filesystem, and `/tmp` is a Fargate bind mount that arrives
+/// owned by root — `TempDir::new()` there fails with EACCES, and every
+/// self-serve export 500s. The snapshot root is the one directory the deploy
+/// guarantees is writable (an EFS access point owned by the gateway's uid).
+#[tokio::test]
+async fn export_stages_under_the_snapshot_root() {
+    let dir = TempDir::new().expect("test dir");
+    let snapshot_root = dir.path().join("snapshots");
+    assert!(
+        !snapshot_root.exists(),
+        "precondition: nothing has created the snapshot root yet"
+    );
+    let (url, _state, cancellation) = start_test_server(&dir).await;
+    let client = reqwest::Client::new();
+    remember(
+        &client,
+        &url,
+        TENANT_OWNER,
+        "staging",
+        "lands under the snapshot root",
+    )
+    .await;
+
+    let (status, _, bytes) = export(&client, &url, TENANT_OWNER).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let (_export_dir, _exported) = open_export(&bytes);
+
+    assert!(
+        snapshot_root.is_dir(),
+        "the export must stage under the snapshot root so a writable mount is used"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(&snapshot_root)
+        .expect("list snapshot root")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "staging directory must be removed once the export is handed off: {leftovers:?}"
+    );
+    cancellation.cancel();
+}
+
+/// Fail closed, and say why: an unwritable snapshot root is a deployment
+/// defect, and the response body is what the customer's dashboard shows.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unwritable_snapshot_root_fails_the_export_closed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().expect("test dir");
+    let snapshot_root = dir.path().join("snapshots");
+    std::fs::create_dir(&snapshot_root).expect("create snapshot root");
+    std::fs::set_permissions(&snapshot_root, std::fs::Permissions::from_mode(0o500))
+        .expect("make snapshot root read-only");
+    let (url, _state, cancellation) = start_test_server(&dir).await;
+    let client = reqwest::Client::new();
+    remember(&client, &url, TENANT_OWNER, "staging", "cannot be written").await;
+
+    let (status, _, body) = export(&client, &url, TENANT_OWNER).await;
+    // Restore before asserting so the TempDir can clean up on failure too.
+    std::fs::set_permissions(&snapshot_root, std::fs::Permissions::from_mode(0o700))
+        .expect("restore snapshot root mode");
+
+    assert_eq!(status, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON error body");
+    let error = body["error"].as_str().expect("error string");
+    assert!(
+        error.contains("staging directory"),
+        "the body must name the failing step, got: {error}"
+    );
+    cancellation.cancel();
+}
