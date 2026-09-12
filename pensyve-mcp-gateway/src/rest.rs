@@ -861,17 +861,46 @@ pub fn export_exceeds_cap(memory_count: usize) -> bool {
     memory_count > MAX_SELF_SERVE_EXPORT_MEMORIES
 }
 
-/// A finished export, held open as a file handle with no path.
+/// A finished export: the open store plus the directory it lives in.
 ///
-/// The staging directory is deleted before this returns. On Unix the open
-/// descriptor keeps the inode alive, so the response can stream from it while
-/// nothing on disk refers to it any more — the artifact cannot outlive the
-/// request even if the response is dropped mid-flight, and there is no
-/// cleanup to tie to the response body's lifetime.
+/// The staging directory is *not* deleted before streaming. The earlier
+/// "unlink first, stream from the nameless inode" trick holds on a local
+/// filesystem but not on NFS, which is what the snapshot root is in production
+/// (EFS): the Linux client silly-renames an unlinked open file to `.nfsXXXX`,
+/// the directory removal fails with `ENOTEMPTY`, `TempDir` swallows the error,
+/// and every export leaks a directory. Instead the directory rides along with
+/// the response body ([`StagedReader`]) and is removed when the body is
+/// dropped — after the last byte, or when the client goes away mid-download.
 struct StagedExport {
+    staging: tempfile::TempDir,
     file: std::fs::File,
     bytes: u64,
     counts: pensyve_core::namespace_export::ExportCounts,
+}
+
+/// Prefix of every staging directory, so a leftover from a crash mid-download
+/// is recognisable next to the forget snapshots that share the root.
+const EXPORT_STAGING_PREFIX: &str = "export-staging-";
+
+/// The store being streamed, owning its staging directory.
+///
+/// `ReaderStream` polls this until the file is exhausted or the body is
+/// dropped; either way the reader drops with it, the file closes first
+/// (field order), and then the directory goes. Cleanup is tied to the body's
+/// lifetime rather than to the handler's, which is what makes it hold on NFS.
+struct StagedReader {
+    file: tokio::fs::File,
+    _staging: tempfile::TempDir,
+}
+
+impl tokio::io::AsyncRead for StagedReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.file).poll_read(cx, buf)
+    }
 }
 
 /// Create the staging root if it does not exist, owner-only when we create it.
@@ -914,7 +943,7 @@ fn export_namespace_staged(
     // access point owned by the gateway's uid), and it is already the place
     // the forget path writes recovery artifacts. Owner-only like that path.
     create_staging_root(staging_root).map_err(|error| format!("staging directory: {error}"))?;
-    let staging = tempfile::TempDir::new_in(staging_root)
+    let staging = tempfile::TempDir::with_prefix_in(EXPORT_STAGING_PREFIX, staging_root)
         .map_err(|error| format!("staging directory: {error}"))?;
 
     let counts = {
@@ -937,10 +966,6 @@ fn export_namespace_staged(
         .map_err(|error| format!("size export store: {error}"))?
         .len();
 
-    // `staging` drops here: the directory and the file name go away, the
-    // descriptor above does not.
-    drop(staging);
-
     tracing::info!(
         namespace = %namespace_id,
         episodes = counts.episodes,
@@ -952,6 +977,7 @@ fn export_namespace_staged(
         "self-serve namespace export complete"
     );
     Ok(StagedExport {
+        staging,
         file,
         bytes,
         counts,
@@ -1058,9 +1084,10 @@ async fn export_namespace_download(
     // Streamed, not buffered: a namespace near the cap can hold hundreds of
     // megabytes of 768-dimensional vectors, and several concurrent exports
     // each holding a full copy in memory would exhaust the gateway.
-    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(
-        tokio::fs::File::from_std(staged.file),
-    ));
+    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(StagedReader {
+        file: tokio::fs::File::from_std(staged.file),
+        _staging: staged.staging,
+    }));
 
     Ok((
         StatusCode::OK,
