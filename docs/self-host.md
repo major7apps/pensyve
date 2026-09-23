@@ -203,7 +203,7 @@ sqlite3 /data/memories.db "SELECT id, name FROM namespaces;"
 **If recall comes back empty, this is almost always why.** Check that the name
 in that query matches `tenant:` plus the id in your `PENSYVE_KEY_USER_MAP`.
 
-`pensyve import` is for the JSON sidecar and you do not need it here.
+There is no import step. The JSON sidecar is for reading, not for loading.
 
 ### Verifying before you wire up a client
 
