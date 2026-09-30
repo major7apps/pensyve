@@ -69,7 +69,10 @@ export class PensyveClient {
         if (entity) {
             body.entity = entity;
         }
-        return this.request<Memory[]>("POST", "/v1/recall", body);
+        // The gateway wraps results as { memories, contradictions }; older
+        // servers returned a bare array.
+        const res = await this.request<Memory[] | { memories?: Memory[] }>("POST", "/v1/recall", body);
+        return Array.isArray(res) ? res : res.memories ?? [];
     }
 
     /** Store a new fact for an entity. */

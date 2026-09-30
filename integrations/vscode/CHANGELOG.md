@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- `pensyve.serverUrl` now defaults to `http://localhost:3000`, the port of a self-hosted `pensyve-mcp-gateway`. The old `:8000` default pointed at the retired Python REST server.
+- Recall works against the gateway again. The gateway wraps results as `{ memories, contradictions }`, and the extension expected a bare array, so the recall command and sidebar search failed.
+- The README's setup steps now start a gateway with an API key, which the gateway requires.
+
 ## [1.3.0] - 2026-04-20
 
 ### Added

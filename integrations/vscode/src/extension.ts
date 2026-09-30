@@ -8,13 +8,16 @@ let statusBarItem: vscode.StatusBarItem | undefined;
 let client: PensyveClient;
 let capture: CaptureIntegration | undefined;
 
+/** Default URL of a local pensyve-mcp-gateway; keep in sync with package.json. */
+const DEFAULT_SERVER_URL = "http://localhost:3000";
+
 /**
  * Called when the extension is activated.
  * Registers commands, initializes the sidebar provider, and creates the status bar item.
  */
 export function activate(context: vscode.ExtensionContext): void {
     const config = vscode.workspace.getConfiguration("pensyve");
-    const serverUrl = config.get<string>("serverUrl", "http://localhost:8000");
+    const serverUrl = config.get<string>("serverUrl", DEFAULT_SERVER_URL);
     const apiKey = config.get<string>("apiKey", "");
 
     client = new PensyveClient(serverUrl, apiKey);
@@ -47,7 +50,7 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.workspace.onDidChangeConfiguration((e) => {
             if (e.affectsConfiguration("pensyve")) {
                 const updated = vscode.workspace.getConfiguration("pensyve");
-                client.setBaseUrl(updated.get<string>("serverUrl", "http://localhost:8000"));
+                client.setBaseUrl(updated.get<string>("serverUrl", DEFAULT_SERVER_URL));
                 client.setApiKey(updated.get<string>("apiKey", ""));
                 updateStatusBar();
             }

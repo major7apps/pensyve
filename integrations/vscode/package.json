@@ -48,13 +48,13 @@
       "properties": {
         "pensyve.serverUrl": {
           "type": "string",
-          "default": "http://localhost:8000",
-          "description": "Pensyve REST API server URL"
+          "default": "http://localhost:3000",
+          "description": "URL of your pensyve-mcp-gateway (REST API)"
         },
         "pensyve.apiKey": {
           "type": "string",
           "default": "",
-          "description": "API key for authenticated requests"
+          "description": "API key configured on your gateway (PENSYVE_API_KEYS)"
         }
       }
     },
