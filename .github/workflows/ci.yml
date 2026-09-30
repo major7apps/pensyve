@@ -133,6 +133,11 @@ jobs:
           bun install
           bun run build
           bun test
+      - name: Test VS Code extension
+        working-directory: integrations/vscode
+        run: |
+          npm ci
+          npm test
 
   test-go:
     name: Go Tests

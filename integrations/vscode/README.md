@@ -17,14 +17,14 @@ Universal memory runtime for AI agents -- recall, remember, and inspect memories
 
    ```bash
    cargo build --release -p pensyve-mcp-gateway
-   PENSYVE_API_KEYS=psy_your_key_here ./target/release/pensyve-mcp-gateway
+   HOST=127.0.0.1 ./target/release/pensyve-mcp-gateway
    ```
 
-   The gateway rejects requests without a configured key; keys must start with `psy_`. See the [self-hosting guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md) for a persistent deployment.
+   With `PENSYVE_API_KEYS` unset, the gateway accepts requests without a key, so bind it to `127.0.0.1` as shown. It listens on all interfaces by default. If other machines can reach it, set `PENSYVE_API_KEYS=psy_...` (a comma-separated list of keys, each starting with `psy_`) and requests without a key are then rejected. See the [self-hosting guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md) for a persistent deployment.
 
 2. Configure the extension in VS Code settings:
    - `pensyve.serverUrl`: Gateway URL (default: `http://localhost:3000`)
-   - `pensyve.apiKey`: One of the keys in the gateway's `PENSYVE_API_KEYS`
+   - `pensyve.apiKey`: One of the gateway's `PENSYVE_API_KEYS`. Leave it empty if the gateway has none.
 
 ## Commands
 

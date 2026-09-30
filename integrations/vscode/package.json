@@ -54,7 +54,7 @@
         "pensyve.apiKey": {
           "type": "string",
           "default": "",
-          "description": "API key configured on your gateway (PENSYVE_API_KEYS)"
+          "description": "One of your gateway's PENSYVE_API_KEYS; leave empty if the gateway has none"
         }
       }
     },
@@ -80,7 +80,8 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "vsce package"
+    "package": "vsce package",
+    "test": "tsc -p ./ && node --test out/client.test.js"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",

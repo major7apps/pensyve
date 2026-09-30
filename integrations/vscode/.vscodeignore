@@ -2,3 +2,5 @@
 src/
 node_modules/
 tsconfig.json
+out/**/*.test.js
+out/**/*.test.js.map
