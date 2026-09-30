@@ -148,7 +148,7 @@ class PensyveMemory:
         path: Storage directory for local mode. Default: ``~/.pensyve/default``.
         mode: ``"auto"`` (default), ``"local"``, or ``"cloud"``.
         api_key: API key for cloud mode. Falls back to ``PENSYVE_API_KEY`` env.
-        base_url: Cloud server URL. Falls back to ``PENSYVE_REMOTE_URL`` env.
+        base_url: Remote Pensyve server URL (self-hosted gateway). Falls back to ``PENSYVE_REMOTE_URL`` env.
         recall_limit: Default number of memories to retrieve.
         confidence: Default confidence for stored memories.
     """
@@ -427,7 +427,7 @@ class PensyveMemory:
     # ------------------------------------------------------------------
 
     async def _cloud_remember(self, fact: str, confidence: float) -> None:
-        """Store a memory via the cloud REST API."""
+        """Store a memory via the remote Pensyve server (REST)."""
         import json
         import urllib.request
 
@@ -453,7 +453,7 @@ class PensyveMemory:
         await asyncio.to_thread(urllib.request.urlopen, req, timeout=10)
 
     async def _cloud_recall(self, query: str, limit: int) -> list[Any]:
-        """Search memories via the cloud REST API."""
+        """Search memories via the remote Pensyve server (REST)."""
         import json
         import urllib.request
 
@@ -484,7 +484,7 @@ class PensyveMemory:
             return []
 
     async def _cloud_forget(self) -> None:
-        """Delete all memories for the entity via the cloud REST API."""
+        """Delete all memories for the entity via the remote Pensyve server (REST)."""
         import urllib.error
         import urllib.request
 

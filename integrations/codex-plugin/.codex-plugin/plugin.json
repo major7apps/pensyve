@@ -6,7 +6,7 @@
     "name": "Major7 Apps",
     "url": "https://github.com/major7apps/pensyve"
   },
-  "homepage": "https://pensyve.com",
+  "homepage": "https://github.com/major7apps/pensyve",
   "repository": "https://github.com/major7apps/pensyve",
   "license": "Apache-2.0",
   "keywords": ["memory", "agents", "mcp", "retrieval", "codex", "ai"],
@@ -19,7 +19,7 @@
     "developerName": "Major7 Apps",
     "category": "Productivity",
     "capabilities": ["Interactive", "Write", "MCP", "Skills", "Hooks", "Commands"],
-    "websiteURL": "https://pensyve.com",
+    "websiteURL": "https://github.com/major7apps/pensyve",
     "brandColor": "#7C3AED",
     "composerIcon": "./assets/pensyve-icon.svg",
     "logo": "./assets/pensyve-logo.svg",

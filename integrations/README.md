@@ -7,7 +7,7 @@ Pensyve integrations connect the memory runtime to AI coding agents, IDEs, and a
 | Integration                     | Directory           | Status   | Description                                                   |
 | ------------------------------- | ------------------- | -------- | ------------------------------------------------------------- |
 | [Claude Code](claude-code/)     | `claude-code/`      | Stable   | Plugin with hooks, skills, commands, and memory-curator agent |
-| [Antigravity CLI](antigravity-plugin/) | `antigravity-plugin/` | Stable | Native plugin with OAuth MCP, rules, and skills |
+| [Antigravity CLI](antigravity-plugin/) | `antigravity-plugin/` | Stable | Native plugin with local MCP, rules, and skills |
 | [Codex](codex-plugin/)          | `codex-plugin/`     | Stable   | Native Codex plugin with bundled MCP, hooks, and `$pensyve` skill |
 | [OpenCode](opencode-plugin/)    | `opencode-plugin/`  | Stable   | Plugin with MCP integration                                   |
 | [OpenClaw](openclaw-plugin/)    | `openclaw-plugin/`  | Stable   | Plugin with MCP integration                                   |
@@ -44,24 +44,25 @@ The [`shared/`](shared/) directory contains the common Pensyve client libraries 
 
 ## Quick Start
 
-Every integration connects to Pensyve via its MCP endpoint. Most remote
-integrations can use an API key:
+Every integration connects to Pensyve via MCP. The default is the local stdio
+server, which needs no account or API key:
 
-1. Sign up at [pensyve.com](https://pensyve.com)
-2. Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys)
-3. Follow the setup instructions in the integration's own README
+1. Build the binary: `cargo build --release -p pensyve-mcp` from the repo root
+2. Follow the setup instructions in the integration's own README
 
-Antigravity uses browser OAuth for interactive cloud access; follow its
-[plugin setup](antigravity-plugin/) instead of placing an API key in the
-bundled configuration.
+To use a remote endpoint instead, run your own `pensyve-mcp-gateway` and follow
+the [self-hosting guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md).
 
 For manual MCP setup in any tool that supports it:
 
 ```bash
-# Endpoint
-https://mcp.pensyve.com/mcp
+# Local (stdio)
+pensyve-mcp --stdio
 
-# Auth
+# Self-hosted gateway
+http://localhost:3000/mcp
+
+# Auth (a key configured on your gateway)
 PENSYVE_API_KEY=psy_your_key
 ```
 

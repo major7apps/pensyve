@@ -4,64 +4,9 @@ Persistent AI memory for [Neovim](https://neovim.io/) via MCP using [MCPHub.nvim
 
 > **Status:** Working-memory substrate v1.0.0 — MCP configuration, instruction files, and documentation. Full plugin integration planned.
 
-## Authentication
+## Local (Offline, Recommended)
 
-1. Sign up at [pensyve.com](https://pensyve.com)
-2. Create an API key at [Settings → API Keys](https://pensyve.com/settings/api-keys)
-3. Set the environment variable:
-   ```bash
-   export PENSYVE_API_KEY="psy_your_key_here"
-   ```
-
-Then configure MCP with headers (see setup instructions below).
-
-## Setup
-
-Set your API key (get one at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys)):
-
-```bash
-export PENSYVE_API_KEY="psy_your_key"
-```
-
-Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
-
-## Cloud (Recommended)
-
-Add to your MCPHub.nvim configuration in `init.lua` (or your plugin manager config):
-
-```lua
-require("mcphub").setup({
-  servers = {
-    pensyve = {
-      type = "http",
-      url = "https://mcp.pensyve.com/mcp",
-      headers = {
-        Authorization = "Bearer " .. os.getenv("PENSYVE_API_KEY"),
-      },
-    },
-  },
-})
-```
-
-Alternatively, create or edit `~/.config/mcphub/servers.json`:
-
-```json
-{
-  "mcpServers": {
-    "pensyve": {
-      "type": "http",
-      "url": "https://mcp.pensyve.com/mcp",
-      "headers": {
-        "Authorization": "Bearer ${PENSYVE_API_KEY}"
-      }
-    }
-  }
-}
-```
-
-## Local (Offline)
-
-No API key needed — all data stays on your machine.
+No API key needed — all data stays on your machine. Add to your MCPHub.nvim configuration in `init.lua` (or your plugin manager config):
 
 ```lua
 require("mcphub").setup({
@@ -80,6 +25,46 @@ require("mcphub").setup({
 
 Build from source: `cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
 
+## Self-hosted Gateway (Remote)
+
+To connect to a `pensyve-mcp-gateway` you run yourself (see the [self-hosting guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md)), set `PENSYVE_API_KEY` to a key configured on your gateway:
+
+```bash
+export PENSYVE_API_KEY="psy_your_key"
+```
+
+Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions. Then in `init.lua`:
+
+```lua
+require("mcphub").setup({
+  servers = {
+    pensyve = {
+      type = "http",
+      url = "http://localhost:3000/mcp",
+      headers = {
+        Authorization = "Bearer " .. os.getenv("PENSYVE_API_KEY"),
+      },
+    },
+  },
+})
+```
+
+Alternatively, create or edit `~/.config/mcphub/servers.json`:
+
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "type": "http",
+      "url": "http://localhost:3000/mcp",
+      "headers": {
+        "Authorization": "Bearer ${PENSYVE_API_KEY}"
+      }
+    }
+  }
+}
+```
+
 ## Available Tools
 
 | Tool                    | Description                            |
@@ -92,7 +77,7 @@ Build from source: `cargo build --release -p pensyve-mcp` from the [pensyve repo
 | `pensyve_forget`        | Delete an entity's memories            |
 | `pensyve_inspect`       | List memories for an entity            |
 
-See [MCP Tools Reference](https://pensyve.com/docs/api-reference/mcp-tools) for full parameter details.
+See [MCP Tools Reference](https://github.com/major7apps/pensyve#mcp-server) for full parameter details.
 
 ## Intelligent Memory Capture
 

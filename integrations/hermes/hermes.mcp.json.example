@@ -2,7 +2,7 @@
   "mcpServers": {
     "pensyve": {
       "type": "http",
-      "url": "https://mcp.pensyve.com/mcp",
+      "url": "http://localhost:3000/mcp",
       "headers": {
         "Authorization": "Bearer ${PENSYVE_API_KEY}"
       }

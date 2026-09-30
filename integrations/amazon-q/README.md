@@ -18,41 +18,9 @@ Two steps: configure the MCP server, then install the rules.
 
 Amazon Q Developer supports MCP via its IDE extensions (VS Code, JetBrains) and via the `q chat` CLI.
 
-**Cloud with API key (recommended):**
+**Local (offline, recommended):**
 
-Set your API key (get one at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys)):
-
-```bash
-export PENSYVE_API_KEY="psy_your_key_here"
-```
-
-Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
-
-Copy `.amazonq/mcp.json.example` to your project root's `.amazonq/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "pensyve": {
-      "type": "http",
-      "url": "https://mcp.pensyve.com/mcp",
-      "headers": {
-        "Authorization": "Bearer ${PENSYVE_API_KEY}"
-      }
-    }
-  }
-}
-```
-
-Or pass via CLI:
-
-```bash
-q chat --mcp-config .amazonq/mcp.json
-```
-
-**Local (offline, self-hosted):**
-
-No API key needed — all data stays on your machine. Copy `.amazonq/mcp.json.local.example` to `.amazonq/mcp.json`:
+No API key needed — all data stays on your machine. Copy `.amazonq/mcp.json.example` (or `.amazonq/mcp.json.local.example` to also set `PENSYVE_PATH` and `PENSYVE_NAMESPACE`) to `.amazonq/mcp.json` in your project root:
 
 ```json
 {
@@ -70,6 +38,36 @@ No API key needed — all data stays on your machine. Copy `.amazonq/mcp.json.lo
 ```
 
 Build the binary: `cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
+
+Or pass via CLI:
+
+```bash
+q chat --mcp-config .amazonq/mcp.json
+```
+
+**Self-hosted gateway (remote):**
+
+To connect to a `pensyve-mcp-gateway` you run yourself (see the [self-hosting guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md)), set `PENSYVE_API_KEY` to a key configured on your gateway:
+
+```bash
+export PENSYVE_API_KEY="psy_your_key_here"
+```
+
+Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
+
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "type": "http",
+      "url": "http://localhost:3000/mcp",
+      "headers": {
+        "Authorization": "Bearer ${PENSYVE_API_KEY}"
+      }
+    }
+  }
+}
+```
 
 ### 2. Install the rules
 
@@ -131,7 +129,7 @@ Pensyve behaves as working memory for the agent — always-on, ambient, continuo
 | `pensyve_forget` | Delete an entity's memories |
 | `pensyve_inspect` | List memories for an entity |
 
-See [MCP Tools Reference](https://pensyve.com/docs/api-reference/mcp-tools) for full parameter details.
+See [MCP Tools Reference](https://github.com/major7apps/pensyve#mcp-server) for full parameter details.
 
 ## Opt-Out
 
@@ -150,7 +148,6 @@ Amazon Q's native pattern is to edit or delete rules:
 
 ## Links
 
-- **Website:** [pensyve.com](https://pensyve.com)
 - **GitHub:** [github.com/major7apps/pensyve](https://github.com/major7apps/pensyve)
 - **Playbook:** [Working-memory substrate design](https://github.com/major7apps/pensyve-docs/blob/main/specs/2026-04-18-pensyve-working-memory-substrate-design.md)
 

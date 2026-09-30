@@ -287,7 +287,7 @@ class TestCloudBackend:
 
     def test_cloud_reset_ignores_not_found(self) -> None:
         with patch("pensyve_crewai._make_cloud_client") as mock_factory:
-            request = httpx.Request("DELETE", "https://api.pensyve.com/v1/entities/crew-agent")
+            request = httpx.Request("DELETE", "https://pensyve.example/v1/entities/crew-agent")
             response = httpx.Response(404, request=request)
             mock_client = MagicMock()
             mock_client.forget.side_effect = httpx.HTTPStatusError(
@@ -300,7 +300,7 @@ class TestCloudBackend:
 
     def test_cloud_reset_reraises_other_http_errors(self) -> None:
         with patch("pensyve_crewai._make_cloud_client") as mock_factory:
-            request = httpx.Request("DELETE", "https://api.pensyve.com/v1/entities/crew-agent")
+            request = httpx.Request("DELETE", "https://pensyve.example/v1/entities/crew-agent")
             response = httpx.Response(500, request=request)
             mock_client = MagicMock()
             error = httpx.HTTPStatusError(

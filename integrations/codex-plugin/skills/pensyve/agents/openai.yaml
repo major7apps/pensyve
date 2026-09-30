@@ -11,4 +11,4 @@ dependencies:
       value: "pensyve"
       description: "Pensyve persistent-memory MCP server"
       transport: "streamable_http"
-      url: "https://mcp.pensyve.com/mcp"
+      url: "http://localhost:3000/mcp"

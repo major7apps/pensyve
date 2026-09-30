@@ -6,9 +6,9 @@ rust-version = "1.88"
 license = "Apache-2.0"
 description = "Universal memory runtime for AI agents — episodic, semantic, and procedural memory with 8-signal fusion retrieval"
 readme = "../README.md"
-homepage = "https://pensyve.com"
+homepage = "https://github.com/major7apps/pensyve"
 repository = "https://github.com/major7apps/pensyve"
-documentation = "https://pensyve.com/docs"
+documentation = "https://github.com/major7apps/pensyve/tree/main/docs"
 keywords = ["ai", "agents", "memory", "llm", "retrieval"]
 categories = ["science", "database"]
 

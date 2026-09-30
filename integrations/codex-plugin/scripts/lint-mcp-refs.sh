@@ -223,7 +223,7 @@ expected = [{
     "value": "pensyve",
     "description": "Pensyve persistent-memory MCP server",
     "transport": "streamable_http",
-    "url": "https://mcp.pensyve.com/mcp",
+    "url": "http://localhost:3000/mcp",
 }]
 if parsed != expected:
     raise SystemExit(f"expected exactly one Pensyve MCP dependency, found: {parsed!r}")

@@ -2,11 +2,11 @@
  * @pensyve/langchain — Pensyve memory store for LangChain.js / LangGraph.js
  *
  * Implements the LangGraph BaseStore interface (put/get/search/delete)
- * backed by Pensyve. Supports both local and cloud backends.
+ * backed by Pensyve. Supports both local and remote (self-hosted) backends.
  *
  * Usage:
  *   import { PensyveStore } from "@pensyve/langchain";
- *   const store = new PensyveStore(); // auto-detects local vs cloud
+ *   const store = new PensyveStore(); // auto-detects local vs remote
  *   const graph = builder.compile({ store });
  */
 
@@ -28,7 +28,7 @@ export interface StoreItem {
 
 /**
  * LangGraph BaseStore-compatible memory backend.
- * Supports local Pensyve server and Pensyve Cloud.
+ * Supports a local Pensyve server and a remote self-hosted gateway.
  */
 export class PensyveStore {
   private client: PensyveClient;
@@ -40,7 +40,7 @@ export class PensyveStore {
     this.defaultEntity = cfg.entity;
   }
 
-  /** Whether the store is connected to Pensyve Cloud. */
+  /** Whether the store is connected to a remote (self-hosted) Pensyve server. */
   get isCloud(): boolean {
     return this.client.isCloud;
   }
@@ -124,7 +124,7 @@ export class PensyveStore {
     return this.client.status();
   }
 
-  /** Get cloud account info (null if local). */
+  /** Get remote account info (null if local). */
   async account() {
     return this.client.account();
   }

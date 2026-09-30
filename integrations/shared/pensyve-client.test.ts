@@ -48,9 +48,9 @@ describe("resolveConfig", () => {
   });
 
   it("applies the flat baseUrl shorthand to cloud mode", () => {
-    const cfg = resolveConfig({ baseUrl: "https://mcp.pensyve.com", apiKey: "psy_test" });
+    const cfg = resolveConfig({ baseUrl: "https://pensyve.example", apiKey: "psy_test" });
     expect(cfg.mode).toBe("cloud");
-    expect(cfg.cloud.baseUrl).toBe("https://mcp.pensyve.com");
+    expect(cfg.cloud.baseUrl).toBe("https://pensyve.example");
   });
 
   it("nested local.baseUrl/cloud.baseUrl still win over the flat shorthand", () => {

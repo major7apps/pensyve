@@ -32,7 +32,7 @@ export PENSYVE_API_KEY="psy_your_key_here"
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
-Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
+Run a self-hosted gateway (see the [self-host guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md)); the API key is the one your gateway operator configured.
 
 ---
 
@@ -73,7 +73,7 @@ agent = Agent(
 from crewai_tools import MCPServerAdapter
 
 pensyve_server_config = {
-    "url": "https://mcp.pensyve.com/mcp",
+    "url": "http://localhost:3000/mcp",
     "transport": "streamable_http",
     "headers": {"Authorization": f"Bearer {os.environ['PENSYVE_API_KEY']}"},
 }
@@ -127,8 +127,8 @@ To disable the substrate, remove the substrate content from the agent's `backsto
 
 ## Links
 
-- [Pensyve](https://pensyve.com) — managed memory service
-- [API Keys](https://pensyve.com/settings/api-keys)
+- [Pensyve on GitHub](https://github.com/major7apps/pensyve)
+- [Self-host guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md)
 - [CrewAI docs](https://docs.crewai.com/)
 
 ## License

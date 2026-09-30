@@ -20,9 +20,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://pensyve.com"
+Homepage = "https://github.com/major7apps/pensyve"
 Repository = "https://github.com/major7apps/pensyve"
-Documentation = "https://pensyve.com/docs"
+Documentation = "https://github.com/major7apps/pensyve/tree/main/docs"
 
 [project.optional-dependencies]
 http = ["httpx>=0.27", "tenacity>=8.0"]

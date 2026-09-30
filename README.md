@@ -44,7 +44,7 @@ Your agent stops being amnesiac. Decisions, patterns, and outcomes persist acros
 | Agent repeats failed approaches           | **Procedural memory** — Bayesian tracking on action→outcome pairs surfaces what actually works                                |
 | Memory store grows unbounded              | **FSRS forgetting curve** — memories you use get stronger, unused ones fade naturally. Consolidation promotes repeated facts. |
 | Need cloud signup to get started          | **Offline-first** — SQLite + ONNX embeddings. Works on your laptop right now. No API keys needed.                             |
-| Need to scale to production               | **Postgres backend** — feature-gated pgvector for multi-node deployments. Managed service at pensyve.com.                     |
+| Need to scale to production               | **Postgres backend** — feature-gated pgvector for multi-node deployments, plus a self-hostable HTTP gateway.                 |
 | Only works with one framework             | **Framework-agnostic** — Python, TypeScript, Go, MCP, REST, CLI. Drop-in adapters for LangChain, CrewAI, AutoGen.             |
 
 ## Install
@@ -55,7 +55,7 @@ npm install @pensyve/sdk     # TypeScript (npm)
 go get github.com/major7apps/pensyve/pensyve-go/v3@latest  # Go
 ```
 
-Or use the MCP server directly with Antigravity CLI, Codex, Claude Code, Cursor, or any MCP client — see [MCP Setup](https://pensyve.com/docs/getting-started/mcp-setup).
+Or use the MCP server directly with Antigravity CLI, Codex, Claude Code, Cursor, or any MCP client — see [MCP Setup](docs/GETTING_STARTED.md#mcp-server).
 
 ## Quick Start
 
@@ -214,9 +214,26 @@ Install from the marketplace:
 /reload-plugins
 ```
 
-The plugin does not bundle an MCP server config — auth method and backend are user choices. Add an `mcpServers.pensyve` entry to your `~/.claude/settings.json` (user-level) or `.claude/settings.json` (project-level). Pick one:
+The plugin does not bundle an MCP server config — the backend is your choice. Add an `mcpServers.pensyve` entry to your `~/.claude/settings.json` (user-level) or `.claude/settings.json` (project-level). Pick one:
 
-**Pensyve Cloud — API key (recommended):**
+**Local (stdio, no API key):**
+
+Build the MCP binary first (see [Install](#install)), then:
+
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "command": "pensyve-mcp",
+      "args": ["--stdio"]
+    }
+  }
+}
+```
+
+**Self-hosted gateway (HTTP):**
+
+Run a `pensyve-mcp-gateway` ([self-hosting guide](docs/self-host.md)), then use one of the API keys you configured on it:
 
 ```bash
 export PENSYVE_API_KEY="psy_your_key_here"
@@ -227,38 +244,10 @@ export PENSYVE_API_KEY="psy_your_key_here"
   "mcpServers": {
     "pensyve": {
       "type": "http",
-      "url": "https://mcp.pensyve.com/mcp",
+      "url": "http://localhost:3000/mcp",
       "headers": {
         "Authorization": "Bearer ${PENSYVE_API_KEY}"
       }
-    }
-  }
-}
-```
-
-**Pensyve Cloud — OAuth (browser sign-in):**
-
-```json
-{
-  "mcpServers": {
-    "pensyve": {
-      "type": "http",
-      "url": "https://mcp.pensyve.com/mcp"
-    }
-  }
-}
-```
-
-**Pensyve Local (self-hosted, no API key):**
-
-Build the MCP binary first (see [Install](#install)), then:
-
-```json
-{
-  "mcpServers": {
-    "pensyve": {
-      "command": "pensyve-mcp",
-      "args": ["--stdio"]
     }
   }
 }
@@ -290,11 +279,7 @@ codex plugin add pensyve@pensyve-codex
 For local development from a checkout, use
 `codex plugin marketplace add /path/to/pensyve/integrations/codex-plugin` instead.
 
-Set your API key for the bundled MCP server:
-
-```bash
-export PENSYVE_API_KEY="psy_your_key_here"
-```
+The bundled MCP server config runs the local stdio server (`pensyve-mcp --stdio`, no API key), so build and install `pensyve-mcp` first (see [Install](#install)).
 
 The plugin bundles `integrations/codex-plugin/.mcp.json`, so Codex can load the Pensyve MCP server without copying a project config file. Use `/skills`, `$pensyve`, or `/pensyve` for explicit memory work, or let the bundled hooks and instructions prompt Codex to recall before substantive project decisions. `@pensyve` is documented as a text-level compatibility convention; true native Codex @-mention dispatch still needs platform support.
 
@@ -421,16 +406,16 @@ Pensyve uses the following environment variables across its components:
 | `HOST`                   | `0.0.0.0` | Server bind address                              |
 | `PORT`                   | `3000`    | Server bind port                                 |
 
-### Cloud / Managed Service
+### Remote / Postgres
 
 | Variable               | Default                 | Description                   |
 | ---------------------- | ----------------------- | ----------------------------- |
-| `PENSYVE_API_KEY`      | _(none)_                | Cloud API key for remote mode |
+| `PENSYVE_API_KEY`      | _(none)_                | Gateway API key for remote mode |
 | `PENSYVE_REMOTE_URL`   | `http://localhost:8000` | Remote server URL             |
 | `DATABASE_URL` | _(none)_                | Postgres connection string    |
 | `REDIS_URL`    | _(none)_                | Redis for caching, rate limiting, daily quotas |
 
-### Quotas (managed service)
+### Quotas (self-hosted gateway)
 
 | Variable                        | Default   | Description                     |
 | ------------------------------- | --------- | ------------------------------- |
@@ -504,7 +489,6 @@ pensyve/
 │   └── autogen/        Microsoft AutoGen multi-agent memory
 ├── tests/python/       Python integration tests
 ├── benchmarks/         LongMemEval_S evaluation + weight tuning
-├── website/            Astro + Tailwind static site for pensyve.com
 └── docs/               Architecture, roadmap, design specs, implementation plans
 ```
 

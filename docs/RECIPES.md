@@ -83,7 +83,7 @@ results = p.recall("database migration", entity=user)
 from pensyve_langchain import PensyveStore
 from langgraph.graph import StateGraph
 
-store = PensyveStore()  # auto-detects local vs cloud
+store = PensyveStore()  # auto-detects local vs remote
 
 # Pre-populate context
 store.put(("project",), "stack", {"data": "Next.js 15, Postgres, Vercel"})
@@ -162,26 +162,6 @@ findings = memory.recall("competitor pricing and market trends", limit=5)
 
 **Problem:** Want agent memory in Cursor/Claude Code without writing any code.
 
-**Cloud** (30 seconds):
-
-```bash
-export PENSYVE_API_KEY="psy_your_key"
-```
-
-Add to your MCP config:
-
-```json
-{
-  "mcpServers": {
-    "pensyve": {
-      "type": "http",
-      "url": "https://mcp.pensyve.com/mcp",
-      "headers": { "Authorization": "Bearer ${PENSYVE_API_KEY}" }
-    }
-  }
-}
-```
-
 **Local** (2 minutes):
 
 ```bash
@@ -194,6 +174,20 @@ cargo build --release -p pensyve-mcp
     "pensyve": {
       "command": "pensyve-mcp",
       "args": ["--stdio"]
+    }
+  }
+}
+```
+
+**Self-hosted gateway** (HTTP): run `pensyve-mcp-gateway` per [docs/self-host.md](self-host.md), then:
+
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "type": "http",
+      "url": "http://localhost:3000/mcp",
+      "headers": { "Authorization": "Bearer ${PENSYVE_API_KEY}" }
     }
   }
 }

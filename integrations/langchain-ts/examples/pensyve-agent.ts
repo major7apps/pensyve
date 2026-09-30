@@ -10,7 +10,7 @@
  *   bun add @langchain/anthropic @langchain/langgraph @langchain/mcp-adapters
  *
  * Environment variables:
- *   PENSYVE_API_KEY   — Pensyve API key (get one at pensyve.com/settings/api-keys)
+ *   PENSYVE_API_KEY   — Pensyve API key (configured by your self-hosted gateway operator)
  *   ANTHROPIC_API_KEY — Anthropic API key
  */
 
@@ -41,7 +41,7 @@ if (!PENSYVE_API_KEY) {
 const mcpConfig = {
   pensyve: {
     transport: "streamable_http" as const,
-    url: "https://mcp.pensyve.com/mcp",
+    url: "http://localhost:3000/mcp",
     headers: { Authorization: `Bearer ${PENSYVE_API_KEY}` },
   },
 };

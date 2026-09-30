@@ -1,6 +1,6 @@
 # pensyve-mcp-gateway
 
-Remote MCP gateway for Pensyve Cloud. Implements the Streamable HTTP transport
+Self-hostable remote MCP gateway for Pensyve (see `docs/self-host.md`). Implements the Streamable HTTP transport
 of the Model Context Protocol (MCP) and exposes the nine `pensyve_*` tools
 (see `pensyve-mcp-tools`) over HTTPS.
 
@@ -11,8 +11,9 @@ Two credential paths:
 1. **API key** — `Authorization: Bearer psy_…` or the `PENSYVE_API_KEY`
    env var. Validated against the local key list (`PENSYVE_API_KEYS`) or
    the remote validation endpoint (`PENSYVE_VALIDATION_URL`).
-2. **OAuth JWT** — `Authorization: Bearer <jwt>` issued by `pensyve.com`,
-   verified with the Ed25519 public key in `OAUTH_PUBLIC_KEY`.
+2. **OAuth JWT** — `Authorization: Bearer <jwt>` from an external issuer,
+   verified with the Ed25519 public key in `OAUTH_PUBLIC_KEY` (optional; used
+   only if you run your own token issuer).
 
 Each credential resolves to an isolated `tenant:<auth_tenant>` namespace
 that is created lazily on first use.
@@ -50,13 +51,13 @@ curl -H 'Authorization: Bearer psy_…' \
      -H 'X-Pensyve-Agent-Id: 4fa7b2c0-1111-4111-8111-111111111111' \
      -H 'Content-Type: application/json' \
      -d '{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"pensyve_remember","arguments":{"entity":"alice","fact":"prefers tea"}}}' \
-     https://mcp.pensyve.com/mcp
+     http://localhost:3000/mcp
 
 curl -H 'Authorization: Bearer psy_…' \
      -H 'X-Pensyve-Agent-Id: 4fa7b2c0-2222-4222-8222-222222222222' \
      -H 'Content-Type: application/json' \
      -d '{"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"pensyve_recall","arguments":{"query":"alice"}}}' \
-     https://mcp.pensyve.com/mcp
+     http://localhost:3000/mcp
 # → returns no results: the second request's agent_id has no memories yet.
 ```
 

@@ -4,50 +4,9 @@ Persistent AI memory for [JetBrains AI Assistant](https://www.jetbrains.com/ai/)
 
 > **Status:** Working-memory substrate v1.0.0 — MCP configuration, instruction files, and documentation. Full plugin integration planned.
 
-## Authentication
+## Local (Offline, Recommended)
 
-1. Sign up at [pensyve.com](https://pensyve.com)
-2. Create an API key at [Settings → API Keys](https://pensyve.com/settings/api-keys)
-3. Set the environment variable:
-   ```bash
-   export PENSYVE_API_KEY="psy_your_key_here"
-   ```
-
-Then configure MCP with headers (see setup instructions below).
-
-## Setup
-
-Set your API key (get one at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys)):
-
-```bash
-export PENSYVE_API_KEY="psy_your_key"
-```
-
-Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions.
-
-## Cloud (Recommended)
-
-In your JetBrains IDE, go to **Settings → AI Assistant → MCP Servers** and add:
-
-```json
-{
-  "mcpServers": {
-    "pensyve": {
-      "type": "http",
-      "url": "https://mcp.pensyve.com/mcp",
-      "headers": {
-        "Authorization": "Bearer ${PENSYVE_API_KEY}"
-      }
-    }
-  }
-}
-```
-
-> Use `headers` with `Authorization: Bearer` for remote MCP. The `env` block is for local stdio servers.
-
-## Local (Offline)
-
-No API key needed — all data stays on your machine.
+No API key needed — all data stays on your machine. In your JetBrains IDE, go to **Settings → AI Assistant → MCP Servers** and add:
 
 ```json
 {
@@ -66,6 +25,32 @@ No API key needed — all data stays on your machine.
 
 Build from source: `cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
 
+## Self-hosted Gateway (Remote)
+
+To connect to a `pensyve-mcp-gateway` you run yourself (see the [self-hosting guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md)), set `PENSYVE_API_KEY` to a key configured on your gateway:
+
+```bash
+export PENSYVE_API_KEY="psy_your_key"
+```
+
+Add to your shell profile (`~/.bashrc`, `~/.zshrc`) to persist across sessions. Then add:
+
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "type": "http",
+      "url": "http://localhost:3000/mcp",
+      "headers": {
+        "Authorization": "Bearer ${PENSYVE_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+> Use `headers` with `Authorization: Bearer` for remote MCP. The `env` block is for local stdio servers.
+
 ## Available Tools
 
 | Tool                    | Description                            |
@@ -78,7 +63,7 @@ Build from source: `cargo build --release -p pensyve-mcp` from the [pensyve repo
 | `pensyve_forget`        | Delete an entity's memories            |
 | `pensyve_inspect`       | List memories for an entity            |
 
-See [MCP Tools Reference](https://pensyve.com/docs/api-reference/mcp-tools) for full parameter details.
+See [MCP Tools Reference](https://github.com/major7apps/pensyve#mcp-server) for full parameter details.
 
 ## Intelligent Memory Capture
 
@@ -122,27 +107,7 @@ JetBrains AI Assistant reads context files you configure in **Settings → AI As
 
 Copy `jetbrains-mcp.json.example` to the JetBrains MCP servers configuration (**Settings → AI Assistant → MCP Servers**) and edit for your setup.
 
-**Cloud with API key (recommended):**
-
-```bash
-export PENSYVE_API_KEY="psy_your_key_here"
-```
-
-```json
-{
-  "mcpServers": {
-    "pensyve": {
-      "type": "http",
-      "url": "https://mcp.pensyve.com/mcp",
-      "headers": {
-        "Authorization": "Bearer ${PENSYVE_API_KEY}"
-      }
-    }
-  }
-}
-```
-
-**Local (offline, self-hosted):**
+**Local (offline, recommended):**
 
 ```json
 {
@@ -153,6 +118,26 @@ export PENSYVE_API_KEY="psy_your_key_here"
       "env": {
         "PENSYVE_PATH": "~/.pensyve/",
         "PENSYVE_NAMESPACE": "default"
+      }
+    }
+  }
+}
+```
+
+**Self-hosted gateway (remote):**
+
+```bash
+export PENSYVE_API_KEY="psy_your_key_here"
+```
+
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "type": "http",
+      "url": "http://localhost:3000/mcp",
+      "headers": {
+        "Authorization": "Bearer ${PENSYVE_API_KEY}"
       }
     }
   }

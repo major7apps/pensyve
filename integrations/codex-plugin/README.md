@@ -42,51 +42,49 @@ The plugin bundles:
 - `hooks/hooks.json` for SessionStart and UserPromptSubmit memory guidance
 - install metadata and assets for Codex plugin surfaces
 
-### 2. Authenticate the MCP server
+### 2. Configure the MCP server
 
-**Cloud with API key (recommended):**
+**Local (offline, recommended):**
 
-```bash
-export PENSYVE_API_KEY="psy_your_key_here"
-```
-
-The plugin's bundled `.mcp.json` uses `bearer_token_env_var: "PENSYVE_API_KEY"`, so no per-project MCP file is required for the cloud path.
-
-Create your key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys). Put the `export` in `~/.bashrc` or `~/.zshrc` to persist.
-
-**Manual MCP config fallback:**
-
-Copy `.agents/mcp.json.example` to `.agents/mcp.json` in your project root if you do not want to install the plugin package.
-
-```json
-{
-  "mcpServers": {
-    "pensyve": {
-      "url": "https://mcp.pensyve.com/mcp",
-      "bearer_token_env_var": "PENSYVE_API_KEY"
-    }
-  }
-}
-```
-
-**Local (offline, self-hosted):**
+The plugin's bundled `.mcp.json` runs the local binary over stdio, so no per-project MCP file or API key is required:
 
 ```json
 {
   "mcpServers": {
     "pensyve": {
       "command": "pensyve-mcp",
-      "args": ["--stdio"],
-      "env": {
-        "PENSYVE_PATH": "~/.pensyve/",
-        "PENSYVE_NAMESPACE": "default"
-      }
+      "args": ["--stdio"]
     }
   }
 }
 ```
 
 Build the binary: `cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
+
+**Manual MCP config fallback:**
+
+Copy `.agents/mcp.json.example` to `.agents/mcp.json` in your project root if you do not want to install the plugin package. Add `PENSYVE_PATH` and `PENSYVE_NAMESPACE` under an `env` key to override the defaults.
+
+**Self-hosted gateway (remote):**
+
+To use a `pensyve-mcp-gateway` you run yourself (see the [self-hosting guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md)), export a key configured on your gateway:
+
+```bash
+export PENSYVE_API_KEY="psy_your_key_here"
+```
+
+```json
+{
+  "mcpServers": {
+    "pensyve": {
+      "url": "http://localhost:3000/mcp",
+      "bearer_token_env_var": "PENSYVE_API_KEY"
+    }
+  }
+}
+```
+
+Put the `export` in `~/.bashrc` or `~/.zshrc` to persist.
 
 ### 3. Project instruction fallback
 
@@ -160,7 +158,7 @@ Use `/plugins` to disable or uninstall the plugin. If you installed the fallback
 | `pensyve_forget` | Delete an entity's memories |
 | `pensyve_inspect` | List memories for an entity |
 
-See [MCP Tools Reference](https://pensyve.com/docs/api-reference/mcp-tools) for full parameter details.
+See [MCP Tools Reference](https://github.com/major7apps/pensyve#mcp-server) for full parameter details.
 
 ## Design Philosophy
 
@@ -175,7 +173,6 @@ See [MCP Tools Reference](https://pensyve.com/docs/api-reference/mcp-tools) for 
 
 ## Links
 
-- **Website:** [pensyve.com](https://pensyve.com)
 - **GitHub:** [github.com/major7apps/pensyve](https://github.com/major7apps/pensyve)
 - **Spec:** [Working-memory substrate design](https://github.com/major7apps/pensyve-docs/blob/main/specs/2026-04-18-pensyve-working-memory-substrate-design.md)
 - **Codex plugin architecture:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)

@@ -114,7 +114,7 @@ def _split_sentences(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Backend protocol — local SDK vs. cloud REST API
+# Backend protocol — local SDK vs. remote Pensyve server (REST)
 # ---------------------------------------------------------------------------
 
 
@@ -230,15 +230,15 @@ class PensyveMemory:
 
     Mode detection:
         - If ``PENSYVE_API_KEY`` is set (or ``api_key`` is passed), uses the
-          Pensyve cloud REST API.
+          the remote Pensyve server (REST).
         - Otherwise, uses the local Pensyve SDK (PyO3 bindings + SQLite).
 
     Args:
         namespace: Pensyve namespace for memory isolation.
         entity_name: Entity name to scope memories to.
         path: Local storage path (local mode only). Default: ``~/.pensyve/default``.
-        api_key: Pensyve cloud API key. Overrides ``PENSYVE_API_KEY`` env var.
-        base_url: Pensyve cloud API base URL. Default: ``https://api.pensyve.com``.
+        api_key: Pensyve API key for the remote server (self-hosted gateway). Overrides ``PENSYVE_API_KEY`` env var.
+        base_url: Remote Pensyve server (self-hosted gateway) base URL. Default: ``http://localhost:3000``.
 
     Usage::
 
@@ -261,7 +261,7 @@ class PensyveMemory:
         *,
         path: str | None = None,
         api_key: str | None = None,
-        base_url: str = "https://api.pensyve.com",
+        base_url: str = "http://localhost:3000",
     ) -> None:
         resolved_key = api_key or os.environ.get("PENSYVE_API_KEY")
         if resolved_key:

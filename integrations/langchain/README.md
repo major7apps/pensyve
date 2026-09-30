@@ -35,7 +35,7 @@ export PENSYVE_API_KEY="psy_your_key_here"
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
-Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
+Run a self-hosted gateway (see the [self-host guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md)); the API key is the one your gateway operator configured.
 
 ---
 
@@ -74,14 +74,14 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 client = MultiServerMCPClient({
     "pensyve": {
         "transport": "streamable_http",
-        "url": "https://mcp.pensyve.com/mcp",
+        "url": "http://localhost:3000/mcp",
         "headers": {"Authorization": f"Bearer {os.environ['PENSYVE_API_KEY']}"},
     }
 })
 tools = await client.get_tools()
 ```
 
-For local development with a self-hosted Pensyve server, replace the `url` with your local endpoint.
+If your gateway runs elsewhere, replace the `url` with its endpoint.
 
 ---
 
@@ -128,9 +128,8 @@ To disable the substrate, remove `SUBSTRATE_PROMPT.md` from the agent's `prompt`
 
 ## Links
 
-- [Pensyve](https://pensyve.com) — managed memory service
-- [API Keys](https://pensyve.com/settings/api-keys)
-- [MCP Server docs](https://docs.pensyve.com/mcp)
+- [Pensyve on GitHub](https://github.com/major7apps/pensyve)
+- [Self-host guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md)
 - [LangChain docs](https://python.langchain.com/)
 - [LangGraph docs](https://langchain-ai.github.io/langgraph/)
 
@@ -150,8 +149,8 @@ Drop-in `InMemoryStore`-compatible backend. Implements `put` / `get` / `search` 
 | ----------- | ------------- | ----------- | ----------------------------------------------- |
 | `namespace` | `str`         | `"default"` | Pensyve namespace for isolation                 |
 | `path`      | `str \| None` | `None`      | Local storage directory (local mode)            |
-| `api_key`   | `str \| None` | `None`      | Cloud API key (falls back to `PENSYVE_API_KEY`) |
-| `base_url`  | `str \| None` | `None`      | Override cloud API URL                          |
+| `api_key`   | `str \| None` | `None`      | Remote server API key (falls back to `PENSYVE_API_KEY`) |
+| `base_url`  | `str \| None` | `None`      | Override remote server URL                       |
 
 All methods have async variants prefixed with `a` (e.g. `aput`, `aget`).
 

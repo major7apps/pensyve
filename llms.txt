@@ -11,7 +11,7 @@ Pensyve gives AI agents persistent, cognitive memory that spans across sessions.
 - **FSRS forgetting curve**: Memories you use get stronger, unused ones fade naturally
 - **Consolidation**: Background "dreaming" promotes repeated episodic facts to semantic knowledge
 - **Offline-first**: SQLite + ONNX embeddings. No API keys needed for local use
-- **Scales to cloud**: Postgres backend, managed service at pensyve.com
+- **Scales out**: Postgres backend and a self-hostable HTTP gateway (`pensyve-mcp-gateway`)
 
 ## Integration Options
 
@@ -19,19 +19,7 @@ Pensyve gives AI agents persistent, cognitive memory that spans across sessions.
 
 The MCP server exposes 10 tools: `pensyve_recall`, `pensyve_remember`, `pensyve_observe`, `pensyve_episode_start`, `pensyve_episode_end`, `pensyve_forget`, `pensyve_forget_memory`, `pensyve_inspect`, `pensyve_status`, `pensyve_account`.
 
-**Cloud** (no build required):
-```json
-{
-  "mcpServers": {
-    "pensyve": {
-      "url": "https://mcp.pensyve.com/mcp",
-      "env": { "PENSYVE_API_KEY": "${PENSYVE_API_KEY}" }
-    }
-  }
-}
-```
-
-**Local** (self-hosted):
+**Local** (stdio, no API key):
 ```json
 {
   "mcpServers": {
@@ -128,19 +116,17 @@ Endpoints: `POST /v1/recall`, `POST /v1/remember`, `POST /v1/inspect`, `POST /v1
 - **OpenClaw**: Native plugin with auto-recall and auto-capture hooks
 - **OpenCode**: Native plugin with system prompt injection
 
-All framework integrations auto-detect local vs cloud mode based on `PENSYVE_API_KEY`.
+All framework integrations auto-detect local vs remote (self-hosted gateway) mode based on `PENSYVE_API_KEY`.
 
 ## Authentication
 
-Set `PENSYVE_API_KEY` environment variable for cloud access. API keys use the `psy_` prefix. Not needed for local mode.
+Set the `PENSYVE_API_KEY` environment variable to talk to a self-hosted `pensyve-mcp-gateway`; the keys are the ones you configure on the gateway (`PENSYVE_API_KEYS`). Not needed for local mode.
 
 ## Key URLs
 
-- Website: https://pensyve.com
 - GitHub: https://github.com/major7apps/pensyve
-- MCP endpoint: https://mcp.pensyve.com/mcp
-- REST API: https://api.pensyve.com
-- API keys: https://pensyve.com/settings/api-keys
+- Docs: https://github.com/major7apps/pensyve/tree/main/docs
+- Self-hosting: https://github.com/major7apps/pensyve/blob/main/docs/self-host.md (MCP at `http://localhost:3000/mcp`, REST at `http://localhost:3000`)
 
 ## Documentation
 

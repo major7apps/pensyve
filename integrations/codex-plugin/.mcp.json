@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "pensyve": {
-      "url": "https://mcp.pensyve.com/mcp",
-      "bearer_token_env_var": "PENSYVE_API_KEY"
+      "command": "pensyve-mcp",
+      "args": ["--stdio"]
     }
   }
 }

@@ -96,8 +96,8 @@ Return a concise result:
 
 ## Next Steps
 
-- For missing MCP configuration: set `PENSYVE_API_KEY` for cloud MCP, or configure local stdio with
-  `pensyve-mcp --stdio`.
+- For missing MCP configuration: configure local stdio with `pensyve-mcp --stdio`, or point at a self-hosted
+  `pensyve-mcp-gateway` and set `PENSYVE_API_KEY` to a key configured on it.
 - For mention-style workflows: use `$pensyve` or `/pensyve` for reliable explicit invocation today;
   use `@pensyve` as a readable convention until Codex exposes native plugin mention dispatch.
 - For memory hygiene: run `/pensyve review <entity>` and follow the confirmation prompts.

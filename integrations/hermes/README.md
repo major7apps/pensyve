@@ -22,7 +22,7 @@ Two steps: configure the MCP server and install the instructions file, then (opt
 
 ### 1. Configure the MCP server
 
-**Cloud with API key (recommended):**
+**Self-hosted gateway (recommended):** run `pensyve-mcp-gateway` per the [self-host guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md) and use the API key your operator configured.
 
 ```bash
 export PENSYVE_API_KEY="psy_your_key_here"
@@ -35,7 +35,7 @@ A ready-to-use MCP config example is at `hermes.mcp.json.example`. The structure
   "mcpServers": {
     "pensyve": {
       "type": "http",
-      "url": "https://mcp.pensyve.com/mcp",
+      "url": "http://localhost:3000/mcp",
       "headers": {
         "Authorization": "Bearer ${PENSYVE_API_KEY}"
       }
@@ -46,13 +46,13 @@ A ready-to-use MCP config example is at `hermes.mcp.json.example`. The structure
 
 Deploy it per Hermes's MCP config convention (typically `~/.hermes/mcp.json` or `config.yaml` `mcp:` section).
 
-Create your key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys). Put the `export` in `~/.bashrc` or `~/.zshrc` to persist.
+Put the `export` in `~/.bashrc` or `~/.zshrc` to persist.
 
-**Local (self-hosted):**
+**Custom gateway URL:**
 
 ```bash
-export PENSYVE_MCP_URL="http://localhost:8001/mcp"
-export PENSYVE_API_KEY="psy_your_local_key"
+export PENSYVE_MCP_URL="http://localhost:3000/mcp"
+export PENSYVE_API_KEY="psy_your_gateway_key"
 ```
 
 ### 2. Install the instructions file
@@ -149,7 +149,7 @@ Pensyve behaves as working memory for the agent — always-on, ambient, continuo
 | `pensyve_status` | Get namespace statistics and health |
 | `pensyve_account` | Get account info, usage, and limits |
 
-See [MCP Tools Reference](https://pensyve.com/docs/api-reference/mcp-tools) for full parameter details.
+See the [repository](https://github.com/major7apps/pensyve) for full MCP tool parameter details.
 
 ## Environment Variables
 
@@ -157,7 +157,7 @@ See [MCP Tools Reference](https://pensyve.com/docs/api-reference/mcp-tools) for 
 |---|---|---|
 | `PENSYVE_API_KEY` | (required) | API key with `psy_` prefix |
 | `PENSYVE_ENTITY` | `hermes-user` | Default entity for memory scoping |
-| `PENSYVE_MCP_URL` | `https://mcp.pensyve.com/mcp` | MCP server URL (for self-hosted) |
+| `PENSYVE_MCP_URL` | `http://localhost:3000/mcp` | MCP server URL (self-hosted gateway) |
 
 ## Design Philosophy
 
@@ -169,9 +169,8 @@ See [MCP Tools Reference](https://pensyve.com/docs/api-reference/mcp-tools) for 
 
 ## Links
 
-- **Website:** [pensyve.com](https://pensyve.com)
 - **GitHub:** [github.com/major7apps/pensyve](https://github.com/major7apps/pensyve)
-- **API Keys:** [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys)
+- **Self-host guide:** [docs/self-host.md](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md)
 - **Spec:** [Working-memory substrate design](https://github.com/major7apps/pensyve-docs/blob/main/specs/2026-04-18-pensyve-working-memory-substrate-design.md)
 
 ## License

@@ -1,7 +1,8 @@
 {
   "mcpServers": {
     "pensyve": {
-      "serverUrl": "https://mcp.pensyve.com/mcp"
+      "command": "pensyve-mcp",
+      "args": ["--stdio"]
     }
   }
 }

@@ -10,7 +10,7 @@ Dependencies:
     pip install langchain-anthropic langchain-mcp-adapters langgraph
 
 Environment variables:
-    PENSYVE_API_KEY   — Pensyve API key (get one at pensyve.com/settings/api-keys)
+    PENSYVE_API_KEY   — Pensyve API key (configured by your self-hosted gateway operator)
     ANTHROPIC_API_KEY — Anthropic API key
 """
 
@@ -41,7 +41,7 @@ PENSYVE_API_KEY = os.environ["PENSYVE_API_KEY"]  # raises KeyError if unset — 
 MCP_CONFIG = {
     "pensyve": {
         "transport": "streamable_http",
-        "url": "https://mcp.pensyve.com/mcp",
+        "url": "http://localhost:3000/mcp",
         "headers": {"Authorization": f"Bearer {PENSYVE_API_KEY}"},
     }
 }

@@ -38,7 +38,7 @@ points to `./integrations/codex-plugin`. The current plugin bundle is:
 ```text
 .codex-plugin/plugin.json       # Codex plugin manifest
 .agents/plugins/marketplace.json # Local marketplace metadata for this subdirectory
-.mcp.json                       # Pensyve Cloud MCP config using PENSYVE_API_KEY
+.mcp.json                       # Local stdio MCP config (pensyve-mcp --stdio)
 AGENTS.md                       # Single-file memory substrate fallback
 skills/                         # Codex skills, including pensyve and mention-workflow
 commands/                       # Slash commands, including /pensyve
@@ -57,9 +57,9 @@ fields.
 
 All memory operations reuse the existing Pensyve runtime surfaces:
 
-- Cloud MCP: `.mcp.json` uses `https://mcp.pensyve.com/mcp` with
-  `bearer_token_env_var: "PENSYVE_API_KEY"`.
-- Local MCP: users can configure `pensyve-mcp --stdio` for offline/self-hosted memory.
+- Local MCP: `.mcp.json` runs `pensyve-mcp --stdio` for offline/self-hosted memory.
+- Self-hosted gateway MCP: users can point Codex at a `pensyve-mcp-gateway` (for example
+  `http://localhost:3000/mcp`) with `bearer_token_env_var: "PENSYVE_API_KEY"`.
 - CLI fallback: `pensyve-cli status`, recall, remember, inspect, and forget remain useful for manual
   verification, but Codex plugin workflows should prefer MCP tools.
 
@@ -69,7 +69,8 @@ The `/pensyve` command is a router, not a reimplementation. It maps user intent 
 
 ## Auth And Config Model
 
-Cloud mode uses one environment variable:
+Self-hosted gateway mode uses one environment variable, set to a key configured on the operator's
+gateway:
 
 ```bash
 export PENSYVE_API_KEY="psy_your_key_here"

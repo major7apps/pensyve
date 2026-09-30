@@ -1,7 +1,7 @@
 """HTTP client for the Pensyve memory API.
 
-Works with both the local server and the Pensyve Cloud gateway at
-``https://mcp.pensyve.com`` (or ``https://api.pensyve.com``).
+Works with a local Pensyve server or a self-hosted ``pensyve-mcp-gateway``
+(e.g. ``http://localhost:3000``).
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ class PensyveClient:
 
     Usage::
 
-        client = PensyveClient(base_url="https://mcp.pensyve.com", api_key="psy_...")
+        client = PensyveClient(base_url="http://localhost:3000", api_key="psy_...")
         result = client.recall("What does the user prefer?")
         client.remember("user", "Prefers dark mode")
     """

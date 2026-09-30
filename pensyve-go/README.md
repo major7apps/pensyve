@@ -3,7 +3,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/major7apps/pensyve/pensyve-go/v3.svg)](https://pkg.go.dev/github.com/major7apps/pensyve/pensyve-go/v3)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/major7apps/pensyve/blob/main/LICENSE)
 
-Go SDK for **[Pensyve](https://pensyve.com)** — the universal memory runtime for AI agents.
+Go SDK for **[Pensyve](https://github.com/major7apps/pensyve)** — the universal memory runtime for AI agents.
 
 Give your agents durable memory that persists across sessions, learns from outcomes, and retrieves with 8-signal fusion ranking.
 
@@ -28,10 +28,8 @@ import (
 
 func main() {
     client := pensyve.NewClient(pensyve.Config{
-        BaseURL: "http://localhost:8000",
-        // Or use Pensyve Cloud:
-        // BaseURL: "https://api.pensyve.com",
-        // APIKey:  "psy_...",
+        BaseURL: "http://localhost:3000", // self-hosted pensyve-mcp-gateway
+        // APIKey:  "psy_...", // a key configured on your gateway
     })
 
     ctx := context.Background()
@@ -118,13 +116,13 @@ if err != nil {
 
 Sentinel errors: `ErrNotFound`, `ErrUnauthorized`, `ErrRateLimited`.
 
-## Pensyve Cloud
+## Self-hosted gateway
 
-Sign up at [pensyve.com](https://pensyve.com) to get an API key for the managed service.
+Run a `pensyve-mcp-gateway` ([self-hosting guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md)) and use one of the API keys you configured on it.
 
 ```go
 client := pensyve.NewClient(pensyve.Config{
-    BaseURL: "https://api.pensyve.com",
+    BaseURL: "http://localhost:3000",
     APIKey:  "psy_your_api_key",
 })
 ```
@@ -132,14 +130,13 @@ client := pensyve.NewClient(pensyve.Config{
 ## Requirements
 
 - Go 1.21+
-- A running Pensyve server (local or cloud)
+- A running Pensyve gateway (`pensyve-mcp-gateway`)
 
 ## Links
 
-- [Documentation](https://pensyve.com/docs)
+- [Documentation](https://github.com/major7apps/pensyve/tree/main/docs)
 - [GitHub](https://github.com/major7apps/pensyve)
-- [Pensyve Cloud](https://pensyve.com)
-- [Go Quickstart](https://pensyve.com/docs/getting-started/go-quickstart)
+- [Getting Started](https://github.com/major7apps/pensyve/blob/main/docs/GETTING_STARTED.md)
 
 ## License
 

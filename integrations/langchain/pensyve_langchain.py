@@ -2,7 +2,7 @@
 
 Drop-in replacement for LangGraph's InMemoryStore or any BaseStore-compatible
 backend.  Uses the Pensyve Python SDK (PyO3) for local mode and the Pensyve
-REST API for cloud mode.
+REST API for remote ("cloud") mode against a self-hosted gateway.
 
 Usage::
 
@@ -100,7 +100,7 @@ def _parse_fact(raw: str) -> tuple[str, dict[str, Any]]:
 # Cloud HTTP helpers (stdlib only — no httpx required)
 # ---------------------------------------------------------------------------
 
-_CLOUD_BASE_URL = "https://api.pensyve.com"
+_CLOUD_BASE_URL = "http://localhost:3000"
 _CLOUD_TIMEOUT = 15
 
 
@@ -112,7 +112,7 @@ def _cloud_request(
     body: dict[str, Any] | None = None,
     timeout: float = _CLOUD_TIMEOUT,
 ) -> Any:
-    """Make an HTTP request to the Pensyve cloud API using stdlib."""
+    """Make an HTTP request to the remote Pensyve server (self-hosted gateway) using stdlib."""
     headers: dict[str, str] = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
@@ -133,7 +133,7 @@ class PensyveStore:
 
     Implements the same ``put`` / ``get`` / ``search`` / ``delete`` /
     ``list_namespaces`` interface as LangGraph's ``InMemoryStore``,
-    backed by Pensyve's local engine or cloud API.
+    backed by Pensyve's local engine or a remote Pensyve server (self-hosted gateway).
 
     Mode detection:
         - If *api_key* is passed or ``PENSYVE_API_KEY`` is set -> **cloud**
@@ -165,9 +165,9 @@ class PensyveStore:
         Args:
             namespace: Pensyve namespace for storage isolation.
             path: Local storage directory (local mode only).
-            api_key: Pensyve cloud API key.  If ``None``, falls back to the
+            api_key: Pensyve API key for the remote server (self-hosted gateway).  If ``None``, falls back to the
                 ``PENSYVE_API_KEY`` environment variable.
-            base_url: Override the cloud API base URL.
+            base_url: Override the remote server base URL.
         """
         self._api_key = api_key or os.environ.get("PENSYVE_API_KEY") or ""
         self._is_cloud = bool(self._api_key)
@@ -192,7 +192,7 @@ class PensyveStore:
 
     @property
     def is_cloud(self) -> bool:
-        """True when the store is using the Pensyve cloud API."""
+        """True when the store is using the remote Pensyve server (self-hosted gateway)."""
         return self._is_cloud
 
     def _get_entity(self, ns: tuple[str, ...]) -> Any:

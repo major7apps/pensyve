@@ -3,7 +3,7 @@
 [![npm](https://img.shields.io/npm/v/@pensyve/sdk)](https://www.npmjs.com/package/@pensyve/sdk)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/major7apps/pensyve/blob/main/LICENSE)
 
-TypeScript SDK for **[Pensyve](https://pensyve.com)** — the universal memory runtime for AI agents.
+TypeScript SDK for **[Pensyve](https://github.com/major7apps/pensyve)** — the universal memory runtime for AI agents.
 
 Give your agents durable memory that persists across sessions, learns from outcomes, and retrieves with 8-signal fusion ranking.
 
@@ -21,10 +21,8 @@ bun add @pensyve/sdk
 import { Pensyve } from "@pensyve/sdk";
 
 const pensyve = new Pensyve({
-  baseUrl: "http://localhost:8000",
-  // Or use Pensyve Cloud:
-  // baseUrl: "https://api.pensyve.com",
-  // apiKey: "psy_...",
+  baseUrl: "http://localhost:3000", // self-hosted pensyve-mcp-gateway
+  // apiKey: "psy_...", // a key configured on your gateway
 });
 
 // Remember a fact
@@ -90,13 +88,13 @@ await episode.end({ summary: "Discussed deployment strategy" });
 | `activity(days?)`        | Get memory activity over N days |
 | `recentActivity(limit?)` | Get recent memory events        |
 
-## Pensyve Cloud
+## Self-hosted gateway
 
-Sign up at [pensyve.com](https://pensyve.com) to get an API key for the managed service. No infrastructure to run.
+Run a `pensyve-mcp-gateway` ([self-hosting guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md)) and use one of the API keys you configured on it.
 
 ```typescript
 const pensyve = new Pensyve({
-  baseUrl: "https://api.pensyve.com",
+  baseUrl: "http://localhost:3000",
   apiKey: "psy_your_api_key",
 });
 ```
@@ -104,14 +102,13 @@ const pensyve = new Pensyve({
 ## Requirements
 
 - Node.js 18+ or Bun 1.0+
-- A running Pensyve server (local or cloud)
+- A running Pensyve gateway (`pensyve-mcp-gateway`)
 
 ## Links
 
-- [Documentation](https://pensyve.com/docs)
+- [Documentation](https://github.com/major7apps/pensyve/tree/main/docs)
 - [GitHub](https://github.com/major7apps/pensyve)
-- [Pensyve Cloud](https://pensyve.com)
-- [REST API Reference](https://pensyve.com/docs/api-reference/rest-api)
+- [Getting Started](https://github.com/major7apps/pensyve/blob/main/docs/GETTING_STARTED.md)
 
 ## License
 

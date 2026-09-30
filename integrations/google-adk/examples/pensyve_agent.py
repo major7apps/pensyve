@@ -13,7 +13,7 @@ Dependencies:
     pip install google-adk
 
 Environment variables:
-    PENSYVE_API_KEY   — Pensyve API key (get one at pensyve.com/settings/api-keys)
+    PENSYVE_API_KEY   — Pensyve API key (configured by your self-hosted gateway operator)
     GOOGLE_API_KEY    — Google AI Studio API key (or configure Vertex AI credentials)
 """
 
@@ -41,7 +41,7 @@ PENSYVE_API_KEY = os.environ["PENSYVE_API_KEY"]  # raises KeyError if unset
 
 pensyve_toolset = MCPToolset(
     connection_params=StreamableHTTPConnectionParams(
-        url="https://mcp.pensyve.com/mcp",
+        url="http://localhost:3000/mcp",
         headers={"Authorization": f"Bearer {PENSYVE_API_KEY}"},
     )
 )

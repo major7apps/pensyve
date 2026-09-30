@@ -13,7 +13,7 @@ Dependencies:
     pip install pydantic-ai
 
 Environment variables:
-    PENSYVE_API_KEY   — Pensyve API key (get one at pensyve.com/settings/api-keys)
+    PENSYVE_API_KEY   — Pensyve API key (configured by your self-hosted gateway operator)
 """
 
 import asyncio
@@ -36,7 +36,7 @@ substrate = SUBSTRATE_PATH.read_text(encoding="utf-8")
 PENSYVE_API_KEY = os.environ["PENSYVE_API_KEY"]  # raises KeyError if unset
 
 pensyve = MCPServerHTTP(
-    url="https://mcp.pensyve.com/mcp",
+    url="http://localhost:3000/mcp",
     headers={"Authorization": f"Bearer {PENSYVE_API_KEY}"},
 )
 

@@ -1,23 +1,22 @@
 # Continue config.yaml — Pensyve MCP server configuration
 # Merge this fragment into your ~/.continue/config.yaml
 
-# Cloud (recommended) — requires PENSYVE_API_KEY env var
+# Local (offline, recommended) — runs the local stdio server
 mcpServers:
   - name: pensyve
     transport:
-      type: streamable-http
-      url: https://mcp.pensyve.com/mcp
-      headers:
-        Authorization: "Bearer ${PENSYVE_API_KEY}"
+      type: stdio
+      command: pensyve-mcp
+      args:
+        - --stdio
 
-# Local (offline) — uncomment to use local stdio server instead
+# Self-hosted gateway (remote) — uncomment to use a pensyve-mcp-gateway you run.
+# Requires PENSYVE_API_KEY set to a key configured on your gateway.
+# See https://github.com/major7apps/pensyve/blob/main/docs/self-host.md
 # mcpServers:
 #   - name: pensyve
 #     transport:
-#       type: stdio
-#       command: pensyve-mcp
-#       args:
-#         - --stdio
-#       env:
-#         PENSYVE_PATH: ~/.pensyve/
-#         PENSYVE_NAMESPACE: default
+#       type: streamable-http
+#       url: http://localhost:3000/mcp
+#       headers:
+#         Authorization: "Bearer ${PENSYVE_API_KEY}"

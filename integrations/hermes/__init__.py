@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 _BREAKER_THRESHOLD = 5
 _BREAKER_COOLDOWN_SECS = 120
-_MCP_BASE_URL = "https://mcp.pensyve.com/mcp"
+_MCP_BASE_URL = "http://localhost:3000/mcp"
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +355,7 @@ class PensyveMemoryProvider(MemoryProvider):
                 "secret": True,
                 "required": True,
                 "env_var": "PENSYVE_API_KEY",
-                "url": "https://pensyve.com/settings/api-keys",
+                "url": "https://github.com/major7apps/pensyve/blob/main/docs/self-host.md",
             },
             {
                 "key": "entity",

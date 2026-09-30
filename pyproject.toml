@@ -26,9 +26,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://pensyve.com"
+Homepage = "https://github.com/major7apps/pensyve"
 Repository = "https://github.com/major7apps/pensyve"
-Documentation = "https://pensyve.com/docs"
+Documentation = "https://github.com/major7apps/pensyve/tree/main/docs"
 Changelog = "https://github.com/major7apps/pensyve/blob/main/CHANGELOG.md"
 Issues = "https://github.com/major7apps/pensyve/issues"
 

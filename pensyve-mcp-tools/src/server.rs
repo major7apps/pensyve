@@ -1128,8 +1128,7 @@ impl PensyveMcpServer {
         // is available but details come from the gateway layer.
         serde_json::to_string(&serde_json::json!({
             "mode": "remote",
-            "message": "Account information available via the Pensyve Cloud dashboard.",
-            "dashboard_url": "https://pensyve.com/settings/billing",
+            "message": "Account information is managed by the operator of this Pensyve server.",
         }))
         .map_err(|e| format!("Serialization error: {e}"))
     }

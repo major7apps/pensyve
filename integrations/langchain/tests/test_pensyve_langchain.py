@@ -346,7 +346,7 @@ class TestCloudMode:
 
         return PensyveStore(
             api_key="psy_test",
-            base_url="https://api.pensyve.com",
+            base_url="https://pensyve.example",
         )
 
     def test_cloud_put(self, cloud_store):
@@ -405,7 +405,7 @@ class TestCloudMode:
 
     def test_cloud_delete_ignores_not_found(self, cloud_store):
         error = urllib.error.HTTPError(
-            "https://api.pensyve.com/v1/entities/missing",
+            "https://pensyve.example/v1/entities/missing",
             404,
             "Not Found",
             None,
@@ -416,7 +416,7 @@ class TestCloudMode:
 
     def test_cloud_delete_reraises_other_http_errors(self, cloud_store):
         error = urllib.error.HTTPError(
-            "https://api.pensyve.com/v1/entities/user",
+            "https://pensyve.example/v1/entities/user",
             500,
             "Server Error",
             None,

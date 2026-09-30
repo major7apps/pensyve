@@ -77,7 +77,9 @@ By default the server stores memories in `~/.pensyve/default` under the
 you want a project-scoped store — set them in the `env` block of the MCP
 server config, or export them before launching OpenClaw.
 
-### Cloud (managed, zero install)
+### Self-hosted gateway (HTTP)
+
+Run a `pensyve-mcp-gateway` ([self-hosting guide](../self-host.md)) and point OpenClaw at its `/mcp` endpoint. The API key is one you configured on the gateway (`PENSYVE_API_KEYS`).
 
 ```bash
 export PENSYVE_API_KEY="psy_your_key_here"
@@ -88,7 +90,7 @@ export PENSYVE_API_KEY="psy_your_key_here"
   "mcpServers": {
     "pensyve": {
       "type": "http",
-      "url": "https://mcp.pensyve.com/mcp",
+      "url": "http://localhost:3000/mcp",
       "headers": {
         "Authorization": "Bearer ${PENSYVE_API_KEY}"
       }
@@ -97,12 +99,11 @@ export PENSYVE_API_KEY="psy_your_key_here"
 }
 ```
 
-Create a key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
 Put the `export` in `~/.bashrc` or `~/.zshrc` to persist it.
 
 ```bash
-openclaw mcp add pensyve-cloud \
-  --url https://mcp.pensyve.com/mcp \
+openclaw mcp add pensyve-gateway \
+  --url http://localhost:3000/mcp \
   --header 'Authorization=Bearer ${PENSYVE_API_KEY}'
 ```
 
@@ -126,7 +127,7 @@ Either transport exposes the same 9 tools:
 | `pensyve_inspect` | List memories for an entity |
 | `pensyve_forget` | Delete an entity's memories |
 | `pensyve_status` | Connection status, namespace, memory counts (free, not metered) |
-| `pensyve_account` | Plan, usage, and quota (cloud) or local-mode info |
+| `pensyve_account` | Plan, usage, and quota (gateway) or local-mode info |
 
 That's the same tool surface Claude Code, Cursor, and every other MCP client
 get — nothing OpenClaw-specific about it. Call `pensyve_remember` when
@@ -173,7 +174,7 @@ honored as of 1.3.1 (it was previously ignored — see Troubleshooting)
 "pensyve": {
   "enabled": true,
   "config": {
-    "baseUrl": "https://mcp.pensyve.com",   // or "http://localhost:3000" for a local pensyve-mcp-gateway
+    "baseUrl": "http://localhost:3000",   // your pensyve-mcp-gateway
     "entity": "my-agent",
     "autoRecall": true,
     "autoCapture": true,
@@ -222,7 +223,7 @@ choice for a pure-local setup.
 
 There is no `namespace` config field for the native plugin — the gateway's
 REST API has no per-request namespace parameter; it derives an isolated
-namespace purely from the authenticated tenant (API key in cloud mode, a
+namespace purely from the authenticated tenant (API key when the gateway has keys configured, a
 single shared default namespace in local/dev mode). Isolation for the native
 plugin path is by `entity` only. If you need real namespace isolation, use
 the MCP path's `PENSYVE_NAMESPACE` env var instead (see above), which is
@@ -233,23 +234,22 @@ honored by the `pensyve-mcp` binary the MCP path drives.
 | Field | Default | Notes |
 |---|---|---|
 | `baseUrl` | `http://localhost:3000` | Pensyve REST endpoint (native plugin only) |
-| `apiKey` | — | Cloud mode auto-activates when set; omit for local |
+| `apiKey` | — | Remote mode auto-activates when set; omit for local |
 | `entity` | `openclaw-agent` | Who memories are stored/recalled against |
 | `autoRecall` | `true` | Inject memories before each turn |
 | `autoCapture` | `true` | Store conversation context after each turn |
 | `recallLimit` | `5` | Max memories injected per turn |
 
 Mode resolution: explicit `apiKey` (or `PENSYVE_API_KEY` in the environment)
-switches the native plugin to cloud mode automatically; without one it stays
+switches the native plugin to remote mode automatically; without one it stays
 local. Set `mode` explicitly if you need to override the auto-detect.
 
 ## Troubleshooting
 
-- **`403 Invalid or revoked API key`** on the cloud MCP transport — the key
+- **`403 Invalid or revoked API key`** on the gateway MCP transport — the key
   is real syntax, wrong or expired credential. Distinguish this from a
   connection failure: a 403 means the server is reachable and the header
-  parsed, it just rejected the key. Issue a fresh one at
-  [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
+  parsed, it just rejected the key. Check the keys configured on your gateway (`PENSYVE_API_KEYS`).
 - **`extension entry not found`** on `openclaw plugins install` — you're on
   a pre-1.3.1 checkout. `dist/index.js` didn't match where `tsc` actually
   emitted the compiled entry point; fixed in 1.3.1 (see the plugin's
@@ -298,10 +298,8 @@ installed OpenClaw 2026.7.1-2 CLI and a release build of `pensyve-mcp`.
 
 Two things were **not** live-tested, both deliberately:
 
-- The cloud MCP transport was config-verified (the CLI correctly saves and
-  substitutes `${PENSYVE_API_KEY}`; a direct request against
-  `https://mcp.pensyve.com/mcp` returns a proper `403` for an invalid key,
-  confirming the endpoint and protocol) but not exercised end-to-end with a
+- The gateway MCP transport was config-verified (the CLI correctly saves and
+  substitutes `${PENSYVE_API_KEY}`) but not exercised end-to-end with a
   working key.
 - The native plugin's REST round trip (`/v1/recall`, `/v1/remember`, ...)
   was verified against a contract-accurate stand-in for

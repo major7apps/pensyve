@@ -20,7 +20,7 @@
 
 ## Use Case
 
-Browser-based playground and lightweight demos. See the [pensyve-cloud playground](/playground) for an interactive example.
+Browser-based playground and lightweight demos.
 
 ## Not Suitable For
 

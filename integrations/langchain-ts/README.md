@@ -35,7 +35,7 @@ export PENSYVE_API_KEY="psy_your_key_here"
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
-Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
+Run a self-hosted gateway (see the [self-host guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md)); the API key is the one your gateway operator configured.
 
 ---
 
@@ -73,7 +73,7 @@ import { MultiServerMCPClient } from "@langchain/mcp-adapters";
 const client = new MultiServerMCPClient({
   pensyve: {
     transport: "streamable_http",
-    url: "https://mcp.pensyve.com/mcp",
+    url: "http://localhost:3000/mcp",
     headers: { Authorization: `Bearer ${process.env.PENSYVE_API_KEY}` },
   },
 });
@@ -112,8 +112,8 @@ To disable the substrate, remove `SUBSTRATE_PROMPT.md` from the agent's `prompt`
 
 ## Links
 
-- [Pensyve](https://pensyve.com) — managed memory service
-- [API Keys](https://pensyve.com/settings/api-keys)
+- [Pensyve on GitHub](https://github.com/major7apps/pensyve)
+- [Self-host guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md)
 - [LangChain.js docs](https://js.langchain.com/)
 - [LangGraph.js docs](https://langchain-ai.github.io/langgraphjs/)
 

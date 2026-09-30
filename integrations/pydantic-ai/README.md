@@ -28,7 +28,7 @@ Set your API key:
 export PENSYVE_API_KEY="psy_your_key_here"
 ```
 
-Create an API key at [pensyve.com/settings/api-keys](https://pensyve.com/settings/api-keys).
+Run a self-hosted gateway (see the [self-host guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md)); the API key is the one your gateway operator configured.
 
 ---
 
@@ -55,7 +55,7 @@ from pydantic_ai.mcp import MCPServerHTTP
 substrate = Path("SUBSTRATE_PROMPT.md").read_text()
 
 pensyve = MCPServerHTTP(
-    url="https://mcp.pensyve.com/mcp",
+    url="http://localhost:3000/mcp",
     headers={"Authorization": f"Bearer {os.environ['PENSYVE_API_KEY']}"},
 )
 
@@ -110,9 +110,8 @@ To disable the substrate, remove `system_prompt=substrate` from agent constructi
 
 ## Links
 
-- [Pensyve](https://pensyve.com) — managed memory service
-- [API Keys](https://pensyve.com/settings/api-keys)
-- [MCP Server docs](https://docs.pensyve.com/mcp)
+- [Pensyve on GitHub](https://github.com/major7apps/pensyve)
+- [Self-host guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md)
 - [Pydantic AI docs](https://ai.pydantic.dev/)
 
 ## License

@@ -48,7 +48,7 @@ export default definePluginEntry({
   id: "pensyve",
   name: "Pensyve Memory",
   description:
-    "Offline-first memory with 8-signal fusion retrieval — semantic, episodic, and procedural memory types. Works with local Pensyve or Pensyve Cloud.",
+    "Offline-first memory with 8-signal fusion retrieval — semantic, episodic, and procedural memory types. Works with local or self-hosted Pensyve.",
 
   register(api: any) {
     const cfg = resolveConfig(api.pluginConfig as Partial<PensyveConfig>);

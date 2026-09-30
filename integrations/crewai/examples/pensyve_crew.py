@@ -13,7 +13,7 @@ Dependencies:
     pip install crewai crewai-tools
 
 Environment variables:
-    PENSYVE_API_KEY   — Pensyve API key (get one at pensyve.com/settings/api-keys)
+    PENSYVE_API_KEY   — Pensyve API key (configured by your self-hosted gateway operator)
     ANTHROPIC_API_KEY — Anthropic API key
 """
 
@@ -38,7 +38,7 @@ substrate = SUBSTRATE_PATH.read_text(encoding="utf-8")
 PENSYVE_API_KEY = os.environ["PENSYVE_API_KEY"]  # raises KeyError if unset
 
 pensyve_server_config = {
-    "url": "https://mcp.pensyve.com/mcp",
+    "url": "http://localhost:3000/mcp",
     "transport": "streamable_http",
     "headers": {"Authorization": f"Bearer {PENSYVE_API_KEY}"},
 }

@@ -34,7 +34,7 @@ npm install pensyve          # TypeScript (npm)
 go get github.com/major7apps/pensyve/pensyve-go/v3@latest  # Go
 ```
 
-Or use the MCP server directly with Claude Code, Cursor, or any MCP client — see [MCP Setup](https://pensyve.com/docs/getting-started/mcp-setup).
+Or use the MCP server directly with Claude Code, Cursor, or any MCP client — see [MCP Setup](https://github.com/major7apps/pensyve/blob/main/docs/GETTING_STARTED.md#mcp-server).
 
 ## Quick Start
 
@@ -267,7 +267,6 @@ pensyve/
 │   └── autogen/        Microsoft AutoGen multi-agent memory
 ├── tests/python/       Python integration tests
 ├── benchmarks/         LongMemEval_S evaluation + weight tuning
-├── website/            Astro + Tailwind static site for pensyve.com
 └── docs/               Architecture, roadmap, design specs, implementation plans
 ```
 

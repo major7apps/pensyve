@@ -6,9 +6,9 @@ rust-version = "1.88"
 readme = "README.md"
 description = "Universal memory runtime for AI agents — framework-agnostic, protocol-native, offline-first"
 license = "Apache-2.0"
-homepage = "https://pensyve.com"
+homepage = "https://github.com/major7apps/pensyve"
 repository = "https://github.com/major7apps/pensyve"
-documentation = "https://pensyve.com/docs"
+documentation = "https://github.com/major7apps/pensyve/tree/main/docs"
 
 [lib]
 name = "pensyve_python"
