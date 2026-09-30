@@ -14,6 +14,23 @@
     {
       "registryType": "oci",
       "identifier": "ghcr.io/major7apps/pensyve-mcp:4.0.0",
+      "runtimeHint": "docker",
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "description": "Persist memories in a Docker volume",
+          "name": "--mount",
+          "value": "type=volume,src={volume_name},dst=/home/pensyve/data",
+          "isRequired": true,
+          "variables": {
+            "volume_name": {
+              "description": "Docker volume that holds the Pensyve memory store",
+              "isRequired": true,
+              "default": "pensyve-data"
+            }
+          }
+        }
+      ],
       "transport": {
         "type": "stdio"
       }

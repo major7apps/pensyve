@@ -16,7 +16,15 @@ permissions:
 jobs:
   publish:
     name: Publish server.json
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    # Only a tag push to this repository may publish; a fork PR could rename
+    # its own workflow to "Release" and trigger this one.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      )
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
