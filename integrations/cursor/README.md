@@ -35,7 +35,7 @@ Copy `.cursor/mcp.json.example` to your project's `.cursor/mcp.json` and edit fo
 }
 ```
 
-Build the binary: `cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
+Install the binary: `cargo install --path pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
 
 **Self-hosted gateway (remote):**
 

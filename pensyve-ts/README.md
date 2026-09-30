@@ -57,7 +57,7 @@ await episode.end({ summary: "Discussed deployment strategy" });
 
 | Option      | Type     | Default                   | Description                                  |
 | ----------- | -------- | ------------------------- | -------------------------------------------- |
-| `baseUrl`   | `string` | `"http://localhost:8000"` | Pensyve API URL                              |
+| `baseUrl`   | `string` | —                         | Pensyve API URL                              |
 | `apiKey`    | `string` | —                         | API key (`psy_...`) for authenticated access |
 | `namespace` | `string` | `"default"`               | Memory namespace                             |
 | `timeout`   | `number` | `30000`                   | Request timeout in ms                        |

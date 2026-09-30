@@ -23,35 +23,35 @@ Merge the `config.yaml.example` fragment into your Continue config at `~/.contin
 ```yaml
 mcpServers:
   - name: pensyve
-    transport:
-      type: stdio
-      command: pensyve-mcp
-      args:
-        - --stdio
-      env:
-        PENSYVE_PATH: ~/.pensyve/
-        PENSYVE_NAMESPACE: default
+    command: pensyve-mcp
+    args:
+      - --stdio
+    env:
+      PENSYVE_PATH: ~/.pensyve/
+      PENSYVE_NAMESPACE: default
 ```
 
-Build the binary: `cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
+Install the binary: `cargo install --path pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
 
 **Self-hosted gateway (remote):**
 
+Add the key to `~/.continue/.env`, where Continue reads `secrets.*` values:
+
 ```bash
-export PENSYVE_API_KEY="psy_your_key_here"
+PENSYVE_API_KEY=psy_your_key_here
 ```
 
 ```yaml
 mcpServers:
   - name: pensyve
-    transport:
-      type: streamable-http
-      url: http://localhost:3000/mcp
+    type: streamable-http
+    url: http://localhost:3000/mcp
+    requestOptions:
       headers:
-        Authorization: "Bearer ${PENSYVE_API_KEY}"
+        Authorization: "Bearer ${{ secrets.PENSYVE_API_KEY }}"
 ```
 
-Set `PENSYVE_API_KEY` to a key configured on your own [`pensyve-mcp-gateway`](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md). Put the `export` in `~/.bashrc` or `~/.zshrc` to persist.
+Use a key configured on your own [`pensyve-mcp-gateway`](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md).
 
 ### 2. Install the rules
 

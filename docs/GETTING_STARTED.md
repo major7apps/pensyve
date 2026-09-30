@@ -39,7 +39,7 @@ Then point the plugin at a Pensyve MCP server (see Local below, or a self-hosted
 
 ### Local
 
-Build the MCP server first ([Building from Source](#building-from-source)), then add the MCP config to `.claude/settings.json`:
+Install the MCP server first ([Building from Source](#building-from-source)), then add the MCP config to `.mcp.json` at your project root (project scope) or `~/.claude.json` (user scope):
 
 ```json
 {
@@ -50,6 +50,12 @@ Build the MCP server first ([Building from Source](#building-from-source)), then
     }
   }
 }
+```
+
+Or register it from the CLI (add `--scope user` for user scope):
+
+```bash
+claude mcp add pensyve -- pensyve-mcp --stdio
 ```
 
 No API key needed.
@@ -74,6 +80,12 @@ export PENSYVE_API_KEY="psy_your_key"
     }
   }
 }
+```
+
+Or register it from the CLI:
+
+```bash
+claude mcp add --transport http pensyve http://localhost:3000/mcp --header "Authorization: Bearer ${PENSYVE_API_KEY}"
 ```
 
 See [`integrations/claude-code/README.md`](../integrations/claude-code/README.md) for full documentation on commands, skills, agents, and hooks.
@@ -150,7 +162,7 @@ Add to your client's MCP config (the exact file varies by client):
 }
 ```
 
-Build: `cargo build --release -p pensyve-mcp`
+Install: `cargo install --path pensyve-mcp` (from a checkout of the repo)
 
 | Client          | Config file                           |
 | --------------- | ------------------------------------- |

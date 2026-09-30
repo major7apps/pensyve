@@ -186,7 +186,7 @@ p.consolidate()
 Works with Antigravity CLI, Claude Code, Cursor, and any MCP-compatible client.
 
 ```bash
-cargo build --release --bin pensyve-mcp
+cargo install --path pensyve-mcp
 ```
 
 ```json
@@ -214,11 +214,11 @@ Install from the marketplace:
 /reload-plugins
 ```
 
-The plugin does not bundle an MCP server config — the backend is your choice. Add an `mcpServers.pensyve` entry to your `~/.claude/settings.json` (user-level) or `.claude/settings.json` (project-level). Pick one:
+The plugin does not bundle an MCP server config — the backend is your choice. Add an `mcpServers.pensyve` entry to `.mcp.json` at your project root (project scope) or `~/.claude.json` (user scope), or register it with `claude mcp add`. Pick one:
 
 **Local (stdio, no API key):**
 
-Build the MCP binary first (see [Install](#install)), then:
+Install the MCP binary first (see [Install](#install)), then add this to `.mcp.json` or `~/.claude.json`:
 
 ```json
 {
@@ -229,6 +229,12 @@ Build the MCP binary first (see [Install](#install)), then:
     }
   }
 }
+```
+
+Or register it from the CLI (add `--scope user` for user scope):
+
+```bash
+claude mcp add pensyve -- pensyve-mcp --stdio
 ```
 
 **Self-hosted gateway (HTTP):**
@@ -251,6 +257,12 @@ export PENSYVE_API_KEY="psy_your_key_here"
     }
   }
 }
+```
+
+Or register it from the CLI:
+
+```bash
+claude mcp add --transport http pensyve http://localhost:3000/mcp --header "Authorization: Bearer ${PENSYVE_API_KEY}"
 ```
 
 > **Note:** Use `headers` with `Authorization: Bearer` for remote MCP (HTTP transport). Use the top-level `env` block (Claude Code MCP schema) for local stdio servers that read environment variables at startup.
@@ -411,7 +423,7 @@ Pensyve uses the following environment variables across its components:
 | Variable               | Default                 | Description                   |
 | ---------------------- | ----------------------- | ----------------------------- |
 | `PENSYVE_API_KEY`      | _(none)_                | Gateway API key for remote mode |
-| `PENSYVE_REMOTE_URL`   | `http://localhost:8000` | Remote server URL             |
+| `PENSYVE_REMOTE_URL`   | `http://localhost:3000` | Remote server URL             |
 | `DATABASE_URL` | _(none)_                | Postgres connection string    |
 | `REDIS_URL`    | _(none)_                | Redis for caching, rate limiting, daily quotas |
 

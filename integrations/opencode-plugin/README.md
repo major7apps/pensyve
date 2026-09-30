@@ -25,11 +25,12 @@ Merge the following into your `opencode.json`:
 
 ```json
 {
-  "mcpServers": {
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
     "pensyve": {
-      "type": "stdio",
-      "command": "pensyve-mcp",
-      "args": ["--stdio"]
+      "type": "local",
+      "command": ["pensyve-mcp", "--stdio"],
+      "enabled": true
     }
   }
 }
@@ -37,7 +38,7 @@ Merge the following into your `opencode.json`:
 
 A ready-to-use example is at `opencode.mcp.json.example` — copy relevant keys into your `opencode.json`.
 
-Build the binary: `cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
+Install the binary: `cargo install --path pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
 
 **Self-hosted gateway (remote):**
 
@@ -47,13 +48,15 @@ export PENSYVE_API_KEY="psy_your_key_here"
 
 ```json
 {
-  "mcpServers": {
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
     "pensyve": {
-      "type": "http",
+      "type": "remote",
       "url": "http://localhost:3000/mcp",
       "headers": {
-        "Authorization": "Bearer ${PENSYVE_API_KEY}"
-      }
+        "Authorization": "Bearer {env:PENSYVE_API_KEY}"
+      },
+      "enabled": true
     }
   }
 }

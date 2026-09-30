@@ -37,7 +37,7 @@ Copy `.kiro/mcp.json.example` to `.kiro/mcp.json` in your project root and edit 
 }
 ```
 
-Build the binary: `cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
+Install the binary: `cargo install --path pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
 
 **Self-hosted gateway (remote):**
 

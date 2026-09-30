@@ -114,7 +114,7 @@ p.consolidate()
 Works with Claude Code, Cursor, and any MCP-compatible client.
 
 ```bash
-cargo build --release --bin pensyve-mcp
+cargo install --path pensyve-mcp
 ```
 
 ```json

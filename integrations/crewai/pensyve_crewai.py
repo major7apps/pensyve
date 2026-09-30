@@ -229,7 +229,7 @@ class PensyveMemory:
     fusion retrieval engine.
 
     Mode detection:
-        - If ``PENSYVE_API_KEY`` is set (or ``api_key`` is passed), uses the
+        - If ``PENSYVE_API_KEY`` is set (or ``api_key`` is passed), uses
           the remote Pensyve server (REST).
         - Otherwise, uses the local Pensyve SDK (PyO3 bindings + SQLite).
 

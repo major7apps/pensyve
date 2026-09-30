@@ -59,7 +59,7 @@ The plugin's bundled `.mcp.json` runs the local binary over stdio, so no per-pro
 }
 ```
 
-Build the binary: `cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
+Install the binary: `cargo install --path pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
 
 **Manual MCP config fallback:**
 

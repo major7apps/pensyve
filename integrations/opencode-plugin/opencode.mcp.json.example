@@ -1,9 +1,10 @@
 {
-  "mcpServers": {
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
     "pensyve": {
-      "type": "stdio",
-      "command": "pensyve-mcp",
-      "args": ["--stdio"]
+      "type": "local",
+      "command": ["pensyve-mcp", "--stdio"],
+      "enabled": true
     }
   }
 }

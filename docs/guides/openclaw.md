@@ -40,7 +40,7 @@ Build the server once:
 ```bash
 git clone https://github.com/major7apps/pensyve
 cd pensyve
-cargo build --release -p pensyve-mcp
+cargo install --path pensyve-mcp
 ```
 
 Point OpenClaw at the binary — either merge this into `openclaw.json` by

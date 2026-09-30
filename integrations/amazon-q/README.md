@@ -37,7 +37,7 @@ No API key needed — all data stays on your machine. Copy `.amazonq/mcp.json.ex
 }
 ```
 
-Build the binary: `cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
+Install the binary: `cargo install --path pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
 
 Or pass via CLI:
 

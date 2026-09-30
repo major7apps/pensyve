@@ -17,8 +17,8 @@ from typing import Any
 
 import pensyve
 
-LOCAL_DEFAULT = "http://localhost:8000"
-REMOTE_DEFAULT = os.environ.get("PENSYVE_REMOTE_URL", "http://localhost:8000")
+LOCAL_DEFAULT = "http://localhost:3000"
+REMOTE_DEFAULT = os.environ.get("PENSYVE_REMOTE_URL", "http://localhost:3000")
 
 
 @dataclass

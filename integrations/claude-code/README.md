@@ -55,20 +55,19 @@ Add the Pensyve marketplace and install:
 
 The plugin ships commands, skills, hooks, and agents — but does **not** bundle an MCP server config. This is intentional: your MCP backend (local stdio vs a self-hosted gateway) is a personal choice, so you configure them once in your own settings and they follow you across Claude Code updates without surprise.
 
-Add an `mcpServers.pensyve` entry to your `~/.claude/settings.json` (for all projects) or `.claude/settings.json` in a project (for project-only scope). Pick **one** of these two options:
+Add an `mcpServers.pensyve` entry to `.mcp.json` at your project root (project scope) or to `~/.claude.json` (user scope, all projects), or register it with `claude mcp add`. Claude Code does not read `mcpServers` from `settings.json`. Pick **one** of these two options:
 
 **Option 1 — Local (offline, recommended)**
 
-Build and install the MCP binary:
+Install the MCP binary:
 
 ```bash
 git clone https://github.com/major7apps/pensyve
 cd pensyve
-cargo build --release -p pensyve-mcp
-# Copy target/release/pensyve-mcp into your PATH
+cargo install --path pensyve-mcp  # installs to ~/.cargo/bin
 ```
 
-Then in settings:
+Then add this to `.mcp.json` or `~/.claude.json`:
 
 ```json
 {
@@ -79,6 +78,12 @@ Then in settings:
     }
   }
 }
+```
+
+Or register it from the CLI (add `--scope user` to make it available in all projects):
+
+```bash
+claude mcp add pensyve -- pensyve-mcp --stdio
 ```
 
 No API key needed — all data stays on your machine in SQLite.
@@ -103,6 +108,12 @@ export PENSYVE_API_KEY="psy_your_key_here"
     }
   }
 }
+```
+
+Or register it from the CLI:
+
+```bash
+claude mcp add --transport http pensyve http://localhost:3000/mcp --header "Authorization: Bearer ${PENSYVE_API_KEY}"
 ```
 
 Put the `export` in `~/.bashrc` or `~/.zshrc` to persist. Works everywhere (local dev, CI, headless boxes, containers).

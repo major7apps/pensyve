@@ -34,9 +34,8 @@ fi
 
 if [ "$USE_LOCAL" = "1" ]; then
   if ! command -v pensyve-mcp >/dev/null 2>&1; then
-    echo "ERROR: 'pensyve-mcp' binary not on PATH. Build with:"
-    echo "  cargo build --release -p pensyve-mcp"
-    echo "  cp target/release/pensyve-mcp /usr/local/bin/"
+    echo "ERROR: 'pensyve-mcp' binary not on PATH. Install with (from a checkout of the repo):"
+    echo "  cargo install --path pensyve-mcp"
     exit 1
   fi
   echo "Mode: Local stdio (pensyve-mcp binary)"

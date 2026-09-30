@@ -39,7 +39,7 @@ Merge the following into your `openclaw.json`:
 
 A ready-to-use example is at `openclaw.mcp.json.example`.
 
-Build the binary: `cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
+Install the binary: `cargo install --path pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
 
 **Self-hosted gateway (remote):**
 

@@ -26,7 +26,7 @@ When the user invokes `/consolidate`, follow these steps:
      cargo run -p pensyve-cli -- consolidate
 
      # Via REST API
-     curl -X POST http://localhost:8000/v1/consolidate
+     curl -X POST http://localhost:3000/v1/consolidate
      ```
 
    - Suggest running `/memory-status` to review current memory health before consolidating.

@@ -23,7 +23,7 @@ require("mcphub").setup({
 })
 ```
 
-Build from source: `cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
+Install from source: `cargo install --path pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
 
 ## Self-hosted Gateway (Remote)
 

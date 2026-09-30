@@ -1,8 +1,12 @@
 # Smithery configuration — https://smithery.ai/docs/build/project-config/smithery-yaml
 # Pensyve: Universal memory runtime for AI agents
 #
-# Local MCP server over stdio: cargo install pensyve-mcp (offline, Apache-2.0)
+# Runs the local MCP server over stdio from pensyve-mcp/Dockerfile (offline, Apache-2.0).
 # Self-hosting over HTTP: https://github.com/major7apps/pensyve/blob/main/docs/self-host.md
+
+build:
+  dockerfile: pensyve-mcp/Dockerfile
+  dockerBuildPath: .
 
 startCommand:
   type: stdio

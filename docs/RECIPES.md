@@ -165,7 +165,7 @@ findings = memory.recall("competitor pricing and market trends", limit=5)
 **Local** (2 minutes):
 
 ```bash
-cargo build --release -p pensyve-mcp
+cargo install --path pensyve-mcp
 ```
 
 ```json

@@ -47,7 +47,7 @@ The [`shared/`](shared/) directory contains the common Pensyve client libraries 
 Every integration connects to Pensyve via MCP. The default is the local stdio
 server, which needs no account or API key:
 
-1. Build the binary: `cargo build --release -p pensyve-mcp` from the repo root
+1. Install the binary: `cargo install --path pensyve-mcp` from the repo root
 2. Follow the setup instructions in the integration's own README
 
 To use a remote endpoint instead, run your own `pensyve-mcp-gateway` and follow

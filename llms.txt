@@ -31,7 +31,7 @@ The MCP server exposes 10 tools: `pensyve_recall`, `pensyve_remember`, `pensyve_
 }
 ```
 
-Build: `cargo build --release -p pensyve-mcp`
+Install: `cargo install --path pensyve-mcp` (from a checkout of the repo)
 
 ### Claude Code Plugin
 

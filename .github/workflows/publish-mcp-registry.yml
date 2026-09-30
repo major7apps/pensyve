@@ -1,11 +1,12 @@
 name: Publish MCP Registry
 
+# server.json lists the ghcr image that the Release workflow pushes, and the
+# registry checks that image's ownership label, so publish only after a
+# successful release.
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - server.json
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -15,9 +16,12 @@ permissions:
 jobs:
   publish:
     name: Publish server.json
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Install MCP publisher
         env:
@@ -35,7 +39,10 @@ jobs:
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
       - name: Validate manifest
-        run: mcp-publisher validate server.json
+        run: |
+          mcp-publisher validate server.json
+          # The OCI package tag must match the manifest version.
+          jq -e '.version as $v | all(.packages[]; .identifier | endswith(":" + $v))' server.json
 
       - name: Authenticate with GitHub OIDC
         run: mcp-publisher login github-oidc

@@ -1,5 +1,5 @@
 {
-  "_comment": "Local (offline) Pensyve MCP configuration for Amazon Q Developer. No API key needed — all data stays on your machine. Build from source: cargo build --release -p pensyve-mcp",
+  "_comment": "Local (offline) Pensyve MCP configuration for Amazon Q Developer. No API key needed — all data stays on your machine. Install from source: cargo install --path pensyve-mcp",
 
   "mcpServers": {
     "pensyve": {

@@ -243,6 +243,29 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.*
 
+  # ── Publish MCP server image to ghcr (MCP registry + Smithery) ────────────
+  # server.json's OCI package points at this image, so the registry publish
+  # (publish-mcp-registry.yml) runs only after this workflow succeeds.
+  publish-mcp-image:
+    name: Publish MCP image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Log in to ghcr.io
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Build and push
+        run: |
+          IMAGE=ghcr.io/major7apps/pensyve-mcp
+          VERSION="${GITHUB_REF_NAME#v}"
+          docker build -f pensyve-mcp/Dockerfile \
+            --build-arg SOURCE_SHA="${GITHUB_SHA}" \
+            -t "${IMAGE}:${VERSION}" -t "${IMAGE}:latest" .
+          docker push "${IMAGE}:${VERSION}"
+          docker push "${IMAGE}:latest"
+
   # ── Package Codex plugin ──────────────────────────────────────────────────
   package-codex-plugin:
     name: Package Codex plugin

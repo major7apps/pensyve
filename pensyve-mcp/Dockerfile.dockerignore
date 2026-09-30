@@ -1,0 +1,7 @@
+.git
+target
+**/.fastembed_cache
+**/.venv
+**/__pycache__
+**/*.so
+**/node_modules

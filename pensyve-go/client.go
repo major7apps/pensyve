@@ -15,7 +15,7 @@ import (
 
 // Config holds the configuration for a Pensyve client.
 type Config struct {
-	// BaseURL is the base URL of the Pensyve REST API (e.g., "http://localhost:8000").
+	// BaseURL is the base URL of the Pensyve REST API (e.g., "http://localhost:3000").
 	BaseURL string
 	// APIKey is an optional API key sent via the Authorization: Bearer header.
 	APIKey string

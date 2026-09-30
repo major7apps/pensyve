@@ -8,7 +8,7 @@ Persistent working memory for Google Antigravity CLI. The native plugin supplies
 agy plugin install https://github.com/major7apps/pensyve/tree/main/integrations/antigravity-plugin
 ```
 
-Build and install the local MCP binary (`cargo build --release -p pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve)), then start `agy`, open `/mcp`, and select **Pensyve**. The bundled MCP configuration runs `pensyve-mcp --stdio`; no credentials are needed and all data stays on your machine.
+Install the local MCP binary (`cargo install --path pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve)), then start `agy`, open `/mcp`, and select **Pensyve**. The bundled MCP configuration runs `pensyve-mcp --stdio`; no credentials are needed and all data stays on your machine.
 
 ## MCP-only setup
 

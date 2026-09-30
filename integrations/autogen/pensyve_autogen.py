@@ -116,8 +116,8 @@ except ImportError:
 # Dual-mode config helpers (same pattern as shared/pensyve_client.py)
 # ---------------------------------------------------------------------------
 
-LOCAL_DEFAULT = "http://localhost:8000"
-REMOTE_DEFAULT = os.environ.get("PENSYVE_REMOTE_URL", "http://localhost:8000")
+LOCAL_DEFAULT = "http://localhost:3000"
+REMOTE_DEFAULT = os.environ.get("PENSYVE_REMOTE_URL", "http://localhost:3000")
 
 
 def _detect_mode(api_key: str | None) -> str:
