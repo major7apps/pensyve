@@ -39,10 +39,18 @@ jobs:
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
       - name: Validate manifest
+        env:
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
         run: |
           mcp-publisher validate server.json
           # The OCI package tag must match the manifest version.
           jq -e '.version as $v | all(.packages[]; .identifier | endswith(":" + $v))' server.json
+          # After a release, the manifest version must match the tag whose image
+          # release.yml just pushed.
+          if [ -n "${RELEASE_TAG}" ]; then
+            jq -e --arg v "${RELEASE_TAG#v}" '.version == $v' server.json \
+              || { echo "server.json version does not match release tag ${RELEASE_TAG}; bump it in the release commit" >&2; exit 1; }
+          fi
 
       - name: Authenticate with GitHub OIDC
         run: mcp-publisher login github-oidc
