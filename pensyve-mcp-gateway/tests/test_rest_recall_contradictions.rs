@@ -4,9 +4,9 @@ use axum::Extension;
 use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::reranker::Reranker;
-use pensyve_core::storage::StorageTrait;
 use pensyve_core::storage::sqlite::SqliteBackend;
-use pensyve_core::types::{Entity, EntityKind, Namespace, SemanticMemory};
+use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
+use pensyve_core::types::{Entity, EntityKind, Memory, Namespace, SemanticMemory};
 use pensyve_mcp_gateway::AppState;
 use pensyve_mcp_gateway::auth::{AuthContext, AuthValidator};
 use pensyve_mcp_gateway::config::GatewayConfig;
@@ -150,28 +150,38 @@ fn store_semantic_pair(state: &AppState, first_object: &str, second_object: &str
         .save_entity(&subject)
         .expect("save subject entity");
 
-    let first = SemanticMemory::new(
+    let mut first = SemanticMemory::new(
         pensyve_state.namespace.id,
         subject.id,
         "works_at",
         first_object,
         0.9,
     );
-    let second = SemanticMemory::new(
+    let mut second = SemanticMemory::new(
         pensyve_state.namespace.id,
         subject.id,
         "works_at",
         second_object,
         0.9,
     );
-    pensyve_state
-        .storage
-        .save_semantic(&first)
-        .expect("save first semantic memory");
-    pensyve_state
-        .storage
-        .save_semantic(&second)
-        .expect("save second semantic memory");
+    // Tenant namespaces are created with an active embedding lifecycle, so
+    // each source row is saved with its embedding generation.
+    for memory in [&mut first, &mut second] {
+        memory.embedding = pensyve_state
+            .embedder
+            .embed(&format!("{} {}", memory.predicate, memory.object))
+            .expect("embed semantic memory");
+        let wrapped = Memory::Semantic(memory.clone());
+        let record = embedding_record_for_memory(
+            &wrapped,
+            pensyve_state.vector_runtime.space(),
+            memory.embedding.clone(),
+        );
+        pensyve_state
+            .storage
+            .save_memory_with_embedding(&wrapped, Some(&record))
+            .expect("save semantic memory with its embedding");
+    }
 
     [first.id, second.id]
 }

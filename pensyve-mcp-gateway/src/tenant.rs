@@ -9,7 +9,7 @@ use pensyve_core::config::RetrievalConfig;
 use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::reranker::Reranker;
 use pensyve_core::snapshot::RetentionPolicy;
-use pensyve_core::storage::StorageTrait;
+use pensyve_core::storage::{StorageError, StorageTrait};
 use pensyve_core::types::Namespace;
 use pensyve_mcp_tools::{PensyveState, VectorRuntime};
 
@@ -60,6 +60,47 @@ pub struct TenantStateManager {
     /// the shared volume without limit, which only works if it applies to all
     /// of them.
     snapshot_retention: RetentionPolicy,
+}
+
+/// Give a served namespace an embedding lifecycle if it has none, as the stdio
+/// server does at startup.
+///
+/// Without lifecycle state a namespace stores no dense embeddings and cannot
+/// consolidate. Existing state is never touched: it may be an operator-managed
+/// migration, or an active space other than this runtime's. A backend that
+/// does not support local initialization (Postgres, which uses the explicit
+/// migration protocol) is left as it is.
+///
+/// # Errors
+/// Returns an error when the state cannot be read, the runtime embedding space
+/// cannot be resolved, or initialization fails for a reason other than
+/// [`StorageError::Unsupported`].
+pub fn ensure_namespace_embedding_lifecycle(
+    storage: &dyn StorageTrait,
+    embedder: &OnnxEmbedder,
+    namespace_id: Uuid,
+) -> Result<(), std::io::Error> {
+    let existing = storage
+        .get_namespace_embedding_state(namespace_id)
+        .map_err(|e| {
+            std::io::Error::other(format!("Failed to read namespace embedding state: {e}"))
+        })?;
+    if existing.is_some() {
+        return Ok(());
+    }
+    let space = embedder.embedding_space().map_err(|e| {
+        std::io::Error::other(format!("Failed to resolve runtime embedding space: {e}"))
+    })?;
+    match storage.initialize_local_runtime_space(namespace_id, space) {
+        Ok(_) => Ok(()),
+        Err(StorageError::Unsupported(reason)) => {
+            tracing::debug!(%namespace_id, %reason, "embedding lifecycle left to migration protocol");
+            Ok(())
+        }
+        Err(e) => Err(std::io::Error::other(format!(
+            "Failed to initialize embedding lifecycle for namespace {namespace_id}: {e}"
+        ))),
+    }
 }
 
 impl TenantStateManager {
@@ -285,6 +326,9 @@ impl TenantStateManager {
                 )));
             }
         };
+        // On cache miss only, so namespaces created before this existed are
+        // covered after a restart without adding a read to every request.
+        ensure_namespace_embedding_lifecycle(self.storage.as_ref(), &self.embedder, namespace.id)?;
 
         Ok(namespace)
     }

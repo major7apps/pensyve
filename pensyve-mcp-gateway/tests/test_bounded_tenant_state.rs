@@ -15,7 +15,7 @@ use pensyve_core::storage::{
 use pensyve_core::types::{
     Edge, Entity, Episode, EpisodicMemory, Memory, Namespace, ProceduralMemory, SemanticMemory,
 };
-use pensyve_mcp_gateway::tenant::TenantStateManager;
+use pensyve_mcp_gateway::tenant::{TenantStateManager, ensure_namespace_embedding_lifecycle};
 use pensyve_mcp_tools::VectorRuntime;
 use uuid::Uuid;
 
@@ -410,4 +410,26 @@ fn concurrent_same_key_performs_exactly_one_backend_resolution() {
         1
     );
     assert_eq!(storage.namespace_bulk_loads.load(Ordering::SeqCst), 0);
+}
+
+/// `CountingStorage` keeps the trait default for
+/// `initialize_local_runtime_space`, which returns `Unsupported` the way the
+/// Postgres backend does. Lifecycle setup must then be a no-op, not an error.
+#[test]
+fn unsupported_local_lifecycle_initialization_is_a_no_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, storage) = manager(&dir);
+    let state = manager.get_tenant_state("unsupported").unwrap();
+    assert!(
+        storage
+            .get_namespace_embedding_state(state.namespace.id)
+            .unwrap()
+            .is_none()
+    );
+    ensure_namespace_embedding_lifecycle(
+        storage.as_ref(),
+        &OnnxEmbedder::new_mock(8),
+        state.namespace.id,
+    )
+    .unwrap();
 }

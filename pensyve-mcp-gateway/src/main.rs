@@ -33,7 +33,7 @@ use pensyve_mcp_gateway::middleware::tracing::TracingLayer;
 use pensyve_mcp_gateway::oauth;
 use pensyve_mcp_gateway::rate_limit::{self, RateLimitLayer};
 use pensyve_mcp_gateway::rest;
-use pensyve_mcp_gateway::tenant::TenantStateManager;
+use pensyve_mcp_gateway::tenant::{TenantStateManager, ensure_namespace_embedding_lifecycle};
 use pensyve_mcp_gateway::usage::{self, UsageReporter};
 use pensyve_mcp_gateway::usage_counter::{self, UsageCounter};
 use pensyve_mcp_gateway::{AppState, build_tenant_key, parse_agent_id_header};
@@ -781,6 +781,8 @@ fn main() -> Result<()> {
     if mode == Some(BACKFILL_EMBEDDINGS_MODE) {
         return backfill_embeddings(res.storage.as_ref(), res.embedder.as_ref());
     }
+    // Serving only, and outside the runtime like the rest of storage setup.
+    ensure_namespace_embedding_lifecycle(res.storage.as_ref(), &res.embedder, res.namespace.id)?;
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -439,17 +439,17 @@ async fn foreign_namespace_entity_uuid_returns_not_found_without_deleting_memori
         .storage
         .save_entity(&foreign_entity)
         .expect("save foreign entity");
-    let foreign_memory = SemanticMemory::new(
+    let mut foreign_memory = SemanticMemory::new(
         foreign_state.namespace.id,
         foreign_entity.id,
         "likes",
         "coffee",
         0.9,
     );
-    foreign_state
-        .storage
-        .save_semantic(&foreign_memory)
-        .expect("save foreign memory");
+    // Tenant namespaces are created with an active embedding lifecycle, so the
+    // source row needs its embedding generation alongside it.
+    foreign_memory.embedding = foreign_state.embedder.embed("likes coffee").unwrap();
+    save_with_generation(&foreign_state, &Memory::Semantic(foreign_memory.clone()));
 
     let response = forget(&client, &url, &foreign_entity.id.to_string()).await;
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
