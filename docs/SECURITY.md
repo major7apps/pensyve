@@ -368,6 +368,34 @@ DDL indefinitely — the database is fine and the application will not start.
 Running the new build as the owner for step 1 collapses steps 1 and 2 into one
 action, which is the simplest way to do this.
 
+##### Rolling back to an earlier build costs the same owner-run startup
+
+The marker records the digest of the schema *text* that was last applied, not a
+version number, and it does not know which direction you are moving in. A
+rollback to a build whose `postgres_schema.sql` differs from the one last
+applied is therefore the same case as an upgrade: the older build reads a digest
+that is not its own, concludes the schema is not current, and runs its DDL
+batch. On the serving role that fails with the same owner-only error.
+
+So a rollback across a schema-text change needs one startup of the older build
+on an owner connection before `pensyve_app` can serve again, exactly like step 2
+above. Plan for it: a rollback you expect to be a quick redeploy of the previous
+image will not start as the serving role until that owner-run startup has
+happened. Rolling forward again afterwards costs another one, for the same
+reason.
+
+That startup logs `database schema is not at this build's version; applying it`
+and stamps the older build's digest.
+
+It does not undo the newer build's schema. The older build sends its own schema
+text, and that text only creates what is missing, so tables, columns and indexes
+the newer build added stay in place. The policies are the exception: the file
+drops and re-creates each policy it defines, so those return to the older
+build's definitions.
+
+None of this applies when the two builds ship the same `postgres_schema.sql`.
+The stored digest matches, the DDL is skipped, and the serving role starts.
+
 `NOBYPASSRLS` is required because a role with `BYPASSRLS`, and any superuser,
 ignores every policy — the startup self-check above will warn if you get this
 wrong.
