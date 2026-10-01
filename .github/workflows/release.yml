@@ -83,9 +83,9 @@ jobs:
         env:
           PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
 
-  # ── Publish to npm (skipped if NPM_TOKEN not configured) ───────────────────
+  # ── Stage on npm for approval (skipped if NPM_TOKEN not configured) ───────────────────
   publish-npm:
-    name: Publish to npm
+    name: Stage on npm
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -142,10 +142,15 @@ jobs:
           fi
 
           echo "NPM_SHOULD_PUBLISH=true" >> "$GITHUB_ENV"
-      - name: Publish to npm
+      # npm no longer lets a token publish directly: tokens that bypass 2FA can
+      # only stage a version. This stages it with provenance; an owner then
+      # approves it (`npm stage approve <id>` or on npmjs.com) to make it live.
+      - name: Stage on npm for approval
         if: env.HAS_NPM_TOKEN != '' && env.NPM_SHOULD_PUBLISH == 'true'
         working-directory: pensyve-ts
-        run: npm publish --access public --provenance
+        run: |
+          npm stage publish --access public --provenance
+          echo "::notice::@pensyve/sdk is staged on npm, not live. Approve it with 'npm stage approve <id>' or on npmjs.com."
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
