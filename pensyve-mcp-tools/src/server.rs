@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerConfig};
 use rmcp::serde_json;
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use uuid::Uuid;
@@ -1139,8 +1139,8 @@ impl PensyveMcpServer {
 #[allow(clippy::unused_async_trait_impl)]
 #[tool_handler]
 impl ServerHandler for PensyveMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_server_info(Implementation::new("pensyve-mcp", "0.1.0"))
             .with_instructions(

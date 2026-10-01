@@ -24,7 +24,7 @@ sha2 = "0.11"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
-dirs = "6"
+dirs = "7"
 regex = "1"
 # Previously exact-pinned to =5.17.2 after PR #190 attributed a 2/6
 # no-network-invariant-test failure to the 5.17.2 -> 5.17.3 bump. Issue #191
