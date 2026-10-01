@@ -2087,7 +2087,8 @@ impl PyPensyve {
     ///
     /// Args:
     ///     entity: The entity whose memories to forget.
-    ///     `hard_delete`: If True, permanently delete; otherwise archive (default: True).
+    ///     `hard_delete`: Must be True (the default). Soft delete is not
+    ///         supported and raises `RuntimeError`.
     ///
     /// Returns:
     ///     Dict with `forgotten_count`, and `snapshot_path` when anything was
