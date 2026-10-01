@@ -14,7 +14,7 @@ use pensyve_core::types::Namespace;
 use pensyve_mcp_tools::{PensyveState, VectorRuntime};
 
 const MAX_CACHED_TENANTS: usize = 1_024;
-const TENANT_TIME_TO_IDLE: Duration = Duration::from_secs(30 * 60);
+const TENANT_TIME_TO_IDLE: Duration = Duration::from_mins(30);
 type TenantClock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 #[derive(Clone)]
@@ -499,7 +499,7 @@ mod tests {
         manager.get_tenant_state("idle").unwrap();
         assert_eq!(manager.cached_tenant_count(), 1);
 
-        *now.lock().unwrap() += std::time::Duration::from_secs(30 * 60);
+        *now.lock().unwrap() += std::time::Duration::from_mins(30);
         manager.get_tenant_state("fresh").unwrap();
 
         assert!(
