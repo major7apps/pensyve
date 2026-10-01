@@ -111,7 +111,9 @@ maintenance mode: security fixes and dependency updates, no new features. See
    without `PENSYVE_API_KEYS`, clients now need a credential. If you validate
    JWTs, set `OAUTH_ISSUER` and `OAUTH_AUDIENCE`.
 2. If you relied on the `business` or `enterprise` plan limits, set
-   `PENSYVE_RATE_LIMIT` and `PENSYVE_DAILY_QUOTA` to the values you want.
+   `PENSYVE_RATE_LIMIT` and `PENSYVE_DAILY_QUOTA` to the values you want. The
+   daily quota is enforced only when `REDIS_URL` is set; without it the gateway
+   applies the per-minute limit alone.
 3. Custom `StorageTrait` backends must implement `save_observation` and
    `purge_namespace`.
 4. No schema change. Existing stores open as they are.
