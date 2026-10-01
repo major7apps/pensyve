@@ -6,8 +6,6 @@
 
 (Only Claude-specific overrides go here. Everything else is in AGENTS.md.)
 
-- Skills: `pensyve:*` MCP skills are available; use `Skill` / `mcp__pensyve__*` tools.
-- Memory: All memory goes through Pensyve MCP (`pensyve_remember` / `pensyve_recall`). Do NOT write to `.claude/` memory files — they are legacy.
 - Subagents: prefer specialist agents (`systems-programming:rust-pro`, `python-development:*`, `javascript-typescript:*`, `feature-dev:code-architect`, `Explore`) over the generic agent when the task matches their description.
 
 ## See also
