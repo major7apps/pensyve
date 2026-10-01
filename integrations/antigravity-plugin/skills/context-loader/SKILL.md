@@ -130,4 +130,4 @@ Rules for full mode:
 
 - If `pensyve_inspect` fails, report the error and suggest checking the MCP server connection.
 - If an explicitly requested broader recall partly fails, present successful results and note the failures briefly.
-- If the MCP server is not connected, inform the user: "Pensyve MCP server is not connected. Context loading skipped. Open `/mcp` and authenticate Pensyve."
+- If the MCP server is not connected, inform the user: "Pensyve MCP server is not connected. Context loading skipped. Open `/mcp` and select Pensyve."

@@ -77,7 +77,7 @@ Beta-binomial posterior: `reliability = (successes + 1) / (trials + 2)`
   partial vector ranking.
 - SQLite and Postgres share the same filters, deterministic tie ordering, and
   immutable embedding-generation identity. PostgreSQL parity still requires the
-  live PostgreSQL suite; SQLite proof alone is not a hosted-backend claim.
+  live PostgreSQL suite; SQLite proof alone is not a Postgres-backend claim.
 
 ### Embedding migration and degradation
 

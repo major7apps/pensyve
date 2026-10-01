@@ -6,7 +6,7 @@
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Consumers                                │
 │  ┌──────────┐ ┌──────────┐ ┌──────────────┐ ┌──────────┐      │
-│  │ Python   │ │ MCP      │ │ Cloud Gateway│ │ TypeScript│      │
+│  │ Python   │ │ MCP      │ │ HTTP Gateway │ │ TypeScript│      │
 │  │ SDK      │ │ Server   │ │ REST + MCP   │ │ SDK      │      │
 │  │(PyO3)    │ │(stdio)   │ │(Rust/Axum)   │ │(HTTP)    │      │
 │  └────┬─────┘ └────┬─────┘ └──────┬───────┘ └────┬─────┘      │
@@ -81,7 +81,7 @@
 
 Storage is abstracted via `StorageTrait`, allowing SQLite and Postgres to be swapped transparently.
 
-## Cloud Gateway (`pensyve-mcp-gateway/`)
+## HTTP Gateway (`pensyve-mcp-gateway/`)
 
 Single Rust/Axum binary serving REST (`/v1/*`) and MCP (`/mcp`) on port 3000:
 
@@ -164,7 +164,7 @@ only its active generation to semantic retrieval, so mock, legacy-unknown, old-r
 and target-real vectors cannot mix. Missing or mismatched active provenance degrades
 explicitly to lexical-only retrieval; it never ranks a partial vector population.
 
-Local SQLite and hosted Postgres implement the same storage contract and ordering.
+SQLite and Postgres implement the same storage contract and ordering.
 The enforced bounds are:
 
 | Work | Hard bound |
@@ -177,8 +177,8 @@ The enforced bounds are:
 | General memory page | 256 rows |
 | Consolidation comparison page | 64 rows |
 | Promotion cluster | 4,096 members |
-| Hosted recall admission | 8 concurrent reservations and 64 MiB |
-| Hosted tenant metadata cache | 1,024 entries, 30-minute idle expiry |
+| Gateway recall admission | 8 concurrent reservations and 64 MiB |
+| Gateway tenant metadata cache | 1,024 entries, 30-minute idle expiry |
 
 Embedding replacement is a one-session-per-namespace migration: one target
 generation is backfilled in 256-row pages, verified for complete coverage, then

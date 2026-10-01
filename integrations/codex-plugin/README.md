@@ -12,7 +12,7 @@ Persistent working-memory substrate for the [OpenAI Codex CLI](https://github.co
 
 ## Install
 
-Recommended path: install the Codex plugin package, then authenticate the bundled MCP server.
+Recommended path: install the Codex plugin package, then configure the bundled MCP server.
 
 Tagged Pensyve releases include a `pensyve-codex-plugin-v*.tar.gz` asset containing this plugin directory for pinned installs.
 

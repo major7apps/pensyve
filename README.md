@@ -305,7 +305,7 @@ Install the native Pensyve plugin for Google Antigravity CLI:
 agy plugin install https://github.com/major7apps/pensyve/tree/main/integrations/antigravity-plugin
 ```
 
-The plugin bundles eight working-memory rules, eight skills, and a URL-only remote MCP definition. Open `/mcp` in Antigravity and authenticate Pensyve in the browser; no API key is stored in the plugin.
+The plugin bundles eight working-memory rules, eight skills, and a local stdio MCP definition (`pensyve-mcp --stdio`, no API key). Install `pensyve-mcp` first (see [Install](#install)), then open `/mcp` in Antigravity and select Pensyve.
 
 See [`integrations/antigravity-plugin/README.md`](integrations/antigravity-plugin/README.md) for MCP-only, local-stdio, and migration setup.
 
@@ -486,7 +486,7 @@ pensyve/
 ├── pensyve_server/       Shared Python utilities — billing, extraction
 ├── integrations/       All integrations — IDE plugins, framework adapters, code harnesses
 │   ├── claude-code/    Claude Code plugin (commands, skills, agents, hooks)
-│   ├── antigravity-plugin/ Antigravity plugin (rules, skills, OAuth MCP)
+│   ├── antigravity-plugin/ Antigravity plugin (rules, skills, MCP config)
 │   ├── vscode/         VS Code sidebar extension
 │   ├── openclaw-plugin/ OpenClaw native memory plugin (TypeScript)
 │   ├── opencode-plugin/ OpenCode native memory plugin (TypeScript)

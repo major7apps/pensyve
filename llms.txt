@@ -48,7 +48,7 @@ Provides 6 slash commands (`/remember`, `/recall`, `/forget`, `/inspect`, `/cons
 agy plugin install https://github.com/major7apps/pensyve/tree/main/integrations/antigravity-plugin
 ```
 
-Provides 8 working-memory rules, 8 skills, and a URL-only OAuth MCP definition. Open `/mcp` in Antigravity to authenticate. Full setup: [Antigravity plugin README](https://github.com/major7apps/pensyve/blob/main/integrations/antigravity-plugin/README.md).
+Provides 8 working-memory rules, 8 skills, and a local stdio MCP definition (`pensyve-mcp --stdio`, no API key). Open `/mcp` in Antigravity and select Pensyve. Full setup: [Antigravity plugin README](https://github.com/major7apps/pensyve/blob/main/integrations/antigravity-plugin/README.md).
 
 ### Python SDK (PyO3, zero-overhead)
 

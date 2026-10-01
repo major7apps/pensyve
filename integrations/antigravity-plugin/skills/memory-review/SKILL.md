@@ -156,4 +156,4 @@ Report results after each action.
 - If `pensyve_recall` returns errors, report partial results and note which queries failed.
 - If `pensyve_forget` fails during cleanup, report the error and continue with remaining actions.
 - If `pensyve_forget_memory` fails during cleanup, report the error and continue with remaining actions.
-- If the MCP server is not connected, tell the user to open `/mcp` and authenticate Pensyve.
+- If the MCP server is not connected, tell the user to open `/mcp` and select Pensyve.

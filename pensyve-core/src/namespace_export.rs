@@ -420,7 +420,7 @@ mod tests {
         let space = embedder.embedding_space().expect("mock space").clone();
 
         let (_source_dir, source_db) = store();
-        let (namespace, episodic_id) = seed(&source_db, &space, "jeremy");
+        let (namespace, episodic_id) = seed(&source_db, &space, "exported");
         // A second tenant in the same source store. The export must not touch it.
         let (other, _) = seed(&source_db, &space, "someone-else");
 
@@ -709,7 +709,7 @@ mod tests {
         let space = embedder.embedding_space().expect("mock space").clone();
 
         let (_source_dir, source_db) = store();
-        let (namespace, _) = seed(&source_db, &space, "jeremy");
+        let (namespace, _) = seed(&source_db, &space, "exported");
 
         let stale = Memory::Semantic(SemanticMemory::new(
             namespace.id,

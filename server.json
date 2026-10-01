@@ -75,7 +75,7 @@
     },
     {
       "name": "pensyve_account",
-      "description": "Plan, usage, and quota information"
+      "description": "Account, usage, and quota information"
     }
   ],
   "tags": [

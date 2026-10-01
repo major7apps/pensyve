@@ -24,7 +24,7 @@ What should happen.
 - OS:
 - Pensyve version:
 - Interface: [Python SDK / TypeScript SDK / MCP / REST API / CLI]
-- Storage: [SQLite / Postgres / Cloud]
+- Storage: [SQLite / Postgres]
 
 **Logs**
 

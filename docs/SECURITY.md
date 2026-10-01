@@ -33,7 +33,7 @@ entities), **Public** (any authenticated caller in the namespace).
 ## Multi-Tenant Isolation
 
 Every memory is scoped to an `(agent_id, user_id)` pair within a namespace.
-Cross-tenant queries are rejected at the storage layer. The cloud gateway
+Cross-tenant queries are rejected at the storage layer. The gateway
 (`pensyve-mcp-gateway`) maintains per-tenant state via `tenant.rs`, ensuring
 one tenant's data is never visible to another.
 
@@ -457,7 +457,7 @@ Hard limits prevent runaway operations and cross-tenant corpus retention:
 | Operation | Bound |
 |---|---|
 | Recall query | 5 second timeout |
-| Hosted recall admission | 8 concurrent reservations; 64 MiB reserved working set |
+| Gateway recall admission | 8 concurrent reservations; 64 MiB reserved working set |
 | Vector / lexical candidates | 100 each |
 | Fused references / hydrated payload | 200 references; 4 MiB |
 | SQLite exact-vector scan | 50,000 eligible active-generation rows |
@@ -475,7 +475,7 @@ degrades to lexical-only retrieval, never a mixed or partial vector ranking. Sou
 and embedding-generation mutations commit transactionally across remember, update,
 supersede, forget, erase, restore, and backfill paths.
 
-These contracts are common to local SQLite and hosted Postgres. They do not approve
+These contracts are common to SQLite and Postgres. They do not approve
 a deployment: no production model has been selected or downloaded, no production
 data has been backfilled, and no cutover has been authorized. Earlier full-GTE-plus-
 BGE and 4 GiB deployment guidance is superseded; sizing requires separate certified
@@ -483,9 +483,9 @@ model evidence and an approved rollout plan.
 
 ## Rate Limiting
 
-The cloud gateway implements token-bucket rate limiting per API key
+The gateway implements token-bucket rate limiting per API key
 (`rate_limit.rs`). Limits are configurable per deployment. Usage metering
-tracks operations per (user, month, tier) for billing and abuse prevention.
+tracks operations per (user, month, tier).
 
 ## Secret Handling
 

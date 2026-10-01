@@ -33,7 +33,7 @@ pensyve-python/        Python SDK (PyO3 bindings)
 pensyve-ts/            TypeScript SDK (HTTP client)
 pensyve-go/            Go SDK (HTTP client)
 pensyve-mcp/           MCP stdio server
-pensyve-mcp-gateway/   MCP HTTP gateway (cloud)
+pensyve-mcp-gateway/   MCP HTTP gateway (self-hosted)
 pensyve-mcp-tools/     Shared MCP tool definitions
 pensyve-cli/           CLI (clap)
 pensyve-wasm/          WASM bindings

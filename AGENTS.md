@@ -4,7 +4,7 @@ Canonical agent entry point for the `pensyve` open-source repo. Shared by Claude
 
 ## What this repo is
 
-Pensyve — the universal memory runtime for AI agents. Apache 2.0 open-core engine: Rust core + Python/TypeScript/Go SDKs + MCP server + REST gateway + CLI + Claude Code plugin + VS Code extension + framework integrations. Offline-first (SQLite default), Postgres feature-gated for managed-service deployments.
+Pensyve — the universal memory runtime for AI agents. Apache 2.0 open-source engine: Rust core + Python/TypeScript/Go SDKs + MCP server + REST gateway + CLI + Claude Code plugin + VS Code extension + framework integrations. Offline-first (SQLite default), Postgres feature-gated for multi-node deployments.
 
 ## Start here
 
@@ -25,7 +25,7 @@ Pensyve — the universal memory runtime for AI agents. Apache 2.0 open-core eng
 | `pensyve-python/` | Rust cdylib (PyO3) — Python SDK (`import pensyve`) |
 | `pensyve-mcp/` | Rust binary — MCP stdio server |
 | `pensyve-mcp-tools/` | Rust rlib — shared MCP tool definitions (stdio + HTTP gateway) |
-| `pensyve-mcp-gateway/` | Rust binary — cloud HTTP gateway (REST + MCP on port 3000) |
+| `pensyve-mcp-gateway/` | Rust binary — self-hostable HTTP gateway (REST + MCP on port 3000) |
 | `pensyve-cli/` | Rust binary — `pensyve` CLI |
 | `pensyve-benchmarks/` | Rust bench harness |
 | `pensyve-ts/` | TypeScript HTTP SDK (bun) |
@@ -58,7 +58,7 @@ cargo build -p pensyve-core --features postgres  # Postgres feature
 cd pensyve-ts && bun test               # TypeScript SDK
 cd pensyve-go && go test ./...          # Go SDK
 cd pensyve-wasm && cargo check          # WASM (standalone, not in workspace)
-cargo run -p pensyve-mcp-gateway        # Cloud gateway (port 3000)
+cargo run -p pensyve-mcp-gateway        # HTTP gateway (port 3000)
 cargo run -p pensyve-cli -- recall "q"  # CLI
 cargo run -p pensyve-mcp               # MCP stdio server
 ```
