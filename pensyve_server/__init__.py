@@ -1,1 +1,1 @@
-# pensyve_server: shared Python utilities — billing, extraction
+# pensyve_server: shared Python utilities — usage quotas, extraction

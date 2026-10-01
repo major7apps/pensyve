@@ -33,7 +33,7 @@ Pensyve — the universal memory runtime for AI agents. Apache 2.0 open-source e
 | `pensyve-wasm/` | Rust cdylib (wasm-bindgen) — browser/edge variant (not in workspace) |
 | `pensyve-vscode/` | VS Code extension |
 | `pensyve-plugin/` | Claude Code marketplace plugin |
-| `pensyve_server/` | Python utilities (billing, Tier 2 extraction) — NOT a standalone server |
+| `pensyve_server/` | Python utilities (usage quotas, Tier 2 extraction) — NOT a standalone server |
 | `integrations/` | Framework adapters (LangChain, CrewAI, etc.) |
 | `benchmarks/` | LongMemEval + tuning harnesses |
 | `tests/python/` | Python integration tests |
