@@ -385,6 +385,14 @@ const _: () = ();
 struct PensyveInner {
     namespace: Namespace,
     storage: Arc<SqliteBackend>,
+    /// Root that `forget` writes its pre-delete snapshots under, resolved once
+    /// at construction the way the MCP servers resolve theirs:
+    /// `<storage path>/snapshots`, or `PENSYVE_SNAPSHOT_DIR`. `forget` refuses
+    /// to delete anything it could not first write a snapshot for (#284).
+    snapshot_root: PathBuf,
+    /// How much snapshot history `forget` keeps per namespace, from
+    /// `PENSYVE_SNAPSHOT_RETENTION_DAYS` / `PENSYVE_SNAPSHOT_MAX_PER_NAMESPACE`.
+    snapshot_retention: pensyve_core::snapshot::RetentionPolicy,
     embedder: Arc<OnnxEmbedder>,
     runtime_space: EmbeddingSpace,
     retrieval_config: RetrievalConfig,
@@ -825,6 +833,9 @@ impl PyPensyve {
 
         let ns_name = namespace.unwrap_or_else(|| "default".to_string());
 
+        let snapshot_root = pensyve_core::snapshot::snapshot_root_for(&storage_path);
+        let snapshot_retention = pensyve_core::snapshot::RetentionPolicy::from_env();
+
         // Open storage.
         let storage = SqliteBackend::open(&storage_path)
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to open storage: {e}")))?;
@@ -943,6 +954,8 @@ impl PyPensyve {
             inner: Arc::new(PensyveInner {
                 namespace: ns,
                 storage,
+                snapshot_root,
+                snapshot_retention,
                 embedder,
                 runtime_space,
                 retrieval_config: config.retrieval,
@@ -2064,8 +2077,21 @@ impl PyPensyve {
         Ok(total)
     }
 
+    /// Permanently delete all memories about an entity.
+    ///
+    /// The rows are written to a snapshot file before they are deleted, in the
+    /// same transaction, so a forget issued by mistake is recoverable. The
+    /// file lands under `<path>/snapshots/<namespace id>/` (override the root
+    /// with `PENSYVE_SNAPSHOT_DIR`). If the snapshot cannot be written nothing
+    /// is deleted and this raises.
+    ///
+    /// Args:
     ///     entity: The entity whose memories to forget.
-    ///     `hard_delete`: If True, permanently delete; otherwise archive (default: False).
+    ///     `hard_delete`: If True, permanently delete; otherwise archive (default: True).
+    ///
+    /// Returns:
+    ///     Dict with `forgotten_count`, and `snapshot_path` when anything was
+    ///     deleted.
     #[pyo3(signature = (entity, hard_delete=true))]
     #[allow(clippy::needless_pass_by_value)]
     fn forget<'py>(
@@ -2081,25 +2107,54 @@ impl PyPensyve {
             ));
         }
 
-        // The capturing delete returns exactly the rows it removed, inside its
-        // own transaction — so the id set for index cleanup cannot race a
-        // concurrent writer the way a list-then-delete would, and it covers
-        // every deleted shape (`about_entity OR source_entity`, `subject OR
-        // object_entity`, superseded rows included) that the per-type
-        // `list_*_by_entity` accessors miss (#261).
-        let deleted = self
-            .inner
-            .storage
-            .delete_memories_by_entity_capturing(entity.uuid, self.inner.namespace.id, &mut |_| {
-                Ok(())
-            })
-            .map_err(|e| PyRuntimeError::new_err(format!("Forget failed: {e}")))?;
-        let count = deleted.len();
+        let inner = self.inner.clone();
+        let entity_id = entity.uuid;
+        let entity_name = entity.name.clone();
+        let outcome = py
+            .detach(move || forget_local(&inner, entity_id, &entity_name))
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "Forget aborted: pre-delete snapshot failed, nothing was deleted: {e}"
+                ))
+            })?;
 
         let dict = PyDict::new(py);
-        dict.set_item("forgotten_count", count)?;
+        dict.set_item("forgotten_count", outcome.snapshot.counts.total)?;
+        if let Some(path) = &outcome.path {
+            // As an `OsStr`, not lossily: a snapshot root is a path, and the
+            // caller has to be able to open exactly what was written.
+            dict.set_item("snapshot_path", path.as_os_str())?;
+        }
         Ok(dict)
     }
+}
+
+/// The entity-wide delete behind `Pensyve.forget`.
+///
+/// Goes through [`pensyve_core::snapshot::forget_entity_bounded`], the same
+/// fail-closed path the MCP tools and the gateway use: the rows are captured to
+/// a snapshot inside the delete's transaction, and the delete rolls back if
+/// that write fails. The binding used to call the storage delete directly with
+/// a persist step that did nothing, which made it the one surface that could
+/// destroy memories and leave no recovery artifact (#284).
+///
+/// The capturing delete returns exactly the rows it removed, so it covers every
+/// deleted shape (`about_entity OR source_entity`, `subject OR object_entity`,
+/// superseded rows included) that the per-type `list_*_by_entity` accessors
+/// miss (#261).
+fn forget_local(
+    inner: &PensyveInner,
+    entity_id: Uuid,
+    entity_name: &str,
+) -> pensyve_core::storage::StorageResult<pensyve_core::snapshot::ForgetOutcome> {
+    pensyve_core::snapshot::forget_entity_bounded(
+        inner.storage.as_ref(),
+        entity_id,
+        Some(entity_name),
+        inner.namespace.id,
+        &inner.snapshot_root,
+        inner.snapshot_retention,
+    )
 }
 
 /// Parse a fact string into (predicate, object).
@@ -2517,6 +2572,8 @@ mod tests {
             inner: Arc::new(PensyveInner {
                 namespace,
                 storage,
+                snapshot_root: path.join("snapshots"),
+                snapshot_retention: pensyve_core::snapshot::RetentionPolicy::UNBOUNDED,
                 embedder,
                 runtime_space,
                 retrieval_config: config.retrieval,
@@ -2537,6 +2594,119 @@ mod tests {
 
     fn python_test_handle(path: &std::path::Path, namespace_name: &str) -> PyPensyve {
         python_test_handle_with_lifecycle(path, namespace_name, true)
+    }
+
+    /// One entity with one semantic memory about it, in `handle`'s namespace.
+    /// The handles these tests use have no active embedding space, so a plain
+    /// save is accepted without an embedding.
+    fn seed_forgettable(handle: &PyPensyve, name: &str) -> Entity {
+        let mut entity = Entity::new(name, EntityKind::User);
+        entity.namespace_id = handle.inner.namespace.id;
+        handle.inner.storage.save_entity(&entity).unwrap();
+        handle
+            .inner
+            .storage
+            .save_semantic(&SemanticMemory::new(
+                handle.inner.namespace.id,
+                entity.id,
+                "likes",
+                "tea",
+                0.9,
+            ))
+            .unwrap();
+        entity
+    }
+
+    fn live_memories(handle: &PyPensyve) -> usize {
+        let (episodic, semantic, procedural) = handle
+            .inner
+            .storage
+            .count_memories_by_namespace(handle.inner.namespace.id)
+            .unwrap();
+        episodic + semantic + procedural
+    }
+
+    /// #284: the binding deleted with a persist step that did nothing, so a
+    /// forget left no recovery artifact. It now writes the snapshot the other
+    /// surfaces write, under the same per-namespace directory, and the file
+    /// restores what was deleted.
+    #[test]
+    fn forget_writes_a_restorable_snapshot_before_deleting() {
+        let dir = std::env::temp_dir().join(format!("pensyve-python-test-{}", Uuid::new_v4()));
+        let handle = python_test_handle_with_lifecycle(&dir, "forget-snapshot", false);
+        let entity = seed_forgettable(&handle, "alice");
+
+        let outcome = forget_local(&handle.inner, entity.id, &entity.name).unwrap();
+
+        assert_eq!(outcome.snapshot.counts.total, 1);
+        assert_eq!(live_memories(&handle), 0);
+        let path = outcome
+            .path
+            .expect("a forget that deleted rows names its snapshot");
+        assert_eq!(
+            path.parent().unwrap(),
+            pensyve_core::snapshot::namespace_dir(
+                &handle.inner.snapshot_root,
+                handle.inner.namespace.id
+            ),
+        );
+        let restored =
+            pensyve_core::snapshot::restore_file(handle.inner.storage.as_ref(), &path).unwrap();
+        assert_eq!(restored.restored, 1);
+        assert_eq!(live_memories(&handle), 1);
+        drop(handle);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Fail-closed: when the snapshot cannot be written the delete does not
+    /// happen. The root is made unwritable by putting a regular file where the
+    /// directory would have to be created.
+    #[test]
+    fn forget_deletes_nothing_when_the_snapshot_cannot_be_written() {
+        let dir = std::env::temp_dir().join(format!("pensyve-python-test-{}", Uuid::new_v4()));
+        let mut handle = python_test_handle_with_lifecycle(&dir, "forget-fail-closed", false);
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        Arc::get_mut(&mut handle.inner).unwrap().snapshot_root = blocked.join("snapshots");
+        let entity = seed_forgettable(&handle, "alice");
+
+        forget_local(&handle.inner, entity.id, &entity.name)
+            .expect_err("a forget with nowhere to write its snapshot must fail");
+
+        assert_eq!(
+            live_memories(&handle),
+            1,
+            "nothing may be deleted when the snapshot was not written"
+        );
+        drop(handle);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The binding honours the retention policy it was constructed with, the
+    /// way the serving states do: a second forget under a one-snapshot cap
+    /// evicts the first forget's file.
+    #[test]
+    fn forget_enforces_the_handles_snapshot_retention_policy() {
+        let dir = std::env::temp_dir().join(format!("pensyve-python-test-{}", Uuid::new_v4()));
+        let mut handle = python_test_handle_with_lifecycle(&dir, "forget-retention", false);
+        Arc::get_mut(&mut handle.inner).unwrap().snapshot_retention =
+            pensyve_core::snapshot::RetentionPolicy {
+                max_age_days: None,
+                max_count: Some(1),
+            };
+        let alice = seed_forgettable(&handle, "alice");
+        let bob = seed_forgettable(&handle, "bob");
+
+        let first = forget_local(&handle.inner, alice.id, &alice.name).unwrap();
+        let second = forget_local(&handle.inner, bob.id, &bob.name).unwrap();
+
+        assert!(
+            !first.path.unwrap().exists(),
+            "the older snapshot is evicted"
+        );
+        assert!(second.path.unwrap().exists(), "the newest snapshot is kept");
+        drop(handle);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

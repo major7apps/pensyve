@@ -334,13 +334,23 @@ class Pensyve:
     def forget(
         self,
         entity: Entity,
-        hard_delete: bool = False,
-    ) -> dict[str, int]:
-        """Archive or delete all memories about an entity.
+        hard_delete: bool = True,
+    ) -> dict[str, int | str]:
+        """Permanently delete all memories about an entity.
+
+        The rows are written to a snapshot file before they are deleted, under
+        ``<path>/snapshots/<namespace id>/`` (override the root with
+        ``PENSYVE_SNAPSHOT_DIR``). If the snapshot cannot be written, nothing
+        is deleted and ``RuntimeError`` is raised.
 
         Args:
             entity: The entity whose memories to forget.
-            hard_delete: If True, permanently delete (default: False).
+            hard_delete: Must be True (the default). Soft delete is not
+                supported and raises ``RuntimeError``.
+
+        Returns:
+            Dict with ``forgotten_count`` and, when anything was deleted,
+            ``snapshot_path``.
         """
         ...
 

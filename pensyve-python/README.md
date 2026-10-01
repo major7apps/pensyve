@@ -107,7 +107,39 @@ with p.episode(entity) as ep:
 
 # Consolidate (promote repeated facts, decay unused memories)
 p.consolidate()
+
+# Forget everything about an entity
+result = p.forget(entity)
+print(result["forgotten_count"], result.get("snapshot_path"))
 ```
+
+#### `forget` writes a snapshot before it deletes
+
+`Pensyve.forget(entity)` permanently deletes every memory about the entity. Before
+it deletes, it writes the rows it is about to remove to a snapshot file, so a
+forget issued by mistake can be recovered from. This is the same behaviour the
+MCP server and the REST gateway have.
+
+- The snapshot is written to `<path>/snapshots/<namespace id>/`, where `<path>`
+  is the storage directory the `Pensyve` object was opened on. Set
+  `PENSYVE_SNAPSHOT_DIR` to use a different root. The variable is read when the
+  `Pensyve` object is constructed.
+- The result is `{"forgotten_count": n, "snapshot_path": "..."}`. `snapshot_path`
+  is absent when the entity had no memories, because nothing is written then.
+- If the snapshot cannot be written (for example the directory is read-only or
+  the disk is full), `forget` raises `RuntimeError` and deletes nothing.
+- Snapshots are pruned per namespace. `PENSYVE_SNAPSHOT_RETENTION_DAYS`
+  (default `30`, at most `36500`) bounds their age and
+  `PENSYVE_SNAPSHOT_MAX_PER_NAMESPACE` (default `50`, at most `1000000`) bounds
+  their number. `0` turns a bound off. A value that is not a whole number, or
+  is above its maximum, is ignored with a warning and the default applies.
+- A snapshot holds the full content of the deleted memories. On Unix the files
+  are created readable by their owner only. Deleting a snapshot file is how you
+  make a forget permanent before retention removes it.
+
+Before version 5.0.0 the Python `forget` deleted without writing a snapshot. If
+you run it in a process whose storage directory is not writable for new files,
+`forget` now fails instead of deleting.
 
 ### MCP Server
 
