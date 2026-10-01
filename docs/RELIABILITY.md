@@ -128,6 +128,4 @@ Four properties that define Pensyve's reliability posture:
 
 The under-300-MB figure is a representative-model target, not a newly certified
 production measurement. Earlier full-GTE-plus-BGE and 4 GiB deployment guidance is
-superseded by the storage-backed design and must not be used for sizing. This
-candidate has not selected or downloaded a production model, run a real-model gate,
-or approved a production backfill or cutover.
+superseded by the storage-backed design and must not be used for sizing.

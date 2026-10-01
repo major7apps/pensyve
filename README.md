@@ -9,6 +9,10 @@
 
 Universal memory runtime for AI agents. Framework-agnostic, protocol-native, offline-first.
 
+## Project status
+
+Pensyve Cloud, the hosted service, closed on 2026-10-01. Pensyve is now a self-hosted, Apache-2.0 project in maintenance mode: it gets security fixes and dependency updates, and no new features. See [`MAINTENANCE.md`](MAINTENANCE.md) for details and [`docs/self-host.md`](docs/self-host.md) to run it yourself.
+
 ### Without memory
 
 ```
@@ -414,7 +418,8 @@ Pensyve uses the following environment variables across its components:
 | ------------------------ | --------- | ------------------------------------------------ |
 | `PENSYVE_API_KEYS`       | _(empty)_ | Comma-separated valid API keys (standalone mode) |
 | `PENSYVE_VALIDATION_URL` | _(none)_  | Remote endpoint for API key validation           |
-| `PENSYVE_RATE_LIMIT`     | `300`     | Max requests per minute per API key              |
+| `PENSYVE_RATE_LIMIT`     | `30`      | Max requests per minute per tenant               |
+| `PENSYVE_DAILY_QUOTA`    | `1000`    | Max operations per UTC day per tenant (needs `REDIS_URL`) |
 | `HOST`                   | `0.0.0.0` | Server bind address                              |
 | `PORT`                   | `3000`    | Server bind port                                 |
 
@@ -483,7 +488,7 @@ pensyve/
 ├── pensyve-ts/         TypeScript SDK (bun) — timeout, retry, PensyveError
 ├── pensyve-go/         Go SDK — context-aware HTTP client
 ├── pensyve-wasm/       WASM build — standalone minimal in-memory Pensyve
-├── pensyve_server/       Shared Python utilities — billing, extraction
+├── pensyve_server/       Shared Python utilities — usage quotas, extraction
 ├── integrations/       All integrations — IDE plugins, framework adapters, code harnesses
 │   ├── claude-code/    Claude Code plugin (commands, skills, agents, hooks)
 │   ├── antigravity-plugin/ Antigravity plugin (rules, skills, MCP config)

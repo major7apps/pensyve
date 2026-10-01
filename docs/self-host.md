@@ -5,11 +5,11 @@ gateway on [Railway](https://railway.com) with a persistent volume, and shows
 how to drop in a store exported from Pensyve Cloud so your existing memories
 come across intact.
 
-**You do not need `pensyve-cloud`.** That repository is the commercial web app —
-marketing site, dashboard, Stripe billing, and the API-key console. It is not
-part of the memory runtime. The gateway in this repository is the whole server:
-it speaks MCP, holds your memories, and answers recall. Forking `pensyve-cloud`
-to self-host would give you a billing dashboard with nothing behind it.
+**Pensyve Cloud closed on 2026-10-01.** The hosted service and its web app
+(dashboard, sign-up, API-key console) no longer exist, and you do not need
+them. The gateway in this repository is the whole server: it speaks MCP, holds
+your memories, and answers recall. See [`MAINTENANCE.md`](../MAINTENANCE.md)
+for the project's status.
 
 ## What you need
 

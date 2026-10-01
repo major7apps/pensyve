@@ -11,10 +11,20 @@ Two auth mechanisms, both opt-in:
 | Method | Transport | When to use |
 |---|---|---|
 | **API key** | `Authorization: Bearer <key>` header | Server-to-server, CLI, SDK clients |
-| **OAuth 2.1 PKCE** | JWT (EdDSA, `OAUTH_PUBLIC_KEY`) | Browser-based dashboards, OAuth flows |
+| **JWT** | `Authorization: Bearer <jwt>` header (EdDSA) | Deployments that run their own token issuer |
 
 When `PENSYVE_API_KEYS` is unset, all endpoints are open (local-only development
 mode). Set it to a comma-separated list of keys for production deployments.
+
+JWT validation is off unless `OAUTH_PUBLIC_KEY` (Ed25519 public key, PEM),
+`OAUTH_ISSUER` (required `iss` claim), and `OAUTH_AUDIENCE` (required `aud`
+claim) are all set. If the key is set without an issuer or audience, the
+gateway logs a warning and rejects every JWT. The gateway does not issue
+tokens and serves no OAuth endpoints; the `/oauth/*` proxy and
+`/.well-known/oauth-*` metadata that pointed at the closed hosted service have
+been removed.
+
+A request with no credential gets `401` with `WWW-Authenticate: Bearer`.
 
 ## Role-Based Access Control (RBAC)
 
@@ -419,8 +429,8 @@ build. The remedy is the same either way.
 **Existing namespaces serve lexical-only after upgrading to schema v6.** Versioned
 embedding generations start with no active generation per namespace. After the
 owner-connected startup, run `pensyve-mcp-gateway backfill-embeddings` once with
-the serving role's `DATABASE_URL` (for ECS, a one-off task from the production
-task definition with the container command overridden to `backfill-embeddings`).
+the serving role's `DATABASE_URL` (in a container deployment, a one-off run of
+the gateway image with the command overridden to `backfill-embeddings`).
 It pages every namespace, embeds each source on the loaded generation, verifies
 coverage, and activates; running tasks observe activation on their next request.
 
@@ -475,17 +485,17 @@ degrades to lexical-only retrieval, never a mixed or partial vector ranking. Sou
 and embedding-generation mutations commit transactionally across remember, update,
 supersede, forget, erase, restore, and backfill paths.
 
-These contracts are common to SQLite and Postgres. They do not approve
-a deployment: no production model has been selected or downloaded, no production
-data has been backfilled, and no cutover has been authorized. Earlier full-GTE-plus-
-BGE and 4 GiB deployment guidance is superseded; sizing requires separate certified
-model evidence and an approved rollout plan.
+These contracts are common to SQLite and Postgres.
 
 ## Rate Limiting
 
-The gateway implements token-bucket rate limiting per API key
-(`rate_limit.rs`). Limits are configurable per deployment. Usage metering
-tracks operations per (user, month, tier).
+The gateway applies one sliding-window limit to every tenant
+(`rate_limit.rs`): `PENSYVE_RATE_LIMIT` requests per minute (default 30) and
+`PENSYVE_DAILY_QUOTA` operations per UTC day (default 1000). There are no plan
+tiers. The daily quota is enforced only when `REDIS_URL` is set; without Redis
+the gateway keeps the per-minute limit in memory. A usage counter
+(`usage_counter.rs`, `GET /v1/usage`) tracks operations per (user, month,
+operation kind). Nothing is reported to an external billing service.
 
 ## Secret Handling
 
@@ -493,7 +503,7 @@ tracks operations per (user, month, tier).
   specific filenames, never `git add -A` or `git add .`.
 - All secrets are passed via environment variables (see `AGENTS.md` for the
   full variable table).
-- The OAuth public key is loaded from `OAUTH_PUBLIC_KEY` env var, never
+- The JWT public key is loaded from `OAUTH_PUBLIC_KEY` env var, never
   embedded in source.
 - API key validation supports both a local list and a remote validation
   endpoint with response caching.

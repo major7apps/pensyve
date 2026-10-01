@@ -88,13 +88,11 @@ Single Rust/Axum binary serving REST (`/v1/*`) and MCP (`/mcp`) on port 3000:
 | Module | Responsibility |
 |---|---|
 | `rest.rs` | REST API handlers (recall, remember, entities, stats, inspect, usage) |
-| `auth.rs` | API key validation (local + remote with caching) and OAuth JWT (EdDSA) |
-| `rate_limit.rs` | Per-key token-bucket rate limiting |
-| `usage.rs` | Stripe usage event reporting (fire-and-forget, batched) |
-| `usage_counter.rs` | In-memory per-(user, month, tier) operation counter |
+| `auth.rs` | API key validation (local + remote with caching) and optional JWT validation (EdDSA, operator's own issuer) |
+| `rate_limit.rs` | Per-tenant sliding-window rate limit and daily quota (`PENSYVE_RATE_LIMIT`, `PENSYVE_DAILY_QUOTA`) |
+| `usage_counter.rs` | Per-(user, month, operation kind) counter behind `GET /v1/usage` |
 | `tenant.rs` | Multi-tenant state management |
 | `cache.rs` | Optional Redis cache for recall responses (`REDIS_URL`) |
-| `oauth.rs` | OAuth 2.1 authorization server endpoints |
 
 ## Data Model
 
