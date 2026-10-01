@@ -857,13 +857,16 @@ pub trait StorageTrait: Send + Sync {
     //
     // Observations are extracted from episodic messages at ingest time and
     // surfaced at recall time by joining on the top-k episodes' IDs. They do
-    // not participate in RRF candidate selection. Default implementations
-    // are no-ops so existing backends keep working without observation support.
-    fn save_observation(&self, _mem: &ObservationMemory) -> StorageResult<()> {
-        Err(StorageError::Context(
-            "save_observation not implemented on this backend".into(),
-        ))
-    }
+    // not participate in RRF candidate selection.
+
+    /// Persist an observation.
+    ///
+    /// Required, with no default. The default this replaced returned
+    /// `Err("save_observation not implemented on this backend")`, so a backend
+    /// that never overrode it compiled and then failed every observation write
+    /// in production. A missing implementation is now a build failure in the
+    /// implementing crate instead (#285).
+    fn save_observation(&self, mem: &ObservationMemory) -> StorageResult<()>;
 
     /// Fetch an observation only when it belongs to `namespace_id`. Same
     /// contract as [`StorageTrait::get_episodic_in_namespace`], including the

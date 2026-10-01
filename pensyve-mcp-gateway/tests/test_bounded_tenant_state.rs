@@ -13,7 +13,8 @@ use pensyve_core::storage::{
     ActivityAggregate, ActivityEvent, ErasedRows, StorageError, StorageResult, StorageTrait,
 };
 use pensyve_core::types::{
-    Edge, Entity, Episode, EpisodicMemory, Memory, Namespace, ProceduralMemory, SemanticMemory,
+    Edge, Entity, Episode, EpisodicMemory, Memory, Namespace, ObservationMemory, ProceduralMemory,
+    SemanticMemory,
 };
 use pensyve_mcp_gateway::tenant::{TenantStateManager, ensure_namespace_embedding_lifecycle};
 use pensyve_mcp_tools::VectorRuntime;
@@ -184,6 +185,10 @@ impl StorageTrait for CountingStorage {
             trial_count,
             success_count,
         )
+    }
+
+    fn save_observation(&self, memory: &ObservationMemory) -> StorageResult<()> {
+        self.inner.save_observation(memory)
     }
 
     fn search_fts(

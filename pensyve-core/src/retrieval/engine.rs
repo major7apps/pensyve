@@ -3798,6 +3798,9 @@ mod tests {
         ) -> StorageResult<()> {
             Ok(())
         }
+        fn save_observation(&self, _mem: &crate::types::ObservationMemory) -> StorageResult<()> {
+            Ok(())
+        }
         fn search_fts(
             &self,
             _query: &str,

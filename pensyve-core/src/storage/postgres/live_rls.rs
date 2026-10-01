@@ -3098,7 +3098,7 @@ fn schema_migrates_a_database_that_predates_the_edges_namespace() {
     let (not_null,): (bool,) = fixture.rt.block_on(async {
         query_as::<Postgres, _>(
             "SELECT attnotnull FROM pg_attribute
-              WHERE attrelid = 'public.edges'::regclass AND attname = 'namespace_id'",
+              WHERE attrelid = 'edges'::regclass AND attname = 'namespace_id'",
         )
         .fetch_one(backend.pool())
         .await
