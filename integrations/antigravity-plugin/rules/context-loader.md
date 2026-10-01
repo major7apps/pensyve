@@ -115,4 +115,4 @@ Medium-signal items that benefit from user confirmation:
 | `pensyve_forget_memory` | Delete one memory by exact ID                  | `memory_id`                                                             |
 | `pensyve_inspect`       | View up to the requested number of memories    | `entity`, `memory_type?`, `limit?`                                      |
 | `pensyve_status`        | Check namespace and connection health          | none                                                                    |
-| `pensyve_account`       | Check account, usage, and quota                 | none                                                                    |
+| `pensyve_account`       | Check account mode (local or remote)            | none                                                                    |

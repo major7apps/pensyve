@@ -1103,10 +1103,10 @@ impl PensyveMcpServer {
         .map_err(|e| format!("Serialization error: {e}"))
     }
 
-    /// Cloud account info (plan, usage, quota).
+    /// Account mode info (local or remote).
     #[tool(
         name = "pensyve_account",
-        description = "Get account information including plan, usage, and quota. Returns local mode info when not connected to a remote server."
+        description = "Get account mode information. Returns local mode info when not connected to a remote server; in remote mode, account details are managed by the server operator."
     )]
     async fn account(
         &self,

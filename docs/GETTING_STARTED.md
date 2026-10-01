@@ -200,7 +200,7 @@ For clients that speak remote MCP, run a `pensyve-mcp-gateway` ([self-hosting gu
 | `pensyve_forget`        | Delete an entity's memories            |
 | `pensyve_inspect`       | List memories for an entity            |
 | `pensyve_status`        | Connection and memory stats            |
-| `pensyve_account`       | Account and usage info                 |
+| `pensyve_account`       | Account mode (local or remote)         |
 
 ---
 

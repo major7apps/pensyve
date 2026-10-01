@@ -147,7 +147,7 @@ Pensyve behaves as working memory for the agent — always-on, ambient, continuo
 | `pensyve_forget` | Delete an entity's memories |
 | `pensyve_inspect` | List memories for an entity |
 | `pensyve_status` | Get namespace statistics and health |
-| `pensyve_account` | Get account info, usage, and limits |
+| `pensyve_account` | Get account mode (local or remote) |
 
 See the [repository](https://github.com/major7apps/pensyve) for full MCP tool parameter details.
 

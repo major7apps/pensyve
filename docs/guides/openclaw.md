@@ -127,7 +127,7 @@ Either transport exposes the same 9 tools:
 | `pensyve_inspect` | List memories for an entity |
 | `pensyve_forget` | Delete an entity's memories |
 | `pensyve_status` | Connection status, namespace, memory counts |
-| `pensyve_account` | Usage and quota (gateway) or local-mode info |
+| `pensyve_account` | Account mode: local, or managed by the server operator |
 
 That's the same tool surface Claude Code, Cursor, and every other MCP client
 get — nothing OpenClaw-specific about it. Call `pensyve_remember` when

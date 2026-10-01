@@ -305,7 +305,7 @@ Install the native Pensyve plugin for Google Antigravity CLI:
 agy plugin install https://github.com/major7apps/pensyve/tree/main/integrations/antigravity-plugin
 ```
 
-The plugin bundles eight working-memory rules, eight skills, and a local stdio MCP definition (`pensyve-mcp --stdio`, no API key). Install `pensyve-mcp` first (see [Install](#install)), then open `/mcp` in Antigravity and select Pensyve.
+The plugin bundles eight working-memory rules, eight skills, and a local stdio MCP definition (`pensyve-mcp --stdio`, no API key). Install `pensyve-mcp` first (see [MCP Server](#mcp-server)), then open `/mcp` in Antigravity and select Pensyve.
 
 See [`integrations/antigravity-plugin/README.md`](integrations/antigravity-plugin/README.md) for MCP-only, local-stdio, and migration setup.
 
