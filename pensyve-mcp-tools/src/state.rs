@@ -95,6 +95,9 @@ impl RecallAdmission {
         bytes: usize,
         permit: OwnedSemaphorePermit,
     ) -> Result<RecallReservation, RecallOverloaded> {
+        // `fetch_update` is deprecated in favour of `try_update` on current
+        // stable, but `try_update` does not exist at this crate's MSRV (1.88).
+        #[allow(deprecated)]
         let result =
             self.reserved_bytes
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
