@@ -22,7 +22,9 @@ use pensyve_core::embedding::OnnxEmbedder;
 use pensyve_core::storage::bounded::MemoryRef;
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::storage::{StorageTrait, embedding_record_for_memory};
-use pensyve_core::types::{Entity, EntityKind, EpisodicMemory, Memory, Namespace, SemanticMemory};
+use pensyve_core::types::{
+    Edge, Entity, EntityKind, EpisodicMemory, Memory, Namespace, SemanticMemory,
+};
 use pensyve_mcp_gateway::AppState;
 use pensyve_mcp_gateway::auth::{AuthContext, AuthValidator};
 use pensyve_mcp_gateway::config::GatewayConfig;
@@ -356,5 +358,151 @@ async fn gdpr_erase_strips_generations_for_every_deleted_row_shape() {
     );
 
     assert_deletable_generations_gone(&state, &seeded);
+    cancellation.cancel();
+}
+
+/// Join the seeded target to the other seeded entity, so an erase or a purge
+/// has an edge to remove and to count.
+fn seed_edge(state: &AppState, seeded: &Seeded) {
+    let ps = state
+        .tenant_mgr
+        .get_tenant_state(TEST_TENANT)
+        .expect("tenant state");
+    let other = ps
+        .storage
+        .get_entity_by_name("bob", ps.namespace.id)
+        .expect("look up the other entity")
+        .expect("the other entity is seeded");
+    ps.storage
+        .save_edge(
+            &Edge::new(seeded.target.id, other.id, "knows"),
+            ps.namespace.id,
+        )
+        .expect("save edge");
+}
+
+/// #283: the erase response left out `edges_deleted` and
+/// `observations_deleted`, which the erasure already counted, and the erase
+/// wrote no activity record at all — the one operation that most needs a
+/// record of processing. The record names the entity by id and carries counts,
+/// never the name that was just erased.
+#[tokio::test]
+async fn gdpr_erase_reports_every_count_and_records_the_erasure() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = app_state(&dir, dir.path().join("snapshots"));
+    let seeded = seed(&state);
+    seed_edge(&state, &seeded);
+
+    let (url, cancellation) = start_test_server(state.clone()).await;
+    let response = reqwest::Client::new()
+        .delete(format!("{url}/v1/gdpr/erase/{}", seeded.target.name))
+        .send()
+        .await
+        .expect("gdpr erase request");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.expect("gdpr erase response JSON");
+    assert_eq!(body["memories_deleted"], seeded.deletable.len());
+    assert_eq!(body["edges_deleted"], 1);
+    assert_eq!(body["observations_deleted"], 0);
+    assert_eq!(body["entities_deleted"], 1);
+
+    let ps = state
+        .tenant_mgr
+        .get_tenant_state(TEST_TENANT)
+        .expect("tenant state");
+    let events = ps
+        .storage
+        .get_recent_activity(ps.namespace.id, 10)
+        .expect("read recent activity");
+    let erasures: Vec<_> = events
+        .iter()
+        .filter(|event| event.event_type == "gdpr_erase")
+        .collect();
+    assert_eq!(erasures.len(), 1, "one erase writes one record: {events:?}");
+    let detail = &erasures[0].detail_json;
+    assert_eq!(detail["entity_id"], seeded.target.id.to_string());
+    assert_eq!(detail["memories_deleted"], seeded.deletable.len());
+    assert_eq!(detail["edges_deleted"], 1);
+    assert_eq!(detail["entities_deleted"], 1);
+    assert!(
+        !detail.to_string().contains(&seeded.target.name),
+        "the record must not carry the erased entity's name: {detail}"
+    );
+
+    cancellation.cancel();
+}
+
+/// #278 through the REST door: `DELETE /v1/memories` emptied the memory tables
+/// and left the namespace's entities and edges standing. It also wrote no
+/// record of having run (#283).
+#[tokio::test]
+async fn purge_all_memories_empties_the_namespace_and_records_the_purge() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = app_state(&dir, dir.path().join("snapshots"));
+    let seeded = seed(&state);
+    seed_edge(&state, &seeded);
+    let ps = state
+        .tenant_mgr
+        .get_tenant_state(TEST_TENANT)
+        .expect("tenant state");
+    ps.storage
+        .log_activity(
+            ps.namespace.id,
+            "remember",
+            &serde_json::json!({"count": 1}),
+        )
+        .expect("seed an earlier activity event");
+
+    let (url, cancellation) = start_test_server(state.clone()).await;
+    let response = reqwest::Client::new()
+        .delete(format!("{url}/v1/memories"))
+        .send()
+        .await
+        .expect("purge request");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.expect("purge response JSON");
+    // Every deletable shape plus the control row: a purge spares nothing.
+    assert_eq!(body["deleted"], seeded.deletable.len() + 1);
+    assert_eq!(body["entities_deleted"], 2);
+    assert_eq!(body["edges_deleted"], 1);
+
+    assert!(
+        ps.storage
+            .get_all_memories_by_namespace_including_superseded(ps.namespace.id)
+            .expect("read memories")
+            .is_empty()
+    );
+    assert!(
+        ps.storage
+            .list_entities_by_namespace(ps.namespace.id)
+            .expect("list entities")
+            .is_empty(),
+        "a purge must not leave entity records behind"
+    );
+    assert!(
+        ps.storage
+            .get_edges_for_entity_in_namespace(seeded.target.id, ps.namespace.id)
+            .expect("read edges")
+            .is_empty(),
+        "a purge must not leave edges behind"
+    );
+
+    let events = ps
+        .storage
+        .get_recent_activity(ps.namespace.id, 10)
+        .expect("read recent activity");
+    assert_eq!(
+        events.len(),
+        1,
+        "the earlier history goes with the namespace; the purge's own record remains: {events:?}"
+    );
+    assert_eq!(events[0].event_type, "purge");
+    assert_eq!(
+        events[0].detail_json["memories_deleted"],
+        seeded.deletable.len() + 1
+    );
+    assert_eq!(events[0].detail_json["entities_deleted"], 2);
+    assert_eq!(events[0].detail_json["edges_deleted"], 1);
+
     cancellation.cancel();
 }

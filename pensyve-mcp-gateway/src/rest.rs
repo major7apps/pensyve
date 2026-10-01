@@ -1688,17 +1688,39 @@ async fn purge_all_memories(
 ) -> Result<impl IntoResponse, RestError> {
     let ps = get_pensyve_state(&state, &auth_ctx)?;
 
-    // Bulk delete all memories in the namespace — single transaction, no per-row loop.
-    let deleted_count = ps.storage.purge_namespace(ps.namespace.id).map_err(|err| {
+    // One transaction empties the namespace: every memory kind, then the
+    // edges, entity records, episodes and activity events that used to outlive
+    // a purge (#278).
+    let purged = ps.storage.purge_namespace(ps.namespace.id).map_err(|err| {
         RestError(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Error purging memories: {err}"),
         )
     })?;
 
-    Ok(Json(
-        serde_json::json!({ "deleted": deleted_count.memory_rows() }),
-    ))
+    // The record of the purge, written after it because the purge removes the
+    // namespace's activity history: this is the one event that history holds
+    // afterwards. Counts only. Nothing awaits between the purge and this
+    // call, so a client disconnect cannot separate them.
+    let _ = ps.storage.log_activity(
+        ps.namespace.id,
+        "purge",
+        &json!({
+            "memories_deleted": purged.memories,
+            "observations_deleted": purged.observations,
+            "edges_deleted": purged.edges,
+            "entities_deleted": purged.entities,
+            "episodes_deleted": purged.episodes,
+            "status": "deleted",
+        }),
+    );
+
+    Ok(Json(json!({
+        "deleted": purged.memory_rows(),
+        "edges_deleted": purged.edges,
+        "entities_deleted": purged.entities,
+        "episodes_deleted": purged.episodes,
+    })))
 }
 
 async fn supersede_memory(
@@ -2670,7 +2692,29 @@ async fn gdpr_erase(
     // erase that has started run to completion. Same shape as `forget_entity`.
     let ps_task = ps.clone();
     let entity_id = entity.id;
-    let task = tokio::spawn(async move { erase_entity_blocking(&ps_task, entity_id).await });
+    let task = tokio::spawn(async move {
+        let result = erase_entity_blocking(&ps_task, entity_id).await?;
+
+        // An erasure is the operation that most needs a record of processing,
+        // and it used to write none. The record names the entity by id and
+        // carries counts: the name was just erased and does not belong in a
+        // log that outlives it. Written on this task so it shares the erase's
+        // fate rather than the request's.
+        let _ = ps_task.storage.log_activity(
+            ps_task.namespace.id,
+            "gdpr_erase",
+            &json!({
+                "entity_id": entity_id.to_string(),
+                "memories_deleted": result.memories_deleted,
+                "observations_deleted": result.observations_deleted,
+                "edges_deleted": result.edges_deleted,
+                "entities_deleted": result.entities_deleted,
+                "status": "erased",
+            }),
+        );
+
+        Ok::<_, String>(result)
+    });
 
     // A panicked task cannot claim "nothing was erased" — the transaction may
     // have committed before the bookkeeping panicked — so the message stays
@@ -2688,6 +2732,8 @@ async fn gdpr_erase(
     Ok(Json(json!({
         "entity": name,
         "memories_deleted": result.memories_deleted,
+        "observations_deleted": result.observations_deleted,
+        "edges_deleted": result.edges_deleted,
         "entities_deleted": result.entities_deleted,
         "complete": result.complete,
     })))
@@ -3549,6 +3595,32 @@ mod tests {
             assert!(!forget.contains(forbidden));
         }
         assert!(!forget_memory.contains("\"memory_id\":"));
+
+        // The two erasure records (#283) carry ids and counts, never the
+        // entity's name: it was just erased, or belongs to a namespace that
+        // was just emptied.
+        let purge_handler = source
+            .split_once("async fn purge_all_memories(")
+            .unwrap()
+            .1
+            .split_once("async fn supersede_memory(")
+            .unwrap()
+            .0;
+        let erase_handler = source
+            .split_once("async fn gdpr_erase(")
+            .unwrap()
+            .1
+            .split_once("// A2A handlers")
+            .unwrap()
+            .0;
+        for detail in [
+            activity_detail(purge_handler),
+            activity_detail(erase_handler),
+        ] {
+            for forbidden in ["\"entity\":", "\"name\":", "\"content\":"] {
+                assert!(!detail.contains(forbidden));
+            }
+        }
     }
 
     #[test]
