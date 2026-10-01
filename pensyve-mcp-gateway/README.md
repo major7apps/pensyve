@@ -17,6 +17,12 @@ Two credential paths:
    or every JWT is rejected. The gateway does not issue tokens and serves no
    OAuth endpoints.
 
+Authentication is required as soon as any of `PENSYVE_API_KEYS`,
+`PENSYVE_VALIDATION_URL`, or `OAUTH_PUBLIC_KEY` is set. The gateway is open
+(no auth) only when none of them is set. A JWT must carry `exp`, `iss`, and
+`aud`. If `OAUTH_PUBLIC_KEY` is set without `OAUTH_ISSUER` and `OAUTH_AUDIENCE`
+and no other mechanism is configured, every request is rejected.
+
 Each credential resolves to an isolated `tenant:<auth_tenant>` namespace
 that is created lazily on first use.
 

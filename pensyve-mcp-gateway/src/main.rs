@@ -849,7 +849,13 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         }
     };
 
-    let auth_required = !config.api_keys.is_empty();
+    // Presence, not validity: a set-but-incomplete mechanism must leave the
+    // gateway closed, never open.
+    let auth_required = auth::auth_required(
+        !config.api_keys.is_empty(),
+        std::env::var_os("PENSYVE_VALIDATION_URL").is_some(),
+        std::env::var_os("OAUTH_PUBLIC_KEY").is_some(),
+    );
 
     // Phase 23/C: circuit breaker for the remote key validation endpoint.
     // Defaults to 5 failures / 60s / 30s cooldown.

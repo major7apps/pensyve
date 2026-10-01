@@ -193,6 +193,9 @@ impl AuthValidator {
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.set_issuer(&[&jwt.issuer]);
         validation.set_audience(&[&jwt.audience]);
+        // jsonwebtoken only checks `iss` and `aud` when the claim is present,
+        // so a token that omits them must be rejected explicitly.
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
 
         let token_data = decode::<OAuthClaims>(token, &jwt.decoding_key, &validation).ok()?;
         let claims = token_data.claims;
@@ -474,6 +477,21 @@ fn json_type(v: &serde_json::Value) -> &'static str {
     }
 }
 
+/// Whether the gateway must authenticate every request.
+///
+/// Open (dev) mode is allowed only when no auth mechanism is configured at
+/// all. Setting any one of them closes the gateway, including a JWT key
+/// whose issuer or audience is missing: that gateway rejects everything
+/// rather than serving unauthenticated requests.
+#[must_use]
+pub fn auth_required(
+    has_api_keys: bool,
+    has_validation_url: bool,
+    has_oauth_public_key: bool,
+) -> bool {
+    has_api_keys || has_validation_url || has_oauth_public_key
+}
+
 fn hash_key(key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
@@ -537,7 +555,7 @@ where
                 return inner.call(req).await;
             }
 
-            // No API keys configured = open access (dev mode).
+            // No auth mechanism configured = open access (dev mode).
             if !state.auth_required {
                 req.extensions_mut().insert(AuthContext {
                     key_id: "dev".to_string(),
@@ -700,8 +718,10 @@ mod tests {
     struct TestClaims {
         sub: String,
         client_id: String,
-        iss: String,
-        aud: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        iss: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        aud: Option<String>,
         exp: u64,
         iat: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -744,8 +764,8 @@ mod tests {
         TestClaims {
             sub: "user_abc123".to_string(),
             client_id: "client_xyz".to_string(),
-            iss: TEST_ISSUER.to_string(),
-            aud: TEST_AUDIENCE.to_string(),
+            iss: Some(TEST_ISSUER.to_string()),
+            aud: Some(TEST_AUDIENCE.to_string()),
             iat: now,
             exp: now + 3600,
             scope: Some("mcp".to_string()),
@@ -785,7 +805,7 @@ mod tests {
     async fn test_auth_validator_rejects_wrong_issuer() {
         let validator = validator_with_jwt(vec![]);
         let mut claims = valid_claims();
-        claims.iss = "https://evil.com".to_string();
+        claims.iss = Some("https://evil.com".to_string());
         let token = sign_jwt(&claims);
 
         assert!(
@@ -798,13 +818,60 @@ mod tests {
     async fn test_auth_validator_rejects_wrong_audience() {
         let validator = validator_with_jwt(vec![]);
         let mut claims = valid_claims();
-        claims.aud = "https://wrong-audience.com".to_string();
+        claims.aud = Some("https://wrong-audience.com".to_string());
         let token = sign_jwt(&claims);
 
         assert!(
             validator.validate(&token, None).await.is_none(),
             "JWT with wrong audience should be rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn test_auth_validator_rejects_missing_issuer() {
+        let validator = validator_with_jwt(vec![]);
+        let mut claims = valid_claims();
+        claims.iss = None;
+        let token = sign_jwt(&claims);
+
+        assert!(
+            validator.validate(&token, None).await.is_none(),
+            "correctly signed JWT without an iss claim should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_validator_rejects_missing_audience() {
+        let validator = validator_with_jwt(vec![]);
+        let mut claims = valid_claims();
+        claims.aud = None;
+        let token = sign_jwt(&claims);
+
+        assert!(
+            validator.validate(&token, None).await.is_none(),
+            "correctly signed JWT without an aud claim should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_auth_required_for_every_combination() {
+        // Open mode only when nothing is configured.
+        assert!(!auth_required(false, false, false));
+        for keys in [false, true] {
+            for url in [false, true] {
+                for jwt_key in [false, true] {
+                    assert_eq!(
+                        auth_required(keys, url, jwt_key),
+                        keys || url || jwt_key,
+                        "keys={keys} url={url} jwt_key={jwt_key}"
+                    );
+                }
+            }
+        }
+        // Each mechanism alone closes the gateway.
+        assert!(auth_required(true, false, false));
+        assert!(auth_required(false, true, false));
+        assert!(auth_required(false, false, true));
     }
 
     #[tokio::test]

@@ -13,13 +13,18 @@ Two auth mechanisms, both opt-in:
 | **API key** | `Authorization: Bearer <key>` header | Server-to-server, CLI, SDK clients |
 | **JWT** | `Authorization: Bearer <jwt>` header (EdDSA) | Deployments that run their own token issuer |
 
-When `PENSYVE_API_KEYS` is unset, all endpoints are open (local-only development
-mode). Set it to a comma-separated list of keys for production deployments.
+Authentication is required as soon as any mechanism is configured:
+`PENSYVE_API_KEYS`, `PENSYVE_VALIDATION_URL`, or `OAUTH_PUBLIC_KEY`. All
+endpoints are open (local-only development mode) only when none of the three is
+set. For production deployments, set `PENSYVE_API_KEYS` to a comma-separated
+list of keys.
 
 JWT validation is off unless `OAUTH_PUBLIC_KEY` (Ed25519 public key, PEM),
 `OAUTH_ISSUER` (required `iss` claim), and `OAUTH_AUDIENCE` (required `aud`
-claim) are all set. If the key is set without an issuer or audience, the
-gateway logs a warning and rejects every JWT. The gateway does not issue
+claim) are all set. A JWT must carry `exp`, `iss`, and `aud`; a token that
+omits any of them is rejected. If the key is set without an issuer or audience,
+the gateway logs a warning and rejects every JWT, and it stays closed: with no
+other mechanism configured it rejects every request. The gateway does not issue
 tokens and serves no OAuth endpoints; the `/oauth/*` proxy and
 `/.well-known/oauth-*` metadata that pointed at the closed hosted service have
 been removed.

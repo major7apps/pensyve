@@ -84,7 +84,7 @@ Python env setup: `uv sync --extra dev && uv run maturin develop --manifest-path
 - UUIDs as TEXT in SQLite (native UUID in Postgres), embeddings as BLOB, metadata as JSON TEXT (JSONB in Postgres).
 - PyO3 module compiles to `pensyve._core` — stubs at `pensyve-python/python/pensyve/_core.pyi`.
 - Episode IDs are UUID v4 strings; 30-minute TTL in the REST API.
-- Auth opt-in via `PENSYVE_API_KEYS` (unset = open). Tier 2 extraction opt-in via `PENSYVE_TIER2_ENABLED=true`.
+- Auth opt-in via `PENSYVE_API_KEYS` (open only when it, `PENSYVE_VALIDATION_URL`, and `OAUTH_PUBLIC_KEY` are all unset). Tier 2 extraction opt-in via `PENSYVE_TIER2_ENABLED=true`.
 - Rust: edition 2024, 100-char line width, 4-space indent. Python: ruff rules E/W/F/I/N/UP/B/SIM/RUF.
 - `conftest.py` at project root adds the project root to `sys.path` for test imports.
 
