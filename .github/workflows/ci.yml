@@ -154,9 +154,19 @@ jobs:
       - name: Module path major matches the release version
         run: |
           version_major="$(sed -n 's/^version = "\([0-9]*\)\..*/\1/p' pensyve-core/Cargo.toml | head -1)"
-          module_major="$(sed -n 's#^module .*/v\([0-9]*\)$#\1#p' pensyve-go/go.mod)"
-          if [ "$version_major" != "$module_major" ]; then
-            echo "::error::pensyve-go/go.mod is /v${module_major} but the release version is ${version_major}.x. Update the module path and its references."
+          if [ -z "$version_major" ]; then
+            echo "::error::Could not read the release major version from pensyve-core/Cargo.toml."
+            exit 1
+          fi
+          # Go v0 and v1 modules carry no suffix; v2 and later must carry /vN.
+          module_major="$(sed -n 's#^module .*/v\([0-9][0-9]*\)$#\1#p' pensyve-go/go.mod)"
+          if [ "$version_major" -ge 2 ]; then
+            expected="$version_major"
+          else
+            expected=""
+          fi
+          if [ "$module_major" != "$expected" ]; then
+            echo "::error::pensyve-go/go.mod has major suffix '${module_major:-none}' but release ${version_major}.x needs '${expected:-none}'. Update the module path and its references."
             exit 1
           fi
       - name: Run tests
