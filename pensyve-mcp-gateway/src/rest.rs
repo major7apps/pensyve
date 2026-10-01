@@ -1146,7 +1146,8 @@ fn oversized_export(memories: usize) -> RestError {
         format!(
             "This namespace holds {memories} rows, above the \
              {MAX_SELF_SERVE_EXPORT_MEMORIES} the self-serve export can copy in one request. \
-             Email support@major7apps.com and we will run the full export for you."
+             Ask the gateway operator to run `pensyve-mcp-gateway export-namespace`, \
+             which has no size limit."
         ),
     )
 }
@@ -1759,15 +1760,15 @@ async fn stats(
 
 /// Return current-period usage (calendar month UTC) for the authenticated user.
 ///
-/// When Neon is configured, reads from the `usage_counters` table
+/// When Postgres is configured, reads from the `usage_counters` table
 /// (authoritative, persistent across deploys). Falls back to the in-memory
 /// `DashMap` when the DB is unreachable or unconfigured.
 async fn usage_summary(
     State(state): State<Arc<AppState>>,
     axum::Extension(auth_ctx): axum::Extension<AuthContext>,
 ) -> Result<impl IntoResponse, RestError> {
-    // Prefer user_id (JWT flow) so the dashboard and MCP clients share
-    // counts; fall back to key_id for API-key-only authenticated requests.
+    // Prefer user_id (JWT flow or `PENSYVE_KEY_USER_MAP`) so one user's
+    // credentials share counts; fall back to key_id for API-key-only authenticated requests.
     let counter_key = auth_ctx.user_id.as_deref().unwrap_or(&auth_ctx.key_id);
     let summary = state.usage_counter.get_summary(counter_key).await;
     Ok(Json(summary))

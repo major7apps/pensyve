@@ -301,8 +301,8 @@ STATUS_SCHEMA = {
 ACCOUNT_SCHEMA = {
     "name": "pensyve_account",
     "description": (
-        "Get account information including usage, tier, and limits. "
-        "Use to check subscription status and quota usage."
+        "Get account mode information. Returns local mode info when not connected "
+        "to a remote server; in remote mode, account details are managed by the server operator."
     ),
     "parameters": {
         "type": "object",

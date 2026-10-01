@@ -1,9 +1,9 @@
-//! Bulk namespace export for the 2026-10-01 shutdown (MAJ-374 pre-req).
+//! Bulk namespace export (`export-namespace --all`).
 //!
-//! `export-namespace --namespace <id>` copies one namespace. The sunset-day
-//! runbook needs every namespace copied before the gateway scales to zero, so
-//! this adds the `--all` loop over `page_namespaces` plus a manifest an
-//! operator can check the run against.
+//! `export-namespace --namespace <id>` copies one namespace. Retiring or
+//! migrating a store needs every namespace copied, so `--all` loops over
+//! `page_namespaces` and writes a manifest an operator can check the run
+//! against.
 //!
 //! The manifest is the point of the whole exercise: after the store is gone
 //! there is no way to re-derive what should have been exported, so the record

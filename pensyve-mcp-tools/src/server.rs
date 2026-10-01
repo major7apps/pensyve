@@ -1118,7 +1118,7 @@ impl PensyveMcpServer {
         if !state.is_remote {
             return serde_json::to_string(&serde_json::json!({
                 "mode": "local",
-                "message": "Local mode — no account or billing. Self-hosted with no usage limits.",
+                "message": "Local mode — no account. Self-hosted with no usage limits.",
             }))
             .map_err(|e| format!("Serialization error: {e}"));
         }

@@ -1,36 +1,30 @@
-//! Copy every namespace out of the hosted store before it is destroyed.
+//! Copy every namespace out of the configured store in one operator run.
 //!
-//! `export-namespace --namespace <id>` (MAJ-369) served one customer. The
-//! 2026-10-01 shutdown needs all ~80 namespaces copied in one operator run,
-//! immediately before the gateway scales to zero and the Postgres store is
-//! deleted (MAJ-374).
+//! `export-namespace --namespace <id>` copies one namespace. `--all` loops
+//! over every namespace, which is what an operator needs before retiring or
+//! migrating a store.
 //!
 //! # Why a manifest
 //!
-//! The run is not repeatable. Once the store is gone there is no way to
-//! re-derive what should have been exported, so the record of what *was*
-//! exported is written alongside the files, and is checkable rather than
-//! merely descriptive: each entry carries the byte length and SHA-256 of its
-//! file, so an operator can verify what survived the upload to S3.
+//! Once the source store is gone there is no way to re-derive what should
+//! have been exported, so the record of what *was* exported is written
+//! alongside the files, and is checkable rather than merely descriptive: each
+//! entry carries the byte length and SHA-256 of its file, so an operator can
+//! verify the files after moving them.
 //!
 //! It is deliberately sanitized — namespace ids, counts and digests only. No
 //! memory content, and no namespace names: the manifest gets pasted into
-//! tickets and vault pages, and namespace names carry customer-identifying
-//! tenant strings.
+//! tickets, and namespace names carry tenant-identifying strings.
 //!
 //! # What this module does not do
 //!
-//! Encryption and upload are not here. Keeping AWS and crypto out of the
-//! shipped OSS binary matters for a project entering maintenance mode, and the
-//! B1 delivery already established the shape: produce plain artifacts locally,
-//! then `gpg` + `aws s3 cp` them from an operator script
-//! (`scripts/export-all-namespaces.sh`). Swapping in an in-binary AWS SDK
-//! later only changes the transport, not this copy.
+//! Encryption and upload are not here. This produces plain artifacts locally;
+//! encrypting and moving them is left to the operator's own tooling.
 //!
 //! # Consistency
 //!
 //! Inherits the caveat from [`pensyve_core::namespace_export`]: this is not a
-//! point-in-time snapshot. Run it with the gateway already scaled to zero, so
+//! point-in-time snapshot. Run it with the gateway stopped, so
 //! nothing is writing underneath it.
 
 use std::path::{Path, PathBuf};

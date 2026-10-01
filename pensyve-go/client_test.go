@@ -894,7 +894,7 @@ func TestA2AAgentCard(t *testing.T) {
 		json.NewEncoder(w).Encode(A2AAgentCard{
 			Name:        "Pensyve Memory Agent",
 			Description: "Universal memory runtime for AI agents",
-			URL:         "https://api.pensyve.ai",
+			URL:         "https://pensyve.example.com",
 			Capabilities: []struct {
 				Name string `json:"name"`
 			}{

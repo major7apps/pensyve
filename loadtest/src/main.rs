@@ -9,7 +9,7 @@ use reqwest::Client;
 #[command(name = "pensyve-loadtest")]
 struct Args {
     /// Base URL of the MCP gateway
-    #[arg(long, default_value = "https://mcp.pensyve.com")]
+    #[arg(long, default_value = "http://localhost:3000")]
     url: String,
 
     /// Bearer token (API key or JWT)
