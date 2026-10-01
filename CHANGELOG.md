@@ -7,6 +7,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.0.0] - 2026-10-01
+
+Self-hosted only. Pensyve Cloud, the hosted service, closed on 2026-10-01, and
+this release removes the code that existed only to serve it. Pensyve is now in
+maintenance mode: security fixes and dependency updates, no new features. See
+`MAINTENANCE.md`. Namespace purge and erasure are now complete, and the Python
+`forget` no longer deletes without a recovery snapshot.
+
+### Breaking
+
+**Gateway (`pensyve-mcp-gateway`)**
+
+- **Authentication is required whenever any mechanism is configured.** Setting
+  `PENSYVE_API_KEYS`, `PENSYVE_VALIDATION_URL`, or `OAUTH_PUBLIC_KEY` closes the
+  gateway. Before, a gateway with only a validation URL or only a JWT key served
+  unauthenticated requests. Open mode remains only when none is set.
+- **JWTs need an operator-configured issuer and audience.** The hard-coded
+  `https://pensyve.com` issuer and `https://mcp.pensyve.com` audience are gone.
+  Set `OAUTH_ISSUER` and `OAUTH_AUDIENCE` alongside `OAUTH_PUBLIC_KEY`; with
+  either missing, every JWT is rejected. Tokens must carry `exp`, `iss`, and
+  `aud`.
+- **The OAuth proxy and discovery endpoints are removed:** `/oauth/token`,
+  `/oauth/revoke`, `/oauth/register`, `/.well-known/oauth-protected-resource`,
+  and `/.well-known/oauth-authorization-server`. The 401 `WWW-Authenticate`
+  header is a plain `Bearer`.
+- **Plan tiers are removed.** One limit applies to every tenant:
+  `PENSYVE_RATE_LIMIT` (default 30 per minute) and the new `PENSYVE_DAILY_QUOTA`
+  (default 1000 per UTC day, enforced with `REDIS_URL`). `plan` and
+  `stripeCustomerId` in a remote validator response are ignored.
+  `PENSYVE_RATE_LIMIT` was documented with a default of 300 but was never
+  applied; it is applied now.
+- **Stripe usage reporting is removed.** `STRIPE_API_KEY`,
+  `PENSYVE_STRIPE_BUFFER_SIZE`, and `PENSYVE_CB_STRIPE_*` are ignored.
+- **`Sunset` and `Deprecation` response headers are removed.**
+- **`DELETE /v1/memories` empties the whole namespace:** edges, entities,
+  episodes, and activity events as well as memories. The response adds
+  `edges_deleted`, `entities_deleted`, and `episodes_deleted`.
+- **Library API:** the `oauth`, `usage`, and `middleware::sunset` modules,
+  `PlanLimits`, `Limits::unlimited`, `CircuitBreakerConfig::stripe_default`,
+  `AuthContext.plan`, `AuthContext.stripe_customer_id`,
+  `AppState.usage_reporter`, and `GatewayConfig.stripe_api_key` are removed.
+  `RateLimiter::check` takes no plan; `is_billable_path` is `is_counted_path`.
+
+**Core (`pensyve-core`)**
+
+- **`StorageTrait::save_observation` is a required method.** It was a default
+  that returned an error at runtime.
+- **`StorageTrait::purge_namespace` is a required method and returns
+  `NamespacePurgeSummary`.** `.memory_rows()` gives the count it used to return.
+  A purge now also deletes the namespace's edges, entities, episodes, and
+  activity events.
+- **`gdpr::erase_namespace` erases the whole namespace** through
+  `purge_namespace`, counts procedural memories in `memories_deleted`, and
+  returns `Err` on failure instead of `Ok` with warnings.
+- **Minimum supported Rust is 1.94.** The declared 1.88 was not buildable: the
+  `sqlx` 0.9 dependency requires 1.94.
+
+**Python**
+
+- **`Pensyve.forget` writes a snapshot before deleting,** under
+  `<path>/snapshots/<namespace id>/` or `PENSYVE_SNAPSHOT_DIR`, and raises without
+  deleting anything if the snapshot cannot be written. The result gains
+  `snapshot_path`.
+- **`pensyve_server.billing` is renamed `pensyve_server.quotas`.**
+
+### Added
+
+- `pensyve-mcp-gateway export-namespace` writes a namespace to a native SQLite
+  store that self-hosted Pensyve opens directly; `--all` exports every namespace
+  in one run with a manifest of counts and SHA-256 digests. `POST /v1/export`
+  lets an owner download their own namespace.
+- `docs/self-host.md`, a guide to running Pensyve on your own machine or server.
+- `MAINTENANCE.md`, the maintenance policy.
+- GDPR erase and namespace purge write an activity record with identifiers and
+  counts. The erase response reports `edges_deleted` and `observations_deleted`.
+- The stdio MCP server is packaged for the MCP registries.
+
+### Fixed
+
+- Episode KG cleanup is scoped to the caller's namespace (#281).
+- Served namespaces get an embedding lifecycle in the gateway (#359).
+- A non-Unicode `PENSYVE_SNAPSHOT_DIR` is honoured instead of silently falling
+  back to the default root.
+- The VS Code extension defaults to the gateway port and unwraps recall results.
+- Self-serve exports stage under the snapshot root, and every REST 5xx is logged.
+
+### Changed
+
+- All dependencies are upgraded, including `dirs` 7, `rmcp` 3.5, and `vitest` 5
+  in the integrations. `fastembed` stays at 6.0.1 on purpose: its version is part
+  of every stored embedding-space identity, so a bump would force every existing
+  store to be re-embedded.
+- Docs, manifests, and plugin text describe the gateway as self-hosted.
+
+### Removed
+
+- The gateway deploy workflow and the one-off shutdown export script.
+
+### Upgrade
+
+1. Gateway operators: if you set `PENSYVE_VALIDATION_URL` or `OAUTH_PUBLIC_KEY`
+   without `PENSYVE_API_KEYS`, clients now need a credential. If you validate
+   JWTs, set `OAUTH_ISSUER` and `OAUTH_AUDIENCE`.
+2. If you relied on the `business` or `enterprise` plan limits, set
+   `PENSYVE_RATE_LIMIT` and `PENSYVE_DAILY_QUOTA` to the values you want.
+3. Custom `StorageTrait` backends must implement `save_observation` and
+   `purge_namespace`.
+4. No schema change. Existing stores open as they are.
+
 ## [4.0.0] - 2026-09-02
 
 Bounded runtime and embedding provenance. Shipping runtimes no longer hold a

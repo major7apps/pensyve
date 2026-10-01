@@ -506,7 +506,7 @@ Clients send: `Authorization: Bearer psy_key1`
 
 ### Prerequisites
 
-- Rust 1.88+ (`rustup update`)
+- Rust 1.94+ (`rustup update`)
 - Python 3.10+ with [uv](https://github.com/astral-sh/uv) (for Python SDK)
 - [Bun](https://bun.sh) (optional, for TypeScript SDK)
 - [Go 1.21+](https://go.dev) (optional, for Go SDK)

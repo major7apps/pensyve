@@ -3,7 +3,7 @@
   "name": "io.github.major7apps/pensyve",
   "title": "Pensyve",
   "description": "Universal memory runtime for AI agents — episodic, semantic, and procedural memory.",
-  "version": "4.0.0",
+  "version": "5.0.0",
   "repository": {
     "url": "https://github.com/major7apps/pensyve",
     "source": "github"
@@ -13,7 +13,7 @@
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/major7apps/pensyve-mcp:4.0.0",
+      "identifier": "ghcr.io/major7apps/pensyve-mcp:5.0.0",
       "runtimeHint": "docker",
       "runtimeArguments": [
         {

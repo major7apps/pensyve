@@ -96,7 +96,7 @@ impl RecallAdmission {
         permit: OwnedSemaphorePermit,
     ) -> Result<RecallReservation, RecallOverloaded> {
         // `fetch_update` is deprecated in favour of `try_update` on current
-        // stable, but `try_update` does not exist at this crate's MSRV (1.88).
+        // stable, but `try_update` does not exist at this crate's MSRV (1.94).
         #[allow(deprecated)]
         let result =
             self.reserved_bytes

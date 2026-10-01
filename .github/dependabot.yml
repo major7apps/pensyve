@@ -33,7 +33,7 @@ updates:
 
   # npm — VS Code extension (uses package-lock.json)
   - package-ecosystem: "npm"
-    directory: "/pensyve-vscode"
+    directory: "/integrations/vscode"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5

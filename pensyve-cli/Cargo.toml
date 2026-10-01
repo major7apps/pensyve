@@ -1,9 +1,9 @@
 [package]
 name = "pensyve-cli"
-version = "4.0.0"
+version = "5.0.0"
 edition = "2024"
 description = "Pensyve command-line interface — universal memory runtime for AI agents"
-rust-version = "1.88"
+rust-version = "1.94"
 license = "Apache-2.0"
 homepage = "https://github.com/major7apps/pensyve"
 repository = "https://github.com/major7apps/pensyve"
@@ -14,7 +14,7 @@ name = "pensyve"
 path = "src/main.rs"
 
 [dependencies]
-pensyve-core = { path = "../pensyve-core", version = "4.0.0" }
+pensyve-core = { path = "../pensyve-core", version = "5.0.0" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }

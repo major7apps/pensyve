@@ -76,7 +76,7 @@ Python env setup: `uv sync --extra dev && uv run maturin develop --manifest-path
   that errors at runtime: for a trait downstream code *implements*, that turns a build failure into a
   production one. Precedent: PRs #247, #253, #259 (2026-08-16).
 - Do not regress test counts (274+ across Rust/Python/TypeScript/Go). New code adds tests.
-- Match existing style: Rust edition 2024, MSRV 1.88, clippy pedantic. Python ruff (line-length 100), pyright basic. TypeScript eslint. Go `go vet`, stdlib only.
+- Match existing style: Rust edition 2024, MSRV 1.94, clippy pedantic. Python ruff (line-length 100), pyright basic. TypeScript eslint. Go `go vet`, stdlib only.
 - Run `make check` before pushing. CI runs the same gate.
 
 ## Conventions

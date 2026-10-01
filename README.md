@@ -5,7 +5,7 @@
 [![CI](https://github.com/major7apps/pensyve/actions/workflows/ci.yml/badge.svg)](https://github.com/major7apps/pensyve/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![Rust 1.88+](https://img.shields.io/badge/rust-1.88+-orange.svg)](https://www.rust-lang.org/)
+[![Rust 1.94+](https://img.shields.io/badge/rust-1.94+-orange.svg)](https://www.rust-lang.org/)
 
 Universal memory runtime for AI agents. Framework-agnostic, protocol-native, offline-first.
 
@@ -139,7 +139,7 @@ p.consolidate()
 <details>
 <summary>Prerequisites and build steps</summary>
 
-- Rust 1.88+, Python 3.10+ with [uv](https://github.com/astral-sh/uv)
+- Rust 1.94+, Python 3.10+ with [uv](https://github.com/astral-sh/uv)
 - Optional: [Bun](https://bun.sh) (TypeScript SDK), [Go 1.21+](https://go.dev) (Go SDK)
 
 ```bash
