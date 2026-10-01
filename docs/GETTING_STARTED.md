@@ -298,7 +298,7 @@ Context-aware HTTP client with structured errors and exponential backoff.
 ### Install
 
 ```bash
-go get github.com/major7apps/pensyve/pensyve-go/v3@latest
+go get github.com/major7apps/pensyve/pensyve-go/v5@latest
 ```
 
 ### Quick start
@@ -311,7 +311,7 @@ import (
     "fmt"
     "log"
 
-    pensyve "github.com/major7apps/pensyve/pensyve-go/v3"
+    pensyve "github.com/major7apps/pensyve/pensyve-go/v5"
 )
 
 func main() {

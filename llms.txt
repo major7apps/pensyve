@@ -87,11 +87,11 @@ const memories = await p.recall("preferences", { entity: "user" });
 ### Go SDK
 
 ```bash
-go get github.com/major7apps/pensyve/pensyve-go/v3@latest
+go get github.com/major7apps/pensyve/pensyve-go/v5@latest
 ```
 
 ```go
-import pensyve "github.com/major7apps/pensyve/pensyve-go/v3"
+import pensyve "github.com/major7apps/pensyve/pensyve-go/v5"
 
 client := pensyve.NewClient(pensyve.Config{BaseURL: "http://localhost:3000", APIKey: "psy_..."})
 client.Remember(ctx, "user", "Prefers Go", 0.9)

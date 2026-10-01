@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Go SDK module path is now `github.com/major7apps/pensyve/pensyve-go/v5`.** The
+  path was still `/v3`, so `go get` could not resolve the `pensyve-go/v4.0.0` and
+  `pensyve-go/v5.0.0` tags. Use `pensyve-go/v5.0.1` or later and update imports
+  from `/v3` to `/v5`. CI now fails if the module path's major version and the
+  release version disagree.
+
 ## [5.0.0] - 2026-10-01
 
 Self-hosted only. Pensyve Cloud, the hosted service, closed on 2026-10-01, and

@@ -56,7 +56,7 @@ Your agent stops being amnesiac. Decisions, patterns, and outcomes persist acros
 ```bash
 pip install pensyve          # Python (PyPI)
 npm install @pensyve/sdk     # TypeScript (npm)
-go get github.com/major7apps/pensyve/pensyve-go/v3@latest  # Go
+go get github.com/major7apps/pensyve/pensyve-go/v5@latest  # Go
 ```
 
 Or use the MCP server directly with Antigravity CLI, Codex, Claude Code, Cursor, or any MCP client — see [MCP Setup](docs/GETTING_STARTED.md#mcp-server).
@@ -372,7 +372,7 @@ for (const g of groups) {
 Context-aware HTTP client with structured errors.
 
 ```go
-import pensyve "github.com/major7apps/pensyve/pensyve-go/v3"
+import pensyve "github.com/major7apps/pensyve/pensyve-go/v5"
 
 client := pensyve.NewClient(pensyve.Config{BaseURL: "http://localhost:3000"})
 ctx := context.Background()

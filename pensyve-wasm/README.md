@@ -52,6 +52,6 @@ This is a **standalone minimal implementation** that does NOT use pensyve-core. 
 
 - **Python**: `pip install pensyve`
 - **TypeScript**: `npm install pensyve` (HTTP client)
-- **Go**: `go get github.com/major7apps/pensyve/pensyve-go/v3`
+- **Go**: `go get github.com/major7apps/pensyve/pensyve-go/v5`
 - **MCP**: Claude Code / Cursor integration
 - **REST API**: Rust/Axum gateway (REST + MCP)

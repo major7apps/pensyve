@@ -148,6 +148,17 @@ jobs:
         with:
           go-version: "1.22"
           cache-dependency-path: pensyve-go/go.mod
+      # The release workflow tags the Go module `pensyve-go/v<version>`. Go only
+      # resolves that tag when the module path's major suffix matches it, so a
+      # major version bump must also update pensyve-go/go.mod.
+      - name: Module path major matches the release version
+        run: |
+          version_major="$(sed -n 's/^version = "\([0-9]*\)\..*/\1/p' pensyve-core/Cargo.toml | head -1)"
+          module_major="$(sed -n 's#^module .*/v\([0-9]*\)$#\1#p' pensyve-go/go.mod)"
+          if [ "$version_major" != "$module_major" ]; then
+            echo "::error::pensyve-go/go.mod is /v${module_major} but the release version is ${version_major}.x. Update the module path and its references."
+            exit 1
+          fi
       - name: Run tests
         working-directory: pensyve-go
         run: go test ./... -v
