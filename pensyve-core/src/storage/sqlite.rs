@@ -22,8 +22,8 @@ use crate::types::{
 
 use super::{
     ActivityAggregate, ActivityEvent, BulkMutationSummary, BulkPageGuard, BulkPageKind,
-    CapturedMemory, ErasedRows, ErasureSummary, StorageError, StorageResult, StorageTrait,
-    bounded_bulk_page_size, canonical_embedding_source_sha256,
+    CapturedMemory, ErasedRows, ErasureSummary, NamespacePurgeSummary, StorageError, StorageResult,
+    StorageTrait, bounded_bulk_page_size, canonical_embedding_source_sha256,
     canonical_embedding_source_text_sha256, cross_namespace_edge_id, memory_is_live,
     memory_namespace_id, validate_record_matches_memory,
 };
@@ -5754,15 +5754,13 @@ impl StorageTrait for SqliteBackend {
         delete_memory_by_id_with_namespace(&conn, id, namespace_id)
     }
 
-    fn purge_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
+    fn purge_namespace(&self, namespace_id: Uuid) -> StorageResult<NamespacePurgeSummary> {
         let conn = lock_conn!(self);
         let ns_str = namespace_id.to_string();
 
         conn.execute_batch("BEGIN")?;
 
-        let result = (|| -> StorageResult<usize> {
-            let mut total = 0usize;
-
+        let result = (|| -> StorageResult<NamespacePurgeSummary> {
             // Phase 2B cascade (CodeRabbit PR #115 round 2): purge the
             // KG before the owning observation rows are gone. Order:
             //   1. kg_passage_entities (no namespace column → must
@@ -5789,19 +5787,19 @@ impl StorageTrait for SqliteBackend {
             )?;
 
             // Bulk delete from each memory table by namespace_id.
-            total += conn.execute(
+            let mut memories = conn.execute(
                 "DELETE FROM episodic_memories WHERE namespace_id = ?1",
                 params![&ns_str],
             )?;
-            total += conn.execute(
+            memories += conn.execute(
                 "DELETE FROM semantic_memories WHERE namespace_id = ?1",
                 params![&ns_str],
             )?;
-            total += conn.execute(
+            memories += conn.execute(
                 "DELETE FROM procedural_memories WHERE namespace_id = ?1",
                 params![&ns_str],
             )?;
-            total += conn.execute(
+            let observations = conn.execute(
                 "DELETE FROM observation_memories WHERE namespace_id = ?1",
                 params![&ns_str],
             )?;
@@ -5816,13 +5814,51 @@ impl StorageTrait for SqliteBackend {
                 params![&ns_str],
             )?;
 
-            Ok(total)
+            // The graph and the records it hangs off (#278). Edges carry no
+            // foreign key, so their position is free; they go first so no edge
+            // ever outlives the entity it names.
+            let edges = conn.execute(
+                "DELETE FROM edges WHERE namespace_id = ?1",
+                params![&ns_str],
+            )?;
+            // `acl.entity_id REFERENCES entities(id)` and this connection runs
+            // with `foreign_keys=ON`, so a grant naming one of this namespace's
+            // entities has to go before the entity does or the delete below is
+            // rejected. Both halves of the predicate are needed: a grant is
+            // namespace-owned by its own `namespace_id`, and one recorded in
+            // another namespace can still name an entity from this one.
+            conn.execute(
+                "DELETE FROM acl WHERE namespace_id = ?1 \
+                 OR entity_id IN (SELECT id FROM entities WHERE namespace_id = ?1)",
+                params![&ns_str],
+            )?;
+            let entities = conn.execute(
+                "DELETE FROM entities WHERE namespace_id = ?1",
+                params![&ns_str],
+            )?;
+            let episodes = conn.execute(
+                "DELETE FROM episodes WHERE namespace_id = ?1",
+                params![&ns_str],
+            )?;
+            let activity_events = conn.execute(
+                "DELETE FROM activity_events WHERE namespace_id = ?1",
+                params![&ns_str],
+            )?;
+
+            Ok(NamespacePurgeSummary {
+                memories,
+                observations,
+                edges,
+                entities,
+                episodes,
+                activity_events,
+            })
         })();
 
         match result {
-            Ok(total) => {
+            Ok(summary) => {
                 conn.execute_batch("COMMIT")?;
-                Ok(total)
+                Ok(summary)
             }
             Err(e) => {
                 let _ = conn.execute_batch("ROLLBACK");
@@ -9409,7 +9445,7 @@ mod tests {
         assert_eq!(db.delete_memories_by_entity(entity_id, ns.id).unwrap(), 2);
         assert_eq!(embedding_count(&db, ns.id), 1);
 
-        assert_eq!(db.purge_namespace(ns.id).unwrap(), 1);
+        assert_eq!(db.purge_namespace(ns.id).unwrap().memory_rows(), 1);
         assert_eq!(embedding_count(&db, ns.id), 0);
     }
 
@@ -11615,6 +11651,175 @@ mod tests {
         assert_eq!(kg_entities_count_for_namespace(&db, ns_b.id), 2);
         assert_eq!(kg_triples_count_for_passage(&db, obs_b.id), 1);
         assert_eq!(kg_passage_entities_count_for_passage(&db, obs_b.id), 2);
+    }
+
+    /// Rows `namespace_id` holds in `table`, read straight off the connection so
+    /// the count sees superseded rows and tables no accessor exposes.
+    fn namespace_row_count(db: &SqliteBackend, table: &str, namespace_id: Uuid) -> i64 {
+        db.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE namespace_id = ?1"),
+                [namespace_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Every table a namespace purge is responsible for emptying.
+    const PURGED_TABLES: [&str; 10] = [
+        "episodic_memories",
+        "semantic_memories",
+        "procedural_memories",
+        "observation_memories",
+        "memory_fts",
+        "edges",
+        "acl",
+        "entities",
+        "episodes",
+        "activity_events",
+    ];
+
+    /// One of everything a namespace can own: two entities joined by an edge,
+    /// an ACL grant naming one of them, an episode, one memory of each kind,
+    /// and an activity event.
+    fn seed_everything_a_namespace_owns(db: &SqliteBackend, name: &str) -> Namespace {
+        let ns = Namespace::new(name);
+        db.save_namespace(&ns).unwrap();
+
+        let mut subject = Entity::new("subject", EntityKind::User);
+        subject.namespace_id = ns.id;
+        db.save_entity(&subject).unwrap();
+        let mut peer = Entity::new("peer", EntityKind::Agent);
+        peer.namespace_id = ns.id;
+        db.save_entity(&peer).unwrap();
+        db.save_edge(&Edge::new(subject.id, peer.id, "knows"), ns.id)
+            .unwrap();
+        // Nothing writes `acl` through the trait yet. The row is here because
+        // `acl.entity_id REFERENCES entities(id)` with `foreign_keys=ON`: a
+        // purge that deleted entities before grants would be rejected.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO acl (id, namespace_id, entity_id, granted_by) VALUES (?1, ?2, ?3, ?3)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    ns.id.to_string(),
+                    subject.id.to_string()
+                ],
+            )
+            .unwrap();
+
+        let episode = Episode::new(ns.id, vec![subject.id, peer.id]);
+        db.save_episode(&episode).unwrap();
+        db.save_episodic(&EpisodicMemory::new(
+            ns.id, episode.id, subject.id, peer.id, "a turn",
+        ))
+        .unwrap();
+        db.save_semantic(&SemanticMemory::new(
+            ns.id, subject.id, "likes", "rust", 0.9,
+        ))
+        .unwrap();
+        db.save_procedural(&ProceduralMemory::new(
+            ns.id,
+            "trigger",
+            "action",
+            Outcome::Success,
+            HashMap::new(),
+        ))
+        .unwrap();
+        db.save_observation(&ObservationMemory::new(
+            ns.id, episode.id, "kind", "instance", "did", "an obs",
+        ))
+        .unwrap();
+        db.log_activity(ns.id, "remember", &serde_json::json!({"count": 1}))
+            .unwrap();
+        ns
+    }
+
+    /// #278: a namespace purge emptied the memory tables and left the
+    /// namespace's edges and entity records standing. #283: episodes and
+    /// activity events outlived it too. All of it goes now, and none of the
+    /// neighbouring namespace's rows do.
+    #[test]
+    fn purge_namespace_removes_edges_entities_episodes_and_activity() {
+        let (_dir, db) = setup();
+        let ns_a = seed_everything_a_namespace_owns(&db, "purge-a");
+        let ns_b = seed_everything_a_namespace_owns(&db, "purge-b");
+        let before_b: Vec<i64> = PURGED_TABLES
+            .iter()
+            .map(|table| namespace_row_count(&db, table, ns_b.id))
+            .collect();
+        assert!(
+            before_b.iter().all(|count| *count > 0),
+            "the fixture must plant a row in every purged table, or its absence proves nothing: \
+             {before_b:?}"
+        );
+
+        let summary = db.purge_namespace(ns_a.id).unwrap();
+
+        assert_eq!(
+            summary,
+            NamespacePurgeSummary {
+                memories: 3,
+                observations: 1,
+                edges: 1,
+                entities: 2,
+                episodes: 1,
+                activity_events: 1,
+            }
+        );
+        for table in PURGED_TABLES {
+            assert_eq!(
+                namespace_row_count(&db, table, ns_a.id),
+                0,
+                "{table} must hold nothing for the purged namespace"
+            );
+        }
+        let after_b: Vec<i64> = PURGED_TABLES
+            .iter()
+            .map(|table| namespace_row_count(&db, table, ns_b.id))
+            .collect();
+        assert_eq!(
+            after_b, before_b,
+            "the neighbouring namespace must be untouched"
+        );
+        assert!(
+            db.get_namespace_by_name("purge-a").unwrap().is_some(),
+            "the namespace record itself stays: a purge empties it, it does not remove it"
+        );
+    }
+
+    /// The purge is one transaction. A failure on its last leg must leave every
+    /// earlier leg's rows in place rather than a namespace with its memories
+    /// gone and its entities still standing.
+    #[test]
+    fn purge_namespace_rolls_back_every_leg_when_one_fails() {
+        let (_dir, db) = setup();
+        let ns = seed_everything_a_namespace_owns(&db, "purge-rollback");
+        let before: Vec<i64> = PURGED_TABLES
+            .iter()
+            .map(|table| namespace_row_count(&db, table, ns.id))
+            .collect();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_activity_delete BEFORE DELETE ON activity_events
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .unwrap();
+
+        db.purge_namespace(ns.id)
+            .expect_err("the refused delete must fail the purge");
+
+        let after: Vec<i64> = PURGED_TABLES
+            .iter()
+            .map(|table| namespace_row_count(&db, table, ns.id))
+            .collect();
+        assert_eq!(after, before, "a failed purge must delete nothing");
     }
 
     #[test]

@@ -2370,7 +2370,9 @@ mod tests {
         VectorSearchRequest,
     };
     use crate::storage::sqlite::SqliteBackend;
-    use crate::storage::{ActivityAggregate, ActivityEvent, ErasedRows, StorageResult};
+    use crate::storage::{
+        ActivityAggregate, ActivityEvent, ErasedRows, NamespacePurgeSummary, StorageResult,
+    };
     use crate::types::{
         Edge, Entity, EntityKind, Episode, EpisodicMemory, Namespace, ProceduralMemory,
         SemanticMemory,
@@ -3862,6 +3864,9 @@ mod tests {
             _namespace_id: Uuid,
         ) -> StorageResult<bool> {
             Ok(false)
+        }
+        fn purge_namespace(&self, _namespace_id: Uuid) -> StorageResult<NamespacePurgeSummary> {
+            Ok(NamespacePurgeSummary::default())
         }
         fn list_entities_by_namespace(&self, _namespace_id: Uuid) -> StorageResult<Vec<Entity>> {
             Ok(Vec::new())

@@ -1696,7 +1696,9 @@ async fn purge_all_memories(
         )
     })?;
 
-    Ok(Json(serde_json::json!({ "deleted": deleted_count })))
+    Ok(Json(
+        serde_json::json!({ "deleted": deleted_count.memory_rows() }),
+    ))
 }
 
 async fn supersede_memory(

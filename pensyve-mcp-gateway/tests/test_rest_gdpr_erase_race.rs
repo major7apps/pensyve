@@ -33,8 +33,8 @@ use pensyve_core::embedding_space::EmbeddingSpaceId;
 use pensyve_core::storage::bounded::{EmbeddingRecord, MemoryRef, NamespaceEmbeddingState};
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::storage::{
-    ActivityAggregate, ActivityEvent, ErasedRows, ErasureSummary, StorageResult, StorageTrait,
-    embedding_record_for_memory,
+    ActivityAggregate, ActivityEvent, ErasedRows, ErasureSummary, NamespacePurgeSummary,
+    StorageResult, StorageTrait, embedding_record_for_memory,
 };
 use pensyve_core::types::{
     Edge, Entity, EntityKind, Episode, EpisodicMemory, Memory, Namespace, ObservationMemory,
@@ -418,7 +418,7 @@ impl StorageTrait for RacingStorage {
         self.inner
             .delete_memory_by_id_in_namespace(id, namespace_id)
     }
-    fn purge_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
+    fn purge_namespace(&self, namespace_id: Uuid) -> StorageResult<NamespacePurgeSummary> {
         self.inner.purge_namespace(namespace_id)
     }
     fn list_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Entity>> {

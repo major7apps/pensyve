@@ -332,6 +332,28 @@ pub struct ErasureSummary {
     pub entities: usize,
 }
 
+/// Constant-size result of [`StorageTrait::purge_namespace`]: how many rows of
+/// each kind the purge removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NamespacePurgeSummary {
+    /// Episodic, semantic and procedural rows, superseded rows included.
+    pub memories: usize,
+    pub observations: usize,
+    pub edges: usize,
+    pub entities: usize,
+    pub episodes: usize,
+    pub activity_events: usize,
+}
+
+impl NamespacePurgeSummary {
+    /// Rows removed from the four memory tables: the number `purge_namespace`
+    /// returned on its own before it reported the other kinds.
+    #[must_use]
+    pub const fn memory_rows(&self) -> usize {
+        self.memories + self.observations
+    }
+}
+
 /// Maximum whitespace-delimited tokens an FTS query contributes to the search
 /// expression; both backends truncate identically so their candidate sets stay
 /// comparable (#225).
@@ -1300,21 +1322,32 @@ pub trait StorageTrait: Send + Sync {
     fn delete_memory_by_id_in_namespace(&self, id: Uuid, namespace_id: Uuid)
     -> StorageResult<bool>;
 
-    /// Delete all memories in a namespace. Returns the count of deleted memories.
-    fn purge_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
-        // Default: fall back to loading + deleting one by one.
-        let memories = self.get_all_memories_by_namespace(namespace_id)?;
-        let mut count = 0;
-        for mem in &memories {
-            if self
-                .delete_memory_by_id_in_namespace(mem.id(), namespace_id)
-                .unwrap_or(false)
-            {
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
+    /// Remove everything `namespace_id` owns, in one transaction, and report
+    /// what was removed.
+    ///
+    /// "Everything" is: all four memory kinds (superseded rows included) with
+    /// their search-index and embedding rows, the knowledge-graph rows derived
+    /// from them where the backend has any, graph edges, entity records,
+    /// episodes, and activity events. Either all of it goes or none of it does,
+    /// and nothing outside `namespace_id` is touched.
+    ///
+    /// What stays is the namespace itself and its configuration: the
+    /// `namespaces` row, the embedding lifecycle state and its backfill queue,
+    /// and consolidation checkpoints. Those hold identifiers and hashes, never
+    /// memory content, and the namespace keeps working after a purge.
+    ///
+    /// Activity events are removed because they are namespace-owned history and
+    /// a whole-namespace erasure that kept them would not be one (#283). A
+    /// caller that owes a record of the purge writes it with
+    /// [`StorageTrait::log_activity`] *after* this returns, so that record is
+    /// the one event the emptied namespace holds.
+    ///
+    /// Required, with no default. The default this replaced could only reach
+    /// what the trait exposes one row at a time — live memories — so it left
+    /// superseded rows, edges, entities and episodes behind while returning
+    /// `Ok` (#270, #278). A backend has to implement the purge as set-based
+    /// deletes in a transaction of its own.
+    fn purge_namespace(&self, namespace_id: Uuid) -> StorageResult<NamespacePurgeSummary>;
 
     // There is deliberately no `update_semantic_content`, no
     // `invalidate_semantic` and no `delete_entity`. All three keyed on a memory

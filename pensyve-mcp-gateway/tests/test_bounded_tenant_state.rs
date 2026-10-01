@@ -10,7 +10,8 @@ use pensyve_core::storage::bounded::{
 };
 use pensyve_core::storage::sqlite::SqliteBackend;
 use pensyve_core::storage::{
-    ActivityAggregate, ActivityEvent, ErasedRows, StorageError, StorageResult, StorageTrait,
+    ActivityAggregate, ActivityEvent, ErasedRows, NamespacePurgeSummary, StorageError,
+    StorageResult, StorageTrait,
 };
 use pensyve_core::types::{
     Edge, Entity, Episode, EpisodicMemory, Memory, Namespace, ObservationMemory, ProceduralMemory,
@@ -261,6 +262,10 @@ impl StorageTrait for CountingStorage {
     ) -> StorageResult<bool> {
         self.inner
             .delete_memory_by_id_in_namespace(id, namespace_id)
+    }
+
+    fn purge_namespace(&self, namespace_id: Uuid) -> StorageResult<NamespacePurgeSummary> {
+        self.inner.purge_namespace(namespace_id)
     }
 
     fn list_entities_by_namespace(&self, namespace_id: Uuid) -> StorageResult<Vec<Entity>> {

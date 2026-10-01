@@ -123,7 +123,7 @@ use crate::storage::consolidation_workspace::{
     CONSOLIDATION_WORKING_STATE_BYTES, ClusterDecision, ConsolidationWorkspace, DecayPage,
     DecayRecord, PromotionCommit, RunId, WorkspaceCursor,
 };
-use crate::storage::{StorageError, StorageTrait};
+use crate::storage::{NamespacePurgeSummary, StorageError, StorageTrait};
 use crate::types::{
     Edge, Entity, EntityKind, EpisodicMemory, Memory, Namespace, ObservationMemory, Outcome,
     ProceduralMemory, SemanticMemory,
@@ -3599,7 +3599,8 @@ fn purge_namespace_is_confined_to_its_namespace() {
     assert_eq!(
         backend
             .purge_namespace(ns_a.id)
-            .expect("purge namespace A must not error"),
+            .expect("purge namespace A must not error")
+            .memory_rows(),
         mine.len(),
         "the purge must report one deletion per memory row in its own namespace"
     );
@@ -3642,7 +3643,8 @@ fn purge_namespace_still_works_under_enforced_rls() {
     assert_eq!(
         backend
             .purge_namespace(ns_a.id)
-            .expect("purge namespace A must not error"),
+            .expect("purge namespace A must not error")
+            .memory_rows(),
         mine.len(),
         "the purge must take effect in its own namespace under enforced RLS"
     );
@@ -3665,12 +3667,12 @@ fn purge_namespace_still_works_under_enforced_rls() {
 /// statements carry no `superseded_by` filter, so the count is *every* row the
 /// namespace holds.
 ///
-/// The trait default cannot match that. It purges by iterating
-/// `get_all_memories_by_namespace`, which filters `superseded_by IS NULL`, so
-/// a superseded row is neither counted nor deleted: the purge leaves tenant
-/// data behind and reports a total that says it did not. That makes this the
-/// test that distinguishes the backend override from the default — the other
-/// two pass either way.
+/// The trait default this backend first overrode (#270) could not match that.
+/// It purged by iterating `get_all_memories_by_namespace`, which filters
+/// `superseded_by IS NULL`, so a superseded row was neither counted nor
+/// deleted: the purge left tenant data behind and reported a total that said
+/// it did not. `purge_namespace` has no default any more (#278); this test
+/// keeps a per-row implementation from coming back.
 #[test]
 fn purge_namespace_counts_superseded_rows_like_sqlite() {
     let Some(admin_opts) = skip_notice("purge_namespace_counts_superseded_rows_like_sqlite") else {
@@ -3696,13 +3698,215 @@ fn purge_namespace_counts_superseded_rows_like_sqlite() {
     assert_eq!(
         backend
             .purge_namespace(ns.id)
-            .expect("purge must not error"),
+            .expect("purge must not error")
+            .memory_rows(),
         live.len() + 1,
         "the purge must count the superseded row, as SQLite's set-based override does"
     );
     assert!(
         surviving_ids(backend, ns.id).is_empty(),
         "the purge must delete the superseded row, not just the live ones"
+    );
+}
+
+/// Tables a namespace purge is responsible for emptying, beyond the four
+/// memory tables [`surviving_ids`] already reads.
+const PURGED_RECORD_TABLES: [&str; 4] = ["edges", "entities", "episodes", "activity_events"];
+
+/// Seed everything a namespace can own beyond its memories: two entities joined
+/// by an edge, an episode, and an activity event.
+fn seed_namespace_records(backend: &PostgresBackend, namespace_id: Uuid) {
+    let mut subject = Entity::new("subject", EntityKind::User);
+    subject.namespace_id = namespace_id;
+    backend.save_entity(&subject).expect("save subject");
+    let mut peer = Entity::new("peer", EntityKind::User);
+    peer.namespace_id = namespace_id;
+    backend.save_entity(&peer).expect("save peer");
+    backend
+        .save_edge(&Edge::new(subject.id, peer.id, "knows"), namespace_id)
+        .expect("save edge");
+    backend
+        .save_episode(&crate::types::Episode::new(
+            namespace_id,
+            vec![subject.id, peer.id],
+        ))
+        .expect("save episode");
+    backend
+        .log_activity(namespace_id, "remember", &serde_json::json!({"count": 1}))
+        .expect("log activity");
+}
+
+/// Rows `namespace_id` holds in each of [`PURGED_RECORD_TABLES`], read on a
+/// connection bound to that namespace so the count is the same whether or not
+/// the policies are enforced.
+fn namespace_record_counts(fixture: &Fixture, namespace_id: Uuid) -> Vec<i64> {
+    fixture.rt.block_on(async {
+        let mut conn = fixture
+            .backend
+            .scoped_conn(namespace_id)
+            .await
+            .expect("bind a connection to the namespace");
+        let mut counts = Vec::new();
+        for table in PURGED_RECORD_TABLES {
+            let (count,): (i64,) = query_as::<Postgres, _>(AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table} WHERE namespace_id = $1"
+            )))
+            .bind(namespace_id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap_or_else(|e| panic!("count {table}: {e}"));
+            counts.push(count);
+        }
+        counts
+    })
+}
+
+/// #278 and #283: the purge emptied the memory tables and left the namespace's
+/// edges, entity records, episodes and activity events standing.
+///
+/// Enforcement is lifted so the explicit `namespace_id = $1` predicates are the
+/// only thing confining each of the new statements — `activity_events` carries
+/// no policy at all, so for that table they are the only confinement there is.
+#[test]
+fn purge_namespace_removes_edges_entities_episodes_and_activity() {
+    let Some(admin_opts) =
+        skip_notice("purge_namespace_removes_edges_entities_episodes_and_activity")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    fixture.relax_rls();
+    let backend = &fixture.backend;
+
+    let ns_a = Namespace::new(format!("purge-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("purge-b-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns_a).expect("save namespace A");
+    backend.save_namespace(&ns_b).expect("save namespace B");
+    seed_one_of_each_kind(backend, ns_a.id, "tenant-a");
+    seed_namespace_records(backend, ns_a.id);
+    let mut theirs = seed_one_of_each_kind(backend, ns_b.id, "tenant-b");
+    theirs.sort();
+    seed_namespace_records(backend, ns_b.id);
+    assert_eq!(namespace_record_counts(&fixture, ns_a.id), [1, 2, 1, 1]);
+
+    let summary = backend
+        .purge_namespace(ns_a.id)
+        .expect("purge namespace A must not error");
+
+    assert_eq!(
+        summary,
+        NamespacePurgeSummary {
+            memories: 3,
+            observations: 1,
+            edges: 1,
+            entities: 2,
+            episodes: 1,
+            activity_events: 1,
+        }
+    );
+    assert!(surviving_ids(backend, ns_a.id).is_empty());
+    assert_eq!(
+        namespace_record_counts(&fixture, ns_a.id),
+        [0, 0, 0, 0],
+        "namespace A must hold no edge, entity, episode or activity event after its purge"
+    );
+    assert_eq!(surviving_ids(backend, ns_b.id), theirs);
+    assert_eq!(
+        namespace_record_counts(&fixture, ns_b.id),
+        [1, 2, 1, 1],
+        "namespace B's records must survive a purge issued for namespace A"
+    );
+    assert!(
+        backend
+            .get_namespace_by_name(&ns_a.name)
+            .expect("read namespace A")
+            .is_some(),
+        "the namespace record itself stays: a purge empties it, it does not remove it"
+    );
+}
+
+/// The same purge with the policies enforced: every new leg must still take
+/// effect on the namespace-bound connection, and still stop at the boundary.
+#[test]
+fn purge_namespace_removes_namespace_records_under_enforced_rls() {
+    let Some(admin_opts) =
+        skip_notice("purge_namespace_removes_namespace_records_under_enforced_rls")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns_a = Namespace::new(format!("purge-a-{}", Uuid::new_v4().simple()));
+    let ns_b = Namespace::new(format!("purge-b-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns_a).expect("save namespace A");
+    backend.save_namespace(&ns_b).expect("save namespace B");
+    seed_namespace_records(backend, ns_a.id);
+    seed_namespace_records(backend, ns_b.id);
+
+    let summary = backend
+        .purge_namespace(ns_a.id)
+        .expect("purge namespace A must not error");
+
+    assert_eq!(
+        (
+            summary.edges,
+            summary.entities,
+            summary.episodes,
+            summary.activity_events
+        ),
+        (1, 2, 1, 1),
+        "a purge that deletes nothing while returning Ok is the failure #254 catalogued"
+    );
+    assert_eq!(namespace_record_counts(&fixture, ns_a.id), [0, 0, 0, 0]);
+    assert_eq!(namespace_record_counts(&fixture, ns_b.id), [1, 2, 1, 1]);
+}
+
+/// The purge is one transaction. A failure on its last leg must leave every
+/// earlier leg's rows in place.
+#[test]
+fn purge_namespace_rolls_back_every_leg_when_one_fails() {
+    let Some(admin_opts) = skip_notice("purge_namespace_rolls_back_every_leg_when_one_fails")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let backend = &fixture.backend;
+
+    let ns = Namespace::new(format!("purge-rollback-{}", Uuid::new_v4().simple()));
+    backend.save_namespace(&ns).expect("save namespace");
+    let mut seeded = seed_one_of_each_kind(backend, ns.id, "tenant");
+    seeded.sort();
+    seed_namespace_records(backend, ns.id);
+
+    fixture.rt.block_on(async {
+        exec(
+            backend.pool(),
+            "CREATE FUNCTION refuse_activity_delete() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE EXCEPTION 'refused'; END $$",
+        )
+        .await;
+        exec(
+            backend.pool(),
+            "CREATE TRIGGER refuse_activity_delete BEFORE DELETE ON activity_events \
+             FOR EACH STATEMENT EXECUTE FUNCTION refuse_activity_delete()",
+        )
+        .await;
+    });
+
+    backend
+        .purge_namespace(ns.id)
+        .expect_err("the refused delete must fail the purge");
+
+    assert_eq!(
+        surviving_ids(backend, ns.id),
+        seeded,
+        "a failed purge must leave every memory in place"
+    );
+    assert_eq!(
+        namespace_record_counts(&fixture, ns.id),
+        [1, 2, 1, 1],
+        "a failed purge must leave every edge, entity, episode and activity event in place"
     );
 }
 

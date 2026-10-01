@@ -16,7 +16,8 @@ use crate::types::Memory;
 #[derive(Debug, Clone, Default)]
 pub struct ErasureResult {
     /// Number of memories deleted (episodic + semantic). Procedural memories
-    /// are not attached to an entity and are not part of an entity erasure.
+    /// are not attached to an entity and are not part of an entity erasure;
+    /// [`erase_namespace`] does remove them, and counts them here.
     pub memories_deleted: usize,
     /// Number of observation memories deleted (derived from episodes the
     /// entity participated in).
@@ -97,7 +98,7 @@ pub fn erase_entity_captured(
 }
 
 /// Count-only bounded erasure for storage-backed callers with no out-of-band
-/// vector index to clean up (the CLI and `erase_namespace`).
+/// vector index to clean up (the CLI).
 pub fn erase_entity(
     storage: &dyn StorageTrait,
     entity_id: Uuid,
@@ -114,37 +115,40 @@ pub fn erase_entity(
     })
 }
 
-/// Execute a GDPR erasure for ALL entities in a namespace.
+/// Execute a GDPR erasure of everything a namespace holds.
 ///
-/// Used when an organization requests full data deletion.
+/// Used when an organization requests full data deletion. One
+/// [`StorageTrait::purge_namespace`] transaction removes every memory kind
+/// (procedural memories included, which belong to the namespace rather than to
+/// any entity), the graph edges, the entity records, the episodes and the
+/// activity events. It either commits whole or rolls back whole and surfaces as
+/// `Err`; there is no partial erase to report on.
+///
+/// This used to walk the namespace's entities and erase each one, which is not
+/// the same thing: procedural memories, memories naming no surviving entity,
+/// episodes and activity events all outlived an erasure documented as full
+/// (#283).
+///
+/// The namespace record and its embedding configuration stay, so the namespace
+/// is empty afterwards rather than gone. `memories_deleted` here counts
+/// episodic, semantic and procedural rows.
+///
+/// This removes the namespace's activity history too. A caller that owes a
+/// record of the erasure writes it afterwards with
+/// [`StorageTrait::log_activity`].
 pub fn erase_namespace(
     storage: &dyn StorageTrait,
     namespace_id: Uuid,
 ) -> Result<ErasureResult, StorageError> {
-    let mut result = ErasureResult::default();
-
-    // Get all entities in the namespace
-    let entities = storage.list_entities_by_namespace(namespace_id)?;
-
-    for entity in &entities {
-        match erase_entity(storage, entity.id, namespace_id) {
-            Ok(entity_result) => {
-                result.memories_deleted += entity_result.memories_deleted;
-                result.observations_deleted += entity_result.observations_deleted;
-                result.edges_deleted += entity_result.edges_deleted;
-                result.entities_deleted += entity_result.entities_deleted;
-                result.warnings.extend(entity_result.warnings);
-            }
-            Err(e) => {
-                result
-                    .warnings
-                    .push(format!("Entity {} erasure error: {e}", entity.id));
-            }
-        }
-    }
-
-    result.complete = result.warnings.is_empty();
-    Ok(result)
+    let purged = storage.purge_namespace(namespace_id)?;
+    Ok(ErasureResult {
+        memories_deleted: purged.memories,
+        observations_deleted: purged.observations,
+        edges_deleted: purged.edges,
+        entities_deleted: purged.entities,
+        complete: true,
+        warnings: Vec::new(),
+    })
 }
 
 /// Export all data for an entity (DSAR — Data Subject Access Request).
@@ -425,7 +429,10 @@ mod tests {
     use super::*;
     use crate::embedding::OnnxEmbedder;
     use crate::storage::sqlite::SqliteBackend;
-    use crate::types::{Edge, Entity, EntityKind, Episode, EpisodicMemory, Namespace};
+    use crate::types::{
+        Edge, Entity, EntityKind, Episode, EpisodicMemory, Namespace, ObservationMemory, Outcome,
+        ProceduralMemory,
+    };
 
     #[test]
     fn test_erase_entity_empty() {
@@ -537,6 +544,121 @@ mod tests {
 
         let result = erase_namespace(&storage, ns.id).unwrap();
         assert!(result.complete);
+    }
+
+    /// #283: `erase_namespace` walked the namespace's entities, so everything
+    /// not reachable from an entity outlived an erasure documented as full —
+    /// procedural memories, a memory about an entity with no record, episodes
+    /// and activity events.
+    #[test]
+    fn erase_namespace_removes_what_no_entity_reaches() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = SqliteBackend::open(dir.path()).unwrap();
+
+        let ns = Namespace::new("erase-ns-full");
+        storage.save_namespace(&ns).unwrap();
+        let other = Namespace::new("erase-ns-neighbour");
+        storage.save_namespace(&other).unwrap();
+
+        let mut subject = Entity::new("subject", EntityKind::User);
+        subject.namespace_id = ns.id;
+        storage.save_entity(&subject).unwrap();
+        let mut peer = Entity::new("peer", EntityKind::User);
+        peer.namespace_id = ns.id;
+        storage.save_entity(&peer).unwrap();
+        storage
+            .save_edge(&Edge::new(subject.id, peer.id, "knows"), ns.id)
+            .unwrap();
+
+        let episode = Episode::new(ns.id, vec![subject.id]);
+        storage.save_episode(&episode).unwrap();
+        storage
+            .save_episodic(&EpisodicMemory::new(
+                ns.id, episode.id, subject.id, subject.id, "a turn",
+            ))
+            .unwrap();
+        // About an entity that has no record: the entity walk never visits it.
+        let orphan = Uuid::new_v4();
+        storage
+            .save_episodic(&EpisodicMemory::new(
+                ns.id,
+                episode.id,
+                orphan,
+                orphan,
+                "an orphaned turn",
+            ))
+            .unwrap();
+        storage
+            .save_procedural(&ProceduralMemory::new(
+                ns.id,
+                "trigger",
+                "action",
+                Outcome::Success,
+                std::collections::HashMap::new(),
+            ))
+            .unwrap();
+        storage
+            .save_observation(&ObservationMemory::new(
+                ns.id, episode.id, "kind", "instance", "did", "an obs",
+            ))
+            .unwrap();
+        storage
+            .log_activity(ns.id, "remember", &serde_json::json!({"count": 1}))
+            .unwrap();
+
+        let mut neighbour = Entity::new("subject", EntityKind::User);
+        neighbour.namespace_id = other.id;
+        storage.save_entity(&neighbour).unwrap();
+        storage
+            .save_procedural(&ProceduralMemory::new(
+                other.id,
+                "trigger",
+                "action",
+                Outcome::Success,
+                std::collections::HashMap::new(),
+            ))
+            .unwrap();
+
+        let result = erase_namespace(&storage, ns.id).unwrap();
+
+        assert_eq!(result.memories_deleted, 3, "two episodic, one procedural");
+        assert_eq!(result.observations_deleted, 1);
+        assert_eq!(result.edges_deleted, 1);
+        assert_eq!(result.entities_deleted, 2);
+        assert!(result.complete);
+        assert!(result.warnings.is_empty());
+
+        assert!(
+            storage
+                .get_all_memories_by_namespace_including_superseded(ns.id)
+                .unwrap()
+                .is_empty(),
+            "no memory of any kind may survive a namespace erasure"
+        );
+        assert!(
+            storage
+                .list_entities_by_namespace(ns.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(storage.count_episodes_by_namespace(ns.id).unwrap(), 0);
+        assert!(
+            storage.get_recent_activity(ns.id, 10).unwrap().is_empty(),
+            "the namespace's activity history is erased with it"
+        );
+
+        assert_eq!(
+            storage
+                .get_all_memories_by_namespace_including_superseded(other.id)
+                .unwrap()
+                .len(),
+            1,
+            "the neighbouring namespace keeps its memories"
+        );
+        assert_eq!(
+            storage.list_entities_by_namespace(other.id).unwrap().len(),
+            1
+        );
     }
 
     #[test]

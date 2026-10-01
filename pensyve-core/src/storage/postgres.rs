@@ -29,8 +29,8 @@ use crate::types::{
 
 use super::{
     ActivityAggregate, ActivityEvent, BulkMutationSummary, BulkPageGuard, BulkPageKind,
-    CapturedMemory, ErasedRows, ErasureSummary, StorageError, StorageResult, StorageTrait,
-    bounded_bulk_page_size, canonical_embedding_source_sha256,
+    CapturedMemory, ErasedRows, ErasureSummary, NamespacePurgeSummary, StorageError, StorageResult,
+    StorageTrait, bounded_bulk_page_size, canonical_embedding_source_sha256,
     canonical_embedding_source_text_sha256, cross_namespace_edge_id, memory_is_live,
     memory_namespace_id, validate_record_matches_memory,
 };
@@ -5641,59 +5641,67 @@ impl StorageTrait for PostgresBackend {
         })
     }
 
-    /// Set-based purge, mirroring `SQLite`'s override rather than the trait
-    /// default.
+    /// Set-based purge, mirroring `SQLite`'s.
     ///
-    /// The default lists the namespace's memories and deletes them one id at a
-    /// time. Two things are wrong with that here. It is O(n) round trips for
-    /// what four statements express. And it is incomplete: it iterates
-    /// [`Self::get_all_memories_by_namespace`], which filters `superseded_by IS
-    /// NULL`, so a superseded row is neither deleted nor counted — a purge that
-    /// leaves tenant data behind and returns a total saying it did not.
+    /// The trait default this first replaced (#270) listed the namespace's
+    /// memories and deleted them one id at a time. Two things were wrong with
+    /// that. It was O(n) round trips for what four statements express. And it
+    /// was incomplete: it iterated [`Self::get_all_memories_by_namespace`],
+    /// which filters `superseded_by IS NULL`, so a superseded row was neither
+    /// deleted nor counted — a purge that left tenant data behind and returned
+    /// a total saying it did not. That default no longer exists.
     ///
-    /// The count is every row removed from the four memory tables, superseded
-    /// rows included, which is exactly what `SQLite`'s `rows_affected` sum
-    /// reports. `purge_namespace_counts_superseded_rows_like_sqlite` pins that
-    /// equality.
+    /// [`NamespacePurgeSummary::memory_rows`] is every row removed from the
+    /// four memory tables, superseded rows included, which is exactly what
+    /// `SQLite`'s `rows_affected` sum reports.
+    /// `purge_namespace_counts_superseded_rows_like_sqlite` pins that equality.
     ///
-    /// # What does not appear here, and why
+    /// # What it removes beyond the memory tables
+    ///
+    /// The namespace's graph edges, entity records, episodes and activity
+    /// events go in the same transaction (#278, #283), so a purge leaves the
+    /// namespace empty rather than emptying its memory tables and leaving the
+    /// graph and entity records standing. Nothing in this schema references
+    /// `entities` by foreign key, so the order below is for the reader: rows
+    /// that name an entity go before the entity does.
     ///
     /// `SQLite`'s override also cascades the knowledge graph (`kg_triples`,
-    /// `kg_entities`, `kg_passage_entities`) and clears `memory_fts`. Neither
-    /// has an analogue in `postgres_schema.sql`: the KG tables are not part of
-    /// the Postgres schema at all, and full-text search is a generated
-    /// `tsvector` column on each memory table, so deleting the row takes its
-    /// index entry with it. `edges` and `entities` are untouched on both
-    /// backends: a purge empties the memory tables and leaves the namespace's
-    /// graph and entity records standing. The entity-scoped
-    /// [`StorageTrait::erase_entity_capturing`] does delete both, so the
-    /// expression is available — the purge simply does not use it. That gap is
-    /// #278.
+    /// `kg_entities`, `kg_passage_entities`), clears `memory_fts` and removes
+    /// `acl` grants. None has an analogue in `postgres_schema.sql`: those
+    /// tables are not part of the Postgres schema at all, and full-text search
+    /// is a generated `tsvector` column on each memory table, so deleting the
+    /// row takes its index entry with it.
     ///
-    /// Every statement names `namespace_id = $1` explicitly even though all
-    /// four run on a namespace-bound connection. That is the #254 convention:
+    /// Every statement names `namespace_id = $1` explicitly even though all of
+    /// them run on a namespace-bound connection. That is the #254 convention:
     /// the predicate is what confines the purge in a deployment as shipped
     /// (the backend connects as the schema owner, so the policies are inert),
-    /// and RLS backs it up once an operator enforces it.
-    fn purge_namespace(&self, namespace_id: Uuid) -> StorageResult<usize> {
+    /// and RLS backs it up once an operator enforces it. For `activity_events`
+    /// the predicate is the only confinement there is, because that table
+    /// carries no policy.
+    fn purge_namespace(&self, namespace_id: Uuid) -> StorageResult<NamespacePurgeSummary> {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
             lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
-            let mut total = 0usize;
+            let mut removed = [0usize; 8];
 
-            for sql in [
+            for (slot, sql) in removed.iter_mut().zip([
                 "DELETE FROM episodic_memories WHERE namespace_id = $1",
                 "DELETE FROM semantic_memories WHERE namespace_id = $1",
                 "DELETE FROM procedural_memories WHERE namespace_id = $1",
                 "DELETE FROM observation_memories WHERE namespace_id = $1",
-            ] {
+                "DELETE FROM edges WHERE namespace_id = $1",
+                "DELETE FROM entities WHERE namespace_id = $1",
+                "DELETE FROM episodes WHERE namespace_id = $1",
+                "DELETE FROM activity_events WHERE namespace_id = $1",
+            ]) {
                 let result = query::<Postgres>(sql)
                     .bind(namespace_id)
                     .execute(&mut *transaction)
                     .await
                     .map_err(sqlx_to_io)?;
-                total += result.rows_affected() as usize;
+                *slot = result.rows_affected() as usize;
             }
 
             query::<Postgres>("DELETE FROM memory_embeddings WHERE namespace_id = $1")
@@ -5703,7 +5711,24 @@ impl StorageTrait for PostgresBackend {
                 .map_err(sqlx_to_io)?;
 
             transaction.commit().await.map_err(sqlx_to_io)?;
-            Ok(total)
+            let [
+                episodic,
+                semantic,
+                procedural,
+                observations,
+                edges,
+                entities,
+                episodes,
+                activity_events,
+            ] = removed;
+            Ok(NamespacePurgeSummary {
+                memories: episodic + semantic + procedural,
+                observations,
+                edges,
+                entities,
+                episodes,
+                activity_events,
+            })
         })
     }
 
