@@ -19,7 +19,6 @@ use pensyve_mcp_gateway::config::GatewayConfig;
 use pensyve_mcp_gateway::rate_limit::RateLimiter;
 use pensyve_mcp_gateway::rest;
 use pensyve_mcp_gateway::tenant::{TenantStateManager, ensure_namespace_embedding_lifecycle};
-use pensyve_mcp_gateway::usage::UsageReporter;
 use pensyve_mcp_gateway::usage_counter::UsageCounter;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -50,7 +49,7 @@ fn gateway_config(dir: &TempDir) -> GatewayConfig {
         namespace: "default".to_string(),
         api_keys: vec![],
         rate_limit_per_minute: 300,
-        stripe_api_key: None,
+        daily_quota: 1_000,
         admin_key: None,
         key_user_map: vec![],
         allowed_hosts: vec![],
@@ -80,7 +79,6 @@ fn app_state(dir: &TempDir, storage: Arc<dyn StorageTrait>) -> Arc<AppState> {
     Arc::new(AppState {
         auth: AuthValidator::new(&config),
         rate_limiter: RateLimiter::new(None),
-        usage_reporter: UsageReporter::new(None),
         usage_counter: UsageCounter::new(),
         tenant_mgr,
         recall_admission: Arc::new(pensyve_mcp_gateway::admission::RecallAdmission::new(
@@ -101,8 +99,6 @@ fn auth_context() -> AuthContext {
         tenant_id: None,
         user_id: None,
         scope: "mcp".to_string(),
-        stripe_customer_id: None,
-        plan: "free".to_string(),
     }
 }
 

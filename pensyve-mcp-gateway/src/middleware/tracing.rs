@@ -1,18 +1,17 @@
 //! W3C Trace Context propagation middleware.
 //!
 //! Implements the W3C Trace Context specification (`traceparent` header)
-//! to enable cross-service distributed tracing across the Pensyve managed
-//! cloud edge. Without this layer, debugging a request that fans out from
-//! the gateway -> pensyve.com (key validation) -> Stripe (usage metering)
-//! requires manual timestamp correlation across `CloudWatch` log groups.
+//! to enable cross-service distributed tracing. Without this layer,
+//! debugging a request that fans out from the gateway to a remote key
+//! validation endpoint requires manual timestamp correlation across logs.
 //!
 //! Behavior:
 //! 1. Extracts the inbound `traceparent` header (W3C v1, version `00`).
 //! 2. If absent or malformed, generates a new [`TraceContext`] with a
 //!    random `trace_id` + `span_id`.
 //! 3. Inserts the [`TraceContext`] into request extensions so downstream
-//!    handlers and outbound clients (`auth.rs` `validate_remote`,
-//!    `usage.rs` Stripe meter events) can echo it.
+//!    handlers and outbound clients (`auth.rs` `validate_remote`)
+//!    can echo it.
 //! 4. Sets up a `tracing::info_span!` carrying `trace_id` + `span_id`
 //!    fields so JSON-formatted log lines emitted while handling the
 //!    request automatically include those identifiers.
@@ -211,7 +210,7 @@ where
         let header_value = trace_ctx.to_header_value();
 
         // Make the trace context available to downstream handlers
-        // (auth.rs validate_remote, usage.rs Stripe meter events).
+        // (auth.rs validate_remote).
         req.extensions_mut().insert(trace_ctx.clone());
 
         // Build a span carrying the trace identifiers. Anything logged via

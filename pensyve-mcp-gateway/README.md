@@ -11,9 +11,11 @@ Two credential paths:
 1. **API key** — `Authorization: Bearer psy_…` or the `PENSYVE_API_KEY`
    env var. Validated against the local key list (`PENSYVE_API_KEYS`) or
    the remote validation endpoint (`PENSYVE_VALIDATION_URL`).
-2. **OAuth JWT** — `Authorization: Bearer <jwt>` from an external issuer,
-   verified with the Ed25519 public key in `OAUTH_PUBLIC_KEY` (optional; used
-   only if you run your own token issuer).
+2. **JWT** — `Authorization: Bearer <jwt>` from your own token issuer,
+   verified with the Ed25519 public key in `OAUTH_PUBLIC_KEY` and checked
+   against `OAUTH_ISSUER` and `OAUTH_AUDIENCE`. Optional. All three must be set,
+   or every JWT is rejected. The gateway does not issue tokens and serves no
+   OAuth endpoints.
 
 Each credential resolves to an isolated `tenant:<auth_tenant>` namespace
 that is created lazily on first use.
@@ -40,7 +42,7 @@ across multiple HTTP sessions resolves to the same namespace.
 
 Clients that never send `X-Pensyve-Agent-Id` (including all v2.1.0 callers)
 continue to work unchanged. The unscoped fallback is bit-for-bit equivalent
-to the v2.1.0 tenant resolution: `tenant:<user_id>` for OAuth, `tenant:<key_prefix>`
+to the v2.1.0 tenant resolution: `tenant:<user_id>` for JWTs, `tenant:<key_prefix>`
 for raw API keys.
 
 ### Example
@@ -81,9 +83,12 @@ isolation as described above is the user-visible boundary today.
 | `DATABASE_URL`                    | _unset_          | Postgres URL; switches to Postgres backend.      |
 | `PENSYVE_NAMESPACE`               | `default`        | Default unscoped namespace.                      |
 | `PENSYVE_API_KEYS`                | _unset_          | Comma-separated `psy_…` keys (standalone mode).  |
-| `PENSYVE_RATE_LIMIT`              | `300`            | Requests/minute per key.                         |
+| `PENSYVE_RATE_LIMIT`              | `30`             | Requests/minute per tenant.                      |
+| `PENSYVE_DAILY_QUOTA`             | `1000`           | Operations per UTC day per tenant (needs `REDIS_URL`). |
 | `PENSYVE_ADMIN_KEY`               | _unset_          | `X-Admin-Key` value for `/metrics`.              |
 | `OAUTH_PUBLIC_KEY`                | _unset_          | Ed25519 PEM for JWT validation.                  |
+| `OAUTH_ISSUER`                    | _unset_          | Required `iss` claim for JWTs.                   |
+| `OAUTH_AUDIENCE`                  | _unset_          | Required `aud` claim for JWTs.                   |
 | `MCP_ALLOWED_HOSTS`               | _loopback only_  | DNS rebinding protection — comma-separated host allow-list. |
 
 ## Local run

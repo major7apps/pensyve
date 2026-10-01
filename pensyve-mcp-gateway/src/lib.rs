@@ -14,11 +14,9 @@ pub mod cache;
 pub mod circuit_breaker;
 pub mod config;
 pub mod middleware;
-pub mod oauth;
 pub mod rate_limit;
 pub mod rest;
 pub mod tenant;
-pub mod usage;
 pub mod usage_counter;
 
 use std::sync::Arc;
@@ -29,14 +27,12 @@ use crate::admission::RecallAdmission;
 use crate::auth::AuthValidator;
 use crate::rate_limit::RateLimiter;
 use crate::tenant::TenantStateManager;
-use crate::usage::UsageReporter;
 use crate::usage_counter::UsageCounter;
 
 /// Application state shared across all requests.
 pub struct AppState {
     pub auth: AuthValidator,
     pub rate_limiter: RateLimiter,
-    pub usage_reporter: UsageReporter,
     pub usage_counter: UsageCounter,
     pub tenant_mgr: TenantStateManager,
     /// One process-wide recall budget shared by HTTP, A2A, and gateway MCP.

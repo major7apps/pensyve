@@ -9,10 +9,11 @@ pub struct GatewayConfig {
     /// Comma-separated list of valid API keys (for standalone mode without DB).
     /// In production, keys are validated against `PostgreSQL`.
     pub api_keys: Vec<String>,
-    /// Maximum requests per minute per API key.
+    /// Maximum requests per minute per tenant (`PENSYVE_RATE_LIMIT`).
     pub rate_limit_per_minute: u32,
-    /// Stripe API key for usage reporting (optional).
-    pub stripe_api_key: Option<String>,
+    /// Maximum operations per UTC day per tenant (`PENSYVE_DAILY_QUOTA`).
+    /// Enforced only when Redis is configured.
+    pub daily_quota: u32,
     /// Admin key for operational endpoints (/metrics). If unset, these endpoints are disabled.
     pub admin_key: Option<String>,
     /// Maps API keys to user IDs for self-hosted namespace unification.
@@ -74,8 +75,11 @@ impl GatewayConfig {
             rate_limit_per_minute: std::env::var("PENSYVE_RATE_LIMIT")
                 .ok()
                 .and_then(|r| r.parse().ok())
-                .unwrap_or(300),
-            stripe_api_key: std::env::var("STRIPE_API_KEY").ok(),
+                .unwrap_or(crate::rate_limit::DEFAULT_RPM),
+            daily_quota: std::env::var("PENSYVE_DAILY_QUOTA")
+                .ok()
+                .and_then(|r| r.parse().ok())
+                .unwrap_or(crate::rate_limit::DEFAULT_DAILY),
             admin_key: std::env::var("PENSYVE_ADMIN_KEY").ok(),
             allowed_hosts: std::env::var("MCP_ALLOWED_HOSTS")
                 .unwrap_or_default()
@@ -99,8 +103,8 @@ mod tests {
             storage_path: PathBuf::from("/tmp/test-gateway"),
             namespace: "test".to_string(),
             api_keys,
-            rate_limit_per_minute: 300,
-            stripe_api_key: None,
+            rate_limit_per_minute: 30,
+            daily_quota: 1_000,
             admin_key: None,
             key_user_map: vec![],
             allowed_hosts: vec![],
@@ -113,9 +117,9 @@ mod tests {
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 3000);
         assert_eq!(config.namespace, "test");
-        assert_eq!(config.rate_limit_per_minute, 300);
+        assert_eq!(config.rate_limit_per_minute, 30);
+        assert_eq!(config.daily_quota, 1_000);
         assert!(config.api_keys.is_empty());
-        assert!(config.stripe_api_key.is_none());
     }
 
     #[test]

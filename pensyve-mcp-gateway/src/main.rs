@@ -30,11 +30,9 @@ use pensyve_mcp_gateway::cache;
 use pensyve_mcp_gateway::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use pensyve_mcp_gateway::config::GatewayConfig;
 use pensyve_mcp_gateway::middleware::tracing::TracingLayer;
-use pensyve_mcp_gateway::oauth;
 use pensyve_mcp_gateway::rate_limit::{self, RateLimitLayer};
 use pensyve_mcp_gateway::rest;
 use pensyve_mcp_gateway::tenant::{TenantStateManager, ensure_namespace_embedding_lifecycle};
-use pensyve_mcp_gateway::usage::{self, UsageReporter};
 use pensyve_mcp_gateway::usage_counter::{self, UsageCounter};
 use pensyve_mcp_gateway::{AppState, build_tenant_key, parse_agent_id_header};
 
@@ -311,11 +309,9 @@ struct ExportArgs {
 
 /// The two shapes of `export-namespace`.
 ///
-/// One customer taking their data (`--namespace`), or the 2026-10-01 operator
-/// run copying everything before the store is destroyed (`--all`). They are
-/// separate variants rather than optional fields so that a half-specified
-/// invocation is a parse error instead of a surprising default — the bulk run
-/// happens once and cannot be repeated afterwards.
+/// One namespace (`--namespace`), or every namespace in the store (`--all`).
+/// They are separate variants rather than optional fields so that a
+/// half-specified invocation is a parse error instead of a surprising default.
 #[derive(Debug)]
 enum ExportMode {
     Single(ExportArgs),
@@ -554,11 +550,10 @@ fn export_namespace_command(
 }
 
 /// Operator mode: `export-namespace --all` copies every namespace out of the
-/// hosted store, for the 2026-10-01 shutdown (MAJ-374).
+/// configured store.
 ///
-/// A run that could not copy every namespace exits non-zero. The store is
-/// deleted after this, so a partial run that looked like a success is the one
-/// outcome there is no recovering from.
+/// A run that could not copy every namespace exits non-zero, so a partial run
+/// never looks like a success.
 fn export_all_namespaces_command(
     storage: &dyn StorageTrait,
     embedder: &OnnxEmbedder,
@@ -828,11 +823,11 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
 
     let redis = cache::init().await;
 
-    // Usage counter — Neon-persisted when DATABASE_URL is set (production),
-    // DashMap-only otherwise (local dev with SQLite backend).
+    // Usage counter — Postgres-persisted when DATABASE_URL is set,
+    // DashMap-only otherwise (SQLite backend).
     let usage_counter = match std::env::var("DATABASE_URL") {
         Ok(url) if url.starts_with("postgres") => {
-            tracing::info!("Usage counter: connecting to Neon for persistent counters");
+            tracing::info!("Usage counter: connecting to Postgres for persistent counters");
             match sqlx_postgres::PgPoolOptions::new()
                 .max_connections(2) // lightweight — only counter upserts + reads
                 .acquire_timeout(std::time::Duration::from_secs(10))
@@ -842,7 +837,7 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
                 Ok(pool) => UsageCounter::with_postgres(pool).await,
                 Err(e) => {
                     tracing::warn!(
-                        "Usage counter: Neon connection failed ({e}), falling back to in-memory"
+                        "Usage counter: Postgres connection failed ({e}), falling back to in-memory"
                     );
                     UsageCounter::new()
                 }
@@ -856,17 +851,11 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
 
     let auth_required = !config.api_keys.is_empty();
 
-    // Phase 23/C: shared circuit breakers for the two known-flaky external
-    // dependencies. Both default to operator-locked thresholds:
-    //   auth:    5 failures / 60s / 30s cooldown
-    //   stripe:  3 failures / 60s / 60s cooldown
-    // Override via PENSYVE_CB_AUTH_*  / PENSYVE_CB_STRIPE_* env vars.
+    // Phase 23/C: circuit breaker for the remote key validation endpoint.
+    // Defaults to 5 failures / 60s / 30s cooldown.
+    // Override via PENSYVE_CB_AUTH_* env vars.
     let auth_cb = Arc::new(CircuitBreaker::new(
         CircuitBreakerConfig::auth_default(),
-        redis.clone(),
-    ));
-    let stripe_cb = Arc::new(CircuitBreaker::new(
-        CircuitBreakerConfig::stripe_default(),
         redis.clone(),
     ));
 
@@ -900,19 +889,13 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         // validate_remote() trips on repeated upstream failures and falls back
         // to remote_cache.
         auth: auth::AuthValidator::new(&config).with_circuit_breaker(auth_cb.clone()),
-        // Phase 23/B: rate limiter is now Redis-backed (when REDIS_URL is set)
-        // with plan-aware daily quotas. Falls back to an in-memory sliding
-        // window when Redis is unavailable. The legacy `rate_limit_per_minute`
-        // config is intentionally no longer wired through here — limits are
-        // sourced from the caller's plan tier.
-        rate_limiter: rate_limit::RateLimiter::new(redis.clone()),
-        // Phase 23/C: UsageReporter wired with the stripe circuit breaker so
-        // failed Stripe meter events buffer (bounded VecDeque) and drain on
-        // half-open success.
-        usage_reporter: UsageReporter::new_with_circuit_breaker(
-            config.stripe_api_key.clone(),
-            stripe_cb.clone(),
-        ),
+        // Phase 23/B: rate limiter is Redis-backed (when REDIS_URL is set)
+        // with daily quotas. Falls back to an in-memory sliding window when
+        // Redis is unavailable. One limit pair applies to every tenant.
+        rate_limiter: rate_limit::RateLimiter::new(redis.clone()).with_limits(rate_limit::Limits {
+            rpm: config.rate_limit_per_minute,
+            daily: config.daily_quota,
+        }),
         usage_counter,
         tenant_mgr,
         recall_admission: Arc::clone(&recall_admission),
@@ -965,26 +948,6 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         .route("/health", axum::routing::get(health_handler))
         .route("/ready", axum::routing::get(readiness_handler))
         .route("/metrics", axum::routing::get(metrics_handler))
-        .route(
-            "/.well-known/oauth-protected-resource",
-            axum::routing::get(oauth::oauth_protected_resource),
-        )
-        .route(
-            "/.well-known/oauth-authorization-server",
-            axum::routing::get(oauth::oauth_metadata),
-        )
-        .route(
-            "/oauth/token",
-            axum::routing::post(oauth::oauth_token).options(oauth::oauth_cors_preflight),
-        )
-        .route(
-            "/oauth/revoke",
-            axum::routing::post(oauth::oauth_revoke).options(oauth::oauth_cors_preflight),
-        )
-        .route(
-            "/oauth/register",
-            axum::routing::post(oauth::oauth_register).options(oauth::oauth_cors_preflight),
-        )
         .layer(
             tower_http::compression::CompressionLayer::new()
                 .gzip(true)
@@ -1004,13 +967,6 @@ async fn async_main(config: GatewayConfig, res: InitResources) -> Result<()> {
         // trace context is already in request extensions when auth.rs's
         // `validate_remote` and the tenant_and_usage middleware run.
         .layer(TracingLayer::new())
-        // Sunset/Deprecation is added LAST so it sits outermost of all: the
-        // shutdown warning has to ride on the responses inner layers reject
-        // outright (expired key, rate limit, unmatched path), because a client
-        // still pointed here late in September is precisely the one seeing them.
-        .layer(axum::middleware::from_fn(
-            pensyve_mcp_gateway::middleware::sunset::announce_sunset,
-        ))
         .with_state(app_state.clone());
 
     // Phase 23 Track B: the periodic `evict_stale()` task is gone — Redis
@@ -1482,26 +1438,20 @@ tokio::task_local! {
 /// 1. Sets the tenant ID task-local from the auth context (for rmcp service factory),
 ///    folding in any `X-Pensyve-Agent-Id` header so per-tenant agents get
 ///    isolated namespaces (G1/P3d).
-/// 2. Records usage for successful billable requests — both to the local
-///    in-memory counter (for the dashboard's "Usage This Period") and to the
-///    Stripe meter pipeline (for invoicing paying customers).
+/// 2. Records usage for successful counted requests in the usage counter
+///    behind `GET /v1/usage`.
 async fn tenant_and_usage_middleware(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let auth_ctx = req.extensions().get::<AuthContext>().cloned();
-    // W3C trace context (Phase 23/A) populated upstream by TracingLayer.
-    let trace_ctx = req
-        .extensions()
-        .get::<pensyve_mcp_gateway::middleware::tracing::TraceContext>()
-        .cloned();
     // Per-tenant agent_id header (G1/P3d). Malformed UUID → ignored, no error
     // returned to the client (backward compatibility with v2.1.0 callers).
     let agent_id = parse_agent_id_header(req.headers());
 
-    // Prefer user_id for tenant resolution so that OAuth (MCP plugin) and
-    // API key (dashboard) access the same namespace for the same user.
+    // Prefer user_id for tenant resolution so that a JWT and an API key
+    // access the same namespace for the same user.
     // When an agent_id is supplied, fold it in so the same credential can
     // host multiple isolated agents.
     let tenant_id = auth_ctx.as_ref().map(|ctx| {
@@ -1512,8 +1462,7 @@ async fn tenant_and_usage_middleware(
         .as_ref()
         .map_or_else(|| "mcp".to_string(), |ctx| ctx.scope.clone());
     let path = req.uri().path().to_string();
-    let is_mcp = path.starts_with("/mcp");
-    let is_billable = usage_counter::is_billable_path(&path);
+    let is_counted = usage_counter::is_counted_path(&path);
 
     let response = CURRENT_SCOPE
         .scope(scope, async {
@@ -1522,35 +1471,16 @@ async fn tenant_and_usage_middleware(
         .await;
 
     if response.status().is_success()
-        && is_billable
+        && is_counted
         && let Some(ctx) = auth_ctx
     {
-        // Local counter: tracks usage for *every* authenticated user so the
-        // dashboard can show a current-period count even for free-tier users
-        // who don't have a Stripe subscription. Keyed on user_id when the
-        // request came through JWT/OAuth, falling back to key_id for raw
-        // API-key auth — the `/v1/usage` handler uses the same rule so both
-        // sides agree on the lookup key.
+        // Keyed on user_id when the credential carries one, falling back to
+        // key_id — the `/v1/usage` handler uses the same rule so both sides
+        // agree on the lookup key.
         let counter_key = ctx.user_id.as_deref().unwrap_or(&ctx.key_id);
         state
             .usage_counter
-            .increment(counter_key, usage::OperationTier::Standard, 1);
-
-        // Stripe meter pipeline: only meaningful for users with a Stripe
-        // customer ID. The reporter drops events with no customer ID.
-        // Only MCP requests are currently reported here to preserve existing
-        // billing semantics; REST-path metering can be enabled later.
-        if is_mcp {
-            state.usage_reporter.report(usage::UsageEvent {
-                key_id: ctx.key_id,
-                stripe_customer_id: ctx.stripe_customer_id,
-                tier: usage::OperationTier::Standard,
-                count: 1,
-                traceparent: trace_ctx
-                    .as_ref()
-                    .map(pensyve_mcp_gateway::middleware::tracing::TraceContext::to_header_value),
-            });
-        }
+            .increment(counter_key, usage_counter::OperationTier::Standard, 1);
     }
 
     response

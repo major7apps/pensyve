@@ -1,17 +1,13 @@
-//! Per-user operation counter for current-period usage display.
+//! Per-user operation counter behind `GET /v1/usage`.
 //!
-//! The Stripe meter pipeline (`usage.rs`) is the source of truth for *billing*,
-//! but it only records events for users with a Stripe customer ID, and events
-//! flow one-way to Stripe — the gateway cannot read them back to populate the
-//! dashboard. This module keeps a per-user counter so the cloud billing page
-//! can display current-period usage for every user, including free-tier users
-//! who have no subscription.
+//! Counts successful operations per user for the current calendar month so an
+//! operator can see how much each credential is using the gateway.
 //!
 //! ## Storage modes
 //!
 //! | `DATABASE_URL` set? | Writes | Reads | Survives restart? |
 //! |---------------------|--------|-------|-------------------|
-//! | Yes (Neon)          | `DashMap` + channel → Neon flush | `SELECT` from Neon | Yes |
+//! | Yes (Postgres)      | `DashMap` + channel → Postgres flush | `SELECT` from Postgres | Yes |
 //! | No (local dev)      | `DashMap` only | `DashMap` | No |
 //!
 //! **Period**: calendar month in UTC. Counters are keyed by (`user_id`,
@@ -30,7 +26,34 @@ use sqlx_core::row::Row;
 use sqlx_postgres::PgPool;
 use tokio::sync::mpsc;
 
-use crate::usage::OperationTier;
+/// Kind of operation being counted. Stored in `usage_counters.tier`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OperationTier {
+    Standard,
+    Multimodal,
+    Extraction,
+}
+
+impl OperationTier {
+    /// Short lowercase name used as the DB value in `usage_counters.tier`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Multimodal => "multimodal",
+            Self::Extraction => "extraction",
+        }
+    }
+
+    /// Parse from the DB tier column. Returns `None` on unrecognised values.
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "standard" => Some(Self::Standard),
+            "multimodal" => Some(Self::Multimodal),
+            "extraction" => Some(Self::Extraction),
+            _ => None,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -66,18 +89,18 @@ struct CounterIncrement {
 // UsageCounter
 // ---------------------------------------------------------------------------
 
-/// Per-(user, month, tier) operation counter with optional Neon persistence.
+/// Per-(user, month, tier) operation counter with optional Postgres persistence.
 ///
 /// **Write path**: `increment()` atomically bumps `DashMap` (non-blocking) and,
 /// when a Postgres pool is configured, sends the delta to a background flush
 /// channel that batches upserts every 10 s.
 ///
-/// **Read path**: `get_summary()` queries Neon when available (authoritative,
+/// **Read path**: `get_summary()` queries Postgres when available (authoritative,
 /// includes all flushed data). Falls back to `DashMap` when the DB is
 /// unreachable or unconfigured — accurate within the current process lifetime.
 pub struct UsageCounter {
     /// In-memory counters. Always updated regardless of DB mode so it can
-    /// serve as a degraded fallback if Neon becomes unreachable.
+    /// serve as a degraded fallback if Postgres becomes unreachable.
     counts: DashMap<CounterKey, AtomicU32>,
     /// Channel to the background flush loop (`None` when no DB is configured).
     flush_tx: Option<mpsc::Sender<CounterIncrement>>,
@@ -96,7 +119,7 @@ impl UsageCounter {
         }
     }
 
-    /// Create a counter with **Neon persistence**.
+    /// Create a counter with **Postgres persistence**.
     ///
     /// - Creates the `usage_counters` table if it doesn't exist.
     /// - Spawns a background flush task that drains the channel every 10 s.
@@ -154,25 +177,26 @@ impl UsageCounter {
                 })
                 .is_err()
         {
-            tracing::warn!("Usage counter channel full — increment will not be persisted to Neon");
+            tracing::warn!(
+                "Usage counter channel full — increment will not be persisted to Postgres"
+            );
         }
     }
 
     /// Return current-period usage for `user_id`.
     ///
-    /// When Neon is available, queries the DB (authoritative — includes all
+    /// When Postgres is available, queries the DB (authoritative — includes all
     /// flushed data from any gateway instance). Falls back to the in-memory
     /// `DashMap` if the query fails or no DB is configured.
     ///
     /// Note: the DB may lag behind the true count by up to the flush interval
-    /// (10 s). For the billing-page use case this is invisible — the page is
-    /// server-rendered on navigation, not polled in real time.
+    /// (10 s).
     pub async fn get_summary(&self, user_id: &str) -> UsageSummary {
         let now = Utc::now();
         let period = period_key(&now);
         let (start, end) = current_month_bounds(&now);
 
-        // Try Neon first (authoritative, persistent).
+        // Try Postgres first (authoritative, persistent).
         if let Some(pool) = &self.pool {
             match read_from_db(pool, user_id, &period).await {
                 Ok((std, multi, ext)) => {
@@ -245,7 +269,7 @@ async fn ensure_schema(pool: &PgPool) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 /// Drains the channel, aggregates increments by (user, period, tier), and
-/// upserts to Neon every 10 s or when the batch reaches 100 events.
+/// upserts to Postgres every 10 s or when the batch reaches 100 events.
 ///
 /// On channel close (gateway shutdown), flushes any remaining events before
 /// returning — so a graceful shutdown never loses queued increments.
@@ -280,7 +304,7 @@ async fn flush_loop(mut rx: mpsc::Receiver<CounterIncrement>, pool: PgPool) {
 }
 
 /// Aggregate a batch of increments and upsert each unique (user, period, tier)
-/// to Neon. Retries transient failures up to 3 times with exponential backoff.
+/// to Postgres. Retries transient failures up to 3 times with exponential backoff.
 async fn flush_batch(batch: &mut Vec<CounterIncrement>, pool: &PgPool) {
     // Aggregate by (user_id, period, tier) to minimise DB round-trips.
     let mut aggregated: HashMap<(String, String, String), u32> = HashMap::new();
@@ -296,7 +320,7 @@ async fn flush_batch(batch: &mut Vec<CounterIncrement>, pool: &PgPool) {
     tracing::debug!(
         groups = aggregated.len(),
         total_ops = aggregated.values().sum::<u32>(),
-        "Flushing usage counters to Neon"
+        "Flushing usage counters to Postgres"
     );
 
     for ((user_id, period, tier), count) in &aggregated {
@@ -359,7 +383,7 @@ async fn flush_batch(batch: &mut Vec<CounterIncrement>, pool: &PgPool) {
 // DB reads
 // ---------------------------------------------------------------------------
 
-/// Read current-period counts from Neon for a single user.
+/// Read current-period counts from Postgres for a single user.
 /// Returns `(standard, multimodal, extraction)`.
 async fn read_from_db(
     pool: &PgPool,
@@ -428,9 +452,9 @@ fn current_month_bounds(dt: &DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
     (start, end)
 }
 
-/// REST endpoints that do *not* count as billable operations — read-only and
-/// metadata routes that the dashboard polls or that report on the system.
-const NON_BILLABLE_REST_PATHS: &[&str] = &[
+/// REST endpoints that do *not* count as operations — read-only and
+/// metadata routes that report on the system.
+const NON_COUNTED_REST_PATHS: &[&str] = &[
     "/v1/health",
     "/v1/stats",
     "/v1/activity",
@@ -442,7 +466,7 @@ const NON_BILLABLE_REST_PATHS: &[&str] = &[
 
 /// True if a request path should count toward usage quota. Excludes read-only
 /// and bookkeeping endpoints (health, stats, activity, usage itself).
-pub fn is_billable_path(path: &str) -> bool {
+pub fn is_counted_path(path: &str) -> bool {
     // MCP transport — any successful request counts as an op.
     if path.starts_with("/mcp") {
         return true;
@@ -450,7 +474,7 @@ pub fn is_billable_path(path: &str) -> bool {
     if !path.starts_with("/v1/") {
         return false;
     }
-    !NON_BILLABLE_REST_PATHS
+    !NON_COUNTED_REST_PATHS
         .iter()
         .any(|p| path == *p || path.starts_with(&format!("{p}/")))
 }
@@ -532,40 +556,39 @@ mod tests {
         assert_eq!(end.month(), 7);
     }
 
-    // -- Billable path classification ---------------------------------------
+    // -- Counted path classification ----------------------------------------
 
     #[test]
-    fn is_billable_path_classifies_correctly() {
-        // MCP is always billable.
-        assert!(is_billable_path("/mcp"));
-        assert!(is_billable_path("/mcp/"));
-        assert!(is_billable_path("/mcp/anything"));
+    fn is_counted_path_classifies_correctly() {
+        // MCP is always counted.
+        assert!(is_counted_path("/mcp"));
+        assert!(is_counted_path("/mcp/"));
+        assert!(is_counted_path("/mcp/anything"));
 
-        // REST write operations are billable.
-        assert!(is_billable_path("/v1/recall"));
-        assert!(is_billable_path("/v1/remember"));
-        assert!(is_billable_path("/v1/observe"));
-        assert!(is_billable_path("/v1/entities"));
-        assert!(is_billable_path("/v1/entities/alice"));
-        assert!(is_billable_path("/v1/memories/abc-123"));
-        assert!(is_billable_path("/v1/inspect"));
-        assert!(is_billable_path("/v1/consolidate"));
-        assert!(is_billable_path("/v1/episodes/start"));
-        assert!(is_billable_path("/v1/gdpr/erase/alice"));
+        // REST write operations are counted.
+        assert!(is_counted_path("/v1/recall"));
+        assert!(is_counted_path("/v1/remember"));
+        assert!(is_counted_path("/v1/observe"));
+        assert!(is_counted_path("/v1/entities"));
+        assert!(is_counted_path("/v1/entities/alice"));
+        assert!(is_counted_path("/v1/memories/abc-123"));
+        assert!(is_counted_path("/v1/inspect"));
+        assert!(is_counted_path("/v1/consolidate"));
+        assert!(is_counted_path("/v1/episodes/start"));
+        assert!(is_counted_path("/v1/gdpr/erase/alice"));
 
-        // REST read-only / metadata endpoints are NOT billable.
-        assert!(!is_billable_path("/v1/health"));
-        assert!(!is_billable_path("/v1/stats"));
-        assert!(!is_billable_path("/v1/activity"));
-        assert!(!is_billable_path("/v1/activity/recent"));
-        assert!(!is_billable_path("/v1/usage"));
-        assert!(!is_billable_path("/v1/a2a/agent-card"));
-        assert!(!is_billable_path("/v1/feedback"));
+        // REST read-only / metadata endpoints are NOT counted.
+        assert!(!is_counted_path("/v1/health"));
+        assert!(!is_counted_path("/v1/stats"));
+        assert!(!is_counted_path("/v1/activity"));
+        assert!(!is_counted_path("/v1/activity/recent"));
+        assert!(!is_counted_path("/v1/usage"));
+        assert!(!is_counted_path("/v1/a2a/agent-card"));
+        assert!(!is_counted_path("/v1/feedback"));
 
-        // Unknown paths are not billable.
-        assert!(!is_billable_path("/health"));
-        assert!(!is_billable_path("/metrics"));
-        assert!(!is_billable_path("/oauth/token"));
+        // Unknown paths are not counted.
+        assert!(!is_counted_path("/health"));
+        assert!(!is_counted_path("/metrics"));
     }
 
     // -- OperationTier round-trip -------------------------------------------

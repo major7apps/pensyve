@@ -1,15 +1,15 @@
-//! Circuit breaker for auth validation and Stripe usage reporting.
+//! Circuit breaker for remote auth validation.
 //!
-//! Phase 23/C — protects the gateway from cascading failures when downstream
-//! dependencies (pensyve.com `validate-key` endpoint, Stripe `meter_events`
-//! API) become slow or unhealthy. Three-state machine:
+//! Phase 23/C — protects the gateway from cascading failures when the remote
+//! key validation endpoint (`PENSYVE_VALIDATION_URL`) becomes slow or
+//! unhealthy. Three-state machine:
 //!
 //! - **Closed** — requests flow normally; failures within `window_secs` are
 //!   counted; if the count reaches `failure_threshold`, the circuit trips
 //!   to **Open**.
 //! - **Open** — requests are short-circuited with [`CircuitOpen`] for the
 //!   `cooldown_secs` window; the caller is expected to use a fallback
-//!   (cached `AuthContext`, bounded event buffer).
+//!   (cached `AuthContext`).
 //! - **`HalfOpen`** — after the cooldown elapses, a single probe request is
 //!   allowed through; success → **Closed**, failure → back to **Open** with
 //!   a fresh cooldown.
@@ -24,9 +24,8 @@
 //!
 //! Defaults from operator decision (2026-05-07):
 //! - auth: 5 failures / 60s window / 30s cooldown
-//! - stripe: 3 failures / 60s window / 60s cooldown
 //!
-//! All four defaults are env-overridable via `PENSYVE_CB_<NAME>_*` vars.
+//! The defaults are env-overridable via `PENSYVE_CB_<NAME>_*` vars.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -39,7 +38,7 @@ use redis::aio::ConnectionManager;
 pub struct CircuitBreakerConfig {
     /// Stable name used as the Redis key prefix and in log lines.
     /// Convention: `lower_snake_case` matching the upstream system
-    /// (`auth_validation`, `stripe_usage`).
+    /// (`auth_validation`).
     pub name: &'static str,
     /// Number of failures within `window_secs` that trips the circuit.
     pub failure_threshold: u32,
@@ -61,8 +60,8 @@ impl CircuitBreakerConfig {
     /// `PENSYVE_CB_<NAME_UPPER>_COOLDOWN_SECS`.
     ///
     /// The `name` is uppercased and the leading qualifier stripped to
-    /// produce the env prefix — `auth_validation` → `AUTH`,
-    /// `stripe_usage` → `STRIPE`. We do this rather than `AUTH_VALIDATION`
+    /// produce the env prefix — `auth_validation` → `AUTH`.
+    /// We do this rather than `AUTH_VALIDATION`
     /// to match the operator-locked env var names from the Phase 23 spec.
     #[must_use]
     pub fn from_env(name: &'static str, defaults: (u32, u32, u32)) -> Self {
@@ -86,23 +85,15 @@ impl CircuitBreakerConfig {
     pub fn auth_default() -> Self {
         Self::from_env("auth_validation", (5, 60, 30))
     }
-
-    /// Operator-locked defaults for the Stripe usage breaker.
-    #[must_use]
-    pub fn stripe_default() -> Self {
-        Self::from_env("stripe_usage", (3, 60, 60))
-    }
 }
 
 /// Map a circuit name to its env-var prefix.
 ///
 /// `auth_validation` → `AUTH` (per locked env var name `PENSYVE_CB_AUTH_*`).
-/// `stripe_usage` → `STRIPE`.
 /// Anything else uppercases the entire name as a safe default.
 fn env_prefix_for(name: &'static str) -> String {
     match name {
         "auth_validation" => "AUTH".to_string(),
-        "stripe_usage" => "STRIPE".to_string(),
         other => other.to_uppercase(),
     }
 }
@@ -971,9 +962,8 @@ mod tests {
 
     #[test]
     fn env_prefix_for_known_circuit_names() {
-        // Locked operator decision: PENSYVE_CB_AUTH_*  / PENSYVE_CB_STRIPE_*.
+        // Locked operator decision: PENSYVE_CB_AUTH_*.
         assert_eq!(env_prefix_for("auth_validation"), "AUTH");
-        assert_eq!(env_prefix_for("stripe_usage"), "STRIPE");
         // Fallback: uppercase the full name.
         assert_eq!(env_prefix_for("custom_thing"), "CUSTOM_THING");
     }
@@ -1003,23 +993,6 @@ mod tests {
     }
 
     #[test]
-    fn stripe_default_env_var_names_match_locked_decision() {
-        let prefix = env_prefix_for("stripe_usage");
-        assert_eq!(
-            format!("PENSYVE_CB_{prefix}_FAILURE_THRESHOLD"),
-            "PENSYVE_CB_STRIPE_FAILURE_THRESHOLD"
-        );
-        assert_eq!(
-            format!("PENSYVE_CB_{prefix}_WINDOW_SECS"),
-            "PENSYVE_CB_STRIPE_WINDOW_SECS"
-        );
-        assert_eq!(
-            format!("PENSYVE_CB_{prefix}_COOLDOWN_SECS"),
-            "PENSYVE_CB_STRIPE_COOLDOWN_SECS"
-        );
-    }
-
-    #[test]
     fn from_env_returns_defaults_when_vars_unset() {
         // Use an obviously-unique name so it can't collide with anything
         // in the runtime environment of the test harness.
@@ -1032,13 +1005,11 @@ mod tests {
 
     #[test]
     fn defaults_match_operator_locked_values_when_env_unset() {
-        // The auth/stripe env vars are not set in the default test env;
+        // The auth env vars are not set in the default test env;
         // we rely on that here. If a developer sets these locally tests
         // will skip — that's fine, this assertion is primarily a
-        // documentation check of the locked values 5/60/30 and 3/60/60.
-        if std::env::var("PENSYVE_CB_AUTH_FAILURE_THRESHOLD").is_ok()
-            || std::env::var("PENSYVE_CB_STRIPE_FAILURE_THRESHOLD").is_ok()
-        {
+        // documentation check of the locked values 5/60/30.
+        if std::env::var("PENSYVE_CB_AUTH_FAILURE_THRESHOLD").is_ok() {
             // Local override active — bail out rather than reporting
             // a false failure.
             return;
@@ -1047,11 +1018,6 @@ mod tests {
         assert_eq!(auth.failure_threshold, 5);
         assert_eq!(auth.window_secs, 60);
         assert_eq!(auth.cooldown_secs, 30);
-
-        let stripe = CircuitBreakerConfig::stripe_default();
-        assert_eq!(stripe.failure_threshold, 3);
-        assert_eq!(stripe.window_secs, 60);
-        assert_eq!(stripe.cooldown_secs, 60);
     }
 
     #[tokio::test]

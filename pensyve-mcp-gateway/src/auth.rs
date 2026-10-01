@@ -22,11 +22,9 @@ pub struct AuthContext {
     pub tenant_id: Option<String>,
     pub user_id: Option<String>,
     pub scope: String,
-    pub stripe_customer_id: Option<String>,
-    pub plan: String,
 }
 
-/// JWT claims from an OAuth access token issued by pensyve.com.
+/// JWT claims from an access token issued by the operator's own token issuer.
 #[derive(Debug, Deserialize)]
 struct OAuthClaims {
     sub: String,
@@ -39,14 +37,55 @@ struct OAuthClaims {
     scope: Option<String>,
 }
 
+/// Settings for validating JWT access tokens from the operator's own issuer.
+struct JwtConfig {
+    /// Ed25519 public key (from `OAUTH_PUBLIC_KEY`, PEM).
+    decoding_key: DecodingKey,
+    /// Required `iss` claim (from `OAUTH_ISSUER`).
+    issuer: String,
+    /// Required `aud` claim (from `OAUTH_AUDIENCE`).
+    audience: String,
+}
+
+impl JwtConfig {
+    /// Build the JWT settings. Returns `None`, leaving JWT validation off,
+    /// unless the key parses and both the issuer and audience are non-empty.
+    fn from_values(
+        public_key_pem: Option<&str>,
+        issuer: Option<String>,
+        audience: Option<String>,
+    ) -> Option<Self> {
+        let pem = public_key_pem?;
+        let decoding_key = DecodingKey::from_ed_pem(pem.as_bytes())
+            .inspect_err(|e| tracing::warn!("Failed to load OAUTH_PUBLIC_KEY: {e}"))
+            .ok()?;
+        let (Some(issuer), Some(audience)) = (
+            issuer.filter(|s| !s.is_empty()),
+            audience.filter(|s| !s.is_empty()),
+        ) else {
+            tracing::warn!(
+                "OAUTH_PUBLIC_KEY is set but OAUTH_ISSUER or OAUTH_AUDIENCE is not; \
+                 JWT validation is disabled and every JWT will be rejected"
+            );
+            return None;
+        };
+        tracing::info!("JWT validation enabled");
+        Some(Self {
+            decoding_key,
+            issuer,
+            audience,
+        })
+    }
+}
+
 /// Validates `psy_` API keys via local hash lookup or remote validation endpoint,
-/// and OAuth JWT access tokens issued by pensyve.com.
+/// and JWT access tokens from the operator's own token issuer.
 ///
 /// Auth priority:
 /// 1. Bearer token starting with `psy_` → API key validation
-/// 2. Bearer JWT → OAuth token validation (`EdDSA` signature check)
+/// 2. Bearer JWT → token validation (`EdDSA` signature, issuer, audience)
 /// 3. `PENSYVE_API_KEY` env var → fallback
-/// 4. No auth → 401 with `WWW-Authenticate`
+/// 4. No auth → 401 with `WWW-Authenticate: Bearer`
 pub struct AuthValidator {
     /// Pre-hashed local keys, mapped hash -> key prefix.
     valid_key_hashes: HashMap<String, String>,
@@ -54,12 +93,14 @@ pub struct AuthValidator {
     key_user_hashes: HashMap<String, String>,
     /// Remote validation endpoint URL (set via `PENSYVE_VALIDATION_URL`).
     validation_url: Option<String>,
-    /// Shared secret for gateway-to-cloud auth.
+    /// Shared secret sent to the remote validation endpoint.
     gateway_secret: Option<String>,
     /// Cache of remote validation results (`key_hash` to context + expiry).
     remote_cache: dashmap::DashMap<String, (AuthContext, std::time::Instant)>,
-    /// JWT decoding key for OAuth access tokens (loaded from `OAUTH_PUBLIC_KEY`).
-    jwt_decoding_key: Option<DecodingKey>,
+    /// JWT validation settings. `None` unless `OAUTH_PUBLIC_KEY`,
+    /// `OAUTH_ISSUER`, and `OAUTH_AUDIENCE` are all set, so a JWT is never
+    /// accepted without an issuer and audience to check it against.
+    jwt: Option<JwtConfig>,
     /// Async HTTP client for remote key validation.
     http_client: reqwest::Client,
     /// Phase 23/C: circuit breaker around `validate_remote`. `None` is
@@ -94,13 +135,11 @@ impl AuthValidator {
             tracing::info!("Remote key validation enabled");
         }
 
-        // Load OAuth public key for JWT validation (Ed25519 PEM).
-        let jwt_decoding_key = std::env::var("OAUTH_PUBLIC_KEY").ok().and_then(|pem| {
-            DecodingKey::from_ed_pem(pem.as_bytes())
-                .inspect(|_| tracing::info!("OAuth JWT validation enabled"))
-                .inspect_err(|e| tracing::warn!("Failed to load OAUTH_PUBLIC_KEY: {e}"))
-                .ok()
-        });
+        let jwt = JwtConfig::from_values(
+            std::env::var("OAUTH_PUBLIC_KEY").ok().as_deref(),
+            std::env::var("OAUTH_ISSUER").ok(),
+            std::env::var("OAUTH_AUDIENCE").ok(),
+        );
 
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
@@ -113,7 +152,7 @@ impl AuthValidator {
             validation_url,
             gateway_secret,
             remote_cache: dashmap::DashMap::new(),
-            jwt_decoding_key,
+            jwt,
             http_client,
             circuit_breaker: None,
         }
@@ -140,7 +179,7 @@ impl AuthValidator {
             return self.validate_api_key(key, trace).await;
         }
 
-        // 2. JWT path (OAuth access tokens from pensyve.com)
+        // 2. JWT path (access tokens from the operator's own issuer)
         if let Some(ctx) = self.validate_jwt(key) {
             return Some(ctx);
         }
@@ -149,13 +188,13 @@ impl AuthValidator {
     }
 
     fn validate_jwt(&self, token: &str) -> Option<AuthContext> {
-        let decoding_key = self.jwt_decoding_key.as_ref()?;
+        let jwt = self.jwt.as_ref()?;
 
         let mut validation = Validation::new(Algorithm::EdDSA);
-        validation.set_issuer(&["https://pensyve.com"]);
-        validation.set_audience(&["https://mcp.pensyve.com"]);
+        validation.set_issuer(&[&jwt.issuer]);
+        validation.set_audience(&[&jwt.audience]);
 
-        let token_data = decode::<OAuthClaims>(token, decoding_key, &validation).ok()?;
+        let token_data = decode::<OAuthClaims>(token, &jwt.decoding_key, &validation).ok()?;
         let claims = token_data.claims;
         let tenant_id = claims
             .tenant_id
@@ -167,8 +206,6 @@ impl AuthValidator {
             tenant_id,
             user_id: Some(claims.sub),
             scope: claims.scope.unwrap_or_else(|| "mcp".to_string()),
-            stripe_customer_id: None,
-            plan: "free".to_string(),
         })
     }
 
@@ -186,8 +223,6 @@ impl AuthValidator {
                 tenant_id: None,
                 user_id,
                 scope: "mcp".to_string(),
-                stripe_customer_id: None,
-                plan: "free".to_string(),
             });
         }
 
@@ -214,7 +249,7 @@ impl AuthValidator {
             // re-read here ignoring the expiry rather than mutating the
             // remove-on-expiry logic above). Returning a stale-but-known
             // AuthContext is safer than 403'ing every authenticated user
-            // when pensyve.com is down — cached entries were valid as of
+            // when the validation endpoint is down — cached entries were valid as of
             // the last successful round-trip.
             if let Some(cb) = &self.circuit_breaker
                 && let Err(open) = cb.check().await
@@ -265,7 +300,7 @@ impl AuthValidator {
             req = req.header("x-gateway-secret", secret);
         }
 
-        // Phase 23/A: propagate W3C trace context to pensyve.com so the
+        // Phase 23/A: propagate W3C trace context so the
         // validation endpoint can correlate its logs with the gateway's.
         if let Some(t) = trace {
             req = req.header(
@@ -332,7 +367,7 @@ impl AuthValidator {
                 cb.record_failure().await;
             }
             // PR #87 r3 (CodeRabbit): never log the raw validator payload
-            // at warn level — it can spill `userId`, `stripeCustomerId`
+            // at warn level — it can spill `userId`
             // or other unexpected fields into structured logs during a
             // contract regression. Surface only top-level field names
             // and JSON types so an operator can diagnose the schema
@@ -397,15 +432,6 @@ fn parse_auth_context(body: &serde_json::Value) -> AuthContext {
             .and_then(|v| v.as_str())
             .unwrap_or("mcp")
             .to_string(),
-        stripe_customer_id: body
-            .get("stripeCustomerId")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        plan: body
-            .get("plan")
-            .and_then(|v| v.as_str())
-            .unwrap_or("free")
-            .to_string(),
     }
 }
 
@@ -421,7 +447,7 @@ fn string_field(body: &serde_json::Value, names: &[&str]) -> Option<String> {
 /// Describe the top-level shape of a JSON payload as a comma-joined
 /// list of `field: type` entries. Used in place of `payload = %body` so
 /// validator contract regressions can be diagnosed without spilling
-/// values like `userId`, `stripeCustomerId`, or arbitrary extension
+/// values like `userId` or arbitrary extension
 /// fields into structured logs.
 fn describe_payload_shape(body: &serde_json::Value) -> String {
     match body {
@@ -506,14 +532,8 @@ where
         Box::pin(async move {
             let path = req.uri().path();
 
-            // Skip auth for health/readiness checks, metrics (has own admin guard), and OAuth.
-            if path == "/health"
-                || path == "/v1/health"
-                || path == "/ready"
-                || path == "/metrics"
-                || path.starts_with("/.well-known/")
-                || path.starts_with("/oauth/")
-            {
+            // Skip auth for health/readiness checks and metrics (has own admin guard).
+            if path == "/health" || path == "/v1/health" || path == "/ready" || path == "/metrics" {
                 return inner.call(req).await;
             }
 
@@ -524,8 +544,6 @@ where
                     tenant_id: None,
                     user_id: None,
                     scope: "mcp".to_string(),
-                    stripe_customer_id: None,
-                    plan: "free".to_string(),
                 });
                 return inner.call(req).await;
             }
@@ -546,15 +564,12 @@ where
                     Some(ref t) if !t.is_empty() => t.clone(),
                     _ => {
                         let body = Body::from(
-                            r#"{"error":"unauthorized","message":"Authentication required. Sign in at pensyve.com or set PENSYVE_API_KEY."}"#,
+                            r#"{"error":"unauthorized","message":"Authentication required. Send an API key as 'Authorization: Bearer <key>'. Keys are set on the gateway with PENSYVE_API_KEYS."}"#,
                         );
                         return Ok(Response::builder()
                             .status(StatusCode::UNAUTHORIZED)
                             .header("content-type", "application/json")
-                            .header(
-                                "www-authenticate",
-                                r#"Bearer resource_metadata="https://mcp.pensyve.com/.well-known/oauth-protected-resource""#,
-                            )
+                            .header("www-authenticate", "Bearer")
                             .body(body)
                             .expect("valid response"));
                     }
@@ -593,7 +608,7 @@ mod tests {
             namespace: "test".to_string(),
             api_keys,
             rate_limit_per_minute: 60,
-            stripe_api_key: None,
+            daily_quota: 1_000,
             admin_key: None,
             key_user_map: vec![],
             allowed_hosts: vec![],
@@ -646,12 +661,10 @@ mod tests {
                 "keyId": "key_123",
                 field: "tenant_abc",
                 "userId": "user_123",
-                "plan": "business",
             });
             let ctx = parse_auth_context(&body);
             assert_eq!(ctx.tenant_id.as_deref(), Some("tenant_abc"));
             assert_eq!(ctx.user_id.as_deref(), Some("user_123"));
-            assert_eq!(ctx.plan, "business");
         }
     }
 
@@ -663,6 +676,25 @@ mod tests {
     const TEST_ED25519_PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
         MCowBQYDK2VwAyEAxGcwHbTUufFJiO1RHuU784Bjy4queMMkS9uR1NwQ85Q=\n\
         -----END PUBLIC KEY-----";
+
+    const TEST_ISSUER: &str = "https://issuer.example.com";
+    const TEST_AUDIENCE: &str = "https://gateway.example.com";
+
+    #[test]
+    fn test_jwt_config_requires_key_issuer_and_audience() {
+        let key = Some(TEST_ED25519_PUBLIC_PEM);
+        let issuer = || Some(TEST_ISSUER.to_string());
+        let audience = || Some(TEST_AUDIENCE.to_string());
+
+        assert!(JwtConfig::from_values(key, issuer(), audience()).is_some());
+        // No key: JWT validation was never requested.
+        assert!(JwtConfig::from_values(None, issuer(), audience()).is_none());
+        // A key without an issuer or audience to check must not enable JWTs.
+        assert!(JwtConfig::from_values(key, None, audience()).is_none());
+        assert!(JwtConfig::from_values(key, issuer(), None).is_none());
+        assert!(JwtConfig::from_values(key, Some(String::new()), audience()).is_none());
+        assert!(JwtConfig::from_values(Some("not a pem"), issuer(), audience()).is_none());
+    }
 
     #[derive(serde::Serialize)]
     struct TestClaims {
@@ -684,9 +716,13 @@ mod tests {
     fn validator_with_jwt(api_keys: Vec<String>) -> AuthValidator {
         let config = test_config(api_keys);
         let mut validator = AuthValidator::new(&config);
-        validator.jwt_decoding_key = Some(
-            DecodingKey::from_ed_pem(TEST_ED25519_PUBLIC_PEM.as_bytes())
-                .expect("test public key should parse"),
+        validator.jwt = Some(
+            JwtConfig::from_values(
+                Some(TEST_ED25519_PUBLIC_PEM),
+                Some(TEST_ISSUER.to_string()),
+                Some(TEST_AUDIENCE.to_string()),
+            )
+            .expect("test JWT settings should load"),
         );
         validator
     }
@@ -708,8 +744,8 @@ mod tests {
         TestClaims {
             sub: "user_abc123".to_string(),
             client_id: "client_xyz".to_string(),
-            iss: "https://pensyve.com".to_string(),
-            aud: "https://mcp.pensyve.com".to_string(),
+            iss: TEST_ISSUER.to_string(),
+            aud: TEST_AUDIENCE.to_string(),
             iat: now,
             exp: now + 3600,
             scope: Some("mcp".to_string()),
@@ -773,10 +809,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_validator_jwt_returns_none_without_public_key() {
-        // AuthValidator created from config has no jwt_decoding_key (no env var set).
+        // AuthValidator created from config has no JWT settings (no env var set).
         let validator = AuthValidator::new(&test_config(vec![]));
         assert!(
-            validator.jwt_decoding_key.is_none(),
+            validator.jwt.is_none(),
             "precondition: no JWT key configured"
         );
 

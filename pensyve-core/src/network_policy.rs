@@ -13,11 +13,11 @@
 //!
 //! Carve-out (CRITICAL): `NetworkPolicy` gates pensyve-core LLM /
 //! extractor traffic only. It does NOT gate `pensyve-mcp-gateway`
-//! infrastructure HTTP (OAuth, Stripe metering, auth provider). Those
-//! callers do not consult `NetworkPolicy` — see v2.1 spec §5.3 for the
+//! infrastructure HTTP (remote API key validation). That
+//! caller does not consult `NetworkPolicy` — see v2.1 spec §5.3 for the
 //! architectural reason. Without this carve-out the gateway would be
-//! forced to `Permissive` purely to keep OAuth working, defeating the
-//! safety property of the LLM path.
+//! forced to `Permissive` purely to keep key validation working, defeating
+//! the safety property of the LLM path.
 
 use std::str::FromStr;
 

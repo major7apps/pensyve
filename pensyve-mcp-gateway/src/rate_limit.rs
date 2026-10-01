@@ -1,11 +1,15 @@
-//! Plan-aware rate limiting for the Pensyve managed cloud gateway.
+//! Per-tenant rate limiting for the gateway.
+//!
+//! Every tenant gets the same two limits: requests per minute
+//! (`PENSYVE_RATE_LIMIT`, default 30) and operations per UTC day
+//! (`PENSYVE_DAILY_QUOTA`, default 1000).
 //!
 //! Phase 23 Track B replaces the original DashMap-only sliding-window
 //! limiter with a Redis-backed implementation that scales horizontally
-//! across multiple gateway instances and adds plan-tier-aware daily
-//! operation quotas. A Lua script performs the per-minute window pruning,
+//! across multiple gateway instances and adds daily operation quotas.
+//! A Lua script performs the per-minute window pruning,
 //! quota INCR, and atomic check-and-allow under a single round trip so
-//! concurrent gateway replicas cannot race past their plan limit.
+//! concurrent gateway replicas cannot race past the limit.
 //!
 //! When `REDIS_URL` is unset or Redis becomes unreachable mid-flight, the
 //! limiter falls back to an in-memory `DashMap` sliding window. The
@@ -32,61 +36,24 @@ use crate::auth::AuthContext;
 const REDIS_RATE_LIMIT_TIMEOUT: Duration = Duration::from_millis(150);
 const FALLBACK_EVICT_EVERY_CHECKS: u64 = 64;
 
-/// Plan-tier limits, keyed by the `plan` string returned from auth.
-///
-/// Locked operator decision (2026-05-07):
-///   `free`       — 30 RPM,   1 000 daily ops
-///   `business`   — 300 RPM,  50 000 daily ops
-///   `enterprise` — unlimited
-///   unknown plan — most restrictive (free) for safety
-#[derive(Debug, Clone, Copy)]
-pub struct PlanLimits;
+/// Default requests per minute per tenant when `PENSYVE_RATE_LIMIT` is unset.
+pub const DEFAULT_RPM: u32 = 30;
+/// Default operations per UTC day per tenant when `PENSYVE_DAILY_QUOTA` is unset.
+pub const DEFAULT_DAILY: u32 = 1_000;
 
-impl PlanLimits {
-    #[must_use]
-    pub fn for_plan(plan: &str) -> Limits {
-        // Unknown plan strings collapse to `free` for safety — keeps an
-        // honest bound on consumption if a new plan is introduced
-        // upstream without the gateway being redeployed.
-        match plan {
-            "business" => Limits {
-                rpm: 300,
-                daily: 50_000,
-            },
-            "enterprise" => Limits::unlimited(),
-            // "free" and unknown plan strings.
-            _ => Limits {
-                rpm: 30,
-                daily: 1_000,
-            },
-        }
-    }
-}
-
-/// Resolved per-tenant limit pair.
+/// The limit pair applied to every tenant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub rpm: u32,
     pub daily: u32,
 }
 
-impl Limits {
-    /// Sentinel for the `enterprise` tier — never blocks. We use
-    /// `u32::MAX` rather than an `Option<u32>` so the comparison logic
-    /// stays branch-free in the hot path and the Lua script's `tonumber`
-    /// can still read it as an integer.
-    #[must_use]
-    pub const fn unlimited() -> Self {
+impl Default for Limits {
+    fn default() -> Self {
         Self {
-            rpm: u32::MAX,
-            daily: u32::MAX,
+            rpm: DEFAULT_RPM,
+            daily: DEFAULT_DAILY,
         }
-    }
-
-    /// `true` when this tier should bypass enforcement entirely.
-    #[must_use]
-    pub const fn is_unlimited(self) -> bool {
-        self.rpm == u32::MAX && self.daily == u32::MAX
     }
 }
 
@@ -109,24 +76,6 @@ pub struct CheckOutcome {
     pub retry_after_seconds: Option<u32>,
 }
 
-impl CheckOutcome {
-    /// Outcome used for unlimited (enterprise) tenants. Daily/rpm fields
-    /// are populated with `u32::MAX` so middleware can still emit headers
-    /// without special-casing the unlimited path.
-    fn unlimited(now_secs: u64) -> Self {
-        Self {
-            allowed: true,
-            rpm_limit: u32::MAX,
-            rpm_remaining: u32::MAX,
-            rpm_reset_seconds: 60,
-            daily_limit: u32::MAX,
-            daily_remaining: u32::MAX,
-            daily_reset_seconds: seconds_until_utc_midnight(now_secs),
-            retry_after_seconds: None,
-        }
-    }
-}
-
 /// In-memory bucket used by the fallback path. Stored in a `DashMap`
 /// keyed by `tenant_id`. Daily counters are intentionally NOT tracked here —
 /// without Redis there's no shared store across replicas, so daily
@@ -140,9 +89,11 @@ struct FallbackBucket {
     last_seen: u64,
 }
 
-/// Plan-aware rate limiter. See module docs for the full contract.
+/// Per-tenant rate limiter. See module docs for the full contract.
 pub struct RateLimiter {
     redis: Option<ConnectionManager>,
+    /// Limits applied to every tenant.
+    limits: Limits,
     /// In-memory fallback when Redis is unavailable or fails mid-flight.
     fallback: Arc<DashMap<String, FallbackBucket>>,
     /// Compiled Lua script — cached on the server via EVALSHA after the
@@ -162,6 +113,7 @@ impl RateLimiter {
     pub fn new(redis: Option<ConnectionManager>) -> Self {
         Self {
             redis,
+            limits: Limits::default(),
             fallback: Arc::new(DashMap::new()),
             script: Arc::new(Script::new(RATE_LIMIT_LUA)),
             fallback_warned: Arc::new(AtomicBool::new(false)),
@@ -171,16 +123,19 @@ impl RateLimiter {
         }
     }
 
+    /// Replace the default limits with the configured ones.
+    #[must_use]
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
+    }
+
     /// Atomic check-and-increment against the tenant's per-minute and
     /// per-day budget. Returns a populated [`CheckOutcome`] suitable for
     /// header emission and 429 short-circuiting.
-    pub async fn check(&self, tenant_id: &str, plan: &str) -> CheckOutcome {
-        let limits = PlanLimits::for_plan(plan);
+    pub async fn check(&self, tenant_id: &str) -> CheckOutcome {
+        let limits = self.limits;
         let now_secs = unix_seconds();
-
-        if limits.is_unlimited() {
-            return CheckOutcome::unlimited(now_secs);
-        }
 
         #[cfg(test)]
         if self.force_redis_error.load(Ordering::Relaxed) {
@@ -481,17 +436,17 @@ where
                 return inner.call(req).await;
             }
 
-            // Resolve `(tenant_id, plan)` from the auth context attached
+            // Resolve the tenant from the auth context attached
             // upstream by `AuthLayer`. Anonymous traffic (no auth) gets
-            // bucketed under a shared key with the most restrictive
-            // tier — auth-failure paths should already have returned 401
-            // before reaching here, so this is mostly belt-and-suspenders.
-            let (tenant_id, plan) = req.extensions().get::<AuthContext>().map_or_else(
-                || ("anonymous".to_string(), "free".to_string()),
-                |ctx| (quota_bucket_key(ctx), ctx.plan.clone()),
-            );
+            // bucketed under a shared key — auth-failure paths should
+            // already have returned 401 before reaching here, so this is
+            // mostly belt-and-suspenders.
+            let tenant_id = req
+                .extensions()
+                .get::<AuthContext>()
+                .map_or_else(|| "anonymous".to_string(), quota_bucket_key);
 
-            let outcome = state.rate_limiter.check(&tenant_id, &plan).await;
+            let outcome = state.rate_limiter.check(&tenant_id).await;
 
             if !outcome.allowed {
                 return Ok(deny_response(&outcome));
@@ -557,66 +512,39 @@ mod tests {
     #[tokio::test]
     async fn test_rpm_in_memory_fallback() {
         let rl = limiter();
-        // Free tier — 30 RPM. Issue 30 requests, all allowed.
+        // Default limit — 30 RPM. Issue 30 requests, all allowed.
         for _ in 0..30 {
-            let outcome = rl.check("tenant_a", "free").await;
+            let outcome = rl.check("tenant_a").await;
             assert!(outcome.allowed, "in-memory fallback should allow under 30");
         }
         // 31st request blocks.
-        let outcome = rl.check("tenant_a", "free").await;
+        let outcome = rl.check("tenant_a").await;
         assert!(!outcome.allowed, "31st request should be denied");
         assert!(outcome.retry_after_seconds.is_some());
     }
 
     #[tokio::test]
-    async fn test_rpm_respects_plan_limit_free() {
-        let rl = limiter();
-        for i in 0..30 {
-            assert!(
-                rl.check("u_free", "free").await.allowed,
-                "free tier req #{} should pass",
-                i + 1
-            );
+    async fn test_rpm_respects_configured_limit() {
+        let rl = limiter().with_limits(Limits {
+            rpm: 3,
+            daily: 50_000,
+        });
+        for i in 0..3 {
+            let outcome = rl.check("u_cfg").await;
+            assert!(outcome.allowed, "req #{} should pass", i + 1);
+            assert_eq!(outcome.rpm_limit, 3);
+            assert_eq!(outcome.daily_limit, 50_000);
         }
         assert!(
-            !rl.check("u_free", "free").await.allowed,
-            "free tier req #31 should fail"
+            !rl.check("u_cfg").await.allowed,
+            "req #4 should fail under a 3 RPM limit"
         );
-    }
-
-    #[tokio::test]
-    async fn test_rpm_respects_plan_limit_business() {
-        let rl = limiter();
-        // Business tier has 10x the free RPM (300 vs 30).
-        // Verify the 31st request still passes — this would have failed
-        // under the old single-limit implementation.
-        for i in 0..50 {
-            assert!(
-                rl.check("u_biz", "business").await.allowed,
-                "business tier req #{} should pass",
-                i + 1
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_plan_enterprise_unlimited() {
-        let rl = limiter();
-        // Burst beyond every other tier's RPM limit. Enterprise must
-        // never block, regardless of count.
-        for _ in 0..1_000 {
-            let outcome = rl.check("u_ent", "enterprise").await;
-            assert!(outcome.allowed);
-            assert_eq!(outcome.rpm_limit, u32::MAX);
-            assert_eq!(outcome.daily_limit, u32::MAX);
-            assert!(outcome.retry_after_seconds.is_none());
-        }
     }
 
     #[tokio::test]
     async fn test_response_headers_populated() {
         let rl = limiter();
-        let outcome = rl.check("u_hdr", "free").await;
+        let outcome = rl.check("u_hdr").await;
         assert!(outcome.allowed);
         assert_eq!(outcome.rpm_limit, 30);
         assert_eq!(outcome.rpm_remaining, 29);
@@ -632,9 +560,9 @@ mod tests {
     async fn test_429_retry_after_header() {
         let rl = limiter();
         for _ in 0..30 {
-            rl.check("u_retry", "free").await;
+            rl.check("u_retry").await;
         }
-        let outcome = rl.check("u_retry", "free").await;
+        let outcome = rl.check("u_retry").await;
         assert!(!outcome.allowed);
         let retry = outcome.retry_after_seconds.expect("denied → retry_after");
         assert!(
@@ -649,7 +577,7 @@ mod tests {
         // forced-error test below exercises the Redis failure branch.
         let rl = limiter();
         for _ in 0..5 {
-            let outcome = rl.check("u_grace", "free").await;
+            let outcome = rl.check("u_grace").await;
             assert!(outcome.allowed);
         }
     }
@@ -660,7 +588,7 @@ mod tests {
         assert!(!rl.fallback_warning_emitted_for_test());
 
         for _ in 0..5 {
-            let outcome = rl.check("u_grace_forced", "free").await;
+            let outcome = rl.check("u_grace_forced").await;
             assert!(outcome.allowed);
         }
 
@@ -671,7 +599,7 @@ mod tests {
     #[tokio::test]
     async fn test_fallback_evicts_idle_buckets() {
         let rl = limiter();
-        let limits = PlanLimits::for_plan("free");
+        let limits = Limits::default();
 
         let first = rl.check_fallback("tenant_idle", limits, 1_000);
         assert!(first.allowed);
@@ -692,8 +620,6 @@ mod tests {
             tenant_id: Some("tenant_abc".to_string()),
             user_id: Some("user_123".to_string()),
             scope: "mcp".to_string(),
-            stripe_customer_id: None,
-            plan: "business".to_string(),
         };
         assert_eq!(quota_bucket_key(&ctx), "tenant_abc");
 
@@ -708,23 +634,17 @@ mod tests {
     async fn test_separate_tenants_have_independent_buckets() {
         let rl = limiter();
         for _ in 0..30 {
-            assert!(rl.check("tenant_x", "free").await.allowed);
+            assert!(rl.check("tenant_x").await.allowed);
         }
         // tenant_x is now exhausted, but tenant_y still has full budget.
-        assert!(!rl.check("tenant_x", "free").await.allowed);
-        assert!(rl.check("tenant_y", "free").await.allowed);
+        assert!(!rl.check("tenant_x").await.allowed);
+        assert!(rl.check("tenant_y").await.allowed);
     }
 
     #[test]
-    fn test_plan_limits_lookup() {
-        assert_eq!(PlanLimits::for_plan("free").rpm, 30);
-        assert_eq!(PlanLimits::for_plan("free").daily, 1_000);
-        assert_eq!(PlanLimits::for_plan("business").rpm, 300);
-        assert_eq!(PlanLimits::for_plan("business").daily, 50_000);
-        assert!(PlanLimits::for_plan("enterprise").is_unlimited());
-        // Unknown plan must collapse to the most restrictive (free).
-        assert_eq!(PlanLimits::for_plan("nonexistent_tier").rpm, 30);
-        assert_eq!(PlanLimits::for_plan("").rpm, 30);
+    fn test_default_limits() {
+        assert_eq!(Limits::default().rpm, 30);
+        assert_eq!(Limits::default().daily, 1_000);
     }
 
     #[test]
@@ -736,15 +656,6 @@ mod tests {
         assert_eq!(seconds_until_utc_midnight(new_year + 86_399), 1);
         // Halfway through the day: 12 h remains.
         assert_eq!(seconds_until_utc_midnight(new_year + 43_200), 43_200);
-    }
-
-    #[test]
-    fn test_unlimited_outcome_has_max_remaining() {
-        let outcome = CheckOutcome::unlimited(unix_seconds());
-        assert!(outcome.allowed);
-        assert_eq!(outcome.rpm_remaining, u32::MAX);
-        assert_eq!(outcome.daily_remaining, u32::MAX);
-        assert!(outcome.retry_after_seconds.is_none());
     }
 
     #[test]
