@@ -1,63 +1,72 @@
 # Contributing to Pensyve
 
-Thanks for your interest in contributing to Pensyve! Here's how to get started.
+Pensyve is an open-source project in maintenance mode. Releases cover security
+fixes and dependency updates, with no new features planned. Please read the
+[maintenance policy](MAINTENANCE.md) before starting work. Issues and pull
+requests are handled on a best-effort basis, with no guaranteed response time.
 
-## Development Setup
+Use [GitHub issues](https://github.com/major7apps/pensyve/issues) for public
+bug reports and documentation corrections. Report security issues privately
+as described in [SECURITY.md](SECURITY.md).
+
+## Development setup
+
+You need Rust 1.94 or newer, Python 3.10 or newer, and
+[uv](https://docs.astral.sh/uv/). TypeScript SDK work also needs
+[Bun](https://bun.sh), and Go SDK work needs [Go 1.21 or newer](https://go.dev).
 
 ```bash
-# Clone the repo
 git clone https://github.com/major7apps/pensyve.git
 cd pensyve
-
-# Build the Rust core
-cargo build
-
-# Run tests
-cargo test
-
-# Run the MCP server locally
-cargo run -p pensyve-mcp
-
-# Run the Python SDK tests
-cd pensyve-python && uv run pytest
-
-# Run the TypeScript SDK tests
-cd pensyve-ts && bun test
+uv sync --extra dev
+make build
 ```
 
-## Project Structure
+`make build` compiles Rust and builds the native Python extension with
+Maturin. Build the extension before running Python examples or tests.
 
-```
-pensyve-core/          Rust core engine (storage, retrieval, embeddings)
-pensyve-python/        Python SDK (PyO3 bindings)
-pensyve-ts/            TypeScript SDK (HTTP client)
-pensyve-go/            Go SDK (HTTP client)
-pensyve-mcp/           MCP stdio server
-pensyve-mcp-gateway/   MCP HTTP gateway (self-hosted)
-pensyve-mcp-tools/     Shared MCP tool definitions
-pensyve-cli/           CLI (clap)
-pensyve-wasm/          WASM bindings
-integrations/          Claude Code, Codex, Antigravity, LangChain, CrewAI, etc.
+## Checks
+
+Run the repository checks before pushing:
+
+```bash
+make check
 ```
 
-## How to Contribute
+`make check` runs Clippy, Ruff, Pyright, and the Rust and Python tests.
+Run the SDK checks separately when changing those components:
 
-1. **Find an issue** — check [issues](https://github.com/major7apps/pensyve/issues) for `good first issue` or `help wanted` labels
-2. **Fork and branch** — create a branch from `main`
-3. **Make your change** — write code, add tests
-4. **Run CI locally** — `cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test`
-5. **Open a PR** — describe what you changed and why
+```bash
+# Run each command from the repository root.
+(cd pensyve-ts && bun install && bun run check)
+(cd pensyve-go && go vet ./... && go test ./...)
+(cd pensyve-wasm && cargo check)
+```
 
-## Code Style
+To run a single Rust crate or the Python integration tests:
 
-- Rust: `cargo fmt` + `clippy` with `-D warnings`
-- Python: `ruff` for linting
-- TypeScript: `eslint` + `prettier`
+```bash
+cargo test -p pensyve-core
+uv run pytest tests/python/ -v
+```
 
-## Commit Messages
+CI also runs checks with PostgreSQL and other feature combinations. See
+the [CI workflow](.github/workflows/ci.yml) for the full set of jobs and
+[RELIABILITY.md](docs/RELIABILITY.md) for test details.
 
-Use conventional commits: `feat:`, `fix:`, `docs:`, `test:`, `chore:`, `refactor:`
+## Submitting a change
+
+1. Check existing issues and the maintenance policy, then create a branch from `main` in your fork.
+2. Keep the change focused, add tests for behavior changes, and update affected documentation.
+3. Run the relevant checks and open a pull request that explains the problem, the change, and the results.
+
+Use `cargo fmt` and Clippy for Rust, Ruff for Python, ESLint for TypeScript,
+and `go vet` for Go. Commit messages use conventional prefixes such as
+`fix:`, `docs:`, `test:`, and `chore:`.
+
+See [AGENTS.md](AGENTS.md) for the directory map and coding conventions, and
+[ARCHITECTURE.md](docs/ARCHITECTURE.md) for the engine's component boundaries.
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the Apache License 2.0.
+Contributions are licensed under [Apache 2.0](LICENSE).

@@ -1,0 +1,4445 @@
+{
+  "recorded_date_utc": "2026-10-04",
+  "repository": "https://github.com/major7apps/pensyve",
+  "baseline_commit": "25b3b0204c030e5be7137a73ccec2e97b9a35c3f",
+  "publication_state": "Local documentation changes are unpublished. This is a baseline, not an improvement measurement.",
+  "market": {
+    "location_code": 2840,
+    "location_name": "United States",
+    "language_code": "en",
+    "serp_device": "desktop"
+  },
+  "requests": {
+    "suggestions-agent": {
+      "endpoint": "dataforseo_labs/google/keyword_suggestions/live",
+      "payload": [
+        {
+          "location_code": 2840,
+          "language_code": "en",
+          "keyword": "agent memory",
+          "include_seed_keyword": true,
+          "include_serp_info": false,
+          "limit": 40
+        }
+      ],
+      "response_status_code": 20000,
+      "cost_usd": "0.0168",
+      "task_status_codes": [
+        20000
+      ],
+      "raw_response_sha256": "d55badd71eb31550c536dd600f1ee37d2ff508c7f96eeb1b46d2b19531c7db8c"
+    },
+    "suggestions-mcp": {
+      "endpoint": "dataforseo_labs/google/keyword_suggestions/live",
+      "payload": [
+        {
+          "location_code": 2840,
+          "language_code": "en",
+          "keyword": "mcp memory",
+          "include_seed_keyword": true,
+          "include_serp_info": false,
+          "limit": 40
+        }
+      ],
+      "response_status_code": 20000,
+      "cost_usd": "0.0168",
+      "task_status_codes": [
+        20000
+      ],
+      "raw_response_sha256": "450fb551ef2bab8d66ecd73bff9f909c0b8e57d665dde022ca33a9c3219dfc7f"
+    },
+    "suggestions-llm": {
+      "endpoint": "dataforseo_labs/google/keyword_suggestions/live",
+      "payload": [
+        {
+          "location_code": 2840,
+          "language_code": "en",
+          "keyword": "llm memory",
+          "include_seed_keyword": true,
+          "include_serp_info": false,
+          "limit": 40
+        }
+      ],
+      "response_status_code": 20000,
+      "cost_usd": "0.0168",
+      "task_status_codes": [
+        20000
+      ],
+      "raw_response_sha256": "3572f7935b622de80ba2d18d332939ea95bc138d1d0752fda23f9d3cfcccfe6e"
+    },
+    "rank-agent": {
+      "endpoint": "serp/google/organic/live/advanced",
+      "payload": [
+        {
+          "location_code": 2840,
+          "language_code": "en",
+          "keyword": "ai agent memory",
+          "device": "desktop",
+          "depth": 30
+        }
+      ],
+      "response_status_code": 20000,
+      "cost_usd": "0.005",
+      "task_status_codes": [
+        20000
+      ],
+      "raw_response_sha256": "3a32e455515315f6be9c8cff4d6064efb5b7fe0dde346a6cfa9e50004daaca7e"
+    },
+    "rank-persistent": {
+      "endpoint": "serp/google/organic/live/advanced",
+      "payload": [
+        {
+          "location_code": 2840,
+          "language_code": "en",
+          "keyword": "persistent memory for ai agents",
+          "device": "desktop",
+          "depth": 30
+        }
+      ],
+      "response_status_code": 20000,
+      "cost_usd": "0.005",
+      "task_status_codes": [
+        20000
+      ],
+      "raw_response_sha256": "d5114b4c671270a152604e9c3ff07a121c9a7edebe1631d0de34ffa8a4d0a4d8"
+    },
+    "rank-mcp": {
+      "endpoint": "serp/google/organic/live/advanced",
+      "payload": [
+        {
+          "location_code": 2840,
+          "language_code": "en",
+          "keyword": "mcp memory server",
+          "device": "desktop",
+          "depth": 30
+        }
+      ],
+      "response_status_code": 20000,
+      "cost_usd": "0.005",
+      "task_status_codes": [
+        20000
+      ],
+      "raw_response_sha256": "7443ab06e6b9f7b7241397943d97400b2ab41c20f15a3637d9cbf6061a1583e3"
+    },
+    "rank-claude": {
+      "endpoint": "serp/google/organic/live/advanced",
+      "payload": [
+        {
+          "location_code": 2840,
+          "language_code": "en",
+          "keyword": "claude code memory",
+          "device": "desktop",
+          "depth": 30
+        }
+      ],
+      "response_status_code": 20000,
+      "cost_usd": "0.005",
+      "task_status_codes": [
+        20000
+      ],
+      "raw_response_sha256": "c253aa9bd613460995c8df856057e1c7511ac70da5f558f6940ca0e1a226bb09"
+    },
+    "rank-cursor": {
+      "endpoint": "serp/google/organic/live/advanced",
+      "payload": [
+        {
+          "location_code": 2840,
+          "language_code": "en",
+          "keyword": "cursor memory mcp",
+          "device": "desktop",
+          "depth": 30
+        }
+      ],
+      "response_status_code": 20000,
+      "cost_usd": "0.005",
+      "task_status_codes": [
+        20000
+      ],
+      "raw_response_sha256": "060848b6a8f247e13756487a7ba75723dd1edddfbf41dd16a643961e36ddfbdb"
+    },
+    "rank-python": {
+      "endpoint": "serp/google/organic/live/advanced",
+      "payload": [
+        {
+          "location_code": 2840,
+          "language_code": "en",
+          "keyword": "python agent memory",
+          "device": "desktop",
+          "depth": 30
+        }
+      ],
+      "response_status_code": 20000,
+      "cost_usd": "0.005",
+      "task_status_codes": [
+        20000
+      ],
+      "raw_response_sha256": "7403596f907a711d9dc57c9dee603974ad22a57145965fd63d5933df1c97d4ac"
+    },
+    "rank-selfhost": {
+      "endpoint": "serp/google/organic/live/advanced",
+      "payload": [
+        {
+          "location_code": 2840,
+          "language_code": "en",
+          "keyword": "self hosted ai memory",
+          "device": "desktop",
+          "depth": 30
+        }
+      ],
+      "response_status_code": 20000,
+      "cost_usd": "0.005",
+      "task_status_codes": [
+        20000
+      ],
+      "raw_response_sha256": "95f915a7e6de0af2073c98aee32da94ba53b2f3882ccccdaef37aa3013f1fd55"
+    },
+    "rank-brand": {
+      "endpoint": "serp/google/organic/live/advanced",
+      "payload": [
+        {
+          "location_code": 2840,
+          "language_code": "en",
+          "keyword": "pensyve github",
+          "device": "desktop",
+          "depth": 30
+        }
+      ],
+      "response_status_code": 20000,
+      "cost_usd": "0.005",
+      "task_status_codes": [
+        20000
+      ],
+      "raw_response_sha256": "90207752d3afdfc2131aa36c0b334a3013b5e4d3b49073b7db1c3cd7c2a2a2c6"
+    },
+    "rank-repo-index": {
+      "endpoint": "serp/google/organic/live/advanced",
+      "payload": [
+        {
+          "location_code": 2840,
+          "language_code": "en",
+          "keyword": "site:github.com/major7apps/pensyve",
+          "device": "desktop",
+          "depth": 10
+        }
+      ],
+      "response_status_code": 20000,
+      "cost_usd": "0.01",
+      "task_status_codes": [
+        20000
+      ],
+      "raw_response_sha256": "c6567f5a3aa79b6267d804ebd3ae333e8c5962e2a712c427b4924e3e16ee4c9d"
+    },
+    "page-github": {
+      "endpoint": "on_page/instant_pages",
+      "payload": [
+        {
+          "url": "https://github.com/major7apps/pensyve",
+          "enable_javascript": false,
+          "enable_browser_rendering": false,
+          "load_resources": false
+        }
+      ],
+      "response_status_code": 20000,
+      "cost_usd": "0.00015",
+      "task_status_codes": [
+        20000
+      ],
+      "raw_response_sha256": "c7a3f66bfa253b5cca35333134e7c36e9bfef75f70439a9e8d66ec599bd530e0"
+    },
+    "page-docs": {
+      "endpoint": "on_page/instant_pages",
+      "payload": [
+        {
+          "url": "https://github.com/major7apps/pensyve/tree/main/docs",
+          "enable_javascript": false,
+          "enable_browser_rendering": false,
+          "load_resources": false
+        }
+      ],
+      "response_status_code": 20000,
+      "cost_usd": "0.00015",
+      "task_status_codes": [
+        20000
+      ],
+      "raw_response_sha256": "3bf3074862dcad64f5d96f0b9d43375c478ac59230cfd9a213de8e6d662ce1d5"
+    },
+    "page-pypi": {
+      "endpoint": "on_page/instant_pages",
+      "payload": [
+        {
+          "url": "https://pypi.org/project/pensyve/",
+          "enable_javascript": false,
+          "enable_browser_rendering": false,
+          "load_resources": false
+        }
+      ],
+      "response_status_code": 20000,
+      "cost_usd": "0.00015",
+      "task_status_codes": [
+        20000
+      ],
+      "raw_response_sha256": "705078403d0db7a585d07d5668140f736cd4e5c9c0b9886cd8e20bcda9e3dc6e"
+    },
+    "overview-expanded": {
+      "endpoint": "dataforseo_labs/google/keyword_overview/live",
+      "payload": [
+        {
+          "location_code": 2840,
+          "language_code": "en",
+          "include_serp_info": false,
+          "keywords": [
+            "ai agent memory",
+            "agent memory",
+            "persistent memory for ai agents",
+            "llm memory",
+            "mcp memory server",
+            "memory mcp server",
+            "claude code memory",
+            "claude memory mcp",
+            "claude code persistent memory",
+            "cursor memory",
+            "cursor memory mcp",
+            "cursor persistent memory",
+            "python agent memory",
+            "python persistent memory",
+            "langchain memory",
+            "langgraph memory",
+            "ai agent memory types",
+            "episodic memory ai",
+            "semantic memory ai",
+            "procedural memory ai",
+            "long term memory ai",
+            "local ai memory",
+            "self hosted ai memory",
+            "open source ai memory",
+            "agent memory vs rag",
+            "llm memory vs rag",
+            "pensyve",
+            "pensyve github",
+            "sqlite vector search",
+            "agent memory framework"
+          ]
+        }
+      ],
+      "response_status_code": 20000,
+      "cost_usd": "0.01464",
+      "task_status_codes": [
+        20000
+      ],
+      "raw_response_sha256": "9ba51220f206968f0451b42d25139c83ddafb428eb36f05bb5de1f8446c5dc71"
+    }
+  },
+  "keyword_overview": [
+    {
+      "request": "overview-expanded",
+      "keyword": "agent memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 1300,
+      "data_updated_utc": "2026-09-16 16:33:37 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 1900
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "agent memory framework",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 30,
+      "data_updated_utc": "2026-09-16 11:10:35 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 30
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "agent memory vs rag",
+      "record_status": "not_returned",
+      "estimated_monthly_searches": null
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "ai agent memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 210,
+      "data_updated_utc": "2026-09-15 09:00:48 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 260
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "ai agent memory types",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-12 03:27:46 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 20
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "claude code memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 1300,
+      "data_updated_utc": "2026-09-15 23:47:16 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 720
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "claude code persistent memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 70,
+      "data_updated_utc": "2026-09-14 12:18:41 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 30
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "claude memory mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 110,
+      "data_updated_utc": "2026-09-15 18:13:05 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 70
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "cursor memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 140,
+      "data_updated_utc": "2026-09-16 13:21:17 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 110
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "cursor memory mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-17 07:44:52 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "cursor persistent memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-12 08:53:31 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "episodic memory ai",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 30,
+      "data_updated_utc": "2026-09-13 20:59:25 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 50
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "langchain memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 260,
+      "data_updated_utc": "2026-09-17 02:22:03 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 140
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "langgraph memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 210,
+      "data_updated_utc": "2026-09-16 20:22:28 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 90
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "llm memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 260,
+      "data_updated_utc": "2026-09-12 17:12:00 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 260
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "llm memory vs rag",
+      "record_status": "not_returned",
+      "estimated_monthly_searches": null
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "local ai memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-14 19:26:37 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "long term memory ai",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 320,
+      "data_updated_utc": "2026-09-12 20:05:50 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 390
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "mcp memory server",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 70,
+      "data_updated_utc": "2026-09-14 22:17:29 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 40
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "memory mcp server",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 140,
+      "data_updated_utc": "2026-09-16 10:25:53 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 50
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "open source ai memory",
+      "record_status": "not_returned",
+      "estimated_monthly_searches": null
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "pensyve",
+      "record_status": "not_returned",
+      "estimated_monthly_searches": null
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "pensyve github",
+      "record_status": "not_returned",
+      "estimated_monthly_searches": null
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "persistent memory for ai agents",
+      "record_status": "not_returned",
+      "estimated_monthly_searches": null
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "procedural memory ai",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-17 03:03:37 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 20
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "python agent memory",
+      "record_status": "not_returned",
+      "estimated_monthly_searches": null
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "python persistent memory",
+      "record_status": "returned_without_volume",
+      "estimated_monthly_searches": null,
+      "data_updated_utc": "2026-06-15 18:57:40 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 5,
+        "search_volume": 0
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "self hosted ai memory",
+      "record_status": "not_returned",
+      "estimated_monthly_searches": null
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "semantic memory ai",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-13 20:06:43 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 40
+      }
+    },
+    {
+      "request": "overview-expanded",
+      "keyword": "sqlite vector search",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 90,
+      "data_updated_utc": "2026-09-15 17:28:56 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 70
+      }
+    }
+  ],
+  "keyword_suggestions": [
+    {
+      "request": "suggestions-agent",
+      "keyword": "agent memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 1300,
+      "data_updated_utc": "2026-09-16 16:33:37 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 1900
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "tencentdb agent memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 210,
+      "data_updated_utc": "2026-09-14 20:31:32 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 1300
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "ai agent memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 210,
+      "data_updated_utc": "2026-09-15 09:00:48 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 260
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "memory agent",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 170,
+      "data_updated_utc": "2026-09-15 13:48:17 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 170
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "agent memory github",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 170,
+      "data_updated_utc": "2026-09-17 00:56:21 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 320
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "agent workflow memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 170,
+      "data_updated_utc": "2026-09-17 21:07:08 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 140
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "reasoningbank scaling agent self-evolving with reasoning memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 110,
+      "data_updated_utc": "2026-09-13 11:32:08 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 110
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "reasoningbank: scaling agent self-evolving with reasoning memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 110,
+      "data_updated_utc": "2026-09-14 09:21:45 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 110
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "agent grant memory of a killer",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 110,
+      "data_updated_utc": "2026-09-14 00:03:44 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 70
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "zep: a temporal knowledge graph architecture for agent memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 70,
+      "data_updated_utc": "2026-09-14 05:53:55 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 70
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "g-memory: tracing hierarchical memory for multi agent systems",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 70,
+      "data_updated_utc": "2026-09-12 04:17:51 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 50
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "agent memory survey",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 70,
+      "data_updated_utc": "2026-09-17 12:21:32 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 30
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "neo4j agent memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 70,
+      "data_updated_utc": "2026-09-17 03:27:23 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 110
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "claude agent memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 70,
+      "data_updated_utc": "2026-09-15 12:28:00 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 30
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "letta agent memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 70,
+      "data_updated_utc": "2026-09-15 11:23:22 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 30
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "cloudflare agent memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 50,
+      "data_updated_utc": "2026-09-13 21:49:21 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 110
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "cast of memory of a killer fbi agent",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 50,
+      "data_updated_utc": "2026-09-16 15:44:46 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 40
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "agent memory system",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 50,
+      "data_updated_utc": "2026-09-16 12:50:29 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 110
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "agent memory systems",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 50,
+      "data_updated_utc": "2026-09-14 07:08:27 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 110
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "agent memory management",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 50,
+      "data_updated_utc": "2026-09-16 03:13:30 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 50
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "memory for ai agent",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 50,
+      "data_updated_utc": "2026-09-13 20:07:29 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 30
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "redis agent memory server",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 50,
+      "data_updated_utc": "2026-09-14 04:31:00 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 40
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "memory of a killer agent grant",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 40,
+      "data_updated_utc": "2026-09-13 13:51:05 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 40
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "memevolve: meta-evolution of agent memory systems",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 40,
+      "data_updated_utc": "2026-09-17 11:23:10 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 30
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "zep agent memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 40,
+      "data_updated_utc": "2026-09-16 14:47:26 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 70
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "claude agent sdk memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 40,
+      "data_updated_utc": "2026-09-13 12:36:32 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 30
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "agent memory benchmark",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 40,
+      "data_updated_utc": "2026-09-12 13:05:41 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 70
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "llm agent memory systems",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 40,
+      "data_updated_utc": "2026-09-12 09:05:06 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "agent memory paper",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 30,
+      "data_updated_utc": "2026-09-13 15:22:45 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 20
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "pre-memory system agent initialization is started",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 30,
+      "data_updated_utc": "2026-09-17 07:25:35 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "langgraph agent memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 30,
+      "data_updated_utc": "2026-09-16 05:08:19 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "agent memory mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 30,
+      "data_updated_utc": "2026-09-17 10:04:26 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 30
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "ai agent memory management",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 30,
+      "data_updated_utc": "2026-09-12 18:13:26 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 50
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "ai agent memory tools",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 30,
+      "data_updated_utc": "2026-09-13 00:43:27 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "memory agent bench",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 30,
+      "data_updated_utc": "2026-09-14 09:27:42 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 30
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "what is agent memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 30,
+      "data_updated_utc": "2026-09-15 11:41:26 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 50
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "agent memory framework",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 30,
+      "data_updated_utc": "2026-09-16 11:10:35 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 30
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "opencode agent memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 30,
+      "data_updated_utc": "2026-09-13 10:26:16 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 30
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "claude code agent memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 30,
+      "data_updated_utc": "2026-09-13 13:46:38 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-agent",
+      "keyword": "ai agent memory architecture",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 30,
+      "data_updated_utc": "2026-09-17 09:07:56 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 40
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "codebase-memory-mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 1000,
+      "data_updated_utc": "2026-09-16 00:37:31 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 3600
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "memory mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 590,
+      "data_updated_utc": "2026-09-12 12:04:53 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 320
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "mcp memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 590,
+      "data_updated_utc": "2026-09-16 18:47:06 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 320
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "memory bank mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 170,
+      "data_updated_utc": "2026-09-12 11:19:32 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "memory mcp server",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 140,
+      "data_updated_utc": "2026-09-16 10:25:53 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 50
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "claude memory mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 110,
+      "data_updated_utc": "2026-09-15 18:13:05 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 70
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "codebase memory mcp github",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 90,
+      "data_updated_utc": "2026-09-15 12:36:11 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 170
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "basic memory mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 90,
+      "data_updated_utc": "2026-09-13 22:11:53 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 70
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "codebase-memory-mcp github",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 90,
+      "data_updated_utc": "2026-09-13 02:51:03 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 170
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "mcp-memory service",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 70,
+      "data_updated_utc": "2026-09-15 19:24:38 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 30
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "mcp memory server",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 70,
+      "data_updated_utc": "2026-09-14 22:17:29 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 40
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "mcp memory service",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 70,
+      "data_updated_utc": "2026-09-13 13:11:12 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 30
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "knowledge graph memory mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 50,
+      "data_updated_utc": "2026-09-16 08:14:52 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "server-memory mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 50,
+      "data_updated_utc": "2026-09-12 17:17:35 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 20
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "mcp server memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 50,
+      "data_updated_utc": "2026-09-12 05:02:13 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "mcp server-memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 50,
+      "data_updated_utc": "2026-09-15 07:54:07 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "server memory mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 50,
+      "data_updated_utc": "2026-09-16 15:17:28 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 20
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "deusdata codebase-memory-mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 40,
+      "data_updated_utc": "2026-09-16 02:50:55 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 90
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "claude code memory mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 40,
+      "data_updated_utc": "2026-09-17 22:15:20 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "agent memory mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 30,
+      "data_updated_utc": "2026-09-17 10:04:26 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 30
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "open memory mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 30,
+      "data_updated_utc": "2026-09-14 05:11:37 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "codebase memory mcp vs graphify",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-16 23:05:03 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 90
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "best memory mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-12 06:00:12 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "claude mcp memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-14 09:00:01 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "memory bank mcp server",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-17 01:44:44 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "mcp memory-keeper",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-13 07:44:22 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "anthropic memory mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-16 04:42:15 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "codebase memory mcp reddit",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-12 13:43:11 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 30
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "doobidoo/mcp-memory-service",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-12 03:23:51 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "doobidoo mcp memory service",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-15 14:57:33 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "memory mcp claude",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-17 06:59:40 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "mcp memory keeper",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-12 16:53:52 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "movibe memory bank mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-13 00:01:05 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 0
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "memory mcp for cursor",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-16 07:59:36 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 0
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "zep memory mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-15 10:38:50 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "alioshr memory bank mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-17 07:43:38 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "windsurf memory mcp",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-12 03:54:39 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "anthropic memory mcp server",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-13 11:28:35 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "mcp server for memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-12 05:21:27 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-mcp",
+      "keyword": "memory bank mcp cursor",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-15 16:04:18 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 0
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "llm memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 260,
+      "data_updated_utc": "2026-09-12 17:12:00 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 260
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "a-mem: agentic memory for llm agents",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 210,
+      "data_updated_utc": "2026-09-16 18:34:47 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 170
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "a mem agentic memory for llm agents",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 210,
+      "data_updated_utc": "2026-09-16 08:02:43 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 170
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "evaluating very long-term conversational memory of llm agents",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 70,
+      "data_updated_utc": "2026-09-12 05:14:50 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 50
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "evaluating memory in llm agents via incremental multi turn interactions",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 50,
+      "data_updated_utc": "2026-09-14 10:24:42 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 30
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "memory llm",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 50,
+      "data_updated_utc": "2026-09-14 04:27:02 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 30
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "simplemem: efficient lifelong memory for llm agents",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 50,
+      "data_updated_utc": "2026-09-17 00:56:18 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 40
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "llm memory calculator",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 40,
+      "data_updated_utc": "2026-09-16 11:24:48 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 20
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "llm long term memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 40,
+      "data_updated_utc": "2026-09-14 22:25:24 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 20
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "memory injection attacks on llm agents via query-only interaction",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 40,
+      "data_updated_utc": "2026-09-16 17:30:20 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 40
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "llm long-term memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 40,
+      "data_updated_utc": "2026-09-16 12:43:48 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 20
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "llm memory management",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 40,
+      "data_updated_utc": "2026-09-12 04:25:01 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "llm agent memory systems",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 40,
+      "data_updated_utc": "2026-09-12 09:05:06 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "galore memory-efficient llm training by gradient low-rank projection",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 40,
+      "data_updated_utc": "2026-09-17 06:13:03 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 20
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "agentic memory for llm agents",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 30,
+      "data_updated_utc": "2026-09-15 09:06:54 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 20
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "mirix multi agent memory system for llm-based agents",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 30,
+      "data_updated_utc": "2026-09-16 13:14:48 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 20
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "llm agent memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 30,
+      "data_updated_utc": "2026-09-17 08:47:44 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 20
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "llm memory github",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-16 15:00:39 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "episodic memory llm",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-15 20:21:39 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 20
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "memory-r1 llm reinforcement learning",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-12 13:22:53 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 0
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "memory r1 llm reinforcement learning",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-14 15:21:29 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 0
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "long-term memory llm",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-17 03:01:35 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "llm memory systems",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-13 00:20:29 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 30
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "long term memory llm",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-12 01:42:43 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "llm-memory github",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 20,
+      "data_updated_utc": "2026-09-15 12:19:45 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "mem agent equipping llm agents with memory using rl",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-13 15:24:47 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "llm agents memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-15 14:04:34 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 0
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "llm memory tool",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-14 15:18:55 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "llm long term memory github",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-15 04:39:38 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "llm procedural memory optimization",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-15 13:38:20 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 0
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "an empirical study of memory poisoning defenses for llm agents",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-12 09:44:39 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "latent memory llm",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-17 19:36:51 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 0
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "llm working memory limitations",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-16 19:50:22 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 0
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "agent memory llm",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-14 20:05:14 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "llm short term memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-12 06:03:19 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "llm inference memory calculator",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-17 06:00:00 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "graph memory llm",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-14 07:40:54 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "memory in llm agents",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-14 07:15:37 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 0
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "local llm with memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-16 05:50:26 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    },
+    {
+      "request": "suggestions-llm",
+      "keyword": "milla jovovich llm memory",
+      "record_status": "returned_with_volume",
+      "estimated_monthly_searches": 10,
+      "data_updated_utc": "2026-09-12 12:27:51 +00:00",
+      "latest_monthly_record": {
+        "year": 2026,
+        "month": 8,
+        "search_volume": 10
+      }
+    }
+  ],
+  "search_results": [
+    {
+      "request": "rank-agent",
+      "query": "ai agent memory",
+      "retrieved_at_utc": "2026-10-04 12:25:11 +00:00",
+      "spelling": null,
+      "organic_result_count": 29,
+      "project_matches": [],
+      "organic_results": [
+        {
+          "rank_group": 1,
+          "rank_absolute": 2,
+          "url": "https://www.ibm.com/think/topics/ai-agent-memory"
+        },
+        {
+          "rank_group": 2,
+          "rank_absolute": 3,
+          "url": "https://mem0.ai/library/agent-memory/memory-in-agents-what-why-and-how"
+        },
+        {
+          "rank_group": 3,
+          "rank_absolute": 4,
+          "url": "https://blog.cloudflare.com/introducing-agent-memory/"
+        },
+        {
+          "rank_group": 4,
+          "rank_absolute": 6,
+          "url": "https://blogs.oracle.com/developers/what-is-agent-memory-a-beginners-guide-for-ai-developers"
+        },
+        {
+          "rank_group": 5,
+          "rank_absolute": 7,
+          "url": "https://medium.com/@nirdiamant21/building-an-ai-agent-with-memory-and-adaptability-cdbc428bc36c"
+        },
+        {
+          "rank_group": 6,
+          "rank_absolute": 8,
+          "url": "https://redis.io/blog/ai-agent-memory-stateful-systems/"
+        },
+        {
+          "rank_group": 7,
+          "rank_absolute": 9,
+          "url": "https://agent-memory.dev/"
+        },
+        {
+          "rank_group": 8,
+          "rank_absolute": 10,
+          "url": "https://ai-sdk.dev/docs/agents/memory"
+        },
+        {
+          "rank_group": 9,
+          "rank_absolute": 11,
+          "url": "https://www.reddit.com/r/Rag/comments/1l9zudk/agent_memory_how_should_it_work/"
+        },
+        {
+          "rank_group": 10,
+          "rank_absolute": 13,
+          "url": "https://www.youtube.com/watch?v=BacJ6sEhqMo"
+        },
+        {
+          "rank_group": 11,
+          "rank_absolute": 14,
+          "url": "https://www.langchain.com/blog/how-to-give-your-agent-memory"
+        },
+        {
+          "rank_group": 12,
+          "rank_absolute": 15,
+          "url": "https://arxiv.org/abs/2506.06326"
+        },
+        {
+          "rank_group": 13,
+          "rank_absolute": 16,
+          "url": "https://www.deeplearning.ai/courses/agent-memory-building-memory-aware-agents"
+        },
+        {
+          "rank_group": 14,
+          "rank_absolute": 17,
+          "url": "https://www.geeksforgeeks.org/artificial-intelligence/ai-agent-memory/"
+        },
+        {
+          "rank_group": 15,
+          "rank_absolute": 18,
+          "url": "https://mem0.ai/"
+        },
+        {
+          "rank_group": 16,
+          "rank_absolute": 19,
+          "url": "https://www.youtube.com/watch?v=aYfZN8t6AQs"
+        },
+        {
+          "rank_group": 17,
+          "rank_absolute": 20,
+          "url": "https://www.mongodb.com/resources/basics/artificial-intelligence/agent-memory"
+        },
+        {
+          "rank_group": 18,
+          "rank_absolute": 21,
+          "url": "https://bhavishyapandit9.substack.com/p/how-memory-works-in-agentic-ai-a"
+        },
+        {
+          "rank_group": 19,
+          "rank_absolute": 22,
+          "url": "https://dev.to/sreeni5018/the-5-types-of-ai-agent-memory-every-developer-needs-to-know-part-1-52fn"
+        },
+        {
+          "rank_group": 20,
+          "rank_absolute": 24,
+          "url": "https://www.mindstudio.ai/blog/what-is-structured-memory-ai-agents"
+        },
+        {
+          "rank_group": 21,
+          "rank_absolute": 25,
+          "url": "https://www.oracle.com/database/ai-agent-memory/"
+        },
+        {
+          "rank_group": 22,
+          "rank_absolute": 26,
+          "url": "https://microsoft.github.io/ai-agents-for-beginners/13-agent-memory/"
+        },
+        {
+          "rank_group": 23,
+          "rank_absolute": 27,
+          "url": "https://towardsdatascience.com/a-practical-guide-to-memory-for-autonomous-llm-agents/"
+        },
+        {
+          "rank_group": 24,
+          "rank_absolute": 28,
+          "url": "https://www.youtube.com/watch?v=vfVcDUCucSs&vl=en-US"
+        },
+        {
+          "rank_group": 25,
+          "rank_absolute": 29,
+          "url": "https://aws.amazon.com/blogs/machine-learning/amazon-bedrock-agentcore-memory-building-context-aware-agents/"
+        },
+        {
+          "rank_group": 26,
+          "rank_absolute": 30,
+          "url": "https://machinelearningmastery.com/ai-agent-memory-explained-in-3-levels-of-difficulty/"
+        },
+        {
+          "rank_group": 27,
+          "rank_absolute": 31,
+          "url": "https://medium.com/@gokcerbelgusen/memory-types-in-agentic-ai-a-breakdown-523c980921ec"
+        },
+        {
+          "rank_group": 28,
+          "rank_absolute": 32,
+          "url": "https://www.jetadmin.io/blog/ai-agent-memory/"
+        },
+        {
+          "rank_group": 29,
+          "rank_absolute": 33,
+          "url": "https://learn.microsoft.com/en-us/azure/foundry/agents/concepts/what-is-memory"
+        }
+      ],
+      "related_questions": [
+        "How much RAM does an AI agent use?",
+        "What is the best memory for AI agent?",
+        "What are the common problems with AI agent memory?",
+        "How to give memory to AI agents?"
+      ]
+    },
+    {
+      "request": "rank-persistent",
+      "query": "persistent memory for ai agents",
+      "retrieved_at_utc": "2026-10-04 12:25:00 +00:00",
+      "spelling": null,
+      "organic_result_count": 29,
+      "project_matches": [],
+      "organic_results": [
+        {
+          "rank_group": 1,
+          "rank_absolute": 2,
+          "url": "https://github.com/rohitg00/agentmemory"
+        },
+        {
+          "rank_group": 2,
+          "rank_absolute": 3,
+          "url": "https://www.reddit.com/r/AI_Agents/comments/1quz5ra/how_are_you_handling_persistent_memory_across/"
+        },
+        {
+          "rank_group": 3,
+          "rank_absolute": 4,
+          "url": "https://www.tigerdata.com/learn/building-ai-agents-with-persistent-memory-a-unified-database-approach"
+        },
+        {
+          "rank_group": 4,
+          "rank_absolute": 5,
+          "url": "https://www.dataiku.com/blog/ai-agent-memory"
+        },
+        {
+          "rank_group": 5,
+          "rank_absolute": 6,
+          "url": "https://aws.amazon.com/blogs/storage/building-persistent-memory-for-multi-agent-ai-systems-with-amazon-s3-vectors/"
+        },
+        {
+          "rank_group": 6,
+          "rank_absolute": 7,
+          "url": "https://www.cognee.ai/building-an-ai-agent-best-persistent-memory-layer"
+        },
+        {
+          "rank_group": 7,
+          "rank_absolute": 8,
+          "url": "https://blog.cloudflare.com/introducing-agent-memory/"
+        },
+        {
+          "rank_group": 8,
+          "rank_absolute": 9,
+          "url": "https://arxiv.org/html/2603.19935v1"
+        },
+        {
+          "rank_group": 9,
+          "rank_absolute": 10,
+          "url": "https://mem0.ai/library/agent-memory/long-term-memory"
+        },
+        {
+          "rank_group": 10,
+          "rank_absolute": 13,
+          "url": "https://www.youtube.com/watch?v=HDqzJJhZsxw"
+        },
+        {
+          "rank_group": 11,
+          "rank_absolute": 14,
+          "url": "https://dev.to/memorylake_ai/what-is-persistent-memory-in-ai-how-it-works-why-it-matters-393g"
+        },
+        {
+          "rank_group": 12,
+          "rank_absolute": 15,
+          "url": "https://hindsight.vectorize.io/guides/2026/04/23/guide-beginners-guide-to-persistent-memory-for-ai-agents"
+        },
+        {
+          "rank_group": 13,
+          "rank_absolute": 16,
+          "url": "https://redis.io/blog/build-smarter-ai-agents-manage-short-term-and-long-term-memory-with-redis/"
+        },
+        {
+          "rank_group": 14,
+          "rank_absolute": 17,
+          "url": "https://machinelearningmastery.com/5-architectural-patterns-for-persistent-memory-and-state-in-ai-agents/"
+        },
+        {
+          "rank_group": 15,
+          "rank_absolute": 18,
+          "url": "https://www.ibm.com/think/topics/ai-agent-memory"
+        },
+        {
+          "rank_group": 16,
+          "rank_absolute": 19,
+          "url": "https://www.langchain.com/blog/how-to-give-your-agent-memory"
+        },
+        {
+          "rank_group": 17,
+          "rank_absolute": 20,
+          "url": "https://agent-memory.dev/"
+        },
+        {
+          "rank_group": 18,
+          "rank_absolute": 21,
+          "url": "https://medium.com/@iniyarajan/building-persistent-ai-agent-memory-systems-that-actually-work-fa37508080fa"
+        },
+        {
+          "rank_group": 19,
+          "rank_absolute": 22,
+          "url": "https://www.youtube.com/watch?v=aYfZN8t6AQs"
+        },
+        {
+          "rank_group": 20,
+          "rank_absolute": 24,
+          "url": "https://www.getzep.com/ai-agents/persistent-memory-for-ai-agents/"
+        },
+        {
+          "rank_group": 21,
+          "rank_absolute": 25,
+          "url": "https://aws.amazon.com/blogs/database/build-persistent-memory-for-agentic-ai-applications-with-mem0-open-source-amazon-elasticache-for-valkey-and-amazon-neptune-analytics/"
+        },
+        {
+          "rank_group": 22,
+          "rank_absolute": 26,
+          "url": "https://www.mindstudio.ai/blog/ai-memory-system-persistent-context-agents"
+        },
+        {
+          "rank_group": 23,
+          "rank_absolute": 27,
+          "url": "https://mem0.ai/blog/the-easiest-way-to-add-persistent-memory-to-any-ai-agent"
+        },
+        {
+          "rank_group": 24,
+          "rank_absolute": 28,
+          "url": "https://www.memorylake.ai/en/blogs/what-is-persistent-memory"
+        },
+        {
+          "rank_group": 25,
+          "rank_absolute": 29,
+          "url": "https://www.mintmcp.com/blog/long-term-memory-ai-agents"
+        },
+        {
+          "rank_group": 26,
+          "rank_absolute": 30,
+          "url": "https://redis.io/blog/ai-agent-memory-stateful-systems/"
+        },
+        {
+          "rank_group": 27,
+          "rank_absolute": 31,
+          "url": "https://www.youtube.com/watch?v=BacJ6sEhqMo"
+        },
+        {
+          "rank_group": 28,
+          "rank_absolute": 32,
+          "url": "https://www.jenova.ai/en/resources/ai-with-persistent-memory"
+        },
+        {
+          "rank_group": 29,
+          "rank_absolute": 33,
+          "url": "https://omidsaffari.com/blog/best-persistent-memory-systems-for-ai-agents-2026"
+        }
+      ],
+      "related_questions": []
+    },
+    {
+      "request": "rank-mcp",
+      "query": "mcp memory server",
+      "retrieved_at_utc": "2026-10-04 12:25:04 +00:00",
+      "spelling": null,
+      "organic_result_count": 29,
+      "project_matches": [],
+      "organic_results": [
+        {
+          "rank_group": 1,
+          "rank_absolute": 1,
+          "url": "https://www.reddit.com/r/ClaudeAI/comments/1sikohc/i_built_an_mcp_memory_server_that_gives_claude/"
+        },
+        {
+          "rank_group": 2,
+          "rank_absolute": 3,
+          "url": "https://lobehub.com/zh-TW/mcp/pigrieco-mcp-memory-server"
+        },
+        {
+          "rank_group": 3,
+          "rank_absolute": 4,
+          "url": "https://forum.cursor.com/t/mcp-add-persistent-memory-in-cursor/57497"
+        },
+        {
+          "rank_group": 4,
+          "rank_absolute": 5,
+          "url": "https://www.memoryplugin.com/platforms/mcp"
+        },
+        {
+          "rank_group": 5,
+          "rank_absolute": 6,
+          "url": "https://github.com/MemoriLabs/memori-mcp"
+        },
+        {
+          "rank_group": 6,
+          "rank_absolute": 7,
+          "url": "https://lobehub.com/mcp/danieleugenewilliams-local-memory-mcp"
+        },
+        {
+          "rank_group": 7,
+          "rank_absolute": 8,
+          "url": "https://mcpservers.org/servers/ibproduct/ib-mcp-cache-server"
+        },
+        {
+          "rank_group": 8,
+          "rank_absolute": 9,
+          "url": "https://cobusgreyling.medium.com/super-memory-mcp-universal-memory-across-llms-7dbf2dc0ccd4"
+        },
+        {
+          "rank_group": 9,
+          "rank_absolute": 10,
+          "url": "https://mcpmarket.com/server/c-memory"
+        },
+        {
+          "rank_group": 10,
+          "rank_absolute": 12,
+          "url": "https://mcpservers.org/category/memory?page=9"
+        },
+        {
+          "rank_group": 11,
+          "rank_absolute": 13,
+          "url": "https://lobehub.com/mcp/cbuntingde-memory-server"
+        },
+        {
+          "rank_group": 12,
+          "rank_absolute": 14,
+          "url": "https://github.com/baryhuang/mcp-openmemory"
+        },
+        {
+          "rank_group": 13,
+          "rank_absolute": 15,
+          "url": "https://www.ksred.com/building-memory-for-claude-desktop-a-quick-mcp-server-implementation/"
+        },
+        {
+          "rank_group": 14,
+          "rank_absolute": 16,
+          "url": "https://mcpservers.org/servers/syyunn/mcp-memory-toolkit"
+        },
+        {
+          "rank_group": 15,
+          "rank_absolute": 17,
+          "url": "https://mcpatlas.dev/server/mcp-memory/"
+        },
+        {
+          "rank_group": 16,
+          "rank_absolute": 18,
+          "url": "https://www.memorylake.ai/en/integrations/mcp"
+        },
+        {
+          "rank_group": 17,
+          "rank_absolute": 19,
+          "url": "https://www.skillhub.pm/skills/memory-bank-mcp"
+        },
+        {
+          "rank_group": 18,
+          "rank_absolute": 20,
+          "url": "https://github.com/scanadi/mcp-ai-memory"
+        },
+        {
+          "rank_group": 19,
+          "rank_absolute": 21,
+          "url": "https://www.all-source.xyz/blog/mcp-memory-server-guide"
+        },
+        {
+          "rank_group": 20,
+          "rank_absolute": 23,
+          "url": "https://ubos.tech/mcp/memory-mcp-server/"
+        },
+        {
+          "rank_group": 21,
+          "rank_absolute": 24,
+          "url": "https://www.coderooz.in/content/local-mcp-memory-server-nodejs-mongodb"
+        },
+        {
+          "rank_group": 22,
+          "rank_absolute": 25,
+          "url": "https://medium.com/@homotechnologicus/your-ai-coding-assistant-is-secretly-eating-ram-and-cpu-resources-how-to-fix-mcp-server-memory-762d0bfe4705"
+        },
+        {
+          "rank_group": 23,
+          "rank_absolute": 26,
+          "url": "https://mcpservers.org/servers/gregorydickson/memory-graph"
+        },
+        {
+          "rank_group": 24,
+          "rank_absolute": 27,
+          "url": "https://mcpmarket.com/server/persistent-ai-memory"
+        },
+        {
+          "rank_group": 25,
+          "rank_absolute": 28,
+          "url": "https://hub.docker.com/mcp/server/memory"
+        },
+        {
+          "rank_group": 26,
+          "rank_absolute": 29,
+          "url": "https://lobehub.com/mcp/eragonht1-simple-memory-mcp"
+        },
+        {
+          "rank_group": 27,
+          "rank_absolute": 30,
+          "url": "https://mcpmarket.com/server/memory-3"
+        },
+        {
+          "rank_group": 28,
+          "rank_absolute": 31,
+          "url": "https://www.mcpserverfinder.com/categories/memory-bank"
+        },
+        {
+          "rank_group": 29,
+          "rank_absolute": 32,
+          "url": "https://apitracker.io/mcp-server/memory"
+        }
+      ],
+      "related_questions": []
+    },
+    {
+      "request": "rank-claude",
+      "query": "claude code memory",
+      "retrieved_at_utc": "2026-10-04 12:25:05 +00:00",
+      "spelling": null,
+      "organic_result_count": 29,
+      "project_matches": [],
+      "organic_results": [
+        {
+          "rank_group": 1,
+          "rank_absolute": 2,
+          "url": "https://www.youtube.com/watch?v=Gl00-jFmKCM&vl=en"
+        },
+        {
+          "rank_group": 2,
+          "rank_absolute": 3,
+          "url": "https://medium.com/@joe.njenga/anthropic-just-added-auto-memory-to-claude-code-memory-md-i-tested-it-0ab8422754d2"
+        },
+        {
+          "rank_group": 3,
+          "rank_absolute": 4,
+          "url": "https://www.reddit.com/r/ClaudeCode/comments/1vfcmmw/does_anyone_actually_use_memory_or_think_its_just/"
+        },
+        {
+          "rank_group": 4,
+          "rank_absolute": 5,
+          "url": "https://dev.to/suede/the-architecture-of-persistent-memory-for-claude-code-17d"
+        },
+        {
+          "rank_group": 5,
+          "rank_absolute": 6,
+          "url": "https://medium.com/@luongnv89/claude-code-memory-teaching-claude-your-projects-dna-45c4beca6121"
+        },
+        {
+          "rank_group": 6,
+          "rank_absolute": 7,
+          "url": "https://github.com/LuciferForge/claude-code-memory"
+        },
+        {
+          "rank_group": 7,
+          "rank_absolute": 8,
+          "url": "https://claudefa.st/blog/guide/mechanics/auto-memory"
+        },
+        {
+          "rank_group": 8,
+          "rank_absolute": 9,
+          "url": "https://medium.com/@codecentrevibe/claude-code-best-practices-memory-management-7bc291a87215"
+        },
+        {
+          "rank_group": 9,
+          "rank_absolute": 10,
+          "url": "https://tonylixu.medium.com/claude-code-two-memory-system-and-claude-md-8dd9f51e4f25"
+        },
+        {
+          "rank_group": 10,
+          "rank_absolute": 12,
+          "url": "https://github.com/topics/claude-memory"
+        },
+        {
+          "rank_group": 11,
+          "rank_absolute": 13,
+          "url": "https://limitededitionjonathan.substack.com/p/stop-re-introducing-yourself-to-claude"
+        },
+        {
+          "rank_group": 12,
+          "rank_absolute": 14,
+          "url": "https://supermemory.ai/blog/claude-code-memory-rehab"
+        },
+        {
+          "rank_group": 13,
+          "rank_absolute": 15,
+          "url": "https://medium.com/@kanavanand8/how-memory-works-in-claude-code-harness-d8b242c114c2"
+        },
+        {
+          "rank_group": 14,
+          "rank_absolute": 16,
+          "url": "https://github.com/anthropics/claude-code/issues/14228"
+        },
+        {
+          "rank_group": 15,
+          "rank_absolute": 17,
+          "url": "https://medium.com/design-bootcamp/how-i-built-a-memory-layer-for-claude-so-it-remembers-me-across-every-chat-f6aad7f9613a"
+        },
+        {
+          "rank_group": 16,
+          "rank_absolute": 18,
+          "url": "https://www.youtube.com/watch?v=9kVVyLVmET4"
+        },
+        {
+          "rank_group": 17,
+          "rank_absolute": 19,
+          "url": "https://dev.to/shimo4228/embedding-memory-into-claude-code-from-session-loss-to-persistent-context-54d8"
+        },
+        {
+          "rank_group": 18,
+          "rank_absolute": 20,
+          "url": "https://www.facebook.com/groups/claudeaicommunity/posts/1232288225605009/"
+        },
+        {
+          "rank_group": 19,
+          "rank_absolute": 21,
+          "url": "https://blog.mikecodeur.com/post/claude-code-memory-guide-en"
+        },
+        {
+          "rank_group": 20,
+          "rank_absolute": 23,
+          "url": "https://its.syr.edu/claude-has-a-memory-heres-how-to-use-it/"
+        },
+        {
+          "rank_group": 21,
+          "rank_absolute": 24,
+          "url": "https://ursb.me/en/notes/claude-code-memory-system/"
+        },
+        {
+          "rank_group": 22,
+          "rank_absolute": 25,
+          "url": "https://alirezarezvani.medium.com/master-claude-memory-in-7-steps-cut-context-loss-by-80-with-project-scoped-recall-b1ff67f0bc2e"
+        },
+        {
+          "rank_group": 23,
+          "rank_absolute": 26,
+          "url": "https://cloudartisan.com/posts/2025-04-16-claude-code-tips-memory/"
+        },
+        {
+          "rank_group": 24,
+          "rank_absolute": 27,
+          "url": "https://www.augmentcode.com/learn/claude-mem-persistent-memory-claude-code"
+        },
+        {
+          "rank_group": 25,
+          "rank_absolute": 28,
+          "url": "https://corti.com/claude-mem-persistent-memory-for-ai-coding-assistants/"
+        },
+        {
+          "rank_group": 26,
+          "rank_absolute": 29,
+          "url": "https://www.linkedin.com/pulse/how-claude-codes-memory-actually-works-lessons-from-leak-makarevych-ntcqf"
+        },
+        {
+          "rank_group": 27,
+          "rank_absolute": 30,
+          "url": "https://ianlpaterson.com/blog/claude-code-memory-architecture/"
+        },
+        {
+          "rank_group": 28,
+          "rank_absolute": 31,
+          "url": "https://mcpmarket.com/tools/skills/claude-code-memory"
+        },
+        {
+          "rank_group": 29,
+          "rank_absolute": 32,
+          "url": "https://news.ycombinator.com/item?id=46126066"
+        }
+      ],
+      "related_questions": []
+    },
+    {
+      "request": "rank-cursor",
+      "query": "cursor memory mcp",
+      "retrieved_at_utc": "2026-10-04 12:25:08 +00:00",
+      "spelling": null,
+      "organic_result_count": 29,
+      "project_matches": [],
+      "organic_results": [
+        {
+          "rank_group": 1,
+          "rank_absolute": 1,
+          "url": "https://forum.cursor.com/t/mcp-add-persistent-memory-in-cursor/57497"
+        },
+        {
+          "rank_group": 2,
+          "rank_absolute": 2,
+          "url": "https://www.youtube.com/watch?v=iSLIBLb3I4M&vl=en"
+        },
+        {
+          "rank_group": 3,
+          "rank_absolute": 3,
+          "url": "https://www.reddit.com/r/cursor/comments/1kg7de3/give_cursor_a_memory_in_oneshot_with_mcp_and_10x/"
+        },
+        {
+          "rank_group": 4,
+          "rank_absolute": 4,
+          "url": "https://www.getzep.com/blog/cursor-adding-memory-with-graphiti-mcp/"
+        },
+        {
+          "rank_group": 5,
+          "rank_absolute": 5,
+          "url": "https://mcp.so/servers/cursor-memory-mcp"
+        },
+        {
+          "rank_group": 6,
+          "rank_absolute": 6,
+          "url": "https://docs.mem0.ai/integrations/cursor"
+        },
+        {
+          "rank_group": 7,
+          "rank_absolute": 8,
+          "url": "https://forum.cursor.com/t/recall-open-source-mcp-memory-server-for-cursor-and-any-mcp-client/160078"
+        },
+        {
+          "rank_group": 8,
+          "rank_absolute": 9,
+          "url": "https://supermemory.ai/blog/cursor-memory-via-mcp/"
+        },
+        {
+          "rank_group": 9,
+          "rank_absolute": 10,
+          "url": "https://egghead.io/foundation-building-ai-memory-with-mcp-and-cursor~duu9m"
+        },
+        {
+          "rank_group": 10,
+          "rank_absolute": 12,
+          "url": "https://www.memoryplugin.com/platforms/cursor"
+        },
+        {
+          "rank_group": 11,
+          "rank_absolute": 13,
+          "url": "https://docs.basicmemory.com/integrations/cursor"
+        },
+        {
+          "rank_group": 12,
+          "rank_absolute": 14,
+          "url": "https://cursor.directory/plugins/mcp-memory"
+        },
+        {
+          "rank_group": 13,
+          "rank_absolute": 15,
+          "url": "https://www.youtube.com/watch?v=mKXzPVIMFYE&vl=en"
+        },
+        {
+          "rank_group": 14,
+          "rank_absolute": 16,
+          "url": "https://datamcp.app/blog/cursor-memory-mcp"
+        },
+        {
+          "rank_group": 15,
+          "rank_absolute": 17,
+          "url": "https://forum.cursor.com/t/one-shot-memory-bank-for-cursor-that-makes-a-difference/87411"
+        },
+        {
+          "rank_group": 16,
+          "rank_absolute": 18,
+          "url": "https://mcpmarket.com/server/cursor-memory"
+        },
+        {
+          "rank_group": 17,
+          "rank_absolute": 19,
+          "url": "https://github.com/ipenywis/aimemory"
+        },
+        {
+          "rank_group": 18,
+          "rank_absolute": 20,
+          "url": "https://memory.store/guides/memory-store-for-cursor"
+        },
+        {
+          "rank_group": 19,
+          "rank_absolute": 21,
+          "url": "https://www.varunpratap.com/blog/how-to-give-cursor-persistent-memory"
+        },
+        {
+          "rank_group": 20,
+          "rank_absolute": 23,
+          "url": "https://wavect.io/blog/mcp-memory-service-claude-code-cursor/"
+        },
+        {
+          "rank_group": 21,
+          "rank_absolute": 24,
+          "url": "https://mcpservers.com/servers/coleam00-mem0-long-term-memory/cursor"
+        },
+        {
+          "rank_group": 22,
+          "rank_absolute": 25,
+          "url": "https://basicmachines.mintlify.app/integrations/cursor"
+        },
+        {
+          "rank_group": 23,
+          "rank_absolute": 26,
+          "url": "https://memwyre.tech/cursor-memory"
+        },
+        {
+          "rank_group": 24,
+          "rank_absolute": 27,
+          "url": "https://memnexus.ai/blog/2026-02-20-cursor-persistent-memory"
+        },
+        {
+          "rank_group": 25,
+          "rank_absolute": 28,
+          "url": "https://forum.cursor.com/t/lynxmcp-the-privacy-first-long-term-memory-server-for-cursor-ast-aware-graph-ui/162508"
+        },
+        {
+          "rank_group": 26,
+          "rank_absolute": 29,
+          "url": "https://medium.com/@lovelyndavid/mcp-in-cursor-ai-02e3d96eb593"
+        },
+        {
+          "rank_group": 27,
+          "rank_absolute": 30,
+          "url": "https://www.youtube.com/watch?v=jPBCHO-4uAE"
+        },
+        {
+          "rank_group": 28,
+          "rank_absolute": 31,
+          "url": "https://github.com/Puliczek/mcp-memory"
+        },
+        {
+          "rank_group": 29,
+          "rank_absolute": 32,
+          "url": "https://mcpcursor.com/server/memory-bank-mcp-server-mcp"
+        }
+      ],
+      "related_questions": []
+    },
+    {
+      "request": "rank-python",
+      "query": "python agent memory",
+      "retrieved_at_utc": "2026-10-04 12:25:12 +00:00",
+      "spelling": null,
+      "organic_result_count": 28,
+      "project_matches": [],
+      "organic_results": [
+        {
+          "rank_group": 1,
+          "rank_absolute": 1,
+          "url": "https://github.com/mem0ai/mem0"
+        },
+        {
+          "rank_group": 2,
+          "rank_absolute": 2,
+          "url": "https://openai.github.io/openai-agents-python/sandbox/memory/"
+        },
+        {
+          "rank_group": 3,
+          "rank_absolute": 4,
+          "url": "https://docs.langchain.com/oss/python/concepts/memory"
+        },
+        {
+          "rank_group": 4,
+          "rank_absolute": 5,
+          "url": "https://blogs.oracle.com/developers/oracle-ai-agent-memory-a-governed-unified-memory-core-for-enterprise-ai-agents"
+        },
+        {
+          "rank_group": 5,
+          "rank_absolute": 6,
+          "url": "https://towardsdatascience.com/ai-agent-with-multi-session-memory/"
+        },
+        {
+          "rank_group": 6,
+          "rank_absolute": 7,
+          "url": "https://mem0.ai/"
+        },
+        {
+          "rank_group": 7,
+          "rank_absolute": 8,
+          "url": "https://medium.com/h7w/building-semantic-memory-for-ai-agents-using-python-d38eed61d68c"
+        },
+        {
+          "rank_group": 8,
+          "rank_absolute": 9,
+          "url": "https://pypi.org/project/memory-agent/"
+        },
+        {
+          "rank_group": 9,
+          "rank_absolute": 13,
+          "url": "https://www.facebook.com/groups/997975157020313/posts/3625868567564279/"
+        },
+        {
+          "rank_group": 10,
+          "rank_absolute": 14,
+          "url": "https://www.reddit.com/r/Python/comments/1lhbsgi/just_opensourced_eion_a_shared_memory_system_for/"
+        },
+        {
+          "rank_group": 11,
+          "rank_absolute": 15,
+          "url": "https://pypi.org/project/memory-agent/"
+        },
+        {
+          "rank_group": 12,
+          "rank_absolute": 16,
+          "url": "https://oneuptime.com/blog/post/2026-01-30-agent-memory/view"
+        },
+        {
+          "rank_group": 13,
+          "rank_absolute": 17,
+          "url": "https://myengineeringpath.dev/genai-engineer/agent-memory/"
+        },
+        {
+          "rank_group": 14,
+          "rank_absolute": 18,
+          "url": "https://www.decodingai.com/p/how-does-memory-for-ai-agents-work"
+        },
+        {
+          "rank_group": 15,
+          "rank_absolute": 19,
+          "url": "https://blog.cloudflare.com/introducing-agent-memory/"
+        },
+        {
+          "rank_group": 16,
+          "rank_absolute": 20,
+          "url": "https://atlan.com/know/how-to-implement-long-term-memory-ai-agents/"
+        },
+        {
+          "rank_group": 17,
+          "rank_absolute": 21,
+          "url": "https://machinelearningmastery.com/the-6-best-ai-agent-memory-frameworks-you-should-try-in-2026/"
+        },
+        {
+          "rank_group": 18,
+          "rank_absolute": 22,
+          "url": "https://www.youtube.com/watch?v=BMzI9cEaGBM"
+        },
+        {
+          "rank_group": 19,
+          "rank_absolute": 24,
+          "url": "https://agent-memory.dev/"
+        },
+        {
+          "rank_group": 20,
+          "rank_absolute": 25,
+          "url": "https://blogs.oracle.com/developers/oracle-ai-agent-memory-a-governed-unified-memory-core-for-enterprise-ai-agents"
+        },
+        {
+          "rank_group": 21,
+          "rank_absolute": 26,
+          "url": "https://ai-sdk.dev/docs/agents/memory"
+        },
+        {
+          "rank_group": 22,
+          "rank_absolute": 27,
+          "url": "https://memorilabs.ai/blog/how-to-build-an-openai-agent-with-persistent-memory"
+        },
+        {
+          "rank_group": 23,
+          "rank_absolute": 28,
+          "url": "https://klymentiev.com/projects/agent-memory"
+        },
+        {
+          "rank_group": 24,
+          "rank_absolute": 29,
+          "url": "https://www.mindstudio.ai/blog/ai-memory-system-persistent-context-agents"
+        },
+        {
+          "rank_group": 25,
+          "rank_absolute": 30,
+          "url": "https://alexostrovskyy.com/ai-agent-with-memory-and-tools/"
+        },
+        {
+          "rank_group": 26,
+          "rank_absolute": 31,
+          "url": "https://docs.agno.com/agents/usage/agent-with-memory"
+        },
+        {
+          "rank_group": 27,
+          "rank_absolute": 32,
+          "url": "https://www.ibm.com/think/topics/ai-agent-memory"
+        },
+        {
+          "rank_group": 28,
+          "rank_absolute": 33,
+          "url": "https://mnemoverse.com/docs/library/python-sdk-agent-memory-compared"
+        }
+      ],
+      "related_questions": [
+        "How to manage agent memory?",
+        "Is Python RAM heavy?",
+        "How does Mem0 work?",
+        "Which agent memory framework is considered the best?"
+      ]
+    },
+    {
+      "request": "rank-selfhost",
+      "query": "self hosted ai memory",
+      "retrieved_at_utc": "2026-10-04 12:25:26 +00:00",
+      "spelling": null,
+      "organic_result_count": 28,
+      "project_matches": [],
+      "organic_results": [
+        {
+          "rank_group": 1,
+          "rank_absolute": 3,
+          "url": "https://github.com/remembra-ai/remembra"
+        },
+        {
+          "rank_group": 2,
+          "rank_absolute": 4,
+          "url": "https://www.reddit.com/r/deeplearning/comments/1sblib3/opensource_memory_system_for_longterm/"
+        },
+        {
+          "rank_group": 3,
+          "rank_absolute": 5,
+          "url": "https://mcpmarket.com/server/dense-mem"
+        },
+        {
+          "rank_group": 4,
+          "rank_absolute": 6,
+          "url": "https://www.edenai.co/post/ai-agent-memory-mempalace-mem0-and-persistent-context"
+        },
+        {
+          "rank_group": 5,
+          "rank_absolute": 7,
+          "url": "https://forum.level1techs.com/t/selfhosted-ai-server/255536"
+        },
+        {
+          "rank_group": 6,
+          "rank_absolute": 8,
+          "url": "https://aws.amazon.com/marketplace/pp/prodview-knqsjjqvag5om"
+        },
+        {
+          "rank_group": 7,
+          "rank_absolute": 9,
+          "url": "https://askubuntu.com/questions/1569419/hardware-requirements-and-feasibility-for-running-a-self-hosted-ai-system-on-ubu"
+        },
+        {
+          "rank_group": 8,
+          "rank_absolute": 10,
+          "url": "https://www.opensourcealternatives.to/item/hindsight"
+        },
+        {
+          "rank_group": 9,
+          "rank_absolute": 12,
+          "url": "https://community.hailo.ai/t/taos-your-ai-your-hardware-your-data-self-hosted-ai-where-your-agents-memory-conversations-and-files-live-on-machines-you-own-fully-offline-when-you-want-cloud-only-when-you-choose/19575"
+        },
+        {
+          "rank_group": 10,
+          "rank_absolute": 13,
+          "url": "https://www.linkedin.com/posts/akshay-pachaar_i-just-created-a-common-memory-layer-for-activity-7337478937200996352-PW1C"
+        },
+        {
+          "rank_group": 11,
+          "rank_absolute": 14,
+          "url": "https://landscape.jimmysong.io/projects/open-memory/"
+        },
+        {
+          "rank_group": 12,
+          "rank_absolute": 15,
+          "url": "https://www.youtube.com/watch?v=vQK0E158f8I"
+        },
+        {
+          "rank_group": 13,
+          "rank_absolute": 16,
+          "url": "https://www.linkedin.com/posts/ai-evermind_github-evermind-aieveros-one-portable-activity-7469737996733513728-Dnkd"
+        },
+        {
+          "rank_group": 14,
+          "rank_absolute": 17,
+          "url": "https://news.ycombinator.com/item?id=47767119"
+        },
+        {
+          "rank_group": 15,
+          "rank_absolute": 18,
+          "url": "https://evermind.ai/blogs"
+        },
+        {
+          "rank_group": 16,
+          "rank_absolute": 19,
+          "url": "https://github.com/n24q02m/better-mem0-mcp"
+        },
+        {
+          "rank_group": 17,
+          "rank_absolute": 20,
+          "url": "https://www.linkedin.com/posts/kriskersey_opensource-ai-voiceassistant-activity-7440110215603277825-8O3r"
+        },
+        {
+          "rank_group": 18,
+          "rank_absolute": 21,
+          "url": "https://community.n8n.io/t/memory-creep-on-n8n-self-hosted-4gb-vps/29095?tl=en"
+        },
+        {
+          "rank_group": 19,
+          "rank_absolute": 22,
+          "url": "https://www.youtube.com/watch?v=3Ak4-sIbDt0"
+        },
+        {
+          "rank_group": 20,
+          "rank_absolute": 23,
+          "url": "https://www.linkedin.com/posts/cmichaelgraham_openmemory-is-an-open-source-self-hosted-activity-7388202013479776256-kFPI"
+        },
+        {
+          "rank_group": 21,
+          "rank_absolute": 24,
+          "url": "https://community.n8n.io/t/rag-ai-agent-with-postgres-as-memory/61136?tl=pt_BR"
+        },
+        {
+          "rank_group": 22,
+          "rank_absolute": 25,
+          "url": "https://powerdrill.ai/fr/blog/best-free-ai-memory-tools"
+        },
+        {
+          "rank_group": 23,
+          "rank_absolute": 26,
+          "url": "https://www.facebook.com/0xSojalSec/videos/cognitive-memory-engine-for-agentslocal-persistent-memory-for-claude-codex-antig/1204092645256437/"
+        },
+        {
+          "rank_group": 24,
+          "rank_absolute": 27,
+          "url": "https://www.linkedin.com/posts/dhravyashah_build-your-own-memory-only-if-you-activity-7414102278510391296-C-Lo"
+        },
+        {
+          "rank_group": 25,
+          "rank_absolute": 28,
+          "url": "https://mcpmarket.com/server/openbrain-1"
+        },
+        {
+          "rank_group": 26,
+          "rank_absolute": 29,
+          "url": "https://github.com/microsoft/AL-Go/discussions/1567"
+        },
+        {
+          "rank_group": 27,
+          "rank_absolute": 30,
+          "url": "https://www.youtube.com/watch?v=7LWTZqksmSg"
+        },
+        {
+          "rank_group": 28,
+          "rank_absolute": 31,
+          "url": "https://community.n8n.io/t/ai-agent-memory-tool-problem-win-buffer-and-postgres/77070?tl=pt_BR"
+        }
+      ],
+      "related_questions": [
+        "Is it possible to self host an AI?",
+        "Is 64 GB of RAM enough for AI?",
+        "How is AI memory stored?",
+        "Is it true that AI is causing a memory shortage?"
+      ]
+    },
+    {
+      "request": "rank-brand",
+      "query": "pensyve github",
+      "retrieved_at_utc": "2026-10-04 12:25:16 +00:00",
+      "spelling": null,
+      "organic_result_count": 29,
+      "project_matches": [],
+      "organic_results": [
+        {
+          "rank_group": 1,
+          "rank_absolute": 2,
+          "url": "https://www.pulsemcp.com/servers?classification%5B%5D=community&classification%5B%5D=official-providers&page=6&q=memory"
+        },
+        {
+          "rank_group": 2,
+          "rank_absolute": 3,
+          "url": "https://lib.rs/crates/langhub"
+        },
+        {
+          "rank_group": 3,
+          "rank_absolute": 4,
+          "url": "https://glama.ai/mcp/servers/SherryLi-vc/strata-memory"
+        },
+        {
+          "rank_group": 4,
+          "rank_absolute": 5,
+          "url": "https://claudedirectory.org/compare/plugins/codebase-documenter-vs-feature-dev/for/codebase-onboarding"
+        },
+        {
+          "rank_group": 5,
+          "rank_absolute": 6,
+          "url": "https://www.linkedin.com/in/davidmmabry"
+        },
+        {
+          "rank_group": 6,
+          "rank_absolute": 7,
+          "url": "https://mcpmarket.com/es/tools/skills/architectural-decision-memory"
+        },
+        {
+          "rank_group": 7,
+          "rank_absolute": 8,
+          "url": "https://www.pulsemcp.com/servers?classification%5B%5D=community&classification%5B%5D=official-providers&page=1&q=memory&sort=popular-desc"
+        },
+        {
+          "rank_group": 8,
+          "rank_absolute": 9,
+          "url": "https://loomal.ai/marketplace/servers/3"
+        },
+        {
+          "rank_group": 9,
+          "rank_absolute": 10,
+          "url": "https://en.softonic.com/mcp/ai/95"
+        },
+        {
+          "rank_group": 10,
+          "rank_absolute": 11,
+          "url": "https://lib.rs/crates/ai-chain-openai"
+        },
+        {
+          "rank_group": 11,
+          "rank_absolute": 12,
+          "url": "https://www.stork.ai/ko/agents"
+        },
+        {
+          "rank_group": 12,
+          "rank_absolute": 13,
+          "url": "https://keyflowhub.com/mcp/pensyve"
+        },
+        {
+          "rank_group": 13,
+          "rank_absolute": 14,
+          "url": "https://etheses.bham.ac.uk/5655/1/Caddick15MRes.pdf"
+        },
+        {
+          "rank_group": 14,
+          "rank_absolute": 15,
+          "url": "https://www.threads.com/@think.5x/post/DdXhlgCHyRI/git-hub/"
+        },
+        {
+          "rank_group": 15,
+          "rank_absolute": 16,
+          "url": "https://www.pulsemcp.com/servers?classification%5B%5D=anthropic-references&classification%5B%5D=community&page=5&q=memory&sort=recommended"
+        },
+        {
+          "rank_group": 16,
+          "rank_absolute": 17,
+          "url": "https://claudedirectory.org/compare/plugins/architecture-patterns-vs-microservices-patterns/for/codebase-onboarding"
+        },
+        {
+          "rank_group": 17,
+          "rank_absolute": 18,
+          "url": "https://www.linkedin.com/posts/gyaansetu-ai_%F0%9D%97%A1%F0%9D%9F%B4%F0%9D%97%BB-%F0%9D%97%A9%F0%9D%97%A6-%F0%9D%97%AD%F0%9D%97%94%F0%9D%97%A3%F0%9D%97%9C%F0%9D%97%98%F0%9D%97%A5-%F0%9D%97%AA%F0%9D%97%9B%F0%9D%97%9C%F0%9D%97%96%F0%9D%97%9B-%F0%9D%97%94%F0%9D%97%A8-activity-7439653152074850305-yJiK"
+        },
+        {
+          "rank_group": 18,
+          "rank_absolute": 19,
+          "url": "https://en.softonic.com/mcp/73"
+        },
+        {
+          "rank_group": 19,
+          "rank_absolute": 20,
+          "url": "https://fr.softonic.com/mcp/132"
+        },
+        {
+          "rank_group": 20,
+          "rank_absolute": 21,
+          "url": "https://glama.ai/mcp/servers/WRG-11/instinct?locale=ru-RU"
+        },
+        {
+          "rank_group": 21,
+          "rank_absolute": 22,
+          "url": "https://mcpmarket.com/ko/server/page/78"
+        },
+        {
+          "rank_group": 22,
+          "rank_absolute": 23,
+          "url": "https://www.worldofbooks.com/products/learning-c-by-programming-games-book-wouter-van-toll-9783662592519"
+        },
+        {
+          "rank_group": 23,
+          "rank_absolute": 24,
+          "url": "https://www.pulsemcp.com/servers?classification%5B%5D=community&classification%5B%5D=official-providers&page=3&q=Memory&sort=last-updated-desc"
+        },
+        {
+          "rank_group": 24,
+          "rank_absolute": 25,
+          "url": "https://www.threads.com/@think.5x/post/DdXhhuQH0d9/3-%EB%B0%B0%ED%8F%AC-%EC%A0%84%EC%97%90-%ED%92%88%EC%A7%88%EB%B6%80%ED%84%B0-%EA%B2%80%EC%A6%9D%ED%95%A9%EB%8B%88%EB%8B%A4-%EC%A0%95%EC%A0%81-%EB%B6%84%EC%84%9D-llm-judge-monte-carlo%EA%B9%8C%EC%A7%80-3%EB%8B%A8%EA%B3%84%EB%A1%9C-%EB%8F%84%EB%8A%94-plugineval%EC%9D%B4-%EB%82%B4%EC%9E%A5%EB%8F%BC-%EC%9E%88%EA%B3%A0-%EB%A9%94%EB%AA%A8%EB%A6%AC%EC%9A%A9/"
+        },
+        {
+          "rank_group": 25,
+          "rank_absolute": 26,
+          "url": "https://agentalog.com/?kind=mcp&topico=ai"
+        },
+        {
+          "rank_group": 26,
+          "rank_absolute": 27,
+          "url": "https://pensyve.softonic-id.com/mcp"
+        },
+        {
+          "rank_group": 27,
+          "rank_absolute": 28,
+          "url": "https://lib.rs/ai"
+        },
+        {
+          "rank_group": 28,
+          "rank_absolute": 29,
+          "url": "https://t.co/7picXX51kc"
+        },
+        {
+          "rank_group": 29,
+          "rank_absolute": 30,
+          "url": "https://trending8.vercel.app/zh/repo/wshobson/agents"
+        }
+      ],
+      "related_questions": []
+    },
+    {
+      "request": "rank-repo-index",
+      "query": "site:github.com/major7apps/pensyve",
+      "retrieved_at_utc": "2026-10-04 12:25:23 +00:00",
+      "spelling": null,
+      "organic_result_count": 1,
+      "project_matches": [
+        {
+          "rank_group": 1,
+          "rank_absolute": 2,
+          "url": "https://github.com/major7apps/pensyve/tree/main/tests/python"
+        }
+      ],
+      "organic_results": [
+        {
+          "rank_group": 1,
+          "rank_absolute": 2,
+          "url": "https://github.com/major7apps/pensyve/tree/main/tests/python"
+        }
+      ],
+      "related_questions": []
+    }
+  ],
+  "public_pages": [
+    {
+      "request": "page-github",
+      "url": "https://github.com/major7apps/pensyve",
+      "http_status": 200,
+      "title": "GitHub - major7apps/pensyve: Universal memory runtime for AI agents · GitHub",
+      "description": "Universal memory runtime for AI agents. Contribute to major7apps/pensyve development by creating an account on GitHub.",
+      "headings": {
+        "h2": [
+          "Navigation Menu",
+          "Latest commit",
+          "History",
+          "Folders and files",
+          "Repository files navigation",
+          "Project status",
+          "Why Pensyve",
+          "Install",
+          "Quick Start",
+          "Interfaces",
+          "Environment Variables",
+          "Architecture",
+          "Project Structure",
+          "Development",
+          "Competitive Landscape",
+          "License",
+          "About",
+          "Releases",
+          "Contributors",
+          "Languages",
+          "Footer"
+        ],
+        "h1": [
+          "Pensyve"
+        ],
+        "h3": [
+          "Without memory",
+          "With Pensyve",
+          "Episode: your agent remembers a conversation",
+          "Recall grouped: feed an LLM reader without rebuilding session blocks",
+          "Remember: store an explicit fact",
+          "Procedural: the agent learns what works",
+          "Consolidate: memories stay clean",
+          "Building from source",
+          "Python SDK",
+          "MCP Server",
+          "Claude Code Plugin",
+          "Codex Plugin",
+          "Antigravity CLI Plugin",
+          "REST API",
+          "TypeScript SDK",
+          "Go SDK",
+          "CLI",
+          "Core",
+          "Gateway / REST API",
+          "Remote / Postgres",
+          "Quotas (self-hosted gateway)",
+          "Optional Features",
+          "Data Model",
+          "Retrieval Pipeline",
+          "First-Time Setup",
+          "Build & Test",
+          "Additional SDKs",
+          "Benchmarks",
+          "Topics",
+          "Resources",
+          "Code of conduct",
+          "Contributing",
+          "Security policy",
+          "Stars",
+          "Watchers",
+          "Forks",
+          "Footer navigation"
+        ]
+      },
+      "canonical": null,
+      "rendered_word_count_including_host_template": 2775,
+      "checks": {
+        "no_content_encoding": false,
+        "high_loading_time": false,
+        "from_sitemap": false,
+        "is_redirect": false,
+        "is_4xx_code": false,
+        "is_5xx_code": false,
+        "is_broken": false,
+        "is_www": false,
+        "is_https": true,
+        "is_http": false,
+        "high_waiting_time": false,
+        "has_micromarkup": false,
+        "has_micromarkup_errors": false,
+        "no_doctype": false,
+        "has_html_doctype": true,
+        "canonical": true,
+        "no_encoding_meta_tag": false,
+        "no_h1_tag": false,
+        "https_to_http_links": false,
+        "size_greater_than_3mb": false,
+        "meta_charset_consistency": false,
+        "has_meta_refresh_redirect": false,
+        "has_render_blocking_resources": true,
+        "low_content_rate": true,
+        "high_content_rate": false,
+        "low_character_count": false,
+        "high_character_count": false,
+        "small_page_size": false,
+        "large_page_size": false,
+        "low_readability_rate": false,
+        "irrelevant_description": false,
+        "irrelevant_title": false,
+        "irrelevant_meta_keywords": false,
+        "title_too_long": true,
+        "has_meta_title": false,
+        "title_too_short": false,
+        "deprecated_html_tags": false,
+        "duplicate_meta_tags": true,
+        "duplicate_title_tag": false,
+        "no_image_alt": false,
+        "no_image_title": true,
+        "no_description": false,
+        "no_title": false,
+        "no_favicon": false,
+        "seo_friendly_url": true,
+        "flash": false,
+        "frame": false,
+        "lorem_ipsum": false,
+        "seo_friendly_url_characters_check": true,
+        "seo_friendly_url_dynamic_check": true,
+        "seo_friendly_url_keywords_check": true,
+        "seo_friendly_url_relative_length_check": true
+      }
+    },
+    {
+      "request": "page-docs",
+      "url": "https://github.com/major7apps/pensyve/tree/main/docs",
+      "http_status": 200,
+      "title": "pensyve/docs at main · major7apps/pensyve · GitHub",
+      "description": "Universal memory runtime for AI agents. Contribute to major7apps/pensyve development by creating an account on GitHub.",
+      "headings": {
+        "h2": [
+          "Navigation Menu",
+          "Files Expand file tree",
+          "Breadcrumbs",
+          "Directory actions",
+          "More options",
+          "Directory actions",
+          "More options",
+          "Latest commit",
+          "History",
+          "Breadcrumbs",
+          "Folders and files",
+          "Footer"
+        ],
+        "h1": [
+          "docs",
+          "docs"
+        ],
+        "h3": [
+          "parent directory",
+          "Footer navigation"
+        ]
+      },
+      "canonical": null,
+      "rendered_word_count_including_host_template": 166,
+      "checks": {
+        "no_content_encoding": false,
+        "high_loading_time": false,
+        "from_sitemap": false,
+        "is_redirect": false,
+        "is_4xx_code": false,
+        "is_5xx_code": false,
+        "is_broken": false,
+        "is_www": false,
+        "is_https": true,
+        "is_http": false,
+        "high_waiting_time": false,
+        "has_micromarkup": false,
+        "has_micromarkup_errors": false,
+        "no_doctype": false,
+        "has_html_doctype": true,
+        "canonical": true,
+        "no_encoding_meta_tag": false,
+        "no_h1_tag": false,
+        "https_to_http_links": false,
+        "size_greater_than_3mb": false,
+        "meta_charset_consistency": false,
+        "has_meta_refresh_redirect": false,
+        "has_render_blocking_resources": true,
+        "low_content_rate": true,
+        "high_content_rate": false,
+        "low_character_count": false,
+        "high_character_count": false,
+        "small_page_size": false,
+        "large_page_size": false,
+        "low_readability_rate": false,
+        "irrelevant_description": false,
+        "irrelevant_title": false,
+        "irrelevant_meta_keywords": false,
+        "title_too_long": false,
+        "has_meta_title": false,
+        "title_too_short": false,
+        "deprecated_html_tags": false,
+        "duplicate_meta_tags": true,
+        "duplicate_title_tag": false,
+        "no_image_alt": false,
+        "no_image_title": false,
+        "no_description": false,
+        "no_title": false,
+        "no_favicon": false,
+        "seo_friendly_url": true,
+        "flash": false,
+        "frame": false,
+        "lorem_ipsum": false,
+        "seo_friendly_url_characters_check": true,
+        "seo_friendly_url_dynamic_check": true,
+        "seo_friendly_url_keywords_check": true,
+        "seo_friendly_url_relative_length_check": true
+      }
+    },
+    {
+      "request": "page-pypi",
+      "url": "https://pypi.org/project/pensyve/",
+      "http_status": 200,
+      "title": "pensyve · PyPI",
+      "description": "Universal memory runtime for AI agents — framework-agnostic, protocol-native, offline-first",
+      "headings": {
+        "h1": [
+          "pensyve 5.0.0",
+          "Pensyve"
+        ],
+        "h2": [
+          "Why Pensyve",
+          "Install",
+          "Quick Start",
+          "Interfaces",
+          "Architecture",
+          "Project Structure",
+          "Development",
+          "Competitive Landscape",
+          "License",
+          "Project links",
+          "Key dates",
+          "1 maintainer",
+          "Credits",
+          "License",
+          "Requires",
+          "Provides Extra",
+          "Tags",
+          "Classifiers",
+          "Metadata",
+          "Project links",
+          "Key dates",
+          "1 maintainer",
+          "Credits",
+          "License",
+          "Requires",
+          "Provides Extra",
+          "Tags",
+          "Classifiers",
+          "Release files for pensyve 5.0.0",
+          "Release files \n    / pensyve-5.0.0.tar.gz",
+          "Release files \n    / pensyve-5.0.0-cp313-cp313-win_amd64.whl",
+          "Release files \n    / pensyve-5.0.0-cp313-cp313-manylinux_2_28_x86_64.whl",
+          "Release files \n    / pensyve-5.0.0-cp313-cp313-manylinux_2_28_aarch64.whl",
+          "Release files \n    / pensyve-5.0.0-cp313-cp313-macosx_11_0_arm64.whl",
+          "Release files \n    / pensyve-5.0.0-cp312-cp312-win_amd64.whl",
+          "Release files \n    / pensyve-5.0.0-cp312-cp312-manylinux_2_28_x86_64.whl",
+          "Release files \n    / pensyve-5.0.0-cp312-cp312-manylinux_2_28_aarch64.whl",
+          "Release files \n    / pensyve-5.0.0-cp312-cp312-macosx_11_0_arm64.whl",
+          "Release files \n    / pensyve-5.0.0-cp311-cp311-win_amd64.whl",
+          "Release files \n    / pensyve-5.0.0-cp311-cp311-manylinux_2_28_x86_64.whl",
+          "Release files \n    / pensyve-5.0.0-cp311-cp311-manylinux_2_28_aarch64.whl",
+          "Release files \n    / pensyve-5.0.0-cp311-cp311-macosx_11_0_arm64.whl",
+          "Release files \n    / pensyve-5.0.0-cp310-cp310-win_amd64.whl",
+          "Release files \n    / pensyve-5.0.0-cp310-cp310-manylinux_2_28_x86_64.whl",
+          "Release files \n    / pensyve-5.0.0-cp310-cp310-manylinux_2_28_aarch64.whl",
+          "Release files \n    / pensyve-5.0.0-cp310-cp310-macosx_11_0_arm64.whl",
+          "Release history \n     \n       Release notifications  |\n       RSS feed",
+          "Help",
+          "About PyPI",
+          "Contributing to PyPI",
+          "Using PyPI"
+        ],
+        "h3": [
+          "Prerequisites (building from source)",
+          "Install",
+          "5-Line Demo",
+          "Python SDK",
+          "MCP Server",
+          "Claude Code Plugin",
+          "REST API",
+          "TypeScript SDK",
+          "Go SDK",
+          "CLI",
+          "Data Model",
+          "Retrieval Pipeline",
+          "First-Time Setup",
+          "Build & Test",
+          "Additional SDKs",
+          "Benchmarks",
+          "Source distribution (sdist)",
+          "Built distributions (wheels)"
+        ],
+        "h4": [
+          "forget  writes a snapshot before it deletes"
+        ]
+      },
+      "canonical": "https://pypi.org/project/pensyve/",
+      "rendered_word_count_including_host_template": 3294,
+      "checks": {
+        "no_content_encoding": false,
+        "high_loading_time": false,
+        "from_sitemap": false,
+        "is_redirect": false,
+        "is_4xx_code": false,
+        "is_5xx_code": false,
+        "is_broken": false,
+        "is_www": false,
+        "is_https": true,
+        "is_http": false,
+        "high_waiting_time": false,
+        "has_micromarkup": false,
+        "has_micromarkup_errors": false,
+        "no_doctype": false,
+        "has_html_doctype": true,
+        "canonical": true,
+        "no_encoding_meta_tag": false,
+        "no_h1_tag": false,
+        "https_to_http_links": false,
+        "size_greater_than_3mb": false,
+        "meta_charset_consistency": false,
+        "has_meta_refresh_redirect": false,
+        "has_render_blocking_resources": true,
+        "low_content_rate": false,
+        "high_content_rate": false,
+        "low_character_count": false,
+        "high_character_count": false,
+        "small_page_size": false,
+        "large_page_size": false,
+        "low_readability_rate": false,
+        "irrelevant_description": false,
+        "irrelevant_title": false,
+        "irrelevant_meta_keywords": false,
+        "title_too_long": false,
+        "has_meta_title": false,
+        "title_too_short": true,
+        "deprecated_html_tags": false,
+        "duplicate_meta_tags": false,
+        "duplicate_title_tag": false,
+        "no_image_alt": true,
+        "no_image_title": true,
+        "no_description": false,
+        "no_title": false,
+        "no_favicon": false,
+        "seo_friendly_url": true,
+        "flash": false,
+        "frame": false,
+        "lorem_ipsum": false,
+        "seo_friendly_url_characters_check": true,
+        "seo_friendly_url_dynamic_check": true,
+        "seo_friendly_url_keywords_check": true,
+        "seo_friendly_url_relative_length_check": true
+      }
+    }
+  ],
+  "github": {
+    "metadata": {
+      "description": "Universal memory runtime for AI agents",
+      "homepageUrl": "",
+      "repositoryTopics": [
+        {
+          "name": "agent-memory"
+        },
+        {
+          "name": "ai-agents"
+        },
+        {
+          "name": "embeddings"
+        },
+        {
+          "name": "knowledge-graph"
+        },
+        {
+          "name": "langchain"
+        },
+        {
+          "name": "llm"
+        },
+        {
+          "name": "mcp"
+        },
+        {
+          "name": "mcp-server"
+        },
+        {
+          "name": "memory"
+        },
+        {
+          "name": "python"
+        },
+        {
+          "name": "rag"
+        },
+        {
+          "name": "rust"
+        },
+        {
+          "name": "spaced-repetition"
+        },
+        {
+          "name": "vector-search"
+        },
+        {
+          "name": "anthropic"
+        },
+        {
+          "name": "ai-memory"
+        },
+        {
+          "name": "state-management"
+        },
+        {
+          "name": "context-engineering"
+        },
+        {
+          "name": "ai"
+        },
+        {
+          "name": "openai"
+        }
+      ]
+    },
+    "views": {
+      "count": 347,
+      "uniques": 101,
+      "views": [
+        {
+          "timestamp": "2026-09-20T00:00:00Z",
+          "count": 50,
+          "uniques": 11
+        },
+        {
+          "timestamp": "2026-09-21T00:00:00Z",
+          "count": 22,
+          "uniques": 8
+        },
+        {
+          "timestamp": "2026-09-22T00:00:00Z",
+          "count": 27,
+          "uniques": 14
+        },
+        {
+          "timestamp": "2026-09-23T00:00:00Z",
+          "count": 31,
+          "uniques": 15
+        },
+        {
+          "timestamp": "2026-09-24T00:00:00Z",
+          "count": 31,
+          "uniques": 11
+        },
+        {
+          "timestamp": "2026-09-25T00:00:00Z",
+          "count": 19,
+          "uniques": 12
+        },
+        {
+          "timestamp": "2026-09-26T00:00:00Z",
+          "count": 20,
+          "uniques": 11
+        },
+        {
+          "timestamp": "2026-09-27T00:00:00Z",
+          "count": 26,
+          "uniques": 16
+        },
+        {
+          "timestamp": "2026-09-28T00:00:00Z",
+          "count": 18,
+          "uniques": 12
+        },
+        {
+          "timestamp": "2026-09-29T00:00:00Z",
+          "count": 38,
+          "uniques": 13
+        },
+        {
+          "timestamp": "2026-09-30T00:00:00Z",
+          "count": 15,
+          "uniques": 5
+        },
+        {
+          "timestamp": "2026-10-01T00:00:00Z",
+          "count": 17,
+          "uniques": 6
+        },
+        {
+          "timestamp": "2026-10-02T00:00:00Z",
+          "count": 23,
+          "uniques": 9
+        },
+        {
+          "timestamp": "2026-10-03T00:00:00Z",
+          "count": 10,
+          "uniques": 5
+        }
+      ]
+    },
+    "referrers": [
+      {
+        "referrer": "github.com",
+        "count": 82,
+        "uniques": 62
+      },
+      {
+        "referrer": "Google",
+        "count": 7,
+        "uniques": 6
+      },
+      {
+        "referrer": "sethhobson.com",
+        "count": 4,
+        "uniques": 4
+      },
+      {
+        "referrer": "geminicli.com",
+        "count": 2,
+        "uniques": 1
+      },
+      {
+        "referrer": "DuckDuckGo",
+        "count": 1,
+        "uniques": 1
+      },
+      {
+        "referrer": "chatgpt.com",
+        "count": 1,
+        "uniques": 1
+      }
+    ],
+    "paths": [
+      {
+        "path": "/major7apps/pensyve",
+        "title": "Overview",
+        "count": 107,
+        "uniques": 52
+      },
+      {
+        "path": "/major7apps/pensyve/tree/main/integrations/codex-plugin",
+        "title": "/tree/main/integrations/codex-plugin",
+        "count": 20,
+        "uniques": 19
+      },
+      {
+        "path": "/major7apps/pensyve/tree/main/integrations/opencode-plugin",
+        "title": "/tree/main/integrations/opencode-plugin",
+        "count": 16,
+        "uniques": 13
+      },
+      {
+        "path": "/major7apps/pensyve/discussions",
+        "title": "/discussions",
+        "count": 11,
+        "uniques": 3
+      },
+      {
+        "path": "/major7apps/pensyve/pull/317",
+        "title": "/pull/317",
+        "count": 10,
+        "uniques": 4
+      },
+      {
+        "path": "/major7apps/pensyve/tree/main/integrations/cursor",
+        "title": "/tree/main/integrations/cursor",
+        "count": 9,
+        "uniques": 9
+      },
+      {
+        "path": "/major7apps/pensyve/pull/316",
+        "title": "/pull/316",
+        "count": 8,
+        "uniques": 3
+      },
+      {
+        "path": "/major7apps/pensyve/pull/318",
+        "title": "/pull/318",
+        "count": 8,
+        "uniques": 3
+      },
+      {
+        "path": "/major7apps/pensyve/pull/323",
+        "title": "/pull/323",
+        "count": 7,
+        "uniques": 5
+      },
+      {
+        "path": "/major7apps/pensyve/pull/319",
+        "title": "/pull/319",
+        "count": 7,
+        "uniques": 4
+      }
+    ],
+    "traffic_note": "A rolling 14-day API window, not search impressions or keyword-attributed visits. Daily unique counts must not be summed into period uniques."
+  },
+  "earlier_exploratory_pass": {
+    "date": "2026-10-04",
+    "location": "United States",
+    "location_code": 2840,
+    "language": "English",
+    "language_code": "en",
+    "serp_device": "desktop",
+    "api_cost_usd": "0.0212",
+    "keyword_metrics": [
+      {
+        "keyword": "agent memory",
+        "estimated_monthly_searches": 1300,
+        "data_updated_utc": "2026-09-16 16:33:37 +00:00",
+        "latest_monthly_record": {
+          "year": 2026,
+          "month": 8,
+          "search_volume": 1900
+        }
+      },
+      {
+        "keyword": "agent memory framework",
+        "estimated_monthly_searches": 30,
+        "data_updated_utc": "2026-09-16 11:10:35 +00:00",
+        "latest_monthly_record": {
+          "year": 2026,
+          "month": 8,
+          "search_volume": 30
+        }
+      },
+      {
+        "keyword": "ai agent memory",
+        "estimated_monthly_searches": 210,
+        "data_updated_utc": "2026-09-15 09:00:48 +00:00",
+        "latest_monthly_record": {
+          "year": 2026,
+          "month": 8,
+          "search_volume": 260
+        }
+      },
+      {
+        "keyword": "ai memory",
+        "estimated_monthly_searches": 2900,
+        "data_updated_utc": "2026-09-12 13:40:56 +00:00",
+        "latest_monthly_record": {
+          "year": 2026,
+          "month": 8,
+          "search_volume": 1900
+        }
+      },
+      {
+        "keyword": "ai memory layer",
+        "estimated_monthly_searches": 30,
+        "data_updated_utc": "2026-09-12 08:15:48 +00:00",
+        "latest_monthly_record": {
+          "year": 2026,
+          "month": 8,
+          "search_volume": 30
+        }
+      },
+      {
+        "keyword": "llm memory",
+        "estimated_monthly_searches": 260,
+        "data_updated_utc": "2026-09-12 17:12:00 +00:00",
+        "latest_monthly_record": {
+          "year": 2026,
+          "month": 8,
+          "search_volume": 260
+        }
+      },
+      {
+        "keyword": "local ai memory",
+        "estimated_monthly_searches": 10,
+        "data_updated_utc": "2026-09-14 19:26:37 +00:00",
+        "latest_monthly_record": {
+          "year": 2026,
+          "month": 8,
+          "search_volume": 10
+        }
+      },
+      {
+        "keyword": "mcp memory server",
+        "estimated_monthly_searches": 70,
+        "data_updated_utc": "2026-09-14 22:17:29 +00:00",
+        "latest_monthly_record": {
+          "year": 2026,
+          "month": 8,
+          "search_volume": 40
+        }
+      },
+      {
+        "keyword": "memory for ai agents",
+        "estimated_monthly_searches": 50,
+        "data_updated_utc": "2026-09-13 03:40:26 +00:00",
+        "latest_monthly_record": {
+          "year": 2026,
+          "month": 8,
+          "search_volume": 30
+        }
+      },
+      {
+        "keyword": "memory mcp server",
+        "estimated_monthly_searches": 140,
+        "data_updated_utc": "2026-09-16 10:25:53 +00:00",
+        "latest_monthly_record": {
+          "year": 2026,
+          "month": 8,
+          "search_volume": 50
+        }
+      }
+    ],
+    "no_returned_record": [
+      "persistent memory for ai agents",
+      "open source ai memory",
+      "self hosted ai memory",
+      "pensyve",
+      "memory runtime"
+    ],
+    "serp_samples": [
+      {
+        "query": "ai agent memory",
+        "retrieved_at_utc": "2026-10-04 12:16:55 +00:00",
+        "spelling": null,
+        "organic_results": [
+          {
+            "rank": 1,
+            "domain": "www.ibm.com",
+            "url": "https://www.ibm.com/think/topics/ai-agent-memory"
+          },
+          {
+            "rank": 2,
+            "domain": "mem0.ai",
+            "url": "https://mem0.ai/library/agent-memory/memory-in-agents-what-why-and-how"
+          },
+          {
+            "rank": 3,
+            "domain": "blog.cloudflare.com",
+            "url": "https://blog.cloudflare.com/introducing-agent-memory/"
+          },
+          {
+            "rank": 4,
+            "domain": "blogs.oracle.com",
+            "url": "https://blogs.oracle.com/developers/what-is-agent-memory-a-beginners-guide-for-ai-developers"
+          },
+          {
+            "rank": 5,
+            "domain": "medium.com",
+            "url": "https://medium.com/@nirdiamant21/building-an-ai-agent-with-memory-and-adaptability-cdbc428bc36c"
+          },
+          {
+            "rank": 6,
+            "domain": "redis.io",
+            "url": "https://redis.io/blog/ai-agent-memory-stateful-systems/"
+          },
+          {
+            "rank": 7,
+            "domain": "agent-memory.dev",
+            "url": "https://agent-memory.dev/"
+          },
+          {
+            "rank": 8,
+            "domain": "ai-sdk.dev",
+            "url": "https://ai-sdk.dev/docs/agents/memory"
+          },
+          {
+            "rank": 9,
+            "domain": "www.reddit.com",
+            "url": "https://www.reddit.com/r/Rag/comments/1l9zudk/agent_memory_how_should_it_work/"
+          }
+        ]
+      },
+      {
+        "query": "mcp memory server",
+        "retrieved_at_utc": "2026-10-04 12:17:04 +00:00",
+        "spelling": null,
+        "organic_results": [
+          {
+            "rank": 1,
+            "domain": "lobehub.com",
+            "url": "https://lobehub.com/zh-TW/mcp/pigrieco-mcp-memory-server"
+          },
+          {
+            "rank": 2,
+            "domain": "www.reddit.com",
+            "url": "https://www.reddit.com/r/mcp/comments/1sfuqhb/i_built_shared_memory_for_mcp_agents/"
+          },
+          {
+            "rank": 3,
+            "domain": "forum.cursor.com",
+            "url": "https://forum.cursor.com/t/mcp-add-persistent-memory-in-cursor/57497"
+          },
+          {
+            "rank": 4,
+            "domain": "www.memoryplugin.com",
+            "url": "https://www.memoryplugin.com/platforms/mcp"
+          },
+          {
+            "rank": 5,
+            "domain": "github.com",
+            "url": "https://github.com/MemoriLabs/memori-mcp"
+          },
+          {
+            "rank": 6,
+            "domain": "lobehub.com",
+            "url": "https://lobehub.com/mcp/danieleugenewilliams-local-memory-mcp"
+          },
+          {
+            "rank": 7,
+            "domain": "mcpservers.org",
+            "url": "https://mcpservers.org/servers/ibproduct/ib-mcp-cache-server"
+          },
+          {
+            "rank": 8,
+            "domain": "cobusgreyling.medium.com",
+            "url": "https://cobusgreyling.medium.com/super-memory-mcp-universal-memory-across-llms-7dbf2dc0ccd4"
+          },
+          {
+            "rank": 9,
+            "domain": "mcpmarket.com",
+            "url": "https://mcpmarket.com/server/c-memory"
+          }
+        ]
+      },
+      {
+        "query": "pensyve",
+        "retrieved_at_utc": "2026-10-04 12:17:01 +00:00",
+        "spelling": {
+          "keyword": "pensive",
+          "type": "did_you_mean"
+        },
+        "organic_results": [
+          {
+            "rank": 1,
+            "domain": "github.com",
+            "url": "https://github.com/regenrek/peky"
+          },
+          {
+            "rank": 2,
+            "domain": "www.producthunt.com",
+            "url": "https://www.producthunt.com/products/pensieve-5/built-with"
+          },
+          {
+            "rank": 3,
+            "domain": "www.facebook.com",
+            "url": "https://www.facebook.com/fb-answers/what-does-pens-mean-in-pensive/?locale=ja_JP"
+          },
+          {
+            "rank": 4,
+            "domain": "x.com",
+            "url": "https://x.com/kamakauzy?lang=en"
+          },
+          {
+            "rank": 5,
+            "domain": "medium.com",
+            "url": "https://medium.com/restpen"
+          },
+          {
+            "rank": 6,
+            "domain": "docs.pensieve.uk",
+            "url": "https://docs.pensieve.uk/overview"
+          },
+          {
+            "rank": 7,
+            "domain": "github.com",
+            "url": "https://github.com/Pen721"
+          },
+          {
+            "rank": 8,
+            "domain": "github.com",
+            "url": "https://github.com/NeumTry/Pensieve"
+          },
+          {
+            "rank": 9,
+            "domain": "dictionary.cambridge.org",
+            "url": "https://dictionary.cambridge.org/dictionary/english-czech/pensive"
+          }
+        ]
+      },
+      {
+        "query": "\"pensyve\" memory",
+        "retrieved_at_utc": "2026-10-04 12:18:02 +00:00",
+        "spelling": {
+          "keyword": "\"pensieve\" memory",
+          "type": "did_you_mean"
+        },
+        "organic_results": [
+          {
+            "rank": 1,
+            "domain": "www.facebook.com",
+            "url": "https://www.facebook.com/fb-answers/pensieve-harry-potter/?locale=da_DK"
+          },
+          {
+            "rank": 2,
+            "domain": "www.reddit.com",
+            "url": "https://www.reddit.com/r/harrypottertheories/comments/9rwy7t/the_pensieve_memories_are_a_scam/"
+          },
+          {
+            "rank": 3,
+            "domain": "www.quora.com",
+            "url": "https://www.quora.com/Why-do-people-misunderstand-the-accuracy-of-Pensieve-memories-in-Harry-Potter-especially-regarding-Snape-s-recollections"
+          },
+          {
+            "rank": 4,
+            "domain": "www.abebooks.com",
+            "url": "https://www.abebooks.com/9780762462315/Harry-Potter-Pensieve-Memory-Set-0762462310/plp"
+          },
+          {
+            "rank": 5,
+            "domain": "www.youtube.com",
+            "url": "https://www.youtube.com/watch?v=1lPbbK7-2FQ"
+          },
+          {
+            "rank": 6,
+            "domain": "www.bkstr.com",
+            "url": "https://www.bkstr.com/rmustore/product/harry-potter-pensieve-memory-s-154311-1"
+          },
+          {
+            "rank": 7,
+            "domain": "scifi.stackexchange.com",
+            "url": "https://scifi.stackexchange.com/questions/132561/pensieve-physics"
+          }
+        ]
+      }
+    ]
+  },
+  "summary": {
+    "expanded_keyword_overview_requested": 30,
+    "expanded_keyword_overview_returned": 22,
+    "expanded_keyword_overview_with_volume": 21,
+    "suggestion_records": 120,
+    "unique_suggested_phrases": 118,
+    "unique_phrases_with_returned_record_in_expanded_pass": 133,
+    "expanded_search_queries": 9,
+    "expanded_organic_results": 231,
+    "public_pages": 3,
+    "expanded_api_cost_usd": "0.11549",
+    "earlier_api_cost_usd": "0.0212",
+    "total_api_cost_usd": "0.13669"
+  },
+  "local_documentation_review": {
+    "method": "Targeted review of known stale statements against source and HEAD. This checklist is not exhaustive and is not an SEO score.",
+    "documents": [
+      "docs/ARCHITECTURE.md",
+      "docs/RECIPES.md",
+      "pensyve-mcp/README.md"
+    ],
+    "assertions": [
+      {
+        "name": "architecture integration paths",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "architecture module paths",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "architecture weighted sum",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "architecture unconditional extraction",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "architecture always-background consolidation",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "architecture universal reinforcement",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "architecture automatic procedural pruning",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "architecture distinct episode promotion",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "architecture archive description",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "MCP tool count",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "MCP mock warning setting",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "MCP default fallback description",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "MCP entity-forget irreversibility",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "MCP episode new-memory count",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "MCP resident startup index",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "MCP semantic response timestamp",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "MCP unbounded inspect description",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "recipe automatic procedural memory",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "recipe generated conversation summary",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "recipe promotion threshold/permanence",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "recipe storage growth guarantee",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "recipe universal reinforcement",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "recipe automatic cleanup",
+        "failed_before": true,
+        "failed_after": false
+      },
+      {
+        "name": "recipe installation duration",
+        "failed_before": true,
+        "failed_after": false
+      }
+    ],
+    "tool_sections": {
+      "before": 7,
+      "after": 10,
+      "runtime_tools": 10
+    },
+    "failed_assertions": {
+      "before": 24,
+      "after": 0
+    }
+  }
+}

@@ -1,6 +1,11 @@
 # Integrations
 
-Pensyve integrations connect the memory runtime to AI coding agents, IDEs, and agent frameworks. Each integration connects to Pensyve via MCP (Model Context Protocol), giving your tools persistent, cross-session memory.
+Pensyve integrations connect AI coding agents, IDEs, and agent frameworks to
+the local engine or a gateway you run yourself. Depending on the integration,
+the connection uses MCP (Model Context Protocol), HTTP, or the Python SDK.
+
+Pensyve Cloud closed on October 1, 2026. The open-source integrations follow
+the project's [maintenance policy](../MAINTENANCE.md).
 
 ## AI Coding Agents
 
@@ -42,31 +47,31 @@ Pensyve integrations connect the memory runtime to AI coding agents, IDEs, and a
 
 The [`shared/`](shared/) directory contains the common Pensyve client libraries (Python and TypeScript) used by framework integrations.
 
-## Quick Start
+## Quick start
 
-Every integration connects to Pensyve via MCP. The default is the local stdio
-server, which needs no account or API key:
+For an MCP client, use the local stdio server, which needs no account or API key:
 
 1. Install the binary: `cargo install --path pensyve-mcp` from the repo root
 2. Follow the setup instructions in the integration's own README
 
-To use a remote endpoint instead, run your own `pensyve-mcp-gateway` and follow
-the [self-hosting guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md).
+HTTP clients need your own `pensyve-mcp-gateway`. Follow the
+[self-hosting guide](../docs/self-host.md). Framework adapters that use the
+Python SDK run the engine locally; follow the adapter's README for setup.
 
-For manual MCP setup in any tool that supports it:
+For manual MCP setup, configure your client to run:
 
 ```bash
-# Local (stdio)
 pensyve-mcp --stdio
-
-# Self-hosted gateway
-http://localhost:3000/mcp
-
-# Auth (a key configured on your gateway)
-PENSYVE_API_KEY=psy_your_key
 ```
 
-## Adding a New Integration
+For MCP over HTTP, use your gateway's `/mcp` endpoint and an API key configured
+on that gateway. See the [MCP setup guide](../docs/GETTING_STARTED.md#mcp-server).
+
+## Maintaining integrations
+
+New integrations are new features and may be declined under the maintenance
+policy. When correcting an existing integration, keep its documentation and
+configuration together.
 
 Each integration directory should contain:
 

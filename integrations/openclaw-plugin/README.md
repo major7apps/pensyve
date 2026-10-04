@@ -165,7 +165,7 @@ See [MCP Tools Reference](https://github.com/major7apps/pensyve#mcp-server) for 
 ## Links
 
 - **GitHub:** [github.com/major7apps/pensyve](https://github.com/major7apps/pensyve)
-- **Spec:** [Working-memory substrate design](https://github.com/major7apps/pensyve-docs/blob/main/specs/2026-04-18-pensyve-working-memory-substrate-design.md)
+- **Setup guide:** [OpenClaw integration](https://github.com/major7apps/pensyve/blob/main/docs/guides/openclaw.md)
 
 ## License
 

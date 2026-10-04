@@ -1,21 +1,21 @@
-# Pensyve -- Cross-Session Memory for Claude Code
+# Pensyve for Claude Code
 
-Pensyve gives Claude Code a persistent, cognitive memory layer that spans across sessions. It remembers your decisions, learned patterns, debugging outcomes, and project context -- so you never repeat the same investigation twice.
+Pensyve connects Claude Code to persistent memory through MCP. The plugin supplies instructions for storing decisions, debugging outcomes, and project context, and retrieving them in later sessions.
 
 ## What It Does
 
-Pensyve makes Claude Code feel continuous across sessions — like working with a colleague who actually remembers your last conversation. Memory is not a feature you invoke; it is the substrate the agent operates on.
+The hooks, commands, and skills ask Claude Code to call Pensyve tools at relevant points. Capture and recall depend on the agent following those instructions and the MCP server being available.
 
-- **Proactive memory during work** — lessons are captured the moment they land, not at session end
-- **Thread-aware continuity** — sessions that continue prior work resume with relevant context, no re-briefing
-- **Default-on recall with guardrails** — substantive questions are grounded in prior decisions; simple commands stay fast
-- **Three memory types** — durable facts (semantic), session-specific events (episodic), reusable procedures (procedural)
-- **Lightly visible** — one-line surfaces when memory is used; never interrupts your flow
-- **Opt-out, not opt-in** — users who prefer manual control set `auto_capture: off` and `prompt_enrichment: false`
+- **Capture during work:** Instructions ask the agent to store confirmed lessons as they arise.
+- **Session context:** Recall can bring relevant decisions and observations into later sessions.
+- **Recall guidance:** The plugin asks for recall before substantive answers and skips it for simple commands.
+- **Memory content:** Store durable facts and session observations, including notes about reusable procedures.
+- **Brief notices:** The instructions ask for one-line notices when memory is used.
+- **Manual control:** Set `auto_capture: off` and `prompt_enrichment: false` to opt out of automatic capture guidance.
 
 ## How It Works
 
-Pensyve runs a local memory engine (Rust-based, SQLite-backed) that stores memories as embeddings with multi-signal retrieval. It connects to Claude Code via MCP, giving the AI access to 6 memory tools. The plugin adds slash commands, workflow skills, background agents, and lifecycle hooks on top.
+Pensyve can run locally with SQLite or through a gateway you host. The MCP server exposes 10 memory tools. The plugin adds slash commands, workflow skills, agents, and hooks that provide instructions to Claude Code.
 
 ```
 Your coding session
@@ -29,13 +29,13 @@ SQLite + ONNX embeddings + vector index
 
 ## Memory Behavior Model
 
-Pensyve behaves as working memory for the agent — always-on, ambient, continuous.
+The plugin instructions describe when the agent should read and write memories.
 
-**Writes happen in-flight.** When a root cause is confirmed, a decision is made, or a reusable procedure emerges, it's captured the moment it lands via memory-woven skills (memory-informed-debug, memory-informed-design, memory-informed-longitudinal-work). The Stop hook catches residuals.
+**Capture guidance.** Debugging, design, and research skills ask the agent to store confirmed findings during work. The Stop hook asks it to review any remaining candidates.
 
-**Reads happen at decision points.** Before substantive answers, the model consults memory scoped to the detected entities. Simple commands (run tests, format file) skip recall to stay fast.
+**Recall guidance.** Before substantive answers, the instructions ask the agent to recall memories for relevant entities. Simple commands, such as running tests or formatting a file, do not require recall.
 
-**Sessions continue.** At session start, Pensyve checks whether the current work continues a prior episode (shared entities + temporal proximity). If yes, you resume with the prior episode's most recent lessons — no re-briefing needed.
+**Session context.** At session start, the hook asks the agent to recall related observations, summarize prior work, and start a new episode. The continuity check does not resume or link an earlier server-side episode.
 
 See `/remember`, `/recall`, `/inspect` for manual control, or `/memory-status` for namespace stats.
 
@@ -47,7 +47,7 @@ Add the Pensyve marketplace and install:
 
 ```
 /plugin marketplace add major7apps/pensyve
-/plugin install pensyve@major7apps-pensyve
+/plugin install pensyve@pensyve
 /reload-plugins
 ```
 
@@ -57,7 +57,7 @@ The plugin ships commands, skills, hooks, and agents — but does **not** bundle
 
 Add an `mcpServers.pensyve` entry to `.mcp.json` at your project root (project scope) or to `~/.claude.json` (user scope, all projects), or register it with `claude mcp add`. Claude Code does not read `mcpServers` from `settings.json`. Pick **one** of these two options:
 
-**Option 1 — Local (offline, recommended)**
+**Option 1: Local stdio server**
 
 Install the MCP binary:
 
@@ -86,7 +86,7 @@ Or register it from the CLI (add `--scope user` to make it available in all proj
 claude mcp add pensyve -- pensyve-mcp --stdio
 ```
 
-No API key needed — all data stays on your machine in SQLite.
+No Pensyve API key is needed. The memory database stays on your machine, and retrieved content is returned to Claude Code. Embedding models may download when first loaded; [prepare the model cache](../../docs/self-host.md#prepare-models-for-local-use) before running without network access.
 
 **Option 2 — Self-hosted gateway (remote)**
 
@@ -116,7 +116,7 @@ Or register it from the CLI:
 claude mcp add --transport http pensyve http://localhost:3000/mcp --header "Authorization: Bearer ${PENSYVE_API_KEY}"
 ```
 
-Put the `export` in `~/.bashrc` or `~/.zshrc` to persist. Works everywhere (local dev, CI, headless boxes, containers).
+Set `PENSYVE_API_KEY` in the environment that launches Claude Code. A shell startup file can provide it for interactive sessions; configure the environment separately for CI or containers.
 
 > **Why `headers` for HTTP and `env` for stdio?** The `headers` block only applies to remote MCP servers (HTTP transport). The `env` block passes environment variables into locally-launched subprocess MCP servers (stdio transport). They don't mix.
 
@@ -125,7 +125,7 @@ Put the `export` in `~/.bashrc` or `~/.zshrc` to persist. Works everywhere (loca
 Copy `pensyve-plugin.local.md` to your project root and edit:
 
 ```yaml
-namespace: "my-project"            # Scope memories to this project
+namespace: "my-project"            # Plugin setting; configure MCP storage separately
 auto_capture: "tiered"             # off | tiered | full | confirm-all
 capture_buffer: true               # Buffer signals from Write/Edit/Bash
 capture_review_point: "stop"       # When to review tier 2 candidates
@@ -136,6 +136,8 @@ prompt_enrichment: true            # Enrich prompts with memory (opt-out via fal
 ```
 
 **Automatic project detection:** The plugin automatically detects the current project for entity-scoped memory. It uses the git repository root directory name (via `git rev-parse --show-toplevel`) as the project identity, falling back to the current working directory name if not in a git repo. Set the `PENSYVE_NAMESPACE` environment variable to override automatic detection. Detected names are normalized to lowercase and hyphenated (e.g., `"pensyve-cloud"`).
+
+The plugin's project label does not select the server's storage namespace. For separate local storage namespaces, set `PENSYVE_NAMESPACE` in the MCP server's `env` configuration before starting it. Gateway namespaces come from authenticated credentials.
 
 ### Try It Out
 
@@ -161,7 +163,7 @@ prompt_enrichment: true            # Enrich prompts with memory (opt-out via fal
 | `/recall <query>`   | Search memories by semantic similarity |
 | `/forget <entity>`  | Delete all memories for an entity      |
 | `/inspect [entity]` | View all memories grouped by type      |
-| `/consolidate`      | Trigger memory consolidation cycle     |
+| `/consolidate`      | Explain consolidation and available API options; no MCP consolidation tool is exposed |
 | `/memory-status`    | Show namespace statistics              |
 
 ## Skills
@@ -187,29 +189,31 @@ prompt_enrichment: true            # Enrich prompts with memory (opt-out via fal
 
 | Hook              | Event              | Behavior                                                                                                    |
 | ----------------- | ------------------ | ----------------------------------------------------------------------------------------------------------- |
-| Session Start     | `SessionStart`     | Loads memories + thread-continuity check — resumes prior episodes when score ≥0.7 on shared entities        |
-| Post-Tool Write   | `PostToolUse`      | Scores file-change signal strength; emits in-flight capture marker when accumulated strength ≥4             |
-| Post-Tool Bash    | `PostToolUse`      | Scores command outcome signal strength; emits in-flight marker on strong signals (confirmed failures, etc.) |
-| Stop              | `Stop`             | Residual flush only — most captures happen in-flight; closes episode via `pensyve_episode_end`              |
-| Pre-Compact       | `PreCompact`       | Flushes residual buffer before context compression; episode stays open (not Stop)                           |
-| Prompt Enrichment | `UserPromptSubmit` | Enriches prompts with memory context (default-on; opt out via `prompt_enrichment: false`)                   |
+| Session Start     | `SessionStart`     | Asks the agent to recall prior context and start a new episode |
+| Post-Tool Write   | `PostToolUse`      | Asks the agent to assess file changes and mark useful findings for capture |
+| Post-Tool Bash    | `PostToolUse`      | Asks the agent to assess command outcomes and mark useful findings for capture |
+| Stop              | `Stop`             | Asks the agent to review remaining candidates and close the episode |
+| Pre-Compact       | `PreCompact`       | Asks the agent to review remaining candidates before context compression, leaving the episode open |
+| Prompt Enrichment | `UserPromptSubmit` | Asks the agent to recall context; opt out via `prompt_enrichment: false` |
 
 ## Configuration Reference
 
-All settings are configured in `pensyve-plugin.local.md` (copy to your project root):
+These settings in `pensyve-plugin.local.md` guide the agent's behavior. They do not enforce server-side limits or schedule server jobs:
 
 | Setting                        | Values                                    | Default          | Description                                                                  |
 | ------------------------------ | ----------------------------------------- | ---------------- | ---------------------------------------------------------------------------- |
-| `namespace`                    | any string                                | directory name   | Memory namespace. Set to your project name for project-scoped memory.        |
+| `namespace`                    | any string                                | `"default"`   | Plugin setting; set the MCP server's `PENSYVE_NAMESPACE` separately for storage isolation. |
 | `auto_capture`                 | `"off"` / `"tiered"` / `"full"` / `"confirm-all"` | `"tiered"` | Memory capture mode. See below.                                              |
 | `capture_buffer`               | `true` / `false`                          | `true`           | Enable PostToolUse signal buffering for richer memory context.               |
 | `capture_review_point`         | `"stop"` / `"pre-compact"` / `"both"`    | `"stop"`         | When to present tier 2 candidates for batch review.                          |
 | `max_auto_memories_per_session`| integer                                   | `10`             | Maximum tier 1 (auto-stored) memories per session.                           |
-| `consolidation_frequency`      | `"manual"` / `"session_end"` / `"daily"` | `"session_end"`  | When to run memory consolidation.                                            |
+| `consolidation_frequency`      | `"manual"` / `"session_end"` / `"daily"` | `"session_end"`  | Agent guidance only; no MCP consolidation tool or plugin scheduler is provided. |
 | `context_loading`              | `"off"` / `"summary"` / `"full"`         | `"summary"`      | How much context to load at session start.                                   |
 | `prompt_enrichment`            | `true` / `false`                          | `true`           | Enable the UserPromptSubmit hook to enrich prompts with memory. Opt-out via `false`. |
 
 ### Capture Modes
+
+The prompt asks the agent to follow these modes:
 
 | Mode          | Tier 1 (high confidence)       | Tier 2 (medium confidence)                 | User Interruption |
 | ------------- | ------------------------------ | ------------------------------------------ | ----------------- |
@@ -225,32 +229,35 @@ All settings are configured in `pensyve-plugin.local.md` (copy to your project r
 | Variable            | Default              | Description                                      |
 | ------------------- | -------------------- | ------------------------------------------------ |
 | `PENSYVE_API_KEY`   | —                    | API key for a self-hosted gateway (not needed for local) |
-| `PENSYVE_NAMESPACE` | auto-detected        | Memory namespace. Overrides automatic git/CWD-based project detection. |
+| `PENSYVE_NAMESPACE` | `default` on the server | Selects the local MCP server's namespace and overrides plugin project detection. |
 | `PENSYVE_PATH`      | `~/.pensyve/default` | Storage directory path (local only)              |
 
 ## MCP Tools
 
-The plugin wraps 7 MCP tools exposed by the `pensyve-mcp` binary:
+The `pensyve-mcp` binary exposes these 10 tools:
 
 | Tool                    | Parameters                             | Returns                              |
 | ----------------------- | -------------------------------------- | ------------------------------------ |
 | `pensyve_recall`        | `query`, `entity?`, `types?`, `limit?`, `min_confidence?` | Ranked array of memories with scores. When `entity` is provided, results are scoped to prefer memories linked to that entity. Hooks auto-detect the project name and pass it as `entity`. |
 | `pensyve_remember`      | `entity`, `fact`, `confidence?`        | Stored memory object                 |
-| `pensyve_observe`       | `episode_id`, `content`, `source_entity`, `about_entity`, `content_type?` | Stored observation object. Primary episodic-capture path used by in-flight memory-woven skills. `source_entity` and `about_entity` are required. |
+| `pensyve_observe`       | `episode_id`, `content`, `source_entity`, `about_entity`, `content_type?` | Stored episodic memory reference. A `[procedural]` content prefix is a text convention and does not change the stored memory type. |
 | `pensyve_episode_start` | `participants`                         | `episode_id`, `started_at`           |
 | `pensyve_episode_end`   | `episode_id`, `outcome?`               | `memories_created` count             |
-| `pensyve_forget`        | `entity`                               | `forgotten_count`. Entity-wide, irreversible hard delete; use `pensyve_forget_memory` to delete a single memory by id. |
-| `pensyve_inspect`       | `entity`, `memory_type?`, `limit?`     | Array of memories with stats         |
+| `pensyve_forget`        | `entity`                               | `forgotten_count` and a recovery `snapshot` reference when memories were deleted. Deletion aborts if the snapshot cannot be written. |
+| `pensyve_forget_memory` | `memory_id`                            | Whether one memory was deleted |
+| `pensyve_inspect`       | `entity`, `memory_type?`, `limit?`     | Entity details, count, and a flat list of typed memories |
+| `pensyve_status`        | `entity?`                              | Namespace, memory counts, and health |
+| `pensyve_account`       | none                                   | Local or remote mode information |
 
-All tools communicate over MCP. A self-hosted gateway serves MCP at `/mcp` (for example `http://localhost:3000/mcp`). The plugin never bypasses MCP to access storage directly.
+See the [MCP tool reference](../../pensyve-mcp/README.md#tool-reference) for request and response details. A self-hosted gateway serves MCP at `/mcp` (for example `http://localhost:3000/mcp`).
 
 ## Design Philosophy
 
 - **CLAUDE.md owns static conventions** -- project setup, commands, architecture
 - **Pensyve owns dynamic memory** -- decisions, outcomes, patterns, context
-- **Never duplicates** -- Pensyve will not store what belongs in CLAUDE.md
-- **Tiered capture** -- high-confidence memories stored silently, medium-confidence batched for review
-- **Local-first** -- all data stays on your machine in SQLite
+- **Avoid duplication:** Instructions ask the agent to leave static project conventions in CLAUDE.md.
+- **Tiered capture:** Instructions ask the agent to store high-confidence findings and batch other candidates for review.
+- **Storage choice:** Memories stay in the local SQLite store or on your own gateway; recalled content is returned to Claude Code.
 
 ## Links
 

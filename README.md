@@ -1,4 +1,4 @@
-![Pensyve Banner Logo](https://raw.githubusercontent.com/major7apps/pensyve/main/docs/images/logo.png)
+![Pensyve logo](docs/images/logo.png)
 
 # Pensyve
 
@@ -7,576 +7,244 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Rust 1.94+](https://img.shields.io/badge/rust-1.94+-orange.svg)](https://www.rust-lang.org/)
 
-Universal memory runtime for AI agents. Framework-agnostic, protocol-native, offline-first.
+Pensyve is an open-source runtime for persistent AI agent memory. It stores facts,
+conversations, observations, and action outcomes so an agent can retrieve them
+in later sessions. You can use it through Python, a Model Context Protocol
+(MCP) server, a command-line tool, or a REST API.
+
+The Rust engine uses SQLite for local storage and runs embedding models
+locally to search by meaning. TypeScript and Go clients connect to a gateway
+you run yourself. Local use does not require a Pensyve account or API key.
+Your application or client integration calls Pensyve to save and retrieve
+memories.
+
+## Choose a setup
+
+| Use case | Start here |
+| --- | --- |
+| Add persistent memory to a Python agent | [Python quick start](#python-quick-start) |
+| Give Claude Code, Cursor, or Codex access to memory tools | [MCP server](#mcp-server) and [client setup guides](#sdks-and-integrations) |
+| Share a memory store through TypeScript, Go, or REST | [HTTP gateway](#http-gateway) |
+| Use a LangChain or LangGraph adapter | [Python integration](integrations/langchain/README.md) or [TypeScript integration](integrations/langchain-ts/README.md) |
 
 ## Project status
 
-Pensyve Cloud, the hosted service, closed on 2026-10-01. Pensyve is now a self-hosted, Apache-2.0 project in maintenance mode: it gets security fixes and dependency updates, and no new features. See [`MAINTENANCE.md`](MAINTENANCE.md) for details and [`docs/self-host.md`](docs/self-host.md) to run it yourself.
+Pensyve Cloud closed on October 1, 2026. The open-source project continues in
+this repository under the Apache 2.0 license, with the engine, SDKs,
+integrations, and documentation available here.
 
-### Without memory
+Pensyve is in maintenance mode. Releases cover security fixes and dependency
+updates, with no new features planned. See the [maintenance policy](MAINTENANCE.md)
+for contribution and support expectations. If you have a saved Cloud export,
+the [self-hosting guide](docs/self-host.md#dropping-in-an-exported-store)
+explains how to use it with your own gateway.
 
-```
-User: "I prefer dark mode and use vim keybindings"
-Agent: "Got it!"
+## What you can do
 
-[next session]
+- Store facts about users, projects, or other named entities, and record conversations as episodes.
+- Search memories using text matching, embeddings, and relationships between entities.
+- Record observations and action outcomes, and use consolidation to promote repeated facts and update memory retention.
+- Keep data in local SQLite storage, or run the HTTP gateway with SQLite or PostgreSQL.
 
-User: "Update my editor settings"
-Agent: "What settings would you like to change?"
-User: "I ALREADY TOLD YOU"
-```
+Embedding models may download when first loaded unless they are already
+cached. Running without network access requires preparing the model files
+first. See the [model setup and deployment guide](docs/self-host.md).
 
-### With Pensyve
+## How agent memory works
 
-```python
-# Session 1 — agent stores the preference
-p.remember(entity=user, fact="Prefers dark mode and vim keybindings", confidence=0.95)
+Pensyve stores memory outside the language model. Your application saves
+facts or conversations, searches for relevant records, and adds the results
+to a later prompt. Reusing the same storage path and namespace lets the
+agent retrieve information across processes and sessions. Saving a memory
+does not train the language model or change its weights.
 
-# Session 2 — agent recalls it automatically
-memories = p.recall("editor settings", entity=user)
-# → [Memory: "Prefers dark mode and vim keybindings" (score: 0.94)]
-```
+The store holds four kinds of records: facts (semantic memory), conversations
+(episodic memory), action outcomes (procedural memory), and observations.
+Your integration decides what to record and when to retrieve it. Recording
+a conversation does not automatically turn it into a successful procedure.
+See [how storage and retrieval work](docs/ARCHITECTURE.md#data-model) and
+the [usage recipes](docs/RECIPES.md) for the APIs and their limits.
 
-Your agent stops being amnesiac. Decisions, patterns, and outcomes persist across sessions — and the right context surfaces when it's needed.
+## Python quick start
 
-## Why Pensyve
-
-| What you need                             | How Pensyve solves it                                                                                                         |
-| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| Agent forgets everything between sessions | **Three memory types** — episodic (what happened), semantic (what is known), procedural (what works)                          |
-| Agent can't find the right memory         | **8-signal fusion retrieval** — vector similarity + BM25 + graph + intent + recency + frequency + confidence + type boost     |
-| Agent repeats failed approaches           | **Procedural memory** — Bayesian tracking on action→outcome pairs surfaces what actually works                                |
-| Memory store grows unbounded              | **FSRS forgetting curve** — memories you use get stronger, unused ones fade naturally. Consolidation promotes repeated facts. |
-| Need cloud signup to get started          | **Offline-first** — SQLite + ONNX embeddings. Works on your laptop right now. No API keys needed.                             |
-| Need to scale to production               | **Postgres backend** — feature-gated pgvector for multi-node deployments, plus a self-hostable HTTP gateway.                 |
-| Only works with one framework             | **Framework-agnostic** — Python, TypeScript, Go, MCP, REST, CLI. Drop-in adapters for LangChain, CrewAI, AutoGen.             |
-
-## Install
-
-```bash
-pip install pensyve          # Python (PyPI)
-npm install @pensyve/sdk     # TypeScript (npm)
-go get github.com/major7apps/pensyve/pensyve-go/v5@latest  # Go
-```
-
-Or use the MCP server directly with Antigravity CLI, Codex, Claude Code, Cursor, or any MCP client — see [MCP Setup](docs/GETTING_STARTED.md#mcp-server).
-
-## Quick Start
+Python 3.10 or newer is required.
 
 ```bash
 pip install pensyve
 ```
 
-### Episode: your agent remembers a conversation
+Create a local store, save a fact, and retrieve it:
 
 ```python
 import pensyve
 
-p = pensyve.Pensyve()
+p = pensyve.Pensyve(path="./memories", namespace="my-agent")
 user = p.entity("user", kind="user")
 
-# Record a conversation — Pensyve captures it as episodic memory
-with p.episode(user) as ep:
-    ep.message("user", "I prefer dark mode and use vim keybindings")
-    ep.message("agent", "Got it — I'll remember your editor preferences")
-    ep.outcome("success")
+p.remember(
+    entity=user,
+    fact="Prefers dark mode and vim keybindings",
+    confidence=0.95,
+)
 
-# Later (even in a new session), the agent recalls what happened
-results = p.recall("editor preferences", entity=user)
-for r in results:
-    print(f"[{r.score:.2f}] {r.content}")
+for memory in p.recall("editor preferences", entity=user):
+    print(memory.content)
 ```
 
-### Recall grouped: feed an LLM reader without rebuilding session blocks
+Reuse the same path and namespace in a later process to retrieve saved
+memories. The Python SDK runs the engine in your process and does not need
+the HTTP gateway.
 
-When the consumer of recalled memories is another LLM (the dominant
-"memory for an AI agent" pattern), `recall_grouped()` returns memories
-already clustered by source session and ordered chronologically — ready
-to format as session blocks in a reader prompt.
+You can also record a conversation with the same `p` and `user`:
 
 ```python
-import pensyve
+with p.episode(user) as episode:
+    episode.message("user", "Use dark mode in my editor")
+    episode.message("agent", "I updated the editor settings")
+    episode.outcome("success")
 
-p = pensyve.Pensyve()
-groups = p.recall_grouped("How many projects have I led this year?", limit=50)
-
-# Each group is one conversation session — feed it to a reader directly.
-for i, g in enumerate(groups, start=1):
-    print(f"### Session {i} ({g.session_time}):")
-    for m in g.memories:
-        print(f"  {m.content}")
+groups = p.recall_grouped("editor settings", limit=10)
+for group in groups:
+    for memory in group.memories:
+        print(memory.content)
 ```
 
-No more manual `OrderedDict` clustering, no more reordering by date string,
-no more boilerplate every consumer has to reinvent.
+`recall_grouped()` groups results by source session for use in an agent's
+prompt. See the [Python SDK guide](pensyve-python/README.md) and
+[recipes](docs/RECIPES.md) for more examples.
 
-### Remember: store an explicit fact
+## MCP server
 
-```python
-p.remember(entity=user, fact="Prefers Python over JavaScript", confidence=0.9)
-```
-
-### Procedural: the agent learns what works
-
-```python
-# After a debugging session that succeeded:
-ep.outcome("success")
-
-# Pensyve tracks action→outcome reliability with Bayesian updates.
-# Next time a similar issue comes up, recall surfaces the approach that worked.
-```
-
-### Consolidate: memories stay clean
-
-```python
-p.consolidate()
-# Promotes repeated episodic facts to semantic knowledge
-# Decays memories you never access via FSRS forgetting curve
-```
-
-### Building from source
-
-<details>
-<summary>Prerequisites and build steps</summary>
-
-- Rust 1.94+, Python 3.10+ with [uv](https://github.com/astral-sh/uv)
-- Optional: [Bun](https://bun.sh) (TypeScript SDK), [Go 1.21+](https://go.dev) (Go SDK)
+Pensyve's local MCP memory server lets clients such as Claude Code, Codex,
+and Cursor store and retrieve memories across sessions. From a checkout of
+this repository, install the server with Rust 1.94 or newer:
 
 ```bash
-git clone https://github.com/major7apps/pensyve.git && cd pensyve
-uv sync --extra dev
-uv run maturin develop --release -m pensyve-python/Cargo.toml
-uv run python -c "import pensyve; print(pensyve.__version__)"
+git clone https://github.com/major7apps/pensyve.git
+cd pensyve
+cargo install --path pensyve-mcp --locked
 ```
 
-</details>
-
-## Interfaces
-
-Pensyve exposes its core engine through multiple interfaces — use whichever fits your stack.
-
-### Python SDK
-
-Direct in-process access via PyO3. Zero network overhead.
-
-```python
-import pensyve
-
-p = pensyve.Pensyve(namespace="my-agent")
-entity = p.entity("user", kind="user")
-
-# Remember a fact
-p.remember(entity=entity, fact="User prefers Python", confidence=0.95)
-
-# Recall memories (flat list)
-results = p.recall("programming language", entity=entity)
-
-# Recall memories clustered by source session — the canonical entry point
-# for "memory as input to an LLM reader" workflows.
-groups = p.recall_grouped("programming language", limit=50)
-
-# Record an episode
-with p.episode(entity) as ep:
-    ep.message("user", "Can you fix the login bug?")
-    ep.message("agent", "Fixed — the session token was expiring early")
-    ep.outcome("success")
-
-# Consolidate (promote repeated facts, decay unused memories)
-p.consolidate()
-```
-
-### MCP Server
-
-Works with Antigravity CLI, Claude Code, Cursor, and any MCP-compatible client.
-
-```bash
-cargo install --path pensyve-mcp
-```
-
-```json
-{
-  "mcpServers": {
-    "pensyve": {
-      "command": "./target/release/pensyve-mcp",
-      "env": { "PENSYVE_PATH": "~/.pensyve/default" }
-    }
-  }
-}
-```
-
-**Tools exposed:** `recall`, `remember`, `episode_start`, `episode_end`, `forget`, `inspect`, `status`, `account`
-
-### Claude Code Plugin
-
-Full cognitive memory layer for Claude Code with 7 commands, 4 skills, 2 agents, and 6 lifecycle hooks.
-
-Install from the marketplace:
-
-```
-/plugin marketplace add major7apps/pensyve
-/plugin install pensyve@major7apps-pensyve
-/reload-plugins
-```
-
-The plugin does not bundle an MCP server config — the backend is your choice. Add an `mcpServers.pensyve` entry to `.mcp.json` at your project root (project scope) or `~/.claude.json` (user scope), or register it with `claude mcp add`. Pick one:
-
-**Local (stdio, no API key):**
-
-Install the MCP binary first (see [Install](#install)), then add this to `.mcp.json` or `~/.claude.json`:
+Make sure Cargo's binary directory is on your client's `PATH`, then add a
+stdio server entry to its MCP configuration:
 
 ```json
 {
   "mcpServers": {
     "pensyve": {
       "command": "pensyve-mcp",
-      "args": ["--stdio"]
-    }
-  }
-}
-```
-
-Or register it from the CLI (add `--scope user` for user scope):
-
-```bash
-claude mcp add pensyve -- pensyve-mcp --stdio
-```
-
-**Self-hosted gateway (HTTP):**
-
-Run a `pensyve-mcp-gateway` ([self-hosting guide](docs/self-host.md)), then use one of the API keys you configured on it:
-
-```bash
-export PENSYVE_API_KEY="psy_your_key_here"
-```
-
-```json
-{
-  "mcpServers": {
-    "pensyve": {
-      "type": "http",
-      "url": "http://localhost:3000/mcp",
-      "headers": {
-        "Authorization": "Bearer ${PENSYVE_API_KEY}"
+      "args": ["--stdio"],
+      "env": {
+        "PENSYVE_NAMESPACE": "my-project"
       }
     }
   }
 }
 ```
 
-Or register it from the CLI:
+The server provides tools such as `pensyve_remember`, `pensyve_recall`,
+`pensyve_observe`, and `pensyve_inspect`. It stores data locally and needs no
+API key. The configuration file location depends on your client. See the
+[MCP setup guide](docs/GETTING_STARTED.md#mcp-server) and
+[integration guides](integrations/README.md).
+
+## HTTP gateway
+
+Run the gateway to access Pensyve over REST or MCP HTTP, including from the
+TypeScript and Go SDKs. From the repository root, start a local instance:
 
 ```bash
-claude mcp add --transport http pensyve http://localhost:3000/mcp --header "Authorization: Bearer ${PENSYVE_API_KEY}"
+HOST=127.0.0.1 PENSYVE_API_KEYS=psy_local_example \
+  cargo run --release -p pensyve-mcp-gateway
 ```
 
-> **Note:** Use `headers` with `Authorization: Bearer` for remote MCP (HTTP transport). Use the top-level `env` block (Claude Code MCP schema) for local stdio servers that read environment variables at startup.
-
-```
-Plugin contents:
-├── 7 slash commands   /remember, /recall, /forget, /inspect, /consolidate, /memory-status, /using-pensyve
-├── 4 skills           session-memory, memory-informed-refactor, context-loader, memory-review
-├── 2 agents           memory-curator (background), context-researcher (on-demand)
-└── 6 hooks            SessionStart, Stop, PreCompact, UserPromptSubmit, PostToolUse (Write/Edit, Bash)
-```
-
-See [`integrations/claude-code/README.md`](integrations/claude-code/README.md) for full documentation.
-
-### Codex Plugin
-
-First-class working memory for OpenAI Codex with a plugin manifest, bundled MCP server config, hooks, skills, `/pensyve`, and `$pensyve` skill invocation.
-
-Add this repo as a Codex plugin marketplace, then install Pensyve:
+In another terminal, save and recall a fact:
 
 ```bash
-codex plugin marketplace add major7apps/pensyve
-codex plugin add pensyve@pensyve-codex
-```
-
-For local development from a checkout, use
-`codex plugin marketplace add /path/to/pensyve/integrations/codex-plugin` instead.
-
-The bundled MCP server config runs the local stdio server (`pensyve-mcp --stdio`, no API key), so build and install `pensyve-mcp` first (see [Install](#install)).
-
-The plugin bundles `integrations/codex-plugin/.mcp.json`, so Codex can load the Pensyve MCP server without copying a project config file. Use `/skills`, `$pensyve`, or `/pensyve` for explicit memory work, or let the bundled hooks and instructions prompt Codex to recall before substantive project decisions. `@pensyve` is documented as a text-level compatibility convention; true native Codex @-mention dispatch still needs platform support.
-
-See [`integrations/codex-plugin/README.md`](integrations/codex-plugin/README.md) for the manual fallback and local-stdio setup.
-
-### Antigravity CLI Plugin
-
-Install the native Pensyve plugin for Google Antigravity CLI:
-
-```bash
-agy plugin install https://github.com/major7apps/pensyve/tree/main/integrations/antigravity-plugin
-```
-
-The plugin bundles eight working-memory rules, eight skills, and a local stdio MCP definition (`pensyve-mcp --stdio`, no API key). Install `pensyve-mcp` first (see [MCP Server](#mcp-server)), then open `/mcp` in Antigravity and select Pensyve.
-
-See [`integrations/antigravity-plugin/README.md`](integrations/antigravity-plugin/README.md) for MCP-only, local-stdio, and migration setup.
-
-### REST API
-
-Rust/Axum gateway serving REST + MCP with auth, rate limiting, and usage metering.
-
-```bash
-cargo build --release --bin pensyve-mcp-gateway
-./target/release/pensyve-mcp-gateway  # listens on 0.0.0.0:3000
-```
-
-```bash
-# Remember
-curl -X POST http://localhost:3000/v1/remember \
+curl http://localhost:3000/v1/remember \
+  -H "Authorization: Bearer psy_local_example" \
   -H "Content-Type: application/json" \
-  -d '{"entity": "seth", "fact": "Seth prefers Python", "confidence": 0.95}'
+  -d '{"entity":"user","fact":"Prefers Python","confidence":0.95}'
 
-# Recall
-curl -X POST http://localhost:3000/v1/recall \
+curl http://localhost:3000/v1/recall \
+  -H "Authorization: Bearer psy_local_example" \
   -H "Content-Type: application/json" \
-  -d '{"query": "programming language", "entity": "seth"}'
-
-# Recall, clustered by source session (canonical for LLM-reader workflows)
-curl -X POST http://localhost:3000/v1/recall_grouped \
-  -H "Content-Type: application/json" \
-  -d '{"query": "How many books did I buy?", "limit": 50, "order": "chronological"}'
+  -d '{"query":"programming language","entity":"user"}'
 ```
 
-**Endpoints:** `GET /v1/health`, `POST /v1/recall`, `POST /v1/recall_grouped`, `POST /v1/remember`, `POST /v1/entities`, `DELETE /v1/entities/{name}`, `POST /v1/inspect`, `GET /v1/stats`, `PATCH /v1/memories/{id}`, `DELETE /v1/memories/{id}`
+The MCP HTTP endpoint is `http://localhost:3000/mcp`. Use the same API key in
+your client's `Authorization: Bearer` header.
 
-### TypeScript SDK
+The example key is for local testing. For a deployment, choose your own key
+with the required `psy_` prefix and configure HTTPS and allowed hosts. See
+the [self-hosting guide](docs/self-host.md),
+[gateway configuration](pensyve-mcp-gateway/README.md), and
+[security documentation](docs/SECURITY.md).
 
-HTTP client with timeout, retry, and structured errors.
+## SDKs and integrations
 
-```typescript
-import { Pensyve } from "@pensyve/sdk";
+The TypeScript and Go SDKs require a running gateway. Configure its URL and,
+when authentication is enabled, an API key from that gateway.
 
-const p = new Pensyve({
-  baseUrl: "http://localhost:3000",
-  timeoutMs: 10000,
-  retries: 2,
-});
-await p.remember({ entity: "seth", fact: "Likes TypeScript", confidence: 0.9 });
-const memories = await p.recall("programming", { entity: "seth" });
+| Interface | Installation or guide |
+| --- | --- |
+| Python | `pip install pensyve`, [SDK guide](pensyve-python/README.md) |
+| TypeScript | `npm install @pensyve/sdk`, [SDK guide](pensyve-ts/README.md) |
+| Go | `go get github.com/major7apps/pensyve/pensyve-go/v5@latest`, [SDK guide](pensyve-go/README.md) |
+| Claude Code | [Plugin setup](integrations/claude-code/README.md) |
+| Cursor | [MCP setup and rules](integrations/cursor/README.md) |
+| Codex | [Plugin setup](integrations/codex-plugin/README.md) |
+| LangChain and LangGraph | [Python adapter](integrations/langchain/README.md), [TypeScript adapter](integrations/langchain-ts/README.md) |
+| Other clients and frameworks | [Integration index](integrations/README.md) |
 
-// Session-grouped recall — feed an LLM reader without rebuilding session blocks.
-const { groups } = await p.recallGrouped("how many projects did I lead?", {
-  limit: 50,
-  order: "chronological",
-});
-for (const g of groups) {
-  console.log(`### Session ${g.sessionId} (${g.sessionTime})`);
-  for (const m of g.memories) console.log(`  ${m.content}`);
-}
-```
+## Command-line tool
 
-### Go SDK
-
-Context-aware HTTP client with structured errors.
-
-```go
-import pensyve "github.com/major7apps/pensyve/pensyve-go/v5"
-
-client := pensyve.NewClient(pensyve.Config{BaseURL: "http://localhost:3000"})
-ctx := context.Background()
-client.Remember(ctx, "seth", "Likes Go", 0.9)
-memories, _ := client.Recall(ctx, "programming", nil)
-```
-
-### CLI
+From the repository root, install the CLI and inspect its commands:
 
 ```bash
-cargo build --bin pensyve-cli
-
-# Recall memories (default output is JSON; use --format text for human-readable)
-./target/debug/pensyve-cli recall "editor preferences" --entity user
-
-# Show namespace status with memory counts
-./target/debug/pensyve-cli status
-
-# Show stats
-./target/debug/pensyve-cli stats
-
-# Inspect an entity
-./target/debug/pensyve-cli inspect --entity user
+cargo install --path pensyve-cli --locked
+pensyve --help
+pensyve status
+pensyve recall "editor preferences" --entity user
 ```
 
-## Environment Variables
+The binary is named `pensyve`. Its default output is JSON, and `--format text`
+selects text output. The CLI uses its own default local storage location;
+it does not automatically open the `./memories` directory from the Python
+example. See the [CLI source and command definitions](pensyve-cli/src/main.rs)
+for storage and namespace options.
 
-Pensyve uses the following environment variables across its components:
+## Documentation
 
-### Core
+| Guide | Contents |
+| --- | --- |
+| [Documentation index](docs/README.md) | Choose a setup, find API guides, and identify historical plans |
+| [Getting started](docs/GETTING_STARTED.md) | Setup by client or SDK |
+| [Self-hosting](docs/self-host.md) | Gateway deployment, model files, backups, and saved Cloud exports |
+| [Recipes](docs/RECIPES.md) | Recall, facts, episodes, observations, and other API examples |
+| [Architecture](docs/ARCHITECTURE.md) | Storage, retrieval, and component boundaries |
+| [Security](docs/SECURITY.md) | Authentication, namespace isolation, and execution limits |
+| [Reliability](docs/RELIABILITY.md) | Tests and runtime guarantees |
+| [Changelog](CHANGELOG.md) | Release history and breaking changes |
 
-| Variable                      | Default                  | Description                                               |
-| ----------------------------- | ------------------------ | --------------------------------------------------------- |
-| `PENSYVE_PATH`                | `~/.pensyve/<namespace>` | SQLite database directory                                 |
-| `PENSYVE_NAMESPACE`           | `default`                | Memory namespace name                                     |
-| `RUST_LOG`                    | `pensyve=info`           | Tracing filter (e.g. `debug`, `pensyve=debug,hyper=warn`) |
-| `PENSYVE_ALLOW_MOCK_EMBEDDER` | `false`                  | Fall back to mock embedder if real models unavailable (eager startup only, i.e. with `PENSYVE_EAGER_EMBEDDER=1`) |
-| `PENSYVE_EAGER_EMBEDDER`      | `false`                  | Load the ONNX model at startup instead of on first use    |
+## Development and contributions
 
-### Gateway / REST API
-
-| Variable                 | Default   | Description                                      |
-| ------------------------ | --------- | ------------------------------------------------ |
-| `PENSYVE_API_KEYS`       | _(empty)_ | Comma-separated valid API keys (standalone mode) |
-| `PENSYVE_VALIDATION_URL` | _(none)_  | Remote endpoint for API key validation           |
-| `PENSYVE_RATE_LIMIT`     | `30`      | Max requests per minute per tenant               |
-| `PENSYVE_DAILY_QUOTA`    | `1000`    | Max operations per UTC day per tenant (needs `REDIS_URL`) |
-| `HOST`                   | `0.0.0.0` | Server bind address                              |
-| `PORT`                   | `3000`    | Server bind port                                 |
-
-### Remote / Postgres
-
-| Variable               | Default                 | Description                   |
-| ---------------------- | ----------------------- | ----------------------------- |
-| `PENSYVE_API_KEY`      | _(none)_                | Gateway API key for remote mode |
-| `PENSYVE_REMOTE_URL`   | `http://localhost:3000` | Remote server URL             |
-| `DATABASE_URL` | _(none)_                | Postgres connection string    |
-| `REDIS_URL`    | _(none)_                | Redis for caching, rate limiting, daily quotas |
-
-### Quotas (self-hosted gateway)
-
-| Variable                        | Default   | Description                     |
-| ------------------------------- | --------- | ------------------------------- |
-| `PENSYVE_MAX_NAMESPACES`        | unlimited | Max namespaces per account      |
-| `PENSYVE_MAX_MEMORIES`          | unlimited | Max total memories per account  |
-| `PENSYVE_MAX_RECALLS_PER_MONTH` | unlimited | Max recall operations per month |
-| `PENSYVE_MAX_STORAGE_BYTES`     | unlimited | Max storage bytes per account   |
-
-### Optional Features
-
-| Variable                   | Default  | Description                  |
-| -------------------------- | -------- | ---------------------------- |
-| `PENSYVE_TIER2_ENABLED`    | `false`  | Enable Tier 2 LLM extraction |
-| `PENSYVE_TIER2_MODEL_PATH` | _(none)_ | Path to GGUF model file      |
-| `PENSYVE_OTEL_ENDPOINT`    | _(none)_ | OpenTelemetry collector URL  |
-
-## Architecture
-
-![Pensyve Architecture](https://raw.githubusercontent.com/major7apps/pensyve/main/docs/images/architecture.png)
-
-### Data Model
-
-```
-Namespace (isolation boundary)
-  └── Entity (agent | user | team | tool)
-        ├── Episodes (bounded interaction sequences)
-        │     └── Messages (role + content)
-        └── Memories
-              ├── Episodic  — what happened (timestamped, multimodal content type)
-              ├── Semantic  — what is known (SPO triples with temporal validity)
-              └── Procedural — what works (action→outcome with Bayesian reliability)
-```
-
-### Retrieval Pipeline
-
-1. **Embed** query via ONNX (Alibaba-NLP/gte-base-en-v1.5, 768 dims)
-2. **Classify intent** — Question/Action/Recall/General (keyword heuristics)
-3. **Vector search** — cosine similarity against stored embeddings
-4. **BM25 search** — FTS5 lexical matching
-5. **Graph traversal** — petgraph BFS from query entity
-6. **Fusion scoring** — weighted sum of 8 signals (vector, BM25, graph, intent, recency, access, confidence, type boost)
-7. **Cross-encoder reranking** — BGE reranker on top-20 candidates
-8. **FSRS reinforcement** — retrieved memories get stability boost
-
-## Project Structure
-
-```
-pensyve/
-├── pensyve-core/       Rust engine (rlib) — storage, embedding, retrieval, graph, decay, mesh, observability
-├── pensyve-python/     Python SDK via PyO3 (cdylib)
-├── pensyve-mcp/        MCP server binary (stdio, rmcp)
-├── pensyve-cli/        CLI binary (clap)
-├── pensyve-ts/         TypeScript SDK (bun) — timeout, retry, PensyveError
-├── pensyve-go/         Go SDK — context-aware HTTP client
-├── pensyve-wasm/       WASM build — standalone minimal in-memory Pensyve
-├── pensyve_server/       Shared Python utilities — usage quotas, extraction
-├── integrations/       All integrations — IDE plugins, framework adapters, code harnesses
-│   ├── claude-code/    Claude Code plugin (commands, skills, agents, hooks)
-│   ├── antigravity-plugin/ Antigravity plugin (rules, skills, MCP config)
-│   ├── vscode/         VS Code sidebar extension
-│   ├── openclaw-plugin/ OpenClaw native memory plugin (TypeScript)
-│   ├── opencode-plugin/ OpenCode native memory plugin (TypeScript)
-│   ├── cursor/         Cursor MCP setup guide
-│   ├── cline/          Cline MCP setup guide
-│   ├── windsurf/       Windsurf MCP setup guide
-│   ├── continue/       Continue MCP setup guide
-│   ├── vscode-copilot/ VS Code Copilot Chat MCP setup guide
-│   ├── langchain/      LangChain/LangGraph Python (PensyveStore + legacy PensyveMemory)
-│   ├── langchain-ts/   LangChain.js/LangGraph.js TypeScript (PensyveStore)
-│   ├── crewai/         CrewAI (PensyveStorage + standalone PensyveCrewMemory)
-│   └── autogen/        Microsoft AutoGen multi-agent memory
-├── tests/python/       Python integration tests
-├── benchmarks/         LongMemEval_S evaluation + weight tuning
-└── docs/               Architecture, roadmap, design specs, implementation plans
-```
-
-## Development
-
-### First-Time Setup
+Start with [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites and setup.
+From the repository root:
 
 ```bash
-# Install dependencies (creates .venv automatically)
 uv sync --extra dev
-
-# Build the native Python module (required before running any Python code)
-uv run maturin develop --release -m pensyve-python/Cargo.toml
-
-# Verify the module loads
-uv run python -c "import pensyve; print(pensyve.__version__)"
+make build
+make check
 ```
 
-> **Note:** The `pensyve` Python package is a native Rust extension built with PyO3.
-> You must run `uv run maturin develop` before `pytest` or any Python import of `pensyve`,
-> otherwise you will get `ModuleNotFoundError: No module named 'pensyve'`.
+`make build` compiles Rust and builds the Python extension. `make check`
+runs the Rust and Python lint and test commands. TypeScript and Go have
+separate checks documented in the contribution guide.
 
-### Build & Test
-
-```bash
-make build      # Compile Rust + build PyO3 module
-make test       # Run all tests (Rust + Python)
-make lint       # clippy + ruff + pyright
-make format     # cargo fmt + ruff format
-make check      # lint + test (CI gate)
-```
-
-To run test suites individually:
-
-```bash
-cargo test --workspace                                       # Rust tests
-uv run maturin develop --release -m pensyve-python/Cargo.toml  # Build PyO3 module first
-uv run pytest tests/python/ -v                               # Python tests
-cd pensyve-ts && bun test                                    # TypeScript tests
-cd pensyve-go && go test ./...                               # Go tests
-```
-
-### Additional SDKs
-
-```bash
-cd pensyve-ts && bun test          # TypeScript (38 tests)
-cd pensyve-go && go test ./...     # Go (17 tests)
-cd pensyve-wasm && cargo check     # WASM (standalone)
-```
-
-### Benchmarks
-
-```bash
-# Synthetic recall smoke test (planted facts, no external dataset required)
-python benchmarks/synthetic/run.py --generate --evaluate --verbose
-```
-
-## Competitive Landscape
-
-| What you need                    | Pensyve                                                       | Mem0                | Zep                  | Honcho         |
-| -------------------------------- | ------------------------------------------------------------- | ------------------- | -------------------- | -------------- |
-| Works offline, no cloud required | **Yes** — SQLite, runs on your laptop                         | No — cloud API      | No — requires server | No — cloud API |
-| Agent learns from outcomes       | **Yes** — procedural memory tracks what works                 | No                  | No                   | No             |
-| Finds memories by meaning        | **8-signal fusion** (vector + BM25 + graph + intent + 4 more) | Vector only         | Vector + temporal    | Vector only    |
-| Memories fade naturally          | **FSRS forgetting curve** with reinforcement                  | No — manual cleanup | Basic TTL            | No             |
-| Multi-turn conversation capture  | **Episodes** with outcome tracking                            | Basic               | Yes                  | Yes            |
-| Framework agnostic               | **Python, TypeScript, Go, MCP, REST, CLI**                    | Python SDK          | Python/JS            | Python         |
-| Claude Code / Cursor / VS Code   | **Native plugins + MCP**                                      | No                  | No                   | No             |
-| Production-ready at scale        | **Postgres + pgvector** (feature-gated)                       | Yes                 | Yes                  | Yes            |
-| Open source                      | **Apache 2.0**                                                | Yes                 | Partial              | Yes            |
+Issues and pull requests follow the [maintenance policy](MAINTENANCE.md).
+Report security issues through [private vulnerability reporting](SECURITY.md).
 
 ## License
 
-[Apache 2.0](LICENSE)
+Pensyve is licensed under [Apache 2.0](LICENSE).

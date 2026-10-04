@@ -1,14 +1,14 @@
 # Pensyve for Cursor
 
-Persistent working-memory substrate for [Cursor](https://cursor.sh) — memory is not a feature you invoke, it is the substrate the agent operates on.
+Pensyve connects [Cursor](https://cursor.sh) to persistent memory through MCP. The included rules ask the agent to store useful observations and recall them in later sessions.
 
 ## What It Does
 
-- **Proactive memory during work** — lessons are captured the moment they land, not at session end
-- **Thread-aware continuity** — sessions that continue prior work resume with relevant context, no re-briefing
-- **Entity-scoped recall** — substantive questions are grounded in prior decisions; simple commands stay fast
-- **Three memory types** — durable facts (semantic), session-specific events (episodic), reusable procedures (procedural)
-- **Lightly visible** — one-line surfaces when memory is used; never interrupts your flow
+- **Capture during work:** Rules ask the agent to store confirmed lessons as they arise.
+- **Session context:** Recall can bring relevant decisions and observations into later conversations.
+- **Recall by entity:** Rules ask for relevant memories before substantive answers.
+- **Memory content:** Store durable facts and session observations, including notes about reusable procedures.
+- **Brief notices:** Rules ask for one-line notices when memory is used.
 
 ## Install
 
@@ -18,7 +18,7 @@ Two steps: configure the MCP server, then install the rules.
 
 Copy `.cursor/mcp.json.example` to your project's `.cursor/mcp.json` and edit for your setup.
 
-**Local (offline, recommended):**
+**Local stdio server:**
 
 ```json
 {
@@ -27,7 +27,6 @@ Copy `.cursor/mcp.json.example` to your project's `.cursor/mcp.json` and edit fo
       "command": "pensyve-mcp",
       "args": ["--stdio"],
       "env": {
-        "PENSYVE_PATH": "~/.pensyve/",
         "PENSYVE_NAMESPACE": "default"
       }
     }
@@ -36,6 +35,8 @@ Copy `.cursor/mcp.json.example` to your project's `.cursor/mcp.json` and edit fo
 ```
 
 Install the binary: `cargo install --path pensyve-mcp` from the [pensyve repo](https://github.com/major7apps/pensyve).
+
+The server defaults to `~/.pensyve/default`. If you set `PENSYVE_PATH`, use an absolute path; the server does not expand `~` in environment values. Embedding models may download when first loaded, so [prepare the model cache](../../docs/self-host.md#prepare-models-for-local-use) before running without network access.
 
 **Self-hosted gateway (remote):**
 
@@ -83,21 +84,21 @@ Cursor will auto-attach the rules based on their frontmatter:
 
 ## How It Works
 
-Cursor has no hook/event surface like Claude Code does, so the entire substrate is delivered through the rules the model interprets during reasoning. `memory-reflex.mdc` establishes the discipline: *before substantive answers, recall by entity; when a lesson lands, observe immediately with a one-line surface*. Flow rules (debug/design/refactor/longitudinal-work) activate when relevant and guide the model through consult-memory + capture-lesson steps.
+This integration supplies rules for the model to interpret; it does not register event hooks. `memory-reflex.mdc` asks the agent to recall relevant memories before answering and store confirmed observations during work. The other rules cover debugging, design, refactoring, and research. Capture and recall depend on the agent following the rules and the MCP server being available.
 
-**Episode lifecycle:** Cursor has no session-start/session-end hooks, so episodes open lazily on the first `pensyve_observe` call and are not explicitly closed under normal operation. Server-side consolidation handles aging.
+**Episode lifecycle:** The rules ask the agent to call `pensyve_episode_start` before its first observation and reuse the returned episode ID. The agent can close the episode with `pensyve_episode_end` when the work is complete.
 
-**Continuity primer:** `context-loader.mdc` runs a best-effort recall at the start of substantive conversations to surface prior relevant observations. Not a structured server-side link — the MCP server has no episode-listing API yet — but good enough to create the "continuing prior work" feel.
+**Session context:** `context-loader.mdc` asks the agent to recall relevant observations at the start of substantive conversations. This does not create a server-side link between episodes.
 
 ## Memory Behavior Model
 
-Pensyve behaves as working memory for the agent — always-on, ambient, continuous.
+The rules describe when the agent should read and write memories.
 
-**Writes happen in-flight.** When a root cause is confirmed, a decision is made, or a reusable procedure emerges, it's captured the moment it lands via the memory reflex. No batching to session end.
+**Capture guidance.** The rules ask the agent to store confirmed root causes, decisions, and useful procedures during work.
 
-**Reads happen at decision points.** Before substantive answers, the model consults memory scoped to the detected entities. Simple commands (run tests, format file) skip recall to stay fast.
+**Recall guidance.** Before substantive answers, the rules ask the agent to recall memories for relevant entities. Simple commands, such as running tests or formatting a file, do not require recall.
 
-**Sessions continue.** At the start of a substantive conversation, Pensyve checks whether the current work continues prior memories (shared entities + recent activity). If yes, you resume with a primer — no re-briefing needed.
+**New conversations.** The rules ask the agent to summarize related prior work when recall finds useful context.
 
 ## Memory Types
 
@@ -105,7 +106,7 @@ Pensyve behaves as working memory for the agent — always-on, ambient, continuo
 |---|---|---|---|
 | **Semantic** | Durable truths, decisions, preferences | `pensyve_remember` | "We chose RS256 over HS256 for JWT signing" |
 | **Episodic** | Temporal events, session-scoped observations | `pensyve_observe` (with lazy-opened `episode_id`) | "Phase-3 regression root cause: hybrid-router threshold" |
-| **Procedural** | Reusable workflows, sequences, recipes | `pensyve_observe` with `[procedural]` content prefix | "To calibrate V7r: freeze Haiku config, run suite, diff baseline" |
+| **Workflow notes** | Reusable procedures stored as episodic memory | `pensyve_observe`; a `[procedural]` prefix does not change the stored type | "To calibrate V7r: freeze Haiku config, run suite, diff baseline" |
 
 ## Opt-Out
 
@@ -122,17 +123,17 @@ Cursor's native pattern is to edit or delete rules:
 |---|---|
 | `pensyve_recall` | Search memories by semantic similarity |
 | `pensyve_remember` | Store a durable fact (semantic memory) |
-| `pensyve_observe` | Record a session observation (episodic / procedural via `[procedural]` prefix) |
+| `pensyve_observe` | Record episodic memory; a `[procedural]` content prefix does not change the stored memory type |
 | `pensyve_episode_start` | Begin tracking an episode |
 | `pensyve_episode_end` | Close an episode with outcome |
 | `pensyve_forget` | Delete an entity's memories |
 | `pensyve_inspect` | List memories for an entity |
 
-See [MCP Tools Reference](https://github.com/major7apps/pensyve#mcp-server) for full parameter details.
+See the [MCP tool reference](../../pensyve-mcp/README.md#tool-reference) for all tools and parameter details.
 
 ## Design Philosophy
 
-- **Memory as substrate** — not a feature the user invokes; always there, continuous, carried across sessions
+- **Persistent storage:** Memories remain available to later sessions using the same storage namespace.
 - **Reasoning-layer only** — no platform-layer code in v1; the entire adapter is MDC rules
 - **1:1 with Claude Code** — same skill structure, same conventions, same memory types
 - **MCP contract-respecting** — every rule's call examples verified against `pensyve-mcp-tools/src/params.rs`
@@ -140,8 +141,8 @@ See [MCP Tools Reference](https://github.com/major7apps/pensyve#mcp-server) for 
 ## Links
 
 - **GitHub:** [github.com/major7apps/pensyve](https://github.com/major7apps/pensyve)
-- **Spec:** [Cursor adapter design](https://github.com/major7apps/pensyve-docs/blob/main/specs/2026-04-20-pensyve-cursor-adapter-design.md)
-- **Playbook:** [Working-memory substrate design](https://github.com/major7apps/pensyve-docs/blob/main/specs/2026-04-18-pensyve-working-memory-substrate-design.md)
+- **MCP setup:** [Getting started](https://github.com/major7apps/pensyve/blob/main/docs/GETTING_STARTED.md#mcp-server)
+- **Memory examples:** [Recipes](https://github.com/major7apps/pensyve/blob/main/docs/RECIPES.md)
 
 ## License
 

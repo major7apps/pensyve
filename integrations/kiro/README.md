@@ -140,8 +140,8 @@ See [MCP Tools Reference](https://github.com/major7apps/pensyve#mcp-server) for 
 ## Links
 
 - **GitHub:** [github.com/major7apps/pensyve](https://github.com/major7apps/pensyve)
-- **Spec:** [Cursor adapter design](https://github.com/major7apps/pensyve-docs/blob/main/specs/2026-04-20-pensyve-cursor-adapter-design.md)
-- **Playbook:** [Working-memory substrate design](https://github.com/major7apps/pensyve-docs/blob/main/specs/2026-04-18-pensyve-working-memory-substrate-design.md)
+- **MCP setup:** [Getting started](https://github.com/major7apps/pensyve/blob/main/docs/GETTING_STARTED.md#mcp-server)
+- **Memory examples:** [Recipes](https://github.com/major7apps/pensyve/blob/main/docs/RECIPES.md)
 
 ## License
 

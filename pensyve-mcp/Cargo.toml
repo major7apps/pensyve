@@ -2,7 +2,7 @@
 name = "pensyve-mcp"
 version = "5.0.0"
 edition = "2024"
-description = "Pensyve MCP server (stdio transport) — universal memory runtime for AI agents"
+description = "Local MCP server for persistent AI agent memory"
 rust-version = "1.94"
 license = "Apache-2.0"
 homepage = "https://github.com/major7apps/pensyve"

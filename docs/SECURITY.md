@@ -483,15 +483,19 @@ The `NetworkPolicy` enum controls outbound network access for the core engine:
 | `LocalOnly` | Only localhost connections (e.g., local LLM inference) |
 | `Permissive` | Outbound allowed (cloud embedding endpoints, remote models) |
 
-Default is `Disabled` for the single-binary distribution, ensuring offline-first
-operation.
+The model-loading policy depends on the entry point. The Python SDK defaults
+to `Permissive` when `PENSYVE_NETWORK_POLICY` is unset, and the stdio server's
+model loader uses `Permissive`. Models may download when first loaded. Prepare
+the [model cache](self-host.md#prepare-models-for-local-use) before running
+without network access.
 
 ## PII Detection
 
-PII detection runs at the extraction boundary (before memories are persisted).
-Tier 1 pattern-based extraction identifies and tags sensitive content. When
-Tier 2 LLM extraction is enabled (`PENSYVE_TIER2_ENABLED=true`), the local
-model runs entirely on-device; no data leaves the machine.
+The optional Python extraction helper in `pensyve_server/extraction.py`
+redacts common sensitive patterns before passing text to its local model.
+The helper accepts a model path explicitly;
+`PENSYVE_TIER2_ENABLED` and `PENSYVE_TIER2_MODEL_PATH` do not configure the
+shipped SDK or gateway.
 
 ## Execution Bounds
 

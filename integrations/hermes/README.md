@@ -171,7 +171,7 @@ See the [repository](https://github.com/major7apps/pensyve) for full MCP tool pa
 
 - **GitHub:** [github.com/major7apps/pensyve](https://github.com/major7apps/pensyve)
 - **Self-host guide:** [docs/self-host.md](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md)
-- **Spec:** [Working-memory substrate design](https://github.com/major7apps/pensyve-docs/blob/main/specs/2026-04-18-pensyve-working-memory-substrate-design.md)
+- **Memory examples:** [Recipes](https://github.com/major7apps/pensyve/blob/main/docs/RECIPES.md)
 
 ## License
 

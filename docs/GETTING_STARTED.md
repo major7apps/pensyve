@@ -1,12 +1,19 @@
 # Getting Started with Pensyve
 
-Choose your path based on how you want to use Pensyve.
+Pensyve is an Apache 2.0 project that you run locally or on your own server.
+Pensyve Cloud closed on October 1, 2026. The project is in maintenance mode,
+with security fixes and dependency updates but no new features. See the
+[maintenance policy](../MAINTENANCE.md).
+
+Choose your path based on how you want to use Pensyve. The
+[documentation index](README.md) also links to deployment and reference guides.
 
 | I want to...                                       | Start here                                     |
 | -------------------------------------------------- | ---------------------------------------------- |
 | Add memory to Claude Code                          | [Claude Code Plugin](#claude-code-plugin)      |
 | Add memory to Codex                                | [Codex Plugin](#codex-plugin)                  |
-| Add memory to Cursor, Cline, or another MCP client | [MCP Server](#mcp-server)                      |
+| Add memory to Cursor                              | [Cursor setup and rules](../integrations/cursor/README.md) |
+| Add memory to Cline or another MCP client          | [MCP Server](#mcp-server)                      |
 | Build a Python agent with memory                   | [Python SDK](#python-sdk)                      |
 | Build a TypeScript agent with memory               | [TypeScript SDK](#typescript-sdk)              |
 | Build a Go agent with memory                       | [Go SDK](#go-sdk)                              |
@@ -20,7 +27,7 @@ Choose your path based on how you want to use Pensyve.
 
 ## Claude Code Plugin
 
-The fastest way to get persistent memory in Claude Code.
+The plugin connects Claude Code to a Pensyve MCP server.
 
 ### Install
 
@@ -94,7 +101,7 @@ See [`integrations/claude-code/README.md`](../integrations/claude-code/README.md
 
 ## Codex Plugin
 
-First-class working memory for OpenAI Codex.
+The plugin connects Codex to the local Pensyve MCP server.
 
 ### Install
 
@@ -116,7 +123,7 @@ $pensyve remember that auth-service uses RS256 signing
 @pensyve recall release workflow decisions
 ```
 
-The plugin bundles its `.mcp.json`, skills, commands, hooks, assets, and install metadata. Current reliable Codex explicit invocation uses `/skills`, `$pensyve`, or `/pensyve`. The `@pensyve` form is a text-level compatibility convention, not native autocomplete or selector behavior; app-style `$app-slug` invocation can be added later through `.app.json` when a registered Pensyve Codex app/connector exists.
+The plugin bundles its `.mcp.json`, skills, commands, hooks, assets, and install metadata. Use `/skills`, `$pensyve`, or `/pensyve` for explicit invocation. The `@pensyve` form is a text convention without native autocomplete or selector support.
 
 ### Local (manual config)
 
@@ -162,7 +169,7 @@ Add to your client's MCP config (the exact file varies by client):
 }
 ```
 
-Install: `cargo install --path pensyve-mcp` (from a checkout of the repo)
+Install: `cargo install --locked --path pensyve-mcp` (from a checkout of the repo)
 
 | Client          | Config file                           |
 | --------------- | ------------------------------------- |
@@ -196,8 +203,10 @@ For clients that speak remote MCP, run a `pensyve-mcp-gateway` ([self-hosting gu
 | `pensyve_recall`        | Search memories by semantic similarity |
 | `pensyve_remember`      | Store a fact as semantic memory        |
 | `pensyve_episode_start` | Begin tracking an interaction          |
+| `pensyve_observe`       | Record an observation in an episode    |
 | `pensyve_episode_end`   | Close an episode with outcome          |
 | `pensyve_forget`        | Delete an entity's memories            |
+| `pensyve_forget_memory` | Delete one memory by ID                |
 | `pensyve_inspect`       | List memories for an entity            |
 | `pensyve_status`        | Connection and memory stats            |
 | `pensyve_account`       | Account mode (local or remote)         |
@@ -206,7 +215,10 @@ For clients that speak remote MCP, run a `pensyve-mcp-gateway` ([self-hosting gu
 
 ## Python SDK
 
-Direct in-process access via PyO3 — zero network overhead.
+The Python SDK runs the Rust engine in your Python process. Local use needs no
+Pensyve account or API key. The first `Pensyve()` call may download ONNX models
+from Hugging Face, so prepare the model cache before running without internet
+access.
 
 ### Install
 
@@ -254,6 +266,8 @@ p.consolidate()
 
 HTTP client with configurable timeout, retry, and structured errors.
 
+Start a [local gateway](#rest-api) before running the example.
+
 ### Install
 
 ```bash
@@ -283,10 +297,6 @@ await p.remember({
 // Recall
 const memories = await p.recall("color preferences", { entity: "user" });
 console.log(memories);
-
-// Episodes
-const episode = await p.startEpisode(["user", "assistant"]);
-await episode.end({ summary: "Discussed deployment strategy" });
 ```
 
 ---
@@ -294,6 +304,8 @@ await episode.end({ summary: "Discussed deployment strategy" });
 ## Go SDK
 
 Context-aware HTTP client with structured errors and exponential backoff.
+
+Start a [local gateway](#rest-api) before running the example.
 
 ### Install
 
@@ -315,16 +327,19 @@ import (
 )
 
 func main() {
-    client := pensyve.NewClient(pensyve.Config{
+    client, err := pensyve.NewClient(pensyve.Config{
         BaseURL: "http://localhost:3000",
         // Or a self-hosted gateway with API keys:
         // APIKey:  "psy_your_key",
     })
+    if err != nil {
+        log.Fatal(err)
+    }
 
     ctx := context.Background()
 
     // Remember
-    _, err := client.Remember(ctx, "user", "Prefers Go and dark mode", 0.9)
+    _, err = client.Remember(ctx, "user", "Prefers Go and dark mode", 0.9)
     if err != nil {
         log.Fatal(err)
     }
@@ -335,7 +350,7 @@ func main() {
         log.Fatal(err)
     }
     for _, m := range memories {
-        fmt.Printf("[%.2f] %s\n", m.Confidence, m.Content)
+        fmt.Printf("[%.2f] %s\n", m.Score, m.Content)
     }
 }
 ```
@@ -344,7 +359,8 @@ func main() {
 
 ## LangChain / LangGraph
 
-Drop-in `BaseStore` replacement for LangGraph.
+The Python adapter provides memory methods that you can call from a LangChain
+chain or LangGraph node. It does not implement LangGraph's `BaseStore` interface.
 
 ### Install
 
@@ -365,17 +381,21 @@ store.put(("user_123", "memories"), "pref-1", {"text": "likes dark mode"})
 # Search
 items = store.search(("user_123", "memories"), query="color preferences")
 
-# Use with LangGraph
-graph = builder.compile(store=store)
+for item in items:
+    print(item.value)
 ```
 
-Auto-detects local vs remote (self-hosted gateway) based on `PENSYVE_API_KEY` env var.
+The adapter selects a remote gateway when an API key is supplied or
+`PENSYVE_API_KEY` is set. Otherwise it uses the local Python engine. Call the
+helper explicitly inside your node. See the [adapter guide](../integrations/langchain/README.md)
+for lookup, append, and deletion semantics, and the
+[node recipe](RECIPES.md#4-i-added-memory-to-my-existing-langchain-agent) for an example.
 
 ---
 
 ## CrewAI
 
-Drop-in memory backend for CrewAI crews.
+The adapter provides `remember()` and `recall()` methods for use in CrewAI code.
 
 ### Quick start
 
@@ -385,14 +405,6 @@ from pensyve_crewai import PensyveMemory
 memory = PensyveMemory(namespace="my-crew")
 memory.remember("The API rate limit is 1000 requests per minute")
 matches = memory.recall("rate limits", limit=5)
-
-# Use with CrewAI
-crew = Crew(
-    agents=[...],
-    tasks=[...],
-    memory=True,
-    memory_config={"provider": "custom", "config": {"instance": memory}},
-)
 ```
 
 Auto-detects local vs remote (self-hosted gateway) based on `PENSYVE_API_KEY` env var.
@@ -443,7 +455,7 @@ The Rust/Axum gateway serves both REST and MCP on the same port.
 
 ```bash
 cargo build --release --bin pensyve-mcp-gateway
-./target/release/pensyve-mcp-gateway  # listens on 0.0.0.0:3000
+HOST=127.0.0.1 ./target/release/pensyve-mcp-gateway  # local examples
 ```
 
 ### Example requests
@@ -492,7 +504,10 @@ returns none. There is deliberately no REST write path for procedural memories t
 
 ### Authentication
 
-Set `PENSYVE_API_KEYS` env var (comma-separated) to enable auth. When unset, all endpoints are open (dev mode).
+Set `PENSYVE_API_KEYS` (comma-separated) to require API keys. Open development
+mode applies only when `PENSYVE_API_KEYS`, `PENSYVE_VALIDATION_URL`, and
+`OAUTH_PUBLIC_KEY` are all unset. See the [self-hosting guide](self-host.md) for
+remote deployment.
 
 ```bash
 PENSYVE_API_KEYS=psy_key1,psy_key2 ./target/release/pensyve-mcp-gateway
@@ -521,8 +536,8 @@ uv sync --extra dev
 uv run maturin develop --release -m pensyve-python/Cargo.toml
 uv run python -c "import pensyve; print(pensyve.__version__)"
 
-# MCP server
-cargo build --release -p pensyve-mcp
+# Build and install the MCP server on PATH
+cargo install --locked --path pensyve-mcp
 
 # REST/MCP gateway
 cargo build --release -p pensyve-mcp-gateway
@@ -531,7 +546,7 @@ cargo build --release -p pensyve-mcp-gateway
 cargo build --release -p pensyve-cli
 
 # TypeScript SDK
-cd pensyve-ts && bun install && bun run build
+(cd pensyve-ts && bun install && bun run build)
 
 # Go SDK (no build step — just go get)
 ```
@@ -539,11 +554,11 @@ cd pensyve-ts && bun install && bun run build
 ### Run tests
 
 ```bash
-make check          # lint + test (full CI gate)
+make check                               # Rust and Python lint/tests
 cargo test --workspace                    # Rust
 uv run pytest tests/python/ -v            # Python
-cd pensyve-ts && bun test                 # TypeScript
-cd pensyve-go && go test ./...            # Go
+(cd pensyve-ts && bun test)               # TypeScript
+(cd pensyve-go && go test ./...)          # Go
 ```
 
 ---
@@ -553,8 +568,12 @@ cd pensyve-go && go test ./...            # Go
 | Variable             | Default                  | Description                         |
 | -------------------- | ------------------------ | ----------------------------------- |
 | `PENSYVE_API_KEY`    | —                        | Gateway API key (`psy_...`)         |
-| `PENSYVE_NAMESPACE`  | `default`                | Memory namespace                    |
-| `PENSYVE_PATH`       | `~/.pensyve/<namespace>` | Local storage directory             |
+| `PENSYVE_NAMESPACE`  | `default`                | MCP/gateway namespace               |
+| `PENSYVE_PATH`       | Component-dependent      | MCP/gateway storage directory       |
 | `PENSYVE_API_KEYS`   | —                        | Gateway auth keys (comma-separated) |
 | `PENSYVE_REMOTE_URL` | —                        | Remote server URL                   |
-| `RUST_LOG`           | `pensyve=info`           | Tracing filter                      |
+| `RUST_LOG`           | `info`                   | Gateway tracing filter              |
+
+The stdio server defaults to `~/.pensyve/default`, and the gateway defaults to
+`~/.pensyve/gateway`. For local Python, pass `path=` and `namespace=` to
+`Pensyve()` explicitly.

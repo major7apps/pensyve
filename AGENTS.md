@@ -4,7 +4,16 @@ Canonical agent entry point for the `pensyve` open-source repo. Shared by Claude
 
 ## What this repo is
 
-Pensyve — the universal memory runtime for AI agents. Apache 2.0 open-source engine: Rust core + Python/TypeScript/Go SDKs + MCP server + REST gateway + CLI + Claude Code plugin + VS Code extension + framework integrations. Offline-first (SQLite default), Postgres feature-gated for multi-node deployments.
+Pensyve is an Apache 2.0 memory runtime for AI agents. The repository contains
+the Rust engine, Python/TypeScript/Go SDKs, MCP server, HTTP gateway, CLI, and
+integrations. SQLite is the default storage backend, and PostgreSQL support
+is available through the core's `postgres` feature.
+
+Pensyve Cloud closed on October 1, 2026. The project runs locally or on an
+operator's own server and is in maintenance mode. Read
+[`MAINTENANCE.md`](MAINTENANCE.md) for the release and contribution policy.
+Current setup instructions must use the public documentation in this
+repository and must not depend on the retired hosted service.
 
 ## Start here
 
@@ -31,8 +40,8 @@ Pensyve — the universal memory runtime for AI agents. Apache 2.0 open-source e
 | `pensyve-ts/` | TypeScript HTTP SDK (bun) |
 | `pensyve-go/` | Go HTTP SDK |
 | `pensyve-wasm/` | Rust cdylib (wasm-bindgen) — browser/edge variant (not in workspace) |
-| `pensyve-vscode/` | VS Code extension |
-| `pensyve-plugin/` | Claude Code marketplace plugin |
+| `integrations/vscode/` | VS Code extension |
+| `integrations/claude-code/` | Claude Code marketplace plugin |
 | `pensyve_server/` | Python utilities (usage quotas, Tier 2 extraction) — NOT a standalone server |
 | `integrations/` | Framework adapters (LangChain, CrewAI, etc.) |
 | `benchmarks/` | LongMemEval + tuning harnesses |
@@ -43,10 +52,10 @@ Pensyve — the universal memory runtime for AI agents. Apache 2.0 open-source e
 
 ```bash
 make build    # Full build (Rust + PyO3 into .venv)
-make test     # All tests (Rust + Python + TypeScript + Go)
-make lint     # clippy --workspace + ruff check + pyright + go vet + eslint
+make test     # Rust + Python tests
+make lint     # clippy --workspace + ruff check + pyright
 make format   # cargo fmt + ruff format
-make check    # CI gate (lint + test)
+make check    # Rust + Python lint and tests; run SDK checks separately
 ```
 
 Per-component:
@@ -84,7 +93,7 @@ Python env setup: `uv sync --extra dev && uv run maturin develop --manifest-path
 - UUIDs as TEXT in SQLite (native UUID in Postgres), embeddings as BLOB, metadata as JSON TEXT (JSONB in Postgres).
 - PyO3 module compiles to `pensyve._core` — stubs at `pensyve-python/python/pensyve/_core.pyi`.
 - Episode IDs are UUID v4 strings; 30-minute TTL in the REST API.
-- Auth opt-in via `PENSYVE_API_KEYS` (open only when it, `PENSYVE_VALIDATION_URL`, and `OAUTH_PUBLIC_KEY` are all unset). Tier 2 extraction opt-in via `PENSYVE_TIER2_ENABLED=true`.
+- Auth opt-in via `PENSYVE_API_KEYS` (open only when it, `PENSYVE_VALIDATION_URL`, and `OAUTH_PUBLIC_KEY` are all unset).
 - Rust: edition 2024, 100-char line width, 4-space indent. Python: ruff rules E/W/F/I/N/UP/B/SIM/RUF.
 - `conftest.py` at project root adds the project root to `sys.path` for test imports.
 
@@ -95,8 +104,6 @@ Python env setup: `uv sync --extra dev && uv run maturin develop --manifest-path
 | `PENSYVE_PATH` | `~/.pensyve/` | SQLite database path |
 | `PENSYVE_NAMESPACE` | `default` | Memory namespace |
 | `PENSYVE_API_KEYS` | (unset) | Comma-separated API keys for auth |
-| `PENSYVE_TIER2_ENABLED` | `false` | Enable LLM-based Tier 2 extraction |
-| `PENSYVE_TIER2_MODEL_PATH` | (unset) | Path to GGUF model for Tier 2 |
 | `DATABASE_URL` | (unset) | Postgres connection string (optional) |
 | `REDIS_URL` | (unset) | Redis for caching, rate limiting, and daily quota enforcement (optional) |
 | `PENSYVE_SNAPSHOT_RETENTION_DAYS` | `30` | How long a `forget` pre-delete snapshot is kept; `0` disables the age bound; maximum `36500` |

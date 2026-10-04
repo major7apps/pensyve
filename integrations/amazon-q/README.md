@@ -149,7 +149,7 @@ Amazon Q's native pattern is to edit or delete rules:
 ## Links
 
 - **GitHub:** [github.com/major7apps/pensyve](https://github.com/major7apps/pensyve)
-- **Playbook:** [Working-memory substrate design](https://github.com/major7apps/pensyve-docs/blob/main/specs/2026-04-18-pensyve-working-memory-substrate-design.md)
+- **Memory examples:** [Recipes](https://github.com/major7apps/pensyve/blob/main/docs/RECIPES.md)
 
 ## License
 

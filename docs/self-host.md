@@ -1,24 +1,40 @@
 # Self-hosting Pensyve
 
-Pensyve runs as a single binary over a SQLite file. This guide deploys the MCP
-gateway on [Railway](https://railway.com) with a persistent volume, and shows
-how to drop in a store exported from Pensyve Cloud so your existing memories
-come across intact.
+Pensyve's HTTP gateway can run as a single binary with SQLite storage. You can
+run it on your own machine or deploy it with a persistent volume. The
+[local setup](../README.md#http-gateway) needs only this repository and Rust.
+The Railway example below includes the model files in a container image.
 
-**Pensyve Cloud closed on 2026-10-01.** The hosted service and its web app
-(dashboard, sign-up, API-key console) no longer exist, and you do not need
-them. The gateway in this repository is the whole server: it speaks MCP, holds
-your memories, and answers recall. See [`MAINTENANCE.md`](../MAINTENANCE.md)
-for the project's status.
+Pensyve Cloud closed on October 1, 2026. You configure your own storage and
+API keys when running the gateway. If you saved an export from Cloud, see
+[Dropping in an exported store](#dropping-in-an-exported-store). See
+[MAINTENANCE.md](../MAINTENANCE.md) for the project's status.
 
 ## What you need
 
 | | |
 |---|---|
 | Storage | One SQLite file. No Postgres, no external vector database. |
-| Models | Embedding model (~130 MB) baked into the image at build time. |
+| Models | The pinned embedding and reranker bundle is about 1.7 GB and is included in the image at build time. |
 | Memory | ~1.5 GB RAM. The ONNX embedding session is the bulk of it. |
 | Disk | The store, plus room to grow. 20k memories is roughly 250 MB. |
+
+## Prepare models for local use
+
+From the repository root, download and verify the pinned model bundle while
+you have network access. The output directory must be absent or empty:
+
+```bash
+PENSYVE_MODEL_DIR="$HOME/.cache/pensyve/models"
+bash pensyve-mcp-gateway/scripts/fetch-model-bundle.sh --output "$PENSYVE_MODEL_DIR"
+export HF_HOME="$PENSYVE_MODEL_DIR"
+export FASTEMBED_CACHE_DIR="$PENSYVE_MODEL_DIR"
+```
+
+Keep both environment variables set when starting Python, the MCP server, or
+the gateway. The download script checks the files against the repository's
+pinned hashes. The bundle contains the embedding model and an optional
+reranker; downloading the reranker does not enable it.
 
 ## Deploying to Railway
 
@@ -43,10 +59,10 @@ RUN cargo build --release -p pensyve-mcp-gateway -p pensyve-cli
 FROM rust:1.97-bookworm AS models
 WORKDIR /src
 COPY pensyve-mcp-gateway/models /src/pensyve-mcp-gateway/models
-COPY pensyve-mcp-gateway/scripts/fetch-model-bundle.sh /src/fetch-model-bundle.sh
+COPY pensyve-mcp-gateway/scripts/fetch-model-bundle.sh /src/pensyve-mcp-gateway/scripts/fetch-model-bundle.sh
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && /src/fetch-model-bundle.sh --output /opt/pensyve/models
+    && /src/pensyve-mcp-gateway/scripts/fetch-model-bundle.sh --output /opt/pensyve/models
 
 # ---- runtime ----
 FROM debian:bookworm-slim
@@ -106,7 +122,7 @@ Attach a Railway volume mounted at **`/data`**, then set:
 | Variable | Value | Notes |
 |---|---|---|
 | `PENSYVE_PATH` | `/data` | A **directory**, not a file. See below. |
-| `PENSYVE_API_KEYS` | `psy_...` | Comma-separated. Any opaque string works; `psy_` is only a convention. |
+| `PENSYVE_API_KEYS` | `psy_...` | Comma-separated API keys. Each key must start with `psy_`. |
 | `PENSYVE_KEY_USER_MAP` | `psy_...:<user-id>` | Only when restoring an export. See [Dropping in an exported store](#dropping-in-an-exported-store). |
 | `PORT` | `3000` | Railway usually injects this. |
 | `MCP_ALLOWED_HOSTS` | `your-app.up.railway.app` | Without it only loopback Host headers are accepted, and every request through the Railway URL is rejected. |
@@ -116,8 +132,9 @@ Attach a Railway volume mounted at **`/data`**, then set:
 > makes the gateway create a *directory* by that name and put `memories.db`
 > inside it, which is almost certainly not what you meant.
 
-Generate a key with something like `openssl rand -hex 24`, prefixed however you
-like. Requests authenticate with `Authorization: Bearer <key>`.
+Generate a key with `openssl rand -hex 24` and add `psy_` at the beginning.
+The gateway uses that prefix to distinguish API keys from JWTs. Requests
+authenticate with `Authorization: Bearer <key>`.
 
 ### 4. Connect over MCP
 
@@ -222,7 +239,7 @@ Confirm the embedding generation is active, using the namespace id from the
 query above:
 
 ```bash
-pensyve embedding-space --storage-path /data inspect --namespace <namespace-id>
+pensyve embedding-space --storage-path /data inspect --namespace '<namespace-id>'
 ```
 
 `phase: active` with an `active_read_space_id` means semantic recall is ready.
@@ -261,9 +278,9 @@ migration the CLI exposes:
 
 ```bash
 pensyve embedding-space --storage-path /data backfill \
-  --namespace <namespace-id> --space-manifest <manifest.json> --max-items 256
-pensyve embedding-space --storage-path /data verify   --namespace <namespace-id> --space-id <new-space-id>
-pensyve embedding-space --storage-path /data activate --namespace <namespace-id> --space-id <new-space-id>
+  --namespace '<namespace-id>' --space-manifest '<manifest.json>' --max-items 256
+pensyve embedding-space --storage-path /data verify   --namespace '<namespace-id>' --space-id '<new-space-id>'
+pensyve embedding-space --storage-path /data activate --namespace '<namespace-id>' --space-id '<new-space-id>'
 ```
 
 `backfill` is resumable and re-runs until it reports nothing left; `verify`

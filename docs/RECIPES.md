@@ -1,6 +1,13 @@
 # Pensyve Recipes
 
-Outcome-driven patterns for common use cases. Each recipe shows the problem, the code, and the result.
+Examples for storing and retrieving agent memory with a local SDK or your own
+MCP gateway. Pensyve is an Apache 2.0 project in maintenance mode; see the
+[maintenance policy](../MAINTENANCE.md).
+
+Install the [Python SDK](../pensyve-python/README.md) before running the Python
+examples. Recipes 2, 3, and 5 reuse the `p` handle from recipe 1. Local models may
+download on first use, so prepare the model cache before running offline. Your
+application must pass retrieved memories to its model when it needs that context.
 
 ---
 
@@ -11,7 +18,7 @@ Outcome-driven patterns for common use cases. Each recipe shows the problem, the
 ```python
 import pensyve
 
-p = pensyve.Pensyve(namespace="my-app")
+p = pensyve.Pensyve(path="./pensyve-data", namespace="my-app")
 
 # On first interaction — store preferences
 user = p.entity("user-42", kind="user")
@@ -19,13 +26,15 @@ p.remember(entity=user, fact="Prefers dark mode", confidence=0.95)
 p.remember(entity=user, fact="Uses vim keybindings", confidence=0.9)
 p.remember(entity=user, fact="Primary language is Python", confidence=1.0)
 
-# On next session — recall before responding
+# In a later session, reopen the same store and namespace
+p = pensyve.Pensyve(path="./pensyve-data", namespace="my-app")
+user = p.entity("user-42", kind="user")
 prefs = p.recall("user preferences and settings", entity=user, limit=5)
 for m in prefs:
     print(f"  {m.content} (confidence: {m.confidence})")
 ```
 
-**Result:** Personalized experience without the user repeating themselves.
+**Result:** Retrieved preferences are available for your agent's next prompt.
 
 ---
 
@@ -45,10 +54,14 @@ with p.episode(user) as ep:
 
 # Next time a similar issue appears
 results = p.recall("502 errors under load")
-# → Returns the procedural memory: "cached DNS fixed 502 under load" with high reliability
+for memory in results:
+    print(memory.content)
 ```
 
-**Result:** Agent surfaces what actually worked instead of re-trying what didn't.
+**Result:** The agent can retrieve the recorded debugging messages. The outcome
+is saved on the episode; it does not automatically create a procedural memory
+or a Bayesian reliability score. See [procedural memory](ARCHITECTURE.md#bayesian-procedural-reliability)
+for the core library's explicit trial-update helpers.
 
 ---
 
@@ -68,10 +81,12 @@ with p.episode(user) as ep:
 
 # Days later...
 results = p.recall("database migration", entity=user)
-# → "Discussed migrating from MySQL to Postgres. Agreed to start with read replicas."
+for memory in results:
+    print(memory.content)
 ```
 
-**Result:** Users can reference past conversations and get real answers.
+**Result:** Recall returns stored messages that your agent can use as context.
+The default episode path does not generate a conversation summary.
 
 ---
 
@@ -79,59 +94,85 @@ results = p.recall("database migration", entity=user)
 
 **Problem:** LangGraph agent has no persistence between runs.
 
+Call the helper directly inside a node function. `PensyveStore` is not a
+LangGraph `BaseStore`, so this example does not rely on store injection through
+`compile(store=...)`. Install the [Python adapter](../integrations/langchain/README.md)
+and leave `PENSYVE_API_KEY` unset for the local example.
+
 ```python
+from typing import TypedDict
+from uuid import uuid4
+
 from pensyve_langchain import PensyveStore
-from langgraph.graph import StateGraph
 
-store = PensyveStore()  # auto-detects local vs remote
+store = PensyveStore(path="./pensyve-data", namespace="my-agent")
 
-# Pre-populate context
-store.put(("project",), "stack", {"data": "Next.js 15, Postgres, Vercel"})
 
-def my_node(state, *, store):
-    # Agent reads from persistent memory
-    stack = store.get(("project",), "stack")
+class MemoryState(TypedDict):
+    lookup_key: str
+    new_note: str
+    context: str
 
-    # Agent writes new knowledge
-    store.put(("project",), "decision-auth", {
-        "data": "Using NextAuth.js with GitHub OAuth"
-    })
-    return state
 
-builder = StateGraph(...)
-builder.add_node("node", my_node)
-graph = builder.compile(store=store)
+def memory_node(state: MemoryState) -> MemoryState:
+    item = store.get(("project",), state["lookup_key"])
+    context = str(item.value.get("data", "")) if item else ""
+    store.put(("project",), uuid4().hex, {"data": state["new_note"]})
+    return {**state, "context": context}
+
+
+# Seed one record, then call the same function your graph node would call
+key = uuid4().hex
+store.put(("project",), key, {"data": "The project uses Rust and SQLite"})
+state = memory_node({
+    "lookup_key": key,
+    "new_note": "Authentication uses signed tokens",
+    "context": "",
+})
+print(state["context"])
 ```
 
-**Result:** Three lines of setup. Existing agent gains persistent memory.
+**Result:** The node explicitly reads context and saves a note. `put()` adds a
+fact rather than replacing an existing key, so the example uses unique keys.
+Local `get()` searches up to 20 recalled candidates and returns the first decoded
+key match or `None`; it is not a guaranteed exact lookup. Remote mode is selected
+only when `api_key` or `PENSYVE_API_KEY` has a value, with `base_url` specifying
+your gateway. See the [adapter source](../integrations/langchain/pensyve_langchain.py)
+for the current behavior.
 
 ---
 
-## 5. My agent's memory stays clean without manual pruning
+<a id="5-my-agents-memory-stays-clean-without-manual-pruning"></a>
 
-**Problem:** Memory store grows unbounded, old irrelevant facts clutter results.
+## 5. I run consolidation to update memory records
+
+**Problem:** Repeated and stale episodic records need periodic consolidation.
 
 ```python
-# Run consolidation periodically (end of session, daily cron, etc.)
-p.consolidate()
+# Schedule consolidation in your application or run it at session end
+result = p.consolidate()
+print(result["status"], result["promoted"], result["decayed"])
 ```
 
 What consolidation does:
 
-- **Promotes** — If the same fact appears in 3+ episodes, it becomes a semantic memory (permanent knowledge)
-- **Decays** — Memories you never access lose stability via FSRS (spaced repetition) forgetting curve
-- **Archives** — Memories below the stability threshold are archived, not deleted
+- Similar episodic records may be promoted into semantic memories. A cluster
+  requires at least two records with cosine similarity greater than 0.8; the
+  records need not come from different episodes.
+- Episodic retrievability is recomputed from elapsed time, and stability is
+  reduced below the configured retrievability threshold.
+- The `archived` counter reports decay updates below the threshold. Rows remain
+  stored; consolidation does not delete them or cap database size.
 
 ```python
-# Memories you USE get stronger (retrieval-induced reinforcement)
-results = p.recall("deployment target")
-# → This recall boosts the stability of the matching memories
-
-# Memories you DON'T use naturally fade
-# No manual cleanup needed
+# Recall attempts to reinforce returned episodic memories
+results = p.recall("deployment target", types=["episodic"])
 ```
 
-**Result:** Storage doesn't grow unbounded. Relevant memories stay fresh.
+**Result:** Consolidation updates memory records within its execution limits.
+Check the returned status for incomplete work, and set a separate retention
+policy if you need to limit stored data. Semantic memories are not changed by
+the current decay pass.
 
 ---
 
@@ -151,10 +192,11 @@ memory.remember("Market analysis shows 3x growth in AI agent tooling")
 
 # Agent 2 (writer) recalls the research
 findings = memory.recall("competitor pricing and market trends", limit=5)
-# → Gets both memories without Agent 1 explicitly passing them
+for match in findings:
+    print(match.record.content)
 ```
 
-**Result:** Multi-agent systems that don't silo information.
+**Result:** Agents using the same store can retrieve each other's saved context.
 
 ---
 
@@ -162,10 +204,10 @@ findings = memory.recall("competitor pricing and market trends", limit=5)
 
 **Problem:** Want agent memory in Cursor/Claude Code without writing any code.
 
-**Local** (2 minutes):
+**Local:** From a repository checkout with Rust 1.94 or later, install the server:
 
 ```bash
-cargo install --path pensyve-mcp
+cargo install --locked --path pensyve-mcp
 ```
 
 ```json
@@ -193,6 +235,10 @@ cargo install --path pensyve-mcp
 }
 ```
 
-Now your agent has `pensyve_recall`, `pensyve_remember`, `pensyve_forget`, `pensyve_inspect`, `pensyve_episode_start`, and `pensyve_episode_end` tools. No application code needed.
+The server exposes ten tools, including `pensyve_remember` for facts,
+`pensyve_recall` for search, and `pensyve_observe` for recording episode content.
+Starting and ending an episode alone does not capture the client's conversation.
+See the [MCP tool reference](../pensyve-mcp/README.md#tool-reference) for parameters
+and deletion snapshot behavior.
 
-**Result:** Agent memory via config, not code.
+**Result:** The client can call memory tools after loading the configuration.

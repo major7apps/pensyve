@@ -27,6 +27,15 @@ and there is no guaranteed response time. A pull request that adds a feature
 may be declined even if it is well made. Forks are welcome under the terms of
 the [license](LICENSE).
 
+## Historical research material
+
+Earlier release and research tools remain in the repository for reference.
+For example, `scripts/v2_1_release_gate.sh` and
+`pensyve-python/tests/test_footprint.py` refer to artifacts from the separate
+`pensyve-docs` repository. Those tools are outside the current build and
+`make check` workflow. Use [CONTRIBUTING.md](CONTRIBUTING.md) for current
+development instructions.
+
 ## Reporting a security issue
 
 Do not open a public issue. Follow [`SECURITY.md`](SECURITY.md): report the

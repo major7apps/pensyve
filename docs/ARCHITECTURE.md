@@ -1,5 +1,14 @@
 # Pensyve Architecture
 
+Pensyve stores agent memories outside an LLM's context window. Your application
+or MCP client saves facts and episode messages, retrieves relevant records, and
+passes those records to the model when needed. Storing memories does not train
+the model or automatically add them to every prompt.
+
+Pensyve runs locally or on your own server under Apache 2.0. See the
+[maintenance policy](../MAINTENANCE.md) for the current project status and the
+[getting started guide](GETTING_STARTED.md) for installation.
+
 ## System Overview
 
 ```
@@ -31,7 +40,7 @@
 │  │                                                    │          │
 │  │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐│          │
 │  │  │ FSRS     │  │Procedural│  │ Consolidation    ││          │
-│  │  │ Decay    │  │ Bayesian │  │ ("Dreaming")     ││          │
+│  │  │ Decay    │  │ Bayesian │  │ (promotion)      ││          │
 │  │  └──────────┘  └──────────┘  └──────────────────┘│          │
 │  │                                                    │          │
 │  │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐│          │
@@ -56,10 +65,10 @@
 | `pensyve-ts`          | TypeScript    | npm package (bun)       | REST API (HTTP)             |
 | `pensyve-go`          | Go            | Go module               | REST API (HTTP)             |
 | `pensyve-wasm`        | Rust          | cdylib (wasm-bindgen)   | — (standalone, not in workspace) |
-| `pensyve-vscode`      | TypeScript    | VS Code extension       | REST API (HTTP)             |
-| `pensyve-plugin`      | TypeScript    | Claude Code plugin      | MCP server                  |
+| `integrations/vscode` | TypeScript    | VS Code extension       | REST API (HTTP)             |
+| `integrations/claude-code` | Markdown + JSON | Claude Code plugin | MCP server              |
 | `pensyve_server`      | Python        | Shared Python utilities | pensyve (Python SDK)        |
-| `integrations/`       | Python        | Framework adapters      | pensyve (Python SDK)        |
+| `integrations/`       | Python, TypeScript, configuration | Framework adapters and client setup | Python SDK, REST, or MCP |
 
 ## Core Engine Modules (`pensyve-core/src/`)
 
@@ -70,11 +79,12 @@
 | `embedding.rs` | ONNX embeddings via `fastembed`; stored as raw f32 BLOBs |
 | `vector.rs` | Cosine-similarity primitives; shipping runtimes use storage-backed search rather than a resident corpus index |
 | `graph.rs` | Entity relationship graph via `petgraph`; BFS traversal for proximity scoring |
-| `retrieval.rs` | `RecallEngine` — 8-signal fusion with weighted sum, optional cross-encoder reranking (only when a reranker is configured), `QueryIntent` classifier |
+| `retrieval/engine.rs` | `RecallEngine` combines ranked signals with reciprocal rank fusion (RRF); cross-encoder reranking requires explicit configuration |
 | `decay.rs` | FSRS forgetting curve: `R(t, S) = (1 + t/(9*S))^(-1)` |
-| `consolidation.rs` | Background "dreaming": episodic-to-semantic promotion, decay, archival |
+| `consolidation/mod.rs` | Bounded episodic-to-semantic promotion and decay updates |
 | `procedural.rs` | Beta-binomial Bayesian reliability for action-outcome procedures |
-| `extraction.rs` | Tier 1 pattern-based fact extraction (regex, always runs) |
+| `extraction/mod.rs` | Pattern-based extraction helpers; use depends on the calling pipeline |
+| `observation.rs` | Optional extraction of structured observations from episode messages |
 | `observability.rs` | Atomic metrics counters, Prometheus text export, `tracing` instrumentation |
 | `mesh.rs` | RBAC with Role (Owner/Writer/Reader), Visibility (Private/Shared/Public), ACL entries |
 | `types.rs` | Data model including `ContentType` enum (Text/Code/Image/ToolOutput/Structured) |
@@ -100,41 +110,59 @@ Single Rust/Axum binary serving REST (`/v1/*`) and MCP (`/mcp`) on port 3000:
 
 ```
 Namespace (isolation boundary)
-  └── Entity (agent | user | team | tool)
-        ├── Episodes (bounded interaction sequences)
-        │     └── Messages (role + content)
-        └── Memories
-              ├── Episodic (what happened — timestamped events)
-              ├── Semantic (what is known — fact triples with temporal validity)
-              └── Procedural (what works — action→outcome with Bayesian reliability)
+  ├── Entities (agent | user | team | tool)
+  ├── Episodes (interactions with participant entities and an outcome)
+  └── Memories
+        ├── Episodic (messages/events linked to an episode and entities)
+        ├── Semantic (subject-predicate-object facts with temporal validity)
+        ├── Procedural (stored procedures with trial counts and reliability)
+        └── Observation (structured facts derived from episode messages)
 ```
+
+Procedural memories belong to a namespace and have no entity linkage. Python
+episode messages and MCP `pensyve_observe` calls create episodic memories.
+Structured `Observation` records are a separate type produced by an explicitly
+configured observation extractor.
 
 ### Memory Lifecycle
 
 ```
 1. INGEST
-   Message → Tier 1 extraction (patterns, always) → Episodic memory created
-           → Tier 2 extraction (LLM, if configured) → Richer facts extracted
-           → Embed via ONNX → Atomically save source + immutable embedding generation
+   Python episode message or MCP observe → Episodic memory
+   Explicit remember call → Semantic memory
+   Configured observation extractor → Structured observation records
+   When semantic search is active → Embed via ONNX
+                                 → Save source + immutable embedding generation atomically
 
 2. RETRIEVE
    Query → Embed query
          → Storage-backed exact vector search (cosine similarity)
          → BM25 search (FTS5 lexical matching)
          → Graph traversal (petgraph BFS from entity)
-         → Fusion scoring (8-signal weighted sum)
+         → Reciprocal rank fusion (available ranked signals)
          → Cross-encoder reranking (top-20; only when a reranker is configured)
-         → FSRS reinforcement (accessed memories strengthened)
+         → Best-effort FSRS reinforcement of returned episodic memories
          → Return ranked results
 
-3. CONSOLIDATE ("Dreaming" — background)
-   → Promote repeated episodic facts to semantic memories
-   → Apply FSRS decay (reduce stability of unaccessed memories)
-   → Archive memories below retrievability threshold
-   → Update Bayesian reliability on procedural memories
+3. CONSOLIDATE (explicit call or supported post-episode trigger)
+   → Promote clusters of similar episodic records to semantic memories
+   → Recompute episodic retrievability and reduce stability below the threshold
+   → Reduce reliability for sufficiently stale, low-reliability procedures
+   → Return completion status and counts; retained rows are not deleted
 ```
 
+Python callers invoke `p.consolidate()` explicitly. MCP episode closure schedules
+consolidation in the background. An episode outcome alone does not create a
+procedure or update its Bayesian trial counts. The `archived` result counter
+reports decay updates below the threshold; consolidation does not move rows to
+a separate archive or guarantee a bound on database size.
+
 ## Retrieval Scoring Formula
+
+The engine uses reciprocal rank fusion, which adds each contributing signal's
+`weight / (k + rank)` for a candidate. It adjusts `k` for the candidate count
+and excludes rankings with no discriminating signal. The default signal slots
+and weights are:
 
 ```text
 slot 1: vector_similarity       (1.0)
@@ -146,6 +174,22 @@ slot 6: confidence              (0.5)  — reliability
 slot 7: entity_affinity         (1.2)  — entity-scoped boost
 slot 8: ppr                     (1.0)  — Personalized PageRank (Phase 2C, opt-in)
 ```
+
+Signal availability depends on the stored data and configured engine features.
+When Personalized PageRank contributes, the engine disables the graph BFS
+weight for that query to avoid counting graph evidence twice. Cross-encoder
+reranking is disabled by default in the Python SDK, CLI, and MCP server.
+
+## Local models and network access
+
+SQLite stores memory locally, and ONNX inference runs locally. Uncached models
+may download from Hugging Face when first loaded. Prepare the model cache before
+running without internet access. The stdio MCP server resolves embedding
+provenance during startup, which loads its model even when the embedder was
+constructed lazily. The Python SDK and HTTP gateway also load embedding models
+during construction or startup. Optional LLM extraction and remote clients use their configured
+endpoints. See the [MCP model configuration](../pensyve-mcp/README.md#embedder-selection)
+and [self-hosting guide](self-host.md) for deployment details.
 
 ## Bounded Retrieval and Embedding Generations
 
@@ -189,7 +233,7 @@ corpus-wide working-set assumption.
 
 ## Storage Schema
 
-SQLite with WAL mode. Tables: `namespaces`, `entities`, `episodes`, `episodic_memories`, `semantic_memories`, `procedural_memories`, `edges`, `memory_fts` (FTS5 virtual table).
+SQLite uses WAL mode. Core tables include `namespaces`, `entities`, `episodes`, `episodic_memories`, `semantic_memories`, `procedural_memories`, `observation_memories`, `edges`, and `memory_fts` (an FTS5 virtual table).
 
 - UUIDs stored as TEXT
 - Embeddings stored as BLOB (raw f32 bytes)
@@ -202,17 +246,31 @@ SQLite with WAL mode. Tables: `namespaces`, `entities`, `episodes`, `episodic_me
 
 Forgetting curve: `R(t, S) = (1 + t / (9 * S))^(-1)`
 
-Every retrieval reinforces stability. Memories never accessed gradually decay. Consolidation archives memories below the retrievability threshold.
+Recall attempts to reinforce the stability of returned episodic memories and
+record their access. Consolidation recomputes episodic retrievability from elapsed
+time and reduces stability below the configured threshold. Semantic memories are
+not changed by the current decay pass.
 
 ### Bayesian Procedural Reliability
 
 Beta-binomial posterior: `reliability = (successes + 1) / (trials + 2)`
 
-Procedures start at 0.5 (uninformative prior). Success increases reliability, failure decreases it. Procedures with reliability < 0.1 after 10+ trials are pruned.
+The core's `procedural::update_reliability` function starts with a 0.5 prior.
+Callers supply trial outcomes to update reliability. The core also provides a
+`should_prune` helper with caller-selected thresholds, but shipping episode and
+consolidation paths do not automatically create or prune procedures.
 
 ### Consolidation
 
-Episodic→Semantic promotion: facts appearing in 2+ episodes (cosine similarity > 0.8) are promoted to semantic memories with confidence proportional to mention count.
+The current implementation promotes clusters of at least two similar episodic
+records, using cosine similarity greater than 0.8. The records need not come from
+different episodes. Confidence is `min(member_count * 0.3, 1.0)`; the promoted
+record uses the latest member's content. Similarity and mention count do not
+establish that a fact is true.
+
+The [retrieval engine](../pensyve-core/src/retrieval/engine.rs),
+[consolidation engine](../pensyve-core/src/consolidation/mod.rs), and
+[procedural helpers](../pensyve-core/src/procedural.rs) define the current behavior.
 
 ## Tooling
 

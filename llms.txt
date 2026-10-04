@@ -1,139 +1,57 @@
 # Pensyve
 
-> Universal memory runtime for AI agents. Framework-agnostic, protocol-native, offline-first.
+> Pensyve provides persistent AI agent memory through Python, an MCP memory server, and a self-hosted HTTP gateway. It is licensed under Apache 2.0.
 
-Pensyve gives AI agents persistent, cognitive memory that spans across sessions. It remembers decisions, learned patterns, debugging outcomes, and project context — so agents never repeat the same investigation twice.
+Pensyve Cloud closed on October 1, 2026. The hosted dashboard, API, and MCP service
+are unavailable. The open-source project is in maintenance mode, with security
+fixes and dependency updates but no new features.
 
-## Core Concepts
+The Rust engine stores memories in SQLite by default, and the core has an
+optional Postgres backend. Python runs the engine in process. TypeScript and
+Go clients connect to a gateway that you host. MCP clients can run the local
+stdio server or connect to the gateway's `/mcp` endpoint.
 
-- **Three memory types**: Episodic (what happened), Semantic (what is known), Procedural (what works)
-- **8-signal fusion retrieval**: Vector similarity, BM25, graph proximity, intent classification, recency, access frequency, confidence, type boost
-- **FSRS forgetting curve**: Memories you use get stronger, unused ones fade naturally
-- **Consolidation**: Background "dreaming" promotes repeated episodic facts to semantic knowledge
-- **Offline-first**: SQLite + ONNX embeddings. No API keys needed for local use
-- **Scales out**: Postgres backend and a self-hostable HTTP gateway (`pensyve-mcp-gateway`)
+Local use needs no Pensyve account or API key. Embedding models may download
+from Hugging Face when first loaded, so prepare the model cache before running
+without internet access. Cross-encoder reranking is disabled by default.
 
-## Integration Options
+## Start here
 
-### MCP Server (Antigravity CLI, Claude Code, Cursor, Cline, Windsurf, Continue, VS Code Copilot)
+- [Project README](https://github.com/major7apps/pensyve/blob/main/README.md): Installation and examples for local Python, MCP, CLI, and a self-hosted gateway.
+- [Documentation index](https://github.com/major7apps/pensyve/blob/main/docs/README.md): Setup by client or framework, usage guides, and historical plans.
+- [Maintenance policy](https://github.com/major7apps/pensyve/blob/main/MAINTENANCE.md): Project status and contribution scope.
+- [Self-hosting guide](https://github.com/major7apps/pensyve/blob/main/docs/self-host.md): Gateway configuration, storage, authentication, and backups.
+- [Security policy](https://github.com/major7apps/pensyve/blob/main/SECURITY.md): Private vulnerability reporting.
 
-The MCP server exposes 10 tools: `pensyve_recall`, `pensyve_remember`, `pensyve_observe`, `pensyve_episode_start`, `pensyve_episode_end`, `pensyve_forget`, `pensyve_forget_memory`, `pensyve_inspect`, `pensyve_status`, `pensyve_account`.
+## SDKs and binaries
 
-**Local** (stdio, no API key):
-```json
-{
-  "mcpServers": {
-    "pensyve": {
-      "command": "pensyve-mcp",
-      "args": ["--stdio"]
-    }
-  }
-}
-```
+Install Python with `pip install pensyve`, TypeScript with
+`npm install @pensyve/sdk`, or Go with
+`go get github.com/major7apps/pensyve/pensyve-go/v5@latest`.
 
-Install: `cargo install --path pensyve-mcp` (from a checkout of the repo)
+From a repository checkout, install the MCP server with
+`cargo install --locked --path pensyve-mcp` and the CLI with
+`cargo install --locked --path pensyve-cli`. The executable names are
+`pensyve-mcp` and `pensyve`. Source builds require Rust 1.94 or later.
 
-### Claude Code Plugin
+- [Python SDK](https://github.com/major7apps/pensyve/blob/main/pensyve-python/README.md): Python 3.10 or later, local facts, episodes, grouped recall, consolidation, and deletion snapshots.
+- [TypeScript SDK](https://github.com/major7apps/pensyve/blob/main/pensyve-ts/src/index.ts): HTTP client API and types.
+- [Go SDK](https://github.com/major7apps/pensyve/blob/main/pensyve-go/client.go): HTTP client API. `NewClient` returns both a client and an error.
+- [MCP tools](https://github.com/major7apps/pensyve/blob/main/pensyve-mcp-tools/src/server.rs): Tool names, parameters, and handlers. Names use the `pensyve_` prefix.
 
-```
-/plugin marketplace add /path/to/pensyve/integrations/claude-code
-/plugin install pensyve@pensyve
-```
+## Plugins and integrations
 
-Provides 6 slash commands (`/remember`, `/recall`, `/forget`, `/inspect`, `/consolidate`, `/memory-status`), 4 skills, 2 agents, and 4 lifecycle hooks.
+- [Integration index](https://github.com/major7apps/pensyve/blob/main/integrations/README.md): Framework adapters and MCP client setup guides.
+- [Claude Code plugin](https://github.com/major7apps/pensyve/blob/main/integrations/claude-code/README.md): Local MCP and self-hosted gateway configuration.
+- [Codex plugin](https://github.com/major7apps/pensyve/blob/main/integrations/codex-plugin/README.md): Plugin installation and local stdio setup.
+- [Antigravity CLI plugin](https://github.com/major7apps/pensyve/blob/main/integrations/antigravity-plugin/README.md): Plugin and MCP configuration.
 
-### Antigravity CLI Plugin
+For other common setups, use the [Cursor guide](https://github.com/major7apps/pensyve/blob/main/integrations/cursor/README.md)
+or the [LangChain and LangGraph guide](https://github.com/major7apps/pensyve/blob/main/integrations/langchain/README.md).
 
-```bash
-agy plugin install https://github.com/major7apps/pensyve/tree/main/integrations/antigravity-plugin
-```
+## Development and reference
 
-Provides 8 working-memory rules, 8 skills, and a local stdio MCP definition (`pensyve-mcp --stdio`, no API key). Open `/mcp` in Antigravity and select Pensyve. Full setup: [Antigravity plugin README](https://github.com/major7apps/pensyve/blob/main/integrations/antigravity-plugin/README.md).
-
-### Python SDK (PyO3, zero-overhead)
-
-```bash
-pip install pensyve
-```
-
-```python
-import pensyve
-
-p = pensyve.Pensyve(namespace="my-agent")
-entity = p.entity("user", kind="user")
-p.remember(entity=entity, fact="User prefers Python", confidence=0.95)
-results = p.recall("programming language", entity=entity)
-
-with p.episode(entity) as ep:
-    ep.message("user", "Can you fix the login bug?")
-    ep.message("agent", "Fixed — session token was expiring early")
-    ep.outcome("success")
-```
-
-### TypeScript SDK (HTTP client)
-
-```bash
-npm install pensyve
-```
-
-```typescript
-import { Pensyve } from "pensyve";
-
-const p = new Pensyve({ baseUrl: "http://localhost:3000", apiKey: "psy_..." });
-await p.remember({ entity: "user", fact: "Prefers TypeScript", confidence: 0.9 });
-const memories = await p.recall("preferences", { entity: "user" });
-```
-
-### Go SDK
-
-```bash
-go get github.com/major7apps/pensyve/pensyve-go/v5@latest
-```
-
-```go
-import pensyve "github.com/major7apps/pensyve/pensyve-go/v5"
-
-client := pensyve.NewClient(pensyve.Config{BaseURL: "http://localhost:3000", APIKey: "psy_..."})
-client.Remember(ctx, "user", "Prefers Go", 0.9)
-memories, _ := client.Recall(ctx, "preferences", nil)
-```
-
-### REST API
-
-```bash
-cargo build --release --bin pensyve-mcp-gateway
-./target/release/pensyve-mcp-gateway  # listens on 0.0.0.0:3000
-```
-
-Endpoints: `POST /v1/recall`, `POST /v1/remember`, `POST /v1/inspect`, `POST /v1/consolidate`, `POST /v1/entities`, `DELETE /v1/entities/{name}`, `GET /v1/stats`, `GET /v1/health`
-
-### Framework Integrations
-
-- **LangChain/LangGraph** (Python): `PensyveStore` — drop-in BaseStore replacement. `pip install pensyve-langchain`
-- **LangChain.js/LangGraph.js** (TypeScript): `@pensyve/langchain`
-- **CrewAI**: `PensyveMemory` — drop-in memory backend
-- **AutoGen**: `PensyveMemory` — implements AutoGen Memory ABC
-- **OpenClaw**: Native plugin with auto-recall and auto-capture hooks
-- **OpenCode**: Native plugin with system prompt injection
-
-All framework integrations auto-detect local vs remote (self-hosted gateway) mode based on `PENSYVE_API_KEY`.
-
-## Authentication
-
-Set the `PENSYVE_API_KEY` environment variable to talk to a self-hosted `pensyve-mcp-gateway`; the keys are the ones you configure on the gateway (`PENSYVE_API_KEYS`). Not needed for local mode.
-
-## Key URLs
-
-- GitHub: https://github.com/major7apps/pensyve
-- Docs: https://github.com/major7apps/pensyve/tree/main/docs
-- Self-hosting: https://github.com/major7apps/pensyve/blob/main/docs/self-host.md (MCP at `http://localhost:3000/mcp`, REST at `http://localhost:3000`)
-
-## Documentation
-
-- [README](https://github.com/major7apps/pensyve/blob/main/README.md) — Overview, install, quickstart for all SDKs
-- [Architecture](https://github.com/major7apps/pensyve/blob/main/docs/ARCHITECTURE.md) — System design, data model, retrieval pipeline
-- [Getting Started](https://github.com/major7apps/pensyve/blob/main/docs/GETTING_STARTED.md) — Per-language setup guides
-- [Claude Code Plugin](https://github.com/major7apps/pensyve/blob/main/integrations/claude-code/README.md)
-- [Codex Plugin](https://github.com/major7apps/pensyve/blob/main/integrations/codex-plugin/README.md)
-- [Antigravity CLI Plugin](https://github.com/major7apps/pensyve/blob/main/integrations/antigravity-plugin/README.md)
-- [CHANGELOG](https://github.com/major7apps/pensyve/blob/main/CHANGELOG.md)
+- [Contributing](https://github.com/major7apps/pensyve/blob/main/CONTRIBUTING.md): Development setup and checks.
+- [Architecture](https://github.com/major7apps/pensyve/blob/main/docs/ARCHITECTURE.md): Engine components and data flow.
+- [Changelog](https://github.com/major7apps/pensyve/blob/main/CHANGELOG.md): Release history.
+- [License](https://github.com/major7apps/pensyve/blob/main/LICENSE): Apache 2.0 terms.

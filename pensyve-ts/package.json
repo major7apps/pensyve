@@ -1,7 +1,7 @@
 {
   "name": "@pensyve/sdk",
   "version": "5.0.0",
-  "description": "Pensyve TypeScript SDK — universal memory runtime for AI agents",
+  "description": "TypeScript client for a self-hosted Pensyve agent memory gateway",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
