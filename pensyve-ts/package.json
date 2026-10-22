@@ -44,7 +44,7 @@
     "eslint": "^10.11.0",
     "jiti": "^2.7.0",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.71.0"
+    "typescript-eslint": "^8.71.2"
   },
   "license": "Apache-2.0",
   "author": "Major7 Apps",
