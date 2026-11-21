@@ -296,7 +296,7 @@ pub struct ForgetOutcome {
     pub artifact: Option<SnapshotArtifact>,
     /// What retention evicted from this namespace's directory afterwards, and
     /// anything that went wrong doing it. Never affects whether the delete
-    /// happened — see [`prune_namespace_dir`].
+    /// happened — see [`PruneOutcome::warnings`].
     pub pruned: PruneOutcome,
 }
 
@@ -473,7 +473,7 @@ fn snapshot_root_from(configured: Option<std::ffi::OsString>, storage_root: &Pat
     configured.map_or_else(|| storage_root.join("snapshots"), PathBuf::from)
 }
 
-/// What a [`prune_namespace_dir`] pass did.
+/// What snapshot retention removed and any problems it encountered.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PruneOutcome {
     pub removed: usize,
@@ -715,7 +715,13 @@ fn increment_counts(counts: &mut SnapshotCounts, memory: &Memory) {
 ///
 /// `retention` bounds what that directory accumulates. It is applied *after*
 /// the delete has committed with its new snapshot on disk, and it can only
-/// report problems, never cause them: see [`prune_namespace_dir`].
+/// report problems through [`PruneOutcome::warnings`].
+///
+/// Standalone pruning would bypass the namespace lock held during forget.
+///
+/// ```compile_fail,E0432
+/// use pensyve_core::snapshot::prune_namespace_dir;
+/// ```
 pub fn forget_entity_bounded(
     storage: &dyn StorageTrait,
     entity_id: Uuid,
@@ -870,6 +876,13 @@ fn forget_entity_bounded_with(
     })
 }
 
+/// The real removal retention performs, named so it has the `for<'a>` signature
+/// the injection point takes (`std::fs::remove_file` is generic over its path
+/// argument and does not coerce to one on its own).
+fn remove_snapshot_file(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
+}
+
 /// Evict snapshots from one namespace directory until it satisfies `policy`,
 /// oldest first.
 ///
@@ -890,27 +903,6 @@ fn forget_entity_bounded_with(
 ///   directory, and a subdirectory is never descended into.
 /// - Age is the snapshot's own `captured_at`, read from the name, never the
 ///   file's mtime — see [`parse_snapshot_file_name`].
-///
-/// Takes no namespace lock, so a caller pruning a directory a live namespace is
-/// still forgetting into bypasses the serialization [`namespace_lock`] provides
-/// and can evict a snapshot a concurrent [`forget_entity_bounded`] just wrote.
-pub fn prune_namespace_dir(
-    dir: &Path,
-    policy: RetentionPolicy,
-    now: DateTime<Utc>,
-) -> PruneOutcome {
-    prune_namespace_dir_with(dir, policy, now, None, remove_snapshot_file)
-}
-
-/// The real removal retention performs, named so it has the `for<'a>` signature
-/// the injection point takes (`std::fs::remove_file` is generic over its path
-/// argument and does not coerce to one on its own).
-fn remove_snapshot_file(path: &Path) -> std::io::Result<()> {
-    std::fs::remove_file(path)
-}
-
-/// [`prune_namespace_dir`] with the file removal injected, and with one file in
-/// the directory declared off-limits.
 ///
 /// `protected` is the snapshot the calling [`forget_entity_bounded`] just wrote. It
 /// cannot be left to survive on its ordering: that only holds while every other
@@ -1900,6 +1892,14 @@ mod tests {
 
     fn epoch() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+    }
+
+    fn prune_namespace_dir(
+        dir: &Path,
+        policy: RetentionPolicy,
+        now: DateTime<Utc>,
+    ) -> PruneOutcome {
+        prune_namespace_dir_with(dir, policy, now, None, remove_snapshot_file)
     }
 
     /// Eviction order comes from the snapshot's own `captured_at`, never from
@@ -3129,7 +3129,7 @@ mod tests {
             .split_once("fn forget_entity_bounded_with(")
             .expect("streamed forget implementation")
             .1
-            .split_once("pub fn prune_namespace_dir(")
+            .split_once("fn remove_snapshot_file(")
             .expect("streamed forget implementation terminator")
             .0;
         let restore = source
