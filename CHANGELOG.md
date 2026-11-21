@@ -32,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PostgreSQL embedding migration state changes can complete with a one-connection
   pool. Previously a migration could time out waiting for a second connection
   while still holding the first.
+- The packed TypeScript SDK now loads directly in Node.js ES modules.
+- Restored the official Apache License 2.0 text in the project and integration
+  packages.
 
 ### Dependencies
 
