@@ -65,6 +65,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Run core snapshot tests
         run: 'cargo test --locked -p pensyve-core --lib snapshot::tests::'
+      - name: Verify the Windows write-through regression test detects an omitted flag
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $file = (Resolve-Path 'pensyve-core/src/snapshot/windows.rs').Path
+          $source = [IO.File]::ReadAllText($file)
+          $mutant = $source.Replace('let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;',
+                                    'let flags = MOVEFILE_REPLACE_EXISTING;')
+          if ($mutant -eq $source) { throw 'Could not locate the write-through move flags' }
+          try {
+            [IO.File]::WriteAllText($file, $mutant)
+            $test = 'snapshot::tests::windows_both_writers_require_a_write_through_move'
+            $log = cargo test --locked -p pensyve-core --lib $test -- --exact 2>&1
+            if ($LASTEXITCODE -ne 101 -or ($log -join "`n") -notmatch 'publication must request MOVEFILE_WRITE_THROUGH') {
+              $log | Write-Output
+              throw 'Expected the missing write-through flag to fail the publication assertion'
+            }
+            Write-Output 'The regression test detected the omitted write-through flag.'
+          } finally {
+            [IO.File]::WriteAllText($file, $source)
+          }
+          exit 0
 
   test-rust-postgres:
     name: Rust Tests (postgres)
