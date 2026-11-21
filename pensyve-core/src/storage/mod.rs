@@ -10,6 +10,7 @@ use crate::types::{
 
 pub mod bounded;
 pub mod consolidation_workspace;
+mod erasure;
 pub mod sqlite;
 
 #[cfg(feature = "postgres")]

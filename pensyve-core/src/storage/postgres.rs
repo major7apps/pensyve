@@ -2087,6 +2087,22 @@ async fn lock_namespace_embedding_serialization_pg_tx(
     Ok(())
 }
 
+// Cluster membership updates lock the run before touching its assignments.
+// The caller holds the namespace lock used when populating a run.
+async fn lock_erasure_runs_pg_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    namespace_id: Uuid,
+) -> StorageResult<()> {
+    query::<Postgres>(
+        "SELECT run_id FROM consolidation_runs WHERE namespace_id = $1 ORDER BY run_id FOR UPDATE",
+    )
+    .bind(namespace_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(sqlx_to_io)?;
+    Ok(())
+}
+
 async fn validate_active_embedding_write_pg_tx(
     transaction: &mut Transaction<'_, Postgres>,
     memory: &Memory,
@@ -5250,6 +5266,15 @@ impl StorageTrait for PostgresBackend {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
             lock_namespace_embedding_serialization_pg_tx(&mut tx, namespace_id).await?;
+            lock_erasure_runs_pg_tx(&mut tx, namespace_id).await?;
+            for sql in super::erasure::ENTITY_BOOKKEEPING {
+                query::<Postgres>(sql)
+                    .bind(namespace_id)
+                    .bind(entity_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(sqlx_to_io)?;
+            }
             let mut erased = ErasedRows::default();
 
             // Leg 1 — observations. MUST precede the episodic delete: the only
@@ -5464,6 +5489,15 @@ impl StorageTrait for PostgresBackend {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
             lock_namespace_embedding_serialization_pg_tx(&mut tx, namespace_id).await?;
+            lock_erasure_runs_pg_tx(&mut tx, namespace_id).await?;
+            for sql in super::erasure::ENTITY_BOOKKEEPING {
+                query::<Postgres>(sql)
+                    .bind(namespace_id)
+                    .bind(entity_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(sqlx_to_io)?;
+            }
             query::<Postgres>(
                 "DELETE FROM memory_embeddings
                  WHERE namespace_id = $2 AND memory_type = 'observation'
@@ -5684,6 +5718,14 @@ impl StorageTrait for PostgresBackend {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
             lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
+            lock_erasure_runs_pg_tx(&mut transaction, namespace_id).await?;
+            for sql in super::erasure::NAMESPACE_BOOKKEEPING {
+                query::<Postgres>(sql)
+                    .bind(namespace_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(sqlx_to_io)?;
+            }
             let mut removed = [0usize; 8];
 
             for (slot, sql) in removed.iter_mut().zip([
@@ -6148,6 +6190,7 @@ impl ConsolidationWorkspace for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut tx = conn.begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut tx, namespace_id).await?;
             let lifecycle = query_as::<Postgres, (String, Option<String>)>(
                 "SELECT state, active_read_space_id FROM namespace_embedding_state
                  WHERE namespace_id = $1 FOR UPDATE",

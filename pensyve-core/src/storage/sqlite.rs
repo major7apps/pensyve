@@ -278,6 +278,25 @@ impl SqliteBackend {
         conn.execute_batch(SCHEMA)?;
         Self::run_migrations(&conn)?;
         Self::run_versioned_migrations(&conn)?;
+        // Access history is keyed by ID alone. On bulk and individual deletes,
+        // its timestamps disappear with the last owner across all namespaces.
+        for table in [
+            "episodic_memories",
+            "semantic_memories",
+            "procedural_memories",
+            "observation_memories",
+        ] {
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER IF NOT EXISTS {table}_delete_accesses AFTER DELETE ON {table}
+                 BEGIN
+                     DELETE FROM memory_accesses WHERE memory_id = OLD.id
+                       AND NOT EXISTS (SELECT 1 FROM episodic_memories WHERE id = OLD.id)
+                       AND NOT EXISTS (SELECT 1 FROM semantic_memories WHERE id = OLD.id)
+                       AND NOT EXISTS (SELECT 1 FROM procedural_memories WHERE id = OLD.id)
+                       AND NOT EXISTS (SELECT 1 FROM observation_memories WHERE id = OLD.id);
+                 END;"
+            ))?;
+        }
         Ok(())
     }
 
@@ -5513,6 +5532,9 @@ impl StorageTrait for SqliteBackend {
         conn.execute_batch("BEGIN")?;
 
         let result = (|| -> StorageResult<ErasedRows> {
+            for sql in super::erasure::ENTITY_BOOKKEEPING {
+                conn.execute(sql, params![&ns_str, &id_str])?;
+            }
             // Leg 1 — observations. MUST precede the episodic delete: the only
             // link from an observation back to the entity runs through
             // `episodic_memories.about_entity / source_entity`, and once those
@@ -5651,6 +5673,9 @@ impl StorageTrait for SqliteBackend {
         let namespace = namespace_id.to_string();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
+            for sql in super::erasure::ENTITY_BOOKKEEPING {
+                conn.execute(sql, params![&namespace, &id])?;
+            }
             let observation_relation = "SELECT o.id FROM observation_memories AS o
                  WHERE o.namespace_id = ?2 AND o.episode_id IN (
                      SELECT DISTINCT e.episode_id FROM episodic_memories AS e
@@ -5761,6 +5786,9 @@ impl StorageTrait for SqliteBackend {
         conn.execute_batch("BEGIN")?;
 
         let result = (|| -> StorageResult<NamespacePurgeSummary> {
+            for sql in super::erasure::NAMESPACE_BOOKKEEPING {
+                conn.execute(sql, params![&ns_str])?;
+            }
             // Phase 2B cascade (CodeRabbit PR #115 round 2): purge the
             // KG before the owning observation rows are gone. Order:
             //   1. kg_passage_entities (no namespace column → must
@@ -6657,7 +6685,9 @@ impl ConsolidationWorkspace for SqliteBackend {
              SET assignment_anchor = ?2, assignment_state = 'tentative'
              WHERE run_id = ?1 AND memory_id = ?3
                AND (assignment_state = 'unassigned'
-                    OR assignment_anchor = ?2)",
+                    OR assignment_anchor = ?2)
+               AND EXISTS (SELECT 1 FROM consolidation_sources AS anchor
+                           WHERE anchor.run_id = ?1 AND anchor.memory_id = ?2)",
             params![&run, &anchor, &member],
         )?;
         if changed == 0 {
@@ -9483,6 +9513,99 @@ mod tests {
     // -----------------------------------------------------------------------
     // Namespace tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn bookkeeping_erasure_is_scoped() {
+        use crate::storage::erasure::{BOOKKEEPING_COUNTS, check_bookkeeping_erasure};
+
+        let (_dir, db) = setup();
+        check_bookkeeping_erasure(&db, |ns| {
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row(BOOKKEEPING_COUNTS, [ns.to_string()], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+        });
+    }
+
+    #[test]
+    fn bookkeeping_rolls_back_with_failed_erasure() {
+        let (_dir, db) = setup();
+        let ns = make_namespace(&db);
+        let entity = Uuid::new_v4();
+        let memory = Memory::Episodic(EpisodicMemory::new(
+            ns.id,
+            Uuid::new_v4(),
+            entity,
+            entity,
+            "rollback",
+        ));
+        let space = EmbeddingSpace::mock(2, "rollback-active");
+        db.initialize_local_runtime_space(ns.id, &space).unwrap();
+        let record = crate::storage::embedding_record_for_memory(&memory, &space, vec![1.0, 0.0]);
+        db.save_memory_with_embedding(&memory, Some(&record))
+            .unwrap();
+        db.begin_or_resume(ns.id, &space.id()).unwrap();
+        db.begin_embedding_migration(ns.id, &EmbeddingSpace::mock(2, "rollback-next"))
+            .unwrap();
+        let id = memory.id().to_string();
+        db.record_access(&id, 1.0).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER abort_erasure AFTER DELETE ON episodic_memories
+             BEGIN SELECT RAISE(ABORT, 'erase failed'); END;",
+            )
+            .unwrap();
+
+        assert!(db.erase_entity_capturing(entity, ns.id).is_err());
+        assert!(db.erase_entity_bounded(entity, ns.id).is_err());
+        assert!(db.purge_namespace(ns.id).is_err());
+        assert_eq!(db.get_access_times(&id, 1).unwrap(), [1.0]);
+        let counts: (i64, i64) = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                crate::storage::erasure::BOOKKEEPING_COUNTS,
+                [ns.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (1, 1));
+    }
+
+    #[test]
+    fn bookkeeping_access_history_survives_until_the_last_owner_is_erased() {
+        let (_dir, db) = setup();
+        let first = make_namespace(&db);
+        let other = Namespace::new("other");
+        db.save_namespace(&other).unwrap();
+        let entity = Uuid::new_v4();
+        let source = EpisodicMemory::new(first.id, Uuid::new_v4(), entity, entity, "source");
+        db.save_episodic(&source).unwrap();
+        let shared = source.id.to_string();
+        let mut survivor = SemanticMemory::new(other.id, entity, "kept", "other namespace", 1.0);
+        survivor.id = source.id;
+        db.save_semantic(&survivor).unwrap();
+        let unique = SemanticMemory::new(first.id, entity, "erase", "unique", 1.0);
+        db.save_semantic(&unique).unwrap();
+        for id in [&shared, &unique.id.to_string()] {
+            db.record_access(id, 1.0).unwrap();
+        }
+        db.erase_entity_bounded(entity, first.id).unwrap();
+        assert!(
+            db.get_access_times(&unique.id.to_string(), 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(db.get_access_times(&shared, 1).unwrap(), [1.0]);
+        db.purge_namespace(other.id).unwrap();
+        assert!(db.get_access_times(&shared, 1).unwrap().is_empty());
+    }
 
     #[test]
     fn test_namespace_roundtrip() {
