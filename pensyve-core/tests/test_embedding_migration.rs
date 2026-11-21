@@ -764,6 +764,69 @@ fn postgres_serial() -> std::sync::MutexGuard<'static, ()> {
 
 #[cfg(feature = "postgres")]
 #[test]
+fn postgres_inspect_returns_state_from_the_coverage_snapshot() {
+    use sqlx_core::acquire::Acquire;
+    use sqlx_core::query::query;
+    use sqlx_postgres::Postgres;
+
+    let Ok(database_url) = std::env::var("PENSYVE_TEST_DATABASE_URL") else {
+        eprintln!("skipped: PENSYVE_TEST_DATABASE_URL is unset");
+        return;
+    };
+    let _serial = postgres_serial();
+    let storage = pensyve_core::storage::PostgresBackend::new(&database_url).unwrap();
+    let reader = pensyve_core::storage::PostgresBackend::new(&database_url).unwrap();
+    let namespace = Namespace::new(format!("coverage-snapshot-{}", uuid::Uuid::new_v4()));
+    storage.save_namespace(&namespace).unwrap();
+    let space = EmbeddingSpace::mock(3, "snapshot");
+    storage
+        .begin_embedding_migration(namespace.id, &space)
+        .unwrap();
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _tokio = runtime.enter();
+    let mut conn = runtime.block_on(storage.pool().acquire()).unwrap();
+    runtime
+        .block_on(storage.set_namespace_config(&mut conn, namespace.id))
+        .unwrap();
+    let mut writer = runtime.block_on(conn.begin()).unwrap();
+    // The queue count follows the source scan. Block it until after a competing
+    // transaction changes the lifecycle phase, then let the inspection finish.
+    runtime
+        .block_on(
+            query::<Postgres>("LOCK TABLE embedding_backfill_queue IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *writer),
+        )
+        .unwrap();
+    let ns = namespace.id;
+    let inspector =
+        std::thread::spawn(move || reader.inspect_embedding_migration_coverage(ns, &space.id()));
+    wait_for_postgres_lock_wait(&storage, "COUNT(*) FROM embedding_backfill_queue");
+    runtime.block_on(async {
+        query::<Postgres>(
+            "UPDATE namespace_embedding_state SET state = 'ready' WHERE namespace_id = $1",
+        )
+        .bind(ns)
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+        writer.commit().await.unwrap();
+    });
+    let (coverage, state) = inspector.join().unwrap().unwrap();
+    assert!(coverage.complete());
+    assert_eq!(state.phase, NamespaceEmbeddingPhase::Backfilling);
+    assert_eq!(
+        storage
+            .get_namespace_embedding_state(ns)
+            .unwrap()
+            .unwrap()
+            .phase,
+        NamespaceEmbeddingPhase::Ready
+    );
+}
+
+#[cfg(feature = "postgres")]
+#[test]
 fn postgres_rollback_between_eligibility_and_vector_fetch_returns_unavailable() {
     use sqlx_core::acquire::Acquire;
     use sqlx_core::query::query;

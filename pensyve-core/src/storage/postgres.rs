@@ -1910,6 +1910,83 @@ async fn pg_migration_source_page(
     Ok(BulkPageGuard::new(refs, namespace_id, kind))
 }
 
+async fn read_namespace_embedding_state(
+    conn: &mut PgConnection,
+    namespace_id: Uuid,
+) -> StorageResult<Option<NamespaceEmbeddingState>> {
+    let row = query_as::<
+        Postgres,
+        (
+            Uuid,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            i64,
+            DateTime<Utc>,
+        ),
+    >(
+        "SELECT state.namespace_id, state.active_read_space_id,
+                state.target_space_id,
+                active.canonical_identity_json,
+                target.canonical_identity_json,
+                state.state, state.barrier_sequence, state.updated_at
+         FROM namespace_embedding_state AS state
+         LEFT JOIN embedding_spaces AS active
+           ON active.id = state.active_read_space_id
+         LEFT JOIN embedding_spaces AS target
+           ON target.id = state.target_space_id
+         WHERE state.namespace_id = $1",
+    )
+    .bind(namespace_id)
+    .fetch_optional(conn)
+    .await
+    .map_err(sqlx_to_io)?;
+    let Some((
+        stored_namespace,
+        active_id,
+        target_id,
+        active,
+        target,
+        phase,
+        barrier_sequence,
+        updated_at,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let parse_space = |json: Option<String>| -> StorageResult<Option<EmbeddingSpace>> {
+        json.map(|value| serde_json::from_str(&value).map_err(StorageError::from))
+            .transpose()
+    };
+    let state = NamespaceEmbeddingState {
+        namespace_id: stored_namespace,
+        active_read_space_id: active_id.map(EmbeddingSpaceId),
+        target_space_id: target_id.map(EmbeddingSpaceId),
+        active_read_space: parse_space(active)?,
+        target_space: parse_space(target)?,
+        phase: NamespaceEmbeddingPhase::parse(&phase)?,
+        barrier_sequence,
+        updated_at,
+    };
+    state.validate_joined_space_identities()?;
+    Ok(Some(state))
+}
+
+// Capture the result inside the same transaction as the writes or coverage scan.
+// A second checkout could observe the next writer, or exhaust a pool of one.
+async fn finish_embedding_state_transaction(
+    mut transaction: Transaction<'_, Postgres>,
+    namespace_id: Uuid,
+) -> Result<NamespaceEmbeddingState, MigrationError> {
+    let state = read_namespace_embedding_state(&mut transaction, namespace_id)
+        .await?
+        .ok_or_else(|| StorageError::NotFound(format!("embedding state {namespace_id}")))?;
+    transaction.commit().await.map_err(sqlx_to_io)?;
+    Ok(state)
+}
+
 async fn pg_migration_coverage(
     conn: &mut PgConnection,
     namespace_id: Uuid,
@@ -2355,64 +2432,7 @@ impl StorageTrait for PostgresBackend {
     ) -> StorageResult<Option<NamespaceEmbeddingState>> {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
-            let row = query_as::<
-                Postgres,
-                (
-                    Uuid,
-                    Option<String>,
-                    Option<String>,
-                    Option<String>,
-                    Option<String>,
-                    String,
-                    i64,
-                    DateTime<Utc>,
-                ),
-            >(
-                "SELECT state.namespace_id, state.active_read_space_id,
-                        state.target_space_id,
-                        active.canonical_identity_json,
-                        target.canonical_identity_json,
-                        state.state, state.barrier_sequence, state.updated_at
-                 FROM namespace_embedding_state AS state
-                 LEFT JOIN embedding_spaces AS active
-                   ON active.id = state.active_read_space_id
-                 LEFT JOIN embedding_spaces AS target
-                   ON target.id = state.target_space_id
-                 WHERE state.namespace_id = $1",
-            )
-            .bind(namespace_id)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(sqlx_to_io)?;
-            let Some((
-                stored_namespace,
-                active_id,
-                target_id,
-                active,
-                target,
-                phase,
-                barrier_sequence,
-                updated_at,
-            )) = row
-            else {
-                return Ok(None);
-            };
-            let parse_space = |json: Option<String>| -> StorageResult<Option<EmbeddingSpace>> {
-                json.map(|value| serde_json::from_str(&value).map_err(StorageError::from))
-                    .transpose()
-            };
-            let state = NamespaceEmbeddingState {
-                namespace_id: stored_namespace,
-                active_read_space_id: active_id.map(EmbeddingSpaceId),
-                target_space_id: target_id.map(EmbeddingSpaceId),
-                active_read_space: parse_space(active)?,
-                target_space: parse_space(target)?,
-                phase: NamespaceEmbeddingPhase::parse(&phase)?,
-                barrier_sequence,
-                updated_at,
-            };
-            state.validate_joined_space_identities()?;
-            Ok(Some(state))
+            read_namespace_embedding_state(&mut conn, namespace_id).await
         })
     }
 
@@ -2480,12 +2500,7 @@ impl StorageTrait for PostgresBackend {
                 && phase == "backfilling"
                 && target.as_deref() == Some(target_id.0.as_str())
             {
-                transaction.commit().await.map_err(sqlx_to_io)?;
-                return self
-                    .get_namespace_embedding_state(namespace_id)?
-                    .ok_or_else(|| {
-                        StorageError::Context("migration state disappeared".into()).into()
-                    });
+                return finish_embedding_state_transaction(transaction, namespace_id).await;
             }
             let phase =
                 existing
@@ -2572,11 +2587,7 @@ impl StorageTrait for PostgresBackend {
             .execute(&mut *transaction)
             .await
             .map_err(sqlx_to_io)?;
-            transaction.commit().await.map_err(sqlx_to_io)?;
-            self.get_namespace_embedding_state(namespace_id)?
-                .ok_or_else(|| {
-                    StorageError::Context("migration state commit disappeared".into()).into()
-                })
+            finish_embedding_state_transaction(transaction, namespace_id).await
         })
     }
 
@@ -2790,20 +2801,23 @@ impl StorageTrait for PostgresBackend {
         namespace_id: Uuid,
         target_space_id: &EmbeddingSpaceId,
     ) -> Result<(MigrationCoverage, NamespaceEmbeddingState), MigrationError> {
-        let coverage = self.block_on(async {
+        self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
-            pg_migration_coverage(
-                &mut conn,
+            let mut transaction = conn.begin().await.map_err(sqlx_to_io)?;
+            query::<Postgres>("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_to_io)?;
+            let coverage = pg_migration_coverage(
+                &mut transaction,
                 namespace_id,
                 target_space_id,
                 BulkPageKind::EmbeddingMigrationVerify,
             )
-            .await
-        })?;
-        let state = self
-            .get_namespace_embedding_state(namespace_id)?
-            .ok_or_else(|| StorageError::NotFound(format!("embedding state {namespace_id}")))?;
-        Ok((coverage, state))
+            .await?;
+            let state = finish_embedding_state_transaction(transaction, namespace_id).await?;
+            Ok((coverage, state))
+        })
     }
 
     fn verify_embedding_migration(
@@ -2811,7 +2825,7 @@ impl StorageTrait for PostgresBackend {
         namespace_id: Uuid,
         target_space_id: &EmbeddingSpaceId,
     ) -> Result<(MigrationCoverage, NamespaceEmbeddingState), MigrationError> {
-        let coverage = self.block_on(async {
+        self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
             lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
@@ -2871,13 +2885,9 @@ impl StorageTrait for PostgresBackend {
                 .await
                 .map_err(sqlx_to_io)?;
             }
-            transaction.commit().await.map_err(sqlx_to_io)?;
-            Ok(coverage)
-        })?;
-        let state = self
-            .get_namespace_embedding_state(namespace_id)?
-            .ok_or_else(|| StorageError::Context("verified migration state disappeared".into()))?;
-        Ok((coverage, state))
+            let state = finish_embedding_state_transaction(transaction, namespace_id).await?;
+            Ok((coverage, state))
+        })
     }
 
     fn activate_embedding_migration(
@@ -2941,11 +2951,7 @@ impl StorageTrait for PostgresBackend {
             .execute(&mut *transaction)
             .await
             .map_err(sqlx_to_io)?;
-            transaction.commit().await.map_err(sqlx_to_io)?;
-            self.get_namespace_embedding_state(namespace_id)?
-                .ok_or_else(|| {
-                    StorageError::Context("activated migration state disappeared".into()).into()
-                })
+            finish_embedding_state_transaction(transaction, namespace_id).await
         })
     }
 
@@ -2997,11 +3003,7 @@ impl StorageTrait for PostgresBackend {
                 .execute(&mut *transaction)
                 .await
                 .map_err(sqlx_to_io)?;
-            transaction.commit().await.map_err(sqlx_to_io)?;
-            self.get_namespace_embedding_state(namespace_id)?
-                .ok_or_else(|| {
-                    StorageError::Context("rolled back migration state disappeared".into()).into()
-                })
+            finish_embedding_state_transaction(transaction, namespace_id).await
         })
     }
 
