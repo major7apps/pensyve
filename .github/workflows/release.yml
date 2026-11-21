@@ -422,9 +422,32 @@ jobs:
       - name: Collect release assets
         run: |
           mkdir -p release-assets
-          find artifacts/ -name "*.tar.gz" -o -name "*.zip" -o -name "*.whl" | while read f; do
-            cp "$f" release-assets/
+          # download-artifact patterns can succeed with only a subset of matches.
+          # Check each shipped asset before tagging Go or making the release public.
+          shopt -s nullglob
+          collect() {
+            if [[ $# -ne 1 || ! -f "$1" ]]; then
+              echo "::error::Expected exactly one matching release asset, found $#"
+              return 1
+            fi
+            cp -- "$1" release-assets/
+          }
+          version="${GITHUB_REF_NAME#v}"
+          for py in 3.10 3.11 3.12 3.13; do
+            abi="cp${py/./}"
+            for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc; do
+              collect artifacts/wheels-"$target"-"$py"/pensyve-"$version"-"$abi"-"$abi"-*.whl
+            done
           done
+          collect "artifacts/wheels-sdist/pensyve-$version.tar.gz"
+          for binary in pensyve-cli pensyve-mcp; do
+            for target in linux-amd64 macos-arm64; do
+              name="$binary-$target"
+              collect "artifacts/$name/$name.tar.gz"
+            done
+          done
+          collect artifacts/pensyve-cli-windows-amd64/pensyve-cli-windows-amd64.zip
+          collect artifacts/pensyve-codex-plugin/pensyve-codex-plugin-v*.tar.gz
       - name: Tag Go module
         run: |
           tag="pensyve-go/${GITHUB_REF_NAME}"
