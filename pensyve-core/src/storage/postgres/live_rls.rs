@@ -273,10 +273,6 @@ struct Fixture {
 
 impl Fixture {
     fn provision(admin_opts: &PgConnectOptions) -> Self {
-        Self::provision_with_connections(admin_opts, 1)
-    }
-
-    fn provision_with_connections(admin_opts: &PgConnectOptions, connections: u32) -> Self {
         let rt = Runtime::new().expect("build tokio runtime");
         let suffix = Uuid::new_v4().simple().to_string();
         let database = format!("pensyve_rls_{suffix}");
@@ -318,7 +314,7 @@ impl Fixture {
 
         // The unprivileged role applies the schema, so it owns every table.
         //
-        // One connection by default: a
+        // One connection, deliberately: a
         // single-connection pool guarantees that consecutive acquisitions get
         // the *same* physical backend. That is what lets
         // [`scoped_namespace_does_not_leak_into_the_next_checkout`] observe
@@ -327,7 +323,7 @@ impl Fixture {
         // reuse rather than a clean session.
         let app_pool = rt.block_on(async {
             PgPoolOptions::new()
-                .max_connections(connections)
+                .max_connections(1)
                 .connect_with(
                     admin_opts
                         .clone()
@@ -567,6 +563,41 @@ fn activate_namespace_space(fixture: &Fixture, namespace_id: Uuid, space: &str) 
         .await
         .expect("activate namespace embedding space");
     });
+}
+
+#[test]
+fn migration_lifecycle_uses_one_connection_and_returns_its_transition() {
+    let Some(admin_opts) =
+        skip_notice("migration_lifecycle_uses_one_connection_and_returns_its_transition")
+    else {
+        return;
+    };
+    let fixture = Fixture::provision(&admin_opts);
+    let db = &fixture.backend;
+    let namespace = Namespace::new("single-connection-migration");
+    let ns = namespace.id;
+    db.save_namespace(&namespace).unwrap();
+    let target = EmbeddingSpace::mock(3, "single-connection");
+    let id = target.id();
+
+    let started = db.begin_embedding_migration(ns, &target).unwrap();
+    assert_eq!(started.phase.as_str(), "backfilling");
+    assert_eq!(started.target_space, Some(target.clone()));
+    let resumed = db.begin_embedding_migration(ns, &target).unwrap();
+    assert_eq!(resumed.updated_at, started.updated_at);
+    let (coverage, inspected) = db.inspect_embedding_migration_coverage(ns, &id).unwrap();
+    assert!(coverage.complete());
+    assert_eq!(inspected.phase.as_str(), "backfilling");
+    let (coverage, verified) = db.verify_embedding_migration(ns, &id).unwrap();
+    assert!(coverage.complete());
+    assert_eq!(verified.phase.as_str(), "ready");
+    let active = db.activate_embedding_migration(ns, &id, &id).unwrap();
+    assert_eq!(active.phase.as_str(), "active");
+    assert_eq!(active.active_read_space, Some(target));
+    let rolled_back = db.rollback_embedding_migration_to_lexical(ns).unwrap();
+    assert_eq!(rolled_back.phase.as_str(), "lexical_only");
+    assert_eq!(rolled_back.active_read_space, None);
+    assert_eq!(rolled_back.target_space, None);
 }
 
 /// Moves one memory's only embedding to `space` behind the API on both
@@ -3772,9 +3803,8 @@ fn bookkeeping_erasure_is_scoped() {
     let Some(admin_opts) = skip_notice("bookkeeping_erasure_is_scoped") else {
         return;
     };
-    // Migration setup reads committed state on a second connection.
     for enforce_rls in [true, false] {
-        let fixture = Fixture::provision_with_connections(&admin_opts, 2);
+        let fixture = Fixture::provision(&admin_opts);
         if !enforce_rls {
             fixture.relax_rls();
         }
