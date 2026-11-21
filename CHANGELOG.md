@@ -7,20 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.0.0] - 2026-11-21
+
 ### Breaking
 
 - Removed `pensyve_core::snapshot::prune_namespace_dir`. Standalone pruning
   could remove the recovery snapshot while another thread was forgetting an
   entity. Pass a `RetentionPolicy` to `forget_entity_bounded` to prune under
   the same namespace lock as the snapshot write.
+- The Go SDK module path is now `github.com/major7apps/pensyve/pensyve-go/v6`.
+  Update your imports and run
+  `go get github.com/major7apps/pensyve/pensyve-go/v6@v6.0.0`.
 
 ### Fixed
 
-- **Go SDK module path is now `github.com/major7apps/pensyve/pensyve-go/v5`.** The
-  path was still `/v3`, so `go get` could not resolve the `pensyve-go/v4.0.0` and
-  `pensyve-go/v5.0.0` tags. Use `pensyve-go/v5.0.1` or later and update imports
-  from `/v3` to `/v5`. CI now fails if the module path's major version and the
-  release version disagree.
+- SQLite and PostgreSQL now erase embedding backfill queue entries and
+  consolidation records in the same transaction as the entity or namespace
+  they belong to. Surviving records no longer reference erased cluster anchors.
+- Windows now creates snapshot files and new directories with a protected ACL
+  granting access only to the effective user. Forget flushes the snapshot
+  and publishes it with a write-through rename. If the volume cannot enforce
+  the ACL, forget fails before deleting the memories. Check permissions on
+  existing directories and older snapshots separately.
+- PostgreSQL embedding migration state changes can complete with a one-connection
+  pool. Previously a migration could time out waiting for a second connection
+  while still holding the first.
+
+### Dependencies
+
+- The Rust embedding runtime uses fastembed 7.5.0. Existing embedding spaces
+  with older runtime provenance use lexical retrieval until a matching
+  embedding generation is active. See [embedding migration and degradation](docs/RELIABILITY.md#embedding-migration-and-degradation).
+- The Python development extra no longer installs the unused Python fastembed
+  package. Pensyve runs embeddings in Rust. The benchmark environment locks
+  `huggingface-hub` to 2.4.0.
+
+## [Go SDK 5.0.1] - 2026-10-01
+
+- Corrected the Go SDK module path from `/v3` to `/v5` so consumers could
+  resolve the v5 module. CI checks that the module suffix matches the release
+  major version.
 
 ## [5.0.0] - 2026-10-01
 

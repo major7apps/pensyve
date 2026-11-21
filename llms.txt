@@ -27,7 +27,7 @@ without internet access. Cross-encoder reranking is disabled by default.
 
 Install Python with `pip install pensyve`, TypeScript with
 `npm install @pensyve/sdk`, or Go with
-`go get github.com/major7apps/pensyve/pensyve-go/v5@latest`.
+`go get github.com/major7apps/pensyve/pensyve-go/v6@latest`.
 
 From a repository checkout, install the MCP server with
 `cargo install --locked --path pensyve-mcp` and the CLI with

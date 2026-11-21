@@ -190,7 +190,7 @@ when authentication is enabled, an API key from that gateway.
 | --- | --- |
 | Python | `pip install pensyve`, [SDK guide](pensyve-python/README.md) |
 | TypeScript | `npm install @pensyve/sdk`, [SDK guide](pensyve-ts/README.md) |
-| Go | `go get github.com/major7apps/pensyve/pensyve-go/v5@latest`, [SDK guide](pensyve-go/README.md) |
+| Go | `go get github.com/major7apps/pensyve/pensyve-go/v6@latest`, [SDK guide](pensyve-go/README.md) |
 | Claude Code | [Plugin setup](integrations/claude-code/README.md) |
 | Cursor | [MCP setup and rules](integrations/cursor/README.md) |
 | Codex | [Plugin setup](integrations/codex-plugin/README.md) |

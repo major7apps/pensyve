@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pensyve"
-version = "5.0.0"
+version = "6.0.0"
 description = "Persistent AI agent memory for Python with local SQLite storage"
 readme = "README.md"
 license = { text = "Apache-2.0" }

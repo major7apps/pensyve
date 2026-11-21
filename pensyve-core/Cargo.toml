@@ -1,6 +1,6 @@
 [package]
 name = "pensyve-core"
-version = "5.0.0"
+version = "6.0.0"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
