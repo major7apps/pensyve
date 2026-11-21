@@ -135,6 +135,13 @@ pub(super) fn check_bookkeeping_erasure(
             counts(ns),
             if bounded { (2, 1, 0, 1) } else { (1, 1, 0, 0) }
         );
+        assert!(
+            db.consolidation_workspace()
+                .unwrap()
+                .assignments(run, 8)
+                .unwrap()
+                .is_empty()
+        );
         // A consolidation worker holding an earlier page cannot reattach an
         // erased anchor to the surviving member.
         assert_eq!(

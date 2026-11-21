@@ -7223,6 +7223,7 @@ impl ConsolidationWorkspace for SqliteBackend {
         let mut stmt = conn.prepare(
             "SELECT assignment_anchor, memory_id FROM consolidation_sources
              WHERE run_id = ?1 AND assignment_state IN ('finalized', 'promoted')
+               AND assignment_anchor IS NOT NULL
              ORDER BY assignment_anchor, source_ordinal LIMIT ?2",
         )?;
         stmt.query_map(
