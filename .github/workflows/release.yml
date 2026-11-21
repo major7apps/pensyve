@@ -6,6 +6,7 @@ on:
     paths:
       - ".github/workflows/release.yml"
       - "scripts/windows-release-runtime.ps1"
+      - "scripts/prepare-manylinux-ort.sh"
   push:
     tags:
       - "v*"
@@ -43,7 +44,21 @@ jobs:
           # Linux builds run inside a manylinux container with its own interpreters.
           args: --locked --release --out dist --manifest-path pensyve-python/Cargo.toml --interpreter ${{ runner.os == 'Linux' && format('python{0}', matrix.python) || 'python' }}
           manylinux: "2_28"
-          before-script-linux: dnf install -y openssl-devel perl-IPC-Cmd
+          before-script-linux: |
+            dnf install -y openssl-devel perl-IPC-Cmd
+            export ORT_LIB_PATH="$(mktemp -d)" ORT_PREFER_DYNAMIC_LINK=1
+            bash scripts/prepare-manylinux-ort.sh "$ORT_LIB_PATH"
+            export LD_LIBRARY_PATH="$ORT_LIB_PATH:${LD_LIBRARY_PATH:-}"
+      - name: Import wheel at its advertised glibc floor
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: |
+          docker run --rm --network none -v "$PWD/dist:/wheels:ro" \
+            "quay.io/pypa/manylinux_2_28_$(uname -m)" \
+            bash -ec '"$1" -m pip install --no-index --no-deps /wheels/*.whl && "$1" -I -c "from pensyve._core import Pensyve"' \
+            -- "python$PYTHON_VERSION"
       - name: Bundle the Windows native runtime in the wheel
         if: runner.os == 'Windows'
         shell: pwsh
