@@ -2490,6 +2490,47 @@ mod tests {
         assert_eq!(file_mode, 0o600, "snapshot file mode was {file_mode:o}");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_staging_file_and_new_directories_have_exact_owner_only_acls() {
+        use std::process::Command;
+
+        let f = fixture();
+        let root = f.dir.path().join("new-root");
+        let namespace = root.join("new-namespace");
+        create_snapshot_dir(&namespace).unwrap();
+        let staging = namespace.join("test.partial");
+        let _file = create_owner_only_file(&staging).unwrap();
+
+        // Inspect the real objects with an independent security API before publication.
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", r#"
+                $ErrorActionPreference = 'Stop'
+                $sidType = [System.Security.Principal.SecurityIdentifier]
+                $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+                foreach ($path in @($env:PENSYVE_TEST_ROOT, $env:PENSYVE_TEST_DIR, $env:PENSYVE_TEST_FILE)) {
+                    $acl = Get-Acl -LiteralPath $path
+                    $rules = @($acl.GetAccessRules($true, $true, $sidType))
+                    if (!$acl.AreAccessRulesProtected -or $acl.GetOwner($sidType) -ne $user -or
+                        $rules.Count -ne 1 -or $rules[0].IdentityReference -ne $user -or
+                        $rules[0].IsInherited -or $rules[0].AccessControlType -ne 'Allow' -or
+                        $rules[0].FileSystemRights -ne 'FullControl') {
+                        throw "Unexpected ACL for $path ($($acl.Sddl))"
+                    }
+                }
+            "#])
+            .env("PENSYVE_TEST_ROOT", &root)
+            .env("PENSYVE_TEST_DIR", &namespace)
+            .env("PENSYVE_TEST_FILE", &staging)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// A directory the operator already created is theirs; we must not silently
     /// re-chmod it out from under them.
     #[cfg(unix)]
