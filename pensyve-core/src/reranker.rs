@@ -60,7 +60,7 @@ enum RerankerLoadMode {
     HuggingFace,
 }
 
-/// Resolve the cache root that fastembed 6.0.1 will actually use.
+/// Resolve the cache root that fastembed will actually use.
 ///
 /// `RerankInitOptions` defaults its cache from `FASTEMBED_CACHE_DIR`, but
 /// fastembed's `pull_from_hf` gives `HF_HOME` precedence. Resolve that same
@@ -284,7 +284,7 @@ impl Reranker {
     /// policy.
     ///
     /// When the effective fastembed cache contains a usable `main` ref and
-    /// all five files consumed by fastembed 6.0.1, construction is entirely
+    /// all five files consumed by fastembed, construction is entirely
     /// local. If any file is missing, the policy gates online retrieval;
     /// [`NetworkPolicy::Disabled`] returns a cache-classified
     /// [`RerankerError::ModelLoad`] before fastembed's hf-hub path is entered.

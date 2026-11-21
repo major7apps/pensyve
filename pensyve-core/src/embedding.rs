@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use fastembed::{
-    EmbeddingModel, InitOptions, InitOptionsUserDefined, TextEmbedding, TokenizerFiles,
+    EmbeddingModel, InitOptionsUserDefined, TextEmbedding, TextInitOptions, TokenizerFiles,
     UserDefinedEmbeddingModel,
 };
 
@@ -50,7 +50,7 @@ pub fn resolved_embedding_pool_size() -> usize {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get().min(4)))
 }
 
-/// Resolve the cache root fastembed 6.0.1 will actually use.
+/// Resolve the cache root fastembed will actually use.
 ///
 /// `HF_HOME` takes precedence over `FASTEMBED_CACHE_DIR`. Relative roots are
 /// anchored to the current directory so preflight, cache identity, and startup
@@ -93,7 +93,7 @@ fn model_cache_dir(cache_dir: &Path, hf_model_code: &str) -> PathBuf {
 }
 
 /// Validate the exact hf-hub `main` ref and snapshot files consumed by
-/// fastembed 6.0.1 before any network-capable loader can run.
+/// fastembed before any network-capable loader can run.
 fn preflight_model_cache(
     cache_dir: &Path,
     hf_model_code: &str,
@@ -306,7 +306,7 @@ fn build_hugging_face_pool(
     for i in 0..pool_size {
         let show_progress = i == 0;
         let session = TextEmbedding::try_new(
-            InitOptions::new(model.clone())
+            TextInitOptions::new(model.clone())
                 .with_cache_dir(cache_dir.to_path_buf())
                 .with_show_download_progress(show_progress),
         )
@@ -869,7 +869,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Runtime component of every fastembed-backed embedding-space identity. A
 /// unit test pins it to the version resolved in `Cargo.lock`, so a dependency
 /// bump cannot leave vectors stamped with a stale runtime.
-const FASTEMBED_RUNTIME: &str = "fastembed-6.0.1/onnxruntime";
+const FASTEMBED_RUNTIME: &str = "fastembed-7.5.0/onnxruntime";
 
 #[cfg(test)]
 #[allow(

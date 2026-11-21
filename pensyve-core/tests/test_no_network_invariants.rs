@@ -147,7 +147,7 @@ const MINILM_REQUIRED_FILES: &[&str] = &[
     "tokenizer_config.json",
 ];
 
-/// Resolve the effective cache dir the same way fastembed 6.0.1's
+/// Resolve the effective cache dir the same way fastembed's
 /// `pull_from_hf` does (`HF_HOME`, then its `FASTEMBED_CACHE_DIR`-derived
 /// option, then `.fastembed_cache`) and check that the named subdir exists.
 /// If it doesn't, we skip the test rather than

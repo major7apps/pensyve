@@ -102,8 +102,8 @@ fn embedding_info() -> (String, usize) {
     (model, dims)
 }
 
-#[pymodule]
-fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+#[pymodule(name = "_core")]
+fn core_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     init_tracing();
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<PyPensyve>()?;
@@ -2183,7 +2183,7 @@ fn parse_fact(fact: &str) -> (String, String) {
 // ---------------------------------------------------------------------------
 
 /// Represents an entity (agent, user, team, or tool).
-#[pyclass(name = "Entity", skip_from_py_object)]
+#[pyclass(name = "Entity")]
 #[derive(Clone)]
 pub struct PyEntity {
     uuid: Uuid,
@@ -2418,7 +2418,7 @@ impl PyEpisode {
 // ---------------------------------------------------------------------------
 
 /// Represents a retrieved memory.
-#[pyclass(name = "Memory", skip_from_py_object)]
+#[pyclass(name = "Memory")]
 #[derive(Clone)]
 pub struct PyMemory {
     #[pyo3(get)]
@@ -2506,7 +2506,7 @@ impl PyMemory {
 /// are clustered into one group, sorted by event time within the group.
 /// Semantic and procedural memories surface as singleton groups with
 /// `session_id = None`.
-#[pyclass(name = "SessionGroup", skip_from_py_object)]
+#[pyclass(name = "SessionGroup")]
 #[derive(Clone)]
 pub struct PySessionGroup {
     /// Episode (session) UUID as a string, or `None` for semantic /
