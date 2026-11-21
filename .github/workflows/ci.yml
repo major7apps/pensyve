@@ -57,6 +57,15 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+  test-windows-snapshots:
+    name: Windows Snapshot Tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run core snapshot tests
+        run: 'cargo test --locked -p pensyve-core --lib snapshot::tests::'
+
   test-rust-postgres:
     name: Rust Tests (postgres)
     runs-on: ubuntu-latest
