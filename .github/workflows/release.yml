@@ -1,12 +1,18 @@
 name: Release
 
 on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "scripts/windows-release-runtime.ps1"
+      - "scripts/prepare-manylinux-ort.sh"
   push:
     tags:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,37 +21,64 @@ jobs:
   # ── Build Python wheels (maturin + PyO3) ───────────────────────────────────
   # Only native builds — ONNX Runtime lacks prebuilt binaries for cross-compile
   build-python:
-    name: Build Python (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
+    name: Build Python ${{ matrix.python }} (${{ matrix.platform.target }})
+    runs-on: ${{ matrix.platform.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
+        python: ["3.10", "3.11", "3.12", "3.13"]
+        platform:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
-      - name: Build wheels
+          python-version: ${{ matrix.python }}
+      - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
-          target: ${{ matrix.target }}
-          args: --release --out dist --manifest-path pensyve-python/Cargo.toml --interpreter python3.10 python3.11 python3.12 python3.13
+          target: ${{ matrix.platform.target }}
+          # Linux builds run inside a manylinux container with its own interpreters.
+          args: --locked --release --out dist --manifest-path pensyve-python/Cargo.toml --interpreter ${{ runner.os == 'Linux' && format('python{0}', matrix.python) || 'python' }}
           manylinux: "2_28"
-          before-script-linux: dnf install -y openssl-devel perl-IPC-Cmd
-      - name: Upload wheels
-        uses: actions/upload-artifact@v7
+          before-script-linux: |
+            dnf install -y openssl-devel perl-IPC-Cmd
+            export ORT_LIB_PATH="$(mktemp -d)" ORT_PREFER_DYNAMIC_LINK=1
+            bash scripts/prepare-manylinux-ort.sh "$ORT_LIB_PATH"
+            export LD_LIBRARY_PATH="$ORT_LIB_PATH:${LD_LIBRARY_PATH:-}"
+      - name: Import wheel at its advertised glibc floor
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: |
+          docker run --rm --network none -v "$PWD/dist:/wheels:ro" \
+            "quay.io/pypa/manylinux_2_28_$(uname -m)" \
+            bash -ec '"$1" -m pip install --no-index --no-deps /wheels/*.whl && "$1" -I -c "from pensyve._core import Pensyve"' \
+            -- "python$PYTHON_VERSION"
+      - name: Bundle the Windows native runtime in the wheel
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $runtime = & ./scripts/windows-release-runtime.ps1
+          python -m pip install delvewheel
+          $wheel = (Get-ChildItem dist/*.whl).FullName
+          python -m delvewheel repair --include DirectML.dll --add-path "$($runtime.DirectML);$($runtime.CRT)" -w repaired $wheel
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Copy-Item repaired/*.whl dist/ -Force
+      - name: Install and import the built wheel
+        shell: bash
+        run: |
+          python -m pip install dist/*.whl
+          python -I -c "from pensyve._core import Pensyve"
+      - uses: actions/upload-artifact@v7
         with:
-          name: wheels-${{ matrix.target }}
+          name: wheels-${{ matrix.platform.target }}-${{ matrix.python }}
           path: dist/*.whl
+          if-no-files-found: error
 
   build-python-sdist:
     name: Build Python sdist
@@ -61,12 +94,14 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: wheels-sdist
+          if-no-files-found: error
           path: dist/*.tar.gz
 
   # ── Publish to PyPI (skipped if PYPI_TOKEN not configured) ──────────────────
   publish-pypi:
     name: Publish to PyPI
-    needs: [build-python, build-python-sdist]
+    needs: release-built
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: release
     steps:
@@ -84,8 +119,33 @@ jobs:
           PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
 
   # ── Stage on npm for approval (skipped if NPM_TOKEN not configured) ───────────────────
+  build-npm:
+    name: Build npm package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - working-directory: pensyve-ts
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+          npm pack
+          cd "$(mktemp -d)"
+          npm install --offline --ignore-scripts "$GITHUB_WORKSPACE"/pensyve-ts/*.tgz
+          node -e "import('@pensyve/sdk')"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm-package
+          path: pensyve-ts/*.tgz
+          if-no-files-found: error
+
   publish-npm:
     name: Stage on npm
+    needs: release-built
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -93,16 +153,16 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
-      - name: Build TypeScript SDK
-        working-directory: pensyve-ts
-        run: |
-          bun install
-          bun run build
+      - uses: actions/download-artifact@v8
+        with:
+          name: npm-package
+          path: pensyve-ts/
       - uses: actions/setup-node@v7
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
+      - name: Install npm with staged publishing support
+        run: npm install -g npm@12.2.3
       - name: Check npm publish access
         if: env.HAS_NPM_TOKEN != ''
         working-directory: pensyve-ts
@@ -149,15 +209,37 @@ jobs:
         if: env.HAS_NPM_TOKEN != '' && env.NPM_SHOULD_PUBLISH == 'true'
         working-directory: pensyve-ts
         run: |
-          npm stage publish --access public --provenance
+          npm stage publish ./*.tgz --access public --provenance
           echo "::notice::@pensyve/sdk is staged on npm, not live. Approve it with 'npm stage approve <id>' or on npmjs.com."
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # ── Publish to crates.io (skipped if CARGO_REGISTRY_TOKEN not configured) ──
+  build-crate:
+    name: Build crates.io package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo package --locked -p pensyve-core
+
+  build-go:
+    name: Build Go module
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.22"
+          cache-dependency-path: pensyve-go/go.mod
+      - working-directory: pensyve-go
+        run: go test ./...
+
   publish-crates:
     name: Publish to crates.io
+    needs: release-built
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: release
     steps:
@@ -165,7 +247,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Publish pensyve-core
         if: env.HAS_CARGO_TOKEN != ''
-        run: cargo publish -p pensyve-core --allow-dirty
+        run: cargo publish --locked -p pensyve-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           HAS_CARGO_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -190,17 +272,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      # Windows packaging also needs the DLL from the exact ort-sys build.
       - uses: Swatinem/rust-cache@v2
+        if: runner.os != 'Windows'
         continue-on-error: true
         with:
           key: cli-${{ matrix.target }}
       - name: Build CLI
-        run: cargo build --release -p pensyve-cli
+        run: cargo build --locked --release -p pensyve-cli
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
           mkdir -p staging
           cp target/release/pensyve staging/pensyve
+          staging/pensyve --version
           cd staging && tar czf ../${{ matrix.artifact }}.tar.gz pensyve
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -208,11 +293,17 @@ jobs:
         run: |
           mkdir staging
           cp target/release/pensyve.exe staging/pensyve.exe
-          Compress-Archive -Path staging/pensyve.exe -DestinationPath ${{ matrix.artifact }}.zip
+          $runtime = & ./scripts/windows-release-runtime.ps1
+          Copy-Item "$($runtime.DirectML)/DirectML.dll" staging/
+          Copy-Item "$($runtime.CRT)/*.dll" staging/
+          & ./staging/pensyve.exe --version
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Compress-Archive -Path staging/* -DestinationPath ${{ matrix.artifact }}.zip
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
+          if-no-files-found: error
           path: ${{ matrix.artifact }}.*
 
   # ── Build MCP server binary (native targets only) ──────────────────────────
@@ -236,7 +327,7 @@ jobs:
         with:
           key: mcp-${{ matrix.target }}
       - name: Build MCP server
-        run: cargo build --release -p pensyve-mcp
+        run: cargo build --locked --release -p pensyve-mcp
       - name: Package
         run: |
           mkdir -p staging
@@ -246,30 +337,56 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
+          if-no-files-found: error
           path: ${{ matrix.artifact }}.*
 
   # ── Publish MCP server image to ghcr (MCP registry + Smithery) ────────────
   # server.json's OCI package points at this image, so the registry publish
   # (publish-mcp-registry.yml) runs only after this workflow succeeds.
+  build-mcp-image:
+    name: Build MCP image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and smoke-test the offline MCP image
+        run: |
+          docker build -f pensyve-mcp/Dockerfile --build-arg SOURCE_SHA="$GITHUB_SHA" -t pensyve-mcp:release .
+          docker run --rm -i --network none pensyve-mcp:release > response.json <<'EOF'
+          {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"release-smoke","version":"1"}}}
+          {"jsonrpc":"2.0","method":"notifications/initialized"}
+          EOF
+          jq -e '.result.serverInfo.name == "pensyve-mcp"' response.json
+      - name: Save the verified image
+        run: docker save pensyve-mcp:release | zstd -T0 -o image.tar.zst
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-oci-image
+          path: image.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+
   publish-mcp-image:
     name: Publish MCP image
+    needs: release-built
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@v8
         with:
-          persist-credentials: false
-      - name: Log in to ghcr.io
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - name: Build and push
+          name: release-oci-image
+      - name: Load and push the verified image
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          zstd -dc image.tar.zst | docker load
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           IMAGE=ghcr.io/major7apps/pensyve-mcp
           VERSION="${GITHUB_REF_NAME#v}"
-          docker build -f pensyve-mcp/Dockerfile \
-            --build-arg SOURCE_SHA="${GITHUB_SHA}" \
-            -t "${IMAGE}:${VERSION}" -t "${IMAGE}:latest" .
+          docker tag pensyve-mcp:release "${IMAGE}:${VERSION}"
+          docker tag pensyve-mcp:release "${IMAGE}:latest"
           docker push "${IMAGE}:${VERSION}"
           docker push "${IMAGE}:latest"
 
@@ -293,30 +410,68 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: pensyve-codex-plugin
+          if-no-files-found: error
           path: pensyve-codex-plugin-v*.tar.gz
 
   # ── GitHub Release ─────────────────────────────────────────────────────────
+  release-built:
+    name: All release artifacts built
+    needs: [build-cli, build-mcp, build-python, build-python-sdist, build-crate, build-go, build-npm, build-mcp-image, package-codex-plugin]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'All release builds passed.'
+
   github-release:
     name: Create GitHub Release
-    needs: [build-cli, build-mcp, build-python, build-python-sdist, package-codex-plugin]
-    if: always() && !cancelled() && needs.package-codex-plugin.result == 'success'
+    needs: [publish-pypi, publish-crates, publish-npm, publish-mcp-image]
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
+          pattern: '{wheels-*,pensyve-cli-*,pensyve-mcp-*,pensyve-codex-plugin}'
           path: artifacts/
       - name: Collect release assets
         run: |
           mkdir -p release-assets
-          find artifacts/ -name "*.tar.gz" -o -name "*.zip" -o -name "*.whl" | while read f; do
-            cp "$f" release-assets/
+          # download-artifact patterns can succeed with only a subset of matches.
+          # Check each shipped asset before tagging Go or making the release public.
+          shopt -s nullglob
+          collect() {
+            if [[ $# -ne 1 || ! -f "$1" ]]; then
+              echo "::error::Expected exactly one matching release asset, found $#"
+              return 1
+            fi
+            cp -- "$1" release-assets/
+          }
+          # Wheel and sdist names use PEP 440 (e.g. 6.0.0rc1 for v6.0.0-rc.1).
+          python3 -m venv "$RUNNER_TEMP/release-metadata"
+          "$RUNNER_TEMP/release-metadata/bin/pip" install --quiet packaging==26.3
+          python_version=$("$RUNNER_TEMP/release-metadata/bin/python" -c 'from packaging.version import Version; import sys; print(Version(sys.argv[1]))' "${GITHUB_REF_NAME#v}")
+          for py in 3.10 3.11 3.12 3.13; do
+            abi="cp${py/./}"
+            for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc; do
+              collect artifacts/wheels-"$target"-"$py"/pensyve-"$python_version"-"$abi"-"$abi"-*.whl
+            done
           done
+          collect "artifacts/wheels-sdist/pensyve-$python_version.tar.gz"
+          for binary in pensyve-cli pensyve-mcp; do
+            for target in linux-amd64 macos-arm64; do
+              name="$binary-$target"
+              collect "artifacts/$name/$name.tar.gz"
+            done
+          done
+          collect artifacts/pensyve-cli-windows-amd64/pensyve-cli-windows-amd64.zip
+          collect artifacts/pensyve-codex-plugin/pensyve-codex-plugin-v*.tar.gz
       - name: Tag Go module
         run: |
-          VERSION="${GITHUB_REF_NAME}"
-          git tag "pensyve-go/${VERSION}" || true
-          git push origin "pensyve-go/${VERSION}" || true
+          tag="pensyve-go/${GITHUB_REF_NAME}"
+          # Push directly from the checked-out commit. A matching existing tag is
+          # idempotent; a tag at a different commit fails without being overwritten.
+          git push origin "HEAD:refs/tags/$tag"
       - name: Bind release display title
         run: echo "RELEASE_DISPLAY_NAME=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
       - name: Create release
@@ -325,5 +480,10 @@ jobs:
           name: ${{ env.RELEASE_DISPLAY_NAME }}
           generate_release_notes: true
           files: release-assets/*
-          draft: false
+          fail_on_unmatched_files: true
+          draft: true
           prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') || contains(github.ref, '-rc') }}
+      - name: Publish the completed GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false

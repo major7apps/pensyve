@@ -310,7 +310,7 @@ Start a [local gateway](#rest-api) before running the example.
 ### Install
 
 ```bash
-go get github.com/major7apps/pensyve/pensyve-go/v5@latest
+go get github.com/major7apps/pensyve/pensyve-go/v6@latest
 ```
 
 ### Quick start
@@ -323,7 +323,7 @@ import (
     "fmt"
     "log"
 
-    pensyve "github.com/major7apps/pensyve/pensyve-go/v5"
+    pensyve "github.com/major7apps/pensyve/pensyve-go/v6"
 )
 
 func main() {

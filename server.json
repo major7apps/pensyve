@@ -3,7 +3,7 @@
   "name": "io.github.major7apps/pensyve",
   "title": "Pensyve",
   "description": "Local MCP server for persistent AI agent memory",
-  "version": "5.0.0",
+  "version": "6.0.0",
   "repository": {
     "url": "https://github.com/major7apps/pensyve",
     "source": "github"
@@ -13,7 +13,7 @@
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/major7apps/pensyve-mcp:5.0.0",
+      "identifier": "ghcr.io/major7apps/pensyve-mcp:6.0.0",
       "runtimeHint": "docker",
       "runtimeArguments": [
         {

@@ -27,7 +27,7 @@
  * ```
  */
 
-import type { Memory, SessionGroup } from "./index";
+import type { Memory, SessionGroup } from "./index.js";
 
 /**
  * Frozen prefix for the V7r observation block. Mirrors the harness's

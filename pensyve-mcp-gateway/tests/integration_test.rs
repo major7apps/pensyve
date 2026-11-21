@@ -171,6 +171,10 @@ async fn test_mcp_initialize() {
     let json: serde_json::Value = serde_json::from_str(&text).expect("parse json");
     assert_eq!(json["jsonrpc"], "2.0");
     assert!(json["result"]["serverInfo"]["name"].is_string());
+    assert_eq!(
+        json["result"]["serverInfo"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
 
     ct.cancel();
 }

@@ -1,6 +1,6 @@
 # pensyve-go
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/major7apps/pensyve/pensyve-go/v5.svg)](https://pkg.go.dev/github.com/major7apps/pensyve/pensyve-go/v5)
+[![Go Reference](https://pkg.go.dev/badge/github.com/major7apps/pensyve/pensyve-go/v6.svg)](https://pkg.go.dev/github.com/major7apps/pensyve/pensyve-go/v6)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/major7apps/pensyve/blob/main/LICENSE)
 
 The Go SDK stores and retrieves agent memories through a [Pensyve](https://github.com/major7apps/pensyve) gateway that you run yourself.
@@ -10,7 +10,7 @@ Pensyve Cloud closed on 2026-10-01. The Apache-2.0 project is in maintenance mod
 ## Install
 
 ```bash
-go get github.com/major7apps/pensyve/pensyve-go/v5@latest
+go get github.com/major7apps/pensyve/pensyve-go/v6@latest
 ```
 
 ## Quick start
@@ -25,7 +25,7 @@ import (
     "fmt"
     "log"
 
-    pensyve "github.com/major7apps/pensyve/pensyve-go/v5"
+    pensyve "github.com/major7apps/pensyve/pensyve-go/v6"
 )
 
 func main() {
