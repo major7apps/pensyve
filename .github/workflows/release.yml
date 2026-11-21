@@ -447,14 +447,17 @@ jobs:
             fi
             cp -- "$1" release-assets/
           }
-          version="${GITHUB_REF_NAME#v}"
+          # Wheel and sdist names use PEP 440 (e.g. 6.0.0rc1 for v6.0.0-rc.1).
+          python3 -m venv "$RUNNER_TEMP/release-metadata"
+          "$RUNNER_TEMP/release-metadata/bin/pip" install --quiet packaging==26.3
+          python_version=$("$RUNNER_TEMP/release-metadata/bin/python" -c 'from packaging.version import Version; import sys; print(Version(sys.argv[1]))' "${GITHUB_REF_NAME#v}")
           for py in 3.10 3.11 3.12 3.13; do
             abi="cp${py/./}"
             for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc; do
-              collect artifacts/wheels-"$target"-"$py"/pensyve-"$version"-"$abi"-"$abi"-*.whl
+              collect artifacts/wheels-"$target"-"$py"/pensyve-"$python_version"-"$abi"-"$abi"-*.whl
             done
           done
-          collect "artifacts/wheels-sdist/pensyve-$version.tar.gz"
+          collect "artifacts/wheels-sdist/pensyve-$python_version.tar.gz"
           for binary in pensyve-cli pensyve-mcp; do
             for target in linux-amd64 macos-arm64; do
               name="$binary-$target"
