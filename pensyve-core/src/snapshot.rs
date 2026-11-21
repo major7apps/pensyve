@@ -2509,7 +2509,11 @@ mod tests {
                 $sidType = [System.Security.Principal.SecurityIdentifier]
                 $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
                 foreach ($path in @($env:PENSYVE_TEST_ROOT, $env:PENSYVE_TEST_DIR, $env:PENSYVE_TEST_FILE)) {
-                    $acl = Get-Acl -LiteralPath $path
+                    $acl = if ([IO.Directory]::Exists($path)) {
+                        [IO.Directory]::GetAccessControl($path)
+                    } else {
+                        [IO.File]::GetAccessControl($path)
+                    }
                     $rules = @($acl.GetAccessRules($true, $true, $sidType))
                     if (!$acl.AreAccessRulesProtected -or $acl.GetOwner($sidType) -ne $user -or
                         $rules.Count -ne 1 -or $rules[0].IdentityReference -ne $user -or
