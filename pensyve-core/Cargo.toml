@@ -76,6 +76,9 @@ tokio-util = { workspace = true }
 # (`futures-util` for `join_all`); we don't pull in executors or I/O.
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"], optional = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_SystemServices"] }
+
 [features]
 default = []
 postgres = ["dep:sqlx-core", "dep:sqlx-postgres", "tokio/rt-multi-thread"]

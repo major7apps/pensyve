@@ -35,13 +35,15 @@
 //! files `0600` on unix, and fsyncs both the file and the directory entry
 //! before reporting success.
 //!
-//! On non-unix targets neither is enforced: files inherit default ACLs and the
-//! directory entry is not fsynced. Implementing Windows ACLs without Windows CI
-//! would ship untested security code, which is a worse failure than a known gap
-//! because it looks like protection nobody can verify. The limitation is made
-//! observable rather than left to these docs — [`write_to_dir`] logs a warning
-//! on every write, and each snapshot records [`ForgetSnapshot::owner_only`] so
-//! the artifact is self-describing once it leaves the host that wrote it.
+//! On Windows, newly created directories and staging files receive a protected DACL
+//! granting only the effective user full control. The writer checks that the file's
+//! volume supports persistent ACLs before writing content. After flushing file data,
+//! both writers publish with a same-volume write-through rename. Existing directories
+//! retain their operator-configured permissions on both platforms.
+//!
+//! On other platforms, the file inherits default permissions and rename durability
+//! depends on the filesystem. The writer warns on every write. Each snapshot records
+//! whether the writer enforced file protection in [`ForgetSnapshot::owner_only`].
 //!
 //! This is deliberately **not** built on [`crate::gdpr::export_entity_data`].
 //! That function answers a GDPR Art. 15 access request: it is namespace-scoped,
@@ -50,6 +52,11 @@
 //! fact (which `forget` does delete), it skips superseded history, and it emits
 //! lossy human-readable JSON rather than restorable rows. Different question,
 //! different answer — the two are intentionally separate.
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows::{create_owner_only_file, create_snapshot_dir, publish_snapshot};
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Seek, Write};
@@ -94,8 +101,8 @@ pub struct ForgetSnapshot {
     pub namespace_id: Uuid,
     pub captured_at: DateTime<Utc>,
     /// Whether the snapshot *file* was created with owner-only permissions
-    /// (`0600`). True on unix; false on platforms where this crate cannot
-    /// restrict access, where the file inherits default ACLs instead.
+    /// (unix `0600` or a protected Windows DACL granting only the effective user
+    /// full control). Other platforms inherit the directory's default permissions.
     ///
     /// Recorded in the artifact so a snapshot is self-describing about its own
     /// protection level — which matters once it is copied between hosts, where
@@ -203,11 +210,9 @@ mod embedding_records_serde {
 
 /// Whether this platform can restrict a snapshot file to its owner.
 ///
-/// Unix sets `0600` on the file and `0700` on directories it creates. Elsewhere
-/// the file inherits default ACLs: implementing Windows ACLs without Windows CI
-/// would ship untested security code, which is a worse failure than a
-/// documented gap because it looks like protection nobody can verify.
-pub const OWNER_ONLY_SUPPORTED: bool = cfg!(unix);
+/// Unix uses filesystem modes and Windows uses a protected DACL. A Windows
+/// volume that cannot persist ACLs causes the write to fail before any content is written.
+pub const OWNER_ONLY_SUPPORTED: bool = cfg!(any(unix, windows));
 
 /// Per-kind row counts, for surfacing what a snapshot holds without loading it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -577,7 +582,7 @@ impl SnapshotStreamWriter {
             )));
         }
         if !page.is_empty() && self.file.is_none() {
-            #[cfg(not(unix))]
+            #[cfg(not(any(unix, windows)))]
             tracing::warn!(
                 directory = %self.dir.display(),
                 "Snapshot files cannot be restricted to owner-only access on this platform: \
@@ -659,8 +664,7 @@ impl SnapshotStreamWriter {
                 let file = self.file.take().ok_or_else(|| {
                     StorageError::Context("snapshot writer already finalized".into())
                 })?;
-                std::fs::rename(&self.temp_path, &self.path)?;
-                sync_dir(&self.dir)?;
+                publish_snapshot(&self.temp_path, &self.path, &self.dir)?;
                 self.published = true;
                 Some(SnapshotArtifact {
                     path: self.path.clone(),
@@ -1096,31 +1100,26 @@ fn memory_namespace(memory: &Memory) -> Uuid {
 /// - The write is staged through a temporary file in the same directory and
 ///   renamed into place, so a crash or a full disk can never leave behind a
 ///   truncated file that reads as a complete snapshot.
-/// - Both the file and the directory entry created by the rename are fsynced
-///   before returning. Syncing the file alone would leave a snapshot whose
-///   contents reached the disk but whose directory entry did not — reported as
-///   a success, absent after a crash.
-/// - Snapshots hold verbatim memory content, so a directory this function
-///   creates is `0700` and the file is `0600` (unix). A pre-existing directory
-///   keeps whatever mode its operator gave it.
+/// - Both writers flush the file before publication. Unix then syncs the
+///   containing directory; Windows requests a write-through rename.
+/// - Newly created directories and files are owner-only on Unix and Windows.
+///   Pre-existing directories keep their operator-configured permissions.
 pub fn write_to_dir(dir: &Path, snapshot: &ForgetSnapshot) -> StorageResult<PathBuf> {
-    write_to_dir_with(dir, snapshot, sync_dir)
+    write_to_dir_with(dir, snapshot, publish_snapshot)
 }
 
-/// [`write_to_dir`] with the directory fsync injected, so its failure path can
-/// be exercised deterministically — there is no portable way to make a real
-/// `fsync` fail on demand.
+/// Inject the durable rename to exercise publication failures deterministically.
 fn write_to_dir_with(
     dir: &Path,
     snapshot: &ForgetSnapshot,
-    sync_dir: fn(&Path) -> std::io::Result<()>,
+    publish: fn(&Path, &Path, &Path) -> std::io::Result<()>,
 ) -> StorageResult<PathBuf> {
     use std::io::Write;
 
     // An operator should not have to read module docs to learn their recovery
     // artifacts are world-readable. Entity-wide forget is rare, so warning per
     // write is appropriately loud rather than noisy.
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     tracing::warn!(
         directory = %dir.display(),
         "Snapshot files cannot be restricted to owner-only access on this platform: \
@@ -1135,14 +1134,19 @@ fn write_to_dir_with(
     let path = dir.join(file_name(snapshot));
     let temp_path = path.with_extension("json.partial");
 
-    let encoded = serde_json::to_vec(snapshot)?;
+    // A caller may republish an older archive whose protection marker describes its
+    // original file. Record the guarantees of this write in the new artifact.
+    let mut snapshot = std::borrow::Cow::Borrowed(snapshot);
+    if snapshot.owner_only != OWNER_ONLY_SUPPORTED {
+        snapshot.to_mut().owner_only = OWNER_ONLY_SUPPORTED;
+    }
+    let encoded = serde_json::to_vec(snapshot.as_ref())?;
     {
         let mut file = create_owner_only_file(&temp_path)?;
         file.write_all(&encoded)?;
         file.sync_all()?;
     }
-    std::fs::rename(&temp_path, &path)?;
-    sync_dir(dir)?;
+    publish(&temp_path, &path, dir)?;
 
     Ok(path)
 }
@@ -1172,10 +1176,8 @@ fn create_snapshot_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Non-unix fallback: the directory inherits its parent's ACL. Tightening it to
-/// an owner-only ACL needs platform APIs this crate does not depend on, and CI
-/// is Linux-only, so it would ship untested — see the module docs.
-#[cfg(not(unix))]
+/// Fallback for platforms without an owner-only creation API.
+#[cfg(not(any(unix, windows)))]
 fn create_snapshot_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
@@ -1198,14 +1200,20 @@ fn create_owner_only_file(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Non-unix fallback — see [`create_snapshot_dir`].
-#[cfg(not(unix))]
+/// Fallback for platforms without an owner-only creation API.
+#[cfg(not(any(unix, windows)))]
 fn create_owner_only_file(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
         .open(path)
+}
+
+#[cfg(not(windows))]
+fn publish_snapshot(from: &Path, to: &Path, dir: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)?;
+    sync_dir(dir)
 }
 
 /// fsync the directory itself, so the rename that published the snapshot is
@@ -1218,7 +1226,7 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 /// Non-unix fallback: a directory cannot be opened as a file without
 /// platform-specific flags, so rename durability falls back to whatever the
 /// filesystem guarantees.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
@@ -2490,6 +2498,107 @@ mod tests {
         assert_eq!(file_mode, 0o600, "snapshot file mode was {file_mode:o}");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_staging_file_and_new_directories_have_exact_owner_only_acls() {
+        use std::process::Command;
+
+        let f = fixture();
+        let root = f.dir.path().join("new-root");
+        let namespace = root.join("new-namespace");
+        create_snapshot_dir(&namespace).unwrap();
+        let staging = namespace.join("test.partial");
+        let _file = create_owner_only_file(&staging).unwrap();
+        let operator_dir = f.dir.path().join("operator-dir");
+        std::fs::create_dir(&operator_dir).unwrap();
+        let legacy = write_to_dir(&operator_dir, &snapshot_of(&f, Vec::new())).unwrap();
+        seed_one_of_each(&f);
+        let outcome = forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            None,
+            f.namespace.id,
+            &operator_dir,
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap();
+        assert!(outcome.snapshot.owner_only);
+        let stream = outcome.path.unwrap();
+        assert!(validate_stream_file(&stream).unwrap().owner_only);
+
+        // Inspect the real objects with an independent security API before publication.
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", r#"
+                $ErrorActionPreference = 'Stop'
+                $sidType = [System.Security.Principal.SecurityIdentifier]
+                $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+                foreach ($path in @($env:PENSYVE_TEST_ROOT, $env:PENSYVE_TEST_DIR, $env:PENSYVE_TEST_FILE, $env:PENSYVE_TEST_LEGACY, $env:PENSYVE_TEST_STREAM)) {
+                    $acl = if ([IO.Directory]::Exists($path)) {
+                        [IO.Directory]::GetAccessControl($path)
+                    } else {
+                        [IO.File]::GetAccessControl($path)
+                    }
+                    $rules = @($acl.GetAccessRules($true, $true, $sidType))
+                    if (!$acl.AreAccessRulesProtected -or $acl.GetOwner($sidType) -ne $user -or
+                        $rules.Count -ne 1 -or $rules[0].IdentityReference -ne $user -or
+                        $rules[0].IsInherited -or $rules[0].AccessControlType -ne 'Allow' -or
+                        $rules[0].FileSystemRights -ne 'FullControl') {
+                        throw "Unexpected ACL for $path ($($acl.Sddl))"
+                    }
+                }
+            "#])
+            .env("PENSYVE_TEST_ROOT", &root)
+            .env("PENSYVE_TEST_DIR", &namespace)
+            .env("PENSYVE_TEST_FILE", &staging)
+            .env("PENSYVE_TEST_LEGACY", &legacy)
+            .env("PENSYVE_TEST_STREAM", &stream)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_both_writers_require_a_write_through_move() {
+        let f = fixture();
+        let root = f.dir.path().join("snapshots");
+        windows::FAIL_NEXT_MOVE.set(true);
+        let error = write_to_dir(&root, &snapshot_of(&f, Vec::new())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected write-through move failure")
+        );
+
+        seed_one_of_each(&f);
+        windows::FAIL_NEXT_MOVE.set(true);
+        let error = forget_entity_bounded(
+            &f.storage,
+            f.entity.id,
+            None,
+            f.namespace.id,
+            &root,
+            RetentionPolicy::UNBOUNDED,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected write-through move failure")
+        );
+        assert_eq!(
+            f.storage
+                .get_all_memories_by_namespace_including_superseded(f.namespace.id)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
     /// A directory the operator already created is theirs; we must not silently
     /// re-chmod it out from under them.
     #[cfg(unix)]
@@ -2514,7 +2623,7 @@ mod tests {
     /// the failure is injected through the seam `write_to_dir` uses.
     #[test]
     fn write_to_dir_fails_when_the_directory_sync_fails() {
-        fn always_fails(_: &Path) -> std::io::Result<()> {
+        fn always_fails(_: &Path, _: &Path, _: &Path) -> std::io::Result<()> {
             Err(std::io::Error::other("simulated directory fsync failure"))
         }
 
@@ -2537,12 +2646,13 @@ mod tests {
     #[test]
     fn snapshots_record_whether_owner_only_permissions_were_enforced() {
         let f = fixture();
-        let snapshot = snapshot_of(&f, Vec::new());
+        let mut snapshot = snapshot_of(&f, Vec::new());
+        snapshot.owner_only = !OWNER_ONLY_SUPPORTED;
 
         let path = write_to_dir(&f.dir.path().join("snapshots"), &snapshot).unwrap();
         let reloaded = read_file(&path).unwrap();
 
-        assert_eq!(reloaded.owner_only, cfg!(unix));
+        assert_eq!(reloaded.owner_only, cfg!(any(unix, windows)));
         // On the platforms CI covers this is the enforced case; the assertion
         // above is what would flip if that ever silently regressed.
         #[cfg(unix)]

@@ -31,6 +31,22 @@ been removed.
 
 A request with no credential gets `401` with `WWW-Authenticate: Bearer`.
 
+## Pre-delete snapshots on disk
+
+An entity-wide forget stores the deleted rows in a recovery file beneath
+`PENSYVE_SNAPSHOT_DIR`. On Windows, newly created directories and files use a
+protected DACL with a single full-control entry for the effective Windows user.
+The writer checks the opened file's volume for persistent ACL support before
+writing any content. On an unsupported volume such as FAT32 or exFAT, forget
+fails and the database transaction rolls back. The writer flushes the file and
+publishes it with a same-volume write-through rename.
+
+Existing directories keep their operator-configured permissions. Choose a
+snapshot root whose parent directories only trusted users can rename, replace
+or delete. On Windows this includes any junctions in the path. Restrict access
+to snapshots created by older Windows releases separately. The `owner_only`
+marker describes permissions when a file was written.
+
 ## Role-Based Access Control (RBAC)
 
 The memory mesh module (`pensyve-core/src/mesh.rs`) enforces namespace-level
