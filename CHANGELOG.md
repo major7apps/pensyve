@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+- Removed `pensyve_core::snapshot::prune_namespace_dir`. Standalone pruning
+  could remove the recovery snapshot while another thread was forgetting an
+  entity. Pass a `RetentionPolicy` to `forget_entity_bounded` to prune under
+  the same namespace lock as the snapshot write.
+
 ### Fixed
 
 - **Go SDK module path is now `github.com/major7apps/pensyve/pensyve-go/v5`.** The
