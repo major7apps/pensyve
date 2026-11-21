@@ -2087,6 +2087,39 @@ async fn lock_namespace_embedding_serialization_pg_tx(
     Ok(())
 }
 
+// Acquire the run before a reader takes any source locks. A joined FOR SHARE
+// alone can lock a source before the run and invert the erasure lock order.
+async fn lock_workspace_run_for_read(
+    tx: &mut Transaction<'_, Postgres>,
+    run: RunId,
+) -> StorageResult<()> {
+    query_as::<Postgres, (Uuid,)>(
+        "SELECT run_id FROM consolidation_runs WHERE run_id = $1 AND namespace_id = $2 FOR SHARE",
+    )
+    .bind(run.id)
+    .bind(run.namespace_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(sqlx_to_io)?;
+    Ok(())
+}
+
+// Cluster membership updates lock the run before touching its assignments.
+// The caller holds the namespace lock used when populating a run.
+async fn lock_erasure_runs_pg_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    namespace_id: Uuid,
+) -> StorageResult<()> {
+    query::<Postgres>(
+        "SELECT run_id FROM consolidation_runs WHERE namespace_id = $1 ORDER BY run_id FOR UPDATE",
+    )
+    .bind(namespace_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(sqlx_to_io)?;
+    Ok(())
+}
+
 async fn validate_active_embedding_write_pg_tx(
     transaction: &mut Transaction<'_, Postgres>,
     memory: &Memory,
@@ -5250,6 +5283,15 @@ impl StorageTrait for PostgresBackend {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
             lock_namespace_embedding_serialization_pg_tx(&mut tx, namespace_id).await?;
+            lock_erasure_runs_pg_tx(&mut tx, namespace_id).await?;
+            for sql in super::erasure::ENTITY_BOOKKEEPING {
+                query::<Postgres>(sql)
+                    .bind(namespace_id)
+                    .bind(entity_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(sqlx_to_io)?;
+            }
             let mut erased = ErasedRows::default();
 
             // Leg 1 — observations. MUST precede the episodic delete: the only
@@ -5464,6 +5506,15 @@ impl StorageTrait for PostgresBackend {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
             lock_namespace_embedding_serialization_pg_tx(&mut tx, namespace_id).await?;
+            lock_erasure_runs_pg_tx(&mut tx, namespace_id).await?;
+            for sql in super::erasure::ENTITY_BOOKKEEPING {
+                query::<Postgres>(sql)
+                    .bind(namespace_id)
+                    .bind(entity_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(sqlx_to_io)?;
+            }
             query::<Postgres>(
                 "DELETE FROM memory_embeddings
                  WHERE namespace_id = $2 AND memory_type = 'observation'
@@ -5684,6 +5735,14 @@ impl StorageTrait for PostgresBackend {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut transaction = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
             lock_namespace_embedding_serialization_pg_tx(&mut transaction, namespace_id).await?;
+            lock_erasure_runs_pg_tx(&mut transaction, namespace_id).await?;
+            for sql in super::erasure::NAMESPACE_BOOKKEEPING {
+                query::<Postgres>(sql)
+                    .bind(namespace_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(sqlx_to_io)?;
+            }
             let mut removed = [0usize; 8];
 
             for (slot, sql) in removed.iter_mut().zip([
@@ -6148,6 +6207,7 @@ impl ConsolidationWorkspace for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(namespace_id).await?;
             let mut tx = conn.begin().await.map_err(sqlx_to_io)?;
+            lock_namespace_embedding_serialization_pg_tx(&mut tx, namespace_id).await?;
             let lifecycle = query_as::<Postgres, (String, Option<String>)>(
                 "SELECT state, active_read_space_id FROM namespace_embedding_state
                  WHERE namespace_id = $1 FOR UPDATE",
@@ -6382,6 +6442,7 @@ impl ConsolidationWorkspace for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(run.namespace_id).await?;
             let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_workspace_run_for_read(&mut tx, run).await?;
             let source = pg_workspace_embedding_source(
                 &mut tx,
                 run,
@@ -6419,6 +6480,7 @@ impl ConsolidationWorkspace for PostgresBackend {
         self.block_on(async {
             let mut conn = self.scoped_conn(run.namespace_id).await?;
             let mut tx = (&mut *conn).begin().await.map_err(sqlx_to_io)?;
+            lock_workspace_run_for_read(&mut tx, run).await?;
             let (entity, ordinal): (Uuid, i64) = query_as::<Postgres, _>(
                 "SELECT about_entity, source_ordinal FROM consolidation_sources
                  WHERE run_id = $1 AND namespace_id = $2 AND memory_id = $3
@@ -7239,6 +7301,7 @@ impl ConsolidationWorkspace for PostgresBackend {
                 "SELECT assignment_anchor, memory_id FROM consolidation_sources
                  WHERE run_id = $1 AND namespace_id = $2
                    AND assignment_state IN ('finalized', 'promoted')
+                   AND assignment_anchor IS NOT NULL
                  ORDER BY assignment_anchor, source_ordinal LIMIT $3",
             )
             .bind(run.id)
@@ -8383,6 +8446,22 @@ mod tests {
             .find("fn record_tentative_match")
             .expect("candidate paging end");
         let candidate = &workspace[candidate_start..candidate_start + candidate_end];
+        let anchor = workspace
+            .split_once("fn load_source(")
+            .unwrap()
+            .1
+            .split_once("fn page_later_unassigned(")
+            .unwrap()
+            .0;
+        for (reader, source_lock) in [
+            (anchor, "pg_workspace_embedding_source("),
+            (candidate, "FROM consolidation_sources"),
+        ] {
+            assert!(
+                reader.find("lock_workspace_run_for_read(").unwrap()
+                    < reader.find(source_lock).unwrap()
+            );
+        }
         for required in [
             "vector_dims(embedding.embedding)",
             "let mut tx = (&mut *conn).begin()",

@@ -273,6 +273,10 @@ struct Fixture {
 
 impl Fixture {
     fn provision(admin_opts: &PgConnectOptions) -> Self {
+        Self::provision_with_connections(admin_opts, 1)
+    }
+
+    fn provision_with_connections(admin_opts: &PgConnectOptions, connections: u32) -> Self {
         let rt = Runtime::new().expect("build tokio runtime");
         let suffix = Uuid::new_v4().simple().to_string();
         let database = format!("pensyve_rls_{suffix}");
@@ -314,7 +318,7 @@ impl Fixture {
 
         // The unprivileged role applies the schema, so it owns every table.
         //
-        // One connection, deliberately: every test here is sequential, and a
+        // One connection by default: a
         // single-connection pool guarantees that consecutive acquisitions get
         // the *same* physical backend. That is what lets
         // [`scoped_namespace_does_not_leak_into_the_next_checkout`] observe
@@ -323,7 +327,7 @@ impl Fixture {
         // reuse rather than a clean session.
         let app_pool = rt.block_on(async {
             PgPoolOptions::new()
-                .max_connections(1)
+                .max_connections(connections)
                 .connect_with(
                     admin_opts
                         .clone()
@@ -3759,6 +3763,32 @@ fn namespace_record_counts(fixture: &Fixture, namespace_id: Uuid) -> Vec<i64> {
         }
         counts
     })
+}
+
+#[test]
+fn bookkeeping_erasure_is_scoped() {
+    use crate::storage::erasure::{BOOKKEEPING_COUNTS, check_bookkeeping_erasure};
+
+    let Some(admin_opts) = skip_notice("bookkeeping_erasure_is_scoped") else {
+        return;
+    };
+    // Migration setup reads committed state on a second connection.
+    for enforce_rls in [true, false] {
+        let fixture = Fixture::provision_with_connections(&admin_opts, 2);
+        if !enforce_rls {
+            fixture.relax_rls();
+        }
+        check_bookkeeping_erasure(&fixture.backend, |ns| {
+            fixture.rt.block_on(async {
+                let mut conn = fixture.backend.scoped_conn(ns).await.unwrap();
+                query_as::<Postgres, (i64, i64, i64, i64)>(BOOKKEEPING_COUNTS)
+                    .bind(ns)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap()
+            })
+        });
+    }
 }
 
 /// #278 and #283: the purge emptied the memory tables and left the namespace's
