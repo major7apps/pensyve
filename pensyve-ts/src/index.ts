@@ -832,5 +832,5 @@ export {
   classifyQueryNaive,
   formatObservationsBlock,
   formatSessionHistory,
-} from "./reader";
-export type { Route } from "./reader";
+} from "./reader.js";
+export type { Route } from "./reader.js";
