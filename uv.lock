@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -299,7 +299,7 @@ wheels = [
 
 [[package]]
 name = "llama-cpp-python"
-version = "0.3.36"
+version = "0.3.38"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "diskcache" },
@@ -309,7 +309,7 @@ dependencies = [
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ec/e9/e7de2b0463ea3ffbf0ede6cb21b58c1258a8f6521aae45ca773a59fe7cf3/llama_cpp_python-0.3.36.tar.gz", hash = "sha256:832db0699007f1be95a7e41ef12e88926b02ba836461e36a36372db2760c1a2e", size = 76589250, upload-time = "2026-10-01T05:48:01.345Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6c/50/e3eba8a25c3927659da15d80bdc3f5ce8692f4f7cda16eeabde5185e1164/llama_cpp_python-0.3.38.tar.gz", hash = "sha256:0570c9736b5e2a239b651da18687238eeba7fc2369dcdfd8cbb009dc1321e23f", size = 79441646, upload-time = "2026-11-23T09:23:00.326Z" }
 
 [[package]]
 name = "markupsafe"
